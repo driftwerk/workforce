@@ -40,6 +40,7 @@ pub(crate) fn kept_scope_contract(store: &dyn PendingApprovalStore) {
             approver_user_ids: vec![],
             ttl: std::time::Duration::from_secs(3600),
             chat: false,
+            origin: None,
             content_scope,
         };
         store.insert_core(&core, None, None, expires).unwrap();
@@ -67,6 +68,7 @@ pub(crate) fn prune_contract(store: &dyn PendingApprovalStore) {
             approver_user_ids: vec![],
             ttl: std::time::Duration::from_secs(3600),
             chat: false,
+            origin: None,
             content_scope: None,
         };
         store.insert_core(&core, None, None, expires_at).unwrap();
@@ -148,6 +150,7 @@ pub(crate) fn pending_for_contract(store: &dyn PendingApprovalStore) {
         approver_user_ids: vec![],
         ttl: std::time::Duration::from_secs(3600),
         chat: false,
+        origin: None,
         content_scope: None,
     };
     let now = Utc::now();
@@ -219,6 +222,7 @@ pub(crate) fn identity_operations_contract(store: &dyn PendingApprovalStore) {
         approver_user_ids: vec![],
         ttl: std::time::Duration::from_secs(3600),
         chat: false,
+        origin: None,
         content_scope: None,
     };
     let expires = Utc::now() + chrono::Duration::hours(1);

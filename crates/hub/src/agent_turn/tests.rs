@@ -3333,6 +3333,7 @@ async fn an_approved_turns_continuation_runs_armed_whatever_ran_since() {
         created_at: chrono::Utc::now(),
         expires_at: chrono::Utc::now(),
         chat: true,
+        origin: None,
         content_scope,
     };
     let send = json!({ "channel": "C2", "text": "the vault" });

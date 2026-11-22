@@ -8,8 +8,14 @@
 //!   for which session; `DELETE /api/desk/computer/grants/{id}` revokes one.
 //! - `POST /api/desk/computer/sessions/{session_id}/forget`: drops a
 //!   session's allowances.
-//! - `GET /api/desk/computer/activity[?agent=&kind=&before=]`: a page of
-//!   what agents did here, newest first, and where the next starts.
+//! - `GET /api/desk/computer/activity[?agent=&kind=&decided_by=&before=]`:
+//!   a page of what agents did here, newest first, and where the next
+//!   starts.
+//! - `GET /api/desk/computer/on-its-own?agent=`: what a local agent does on
+//!   its own; `PUT` sets one level or override, `{agent, kind, scope,
+//!   level}` (`level` null asks each time again); `POST
+//!   /api/desk/computer/on-its-own/ask-again` `{agent}` forgets all of it
+//!   and every grant the agent holds.
 //!
 //! An agent's level is its `[computer]` table, set through the agent's
 //! config like any other setting.
@@ -26,7 +32,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use uuid::Uuid;
 
-use super::store::{ActivityFilter, KeptGrant};
+use super::store::{level_refusal, ActivityFilter, KeptGrant, OnItsOwnRow};
+use workforce_core::computer::{ActionKind, Level, Scope};
 
 use crate::api::Authorize;
 use crate::service::Desk;
@@ -248,6 +255,7 @@ struct ActivityQuery {
     token: Option<String>,
     agent: Option<String>,
     kind: Option<String>,
+    decided_by: Option<String>,
     /// A page's `next`: `<micros>~<id>`.
     before: Option<String>,
 }
@@ -283,6 +291,7 @@ async fn list_activity(State(s): S, h: HeaderMap, Query(q): Query<ActivityQuery>
     let filter = ActivityFilter {
         agent: q.agent,
         kind: q.kind,
+        decided_by: q.decided_by,
         before,
     };
     match s.desk.store().activity(&filter).await {
@@ -299,6 +308,236 @@ async fn list_activity(State(s): S, h: HeaderMap, Query(q): Query<ActivityQuery>
     }
 }
 
+/// The hub a local agent's levels are kept for.
+const LOCAL: &str = "local";
+
+fn bad(why: impl Into<String>) -> Response {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(json!({ "error": why.into() })),
+    )
+        .into_response()
+}
+
+/// A level or override as Settings lists it: a folder as the person reads it.
+#[derive(Serialize)]
+struct OnItsOwnView {
+    kind: ActionKind,
+    scope: Scope,
+    level: Level,
+    created_at: chrono::DateTime<chrono::Utc>,
+}
+
+impl OnItsOwnView {
+    fn of(row: OnItsOwnRow, home: &Path) -> Self {
+        let scope = match row.scope {
+            Scope::Folder(f) => Scope::Folder(PathBuf::from(super::policy::shown(&f, home))),
+            other => other,
+        };
+        Self {
+            kind: row.kind,
+            scope,
+            level: row.level,
+            created_at: row.created_at,
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct AgentQuery {
+    token: Option<String>,
+    agent: String,
+}
+
+async fn get_on_its_own(State(s): S, h: HeaderMap, Query(q): Query<AgentQuery>) -> Response {
+    let t = TokenQuery {
+        token: q.token.clone(),
+    };
+    if let Err(r) = guard(&s, &h, &t).await {
+        return r;
+    }
+    let home = home();
+    match s.desk.store().on_its_own_rows(LOCAL, &q.agent).await {
+        Ok(rows) => Json(
+            rows.into_iter()
+                .map(|r| OnItsOwnView::of(r, &home))
+                .collect::<Vec<_>>(),
+        )
+        .into_response(),
+        Err(e) => failed(e),
+    }
+}
+
+#[derive(Deserialize)]
+struct OnItsOwnBody {
+    agent: String,
+    kind: ActionKind,
+    scope: Scope,
+    level: Option<Level>,
+}
+
+/// The longest host name.
+const MAX_HOST: usize = 253;
+
+/// `scope` as it is kept, or why it can't be: a host as a command names
+/// it, less any `user@`; a site's bare origin; a folder, `~` read as home,
+/// that an agent may work in, as the disk spells it with its links
+/// followed.
+fn kept_scope(scope: Scope, home: &Path) -> Result<Scope, String> {
+    match spelled(scope, home) {
+        Scope::Whole => Ok(Scope::Whole),
+        Scope::Host(host) => {
+            let plain = !host.is_empty()
+                && host.len() <= MAX_HOST
+                && (host.parse::<std::net::Ipv6Addr>().is_ok()
+                    || host
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_')));
+            match plain {
+                true => Ok(Scope::Host(host)),
+                false => Err(format!("{host} isn't a host name or address.")),
+            }
+        }
+        Scope::Site(site) => {
+            let bare = site
+                .split_once("://")
+                .filter(|(scheme, _)| matches!(*scheme, "http" | "https"))
+                .is_some_and(|(_, host)| {
+                    !host.is_empty()
+                        && host
+                            .chars()
+                            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | ':'))
+                });
+            match bare {
+                true => Ok(Scope::Site(site)),
+                false => Err(format!(
+                    "{site} isn't a site's address: write it as https://example.com."
+                )),
+            }
+        }
+        Scope::Folder(folder) => {
+            let plain = folder.is_absolute()
+                && folder.components().all(|c| {
+                    matches!(
+                        c,
+                        std::path::Component::RootDir | std::path::Component::Normal(_)
+                    )
+                });
+            if !plain {
+                return Err(format!("{} isn't a full folder path.", folder.display()));
+            }
+            if let Some(why) =
+                workforce_common::computer_access::works_in_refusal(&folder, home, &[])
+            {
+                return Err(why);
+            }
+            super::boss::resolve_real(&folder)
+                .map(Scope::Folder)
+                .ok_or_else(|| format!("{} leads nowhere.", folder.display()))
+        }
+    }
+}
+
+/// `scope` as it is kept, whatever is set there: a host lower-cased with
+/// any `user@` and IPv6 brackets dropped, an IPv6 address in its standard
+/// form, a site lower-cased with no
+/// trailing `/`, a folder with `~` expanded and its links followed where
+/// it still leads somewhere.
+fn spelled(scope: Scope, home: &Path) -> Scope {
+    match scope {
+        Scope::Host(host) => {
+            let host = host.trim();
+            let host = host.rsplit('@').next().unwrap_or(host);
+            let host = host
+                .strip_prefix('[')
+                .and_then(|h| h.strip_suffix(']'))
+                .unwrap_or(host);
+            Scope::Host(super::asks::host_spelled(host))
+        }
+        Scope::Site(site) => Scope::Site(site.trim().trim_end_matches('/').to_ascii_lowercase()),
+        Scope::Folder(folder) => {
+            let folder = match folder.strip_prefix("~") {
+                Ok(rest) => home.join(rest),
+                Err(_) => folder,
+            };
+            Scope::Folder(super::boss::resolve_real(&folder).unwrap_or(folder))
+        }
+        Scope::Whole => Scope::Whole,
+    }
+}
+
+async fn put_on_its_own(
+    State(s): S,
+    h: HeaderMap,
+    Query(q): Query<TokenQuery>,
+    body: Option<Json<OnItsOwnBody>>,
+) -> Response {
+    if let Err(r) = guard(&s, &h, &q).await {
+        return r;
+    }
+    let Some(Json(body)) = body else {
+        return bad("the body is {\"agent\", \"kind\", \"scope\", \"level\"}");
+    };
+    // Asking again where it was set is never refused: what is kept is
+    // removed as it was kept, however it would be judged now.
+    let scope = match body.level {
+        None => spelled(body.scope, &home()),
+        Some(_) => match kept_scope(body.scope, &home()) {
+            Ok(scope) => scope,
+            Err(why) => return bad(why),
+        },
+    };
+    if let Some(why) = body
+        .level
+        .and_then(|_| level_refusal(body.kind, &scope, body.level))
+    {
+        return bad(why);
+    }
+    match s
+        .desk
+        .store()
+        .set_on_its_own(LOCAL, &body.agent, body.kind, &scope, body.level)
+        .await
+    {
+        Ok(false) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "It already asks each time there." })),
+        )
+            .into_response(),
+        Ok(true) => {
+            tracing::info!(agent = %body.agent, kind = body.kind.as_str(), scope = %scope.text(), level = ?body.level, "what an agent does on its own set");
+            StatusCode::NO_CONTENT.into_response()
+        }
+        Err(e) => failed(e),
+    }
+}
+
+#[derive(Deserialize)]
+struct AskAgainBody {
+    agent: String,
+}
+
+async fn ask_again(
+    State(s): S,
+    h: HeaderMap,
+    Query(q): Query<TokenQuery>,
+    body: Option<Json<AskAgainBody>>,
+) -> Response {
+    if let Err(r) = guard(&s, &h, &q).await {
+        return r;
+    }
+    let Some(Json(body)) = body else {
+        return bad("the body is {\"agent\"}");
+    };
+    match s.desk.store().ask_again(LOCAL, &body.agent).await {
+        Ok(cleared) => {
+            tracing::info!(agent = %body.agent, cleared, "an agent asks about everything again");
+            Json(json!({ "cleared": cleared })).into_response()
+        }
+        Err(e) => failed(e),
+    }
+}
+
 pub(crate) fn computer_router(desk: Desk, auth: Arc<dyn Authorize>) -> Router {
     Router::new()
         .route("/api/desk/computer/disk-access", get(get_disk_access))
@@ -310,6 +549,11 @@ pub(crate) fn computer_router(desk: Desk, auth: Arc<dyn Authorize>) -> Router {
             post(forget_session),
         )
         .route("/api/desk/computer/activity", get(list_activity))
+        .route(
+            "/api/desk/computer/on-its-own",
+            get(get_on_its_own).put(put_on_its_own),
+        )
+        .route("/api/desk/computer/on-its-own/ask-again", post(ask_again))
         .with_state(Arc::new(ComputerApi { desk, auth }))
 }
 
@@ -460,6 +704,171 @@ mod tests {
             let (status, probe) = call(&app, "GET", "/api/desk/computer/disk-access", None).await;
             assert_eq!(status, 200);
             assert!(["granted", "missing", "unknown"].contains(&probe["state"].as_str().unwrap()));
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn what_an_agent_does_on_its_own_is_set_listed_and_forgotten_by_desk_alone() {
+        with_test_pool(build_pool, |pool| async move {
+            let dir = tempfile::tempdir().unwrap();
+            let desk = crate::testing::desk_on(pool, dir.path()).await;
+            let closed = computer_router(desk.clone(), deny_all());
+            let devbox = json!({"agent": "kat", "kind": "network", "scope": {"kind": "host", "value": "dev@DevBox"}, "level": "anywhere"});
+            for (method, uri, body) in [
+                ("GET", "/api/desk/computer/on-its-own?agent=kat", None),
+                ("PUT", "/api/desk/computer/on-its-own", Some(devbox.clone())),
+                (
+                    "POST",
+                    "/api/desk/computer/on-its-own/ask-again",
+                    Some(json!({"agent": "kat"})),
+                ),
+                ("GET", "/api/desk/computer/activity?decided_by=on_its_own", None),
+            ] {
+                assert_eq!(call(&closed, method, uri, body).await.0, 401, "{uri}");
+            }
+            assert!(desk
+                .store()
+                .on_its_own_rows("local", "kat")
+                .await
+                .unwrap()
+                .is_empty());
+
+            let app = computer_router(desk.clone(), allow_all());
+            let put = |body: Value| {
+                let app = app.clone();
+                async move { call(&app, "PUT", "/api/desk/computer/on-its-own", Some(body)).await }
+            };
+            assert_eq!(put(devbox.clone()).await.0, 204);
+            assert_eq!(
+                put(json!({"agent": "kat", "kind": "files", "scope": {"kind": "folder", "value": "~/dev/acme-web"}, "level": "anywhere"}))
+                    .await
+                    .0,
+                204
+            );
+            assert_eq!(
+                put(json!({"agent": "kat", "kind": "commands", "scope": {"kind": "whole"}, "level": "in_folders"}))
+                    .await
+                    .0,
+                204
+            );
+            let (status, listed) =
+                call(&app, "GET", "/api/desk/computer/on-its-own?agent=kat", None).await;
+            assert_eq!(status, 200);
+            let rows: Vec<(&str, &Value, &str)> = listed
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|r| (r["kind"].as_str().unwrap(), &r["scope"], r["level"].as_str().unwrap()))
+                .collect();
+            assert_eq!(
+                rows,
+                vec![
+                    ("commands", &json!({"kind": "whole"}), "in_folders"),
+                    ("files", &json!({"kind": "folder", "value": "~/dev/acme-web"}), "anywhere"),
+                    ("network", &json!({"kind": "host", "value": "devbox"}), "anywhere"),
+                ]
+            );
+
+            for bad in [
+                json!({"agent": "kat", "kind": "network", "scope": {"kind": "host", "value": "devbox:22"}, "level": "anywhere"}),
+                json!({"agent": "kat", "kind": "network", "scope": {"kind": "host", "value": "dev box"}, "level": "anywhere"}),
+                json!({"agent": "kat", "kind": "network", "scope": {"kind": "whole"}, "level": "in_folders"}),
+                json!({"agent": "kat", "kind": "commands", "scope": {"kind": "host", "value": "devbox"}, "level": "anywhere"}),
+                json!({"agent": "kat", "kind": "files", "scope": {"kind": "folder", "value": "~/.ssh"}, "level": "anywhere"}),
+                json!({"agent": "kat", "kind": "browser", "scope": {"kind": "site", "value": "github.com"}, "level": "anywhere"}),
+            ] {
+                assert_eq!(put(bad.clone()).await.0, 400, "{bad}");
+            }
+            assert_eq!(
+                call(&app, "PUT", "/api/desk/computer/on-its-own", None).await.0,
+                400
+            );
+            assert_eq!(
+                call(&app, "POST", "/api/desk/computer/on-its-own/ask-again", None)
+                    .await
+                    .0,
+                400
+            );
+
+            let removed = json!({"agent": "kat", "kind": "network", "scope": {"kind": "host", "value": "devbox"}, "level": null});
+            assert_eq!(put(removed.clone()).await.0, 204);
+            let (status, missing) = put(removed).await;
+            assert_eq!(status, 404);
+            assert_eq!(missing["error"], "It already asks each time there.");
+            // Asking again is never refused for how the scope is written:
+            // one no level could be set for is simply not there.
+            for odd in [
+                json!({"agent": "kat", "kind": "network", "scope": {"kind": "host", "value": "dev box"}, "level": null}),
+                json!({"agent": "kat", "kind": "commands", "scope": {"kind": "host", "value": "devbox"}, "level": null}),
+                json!({"agent": "kat", "kind": "files", "scope": {"kind": "folder", "value": "~/.ssh"}, "level": null}),
+            ] {
+                assert_eq!(put(odd.clone()).await.0, 404, "{odd}");
+            }
+            // An IPv6 address, brackets dropped, as the card reads it.
+            let v6 = json!({"agent": "kat", "kind": "network", "scope": {"kind": "host", "value": "[FE80::1]"}, "level": "anywhere"});
+            assert_eq!(put(v6).await.0, 204);
+            let gone = json!({"agent": "kat", "kind": "network", "scope": {"kind": "host", "value": "fe80::1"}, "level": null});
+            assert_eq!(put(gone).await.0, 204);
+            // Kept in its one standard form, as a command naming it is read.
+            let long = json!({"agent": "kat", "kind": "network", "scope": {"kind": "host", "value": "[FE80:0:0:0::0001]"}, "level": "anywhere"});
+            assert_eq!(put(long).await.0, 204);
+            let short = json!({"agent": "kat", "kind": "network", "scope": {"kind": "host", "value": "fe80::1"}, "level": null});
+            assert_eq!(put(short).await.0, 204);
+
+            for decided_by in ["on_its_own", "person"] {
+                desk.store()
+                    .record_activity(&Activity {
+                        hub: "local".into(),
+                        agent: "kat".into(),
+                        person: Some("sarah".into()),
+                        session_id: None,
+                        request_id: None,
+                        kind: "exec".into(),
+                        doing: "git push --force".into(),
+                        folder: None,
+                        connector: None,
+                        tool: "exec.run".into(),
+                        vault_source: None,
+                        decided_by: decided_by.into(),
+                        outcome: json!({"outcome": "allowed"}),
+                        reason: None,
+                        exit_code: None,
+                        duration_ms: None,
+                        arguments: json!({}),
+                        device: None,
+                    })
+                    .await
+                    .unwrap();
+            }
+            let (status, page) = call(
+                &app,
+                "GET",
+                "/api/desk/computer/activity?agent=kat&decided_by=on_its_own",
+                None,
+            )
+            .await;
+            assert_eq!(status, 200);
+            let rows = page["rows"].as_array().unwrap();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0]["decided_by"], "on_its_own");
+
+            assert_eq!(
+                call(
+                    &app,
+                    "POST",
+                    "/api/desk/computer/on-its-own/ask-again",
+                    Some(json!({"agent": "kat"}))
+                )
+                .await,
+                (200, json!({"cleared": 2}))
+            );
+            assert_eq!(
+                call(&app, "GET", "/api/desk/computer/on-its-own?agent=kat", None)
+                    .await
+                    .1,
+                json!([])
+            );
         })
         .await;
     }

@@ -183,6 +183,10 @@ pub enum Effect {
     Delete {
         paths: Vec<PathBuf>,
     },
+    /// A move of `paths` to the Trash: a delete that can be undone.
+    Trash {
+        paths: Vec<PathBuf>,
+    },
     /// A delete of `from` and a write of `to`.
     Move {
         from: Vec<PathBuf>,
@@ -240,6 +244,129 @@ impl Ability {
     }
 }
 
+/// A kind of action an agent may take on its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ActionKind {
+    /// Running commands and starting sessions.
+    Commands,
+    /// Commands that reach other machines: ssh, scp, sftp, rsync, mosh.
+    Network,
+    /// The person's Chrome: using it, opening sites, acting on pages.
+    Browser,
+    /// Changing files outside its folders.
+    Files,
+    /// Moving things to the Trash.
+    Delete,
+}
+
+impl ActionKind {
+    pub const ALL: [ActionKind; 5] = [
+        ActionKind::Commands,
+        ActionKind::Network,
+        ActionKind::Browser,
+        ActionKind::Files,
+        ActionKind::Delete,
+    ];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Commands => "commands",
+            Self::Network => "network",
+            Self::Browser => "browser",
+            Self::Files => "files",
+            Self::Delete => "delete",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|k| k.as_str() == s)
+    }
+
+    /// Whether "in its folders" means anything for it: not for hosts or
+    /// sites.
+    pub fn takes_folders(self) -> bool {
+        !matches!(self, Self::Network | Self::Browser)
+    }
+}
+
+/// How far an agent does a kind of action on its own. Asking each time is
+/// no level at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Level {
+    /// Where its targets are inside its own folder or one it works in.
+    InFolders,
+    Anywhere,
+}
+
+impl Level {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::InFolders => "in_folders",
+            Self::Anywhere => "anywhere",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "in_folders" => Some(Self::InFolders),
+            "anywhere" => Some(Self::Anywhere),
+            _ => None,
+        }
+    }
+}
+
+/// Where a kind's level holds: the whole kind, or one folder, host or site.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "value", rename_all = "snake_case")]
+pub enum Scope {
+    Whole,
+    Folder(PathBuf),
+    /// A host as a command names it (`devbox`, `10.0.1.20`).
+    Host(String),
+    /// A site's origin (`https://github.com`).
+    Site(String),
+}
+
+impl Scope {
+    /// As it is stored: empty for the whole kind, else `folder:`, `host:` or
+    /// `site:` and its value.
+    pub fn text(&self) -> String {
+        match self {
+            Self::Whole => String::new(),
+            Self::Folder(f) => format!("folder:{}", f.display()),
+            Self::Host(h) => format!("host:{h}"),
+            Self::Site(s) => format!("site:{s}"),
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        if s.is_empty() {
+            return Some(Self::Whole);
+        }
+        let (kind, value) = s.split_once(':')?;
+        (!value.is_empty()).then_some(())?;
+        match kind {
+            "folder" => Some(Self::Folder(PathBuf::from(value))),
+            "host" => Some(Self::Host(value.to_string())),
+            "site" => Some(Self::Site(value.to_string())),
+            _ => None,
+        }
+    }
+
+    /// Whether it fits `kind`: a host for the network, a site for the
+    /// browser, a folder for the rest.
+    pub fn fits(&self, kind: ActionKind) -> bool {
+        match self {
+            Self::Whole => true,
+            Self::Folder(_) => kind.takes_folders(),
+            Self::Host(_) => kind == ActionKind::Network,
+            Self::Site(_) => kind == ActionKind::Browser,
+        }
+    }
+}
+
 /// Where an "always" answer holds.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "value", rename_all = "snake_case")]
@@ -248,6 +375,8 @@ pub enum Always {
     Folder(PathBuf),
     /// Writes to this connector.
     Connector(String),
+    /// This kind of action, on its own, in this scope.
+    OnItsOwn { kind: ActionKind, scope: Scope },
 }
 
 /// An answer a card may offer.
@@ -274,6 +403,8 @@ pub enum By {
     /// ask (`[computer] unattended = "run"`, the default). Never a verdict's
     /// own answer: the gate's, on a path with nobody on it.
     Unattended,
+    /// The person lets it do this kind of action on its own.
+    OnItsOwn,
 }
 
 /// Which rule refused a call.
@@ -285,6 +416,8 @@ pub enum Refused {
     OutsideLevel,
     ConnectorOff,
     ConnectorReadOnly,
+    /// It deletes on its own only by moving to the Trash.
+    UseTrash,
 }
 
 /// A refusal, with the sentence the agent and the person read.
@@ -378,6 +511,12 @@ pub enum Why {
     NewSite,
     /// It waits while the person signs in to a site themselves.
     SignIn,
+    /// It changes the computer's own settings or security.
+    System,
+    /// It moves something to the Trash outside its folder.
+    ToTrash,
+    /// It deletes or replaces what can't be told until it runs.
+    ForGood,
 }
 
 impl Why {
@@ -398,7 +537,38 @@ impl Why {
             Self::TheirChrome => "Uses your own Chrome, signed in as you",
             Self::NewSite => "Opens a new site in your Chrome",
             Self::SignIn => "Waits while you sign in. Desk never sees your password",
+            Self::System => "Changes this computer's own settings or security",
+            Self::ToTrash => "Moves to the Trash",
+            Self::ForGood => "Can't tell what this deletes or replaces",
         }
+    }
+
+    /// Whether an ask stays the person's whatever the agent may do on its
+    /// own: a page that read as hostile, their own sign-in, what reaches
+    /// other people or a connected service, what a tool can't name, what a
+    /// command can't be read as, what it can't say it deletes, and the
+    /// computer's own settings and security.
+    pub fn held(self) -> bool {
+        matches!(
+            self,
+            Self::HostilePage
+                | Self::SignIn
+                | Self::SendsToPeople
+                | Self::ConnectorWrite
+                | Self::Unknown
+                | Self::Unclear
+                | Self::ForGood
+                | Self::System
+                | Self::ChangesTheBooks(_)
+        )
+    }
+
+    /// Whether an ask is refused, not run, where nobody can be asked.
+    pub fn never_unattended(self) -> bool {
+        matches!(
+            self,
+            Self::Unclear | Self::ForGood | Self::System | Self::ChangesTheBooks(_)
+        )
     }
 }
 
@@ -464,5 +634,76 @@ mod tests {
         let back = serde_json::to_value(&node).unwrap();
         assert_eq!(back["platform"], "windows");
         assert_eq!(serde_json::from_value::<DeskNode>(back).unwrap(), node);
+    }
+
+    #[test]
+    fn on_its_own_round_trips_as_stored_and_as_sent() {
+        for kind in ActionKind::ALL {
+            assert_eq!(ActionKind::parse(kind.as_str()), Some(kind));
+            let sent = serde_json::to_value(kind).unwrap();
+            assert_eq!(sent, serde_json::json!(kind.as_str()));
+            assert_eq!(serde_json::from_value::<ActionKind>(sent).unwrap(), kind);
+        }
+        for level in [Level::InFolders, Level::Anywhere] {
+            assert_eq!(Level::parse(level.as_str()), Some(level));
+            assert_eq!(
+                serde_json::from_value::<Level>(serde_json::to_value(level).unwrap()).unwrap(),
+                level
+            );
+        }
+        for (scope, sent) in [
+            (Scope::Whole, serde_json::json!({"kind": "whole"})),
+            (
+                Scope::Folder(PathBuf::from("/Users/sarah/dev")),
+                serde_json::json!({"kind": "folder", "value": "/Users/sarah/dev"}),
+            ),
+            (
+                Scope::Host("devbox".into()),
+                serde_json::json!({"kind": "host", "value": "devbox"}),
+            ),
+            (
+                Scope::Site("https://github.com".into()),
+                serde_json::json!({"kind": "site", "value": "https://github.com"}),
+            ),
+        ] {
+            assert_eq!(Scope::parse(&scope.text()), Some(scope.clone()));
+            assert_eq!(serde_json::to_value(&scope).unwrap(), sent);
+            assert_eq!(serde_json::from_value::<Scope>(sent).unwrap(), scope);
+        }
+        assert_eq!(Scope::Whole.text(), "");
+        for bad in ["host:", "planet:x", "devbox"] {
+            assert_eq!(Scope::parse(bad), None, "{bad}");
+        }
+        let always = Always::OnItsOwn {
+            kind: ActionKind::Network,
+            scope: Scope::Host("devbox".into()),
+        };
+        let sent = serde_json::to_value(&always).unwrap();
+        assert_eq!(serde_json::from_value::<Always>(sent).unwrap(), always);
+        assert_eq!(
+            serde_json::from_value::<By>(serde_json::to_value(By::OnItsOwn).unwrap()).unwrap(),
+            By::OnItsOwn
+        );
+    }
+
+    #[test]
+    fn held_asks_stay_the_persons_and_refuse_unattended() {
+        for why in [Why::Unclear, Why::ForGood, Why::System] {
+            assert!(why.held() && why.never_unattended(), "{why:?}");
+        }
+        for why in [
+            Why::CantBeUndone,
+            Why::OutsideFolder,
+            Why::OnAPage,
+            Why::NewSite,
+        ] {
+            assert!(!why.held() && !why.never_unattended(), "{why:?}");
+        }
+        assert!(Why::SendsToPeople.held() && !Why::SendsToPeople.never_unattended());
+        // Payments and the books stay the person's, even unattended.
+        for books in [Books::FreeAgent, Books::Xero] {
+            let why = Why::ChangesTheBooks(books);
+            assert!(why.held() && why.never_unattended(), "{why:?}");
+        }
     }
 }

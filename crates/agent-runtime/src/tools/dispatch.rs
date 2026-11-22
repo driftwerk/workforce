@@ -527,6 +527,7 @@ pub fn options_for_tool(
         options.allow_always = false;
         options.allow_session = false;
         options.allow_in_folder = None;
+        options.allow_scope = None;
     }
     options
 }

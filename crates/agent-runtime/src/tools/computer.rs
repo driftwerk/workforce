@@ -130,7 +130,14 @@ pub trait ComputerGate: Send + Sync {
     fn unbound(&self) -> bool {
         false
     }
-    /// Keeps a session or folder answer as Desk's grant.
+    /// Whether the agent's standing is Act fully, in force by its settings
+    /// and grant, in any turn: nothing it does is held back for the person,
+    /// jobs included.
+    fn acts_fully(&self) -> bool {
+        false
+    }
+    /// Keeps a session or lasting answer as Desk's grant, or as what the
+    /// agent does on its own.
     fn keep(
         &self,
         _decision: &Decision,
@@ -161,8 +168,23 @@ pub fn decide_unattended(
     }
     let asks = matches!(decision.verdict, Verdict::Ask { .. } | Verdict::Review);
     if asks && gate.is_some_and(|g| g.unattended_runs() && !g.asks_unattended(tool_name)) {
-        decision.verdict = Verdict::Run {
-            by: workforce_core::computer::By::Unattended,
+        decision.verdict = match &decision.verdict {
+            Verdict::Ask { why, .. }
+                if why.never_unattended() && !gate.is_some_and(|g| g.acts_fully()) =>
+            {
+                Verdict::Refuse {
+                    refusal: workforce_core::computer::Refusal {
+                        rule: workforce_core::computer::Refused::OutsideLevel,
+                        sentence: format!(
+                        "{tool_name} wasn't run with nobody there to ask: {}. Ask for it in Desk.",
+                        why.sentence()
+                    ),
+                    },
+                }
+            }
+            _ => Verdict::Run {
+                by: workforce_core::computer::By::Unattended,
+            },
         };
     }
     Some(decision)
@@ -205,6 +227,7 @@ pub fn describe(effect: &Effect) -> String {
         Effect::Read { paths } => format!("read {}", list(paths)),
         Effect::Write { paths } => format!("change {}", list(paths)),
         Effect::Delete { paths } => format!("delete {}", list(paths)),
+        Effect::Trash { paths } => format!("move {} to the Trash", list(paths)),
         Effect::Move { from, to } => format!("move {} to {}", list(from), to.display()),
         Effect::Exec { command, cwd } => match cwd {
             Some(cwd) => format!("run `{command}` in {}", cwd.display()),
@@ -238,7 +261,6 @@ pub fn apply(response: PolicyResponse, decision: Option<&Decision>) -> PolicyRes
             },
             ..response
         },
-        // Working on its own (AC11) is not built yet: a review asks.
         Verdict::Ask { why, .. } => held(response, why.sentence(), &decision.effect),
         Verdict::Review => held(response, "Asks first", &decision.effect),
     }
@@ -273,6 +295,7 @@ pub fn once_or_deny() -> workforce_core::policy::PermissionPromptOptions {
         deny_always: false,
         allow_session: false,
         allow_in_folder: None,
+        allow_scope: None,
         facts: None,
     }
 }
@@ -289,8 +312,9 @@ pub fn prompt_options(
     options
 }
 
-/// Keeps a session or folder answer to `decision` as a grant; any other
-/// answer keeps nothing. A grant that can't be kept is logged: the call
+/// Keeps a session or lasting answer to `decision` (a folder's or a
+/// connector's grant, or a kind of action on its own); any other answer
+/// keeps nothing. A grant that can't be kept is logged: the call
 /// itself was still allowed once.
 pub fn keep_answer(
     gate: Option<&dyn ComputerGate>,
@@ -559,6 +583,65 @@ mod tests {
             apply(denied, Some(&ask)).decision,
             PolicyDecision::Deny { reason } if reason == "policy"
         ));
+    }
+
+    /// A gate at Full access running what would ask in a job, acting
+    /// fully or not.
+    struct Asking(Why, bool);
+
+    impl ComputerGate for Asking {
+        fn decides(&self, _tool: &str) -> bool {
+            true
+        }
+        fn verdict(&self, _tool: &str, _effect: &Effect) -> Verdict {
+            Verdict::Ask {
+                choices: vec![Choice::AllowOnce, Choice::Deny],
+                why: self.0,
+            }
+        }
+        fn record(&self, _record: Record) {}
+        fn unattended_runs(&self) -> bool {
+            true
+        }
+        fn acts_fully(&self) -> bool {
+            self.1
+        }
+    }
+
+    #[test]
+    fn what_stays_the_persons_is_never_run_in_a_job() {
+        let tools = ToolRegistry::new();
+        let input = serde_json::json!({});
+        for why in [Why::Unclear, Why::ForGood, Why::System] {
+            let decided =
+                decide_unattended(Some(&Asking(why, false)), &tools, "exec.run", &input).unwrap();
+            assert!(
+                matches!(
+                    &decided.verdict,
+                    Verdict::Refuse { refusal } if refusal.rule == Refused::OutsideLevel
+                        && refusal.sentence.contains(why.sentence())
+                ),
+                "{why:?}: {:?}",
+                decided.verdict
+            );
+        }
+        let decided = decide_unattended(
+            Some(&Asking(Why::CantBeUndone, false)),
+            &tools,
+            "exec.run",
+            &input,
+        )
+        .unwrap();
+        assert_eq!(decided.verdict, Verdict::Run { by: By::Unattended });
+        for why in [Why::Unclear, Why::ForGood, Why::System] {
+            let decided =
+                decide_unattended(Some(&Asking(why, true)), &tools, "exec.run", &input).unwrap();
+            assert_eq!(
+                decided.verdict,
+                Verdict::Run { by: By::Unattended },
+                "acting fully: {why:?}"
+            );
+        }
     }
 
     #[test]
