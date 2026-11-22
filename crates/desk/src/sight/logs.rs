@@ -78,8 +78,9 @@ fn stamp(line: &str) -> Option<(DateTime<Utc>, &str)> {
 /// What of `text`, the tail of the log `file`, belongs to the session `ask`
 /// is for: in the hub's log, the lines that name it; in the helper's and
 /// PTY holder's, warnings, errors and starts and stops. Within its window,
-/// with `query` in them when it is asked, each redacted and clipped; none
-/// without a redactor.
+/// each redacted, with `query` in what is redacted when it is asked (a
+/// secret is never found by its own words), and clipped; none without a
+/// redactor.
 pub fn lines_of(
     file: &str,
     text: &str,
@@ -99,15 +100,19 @@ pub fn lines_of(
                 true => ask.names.iter().any(|n| !n.is_empty() && line.contains(n)),
                 false => matches!(level, "WARN" | "ERROR") || lifecycle().is_match(line),
             };
-            let asked = query
+            if !own || at < ask.from || at > ask.to {
+                return None;
+            }
+            let text = r.stored(line).text;
+            query
                 .as_deref()
-                .is_none_or(|q| line.to_lowercase().contains(q));
-            (own && asked && at >= ask.from && at <= ask.to).then(|| LogLine {
-                file: file.to_string(),
-                at,
-                level: level.to_string(),
-                text: crate::crew::clip(&r.stored(line).text, LINE_MAX),
-            })
+                .is_none_or(|q| text.to_lowercase().contains(q))
+                .then(|| LogLine {
+                    file: file.to_string(),
+                    at,
+                    level: level.to_string(),
+                    text: crate::crew::clip(&text, LINE_MAX),
+                })
         })
         .collect()
 }
@@ -196,10 +201,16 @@ mod tests {
     }
 
     #[test]
-    fn a_query_keeps_only_the_lines_holding_it_and_nothing_is_kept_without_a_redactor() {
+    fn a_query_keeps_only_the_lines_whose_redacted_text_holds_it_and_none_without_a_redactor() {
         let names = ["s-1", "c-1"];
         let kept = lines_of("hub.log", HUB, &ask(&names, Some("RESUMED")), Some(&Hides));
         assert_eq!(kept.len(), 1);
+        let secret = |q| lines_of("hub.log", HUB, &ask(&names, Some(q)), Some(&Hides));
+        assert!(
+            secret("SECRET-abc").is_empty(),
+            "never found by its own words"
+        );
+        assert_eq!(secret("[SECRET]").len(), 1);
         assert!(lines_of("hub.log", HUB, &ask(&names, None), None).is_empty());
     }
 

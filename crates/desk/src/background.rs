@@ -180,6 +180,14 @@ impl Background {
         agents + shells
     }
 
+    /// The ids of the shells known running.
+    pub fn shells(&self) -> impl Iterator<Item = &str> {
+        self.tasks
+            .iter()
+            .filter(|(_, t)| t.kind == TaskKind::Shell)
+            .map(|(id, _)| id.as_str())
+    }
+
     /// As the floor shows it, while there is any.
     pub fn view(&self) -> Option<floor::Background> {
         let count = u32::try_from(self.count()).ok().filter(|c| *c > 0)?;
@@ -437,6 +445,16 @@ mod tests {
             2,
             "its shells are counted by process"
         );
+    }
+
+    #[test]
+    fn its_shells_are_the_running_pieces_that_are_shells() {
+        let b = Background::default().reported(
+            tasks(&[("s1", TaskKind::Shell), ("a1", TaskKind::Agent)]),
+            at(0),
+        );
+        assert_eq!(b.shells().collect::<Vec<_>>(), ["s1"]);
+        assert_eq!(b.ended("s1", at(1)).shells().count(), 0);
     }
 
     #[test]

@@ -56,9 +56,13 @@ pub struct Reading {
     /// The computer a remote command runs on.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub on: Option<String>,
-    /// The process it was read from.
-    #[serde(skip)]
+    /// The process it was read from: sent, so a machine's waits are told
+    /// apart by it too.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pid: Option<u32>,
+    /// The open call it was read from: the waiting call's id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub call: Option<String>,
 }
 
 impl Reading {
@@ -71,6 +75,7 @@ impl Reading {
             by: None,
             on: None,
             pid: None,
+            call: None,
         }
     }
 }
@@ -297,7 +302,11 @@ pub fn verdict(
             Some(p) => stall(
                 StallKind::CiRed,
                 g.since,
-                format!("its PR #{}'s CI failed ({})", p.number, named(&p.failed)),
+                format!(
+                    "its {}'s CI failed{}",
+                    pr_named(p.number),
+                    checks_named(&p.failed)
+                ),
             ),
             None => w
                 .left
@@ -317,11 +326,19 @@ pub fn verdict(
     waited.or_else(still).or_else(workspace)
 }
 
-/// Failed checks' names, or that none were named.
-fn named(failed: &[String]) -> String {
+/// A PR by its number, where it is shown (0 where it isn't).
+fn pr_named(number: u64) -> String {
+    match number {
+        0 => "PR".into(),
+        n => format!("PR #{n}"),
+    }
+}
+
+/// The failed checks' names in brackets, where any are shown.
+fn checks_named(failed: &[String]) -> String {
     match failed {
-        [] => "no check named".into(),
-        names => names.join(", "),
+        [] => String::new(),
+        names => format!(" ({})", names.join(", ")),
     }
 }
 
@@ -429,13 +446,10 @@ impl Glance {
                 w.behind.filter(|n| *n > 0).map(|n| format!("{n} behind")),
                 w.pr.as_ref().map(|p| {
                     format!(
-                        "PR #{}: CI {}{}{}",
-                        p.number,
+                        "{}: CI {}{}{}",
+                        pr_named(p.number),
                         p.checks,
-                        Some(&p.failed)
-                            .filter(|f| !f.is_empty())
-                            .map(|f| format!(" ({})", f.join(", ")))
-                            .unwrap_or_default(),
+                        checks_named(&p.failed),
                         match p.head_matches_local {
                             Some(false) => ", for another push than its HEAD",
                             _ => "",
@@ -542,7 +556,7 @@ mod tests {
     }
 
     #[test]
-    fn a_reading_is_written_with_its_kind_and_wait_beside_its_words() {
+    fn a_reading_is_written_with_its_kind_and_wait_beside_its_words_and_where_it_was_read() {
         let r = Reading {
             kind: Kind::Waits(Wait::Queue),
             words: "waiting for a build slot".into(),
@@ -550,13 +564,24 @@ mod tests {
             by: Some("ssh".into()),
             on: None,
             pid: Some(7),
+            call: Some("toolu_1".into()),
         };
         let v = serde_json::to_value(&r).unwrap();
         assert_eq!(v["kind"], "waits");
         assert_eq!(v["wait"], "queue");
-        assert!(v.get("pid").is_none());
-        let back: Reading = serde_json::from_value(v).unwrap();
-        assert_eq!(back, Reading { pid: None, ..r });
+        assert_eq!(
+            (v["pid"].clone(), v["call"].clone()),
+            (serde_json::json!(7), serde_json::json!("toolu_1"))
+        );
+        let back: Reading = serde_json::from_value(v.clone()).unwrap();
+        assert_eq!(back, r);
+        let mut older = v;
+        older
+            .as_object_mut()
+            .unwrap()
+            .retain(|k, _| k != "pid" && k != "call");
+        let older: Reading = serde_json::from_value(older).unwrap();
+        assert_eq!((older.pid, older.call), (None, None));
         let works = serde_json::to_value(Reading::quiet(at(0))).unwrap();
         assert_eq!(works["kind"], "quiet");
         assert!(works.get("wait").is_none());
@@ -575,6 +600,7 @@ mod tests {
             by: None,
             on: None,
             pid: None,
+            call: None,
         }
     }
 
