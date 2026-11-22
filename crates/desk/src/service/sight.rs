@@ -10,10 +10,11 @@ use std::ffi::OsString;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, SystemTime};
 
 use chrono::{DateTime, Utc};
+use regex::Regex;
 use serde::Serialize;
 use uuid::Uuid;
 
@@ -82,6 +83,9 @@ pub struct SightOptions {
     pub shown_after: Duration,
     /// Desk's own logs folder, where this hub is Desk's.
     pub logs: Option<PathBuf>,
+    /// How long looks in a row must miss a background shell the CLI
+    /// reported running before it is taken to have ended.
+    pub shell_unseen: Duration,
 }
 
 impl Default for SightOptions {
@@ -96,6 +100,7 @@ impl Default for SightOptions {
             poll: Duration::from_secs(10 * 60),
             shown_after: Duration::from_secs(2 * 60),
             logs: None,
+            shell_unseen: Duration::from_secs(2 * 60),
         }
     }
 }
@@ -225,6 +230,8 @@ struct Tracked {
     read_to: u64,
     /// Its newest lines, redacted, oldest first.
     lines: Vec<String>,
+    /// Whether its last line says its command ended.
+    ended: bool,
 }
 
 impl Tracked {
@@ -234,8 +241,20 @@ impl Tracked {
             len: read_to,
             read_to,
             lines: Vec::new(),
+            ended: false,
         }
     }
+}
+
+/// Whether `line` is what Claude Code writes last in a task output file
+/// once its command ended: "[exited with code 0]", "[killed]".
+fn says_ended(line: &str) -> bool {
+    static ENDED: OnceLock<Regex> = OnceLock::new();
+    ENDED
+        .get_or_init(|| {
+            Regex::new(r"^\[(exited with code -?\d+|killed)\]$").expect("a valid pattern")
+        })
+        .is_match(line.trim())
 }
 
 /// A session's task output folder as last listed: when it was first
@@ -402,6 +421,10 @@ fn read_on(t: Tracked, redactor: Option<&dyn Redactor>) -> (Tracked, Vec<String>
         true => text.split_once('\n').map_or("", |(_, rest)| rest),
         false => text.as_str(),
     };
+    let ended = match text.lines().rev().find(|l| !l.trim().is_empty()) {
+        Some(last) => says_ended(last),
+        None => t.ended,
+    };
     let new = redacted_lines(text, redactor);
     let lines = t.lines.iter().chain(&new).cloned().collect::<Vec<_>>();
     let lines = lines[lines.len().saturating_sub(OUTPUT_LINES)..].to_vec();
@@ -409,6 +432,7 @@ fn read_on(t: Tracked, redactor: Option<&dyn Redactor>) -> (Tracked, Vec<String>
         len,
         read_to,
         lines,
+        ended,
         ..t
     };
     (t, new)
@@ -611,6 +635,11 @@ impl Desk {
         &self.0.opts.sight
     }
 
+    /// [`SightOptions::shell_unseen`].
+    pub(super) fn shell_unseen(&self) -> chrono::Duration {
+        chrono::Duration::from_std(self.0.opts.sight.shell_unseen).unwrap_or_default()
+    }
+
     /// How many process listings the sampler has read.
     pub fn sight_reads(&self) -> u64 {
         self.0.sight.reads.load(Ordering::Relaxed)
@@ -725,7 +754,32 @@ impl Desk {
             let sample = self.sampled(d.prev.as_ref(), &d, table.as_deref()).await;
             samples.insert(d.id, sample);
         }
+        self.shells_ended(&samples);
         self.sight_keep(samples);
+    }
+
+    /// Ends each background shell whose own output says it ended.
+    fn shells_ended(&self, samples: &HashMap<Uuid, Sample>) {
+        samples.iter().for_each(|(id, s)| {
+            let ended: Vec<&str> = s
+                .shells
+                .iter()
+                .filter(|(_, t)| t.ended)
+                .map(|(shell, _)| shell.as_str())
+                .collect();
+            if !ended.is_empty() {
+                self.change(*id, |_, l| {
+                    if let Some(l) = l {
+                        let now = Utc::now();
+                        l.background = ended
+                            .iter()
+                            .fold(std::mem::take(&mut l.background), |b, shell| {
+                                b.ended(shell, now)
+                            });
+                    }
+                });
+            }
+        });
     }
 
     /// Keeps `samples`, drops those of sessions no longer sampled, and
@@ -1331,6 +1385,11 @@ mod tests {
         assert!(next.names.len() == 5 && next.born.iter().any(|(p, _)| *p == new));
     }
 
+    fn append_to(path: &Path, text: &str) {
+        let mut f = std::fs::File::options().append(true).open(path).unwrap();
+        std::io::Write::write_all(&mut f, text.as_bytes()).unwrap();
+    }
+
     #[test]
     fn a_task_file_is_read_on_from_where_it_was_left_in_whole_lines() {
         let dir = tempfile::tempdir().unwrap();
@@ -1340,8 +1399,7 @@ mod tests {
         let (t, new) = read_on(Tracked::from(path.clone(), 0), Some(r.as_ref()));
         assert_eq!(new, ["one", "key [secret]"]);
         assert_eq!((t.read_to, t.len), (19, 23));
-        let mut f = std::fs::File::options().append(true).open(&path).unwrap();
-        std::io::Write::write_all(&mut f, b"ial\rwaiting for one\n").unwrap();
+        append_to(&path, "ial\rwaiting for one\n");
         let (t, new) = read_on(t, Some(r.as_ref()));
         assert_eq!(new, ["partial", "waiting for one"]);
         assert_eq!(
@@ -1353,8 +1411,19 @@ mod tests {
         std::fs::write(&path, "again\n").unwrap();
         let (t, new) = read_on(t, Some(r.as_ref()));
         assert_eq!((new, t.read_to), (vec!["again".to_string()], 6));
-        let (_, bare) = read_on(Tracked::from(path.clone(), 0), None);
-        assert!(bare.is_empty(), "nothing is read without a redactor");
+        assert!(!t.ended);
+        append_to(&path, "done\n\n[exited with code 0]\n");
+        let (t, _) = read_on(t, Some(r.as_ref()));
+        assert!(t.ended, "Claude Code's last line says its command ended");
+        let (t, new) = read_on(t, Some(r.as_ref()));
+        assert!(t.ended && new.is_empty(), "and it stays ended");
+        let (bare, lines) = read_on(Tracked::from(path.clone(), 0), None);
+        assert!(lines.is_empty(), "nothing is read without a redactor");
+        assert!(bare.ended, "but its end is");
+        std::fs::write(&path, "[killed]\n").unwrap();
+        assert!(read_on(Tracked::from(path.clone(), 0), None).0.ended);
+        std::fs::write(&path, "echo [exited with code 0] means done\n").unwrap();
+        assert!(!read_on(Tracked::from(path.clone(), 0), None).0.ended);
         let big = dir.path().join("b2.output");
         let text = format!("{}\nlast\n", "x".repeat(TASK_TAIL as usize));
         std::fs::write(&big, text).unwrap();

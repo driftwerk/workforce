@@ -3121,6 +3121,7 @@ impl Desk {
 
     /// Records what of `due`'s background work `table` lists running.
     fn background_looked<P: AsRef<procs::Proc>>(&self, due: Vec<(Uuid, Look)>, table: &[P]) {
+        let unseen = self.shell_unseen();
         for (id, look) in due {
             let running = Self::running(table, &look);
             let now = Utc::now();
@@ -3128,7 +3129,10 @@ impl Desk {
                 let st = self.0.state.lock();
                 st.live
                     .get(&id)
-                    .map(|l| (l.background.clone().looked(running, now), &l.background))
+                    .map(|l| {
+                        let after = l.background.clone().looked(running, now, unseen);
+                        (after, &l.background)
+                    })
                     .filter(|(after, before)| after != *before)
                     .map(|(after, _)| after)
             };
@@ -7042,6 +7046,7 @@ impl Desk {
                 .is_none_or(|s| !crate::limit::says_plan_limit(s));
         let reader = unsure.then(|| self.reader()).flatten();
         let running = self.running_now(id).await;
+        let unseen = self.shell_unseen();
         // A refusal whose words aren't the plan's, on an account whose
         // readings show a window full: the plan's limit after all.
         let failure = failure.map(|f| self.cross_checked(id, f));
@@ -7120,7 +7125,7 @@ impl Desk {
                     (true, None) => std::mem::take(&mut l.background),
                     (_, background) => std::mem::take(&mut l.background).reported(background, now),
                 }
-                .looked_if(running, now);
+                .looked_if(running, now, unseen);
             }
         });
         if let (Some(reader), Some(end), Some(reply)) = (reader, read, said_whole) {
@@ -7991,6 +7996,7 @@ impl Desk {
                 CodexEvent::Idle => self.running_now(id).await,
                 _ => None,
             };
+            let unseen = self.shell_unseen();
             let tail = match &event {
                 CodexEvent::Idle => {
                     let rollout = self
@@ -8110,8 +8116,11 @@ impl Desk {
                             l.pending = None;
                             l.codex_asks.clear();
                             l.codex_question = None;
-                            l.background =
-                                std::mem::take(&mut l.background).looked_if(running, Utc::now());
+                            l.background = std::mem::take(&mut l.background).looked_if(
+                                running,
+                                Utc::now(),
+                                unseen,
+                            );
                         }
                     }
                     CodexEvent::Prompt(p) => {
@@ -10339,7 +10348,13 @@ mod tests {
             let logged = Arc::new(Logged::default());
             let d = Desk::start(
                 DeskStore::from_pool(pool),
-                options(dir.path()).with_program(Engine::Claude, shell_cli(dir.path())),
+                Options {
+                    sight: SightOptions {
+                        shell_unseen: Duration::ZERO,
+                        ..SightOptions::default()
+                    },
+                    ..options(dir.path()).with_program(Engine::Claude, shell_cli(dir.path()))
+                },
                 Floor {
                     turns: Some(logged.clone()),
                     plans: None,
