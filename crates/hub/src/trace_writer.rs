@@ -615,9 +615,10 @@ mod tests {
         let writer = JsonlTraceWriter::new(base.path(), "kat").unwrap();
         let linear = || ("linear.issue_get", serde_json::json!("DW-1"));
         let bank = || ("bank.transactions", serde_json::json!("£12.30 at Tesco"));
+        let (ann, bob) = ([linear(), bank(), linear()], [linear(), linear()]);
         tokio::join!(
-            run(&writer, "ann-banks", false, &[linear(), bank(), linear()]),
-            run(&writer, "bob", false, &[linear(), linear()]),
+            run(&writer, "ann-banks", false, &ann),
+            run(&writer, "bob", false, &bob),
         );
         run(&writer, "ann-later", true, &[linear()]).await;
         run(
