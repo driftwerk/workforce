@@ -151,15 +151,17 @@ async fn a_wait_that_has_lasted_shows_on_the_overview_and_none_shows_otherwise()
         assert_eq!(seen.reading.kind, Kind::Waits(Wait::Queue));
         let v = d.view(s.id).unwrap();
         assert_eq!(v.waits.as_ref().unwrap().words, "waiting for a build slot");
+        let tool = v.current_tool.clone().unwrap();
+        assert!(tool.starts_with("Bash"), "{tool}");
         let detail = crate::overview::session_item_of(&v).detail.unwrap();
         assert!(
-            detail.starts_with("● Bash · waiting for a build slot, "),
+            detail.starts_with(&format!("● {tool} · waiting for a build slot, ")),
             "{detail}"
         );
         let plain = SessionView { waits: None, ..v };
         assert_eq!(
-            crate::overview::session_item_of(&plain).detail.as_deref(),
-            Some("● Bash")
+            crate::overview::session_item_of(&plain).detail,
+            Some(format!("● {tool}"))
         );
         kill_work(&seen);
     })
