@@ -3144,7 +3144,7 @@ fn compares_names(args: &[&Word], simple: &Simple) -> bool {
             || !w.dynamic && {
                 let t = w.text.strip_prefix(['-', '+']).unwrap_or(&w.text);
                 (!t.is_empty() && t.chars().all(|c| c.is_ascii_digit()))
-                    || simple.ints.iter().any(|n| *n == w.text)
+                    || simple.ints.contains(&w.text)
             }
     };
     args.iter().any(|w| subscripted(w))
