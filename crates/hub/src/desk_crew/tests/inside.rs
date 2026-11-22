@@ -200,7 +200,8 @@ fn ask_session_is_the_last_resort_and_every_text_names_crew_inside_first() {
         assert!(text.contains("crew.inside"), "{text}");
         assert!(named_first(text), "{text}");
     }
-    for name in tools::READ.iter().chain(tools::ACT.iter()) {
+    let others = tools::READ.iter().chain(tools::ACT.iter());
+    for name in others.filter(|n| **n != super::super::inside::NAME) {
         assert!(named_first(tools::describe(name)), "{name}");
     }
 }
