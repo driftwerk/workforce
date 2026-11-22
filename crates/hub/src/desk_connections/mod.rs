@@ -34,8 +34,8 @@
 //! Requests are the person's own, through their paired device, and only the
 //! person whose hub this is may make them.
 
-pub mod approvals;
 pub mod app;
+pub mod approvals;
 pub mod catalog;
 pub mod check;
 pub mod gh;
