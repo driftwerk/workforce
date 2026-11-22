@@ -540,22 +540,54 @@ impl CrewHub {
                 return Some("Its tickets couldn't be read, so it stays open for now.".into());
             }
         }
-        let pulls = self.pulls_of(&service, v).await;
-        if let Some((n, _)) = pulls
-            .iter()
-            .find(|(_, p)| p.as_ref().is_some_and(|p| p.open))
-        {
+        let (open, kept) = self.left_behind(&service, v).await;
+        if let Some(n) = open.first() {
             return Some(format!(
                 "Its PR #{n} is still open: it stays open until that's merged or closed."
             ));
         }
+        kept.map(|kept| format!("It stays open ({kept}): nothing is closed that would lose work."))
+    }
+
+    /// What closing `v` leaves behind, read as `service`: its pull requests
+    /// still open, and why its folder keeps it open ([`held`]), its merged
+    /// ones' heads counting as pushed.
+    pub(super) async fn left_behind(
+        &self,
+        service: &Arc<AgentService>,
+        v: &SessionView,
+    ) -> (Vec<u64>, Option<String>) {
+        let pulls = self.pulls_of(service, v).await;
+        let open = pulls
+            .iter()
+            .filter(|(_, p)| p.as_ref().is_some_and(|p| p.open))
+            .map(|(n, _)| *n)
+            .collect();
         let merged: Vec<String> = pulls
             .iter()
             .filter_map(|(_, p)| p.as_ref().filter(|p| p.merged))
             .filter_map(|p| p.head.clone())
             .collect();
-        held(&folder(&v.cwd).await, &merged)
-            .map(|kept| format!("It stays open ({kept}): nothing is closed that would lose work."))
+        (open, held(&folder(&v.cwd).await, &merged))
+    }
+
+    /// What closing `v` would leave, as the person reads it before they
+    /// close it: `known`, with its open pull requests (read as the overseer
+    /// of its scope, when it has one) and its folder's work.
+    pub(super) async fn what_closing_leaves(
+        &self,
+        v: &SessionView,
+        known: workforce_desk::Closing,
+    ) -> workforce_desk::Closing {
+        let (pulls, changes) = match self.overseer_of_session(v.id) {
+            Some((service, _)) => self.left_behind(&service, v).await,
+            None => (Vec::new(), held(&folder(&v.cwd).await, &[])),
+        };
+        workforce_desk::Closing {
+            pulls,
+            changes,
+            ..known
+        }
     }
 
     /// Notes `s` for `boss`'s next update, once for `session` and `what`.

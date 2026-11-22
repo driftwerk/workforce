@@ -1199,47 +1199,13 @@ mod tests {
     const ACCESS_ID: &str = "test-client-id.access";
     const ACCESS_SECRET: &str = "not-a-real-access-secret";
 
-    #[derive(Clone, Default)]
-    struct Logs(Arc<std::sync::Mutex<Vec<u8>>>);
+    use crate::adapters::test_support::Logs;
 
-    impl std::io::Write for Logs {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            self.0.lock().unwrap().extend_from_slice(buf);
-            Ok(buf.len())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-
-    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Logs {
-        type Writer = Logs;
-        fn make_writer(&'a self) -> Logs {
-            self.clone()
-        }
-    }
-
-    impl Logs {
-        fn capture() -> (Self, tracing::subscriber::DefaultGuard) {
-            let logs = Self::default();
-            let subscriber = tracing_subscriber::fmt()
-                .with_writer(logs.clone())
-                .with_ansi(false)
-                .with_max_level(tracing::Level::TRACE)
-                .finish();
-            (logs, tracing::subscriber::set_default(subscriber))
-        }
-
-        fn text(&self) -> String {
-            String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
-        }
-
-        fn warnings(&self) -> usize {
-            self.text()
-                .lines()
-                .filter(|line| line.contains("Cloudflare Access headers not sent"))
-                .count()
-        }
+    fn warnings(logs: &Logs) -> usize {
+        logs.text()
+            .lines()
+            .filter(|line| line.contains("Cloudflare Access headers not sent"))
+            .count()
     }
 
     async fn sent_headers(
@@ -1314,7 +1280,7 @@ mod tests {
             client.get("/user/current", &[]).await.unwrap();
             assert_eq!(has_access_headers(&headers), (false, false), "{missing}");
             assert!(logs.text().contains(missing), "{}", logs.text());
-            assert_eq!(logs.warnings(), 1, "warned once: {}", logs.text());
+            assert_eq!(warnings(&logs), 1, "warned once: {}", logs.text());
             assert!(!logs.text().contains(ACCESS_SECRET), "{}", logs.text());
         }
     }
@@ -1465,7 +1431,7 @@ mod tests {
             "{}",
             logs.text()
         );
-        assert_eq!(logs.warnings(), 1, "warned once: {}", logs.text());
+        assert_eq!(warnings(&logs), 1, "warned once: {}", logs.text());
         assert!(!logs.text().contains(ACCESS_SECRET));
     }
 
@@ -1506,7 +1472,7 @@ mod tests {
         client.build_request().unwrap();
         assert_eq!(has_access_headers(&headers), (false, false));
         assert!(logs.text().contains("access_client_secret is not set"));
-        assert_eq!(logs.warnings(), 1, "warned once: {}", logs.text());
+        assert_eq!(warnings(&logs), 1, "warned once: {}", logs.text());
     }
 
     #[tokio::test]

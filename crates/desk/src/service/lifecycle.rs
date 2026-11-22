@@ -15,6 +15,7 @@ use uuid::Uuid;
 
 use super::{Desk, DeskError, Persist, State};
 use crate::adopt;
+use crate::board::TicketState;
 use crate::codex;
 use crate::crew::{By, Kind, Party};
 use crate::memory_store::Memory;
@@ -31,6 +32,19 @@ pub struct Hidden {
     pub name: String,
     pub cwd: String,
     pub hidden_at: DateTime<Utc>,
+}
+
+/// What closing a session would leave, as the person reads it before they
+/// close it: its turn under way or what it asks, its folder's uncommitted
+/// or unpushed work, its open pull requests and tickets, and its folder.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Closing {
+    pub folder: String,
+    pub work: Option<String>,
+    pub changes: Option<String>,
+    pub pulls: Vec<u64>,
+    pub tickets: Vec<String>,
 }
 
 /// How a session is removed.
@@ -726,6 +740,90 @@ impl Desk {
     /// person, or the boss that started it or was handed it.
     pub fn may_end(&self, id: Uuid, by: Option<&By>) -> bool {
         super::finish::may_end(by, self.charge_of(id).as_ref())
+    }
+
+    /// What closing session `id` would leave ([`Closing`]): what Desk knows
+    /// of it here, and what the hub's crew reads of its folder and pull
+    /// requests, as its boss's own close reads them.
+    pub async fn closing(&self, id: Uuid) -> Result<Closing, DeskError> {
+        let v = self.view(id)?;
+        let waits = v.pending.is_some()
+            || v.asked.is_some()
+            || matches!(v.state, SessionState::Asking | SessionState::Blocked);
+        let work = match v.state {
+            _ if waits => Some("it's waiting on you"),
+            SessionState::Starting | SessionState::Working => Some("it's working"),
+            _ => None,
+        };
+        let open: Vec<_> = self
+            .0
+            .store
+            .session_tickets(id)
+            .await
+            .map_err(|e| DeskError::Internal(e.wrap_err("reading a session's tickets")))?
+            .into_iter()
+            .filter(|t| !matches!(t.state, TicketState::Done | TicketState::Dropped))
+            .collect();
+        let tickets = futures::future::try_join_all(open.iter().map(|t| self.key_of(t))).await?;
+        let known = Closing {
+            folder: v.cwd.clone(),
+            work: work.map(str::to_string),
+            tickets,
+            ..Closing::default()
+        };
+        Ok(match self.crew() {
+            Some(crew) => crew.closing(&v, known).await,
+            None => known,
+        })
+    }
+
+    /// Which of the sessions `ids` were closed or removed here: not one
+    /// open, and closed or no longer known to the store. Only those in a
+    /// group `sees` lets the asker see are said: a closed one in its group
+    /// in the sidebar, a removed one in the group its boss's close kept
+    /// ([`KeptSession::group`]), else in none.
+    pub async fn closed_among(
+        &self,
+        ids: &[Uuid],
+        sees: impl Fn(Option<&str>) -> bool,
+    ) -> Result<Vec<Uuid>, DeskError> {
+        let mut states = Vec::with_capacity(ids.len());
+        for &id in ids {
+            let state = match self.view(id) {
+                Ok(v) => Some(v.state),
+                Err(_) => self
+                    .0
+                    .store
+                    .get(id)
+                    .await
+                    .map_err(|e| DeskError::Internal(e.wrap_err("reading a session")))?
+                    .map(|r| r.state),
+            };
+            states.push((id, state));
+        }
+        let gone: Vec<Uuid> = states
+            .iter()
+            .filter(|(_, s)| s.is_none())
+            .map(|&(id, _)| id)
+            .collect();
+        let removed = self
+            .0
+            .store
+            .removed_groups(&gone)
+            .await
+            .map_err(|e| DeskError::Internal(e.wrap_err("reading removed sessions' groups")))?;
+        let layout = self.layout();
+        Ok(states
+            .into_iter()
+            .filter(|(id, state)| match state {
+                None => sees(removed.get(id).and_then(Option::as_deref)),
+                Some(s) => {
+                    *s == SessionState::Closed
+                        && sees(crate::scope::group_of(&super::session_item(*id), &layout))
+                }
+            })
+            .map(|(id, _)| id)
+            .collect())
     }
 
     /// Ends a session: stops it if it runs here and closes it, so it leaves

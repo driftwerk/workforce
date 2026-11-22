@@ -60,6 +60,17 @@ pub async fn freeagent_oauth_callback(
     State(state): State<Arc<GatewayState>>,
     Query(params): Query<CallbackParams>,
 ) -> Response {
+    // A sign-in Desk's Connections started is theirs to complete; any
+    // other goes on as it always has.
+    #[cfg(feature = "postgres")]
+    if let Some(done) = crate::desk_connections::app::callback(
+        params.state.as_deref(),
+        params.code.as_deref().filter(|_| params.error.is_none()),
+    )
+    .await
+    {
+        return done;
+    }
     let Some(vault) = state.vault.as_ref() else {
         return failure("Hub is not configured with a global vault");
     };
