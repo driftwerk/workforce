@@ -113,6 +113,13 @@ pub struct Step {
     pub label: String,
     pub state: StepState,
     pub note: Option<String>,
+    /// What to do on it, exactly: what the agent is told, and the card
+    /// shows when the step is the person's.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub instruction: Option<String>,
+    /// The page it is done on.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
 }
 
 /// How a setup gets its key.
@@ -127,6 +134,9 @@ pub enum Way {
     Browser,
     /// A token the person pasted on the card themselves.
     Token,
+    /// The person's own app, made in the browser where none is kept, then
+    /// approved on the service's sign-in page.
+    App,
 }
 
 /// What a setup's card asks of the person, or tells them, now: the one
@@ -142,6 +152,10 @@ pub enum NowKind {
     Code,
     /// The person signs in, in Desk's window.
     SignIn,
+    /// The person approves Desk on the service's sign-in page.
+    Approve,
+    /// A step of the app's the agent couldn't do: the person does it.
+    Step,
     Connected,
     Failed,
     /// Replaced by a newer setup of the same service, or cancelled.
@@ -161,14 +175,17 @@ pub struct Now {
     pub url: Option<String>,
     pub expires_at: Option<DateTime<Utc>>,
     /// The card's one button: `use_cli`, `open_code`, `show_page`,
-    /// `new_code`, `other_way` or `retry`.
+    /// `new_code`, `other_way`, `open_approve`, `open_step` or `retry`.
     pub action: Option<&'static str>,
-    /// A quiet second choice beside it: `other_way`.
+    /// A quiet second choice beside it: `other_way`, `done_step`.
     pub other: Option<&'static str>,
     /// GitHub: the person may paste a token they make themselves, on this
     /// page (GitHub's new fine-grained token, filled in with the least it
     /// needs). The token goes from the card straight to the hub.
     pub paste: Option<String>,
+    /// The person may paste their app's id and secret here: the step that
+    /// keeps them is theirs.
+    pub app_paste: bool,
 }
 
 /// GitHub's device sign-in, as the card shows it.
@@ -313,7 +330,7 @@ fn browser_page(connector: &str, origin: &str) -> Option<browser_keys::KeyPage> 
 /// and Metabase's, whose address is each person's own, on any `http` or `https`
 /// origin. Nothing is registered later, so the registry never grows.
 pub fn register_key_pages() {
-    for service in ["jira", "linear", "github"] {
+    for service in ["jira", "linear", "github", "google", "freeagent"] {
         if let Some(r) = recipe(service) {
             for origin in (r.origins)(&BTreeMap::new()) {
                 if let Some(page) = browser_page(service, &origin) {
@@ -416,14 +433,194 @@ fn recipe(service: &str) -> Option<Recipe> {
             sign_in_label: "Sign in to GitHub",
             key_label: "Make a token and save it to the vault",
         },
+        "google" => Recipe {
+            page: |_| Some(GOOGLE_CONSOLE_CLIENTS.into()),
+            origins: |_| vec![GOOGLE_CONSOLE.into()],
+            paths: &["/auth/clients", "/apis/credentials"],
+            workspace_segment: false,
+            shaped: |field, v| app_shaped("google", field, v),
+            shape: r"[0-9]{6,20}-[0-9a-z]{32}\.apps\.googleusercontent\.com|GOCSPX-[A-Za-z0-9_-]{20,40}",
+            where_label: None,
+            page_label: "Open Google Cloud",
+            sign_in_label: "Sign in to Google",
+            key_label: "Save the client ID and secret to the vault",
+        },
+        "freeagent" => Recipe {
+            page: |_| Some(FREEAGENT_APPS.into()),
+            origins: |_| vec![FREEAGENT_DEV.into()],
+            paths: &["/apps"],
+            workspace_segment: false,
+            shaped: |field, v| app_shaped("freeagent", field, v),
+            shape: r"[A-Za-z0-9_-]{16,64}",
+            where_label: None,
+            page_label: "Open FreeAgent's Developer Dashboard",
+            sign_in_label: "Sign in to the FreeAgent Developer Dashboard",
+            key_label: "Save the OAuth identifier and secret to the vault",
+        },
         _ => return None,
     })
+}
+
+const GOOGLE_CONSOLE: &str = "https://console.cloud.google.com";
+const GOOGLE_CONSOLE_CLIENTS: &str = "https://console.cloud.google.com/auth/clients";
+const FREEAGENT_DEV: &str = "https://dev.freeagent.com";
+const FREEAGENT_APPS: &str = "https://dev.freeagent.com/apps";
+
+/// The keys a setup of the person's own app reads off its page.
+const APP_FIELDS: [&str; 2] = ["client_id", "client_secret"];
+
+/// Whether `v` is shaped like `field` of `service`'s app.
+fn app_shaped(service: &str, field: &str, v: &str) -> bool {
+    super::app::of(service).is_some_and(|app| app.field_shaped(field, v))
+}
+
+/// The keys a setup of `c` reads off its page: its app's, or its secret
+/// fields.
+fn secret_fields(c: &Connector) -> Vec<&'static str> {
+    match c.sign_in {
+        catalog::SignIn::App => APP_FIELDS.to_vec(),
+        _ => c
+            .fields
+            .iter()
+            .filter(|f| f.secret)
+            .map(|f| f.name)
+            .collect(),
+    }
+}
+
+/// The step the person does: what to do and where, in the hub's words,
+/// `<email>`, `<uri>` and `<name>` filled in when the card is shown.
+fn app_step(id: &'static str, label: &str, url: Option<&str>, instruction: &str) -> Step {
+    Step {
+        instruction: Some(instruction.to_string()),
+        url: url.map(str::to_string),
+        ..step(id, label)
+    }
+}
+
+/// The steps of a setup of the person's own app, from where it is.
+fn app_steps(service: &str, app: super::app::AppState, whose: &str) -> Vec<Step> {
+    use super::app::AppState;
+    let c = catalog::find(service).expect("an app's service is in the catalog");
+    let approve = step(
+        "approve",
+        &match service {
+            "freeagent" => "Approve Desk on FreeAgent as <name>".to_string(),
+            _ => format!("Approve Desk on {}", c.name),
+        },
+    );
+    let check = step(
+        "check",
+        &format!("Check it works, then turn it on for {whose}"),
+    );
+    let page = |url: &str| {
+        app_step(
+            "page",
+            recipe(service).map_or("Open the page", |r| r.page_label),
+            Some(url),
+            &format!("Open {url} with browser.navigate."),
+        )
+    };
+    let sign_in = || {
+        app_step(
+            "sign_in",
+            recipe(service).map_or("Sign in", |r| r.sign_in_label),
+            None,
+            match service {
+                "freeagent" => "Sign in to FreeAgent's Developer Dashboard in this window, or sign up there for free. Desk never reads or types your password.",
+                _ => "Sign in to Google in this window. Desk never reads or types your password.",
+            },
+        )
+    };
+    let key = || {
+        app_step(
+            "key",
+            recipe(service).map_or("Save the app's keys", |r| r.key_label),
+            None,
+            &match service {
+                "freeagent" => "On the app's page, read the OAuth identifier with browser.capture_key {connector: \"freeagent\", field: \"client_id\", selector: <the element showing it>}, then the OAuth secret with field: \"client_secret\" and its own element's selector. The two look alike, so Desk can't tell them apart on its own: give each one's selector from browser.snapshot. They never come back to you.".to_string(),
+                _ => "On the dialog that shows the new client, read the Client ID with browser.capture_key {connector: \"google\", field: \"client_id\"}, then the Client secret with field: \"client_secret\", each with no selector: Desk finds them, and they never come back to you.".to_string(),
+            },
+        )
+    };
+    let mut steps = match (service, app) {
+        (_, AppState::Ready) => vec![approve, check],
+        ("freeagent", AppState::Moved) => vec![
+            page(FREEAGENT_APPS),
+            sign_in(),
+            app_step(
+                "address",
+                "Add Desk's new address to your FreeAgent app",
+                Some(FREEAGENT_APPS),
+                "Open your Desk app on https://dev.freeagent.com/apps and click Edit. Add <uri> to its OAuth redirect URIs, keeping the ones there, then Save. Then call connections.keep {field: \"redirect_uri_added\", value: \"yes\"}.",
+            ),
+            approve,
+            check,
+        ],
+        ("freeagent", _) => vec![
+            page(FREEAGENT_APPS),
+            sign_in(),
+            app_step(
+                "make",
+                "Make Desk's FreeAgent app",
+                Some(FREEAGENT_APPS),
+                "Click Create New App. Name it \"Desk\", description \"Desk on this computer\", OAuth redirect URIs <uri>. For who may use the app, choose all FreeAgent users, so each business can approve it, and leave accountancy practices off. Then Create.",
+            ),
+            key(),
+            approve,
+            check,
+        ],
+        _ => vec![
+            page("https://console.cloud.google.com/projectcreate"),
+            sign_in(),
+            app_step(
+                "project",
+                "Make a Google Cloud project called Desk",
+                Some("https://console.cloud.google.com/projectcreate"),
+                "Name the project \"Desk\" and click Create. If a project called Desk is there already, pick it in the project picker instead. On a work (Google Workspace) account, leave Location set to the organisation.",
+            ),
+            app_step(
+                "apis",
+                "Turn on Calendar, Drive, Gmail, Sheets and Docs",
+                Some("https://console.cloud.google.com/apis/library/calendar-json.googleapis.com"),
+                "In the Desk project, open each of these and click Enable: https://console.cloud.google.com/apis/library/calendar-json.googleapis.com, https://console.cloud.google.com/apis/library/drive.googleapis.com, https://console.cloud.google.com/apis/library/gmail.googleapis.com, https://console.cloud.google.com/apis/library/sheets.googleapis.com and https://console.cloud.google.com/apis/library/docs.googleapis.com.",
+            ),
+            app_step(
+                "branding",
+                "Set up Desk's sign-in screen",
+                Some("https://console.cloud.google.com/auth/branding"),
+                "Open https://console.cloud.google.com/auth/branding and click Get started. App name \"Desk\", user support email <email>, then Next. Audience: Internal if it is offered (a work account), else External, then Next. Contact email <email>, then Next. Agree, then Create.",
+            ),
+            app_step(
+                "audience",
+                "Publish the app, so it keeps working",
+                Some("https://console.cloud.google.com/auth/audience"),
+                "If the audience is Internal, mark this step done. If it is External: first tell the person, in one line, that this keeps their own app working beyond 7 days, and that Google will call it unverified because only they use it. Then open https://console.cloud.google.com/auth/audience, click Publish app, then Confirm, so the status reads In production.",
+            ),
+            app_step(
+                "access",
+                "Add what Desk asks for",
+                Some("https://console.cloud.google.com/auth/scopes"),
+                "Open https://console.cloud.google.com/auth/scopes and click Add or remove scopes. Tick https://www.googleapis.com/auth/calendar, https://www.googleapis.com/auth/drive, https://mail.google.com/, https://www.googleapis.com/auth/userinfo.email and openid, click Update, then Save.",
+            ),
+            app_step(
+                "client",
+                "Make Desk's sign-in client",
+                Some("https://console.cloud.google.com/auth/clients/create"),
+                "Open https://console.cloud.google.com/auth/clients/create. Application type \"Desktop app\", name \"Desk\", then Create.",
+            ),
+            key(),
+            approve,
+            check,
+        ],
+    };
+    steps[0].state = StepState::Current;
+    steps
 }
 
 /// Why a service isn't one an agent sets up, and what the person does.
 fn by_hand(service: &str) -> &'static str {
     match service {
-        "google" => "Google is connected by the person: it needs their own OAuth client and their consent on Google's page. Ask them to use Settings → Connections → Google → Connect.",
         "email" => "Email is connected by the person: it takes an app password their provider shows only to them. Ask them to use Settings → Connections → Email → Connect.",
         "slack" => "Slack is connected by the person: it takes their Slack app's bot token. Ask them to use Settings → Connections → Slack → Connect.",
         _ => "Desk doesn't set that service up itself. Ask the person to connect it in Settings → Connections.",
@@ -466,6 +663,12 @@ struct Setup {
     /// The person said on its card they're signed in, where Desk didn't
     /// see it.
     said_signed_in: bool,
+    /// The person did a step of the app's on its card.
+    said_done: Option<&'static str>,
+    /// The service's sign-in page the person approves Desk on.
+    approve_url: Option<String>,
+    /// This hub's address the person's app redirects to.
+    redirect: Option<String>,
     ended: Option<Ended>,
     /// When the agent last asked for it: its start, or its asking again.
     asked_at: DateTime<Utc>,
@@ -541,6 +744,7 @@ impl Setup {
             action: None,
             other: None,
             paste: None,
+            app_paste: false,
         };
         let access = match self.write {
             true => "read and write",
@@ -594,7 +798,7 @@ impl Setup {
             let action = match self.way {
                 Way::Device => "new_code",
                 Way::Cli => "other_way",
-                Way::Browser => "retry",
+                Way::Browser | Way::App => "retry",
                 Way::Token => "paste_token",
             };
             return Now {
@@ -642,6 +846,55 @@ impl Setup {
                     format!("Checking {service} and turning it on for {}", self.whose),
                 ),
             },
+            Way::App if !self.finishing => {
+                let steps = self.filled_steps();
+                let waiting = steps
+                    .iter()
+                    .enumerate()
+                    .find(|(_, x)| x.state == StepState::Waiting);
+                match waiting {
+                    Some((_, x)) if x.id == "approve" => Now {
+                        detail: Some(match (service, self.named()) {
+                            ("Google", _) => "It's your own app, so Google may say it hasn't verified it: click Advanced, then Go to Desk. Desk carries on as soon as you allow it.".to_string(),
+                            (_, Some(name)) => format!("On {service}'s page, sign in as {name}, then approve. Desk carries on as soon as you do."),
+                            _ => "Desk carries on as soon as you approve.".to_string(),
+                        }),
+                        url: self.approve_url.clone(),
+                        action: Some("open_approve"),
+                        ..now(NowKind::Approve, format!("Approve Desk on {service}"))
+                    },
+                    Some((_, x)) if x.id == "sign_in" => Now {
+                        detail: x.instruction.clone(),
+                        action: Some("show_page"),
+                        ..now(NowKind::SignIn, x.label.clone())
+                    },
+                    Some((n, x)) => Now {
+                        detail: x.instruction.clone(),
+                        url: x.url.clone(),
+                        action: Some("open_step"),
+                        other: Some("done_step"),
+                        app_paste: x.id == "key",
+                        ..now(
+                            NowKind::Step,
+                            format!("Step {} of {}: {}", n + 1, steps.len(), x.label),
+                        )
+                    },
+                    None => Now {
+                        detail: steps
+                            .iter()
+                            .find(|x| x.state != StepState::Done)
+                            .map(|x| x.label.clone()),
+                        ..now(
+                            NowKind::Working,
+                            format!("Setting up {service} for {}", self.whose),
+                        )
+                    },
+                }
+            }
+            Way::App => now(
+                NowKind::Working,
+                format!("Checking {service} and turning it on for {}", self.whose),
+            ),
             _ => match self.steps.iter().find(|s| s.state == StepState::Waiting) {
                 Some(_) => Now {
                     detail: Some("Your password stays with you: Desk never reads or types it. It carries on by itself once you're in.".into()),
@@ -663,6 +916,38 @@ impl Setup {
         }
     }
 
+    /// The name the person gave it, where it isn't the service's own.
+    fn named(&self) -> Option<&str> {
+        let c = catalog::find(self.service)?;
+        (self.name != c.name).then_some(self.name.as_str())
+    }
+
+    /// Its steps, their words filled in: the account's email, this hub's
+    /// address and the connection's name.
+    fn filled_steps(&self) -> Vec<Step> {
+        let fill = |text: &str| {
+            text.replace(
+                "<email>",
+                self.fields
+                    .get("email")
+                    .map_or("your email address", String::as_str),
+            )
+            .replace(
+                "<uri>",
+                self.redirect.as_deref().unwrap_or("Desk's address"),
+            )
+            .replace("<name>", self.named().unwrap_or("your business"))
+        };
+        self.steps
+            .iter()
+            .map(|x| Step {
+                label: fill(&x.label),
+                instruction: x.instruction.as_deref().map(fill),
+                ..x.clone()
+            })
+            .collect()
+    }
+
     fn view(&self) -> SetupView {
         let c = catalog::find(self.service).expect("a setup's service is in the catalog");
         SetupView {
@@ -673,7 +958,7 @@ impl Setup {
             service_name: c.name,
             name: self.name.clone(),
             site: c.site.and_then(|s| self.fields.get(s).cloned()),
-            steps: self.steps.clone(),
+            steps: self.filled_steps(),
             started_at: self.started_at,
             asked_at: self.asked_at,
             connected: self.connected.clone(),
@@ -690,15 +975,19 @@ impl Setup {
     fn sync(&mut self, connections: &Connections) {
         let Some(flow) = &self.flow else { return };
         let state = connections.flow(&self.person, flow);
+        let service = catalog::find(self.service).map_or(self.service, |c| c.name);
         if self.connected.is_none() {
             let said = match &state {
-                Some(super::FlowState::Expired) => {
-                    Some("The code expired before it was approved.".to_string())
-                }
+                Some(super::FlowState::Expired) => Some(match self.way {
+                    Way::App => format!("{service}'s page wasn't approved in time."),
+                    _ => "The code expired before it was approved.".to_string(),
+                }),
                 Some(super::FlowState::Cancelled) => {
-                    Some("The sign-in was turned down on GitHub.".to_string())
+                    Some(format!("The sign-in was turned down on {service}."))
                 }
-                Some(super::FlowState::Failed { error }) => Some(format!("{error}.")),
+                Some(super::FlowState::Failed { error }) => {
+                    Some(format!("{}.", error.trim_end_matches('.')))
+                }
                 None => Some("The sign-in ended.".to_string()),
                 _ => None,
             };
@@ -898,7 +1187,7 @@ impl Setups {
     ) -> Result<SetupView, String> {
         self.check_caller(caller)?;
         let c = catalog::find(service)
-            .ok_or_else(|| format!("Desk has no connector {service}. It sets up: Jira, Linear, Datadog, Metabase and GitHub."))?;
+            .ok_or_else(|| format!("Desk has no connector {service}. It sets up: Jira, Linear, Datadog, Metabase, GitHub, Google and FreeAgent."))?;
         let Some(recipe) = recipe(c.id) else {
             return Err(by_hand(c.id).into());
         };
@@ -983,10 +1272,16 @@ impl Setups {
             "github" => self.connections.services.gh.login().await,
             _ => None,
         };
-        let way = match (c.id, &offer) {
-            ("github", Some(_)) => Way::Cli,
-            ("github", None) if self.connections.github_client_id.is_some() => Way::Device,
+        let app = self.connections.app_state(c);
+        let way = match (c.id, &offer, app) {
+            (_, _, Some(_)) => Way::App,
+            ("github", Some(_), _) => Way::Cli,
+            ("github", None, _) if self.connections.github_client_id.is_some() => Way::Device,
             _ => Way::Browser,
+        };
+        let steps = match app {
+            Some(app) => app_steps(c.id, app, &whose),
+            None => steps_for(way, &recipe, &whose, offer.as_ref()),
         };
         let id = uuid::Uuid::new_v4().simple().to_string();
         let setup = Setup {
@@ -999,7 +1294,7 @@ impl Setups {
             key,
             level,
             for_agent,
-            steps: steps_for(way, &recipe, &whose, offer.as_ref()),
+            steps,
             fields: BTreeMap::new(),
             secrets: BTreeMap::new(),
             way,
@@ -1012,6 +1307,9 @@ impl Setups {
             whose,
             finishing: false,
             said_signed_in: false,
+            said_done: None,
+            approve_url: None,
+            redirect: super::app::of(c.id).map(|a| a.redirect(&self.connections.gateway)),
             ended: None,
             asked_at: Utc::now(),
             read_at: None,
@@ -1039,6 +1337,13 @@ impl Setups {
         }
         if way == Way::Device {
             if let Err(e) = self.begin_device(caller, &id).await {
+                self.setups.lock().expect("setups poisoned").remove(&id);
+                return Err(e);
+            }
+        }
+        // The person's app is kept already: straight to approving it.
+        if way == Way::App {
+            if let Err(e) = self.advance(caller, &id).await {
                 self.setups.lock().expect("setups poisoned").remove(&id);
                 return Err(e);
             }
@@ -1131,7 +1436,6 @@ impl Setups {
                 return Err(e);
             }
         };
-        let flow = started.flow.clone();
         self.with(caller, id, |s| {
             s.flow = Some(started.flow.clone());
             s.flow_state = Some(super::FlowState::Waiting);
@@ -1151,6 +1455,13 @@ impl Setups {
             s.steps[0].state = StepState::Waiting;
             Ok(())
         })?;
+        self.watch_flow(caller, id, started.flow);
+        Ok(())
+    }
+
+    /// Watches sign-in `flow` of setup `id`: once the person approves it,
+    /// the hub checks the connection and turns it on itself.
+    fn watch_flow(self: &Arc<Self>, caller: &Caller, id: &str, flow: String) {
         let this = Arc::clone(self);
         let caller = caller.clone();
         let id = id.to_string();
@@ -1177,13 +1488,89 @@ impl Setups {
                 }
             }
         });
+    }
+
+    /// Moves setup `id` of the person's own app on, once every step before
+    /// approving is done: the app's id and secret, where they are held,
+    /// kept as the person's app, then the service's sign-in page opened
+    /// for the person to approve.
+    async fn advance(self: &Arc<Self>, caller: &Caller, id: &str) -> Result<(), String> {
+        let ready = self.with(caller, id, |s| {
+            Ok(s.way == Way::App
+                && s.flow.is_none()
+                && s.connected.is_none()
+                && s.steps.iter().any(|x| x.id == "approve")
+                && s.steps
+                    .iter()
+                    .take_while(|x| x.id != "approve")
+                    .all(|x| x.state == StepState::Done))
+        })?;
+        if !ready {
+            return Ok(());
+        }
+        let (service, app) = self.with(caller, id, |s| {
+            let app = match (s.secrets.get("client_id"), s.secrets.get("client_secret")) {
+                (Some(id), Some(secret)) => {
+                    Some((id.expose_secret().clone(), secret.expose_secret().clone()))
+                }
+                _ => None,
+            };
+            Ok((s.service, app))
+        })?;
+        let fail = |e: String| {
+            let note: String = e.chars().take(200).collect();
+            let _ = self.with(caller, id, |s| {
+                s.secrets.clear();
+                s.mark("check", StepState::Failed, Some(note));
+                Ok(())
+            });
+            e
+        };
+        if let Some((client_id, client_secret)) = app {
+            self.connections
+                .keep_app(&caller.person, service, &client_id, &client_secret)
+                .await
+                .map_err(|r| fail(refused(r)))?;
+            self.with(caller, id, |s| {
+                s.secrets.clear();
+                Ok(())
+            })?;
+        }
+        let (level, key, name) = self.with(caller, id, |s| {
+            Ok((
+                s.level.clone(),
+                s.key.clone(),
+                s.named().map(str::to_string),
+            ))
+        })?;
+        let c = catalog::find(service).expect("in the catalog");
+        let started = self
+            .connections
+            .begin_app(&caller.person, c, level, Some(key), name, false)
+            .map_err(|r| fail(refused(r)))?;
+        self.with(caller, id, |s| {
+            s.flow = Some(started.flow.clone());
+            s.flow_state = Some(super::FlowState::Waiting);
+            s.approve_url = started.url.clone();
+            s.mark("approve", StepState::Waiting, None);
+            Ok(())
+        })?;
+        self.watch_flow(caller, id, started.flow);
         Ok(())
     }
 
     /// Checks setup `id`'s connection, keeps it on a pass and turns it on
     /// for whom it is for: what the person's word on the card, or the key
     /// read off the page, starts. Once.
-    pub async fn finish(&self, caller: &Caller, id: &str) {
+    pub async fn finish(self: &Arc<Self>, caller: &Caller, id: &str) {
+        // The person's app's keys held: approving it is next.
+        if self
+            .with(caller, id, |s| Ok(s.way == Way::App && s.flow.is_none()))
+            .unwrap_or(false)
+        {
+            let _ = self.advance(caller, id).await;
+            return;
+        }
         let Ok((false, write)) = self.with(caller, id, |s| {
             let was = s.finishing;
             s.finishing = true;
@@ -1233,7 +1620,7 @@ impl Setups {
 
     /// The person said, on the card, to use the GitHub CLI's sign-in: its
     /// token is read now, checked, kept and turned on.
-    pub async fn use_cli(&self, person: &str, id: &str) -> Result<SetupView, String> {
+    pub async fn use_cli(self: &Arc<Self>, person: &str, id: &str) -> Result<SetupView, String> {
         let caller = self.caller_of(person, id).ok_or(GONE)?;
         let offered = self.with(&caller, id, |s| {
             Ok(s.way == Way::Cli && s.connected.is_none() && !s.finishing)
@@ -1271,7 +1658,7 @@ impl Setups {
     pub async fn other_way(self: &Arc<Self>, person: &str, id: &str) -> Result<SetupView, String> {
         let caller = self.caller_of(person, id).ok_or(GONE)?;
         let way = self.with(&caller, id, |s| {
-            if s.connected.is_some() || s.finishing || s.way == Way::Browser {
+            if s.connected.is_some() || s.finishing || matches!(s.way, Way::Browser | Way::App) {
                 return Ok(None);
             }
             let way = match (s.way, self.connections.github_client_id.is_some()) {
@@ -1308,7 +1695,7 @@ impl Setups {
     /// it goes no further than this, the vault and GitHub. Any other way
     /// under way stops; the token is checked, kept and turned on.
     pub async fn paste_token(
-        &self,
+        self: &Arc<Self>,
         person: &str,
         id: &str,
         token: Secret<String>,
@@ -1346,6 +1733,121 @@ impl Setups {
         self.with(&caller, id, |s| Ok(s.view()))
     }
 
+    /// The person pasted their own app's id and secret on setup `id`'s
+    /// card: they go no further than this, the vault and the service. Every
+    /// step before approving is theirs done, and approving is next.
+    pub async fn paste_app(
+        self: &Arc<Self>,
+        person: &str,
+        id: &str,
+        client_id: Secret<String>,
+        client_secret: Secret<String>,
+    ) -> Result<SetupView, String> {
+        let caller = self.caller_of(person, id).ok_or(GONE)?;
+        let (client_id, client_secret) = (
+            client_id.expose_secret().trim().to_string(),
+            client_secret.expose_secret().trim().to_string(),
+        );
+        let ok = self.with(&caller, id, |s| {
+            if s.way != Way::App || s.flow.is_some() || s.connected.is_some() || s.finishing {
+                return Ok(false);
+            }
+            let app = super::app::of(s.service).expect("an app's setup has an app");
+            if !app.shaped(&client_id, &client_secret) {
+                let c = catalog::find(s.service).expect("in the catalog");
+                return Err(format!(
+                    "That doesn't look like a {} app's id and secret.",
+                    c.name
+                ));
+            }
+            s.secrets.insert("client_id".into(), Secret::new(client_id));
+            s.secrets
+                .insert("client_secret".into(), Secret::new(client_secret));
+            let ids: Vec<&'static str> = s
+                .steps
+                .iter()
+                .map(|x| x.id)
+                .take_while(|x| *x != "approve")
+                .collect();
+            for step in ids {
+                s.mark(step, StepState::Done, None);
+            }
+            Ok(true)
+        })?;
+        if ok {
+            self.advance(&caller, id).await?;
+        }
+        self.with(&caller, id, |s| Ok(s.view()))
+    }
+
+    /// The person did, on setup `id`'s card, the step of the app's it
+    /// showed them: it is done, and the agent is told to go on. FreeAgent's
+    /// new address added is kept as the app's.
+    pub async fn done_step(self: &Arc<Self>, person: &str, id: &str) -> Result<SetupView, String> {
+        let caller = self.caller_of(person, id).ok_or(GONE)?;
+        let done = self.with(&caller, id, |s| {
+            let step = s
+                .steps
+                .iter()
+                .find(|x| {
+                    x.state == StepState::Waiting
+                        && !matches!(x.id, "sign_in" | "key" | "approve" | "check")
+                })
+                .map(|x| x.id);
+            if let Some(step) = step {
+                s.mark(step, StepState::Done, Some("You did this step".into()));
+                s.said_done = Some(step);
+            }
+            Ok(step.map(|step| (step, s.service)))
+        })?;
+        if let Some(("address", service)) = done {
+            let c = catalog::find(service).expect("in the catalog");
+            self.connections
+                .keep_app_address(person, c)
+                .map_err(refused)?;
+        }
+        self.advance(&caller, id).await?;
+        self.with(&caller, id, |s| Ok(s.view()))
+    }
+
+    /// What the agent does next on setup `id` of the person's own app, now
+    /// that nothing waits on the person: the step under way, exactly.
+    fn app_next(&self, view: &SetupView) -> Value {
+        let Some(x) = view.steps.iter().find(|x| x.state != StepState::Done) else {
+            return json!({ "next": "Call connections.wait: Desk checks it and turns it on itself." });
+        };
+        let todo = x.instruction.clone().unwrap_or_else(|| x.label.clone());
+        match x.id {
+            "key" => {
+                json!({ "step": x.id, "do": todo, "next": "Then call connections.wait: Desk keeps the app and asks the person to approve it." })
+            }
+            "approve" | "check" => {
+                json!({ "next": "Call connections.wait, and nothing else: Desk carries on by itself." })
+            }
+            _ => json!({
+                "step": x.id,
+                "do": todo,
+                "next": format!("Do this in your browser. Then call connections.step {{setup: \"{}\", step: \"{}\", state: \"done\"}} and connections.wait. If the page isn't as described, or a click fails twice, call connections.keep {{setup: \"{}\", field: \"stuck\", value: <what you saw>}}: the card shows the person this step, and connections.wait tells you once they've done it.", view.id, x.id, view.id),
+            }),
+        }
+    }
+
+    /// Whether the agent's tab shows the person signed in to setup `id`'s
+    /// service, for the person's own app: on its console (Google's) or its
+    /// apps (FreeAgent's), with no password asked. `None`: no tab.
+    async fn app_signed_in(&self, caller: &Caller, service: &str) -> Option<bool> {
+        let TabAt { url, password } = self.tabs.location(&caller.agent, &caller.person).await?;
+        let parsed = url::Url::parse(&url).ok()?;
+        let origin = workforce_skills::adapters::browser::origin_of(parsed.as_str());
+        let held = match service {
+            "freeagent" => {
+                origin.as_deref() == Some(FREEAGENT_DEV) && parsed.path().starts_with("/apps")
+            }
+            _ => origin.as_deref() == Some(GOOGLE_CONSOLE),
+        };
+        Some(held && !password)
+    }
+
     /// Waits, at most `most`, while setup `id` waits on the person: their
     /// word on its card, GitHub's code approved, or their signing in on the
     /// key page in the agent's tab, which is watched here. What the agent
@@ -1360,18 +1862,15 @@ impl Setups {
             .clamp(Duration::from_millis(5), Duration::from_secs(1));
         let mut shown = false;
         loop {
-            let (view, held, recipe_of, said) = self.with(caller, id, |s| {
+            let (view, held, recipe_of, said, did) = self.with(caller, id, |s| {
                 let c = catalog::find(s.service).expect("in the catalog");
-                let held = c
-                    .fields
-                    .iter()
-                    .filter(|f| f.secret)
-                    .all(|f| s.secrets.contains_key(f.name));
+                let held = secret_fields(c).iter().all(|f| s.secrets.contains_key(*f));
                 Ok((
                     s.view(),
                     held || s.finishing,
                     s.service,
                     std::mem::take(&mut s.said_signed_in),
+                    s.said_done.take(),
                 ))
             })?;
             match view.now.kind {
@@ -1396,6 +1895,65 @@ impl Setups {
                     }))
                 }
                 _ => {}
+            }
+            if let (Way::App, Some(step)) = (view.way, did) {
+                let mut next = self.app_next(&view);
+                next["did"] = json!(step);
+                next["said"] = json!("The person did that step themselves.");
+                return Ok(next);
+            }
+            if view.way == Way::App && view.connected.is_none() {
+                let waiting = view.steps.iter().find(|x| x.state == StepState::Waiting);
+                match waiting.map(|x| x.id) {
+                    Some("approve") => {}
+                    Some("sign_in") | None
+                        if view
+                            .steps
+                            .iter()
+                            .any(|x| x.id == "sign_in" && x.state != StepState::Done) =>
+                    {
+                        let page = recipe(recipe_of)
+                            .and_then(|r| (r.page)(&BTreeMap::new()))
+                            .unwrap_or_default();
+                        match self.app_signed_in(caller, recipe_of).await {
+                            None => {
+                                return Ok(
+                                    json!({ "next": format!("Desk's browser has no page open: open {} with browser.navigate, then call connections.wait.", view.steps.iter().find_map(|x| x.url.clone()).unwrap_or(page)) }),
+                                )
+                            }
+                            Some(true) => {
+                                self.with(caller, id, |s| {
+                                    s.mark("page", StepState::Done, None);
+                                    s.mark("sign_in", StepState::Done, None);
+                                    Ok(())
+                                })?;
+                                let view = self.with(caller, id, |s| Ok(s.view()))?;
+                                let mut next = self.app_next(&view);
+                                next["signedIn"] = json!(true);
+                                return Ok(next);
+                            }
+                            Some(false) => {
+                                if waiting.is_none() {
+                                    self.with(caller, id, |s| {
+                                        s.mark("page", StepState::Done, None);
+                                        s.mark("sign_in", StepState::Waiting, None);
+                                        Ok(())
+                                    })?;
+                                }
+                                if !shown {
+                                    shown = true;
+                                    self.tabs.show(&caller.agent).await;
+                                }
+                            }
+                        }
+                    }
+                    // A step the person is doing on the card.
+                    Some(_) => {}
+                    None if !view.steps.iter().any(|x| x.state == StepState::Failed) && !held => {
+                        return Ok(self.app_next(&view))
+                    }
+                    None => {}
+                }
             }
             if view.way == Way::Browser && !held && said {
                 return Ok(json!({
@@ -1484,11 +2042,19 @@ impl Setups {
                 }
             }
             if Instant::now() >= until {
-                return Ok(json!({
-                    "waiting": true,
-                    "on": view.now.title,
-                    "next": "Still waiting on the person. Call connections.wait again. Don't message them: the card says what to do.",
-                }));
+                return Ok(match view.now.kind {
+                    NowKind::Approve => json!({
+                        "waiting": true,
+                        "on": view.now.title,
+                        "approve": view.now.url,
+                        "next": "The card asks the person to approve Desk on the service's page. You may open that page in your tab with browser.navigate; they approve it themselves. Call connections.wait again, and don't message them meanwhile.",
+                    }),
+                    _ => json!({
+                        "waiting": true,
+                        "on": view.now.title,
+                        "next": "Still waiting on the person. Call connections.wait again. Don't message them: the card says what to do.",
+                    }),
+                });
             }
             tokio::time::sleep(every).await;
         }
@@ -1511,7 +2077,7 @@ impl Setups {
                     && !s.steps.iter().any(|x| x.state == StepState::Failed)
             })
             .find(|s| match s.way {
-                Way::Browser => recipe(s.service)
+                Way::Browser | Way::App => recipe(s.service)
                     .is_some_and(|r| (r.origins)(&s.fields).contains(&origin)),
                 // GitHub's own sign-in, or the CLI's: no browser at all.
                 Way::Cli | Way::Device | Way::Token => origin == "https://github.com",
@@ -1525,12 +2091,7 @@ impl Setups {
     /// where the person finds the setup's card.
     pub fn next(&self, view: &SetupView) -> String {
         let c = catalog::find(view.service).expect("in the catalog");
-        let secrets: Vec<&str> = c
-            .fields
-            .iter()
-            .filter(|f| f.secret)
-            .map(|f| f.name)
-            .collect();
+        let secrets = secret_fields(c);
         let plain: Vec<&str> = c
             .fields
             .iter()
@@ -1543,6 +2104,7 @@ impl Setups {
             Way::Device => return format!("The setup's card shows the person a code to approve on GitHub. {said} Then call connections.wait, and nothing else: Desk finishes by itself once they approve. Don't open a browser, read the code out or say anything more to the person."),
             Way::Browser => {}
             Way::Token => return format!("The person is pasting a token of their own on the setup's card. {said} Then call connections.wait, and nothing else."),
+            Way::App => return self.app_plan(view, &said),
         }
         let page = match view.service {
             "github" => github_token_page(&view.name, view.write),
@@ -1568,6 +2130,37 @@ impl Setups {
         )
     }
 
+    /// What the agent does for a setup of the person's own app: every step
+    /// it drives in their Chrome, in order, or only waiting on their
+    /// approval where the app is kept already.
+    fn app_plan(&self, view: &SetupView, said: &str) -> String {
+        if view.steps.first().is_some_and(|x| x.id == "approve") {
+            return format!("The person's {} app is set up already: the setup's card asks them to approve Desk on {}'s page. {said} Then call connections.wait, and nothing else: Desk finishes by itself once they approve.", view.service_name, view.service_name);
+        }
+        let steps: Vec<String> = view
+            .steps
+            .iter()
+            .filter(|x| !matches!(x.id, "approve" | "check"))
+            .enumerate()
+            .map(|(n, x)| {
+                format!(
+                    "{}. [{}] {}",
+                    n + 1,
+                    x.id,
+                    x.instruction.as_deref().unwrap_or(&x.label)
+                )
+            })
+            .collect();
+        format!(
+            "{said}\n\
+             You set up the person's own {service} app in their Chrome, through Desk's browser: Desk ships no app of its own. The person only signs in and approves; you do every other step. Keep the email they sign in with first with connections.keep {{field: \"email\"}} if you know it.\n\
+             {}\n\
+             After each step, call connections.step {{setup, step, state: \"done\"}}; call connections.wait whenever the person has something to do: it says what's next. Never call browser.sign_in, never type or read a password. If Chrome isn't connected, a page isn't as described, or a click fails twice, call connections.keep {{setup, field: \"stuck\", value: <what you saw>}}: the card then shows the person that step, exactly, and connections.wait tells you once it's done. Once the keys are held, Desk asks the person to approve on {service}'s page, then checks it and turns it on itself.",
+            steps.join("\n"),
+            service = view.service_name,
+        )
+    }
+
     pub fn step(
         &self,
         caller: &Caller,
@@ -1585,6 +2178,9 @@ impl Setups {
             if step == "check" && state == StepState::Done {
                 return Err("connections.test marks the check done.".into());
             }
+            if matches!(step, "approve" | "key" | "address") && s.way == Way::App {
+                return Err("Desk marks that step itself: read the keys with browser.capture_key, and the person approves on the service's page.".into());
+            }
             let note = note.map(|n| n.chars().take(200).collect::<String>());
             s.mark(step, state, note);
             Ok(s.view())
@@ -1600,6 +2196,9 @@ impl Setups {
     ) -> Result<SetupView, String> {
         self.with(caller, id, |s| {
             let c = catalog::find(s.service).expect("in the catalog");
+            if s.way == Way::App {
+                return self.keep_app_field(s, c, field, value);
+            }
             let f = c
                 .fields
                 .iter()
@@ -1657,6 +2256,69 @@ impl Setups {
         })
     }
 
+    /// [`Self::keep`] for a setup of the person's own app: the email they
+    /// sign in with, FreeAgent's new address added to their app, or that
+    /// the step under way is the person's (`stuck`, in the agent's words).
+    fn keep_app_field(
+        &self,
+        s: &mut Setup,
+        c: &Connector,
+        field: &str,
+        value: &str,
+    ) -> Result<SetupView, String> {
+        let value = value.trim();
+        if value.is_empty() || value.len() > MAX_FIELD || value.chars().any(char::is_control) {
+            return Err(format!("{field} should be one short line"));
+        }
+        match field {
+            "email" if value.contains('@') => {
+                s.fields.insert("email".into(), value.to_string());
+                if let Some(x) = s.steps.iter_mut().find(|x| x.id == "sign_in") {
+                    if !x.label.contains(" as ") {
+                        x.label = format!("{} as {value}", x.label);
+                    }
+                }
+            }
+            "email" => return Err("That isn't an email address".into()),
+            "redirect_uri_added" => {
+                if !s
+                    .steps
+                    .iter()
+                    .any(|x| x.id == "address" && x.state != StepState::Done)
+                {
+                    return Err("This setup has no address to add.".into());
+                }
+                self.connections
+                    .keep_app_address(&s.person, c)
+                    .map_err(refused)?;
+                s.mark("address", StepState::Done, None);
+            }
+            "stuck" => {
+                let step = s
+                    .steps
+                    .iter()
+                    .find(|x| {
+                        x.state != StepState::Done
+                            && !matches!(x.id, "sign_in" | "approve" | "check")
+                    })
+                    .map(|x| x.id)
+                    .ok_or("No step of this setup is the person's to do now.")?;
+                let note: String = super::scrub(value, &BTreeMap::new())
+                    .chars()
+                    .take(200)
+                    .collect();
+                s.mark(step, StepState::Waiting, Some(note));
+            }
+            _ => {
+                return Err(format!(
+                    "A {} setup keeps email, stuck or redirect_uri_added",
+                    c.name
+                ))
+            }
+        }
+        Ok(s.view())
+    }
+
     /// The setup `caller`'s conversation is running for `connector`, still
     /// waiting on a key: its id, as [`Self::with`] finds it.
     fn running(&self, caller: &Caller, connector: &str) -> Option<String> {
@@ -1671,7 +2333,8 @@ impl Setups {
                     && s.session == caller.session
                     && s.service == connector
                     && s.connected.is_none()
-                    && s.way == Way::Browser
+                    && matches!(s.way, Way::Browser | Way::App)
+                    && s.flow.is_none()
                     && s.ended.is_none()
             })
             .max_by_key(|s| s.started_at)
@@ -1700,11 +2363,9 @@ impl Setups {
                 origin,
                 paths: recipe.paths.to_vec(),
                 workspace_segment: recipe.workspace_segment,
-                fields: c
-                    .fields
-                    .iter()
-                    .filter(|f| f.secret && !s.secrets.contains_key(f.name))
-                    .map(|f| f.name)
+                fields: secret_fields(c)
+                    .into_iter()
+                    .filter(|f| !s.secrets.contains_key(*f))
                     .collect(),
             })
         })
@@ -1778,11 +2439,9 @@ impl Setups {
         }
         let c = catalog::find(connector).expect("in the catalog");
         let field = match field {
-            Some(f) => c
-                .fields
-                .iter()
-                .find(|x| x.name == f && x.secret)
-                .map(|x| x.name)
+            Some(f) => secret_fields(c)
+                .into_iter()
+                .find(|x| *x == f)
                 .ok_or_else(|| format!("{} has no key named {f}", c.name))?,
             // The first still to read that it is shaped for: Datadog's API
             // and application keys may be read in either order.
@@ -1820,15 +2479,30 @@ impl Setups {
         }
         let length = value.expose_secret().chars().count();
         let all = self.with(caller, &id, move |s| {
+            // An app's id and secret may be shaped alike: the same value
+            // read for both is neither.
+            if c.sign_in == catalog::SignIn::App
+                && s.secrets
+                    .iter()
+                    .any(|(k, v)| k != field && v.expose_secret() == value.expose_secret())
+            {
+                return Err(format!(
+                    "That's the value already kept as the app's {}, so nothing was kept. Read the {field} with browser.capture_key and field: \"{field}\".",
+                    APP_FIELDS.iter().find(|f| **f != field).unwrap_or(&field)
+                ));
+            }
             s.secrets.insert(field.to_string(), value);
             s.read_at = Some(page.origin.clone());
-            let all = c
-                .fields
-                .iter()
-                .filter(|f| f.secret)
-                .all(|f| s.secrets.contains_key(f.name));
+            let all = secret_fields(c).iter().all(|f| s.secrets.contains_key(*f));
             if all {
-                for step in ["page", "sign_in", "key"] {
+                // Everything before the keys is done once they are read.
+                let before: Vec<&'static str> = s
+                    .steps
+                    .iter()
+                    .map(|x| x.id)
+                    .take_while(|x| *x != "approve" && *x != "check")
+                    .collect();
+                for step in before {
                     s.mark(step, StepState::Done, None);
                 }
             }
@@ -1842,6 +2516,7 @@ impl Setups {
                     .unwrap_or_default();
                 format!("still needs {}", left.join(" and "))
             }
+            true if c.sign_in == catalog::SignIn::App => "kept: Desk keeps the person's app and asks them to approve it on the service's page. Call connections.wait.".to_string(),
             true => "kept: Desk checks it with the service and turns it on itself. Call connections.wait.".to_string(),
         };
         Ok(KeptKey {
@@ -1927,17 +2602,20 @@ impl Setups {
         let person = caller.person.clone();
         let (account, conn) = match flow {
             Some(flow) => match self.connections.flow(&person, &flow) {
+                // Where the sign-in ended: an account connected already is
+                // its own connection, signed in again.
                 Some(super::FlowState::Connected { account }) => (
                     account,
-                    Conn {
+                    self.connections.flow_conn(&flow).unwrap_or(Conn {
                         level: level.clone(),
                         key: key.clone(),
-                    },
+                    }),
                 ),
                 Some(super::FlowState::Waiting) => {
-                    return Err(
-                        "GitHub is still waiting for the person to approve the code.".into(),
-                    )
+                    return Err(format!(
+                        "{} is still waiting for the person to approve it.",
+                        catalog::find(service).map_or(service, |c| c.name)
+                    ))
                 }
                 other => {
                     let said = match other {
@@ -2262,6 +2940,19 @@ impl Setups {
         let Some(s) = setups.get(id) else {
             return UNKNOWN.into();
         };
+        if s.way == Way::App {
+            return match field {
+                Some("stuck") => "that the step under way is the person's to do".into(),
+                Some("redirect_uri_added") => {
+                    "that Desk's new address is on the person's FreeAgent app".into()
+                }
+                Some("email") => format!(
+                    "the email signed in with: {} characters",
+                    value.unwrap_or_default().chars().count()
+                ),
+                _ => UNKNOWN.into(),
+            };
+        }
         let Some(f) = catalog::find(s.service)
             .and_then(|c| c.fields.iter().find(|f| Some(f.name) == field && !f.secret))
         else {
@@ -2388,7 +3079,7 @@ fn steps_for(
         )),
         Way::Device => steps.push(step("sign_in", "Approve Desk on GitHub")),
         Way::Token => steps.push(step("key", "Paste a token you made on GitHub")),
-        Way::Browser => {
+        Way::Browser | Way::App => {
             if let Some(label) = recipe.where_label {
                 steps.push(step("where", label));
             }
@@ -2436,6 +3127,8 @@ fn step(id: &'static str, label: &str) -> Step {
         label: label.to_string(),
         state: StepState::Todo,
         note: None,
+        instruction: None,
+        url: None,
     }
 }
 
@@ -2499,6 +3192,7 @@ pub fn install(state: &Arc<crate::gateway::GatewayState>, connections: Arc<Conne
             post(signed_in_route),
         )
         .route("/api/desk/connection-setups/{id}/token", post(token_route))
+        .route("/api/desk/connection-setups/{id}/app", post(app_route))
         .route(
             "/api/desk/connection-setups/{id}/{choice}",
             post(choice_route),
@@ -2574,7 +3268,8 @@ async fn signed_in_route(
 }
 
 /// What the person chose on a setup's card: `use-cli` (the GitHub CLI's
-/// sign-in), `other-way`, or `new-code`. Theirs alone: no tool reaches it.
+/// sign-in), `other-way`, `new-code`, or `done-step` (a step of their own
+/// app's done). Theirs alone: no tool reaches it.
 async fn choice_route(
     State(r): State<Arc<Routes>>,
     h: HeaderMap,
@@ -2589,6 +3284,7 @@ async fn choice_route(
         "use-cli" => r.setups.use_cli(&person, &id).await,
         "other-way" => r.setups.other_way(&person, &id).await,
         "new-code" => r.setups.new_code(&person, &id).await,
+        "done-step" => r.setups.done_step(&person, &id).await,
         _ => {
             return (
                 StatusCode::NOT_FOUND,
@@ -2623,6 +3319,38 @@ async fn token_route(
         Err(refused) => return refused,
     };
     match r.setups.paste_token(&person, &id, token).await {
+        Ok(view) => Json(json!({ "setup": view })).into_response(),
+        Err(e) if e == GONE => (StatusCode::NOT_FOUND, Json(json!({ "error": e }))).into_response(),
+        Err(e) => (StatusCode::BAD_REQUEST, Json(json!({ "error": e }))).into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+struct AppBody {
+    client_id: String,
+    client_secret: String,
+}
+
+/// The person's own app's id and secret, pasted on a setup's card: theirs
+/// alone, from the card straight to the vault. Never logged, never in an
+/// answer.
+async fn app_route(
+    State(r): State<Arc<Routes>>,
+    h: HeaderMap,
+    Query(q): Query<ListQuery>,
+    Path(id): Path<String>,
+    Json(body): Json<AppBody>,
+) -> Response {
+    let (client_id, client_secret) = (Secret::new(body.client_id), Secret::new(body.client_secret));
+    let person = match holder(&r, &h, q.token.as_deref()).await {
+        Ok(person) => person,
+        Err(refused) => return refused,
+    };
+    match r
+        .setups
+        .paste_app(&person, &id, client_id, client_secret)
+        .await
+    {
         Ok(view) => Json(json!({ "setup": view })).into_response(),
         Err(e) if e == GONE => (StatusCode::NOT_FOUND, Json(json!({ "error": e }))).into_response(),
         Err(e) => (StatusCode::BAD_REQUEST, Json(json!({ "error": e }))).into_response(),
@@ -2685,10 +3413,10 @@ impl Tool for SetupTool {
     fn description(&self) -> &str {
         match self.name {
             "connections.list" => "The person's connections to services (Jira, Linear, GitHub, Datadog, Metabase, Email, Google, Slack) you can use: each by the name the person gave it, its site and account, whether it is for all their agents or just you, whether you use it, take writes with it, and which is your default. Never a key.",
-            "connections.step" => "Rarely needed: the setup's card follows the setup by itself. Marks a step `current`, `waiting` or `done`.",
-            "connections.wait" => "Wait while a setup waits on the person (using a sign-in on this computer, approving GitHub's code, signing in to the service in your browser): Desk sees when they have, and checks and turns the connection on itself. Returns what to do next. Call it again while it says it's still waiting; never message the person meanwhile, the card says what to do.",
-            "connections.setup" => "Start setting up a connection to a service yourself: Jira, Linear, Datadog, Metabase or GitHub. `name` is what the person calls it (Acme, Work). `for` is `me` (default), or, for the person's overseer only, `all` or another agent's name. `write` (default false) lets whom it is for make changes with it. Desk shows the person one card for it in this conversation, and turns it on itself once it works. Calling it again for the same connection returns the same setup. Returns the setup's id and what to do next. Google, Email and Slack the person connects themselves.",
-            "connections.keep" => "Keep a field of a setup that isn't a secret: a Jira site (acme.atlassian.net), a Metabase address (its https origin), a Datadog site (us1, eu1, …), an email. A key is read off its page with browser.capture_key instead, and once one is held nothing more is kept.",
+            "connections.step" => "Marks a step `current`, `waiting` or `done`. For Google and FreeAgent, mark each step of the person's app done as you finish it; otherwise rarely needed, as the card follows the setup by itself.",
+            "connections.wait" => "Wait while a setup waits on the person (using a sign-in on this computer, approving GitHub's code, signing in to the service in your browser, approving Desk on Google's or FreeAgent's page, doing a step on the card): Desk sees when they have, and checks and turns the connection on itself. Returns what to do next, exactly. Call it again while it says it's still waiting; never message the person meanwhile, the card says what to do.",
+            "connections.setup" => "Start setting up a connection to a service yourself: Jira, Linear, Datadog, Metabase, GitHub, Google (Calendar, Drive, Gmail) or FreeAgent. `name` is what the person calls it (Acme, Work; for FreeAgent, the business, like Harbor). Each Google account or FreeAgent business is its own connection: set up a second one with its own name. `for` is `me` (default), or, for the person's overseer only, `all` or another agent's name. `write` (default false) lets whom it is for make changes with it. Desk shows the person one card for it in this conversation, and turns it on itself once it works. For Google and FreeAgent you set up the person's own app in their Chrome first, where none is kept; the steps come back exactly. Calling it again for the same connection returns the same setup. Returns the setup's id and what to do next. Email and Slack the person connects themselves.",
+            "connections.keep" => "Keep a field of a setup that isn't a secret: a Jira site (acme.atlassian.net), a Metabase address (its https origin), a Datadog site (us1, eu1, …), an email. For Google or FreeAgent: `email` (the account the person signs in with), `redirect_uri_added` = yes once Desk's new address is on their FreeAgent app, or `stuck` = what you saw, when Chrome isn't connected, a page isn't as described or a click fails twice: the card then shows the person the step, exactly. A key is read off its page with browser.capture_key instead, and once one is held nothing more is kept.",
             "connections.test" => "Check the setup's keys with the service again, or finish GitHub's sign-in once the person approved its code. Only if it works are they kept, in the vault, for whom the setup is for. A failed check keeps nothing.",
             "connections.use" => "Turn a connection on for an agent: the setup's (`setup`), or one by `service` and `connection` (its name). `agent` is you by default; another agent only for the person's overseer. `write` (default false) lets it make changes; `default` makes it the one used when a request doesn't say.",
             _ => "",
@@ -2704,7 +3432,7 @@ impl Tool for SetupTool {
                 "type": "object",
                 "properties": {
                     "setup": setup,
-                    "step": { "type": "string", "description": "The step's id: where, page, sign_in, key or check" },
+                    "step": { "type": "string", "description": "The step's id: where, page, sign_in, key or check; for Google and FreeAgent also project, apis, branding, audience, access, client or make" },
                     "state": { "type": "string", "enum": ["current", "waiting", "done"] },
                     "note": { "type": "string", "description": "A few words for the person" }
                 },
@@ -2713,7 +3441,7 @@ impl Tool for SetupTool {
             "connections.setup" => json!({
                 "type": "object",
                 "properties": {
-                    "service": { "type": "string", "enum": ["jira", "linear", "datadog", "metabase", "github"] },
+                    "service": { "type": "string", "enum": ["jira", "linear", "datadog", "metabase", "github", "google", "freeagent"] },
                     "name": { "type": "string" },
                     "for": { "type": "string", "description": "me (default), all, or an agent's name" },
                     "write": { "type": "boolean", "description": "Whether whom it is for makes changes with it (default false)" }
@@ -2729,7 +3457,7 @@ impl Tool for SetupTool {
                 "type": "object",
                 "properties": {
                     "setup": setup,
-                    "field": { "type": "string", "description": "site, email, site_url" },
+                    "field": { "type": "string", "description": "site, email, site_url; for Google and FreeAgent: email, stuck or redirect_uri_added" },
                     "value": { "type": "string" }
                 },
                 "required": ["setup", "field", "value"]
@@ -2931,7 +3659,7 @@ impl Tool for SetupTool {
                     )
                     .map(|v| json!({ "steps": v.steps }))
             }),
-            "connections.keep" => need().and_then(|id| {
+            "connections.keep" => match need().and_then(|id| {
                 setups
                     .keep(
                         &caller,
@@ -2942,8 +3670,17 @@ impl Tool for SetupTool {
                             .and_then(Value::as_str)
                             .unwrap_or_default(),
                     )
-                    .map(|v| json!({ "steps": v.steps }))
-            }),
+                    .map(|_| id)
+            }) {
+                Err(e) => Err(e),
+                // FreeAgent's new address added: approving is next.
+                Ok(id) => match setups.advance(&caller, &id).await {
+                    Err(e) => Err(e),
+                    Ok(()) => setups
+                        .with(&caller, &id, |s| Ok(s.view()))
+                        .map(|v| json!({ "steps": v.steps, "now": v.now.title })),
+                },
+            },
             "connections.test" => match need() {
                 Err(e) => Err(e),
                 // Desk is already checking it, or has: not twice.
@@ -3004,11 +3741,13 @@ fn say_card(view: &SetupView) -> String {
     )
 }
 
-/// Registers `connections.*` for `service`.
+/// Registers `connections.*` for `service`, with Desk's browser they set
+/// connections up in and its documents folder ([`crate::desk_browser::equip`]).
 pub fn register(service: &crate::serve::AgentService) {
     for tool in SetupTool::all(service.agent_id.as_str()) {
         if !service.tools.has(tool.name) {
             service.tools.register(Arc::new(tool));
         }
     }
+    crate::desk_browser::equip(service);
 }

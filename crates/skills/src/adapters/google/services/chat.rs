@@ -8,7 +8,7 @@ use eyre::{Result, WrapErr};
 use serde_json::{json, Map, Value};
 use workforce_agent::tools::{SurfaceEffect, Tool};
 
-use crate::adapters::google::api::{GoogleApi, GoogleApiContext};
+use crate::adapters::google::api::{GoogleApi, GoogleApis};
 
 use crate::adapters::google::tool_helpers::{
     handler, object_schema, optional_str, optional_u64, props, required_str, sending_tool, tool,
@@ -25,7 +25,7 @@ fn chat_write(input: &Value, field: &str) -> SurfaceEffect {
     }
 }
 
-pub fn tools(ctx: Arc<GoogleApiContext>) -> Vec<Arc<dyn Tool>> {
+pub fn tools(ctx: Arc<GoogleApis>) -> Vec<Arc<dyn Tool>> {
     let mut out: Vec<Arc<dyn Tool>> = Vec::new();
 
     // ── spaces list ──────────────────────────────────────────────────────────

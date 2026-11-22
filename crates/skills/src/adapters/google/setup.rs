@@ -155,7 +155,7 @@ impl GoogleSetupTool {
                 "status": "authorized",
                 "workspace": workspace,
                 "email": tokens.email,
-                "message": "Google account authorized via loopback flow. Use the `account` parameter on any google.* tool to select this workspace."
+                "message": "Google account authorized via loopback flow. Use the `workspace` parameter on any google.* tool to select this workspace."
             }));
         }
 
