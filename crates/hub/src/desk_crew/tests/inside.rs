@@ -133,11 +133,7 @@ async fn every_facet_is_fenced_and_names_no_secret() {
             assert!(r.success, "{facet}: {r:?}");
             let out = r.output.to_string();
             assert!(!out.contains(SECRET), "{facet}: {out}");
-            let field = match facet {
-                "glance" => "glance",
-                f => f,
-            };
-            let said = r.output[field].as_str().unwrap();
+            let said = r.output[facet].as_str().unwrap();
             assert!(
                 said.starts_with("<<<EXTERNAL_UNTRUSTED_CONTENT_")
                     || facet == "processes" && !said.contains('<'),
