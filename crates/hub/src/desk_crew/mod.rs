@@ -46,6 +46,7 @@ mod github_seen;
 mod handover;
 mod held;
 mod idle;
+mod inside;
 mod items;
 mod line;
 mod logins;
@@ -272,6 +273,9 @@ pub struct CrewHub {
     /// What is known of the sessions' pull requests on GitHub
     /// ([`github_seen`]).
     github_seen: Mutex<github_seen::GithubSeen>,
+    /// The sessions' folders as git last read them for a glance
+    /// ([`inside`]), by folder.
+    workspaces: Mutex<HashMap<String, (workspace::Workspace, std::time::Instant)>>,
     /// How long a finished session rests before it is closed
     /// ([`closing::SETTLE`]; a test's own).
     close_settle: Mutex<chrono::Duration>,
@@ -784,6 +788,7 @@ impl CrewHub {
             quiet_made: Mutex::default(),
             closing: Mutex::default(),
             github_seen: Mutex::default(),
+            workspaces: Mutex::default(),
             close_settle: Mutex::new(closing::SETTLE),
             closing_now: tokio::sync::Mutex::new(()),
             dm_typing: Mutex::default(),

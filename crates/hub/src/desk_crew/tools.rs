@@ -27,11 +27,12 @@ use super::CrewHub;
 
 /// Every `crew.*` tool: the ones it has at every level first (its reads,
 /// and what it asks of the person, which is never gated).
-pub const READ: [&str; 27] = [
+pub const READ: [&str; 28] = [
     "crew.overview",
     LOGINS,
     "crew.activity",
     "crew.account",
+    super::inside::NAME,
     super::decisions::NAME,
     "crew.history",
     super::spend::NAME,
@@ -507,8 +508,9 @@ impl CrewTool {
                         .ok_or("Say which session: a session_id from crew.overview.")?,
                 )?;
                 crew.session_seen(id, seen)?;
-                self.account(crew, id, input["question"].as_str()).await
+                self.account(crew, b, id, input["question"].as_str()).await
             }
+            super::inside::NAME => crew.inside_tool(b, input).await,
             LOGINS => Ok(crew.logins_seen(seen)),
             super::spend::NAME => crew.spend(input, seen).await,
             super::assignments::LIST => {
@@ -574,10 +576,11 @@ impl CrewTool {
     /// Session `id`'s running account, brought up to date first when it is
     /// stale; with `question`, the answer its recent conversation gives.
     /// With no account (none yet, or none can be read): what crew.history
-    /// says of it.
+    /// says of it. While it runs, what Desk sees inside it as well.
     async fn account(
         &self,
         crew: &Arc<CrewHub>,
+        b: &Bound,
         id: uuid::Uuid,
         question: Option<&str>,
     ) -> Result<Value, String> {
@@ -618,6 +621,10 @@ impl CrewTool {
                 out
             }
         };
+        if v.live {
+            let g = crew.glance_of(&b.service, &v, &b.oversight).await;
+            out["inside"] = json!(crew.glance_said(&g));
+        }
         if let Some(q) = question.map(str::trim).filter(|q| !q.is_empty()) {
             use workforce_desk::AccountAnswer;
             out["answer"] = match crew.desk.account_question(id, q).await {
@@ -625,9 +632,7 @@ impl CrewTool {
                     &answer,
                     "an answer from the session's own conversation"
                 )),
-                Ok(AccountAnswer::NotInRecord) => json!(
-                    "Its account and recent conversation don't say. If it matters, ask the session (crew.ask_session, if you may act)."
-                ),
+                Ok(AccountAnswer::NotInRecord) => json!(NOT_IN_RECORD),
                 Ok(AccountAnswer::Unavailable) => json!(
                     "That couldn't be looked up just now (Desk's notes are thin today, or its model is busy): answer from the account, and say so."
                 ),
@@ -1063,12 +1068,20 @@ impl CrewTool {
     }
 }
 
+/// `crew.ask_session`: the last resort, after the boss looked itself.
+pub(super) const ASK_SESSION_DESCRIPTION: &str = "Last resort: ask a session (session_id) about its work, as Desk's status question on its line, without derailing it. Look first: crew.inside (its processes, transcript and workspace) and crew.account answer most questions now. One that is working gets the question only once its turn ends, so a session stuck in a long tool call (a build queue, a hung command) won't answer: look inside it instead. It asks for words only and never changes what the session does; to have it wait, hold or change course, tell it so with crew.nudge.";
+
+/// What crew.account says when a session's account and conversation don't
+/// answer the boss's question.
+pub(super) const NOT_IN_RECORD: &str = "Its account and recent conversation don't say. Search its transcript (crew.inside, facet transcript, query); ask the session (crew.ask_session) only if that can't answer.";
+
 /// What the `crew.*` tool `name` is for, as the agent reads it: this hub's
 /// own words, the same whether its crew is here or on a linked engine.
 pub(crate) fn describe(name: &str) -> &'static str {
     match name {
             "crew.overview" => "Everyone on the crew now: the person's agents and their Claude Code and Codex sessions, each with its state (needs you, working, quiet, done today, idle, failed, stopped), what it's doing, what it asks (with approval ids), since when, which of the person's logins it runs on (its Login), and whether you run it for the person (and whether they are driving it now). slots says how many of the sessions you run are starting or working, of the most you may run at once. For what sessions spent (tokens, cost), use crew.spend.",
             super::spend::NAME => super::spend::DESCRIPTION,
+            super::inside::NAME => super::inside::DESCRIPTION,
             super::github::PR | super::github::BRANCH | super::github::CI => {
                 super::github::describe(name)
             }
@@ -1105,7 +1118,7 @@ pub(crate) fn describe(name: &str) -> &'static str {
             super::watches::WATCHES => super::watches::WATCHES_DESCRIPTION,
             "crew.activity" => "What happened on the crew, newest first: turns started and finished, questions, requests, failures, and what you and the person did. Filter to one agent or session with subject_id.",
             "crew.account" => "What one session (session_id) is for, who asked, its plan, what it has done (with its PRs, tickets, commits and deploys), what it is doing now, what it waits on, what comes next and the choices it made: its running account, brought up to date first when it is stale, with the time it is as of. Read it before you say anything of a session. With question, also the answer its own recent conversation gives to something the account doesn't say (which key, which file, what error).",
-            "crew.ask_session" => "Ask a session (session_id) a question about its work, as Desk's status question on its line, without derailing it: one that is working gets it once its turn ends, never typed in over what it is doing. Use it only when crew.account, with a question, can't answer; then answer the person now from what you have and say you asked. It asks for words only and never changes what the session does: to have it wait, hold or change course, tell it so with crew.nudge.",
+            "crew.ask_session" => ASK_SESSION_DESCRIPTION,
             "crew.history" => "The recent messages of one agent's Desk DM with the person (agent_id), one session's last prompt, reply, pending request and terminal (session_id), or one message on a session's Desk line, whole (message_id: when what you were shown of it says it was cut short).",
             "crew.nudge" => "Send a short message to an agent's DM (agent_id) or to a session on its Desk line (session_id): a check-in, a hint, a correction. A session gets it once its turn ends, or, with urgent, with its next tool call's result (crew.interrupt stops a turn now). With reply_to (a question's message id), it is your answer to what that session asked you.",
             "crew.escalate" => "Give a question a session asked you on its Desk line to the person (message_id): say why in reason, offer answers in options, and draft one in draft if you can. Use it for anything that pushes, deletes, deploys, spends, sends to people or changes scope, and whenever you are unsure; at Act fully, only for what the person's own orders and preferences don't cover (they are the rule, both ways).",
@@ -1163,6 +1176,7 @@ pub(crate) fn schema(name: &str, engines: impl Fn() -> Vec<&'static str>) -> Val
         super::cadence_tool::NAME => super::cadence_tool::schema(),
         super::board::NAME => super::board::schema(),
         super::find::NAME => super::find::schema(),
+        super::inside::NAME => super::inside::schema(),
         super::tickets::READ => super::tickets::read_schema(),
         super::tickets::EDIT
         | super::tickets::COMMENT
@@ -1457,6 +1471,7 @@ mod tests {
                 LOGINS,
                 "crew.activity",
                 "crew.account",
+                super::super::inside::NAME,
                 super::super::decisions::NAME,
                 "crew.history",
                 super::super::spend::NAME,

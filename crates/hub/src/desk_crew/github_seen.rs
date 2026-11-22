@@ -127,10 +127,6 @@ pub(crate) struct Seen<T> {
 impl<T> Seen<T> {
     /// Why it is as of when it was read, in words, in `tz`; none when it
     /// was read now.
-    #[cfg_attr(
-        not(test),
-        allow(dead_code, reason = "crew.inside says it (DW-724, PR 4)")
-    )]
     pub(crate) fn note(&self, tz: &chrono_tz::Tz) -> Option<String> {
         let at = self.at.with_timezone(tz).format("%H:%M");
         self.held.map(|h| match h {
@@ -442,7 +438,6 @@ impl CrewHub {
 
     /// The pull request that is `branch`'s work on `repo`, as GitHub says,
     /// read as the person.
-    #[allow(dead_code, reason = "crew.inside reads it (DW-724, PR 4)")]
     pub(crate) async fn branch_pull(
         &self,
         service: &Arc<AgentService>,

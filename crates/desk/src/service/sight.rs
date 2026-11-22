@@ -23,7 +23,7 @@ use crate::procs::{self, Stat};
 use crate::sight::logs::{self, Logs};
 use crate::sight::procs::{self as sight_procs, Evidence};
 use crate::sight::transcript::{self, Budget, Call, Hit, Ranges};
-use crate::sight::{self, OpenCall, Reading};
+use crate::sight::{self, Glance, Growth, OpenCall, Reading};
 
 /// The most lines of output a sample keeps from each place it reads.
 const OUTPUT_LINES: usize = 20;
@@ -653,6 +653,44 @@ impl Desk {
             more,
             as_of: s.at,
         })
+    }
+
+    /// What Desk sees inside `v` from its last sample, reading nothing:
+    /// its folder and stall are for the caller to add.
+    pub fn glance(&self, v: &crate::model::SessionView) -> Glance {
+        let s = self.sample(v.id);
+        let s = s.as_ref();
+        let now = Utc::now();
+        let o = &self.0.opts.sight;
+        let lasted =
+            |from: DateTime<Utc>, to: DateTime<Utc>| (to - from).to_std().unwrap_or_default();
+        Glance {
+            reading: s.map_or_else(|| Reading::quiet(now), |s| s.reading.clone()),
+            open_call: s.and_then(|s| s.open_call.clone()),
+            transcript: s.filter(|s| s.record_count > 0).map(|s| Growth {
+                grew_at: s.grew_at,
+                records: s.record_count,
+            }),
+            cpu_active_at: s.filter(|s| s.listed).map(|s| s.active_at),
+            output_at: s.filter(|s| !s.output.is_empty()).map(|s| s.output_at),
+            output: s.and_then(|s| s.output.last().cloned()),
+            background: v.waiting_on(),
+            settled: s.is_some_and(|s| lasted(s.first_at, s.at) >= o.settled),
+            since: v.updated_at,
+            as_of: s.map(|s| s.at),
+            aged: s.is_some_and(|s| lasted(s.at, now) >= o.fresh),
+            workspace: None,
+            stall: None,
+        }
+    }
+
+    /// `text` with its secrets hidden; none where they can't be.
+    pub fn redact(&self, text: &str) -> Option<String> {
+        self.0
+            .ledger
+            .redactor
+            .as_ref()
+            .map(|r| r.stored(text).text.into_owned())
     }
 
     /// A session's sampled wait, for [`Self::view_of`].

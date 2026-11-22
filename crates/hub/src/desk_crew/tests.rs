@@ -1995,6 +1995,7 @@ mod assignments;
 mod terminal_asks;
 
 mod idle;
+mod inside;
 
 mod closing;
 

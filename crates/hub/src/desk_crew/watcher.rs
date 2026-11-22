@@ -311,7 +311,7 @@ pub(super) const OWN_WORK_SESSIONS_ONLY: &str = "Your “How it works” setting
 pub(super) const OWN_WORK_PREFER: &str = "Your “How it works” setting is Prefer sessions: code changes, builds and long tasks go to a session (crew.start_session, which may only suggest one); checks, lookups and ops (ssh to one of their machines, gh, reading files and logs, a quick command) you run yourself.";
 
 /// What every DM turn of a boss is told before it speaks of a session.
-pub(super) const CHECK_FIRST: &str = "Before you say anything about a session, read its account with crew.account; never guess. Answer as Done / Now / Next / Waiting on, from the account, and say how fresh it is if it's over a few minutes old.";
+pub(super) const CHECK_FIRST: &str = "Before you say anything about a session, look at it yourself: crew.inside shows what it is doing from evidence, crew.account its account; never guess. Answer as Done / Now / Next / Waiting on, from the account, and say how fresh it is if it's over a few minutes old.";
 
 impl CrewHub {
     /// Keeps tools, summaries and the one-overseer-per-scope rule in step
