@@ -404,6 +404,13 @@ async fn a_session_kept_out_of_desk_is_read_but_shows_none_of_its_lines() {
         assert!(seen.output.is_empty(), "{:?}", seen.output);
         let call = seen.open_call.as_ref().unwrap();
         assert_eq!((call.tool.as_str(), call.input.as_str()), ("Bash", ""));
+        let g = d.glance(&d.view(s.id).unwrap());
+        let shown = g.render(chrono_tz::UTC, chrono::Utc::now());
+        assert!(g.output.is_none(), "{shown}");
+        assert!(
+            !shown.contains("printed") && !shown.contains("SECRET"),
+            "{shown}"
+        );
         kill_work(&seen);
     })
     .await;
