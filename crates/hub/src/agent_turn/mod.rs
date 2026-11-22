@@ -676,6 +676,8 @@ impl TurnChain {
         .await;
         // A conversation that read the person's bank keeps nothing of any
         // turn of it ([`workforce_agent::personal`]), from its first call.
+        // The routes are boxed before the layers nest them, which would
+        // otherwise overflow a worker thread's stack.
         let read_personal = turn.session.read_personal();
         let routes = Box::pin(workforce_agent::personal::scoped(
             read_personal,
@@ -683,7 +685,7 @@ impl TurnChain {
                 Some(keeps),
                 workforce_agent::runner::with_content_guard(
                     Some(Arc::clone(&guard)),
-                    self.run_routes(service, turn),
+                    Box::pin(self.run_routes(service, turn)),
                 ),
             ),
         ));
