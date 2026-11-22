@@ -1668,13 +1668,14 @@ impl Desk {
         )
         .await;
         // What it asked its boss and still waits on is the person's now: no
-        // boss answers it. So too when Desk lets a served boss go (its grant
-        // no longer live): its home can't answer it any more.
+        // boss answers it. So too when a served boss is let go, by Desk (its
+        // grant no longer live) or by itself: its home answers it no more.
         let why = match by.party.kind {
             PartyKind::You => Some("You took this session back, so its question is yours."),
             PartyKind::Desk if served => {
                 Some("Its boss no longer runs this session, so its question is yours.")
             }
+            _ if served => Some("Its boss let this session go, so its question is yours."),
             _ => None,
         };
         if let Some(why) = why {
