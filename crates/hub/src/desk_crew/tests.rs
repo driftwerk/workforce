@@ -1806,13 +1806,13 @@ async fn what_the_crew_tools_read_is_fenced_as_data() {
                 read("crew.account", json!({"session_id": s.id.to_string()})).await,
             ),
         ] {
-            let opens = out.find("<<<EXTERNAL_UNTRUSTED_CONTENT_");
             let said = out.find(SAID);
-            let closes = out.find("<<</EXTERNAL_UNTRUSTED_CONTENT_");
-            assert!(
-                matches!((opens, said, closes), (Some(o), Some(m), Some(c)) if o < m && m < c),
-                "{what}: {out}"
-            );
+            let opens = said.and_then(|m| out[..m].rfind("<<<EXTERNAL_UNTRUSTED_CONTENT_"));
+            let closes = said.and_then(|m| out[m..].find("<<</EXTERNAL_UNTRUSTED_CONTENT_"));
+            let between = opens
+                .zip(said)
+                .is_some_and(|(o, m)| !out[o..m].contains("<<</EXTERNAL_UNTRUSTED_CONTENT_"));
+            assert!(closes.is_some() && between, "{what}: {out}");
         }
     })
     .await;

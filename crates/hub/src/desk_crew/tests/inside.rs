@@ -26,10 +26,11 @@ impl Redactor for Hides {
     }
 }
 
-/// An overseer at Act over a Desk that hides [`SECRET`].
+/// An overseer at Act over a Desk that hides [`SECRET`], beside `crew`.
 async fn overseeing_hidden(
     dir: &Path,
     pool: workforce_postgres::PostgresPool,
+    crew: &[Arc<AgentService>],
 ) -> (Arc<AgentService>, Desk, wiremock::MockServer) {
     let (overseer, llm) = agent(dir, "desk", "ok").await;
     write_config(&overseer, "[oversight]\nenabled = true\nlevel = \"act\"\n");
@@ -38,12 +39,10 @@ async fn overseeing_hidden(
         ..Default::default()
     };
     let d = desk_with(pool, dir, floor).await;
-    CrewHub::start(
-        hub(&[Arc::clone(&overseer)]),
-        d.clone(),
-        FAST,
-        CancellationToken::new(),
-    );
+    let all: Vec<Arc<AgentService>> = std::iter::once(Arc::clone(&overseer))
+        .chain(crew.iter().cloned())
+        .collect();
+    CrewHub::start(hub(&all), d.clone(), FAST, CancellationToken::new());
     eventually("the overseer's tools", async || {
         overseer.tools.has(super::super::inside::NAME).then_some(())
     })
@@ -55,7 +54,8 @@ async fn overseeing_hidden(
 /// name [`SECRET`].
 fn repo_with_secrets(dir: &Path) {
     let git = |args: &[&str]| {
-        let out = std::process::Command::new("git")
+        let out = crate::git_hardening::hardened_git()
+            .as_std_mut()
             .args([
                 "-c",
                 "user.name=t",
@@ -96,7 +96,9 @@ async fn inside(overseer: &AgentService, input: Value) -> workforce_agent::tools
 async fn an_id_it_cant_see_is_refused_as_none_and_an_agents_id_points_at_its_history() {
     with_test_pool(workforce_desk::store::build_pool, |pool| async move {
         let dir = tempfile::tempdir().unwrap();
-        let (overseer, _d, _llm) = overseeing_hidden(dir.path(), pool).await;
+        let (uuid_named, _) = agent(dir.path(), &uuid::Uuid::new_v4().to_string(), "ok").await;
+        let (overseer, _d, _llm) =
+            overseeing_hidden(dir.path(), pool, std::slice::from_ref(&uuid_named)).await;
         let made_up = inside(
             &overseer,
             json!({"session_id": uuid::Uuid::new_v4().to_string()}),
@@ -106,6 +108,12 @@ async fn an_id_it_cant_see_is_refused_as_none_and_an_agents_id_points_at_its_his
         assert_eq!(made_up.error.as_deref(), Some("That isn't one of yours."));
         let agent = inside(&overseer, json!({"session_id": "scout"})).await;
         assert!(agent.error.unwrap().contains("crew.history (agent_id)"));
+        let named = inside(
+            &overseer,
+            json!({"session_id": uuid_named.agent_id.as_str()}),
+        )
+        .await;
+        assert!(named.error.unwrap().contains("crew.history (agent_id)"));
         let every = inside(&overseer, json!({"session_id": "*", "facet": "logs"})).await;
         assert!(every.error.unwrap().contains("facet glance only"));
         let facet = inside(
@@ -122,7 +130,7 @@ async fn an_id_it_cant_see_is_refused_as_none_and_an_agents_id_points_at_its_his
 async fn every_facet_is_fenced_and_names_no_secret() {
     with_test_pool(workforce_desk::store::build_pool, |pool| async move {
         let dir = tempfile::tempdir().unwrap();
-        let (overseer, d, _llm) = overseeing_hidden(dir.path(), pool).await;
+        let (overseer, d, _llm) = overseeing_hidden(dir.path(), pool, &[]).await;
         let work = dir.path().join("work");
         std::fs::create_dir(&work).unwrap();
         repo_with_secrets(&work);
@@ -204,4 +212,36 @@ fn ask_session_is_the_last_resort_and_every_text_names_crew_inside_first() {
     for name in others.filter(|n| **n != super::super::inside::NAME) {
         assert!(named_first(tools::describe(name)), "{name}");
     }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_glance_at_everything_working_says_each_once() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (overseer, d, _llm) = overseeing_hidden(dir.path(), pool, &[]).await;
+        let mut ids = Vec::new();
+        for name in ["one", "two", "three"] {
+            let s = new_session(&d, dir.path(), name).await;
+            let url = hook_url(dir.path(), s.id).await;
+            hook(
+                &url,
+                json!({"hook_event_name": "UserPromptSubmit", "prompt": "Build it."}),
+            )
+            .await;
+            ids.push(s.id.to_string());
+        }
+        let said = eventually("every one working", async || {
+            let r = inside(&overseer, json!({"session_id": "*"})).await;
+            let said = r.output["sessions"].as_str()?.to_string();
+            ids.iter()
+                .all(|id| said.contains(id.as_str()))
+                .then_some(said)
+        })
+        .await;
+        assert!(
+            ids.iter().all(|id| said.matches(id.as_str()).count() == 1),
+            "{said}"
+        );
+    })
+    .await;
 }
