@@ -218,7 +218,9 @@ impl CliServed {
             hit_round_cap: self.capped,
             injected_user_messages: self.injected,
             gate_notice: None,
-            guard: None,
+            // The turn's guard, as its round's calls armed it.
+            guard: workforce_agent::runner::caller_content_guard()
+                .and_then(|guard| guard.armed_scope()),
         }
     }
 }

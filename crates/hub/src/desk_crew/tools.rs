@@ -199,6 +199,36 @@ impl CrewTool {
     }
 }
 
+/// Whether `oversight`'s level and act switches let a crew tool `name`
+/// called with `input` run without asking the person: what
+/// [`CrewTool::standing_choice`] says.
+pub(super) fn switched_on(
+    name: &str,
+    input: &Value,
+    oversight: &workforce_common::oversight::Oversight,
+) -> bool {
+    use workforce_common::oversight::Level;
+    if READ.contains(&name) {
+        return true;
+    }
+    if !matches!(oversight.level, Level::Act | Level::Full) {
+        return false;
+    }
+    let act = &oversight.act;
+    match name {
+        "crew.nudge" if input.get("reply_to").is_some_and(|r| !r.is_null()) => act.answer_sessions,
+        "crew.nudge" => act.nudge,
+        "crew.ask_session" | "crew.assign" => act.message_agents,
+        "crew.approve" => act.answer_sessions || act.read_only_approvals,
+        "crew.deny" | "crew.stop" | "crew.handoff" => false,
+        "crew.interrupt" => act.interrupt,
+        "crew.resume" | "crew.restart" | SWITCH_LOGIN => act.resume_restart,
+        "crew.start_session" | "crew.assign_ticket" | "crew.move_ticket" => act.hand_out_work,
+        "crew.set_mode" => act.set_mode,
+        _ => true,
+    }
+}
+
 /// The overseer a tool runs for, and what its scope sees now.
 pub(super) struct Bound {
     pub service: Arc<AgentService>,
@@ -1353,11 +1383,21 @@ impl Tool for CrewTool {
         describe(self.name)
     }
 
-    /// The person's standing choice decides it: the overseer's level is
-    /// what offered it, and Desk's act switches decide each action it takes
-    /// as they decide every action.
-    fn standing_choice(&self) -> bool {
-        true
+    /// The person's standing choice lets this call run when the overseer
+    /// still oversees its scope, at Act or Act fully, with the act switch
+    /// that decides it on. Its reads, and what it keeps for itself, are
+    /// its own at any level it has them.
+    fn standing_choice(&self, input: &Value) -> bool {
+        let Some(crew) = self.crew.upgrade() else {
+            return false;
+        };
+        let Some((_, oversight)) = crew
+            .overseer_named(&self.agent)
+            .filter(|(_, o)| o.scope == self.scope)
+        else {
+            return false;
+        };
+        switched_on(self.name, input, &oversight)
     }
 
     fn input_schema(&self) -> Value {

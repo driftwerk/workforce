@@ -1418,7 +1418,7 @@ pub struct RunResult {
     /// what guards a turn resumed from here (after an approval, a restart),
     /// and what tells whoever posts the answer that it carries what that
     /// content said.
-    pub guard: Option<crate::security::monitor::ContentScope>,
+    pub guard: Option<Box<crate::security::monitor::ContentScope>>,
 }
 
 impl RunResult {
@@ -1955,7 +1955,7 @@ fn tell_guard_refused(
 /// Arm `guard` when `tool`'s result is outside content: a fence in it, or a
 /// successful call of a tool that returns outside content as it is. The
 /// URLs it carries are then ones the turn may open.
-pub(crate) fn arm_on_result(
+pub fn arm_on_result(
     guard: &crate::security::monitor::ContentGuard,
     tools: &ToolRegistry,
     tool: &str,
@@ -3965,6 +3965,14 @@ impl AgentRunner {
         )
     }
 
+    /// This runner's gates, with the turn's `guard` holding what it must.
+    fn gates_guarded_by(&self, guard: &Arc<crate::security::monitor::ContentGuard>) -> ToolGates {
+        ToolGates {
+            content_guard: Some(Arc::clone(guard)),
+            ..ToolGates::from(&self.config)
+        }
+    }
+
     /// The program context a `program_run` call in this turn runs with.
     fn program_context(
         &self,
@@ -3977,10 +3985,7 @@ impl AgentRunner {
             .programs
             .as_ref()
             .map(|programs| crate::tools::program::ProgramContext {
-                gates: ToolGates {
-                    content_guard: Some(Arc::clone(guard)),
-                    ..ToolGates::from(&self.config)
-                },
+                gates: self.gates_guarded_by(guard),
                 policy: Arc::clone(&self.policy),
                 tools: Arc::clone(&self.tools),
                 access: Arc::clone(access),
@@ -4387,7 +4392,7 @@ impl AgentRunner {
                             hit_round_cap: true,
                             injected_user_messages: Vec::new(),
                             gate_notice: notice,
-                            guard: content_guard.armed().map(|_| content_guard.kept_scope()),
+                            guard: content_guard.armed_scope(),
                         });
                     }
                     Err(e) => {
@@ -4424,7 +4429,7 @@ impl AgentRunner {
                             hit_round_cap: true,
                             injected_user_messages: Vec::new(),
                             gate_notice: notice,
-                            guard: content_guard.armed().map(|_| content_guard.kept_scope()),
+                            guard: content_guard.armed_scope(),
                         });
                     }
                 }
@@ -4684,7 +4689,7 @@ impl AgentRunner {
                     hit_round_cap: rounds >= self.config.max_rounds,
                     injected_user_messages: Vec::new(),
                     gate_notice,
-                    guard: content_guard.armed().map(|_| content_guard.kept_scope()),
+                    guard: content_guard.armed_scope(),
                 });
             }
 
@@ -4718,7 +4723,7 @@ impl AgentRunner {
                     hit_round_cap: false,
                     injected_user_messages: Vec::new(),
                     gate_notice: None,
-                    guard: content_guard.armed().map(|_| content_guard.kept_scope()),
+                    guard: content_guard.armed_scope(),
                 });
             }
 
@@ -4827,8 +4832,7 @@ impl AgentRunner {
                         true => crate::tools::arguments::ArgumentValidation::Enforce,
                         false => self.config.arguments,
                     },
-                    content_guard: Some(Arc::clone(&content_guard)),
-                    ..ToolGates::from(&self.config)
+                    ..self.gates_guarded_by(&content_guard)
                 };
                 // No one watches a turn without progress: nobody can be asked.
                 let (outcome, decided) =
@@ -5497,7 +5501,7 @@ impl AgentRunner {
                     hit_round_cap: true,
                     injected_user_messages: std::mem::take(&mut absorbed_followups),
                     gate_notice: notice,
-                    guard: content_guard.armed().map(|_| content_guard.kept_scope()),
+                    guard: content_guard.armed_scope(),
                 });
             }
 
@@ -5964,7 +5968,7 @@ impl AgentRunner {
                     hit_round_cap: rounds >= self.config.max_rounds,
                     injected_user_messages: std::mem::take(&mut absorbed_followups),
                     gate_notice,
-                    guard: content_guard.armed().map(|_| content_guard.kept_scope()),
+                    guard: content_guard.armed_scope(),
                 });
             }
 
@@ -6010,7 +6014,7 @@ impl AgentRunner {
                     hit_round_cap: false,
                     injected_user_messages: std::mem::take(&mut absorbed_followups),
                     gate_notice: None,
-                    guard: content_guard.armed().map(|_| content_guard.kept_scope()),
+                    guard: content_guard.armed_scope(),
                 });
             }
 
@@ -6140,8 +6144,7 @@ impl AgentRunner {
                         true => crate::tools::arguments::ArgumentValidation::Enforce,
                         false => self.config.arguments,
                     },
-                    content_guard: Some(Arc::clone(&content_guard)),
-                    ..ToolGates::from(&self.config)
+                    ..self.gates_guarded_by(&content_guard)
                 };
                 let (outcome, decided) = match approvals {
                     Some(_) => {
@@ -6675,10 +6678,7 @@ impl AgentRunner {
         if stopping {
             return gate.standing();
         }
-        let gates = ToolGates {
-            content_guard: Some(Arc::clone(guard)),
-            ..ToolGates::from(&self.config)
-        };
+        let gates = self.gates_guarded_by(guard);
         let authorise = |tool: &str, input: &serde_json::Value| {
             would_execute(&gates, &self.policy, &self.tools, access, tool, input)
         };

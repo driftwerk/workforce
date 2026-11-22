@@ -211,17 +211,40 @@ pub(crate) fn turn_keeper(
     sessions: Arc<dyn workforce_common::session::SessionStore>,
     session_id: String,
 ) -> workforce_agent::security::monitor::Keeper {
+    // Kept off the runtime's threads, in the order the guard changed: a
+    // write that lands after a later one is skipped.
+    let order = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let written = Arc::new(std::sync::Mutex::new(0u64));
     Arc::new(move |scope: &ContentScope| {
         let Ok(kept) = serde_json::to_value(scope) else {
             return;
         };
-        let mut patch = serde_json::Map::new();
-        patch.insert(
-            workforce_common::session::TURN_CONTENT_SCOPE.to_string(),
-            kept,
+        let at = order.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+        let (sessions, session_id, written) = (
+            Arc::clone(&sessions),
+            session_id.clone(),
+            Arc::clone(&written),
         );
-        if let Err(e) = sessions.merge_metadata(&session_id, patch, &[]) {
-            tracing::warn!(session = %session_id, error = %e, "The turn's guard could not be kept");
+        let write = move || {
+            let mut last = written.lock().unwrap_or_else(|e| e.into_inner());
+            if *last > at {
+                return;
+            }
+            let mut patch = serde_json::Map::new();
+            patch.insert(
+                workforce_common::session::TURN_CONTENT_SCOPE.to_string(),
+                kept,
+            );
+            match sessions.merge_metadata(&session_id, patch, &[]) {
+                Ok(()) => *last = at,
+                Err(e) => {
+                    tracing::warn!(session = %session_id, error = %e, "The turn's guard could not be kept")
+                }
+            }
+        };
+        match tokio::runtime::Handle::try_current() {
+            Ok(runtime) => drop(runtime.spawn_blocking(write)),
+            Err(_) => write(),
         }
     })
 }

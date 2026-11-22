@@ -163,7 +163,6 @@ fn gate_with(
     let response = apply_cascade_gate(gates, response, tool_name);
     let response = apply_tool_requirement(tools, response, tool_name);
     let effect = surface_effect_of(tools, tool_name, input);
-    let guard_effect = guarded_effect(tools, tool_name, input);
     let to = effect.as_ref().and_then(SurfaceEffect::destination);
     let mut held = None;
     let asks_nothing = gates
@@ -209,8 +208,9 @@ fn gate_with(
         return blocked;
     }
     let guarded = gates.content_guard.as_deref().and_then(|guard| {
+        let effect = guarded_effect(tools, tool_name, input);
         guard
-            .check_call(&guarded_call(tools, tool_name, input, &guard_effect))
+            .check_call(&guarded_call(tools, tool_name, input, &effect))
             .map(|held| (guard, held))
     });
     let missing = || {
@@ -630,7 +630,7 @@ fn guarded_call<'a>(
     crate::security::monitor::Call {
         standing: tools
             .get(tool_name)
-            .is_some_and(|tool| tool.standing_choice()),
+            .is_some_and(|tool| tool.standing_choice(input)),
         ..crate::security::monitor::Call::new(tool_name, input, effect.as_ref())
     }
 }
@@ -2671,6 +2671,43 @@ mod tests {
                 1,
                 "a call missing its text was never refused"
             );
+        }
+
+        /// A crew tool whose act switch is `input.on`.
+        struct Switched;
+
+        #[async_trait::async_trait]
+        impl Tool for Switched {
+            fn name(&self) -> &str {
+                "crew.nudge"
+            }
+            fn description(&self) -> &str {
+                "switched"
+            }
+            fn input_schema(&self) -> Value {
+                serde_json::json!({ "type": "object" })
+            }
+            fn standing_choice(&self, input: &Value) -> bool {
+                input["on"] == true
+            }
+            async fn execute(&self, input: Value) -> eyre::Result<ToolResult> {
+                Ok(ToolResult::success(input, 1))
+            }
+        }
+
+        #[test]
+        fn a_standing_choice_runs_only_while_its_switch_is_on() {
+            let tools = ToolRegistry::new();
+            tools.register(Arc::new(Switched));
+            let gates = guarded("C1", true);
+            let call = |on: bool| {
+                let input = serde_json::json!({ "session_id": "s1", "on": on });
+                as_user(|| {
+                    gate_tool_call(&gates, &permissive_policy(), &tools, "crew.nudge", &input)
+                })
+            };
+            assert!(matches!(call(true), GateOutcome::Execute { .. }));
+            assert!(matches!(call(false), GateOutcome::Blocked { .. }));
         }
 
         /// A gate at Full access that asks before nothing.

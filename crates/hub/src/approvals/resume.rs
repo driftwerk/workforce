@@ -199,11 +199,10 @@ fn directive_for(row: &PendingApproval, outcome: ApprovalOutcome, resolver: &str
     }
 }
 
-/// Deliver the resumed turn's final text to the original conversation:
+/// Deliver the resumed turn's `response` to the original conversation:
 /// its Slack thread, mirroring the scheduler's surface fan-out, else the
-/// Desk conversation it answers to.
-/// Post the resumed turn's `response` where the approval was asked;
-/// `outside` when that turn read outside content.
+/// Desk conversation it answers to. `outside` when that turn read outside
+/// content, so the post is marked so.
 async fn deliver(svc: &Arc<AgentService>, row: &PendingApproval, response: &str, outside: bool) {
     let Some(channel) = row.channel_id.clone().filter(|c| !c.is_empty()) else {
         let session = svc

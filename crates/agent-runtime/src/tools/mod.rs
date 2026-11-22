@@ -282,13 +282,13 @@ pub trait Tool: Send + Sync {
         false
     }
 
-    /// Whether the person's standing choice already decides a call of this
-    /// tool for the agent it is registered for, as an overseer's crew tools
-    /// are decided by its oversight level and act switches. A turn steered
-    /// by outside content takes it as named for the turn
-    /// ([`Call::standing`](crate::security::monitor::Call::standing)).
+    /// Whether the person's standing choice already lets this call with
+    /// `input` run for the agent the tool is registered for, as an
+    /// overseer's crew tools are let by its oversight level and act
+    /// switches. A turn steered by outside content takes it as named for the
+    /// turn ([`Call::standing`](crate::security::monitor::Call::standing)).
     /// `false`, the default.
-    fn standing_choice(&self) -> bool {
+    fn standing_choice(&self, _input: &serde_json::Value) -> bool {
         false
     }
 
@@ -329,15 +329,15 @@ pub trait Tool: Send + Sync {
     }
 }
 
+#[doc(hidden)]
+pub use workforce_core::computer::Effect as CallEffect;
+
 /// The methods a tool wrapping another answers as the tool it wraps,
 /// saying what a call does: where it writes, whether what it returns is
 /// outside content, whether the person's standing choice decides it, and
 /// what it does to this computer. Every wrapper says them through this, so
 /// one added here is never silently dropped by a wrapper that forgot it.
 /// `$inner` is the wrapped tool's field.
-#[doc(hidden)]
-pub use workforce_core::computer::Effect as CallEffect;
-
 #[macro_export]
 macro_rules! delegate_call_facts {
     ($($inner:tt)+) => {
@@ -352,8 +352,8 @@ macro_rules! delegate_call_facts {
             self.$($inner)+.reads_outside_content()
         }
 
-        fn standing_choice(&self) -> bool {
-            self.$($inner)+.standing_choice()
+        fn standing_choice(&self, input: &serde_json::Value) -> bool {
+            self.$($inner)+.standing_choice(input)
         }
 
         fn effect(&self, input: &serde_json::Value) -> $crate::tools::CallEffect {

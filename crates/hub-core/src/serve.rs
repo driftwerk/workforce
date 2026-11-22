@@ -2838,7 +2838,9 @@ impl AgentService {
             surface_allows,
             computer_gate: self.computer_gate(),
             arguments: self.config.tools.validation.mode,
-            content_guard: None,
+            // The turn's guard when a guarded turn (a monitor's, a
+            // workflow step's, a resumed one) binds them.
+            content_guard: workforce_agent::runner::caller_content_guard(),
         }
     }
 

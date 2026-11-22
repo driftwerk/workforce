@@ -222,6 +222,16 @@ impl CallSite {
     /// its result for the MCP client from `tools`, the surface it ran on.
     fn report(&self, tools: &ToolRegistry, name: &str, held: Held) -> ToolResult {
         let Held { exec, decision } = held;
+        // What a call returns arms the turn's guard as a runner's call does.
+        if let Some(guard) = &self.gates.content_guard {
+            workforce_agent::runner::arm_on_result(
+                guard,
+                tools,
+                name,
+                exec.success,
+                &exec.output_text,
+            );
+        }
         self.audit
             .record(name, decision, exec.deny_reason.as_deref());
         self.shape(tools, name, exec)

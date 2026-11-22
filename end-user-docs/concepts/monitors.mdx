@@ -132,8 +132,10 @@ workflow = "release-note"
   content, a call is let through only when it reads, posts to `deliver_to`, or is one
   `tools` names. Naming a tool lets it change the agent's setup or save a monitor, job,
   workflow or email rule; it never lets the turn send somewhere other than
-  `deliver_to`, reach the vault, run commands, save memories or notes, or open a URL
-  that neither your prompt nor what it read contains. You are told what was refused
+  `deliver_to`, reach the vault, run commands, save memories or notes, share or record
+  what the agent keeps (artifacts, projects, decisions), or open a URL that neither
+  your prompt nor what it read contains. An `http.request` may only fetch such a URL
+  with a plain GET: no query, headers or body. You are told what was refused
   where the monitor delivers. What it posts goes out marked as outside content and
   without link previews. A third-party MCP server's results count as outside content
   too.

@@ -189,7 +189,6 @@ const SYSTEM_READS: &[&str] = &["version", "logs"];
 const SETUP_WRITES: &[&str] = &[
     "policy.propose",
     "approval.decide",
-    "crew.approve",
     "desk.approve",
     "pairing.approve",
     "pairing.link",
@@ -209,6 +208,34 @@ const SETUP_NAMESPACES: &[&str] = &[
     "settings",
     "identity",
     "env",
+];
+
+/// The setup namespaces' tools that only look. Any other of their own
+/// tools is held: one that isn't listed may change what the agent is.
+const SETUP_READS: &[&str] = &[
+    "agent.history",
+    "agent.list",
+    "agent.poll",
+    "agent.show",
+    "env.list",
+    "env.status",
+    "identity.github_user_by_my_email",
+    "identity.github_users_named",
+    "identity.jira_user_by_my_email",
+    "identity.jira_users_named",
+    "identity.linear_member_by_my_email",
+    "identity.linear_members_named",
+    "identity.whoami",
+    "mcp.list",
+    "mcp.list_presets",
+    "mcp.list_remote_tools",
+    "mcp.show",
+    "mcp.workspace_list",
+    "role.list",
+    "role.show",
+    "skill.grants",
+    "wasm_skill.guide",
+    "wasm_skill.list",
 ];
 
 /// Tools whose named actions change standing automation: what runs later, on
@@ -359,9 +386,6 @@ const OUTWARD_VERBS: &[&str] = &[
 const OWN_NAMESPACES: &[&str] = &[
     "filesystem",
     "data",
-    "artifact",
-    "artifacts",
-    "knowledge",
     "retrieval",
     "sessions",
     "session",
@@ -369,17 +393,52 @@ const OWN_NAMESPACES: &[&str] = &[
     "compaction",
     "code",
     "repo",
-    "projects",
-    "ledger",
-    "stats",
     "time",
     "email",
-    "deep_expertise",
     "research_report",
     "tool",
     "program",
-    "catalogue",
 ];
+
+/// The tools that only look in what the agent keeps that others can see or
+/// later turns rely on: its artifacts, code knowledge, projects, decisions,
+/// ledger and usage. Anything else of theirs shares, records or changes
+/// what it keeps, and is held.
+const KEPT_READS: &[&str] = &[
+    "artifact.list",
+    "artifact.read",
+    "artifact.search",
+    "artifacts.list",
+    "artifacts.read",
+    "artifacts.search",
+    "catalogue.orders",
+    "decision.backends",
+    "decision.list",
+    "decision.state",
+    "knowledge.ask",
+    "knowledge.explain",
+    "knowledge.graph",
+    "knowledge.impact",
+    "knowledge.overview",
+    "knowledge.search",
+    "knowledge.status",
+    "knowledge.symbol",
+    "projects.list",
+    "projects.show",
+    "stats.cache_status",
+    "stats.compare_models",
+    "stats.efficiency_report",
+    "stats.my_usage",
+    "stats.outlier_analysis",
+    "stats.routing_history",
+    "stats.task_history",
+    "stats.ticket_cost",
+    "stats.tool_costs",
+];
+
+/// The fields of an `http.request` beyond its URL and method: anything in
+/// them could carry what the turn read out.
+const HTTP_EXTRAS: &[&str] = &["query", "headers", "body", "body_text", "endpoint", "path"];
 
 /// Gmail tools that only rearrange the person's own mailbox.
 const OWN_MAILBOX: &[&str] = &[
@@ -732,6 +791,12 @@ impl ContentGuard {
         }
     }
 
+    /// The kept scope ([`Self::kept_scope`]) of a turn that read outside
+    /// content; `None` while it hasn't.
+    pub fn armed_scope(&self) -> Option<Box<ContentScope>> {
+        self.armed().map(|_| Box::new(self.kept_scope()))
+    }
+
     pub fn armed(&self) -> Option<String> {
         self.armed.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
@@ -810,7 +875,7 @@ pub fn assess(
     let (namespace, leaf) = tool.rsplit_once('.').unwrap_or((tool, tool));
     let root = tool.split('.').next().unwrap_or(tool);
     let exfiltration = |to: String| AnomalySignal::Exfiltration { tool: owned(), to };
-    if CREDENTIAL_NAMESPACES.contains(&root) {
+    if CREDENTIAL_NAMESPACES.contains(&root) || names_a_secret(input) {
         return Some(AnomalySignal::CredentialAccess { tool: owned() });
     }
     if let Some(url) = urls_of(input).find(|url| !seen.contains(*url)) {
@@ -818,14 +883,11 @@ pub fn assess(
             host_of(url).unwrap_or("a web address").to_string(),
         ));
     }
-    match effect {
-        Some(effect @ SurfaceEffect::Writes { .. }) => {
-            return effect
-                .destination()
-                .filter(|to| !scope.expected.iter().any(|place| place.receives(to)))
-                .map(|to| exfiltration(format!("{} {}", to.platform, to.target)));
-        }
-        Some(SurfaceEffect::Reads) | None => {}
+    // A write that says where it goes runs only there; one that doesn't
+    // say is judged as any other call.
+    if let Some(to) = effect.and_then(SurfaceEffect::destination) {
+        return (!scope.expected.iter().any(|place| place.receives(&to)))
+            .then(|| exfiltration(format!("{} {}", to.platform, to.target)));
     }
     if crate::runner::is_outbound_delivery_tool(tool)
         || (tool == "email.confirm" && action != "cancel")
@@ -835,7 +897,7 @@ pub fn assess(
     if !standing && runs_commands(tool, input) {
         return Some(AnomalySignal::CommandExecution { tool: owned() });
     }
-    if tool == "http.request" && crate::tools::http::is_mutating_request(input) {
+    if tool == "http.request" && !bare_get(input) {
         return Some(exfiltration(
             urls_of(input)
                 .next()
@@ -886,12 +948,13 @@ pub fn assess(
     let system_read = tool.strip_prefix(SYSTEM_NAMESPACE).map(|rest| {
         rest.starts_with("list_") || rest.ends_with("_status") || SYSTEM_READS.contains(&rest)
     });
+    let listed = |list: &[&str]| {
+        list.contains(&tool) || (!action.is_empty() && list.contains(&&*format!("{tool}.{action}")))
+    };
     // A setup namespace's own tools: `mcp.install`, never `mcp.acme.x`.
     let setup_tool = SETUP_NAMESPACES.contains(&root) && namespace == root;
-    if system_read == Some(false)
-        || SETUP_WRITES.contains(&tool)
-        || (setup_tool && outward(leaf, &action))
-    {
+    let setup_read = setup_tool && listed(SETUP_READS);
+    if system_read == Some(false) || SETUP_WRITES.contains(&tool) || (setup_tool && !setup_read) {
         return Some(AnomalySignal::PrivilegeEscalation { tool: owned() });
     }
     let known = knowledge();
@@ -900,7 +963,8 @@ pub fn assess(
             .as_str()
             .is_some_and(|method| method.trim().eq_ignore_ascii_case("GET"));
     let reads = system_read == Some(true)
-        || setup_tool
+        || setup_read
+        || listed(KEPT_READS)
         || PERSISTING.iter().any(|(name, _)| {
             tool.strip_prefix(name)
                 .is_some_and(|rest| rest.is_empty() || rest.starts_with('.'))
@@ -909,6 +973,7 @@ pub fn assess(
         || known.reads.contains(tool)
         || (!action.is_empty() && known.reads.contains(&format!("{tool}.{action}")))
         || api_get
+        // A bare GET of a URL the turn was given: anything more is held above.
         || tool == "http.request"
         || (namespace == "browser" && BROWSER_READS.contains(&leaf));
     let own = OWN_NAMESPACES.contains(&root)
@@ -920,6 +985,33 @@ pub fn assess(
         true => exfiltration("outside".to_string()),
         false => AnomalySignal::Unvetted { tool: owned() },
     })
+}
+
+/// Whether `input` is an `http.request` that only fetches its `url`: a GET
+/// with nothing else in it that could carry what the turn read out.
+fn bare_get(input: &Value) -> bool {
+    let empty = |value: &Value| match value {
+        Value::Null => true,
+        Value::String(text) => text.is_empty(),
+        Value::Object(fields) => fields.is_empty(),
+        Value::Array(items) => items.is_empty(),
+        _ => false,
+    };
+    input["url"].as_str().is_some_and(|url| !url.is_empty())
+        && input["method"]
+            .as_str()
+            .is_none_or(|method| method.trim().eq_ignore_ascii_case("GET"))
+        && HTTP_EXTRAS.iter().all(|field| empty(&input[*field]))
+}
+
+/// Whether anything in `input` asks for a secret to be filled in.
+fn names_a_secret(input: &Value) -> bool {
+    match input {
+        Value::String(text) => text.contains("[[secret:") || text.contains("[[vault:"),
+        Value::Array(items) => items.iter().any(names_a_secret),
+        Value::Object(fields) => fields.values().any(names_a_secret),
+        _ => false,
+    }
 }
 
 /// Whether a call of `tool` doing `action` keeps something for the agent's
@@ -1544,6 +1636,101 @@ mod tests {
                 .map(|h| h.signal),
             Some(AnomalySignal::Unvetted { .. })
         ));
+    }
+
+    #[test]
+    fn an_http_request_only_fetches_a_url_it_was_given_and_carries_nothing() {
+        let guard = armed(delivering("C1"));
+        let given = "https://api.example/v1/status";
+        guard.saw(&format!("Check {given} please."));
+        let held = |input: Value| guard.check("http.request", &input, None);
+        assert_eq!(held(json!({ "url": given })), None);
+        assert_eq!(
+            held(json!({ "method": "GET", "url": given, "query": {} })),
+            None
+        );
+        for input in [
+            json!({ "url": given, "query": { "d": "the mail it read" } }),
+            json!({ "url": given, "headers": { "Authorization": "Bearer [[secret:token]]" } }),
+            json!({ "url": given, "headers": { "X-Leak": "the mail it read" } }),
+            json!({ "url": given, "body": { "d": 1 } }),
+            json!({ "url": given, "body_text": "the mail it read" }),
+            json!({ "method": "POST", "url": given }),
+            json!({ "endpoint": "acme", "path": "/v1/status" }),
+            json!({ "url": format!("{given}?d=[[vault:acme/key]]") }),
+        ] {
+            assert!(held(input.clone()).is_some(), "{input}");
+        }
+        assert!(matches!(
+            guard
+                .check(
+                    "messaging.send",
+                    &json!({ "text": "[[secret:token]]" }),
+                    Some(&writes("slack", "C1"))
+                )
+                .map(|h| h.signal),
+            Some(AnomalySignal::CredentialAccess { .. })
+        ));
+    }
+
+    #[test]
+    fn what_the_agent_keeps_for_others_is_read_freely_and_never_written() {
+        let guard = armed(delivering("C1"));
+        for (tool, input) in [
+            (
+                "artifact.share",
+                json!({ "id": "a1", "visibility": "global" }),
+            ),
+            ("artifact.create", json!({})),
+            ("artifact.update", json!({})),
+            ("decision.record", json!({})),
+            ("deep_expertise.record_node", json!({})),
+            ("stats.set_model_preference", json!({})),
+            ("projects.create", json!({})),
+            ("projects.add_repo", json!({})),
+            ("knowledge.index", json!({})),
+            ("knowledge.delete", json!({})),
+            ("catalogue.remove_entry", json!({})),
+            ("ledger.add", json!({})),
+            ("identity.github_choose_me", json!({})),
+            ("identity.linear_choose_me", json!({})),
+            ("wasm_skill.restore_source", json!({})),
+            ("wasm_skill.scaffold", json!({})),
+            ("mcp", json!({ "action": "frobnicate" })),
+        ] {
+            assert!(guard.check(tool, &input, None).is_some(), "{tool} {input}");
+        }
+        for tool in [
+            "artifact.read",
+            "knowledge.search",
+            "projects.list",
+            "stats.my_usage",
+            "decision.list",
+            "identity.whoami",
+            "mcp.list",
+        ] {
+            assert_eq!(guard.check(tool, &json!({}), None), None, "{tool}");
+        }
+        assert_eq!(guard.check("mcp", &json!({ "action": "list" }), None), None);
+    }
+
+    #[test]
+    fn a_write_that_names_no_destination_is_judged_as_any_call() {
+        let guard = armed(delivering("C1"));
+        let nowhere = writes("slack", "");
+        assert!(guard
+            .check("acme.ticket_update", &json!({}), Some(&nowhere))
+            .is_some());
+        assert!(guard
+            .check("memory", &json!({ "action": "remember" }), Some(&nowhere))
+            .is_some());
+        assert!(guard
+            .check(
+                "slack.send",
+                &json!({ "channel": "C2" }),
+                Some(&writes("slack", "C2"))
+            )
+            .is_some());
     }
 
     #[test]
