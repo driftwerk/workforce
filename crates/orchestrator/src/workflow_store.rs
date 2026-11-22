@@ -73,6 +73,9 @@ pub struct EditContext<'a> {
     pub edited_via: &'a str,
     /// Source revision number when `edited_via == "restore"`.
     pub restored_from: Option<i32>,
+    /// Made in a conversation that read the person's bank: the row is
+    /// marked, for good, in the same write ([`READ_PERSONAL_STAYS_PRIVATE`]).
+    pub read_personal: bool,
 }
 
 impl<'a> EditContext<'a> {
@@ -81,7 +84,15 @@ impl<'a> EditContext<'a> {
             edited_by,
             edited_via,
             restored_from: None,
+            read_personal: false,
         }
+    }
+
+    /// This edit, marked as made in a conversation that read the person's
+    /// bank when `read` is.
+    pub fn read_personal(mut self, read: bool) -> Self {
+        self.read_personal |= read;
+        self
     }
 
     /// A restore edit: inserts a NEW revision (history is never rewritten)
@@ -91,6 +102,7 @@ impl<'a> EditContext<'a> {
             edited_by,
             edited_via: "restore",
             restored_from: Some(from),
+            read_personal: false,
         }
     }
 }
@@ -386,6 +398,9 @@ pub enum TransferFailed {
     NotFound,
     /// The target already owns a definition of `(kind, id)`.
     Occupied,
+    /// It was saved in a conversation that read the person's bank, so it
+    /// stays theirs ([`READ_PERSONAL_STAYS_PRIVATE`]).
+    ReadPersonal,
     Storage(eyre::Report),
 }
 
@@ -394,6 +409,7 @@ impl std::fmt::Display for TransferFailed {
         match self {
             Self::NotFound => f.write_str("no such definition under that owner"),
             Self::Occupied => f.write_str("the new owner already holds a definition of that name"),
+            Self::ReadPersonal => f.write_str(READ_PERSONAL_STAYS_PRIVATE),
             Self::Storage(e) => write!(f, "{e}"),
         }
     }
@@ -443,6 +459,26 @@ const MONITOR_SATELLITES: [&str; 4] = [
 const DEF_ROW_FOR_UPDATE: &str = "SELECT 1 FROM workflow_defs \
                                   WHERE id = $1 AND kind = $2 AND owner_identity_id = $3 \
                                   FOR UPDATE";
+
+/// [`DEF_ROW_FOR_UPDATE`], with whether the row is marked as saved in a
+/// conversation that read the person's bank.
+const DEF_ROW_FOR_UPDATE_MARKED: &str = "SELECT read_personal FROM workflow_defs \
+                                         WHERE id = $1 AND kind = $2 AND owner_identity_id = $3 \
+                                         FOR UPDATE";
+
+/// Whether one row is marked as saved in a conversation that read the
+/// person's bank, locked for the rest of `tx`.
+async fn read_personal_for_update(
+    tx: &tokio_postgres::Transaction<'_>,
+    kind: &str,
+    id: &str,
+    owner: &str,
+) -> Result<bool> {
+    Ok(tx
+        .query_opt(DEF_ROW_FOR_UPDATE_MARKED, &[&id, &kind, &owner])
+        .await?
+        .is_some_and(|r| r.get::<_, bool>("read_personal")))
+}
 
 const LIST_DEFS: &str = "SELECT id, toml_source, owner_identity_id, visibility, \
                                 last_modified_by, run_as_identity_id \
@@ -763,7 +799,7 @@ impl WorkflowStore {
 
     /// Insert or update a definition owned by `owner` (`None` = system),
     /// refused ([`READ_PERSONAL_STAYS_PRIVATE`]) when it would share one
-    /// marked [`Self::mark_read_personal`] with a team or everyone,
+    /// marked ([`EditContext::read_personal`]) with a team or everyone,
     /// recording a revision (and `last_modified_by`) in the same transaction.
     pub async fn save(
         &self,
@@ -784,16 +820,18 @@ impl WorkflowStore {
             .execute(
                 "INSERT INTO workflow_defs \
              (id, agent_id, kind, toml_source, parsed_json, owner_identity_id, visibility, \
-              last_modified_by, created_at, updated_at, run_as_identity_id) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $9, $11) \
+              last_modified_by, created_at, updated_at, run_as_identity_id, read_personal) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $9, $11, $12) \
              ON CONFLICT (id, kind, owner_identity_id) DO UPDATE \
              SET kind = EXCLUDED.kind, toml_source = EXCLUDED.toml_source, \
                  parsed_json = EXCLUDED.parsed_json, visibility = EXCLUDED.visibility, \
                  last_modified_by = EXCLUDED.last_modified_by, \
                  updated_at = EXCLUDED.updated_at, \
                  run_as_identity_id = CASE WHEN $10 THEN $11 \
-                                      ELSE workflow_defs.run_as_identity_id END \
-             WHERE NOT (workflow_defs.read_personal AND EXCLUDED.visibility <> 'private')",
+                                      ELSE workflow_defs.run_as_identity_id END, \
+                 read_personal = workflow_defs.read_personal OR EXCLUDED.read_personal \
+             WHERE NOT ((workflow_defs.read_personal OR EXCLUDED.read_personal) \
+                        AND EXCLUDED.visibility <> 'private')",
                 &[
                     &id,
                     &GLOBAL_AGENT,
@@ -806,6 +844,7 @@ impl WorkflowStore {
                     &now,
                     &set_run_as,
                     &run_as_value,
+                    &edit.read_personal,
                 ],
             )
             .await?;
@@ -1241,24 +1280,6 @@ impl WorkflowStore {
         Ok(n > 0)
     }
 
-    /// Marks one definition, for good, as saved in a conversation that read
-    /// the person's bank: it is never shared with a team or everyone after.
-    pub async fn mark_read_personal(
-        &self,
-        kind: &str,
-        id: &str,
-        owner: Option<&str>,
-    ) -> Result<()> {
-        let conn = self.pool.get().await?;
-        conn.execute(
-            "UPDATE workflow_defs SET read_personal = TRUE \
-             WHERE kind = $1 AND id = $2 AND owner_identity_id = $3",
-            &[&kind, &id, &owner_column(owner)],
-        )
-        .await?;
-        Ok(())
-    }
-
     /// Whether one definition was saved in a conversation that read the
     /// person's bank.
     pub async fn read_personal(&self, kind: &str, id: &str, owner: Option<&str>) -> Result<bool> {
@@ -1318,6 +1339,9 @@ impl WorkflowStore {
         let now = Utc::now();
         let mut conn = self.pool.get().await?;
         let tx = conn.transaction().await?;
+        if !deduped.is_empty() && read_personal_for_update(&tx, kind, def_id, owner).await? {
+            return Err(eyre::eyre!(READ_PERSONAL_STAYS_PRIVATE));
+        }
         tx.execute(
             "DELETE FROM def_shares WHERE kind = $1 AND def_id = $2 AND owner_identity_id = $3",
             &[&kind, &def_id, &owner],
@@ -1477,12 +1501,14 @@ impl WorkflowStore {
         let mut conn = self.pool.get().await?;
         let tx = conn.transaction().await?;
 
-        if tx
-            .query_opt(DEF_ROW_FOR_UPDATE, &[&id, &kind, &from])
+        let Some(row) = tx
+            .query_opt(DEF_ROW_FOR_UPDATE_MARKED, &[&id, &kind, &from])
             .await?
-            .is_none()
-        {
+        else {
             return Err(TransferFailed::NotFound);
+        };
+        if row.get::<_, bool>("read_personal") {
+            return Err(TransferFailed::ReadPersonal);
         }
         if tx
             .query_opt(DEF_ROW_FOR_UPDATE, &[&id, &kind, &to])

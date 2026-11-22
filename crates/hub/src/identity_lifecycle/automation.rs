@@ -458,6 +458,9 @@ async fn transfer(
                 "The recipient already owns a {} named {}",
                 def.kind, def.id
             )),
+            TransferFailed::ReadPersonal => LifecycleError::Refused(
+                workforce_orchestrator::workflow_store::READ_PERSONAL_STAYS_PRIVATE.to_string(),
+            ),
             TransferFailed::Storage(e) => LifecycleError::Failed(e),
         })
 }

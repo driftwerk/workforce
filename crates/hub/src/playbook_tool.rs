@@ -149,6 +149,10 @@ impl Tool for PlaybookTool {
     }
 }
 
+/// What a save is told in a turn that read the person's bank, on a hub with
+/// no definition store to keep it private for good.
+pub(crate) const PERSONAL_KEPT_NOWHERE: &str = "A conversation that read the person's bank saves no playbook on this hub: it has nowhere to keep it private to them for good.";
+
 /// What a shared save is told in a turn that read the person's bank.
 pub(crate) const PERSONAL_STAYS_PRIVATE: &str = "A conversation that read the person's bank saves a playbook only for them: save it with `visibility: \"private\"`.";
 
@@ -307,6 +311,10 @@ impl PlaybookTool {
         {
             return Ok(ToolResult::failure(PERSONAL_STAYS_PRIVATE, elapsed()));
         }
+        // Without a store nothing carries the mark that keeps it theirs.
+        if workforce_agent::personal::read() && self.runtime.def_store().is_none() {
+            return Ok(ToolResult::failure(PERSONAL_KEPT_NOWHERE, elapsed()));
+        }
         match self
             .runtime
             .save_definition_source(
@@ -322,18 +330,6 @@ impl PlaybookTool {
             .await
         {
             Ok(()) => {
-                // Saved in a turn that read the bank: it stays private for
-                // good, whatever later saves or shares ask.
-                if workforce_agent::personal::read() {
-                    if let Some(store) = self.runtime.def_store() {
-                        if let Err(e) = store
-                            .mark_read_personal(KIND_PLAYBOOK, &id, grant.owner.as_deref())
-                            .await
-                        {
-                            tracing::warn!(error = %e, playbook = %id, "a playbook saved after reading the bank wasn't marked");
-                        }
-                    }
-                }
                 let message = if self.shadows_shared(&id, &grant).await {
                     format!(
                         "Saved as your {} copy of '{id}'; the shared '{id}' is unchanged.",
@@ -697,6 +693,19 @@ mod tests {
         assert!(!refused.success);
         assert_eq!(refused.error.as_deref(), Some(PERSONAL_STAYS_PRIVATE));
         assert!(!dir.join("demo.toml").exists());
+        // With no store to carry the mark, not even a private save.
+        let private = workforce_agent::personal::scoped(true, async {
+            tool.execute(serde_json::json!({
+                "action": "save", "playbook_id": "demo",
+                "toml_content": GOOD, "visibility": "private",
+            }))
+            .await
+            .unwrap()
+        })
+        .await;
+        assert!(!private.success);
+        assert_eq!(private.error.as_deref(), Some(PERSONAL_KEPT_NOWHERE));
+        assert!(!dir.join("demo.toml").exists());
         assert!(
             tool.execute(save(GOOD)).await.unwrap().success,
             "elsewhere, as ever"
@@ -956,6 +965,47 @@ mod tests {
                         .unwrap(),
                     "a later save keeps the mark"
                 );
+
+                // Nor is it shared with anyone by a grant, nor handed on.
+                let stays = workforce_orchestrator::workflow_store::READ_PERSONAL_STAYS_PRIVATE;
+                let granted = store
+                    .set_shares(
+                        KIND_PLAYBOOK,
+                        "demo",
+                        "alice",
+                        &[Grant::user("bob", GrantLevel::Run)],
+                        "alice",
+                    )
+                    .await
+                    .unwrap_err();
+                assert!(granted.to_string().contains(stays), "{granted}");
+                assert!(store
+                    .list_shares(KIND_PLAYBOOK, "demo", "alice")
+                    .await
+                    .unwrap()
+                    .is_empty());
+                store
+                    .set_shares(KIND_PLAYBOOK, "demo", "alice", &[], "alice")
+                    .await
+                    .expect("clearing its grants is no share");
+                let handed = store
+                    .transfer(
+                        KIND_PLAYBOOK,
+                        "demo",
+                        "alice",
+                        "bob",
+                        workforce_core::access::OutgoingAccess::Nothing,
+                        "alice",
+                    )
+                    .await
+                    .err()
+                    .expect("never handed on");
+                assert_eq!(handed.to_string(), stays);
+                assert!(store
+                    .get("demo", KIND_PLAYBOOK, Some("bob"))
+                    .await
+                    .unwrap()
+                    .is_none());
                 let _ = std::fs::remove_dir_all(&dir);
             },
         )

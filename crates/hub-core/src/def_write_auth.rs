@@ -360,6 +360,9 @@ pub async fn transfer_definition(
                 id: id.to_string(),
                 holder: to_display.clone(),
             },
+            TransferFailed::ReadPersonal => TransferDenied::Target(
+                workforce_orchestrator::workflow_store::READ_PERSONAL_STAYS_PRIVATE.to_string(),
+            ),
             TransferFailed::Storage(e) => TransferDenied::Storage(e.to_string()),
         })?;
     crate::hub_core::resource_audit::owner_changed(kind, id, Some(from), &to_id, actor);
