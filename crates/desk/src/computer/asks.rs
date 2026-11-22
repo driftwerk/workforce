@@ -5749,12 +5749,12 @@ mod tests {
         }
     }
 
-    /// The last of the final review: `fd`'s commands, `rg --pre`, more
-    /// runners, `open` running a script, and git settings that run.
+    /// What `sort -o` writes is a write, read past the values of its other
+    /// options.
     #[test]
     fn what_sort_writes_is_a_write() {
+        assert_eq!(asks("sort -o ~/.zshrc x"), Some(Asks::System));
         for command in [
-            "sort -o ~/.zshrc x",
             "sort -o/Users/sarah/.zshrc x",
             "sort --ou ~/.zshrc x",
             "sort --output=/Users/sarah/dev/acme-web/README.md x",
@@ -5763,8 +5763,13 @@ mod tests {
         ] {
             assert!(asks(command).is_some(), "{command:?}");
         }
+        // `o` as the value of `-T` and `-t`, not an output.
+        assert_eq!(asks("sort -To x"), None);
+        assert_eq!(asks("sort -t o x"), None);
     }
 
+    /// The last of the final review: `fd`'s commands, `rg --pre`, more
+    /// runners, `open` running a script, and git settings that run.
     #[test]
     fn fd_rg_runners_and_open_are_read() {
         assert_eq!(
