@@ -56,6 +56,22 @@ async fn desk_with(pool: workforce_postgres::PostgresPool, opts: Options, floor:
     .unwrap()
 }
 
+/// A Desk in `dir` whose CLI is `cli`, sighted as `sight`.
+async fn desk_on(
+    pool: workforce_postgres::PostgresPool,
+    dir: &Path,
+    cli: PathBuf,
+    floor: Floor,
+    sight: SightOptions,
+) -> Desk {
+    let opts = Options {
+        programs: crate::testing::programs(cli.clone(), cli),
+        sight,
+        ..options(dir)
+    };
+    desk_with(pool, opts, floor).await
+}
+
 /// Sight that shows a wait at once and reads task output under `dir`.
 fn sight_in(dir: &Path) -> SightOptions {
     SightOptions {
@@ -409,13 +425,6 @@ fn kept(home: &Path, name: &str, cwd: &Path) -> crate::model::SessionRecord {
     r
 }
 
-fn redacting() -> Floor {
-    Floor {
-        redactor: Some(redactor_for_tests()),
-        ..Floor::default()
-    }
-}
-
 #[tokio::test]
 async fn a_transcript_is_paged_where_the_person_lets_desk_read_it_and_refused_in_words_otherwise() {
     with_test_pool(build_pool, |pool| async move {
@@ -501,7 +510,7 @@ async fn without_a_redactor_no_transcript_and_no_logs_are_shown() {
             logs: Some(home.to_path_buf()),
             ..SightOptions::default()
         };
-        let d = desk_with(pool, home, fake_cli(home), Floor::default(), sight).await;
+        let d = desk_on(pool, home, fake_cli(home), Floor::default(), sight).await;
         assert_eq!(
             d.transcript_page(web.id, Default::default())
                 .await
@@ -544,7 +553,7 @@ async fn a_sessions_own_log_lines_are_read_from_desks_logs_where_the_person_lets
             logs: Some(logs),
             ..SightOptions::default()
         };
-        let d = desk_with(pool, dir.path(), fake_cli(dir.path()), redacting(), sight).await;
+        let d = desk_on(pool, dir.path(), fake_cli(dir.path()), redacting(), sight).await;
         let read = d.session_logs(r.id, None).await.unwrap();
         assert_eq!(read.lines.len(), 1);
         assert!(read.lines[0].text.contains("[secret]"));
@@ -561,7 +570,7 @@ async fn a_hub_with_no_desk_logs_says_so() {
     with_test_pool(build_pool, |pool| async move {
         let dir = tempfile::tempdir().unwrap();
         let cli = fake_cli(dir.path());
-        let d = desk_with(pool, dir.path(), cli, redacting(), SightOptions::default()).await;
+        let d = desk_on(pool, dir.path(), cli, redacting(), SightOptions::default()).await;
         let s = new_session(&d, dir.path()).await;
         assert_eq!(
             d.session_logs(s.id, None).await.unwrap_err(),
