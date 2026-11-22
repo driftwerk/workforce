@@ -1700,6 +1700,10 @@ impl CrewHub {
             self.machine_seen
                 .lock()
                 .retain(|k, s| ours.contains(k) || unread.contains(&s.plan));
+            {
+                let seen = self.machine_seen.lock();
+                self.machine_sight_keep(|k| seen.contains_key(k));
+            }
             let mut plans = self.machine_plans.lock();
             plans.retain(|(_, p), _| unread.contains(p));
             plans.extend(to_start);
@@ -1759,6 +1763,9 @@ impl CrewHub {
                     continue;
                 }
             };
+            // The plans' grants whose working sessions there went quiet,
+            // by their boss: looked inside of below.
+            let mut quiet: HashMap<String, String> = HashMap::new();
             for (item, fresh, _, review) in sessions {
                 let id = item.rsplit('/').next().and_then(|i| i.parse::<Uuid>().ok());
                 let now = listed.iter().find(|x| Some(x.id) == id);
@@ -1803,6 +1810,13 @@ impl CrewHub {
                     (None, Some(line)) => self.plan_failures.lock().push((fresh.plan, line)),
                     (None, None) => {}
                 }
+                let moved = now.is_some_and(|now| {
+                    was.as_ref()
+                        .is_none_or(|w| w.state != now.state || w.reply != now.last_reply)
+                });
+                if moved {
+                    self.machine_moved(&item);
+                }
                 let mut next = was.unwrap_or(fresh);
                 match now {
                     Some(now) => {
@@ -1814,7 +1828,16 @@ impl CrewHub {
                     }
                     None => next.misses += 1,
                 }
+                if next.state == "working" && self.machine_quiet(&item, &next.boss) {
+                    quiet.insert(
+                        workforce_desk::grant::plan_key(next.plan),
+                        next.boss.clone(),
+                    );
+                }
                 self.machine_seen.lock().insert(item, next);
+            }
+            for (grant, boss) in quiet {
+                self.glance_machine(&machine, &grant, &boss).await;
             }
         }
     }

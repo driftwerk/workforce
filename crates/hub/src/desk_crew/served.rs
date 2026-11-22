@@ -48,7 +48,12 @@ use super::watcher::reported;
 use super::CrewHub;
 
 /// The reading tools served.
-pub const SERVED_READ: [&str; 3] = ["crew.overview", "crew.activity", "crew.history"];
+pub const SERVED_READ: [&str; 4] = [
+    "crew.overview",
+    "crew.activity",
+    "crew.history",
+    super::inside::NAME,
+];
 /// The acting tools served.
 pub const SERVED_ACT: [&str; 10] = [
     "crew.nudge",
@@ -62,6 +67,12 @@ pub const SERVED_ACT: [&str; 10] = [
     "crew.start_session",
     "crew.release",
 ];
+
+/// What a boss is told of a tool this engine doesn't serve: an older
+/// Desk's own words, which a newer boss's home reads as such.
+pub fn unserved(tool: &str) -> String {
+    format!("{tool} isn't served to a boss here.")
+}
 
 /// The most sessions a served boss runs at once when its grant doesn't
 /// say.
@@ -358,7 +369,7 @@ impl CrewHub {
             }
         };
         let (status, mut body) = match tool {
-            None => refused(format!("{} isn't served to a boss here.", call.tool)),
+            None => refused(unserved(&call.tool)),
             Some(tool) => self.decide_served(tool, &call, group).await,
         };
         let changed = cleaned(&mut body);
@@ -817,11 +828,11 @@ impl CrewHub {
     }
 
     /// Whether `id` is one of this engine's sessions in `g`.
-    fn in_grant(&self, g: &Grant, id: Uuid) -> bool {
+    pub(super) fn in_grant(&self, g: &Grant, id: Uuid) -> bool {
         (g.members.contains(&id) || g.born.contains(&id)) && self.desk.view(id).is_ok()
     }
 
-    fn not_in_grant(&self, g: &Grant) -> String {
+    pub(super) fn not_in_grant(&self, g: &Grant) -> String {
         workforce_desk::scope::not_ours(Some(&g.name))
     }
 
@@ -965,6 +976,7 @@ impl CrewHub {
                 }
                 Ok(json!({ "session": reported(&said.to_string(), "the session") }))
             }
+            super::inside::NAME => self.served_inside(input, g).await,
             _ => Err("not a reading tool".into()),
         }
     }

@@ -247,6 +247,7 @@ pub fn verdict(
             let d = lasted(now - r.since);
             let words = match r.words.strip_prefix("waiting for ") {
                 Some(what) => format!("has waited {d} for {what}"),
+                None if r.words.is_empty() => format!("has waited {d}"),
                 None => format!("has been {} for {d}", r.words),
             };
             stall(StallKind::Queued, r.since, words)
@@ -254,7 +255,13 @@ pub fn verdict(
         Kind::Input if sampled && past(r.since, t.quiet) => stall(
             StallKind::Input,
             r.since,
-            format!("{} for {}", r.words, lasted(now - r.since)),
+            format!(
+                "{} for {}",
+                Some(r.words.as_str())
+                    .filter(|w| !w.is_empty())
+                    .unwrap_or("may be waiting for input at its terminal"),
+                lasted(now - r.since)
+            ),
         ),
         _ => None,
     };

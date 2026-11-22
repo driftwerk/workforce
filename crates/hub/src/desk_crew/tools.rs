@@ -880,8 +880,9 @@ impl CrewTool {
 /// What a local overseer may ask of its group's or its plans' sessions on
 /// a machine, through the relay: by a session id of the machine's
 /// (`devbox/<id>`).
-const RELAYED: [&str; 9] = [
+const RELAYED: [&str; 10] = [
     "crew.history",
+    super::inside::NAME,
     "crew.nudge",
     "crew.approve",
     "crew.deny",
@@ -970,7 +971,8 @@ impl CrewTool {
         let named = input["session_id"].as_str()?;
         let (machine, id) = super::relay::machine_session(named)?;
         // A machine keeps no account of its sessions here: what it gives
-        // is its history of one, as crew.history reads it.
+        // is its history of one, as crew.history reads it, and what Desk
+        // sees inside it.
         let name = match self.name {
             "crew.account" => "crew.history",
             n => n,
@@ -985,6 +987,16 @@ impl CrewTool {
             Ok(g) => g,
             Err(why) => return Some(Err(why)),
         };
+        let mut sent = input.clone();
+        sent["session_id"] = json!(id.to_string());
+        // What Desk sees inside it is read there and judged here, at any
+        // level, as its history is.
+        if self.name == super::inside::NAME {
+            return Some(
+                crew.relayed_inside(&b.service, &b.oversight, machine, &g, sent)
+                    .await,
+            );
+        }
         // What its own level here doesn't let it do, it doesn't ask of a
         // machine either; the machine decides at no more than it.
         if name != "crew.history" && b.oversight.level == workforce_common::oversight::Level::Watch
@@ -994,8 +1006,6 @@ impl CrewTool {
             ));
         }
         let ceiling = crew.ceiling_now(b.service.agent_id.as_str(), &b.oversight);
-        let mut sent = input.clone();
-        sent["session_id"] = json!(id.to_string());
         let cited = input["preference"]
             .as_str()
             .is_some_and(|p| !p.trim().is_empty());
@@ -1031,14 +1041,32 @@ impl CrewTool {
                 }
             }
         }
-        let relayed = crew.relay(machine, &g, name, sent, agent, &ceiling).await;
+        // Its account is its history there and what Desk sees inside it,
+        // asked at once.
+        let inside = async {
+            match self.name {
+                "crew.account" => Some(
+                    crew.relayed_inside(
+                        &b.service,
+                        &b.oversight,
+                        machine,
+                        &g,
+                        json!({ "session_id": id.to_string(), "facet": "glance" }),
+                    )
+                    .await,
+                ),
+                _ => None,
+            }
+        };
+        let (relayed, inside) =
+            futures::join!(crew.relay(machine, &g, name, sent, agent, &ceiling), inside);
         if let Some(a) = assigned.map(|a| a.id) {
             let ok = relayed
                 .as_ref()
                 .is_ok_and(|r| r.status == super::served::ServedStatus::Ok);
             crew.assign_relayed_done(a, ok).await;
         }
-        Some(match relayed {
+        let answered = match relayed {
             Ok(a) => {
                 let said = reported(
                     &workforce_desk::sees::capped(
@@ -1064,6 +1092,16 @@ impl CrewTool {
                 }
             }
             Err(why) => Err(why),
+        };
+        Some(match inside {
+            None => answered,
+            Some(inside) => answered.map(|mut v| {
+                if let Some(said) = v.as_object_mut().and_then(|o| o.remove("done")) {
+                    v["session"] = said;
+                }
+                v["inside"] = inside.map_or_else(|why| json!(why), |i| i["glance"].clone());
+                v
+            }),
         })
     }
 }

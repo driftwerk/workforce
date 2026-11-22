@@ -276,6 +276,9 @@ pub struct CrewHub {
     /// The sessions' folders as git last read them for a glance
     /// ([`inside`]), by folder.
     workspaces: Mutex<HashMap<String, (workspace::Workspace, std::time::Instant)>>,
+    /// What is known inside the sessions on the person's machines
+    /// ([`inside`]).
+    machine_sight: Mutex<inside::MachineSight>,
     /// How long a finished session rests before it is closed
     /// ([`closing::SETTLE`]; a test's own).
     close_settle: Mutex<chrono::Duration>,
@@ -789,6 +792,7 @@ impl CrewHub {
             closing: Mutex::default(),
             github_seen: Mutex::default(),
             workspaces: Mutex::default(),
+            machine_sight: Mutex::default(),
             close_settle: Mutex::new(closing::SETTLE),
             closing_now: tokio::sync::Mutex::new(()),
             dm_typing: Mutex::default(),

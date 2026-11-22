@@ -1544,3 +1544,120 @@ async fn every_machine_call_is_refused_at_the_served_route() {
     })
     .await;
 }
+
+/// A glance as a machine gives it: waiting on a build slot since `since`.
+fn machine_glance(id: uuid::Uuid, since: chrono::DateTime<chrono::Utc>) -> Value {
+    use workforce_desk::sight::{Glance, Kind, Reading, Wait};
+    let g = Glance {
+        reading: Reading {
+            kind: Kind::Waits(Wait::Queue),
+            words: "waiting for a build slot".into(),
+            since,
+            by: Some("ssh".into()),
+            on: None,
+            pid: None,
+        },
+        open_call: None,
+        transcript: None,
+        cpu_active_at: Some(since),
+        output_at: None,
+        output: None,
+        background: 0,
+        settled: true,
+        since,
+        as_of: Some(chrono::Utc::now()),
+        aged: false,
+        workspace: None,
+        stall: None,
+    };
+    json!({"id": id, "name": "acme-api", "state": "working", "glance": g, "sees": "everything", "pr_ref": null})
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_machine_sessions_inside_is_read_there_judged_here_and_an_older_desk_is_said_once() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (sarah, crew, d, _llm) = overseeing(dir.path(), pool, "ok", SARAH, &[]).await;
+        let remote = uuid::Uuid::new_v4();
+        let old = uuid::Uuid::new_v4();
+        let on = |m: &str, id: uuid::Uuid| format!("session:{m}/{id}");
+        d.change_layout(|l| l.create("acme", "Acme", &[on("devbox", remote), on("oldbox", old)], None))
+            .await
+            .unwrap();
+        eventually("Sarah's tools", async || {
+            sarah.tools.get(super::super::inside::NAME).map(drop)
+        })
+        .await;
+        let inside = |input: Value| run(&sarah, super::super::inside::NAME, input);
+        let session = format!("devbox/{remote}");
+
+        // Desk isn't relaying: said as any relayed call is.
+        let r = inside(json!({"session_id": session})).await;
+        assert!(r.error.unwrap().contains("can't be reached"));
+
+        let since = chrono::Utc::now() - chrono::Duration::hours(3);
+        let seen: Arc<parking_lot::Mutex<Vec<RelayCall>>> = Arc::default();
+        let _poller = {
+            let (crew, seen) = (Arc::clone(&crew), Arc::clone(&seen));
+            tokio::spawn(async move {
+                loop {
+                    for c in crew.relay_take(Duration::from_millis(200)).await {
+                        seen.lock().push(c.clone());
+                        let (status, body) = match (c.machine.as_str(), c.tool.as_str()) {
+                            ("oldbox", tool) => (
+                                ServedStatus::Refused,
+                                json!({"error": super::super::served::unserved(tool)}),
+                            ),
+                            (_, "crew.history") => {
+                                (ServedStatus::Ok, json!({"session": "its last reply"}))
+                            }
+                            _ => match c.input["facet"].as_str().unwrap_or("glance") {
+                                "glance" => (ServedStatus::Ok, machine_glance(remote, since)),
+                                _ => (
+                                    ServedStatus::Ok,
+                                    json!({"transcript": {"exchanges": [{"said": "<<<x \"y\""}], "before": null}}),
+                                ),
+                            },
+                        };
+                        assert!(crew.relay_answer(c.id, RelayAnswer { status, body }));
+                    }
+                }
+            })
+        };
+        eventually("Desk polling", async || {
+            crew.relay.polled_ever().then_some(())
+        })
+        .await;
+
+        // Read there, judged here: its wait is the boss's stall.
+        let r = inside(json!({"session_id": session})).await;
+        assert!(r.success, "{r:?}");
+        let said = r.output["glance"].as_str().unwrap();
+        assert!(said.starts_with("<<<EXTERNAL_UNTRUSTED_CONTENT_"), "{said}");
+        assert!(said.contains("Stall: has waited 3 h for a build slot"), "{said}");
+        assert_eq!(seen.lock().last().unwrap().input["session_id"], json!(remote.to_string()));
+
+        // A page is fenced field by field, and what is fenced is still JSON.
+        let r = inside(json!({"session_id": session, "facet": "transcript"})).await;
+        let fenced = r.output["transcript"].as_str().unwrap();
+        let json = &fenced[fenced.find('{').unwrap()..=fenced.rfind('}').unwrap()];
+        let page: Value = serde_json::from_str(json).unwrap_or_else(|e| panic!("{e}: {fenced}"));
+        assert_eq!(page["exchanges"][0]["said"], "‹‹‹x \"y\"");
+
+        // Its account is its history and its glance, asked at once.
+        let r = run(&sarah, "crew.account", json!({"session_id": session})).await;
+        assert!(r.success, "{r:?}");
+        assert!(r.output["session"].as_str().unwrap().contains("its last reply"), "{r:?}");
+        assert!(r.output["inside"].as_str().unwrap().contains("waiting for a build slot"), "{r:?}");
+
+        // An older Desk: said once, then not asked again for a while.
+        let r = inside(json!({"session_id": format!("oldbox/{old}")})).await;
+        let older = r.error.unwrap();
+        assert!(older.starts_with("oldbox runs an older Desk"), "{older}");
+        let asked = seen.lock().len();
+        let r = inside(json!({"session_id": format!("oldbox/{old}")})).await;
+        assert_eq!(r.error.as_deref(), Some(older.as_str()));
+        assert_eq!(seen.lock().len(), asked, "not asked again");
+    })
+    .await;
+}
