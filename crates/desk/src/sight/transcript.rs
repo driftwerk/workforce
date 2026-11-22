@@ -677,7 +677,11 @@ mod tests {
         let c = cursor("16777220-4242", 1234);
         assert_eq!(read_cursor(&c), Some(("16777220-4242".into(), 1234)));
         assert_eq!(read_cursor("not a cursor!"), None);
-        assert_eq!(read_cursor(&cursor("x", 0).replace('A', "")), None);
+        let unread = |text: &str| {
+            read_cursor(&base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(text))
+        };
+        assert_eq!(unread("no offset"), None);
+        assert_eq!(unread("x:minus"), None);
     }
 
     #[test]
