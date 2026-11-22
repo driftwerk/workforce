@@ -62,6 +62,9 @@ pub(crate) enum Left {
     },
     /// Its request is the person's again: Act fully isn't in force for it.
     YoursAgain { session: String },
+    /// `more` of the oldest of these made room for newer ones before they
+    /// were said.
+    Crowded { more: usize },
 }
 
 impl Left {
@@ -109,6 +112,9 @@ impl Left {
             }
             Self::YoursAgain { session } => format!(
                 "{session}'s request is yours again: Act fully isn't in force for it now, so I didn't do what I decided"
+            ),
+            Self::Crowded { more } => format!(
+                "{more} more things I left to you came faster than I could tell you here: see those sessions in Desk there"
             ),
         }
     }
@@ -170,6 +176,7 @@ impl Left {
             Self::YoursAgain { session } => Self::YoursAgain {
                 session: f(session),
             },
+            Self::Crowded { more } => Self::Crowded { more },
         }
     }
 }

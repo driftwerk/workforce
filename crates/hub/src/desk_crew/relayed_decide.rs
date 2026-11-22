@@ -59,6 +59,9 @@ const TAKE_EVERY: Duration = Duration::from_secs(1);
 /// How often, when the machine says its grant doesn't put the boss at Act
 /// fully, or can't be reached.
 const IDLE_EVERY: Duration = Duration::from_secs(10);
+/// How long after Act fully lapses, or after its last notice for the person
+/// since, the Mac still takes from the machine for what it left to them.
+const NOTED_FOR: Duration = Duration::from_secs(60);
 /// The most decisions one take hands out: no more than the Mac has room
 /// to decide at once, and fewer when it says so (`most`).
 const MOST_TAKEN: usize = AT_ONCE;
@@ -211,6 +214,10 @@ pub(crate) struct Outbox {
     /// What each boss (`home/<agent>`) leaves to the person, oldest first:
     /// each of its home's takes hands it until one says it was taken.
     notes: HashMap<String, VecDeque<Note>>,
+    /// How many of each boss's oldest notices made room for newer ones,
+    /// said as one notice of their own (by its id) until a take says it
+    /// was taken.
+    crowded: HashMap<String, (Uuid, usize)>,
     /// Who waits for each answer, and whose it is.
     waiting: HashMap<Uuid, (Key, oneshot::Sender<Result<String, Failed>>)>,
     /// What a take handed out: only these are answered.
@@ -226,6 +233,48 @@ pub(crate) struct Outbox {
 }
 
 impl Outbox {
+    /// Keeps `left` for `party`'s home to take: the oldest makes room once
+    /// [`MOST_NOTES`] wait, and is counted, never lost unsaid.
+    fn leave(&mut self, party: &str, left: Left) {
+        let notes = self.notes.entry(party.to_string()).or_default();
+        if notes.len() >= MOST_NOTES {
+            notes.pop_front();
+            self.crowded
+                .entry(party.to_string())
+                .or_insert_with(|| (Uuid::new_v4(), 0))
+                .1 += 1;
+        }
+        notes.push_back(Note {
+            id: Uuid::new_v4(),
+            left,
+        });
+    }
+
+    /// What `party`'s home takes now, once those it says it took (`said`)
+    /// are gone: each notice, then how many made room, if any did.
+    fn notes_of(&mut self, party: &str, said: &HashSet<Uuid>) -> Vec<Note> {
+        if self
+            .crowded
+            .get(party)
+            .is_some_and(|(id, _)| said.contains(id))
+        {
+            self.crowded.remove(party);
+        }
+        let mut notes: Vec<Note> = match self.notes.get_mut(party) {
+            Some(n) => {
+                n.retain(|note| !said.contains(&note.id));
+                Vec::from(n.clone())
+            }
+            None => Vec::new(),
+        };
+        self.notes.retain(|_, n| !n.is_empty());
+        notes.extend(self.crowded.get(party).map(|(id, more)| Note {
+            id: *id,
+            left: Left::Crowded { more: *more },
+        }));
+        notes
+    }
+
     fn forget(&mut self, id: Uuid) {
         self.waiting.remove(&id);
         self.taken.remove(&id);
@@ -383,15 +432,7 @@ impl CrewHub {
     /// person, for its home's takes to say in the boss's DM there; the
     /// oldest goes first once [`MOST_NOTES`] wait.
     pub(crate) fn relayed_note(&self, party: &str, left: Left) {
-        let mut out = self.relayed.lock();
-        let notes = out.notes.entry(party.to_string()).or_default();
-        if notes.len() >= MOST_NOTES {
-            notes.pop_front();
-        }
-        notes.push_back(Note {
-            id: Uuid::new_v4(),
-            left: tidied(left),
-        });
+        self.relayed.lock().leave(party, tidied(left));
     }
 
     /// One decision call by `boss` (`home/<agent>`), relayed from the home,
@@ -574,20 +615,7 @@ impl CrewHub {
             .flatten()
             .filter_map(|v| v.as_str()?.parse().ok())
             .collect();
-        let notes: Vec<Note> = {
-            let mut out = self.relayed.lock();
-            match out.notes.get_mut(&key.0) {
-                Some(n) => {
-                    n.retain(|note| !said.contains(&note.id));
-                    let left = Vec::from(n.clone());
-                    if n.is_empty() {
-                        out.notes.remove(&key.0);
-                    }
-                    left
-                }
-                None => Vec::new(),
-            }
-        };
+        let notes = self.relayed.lock().notes_of(&key.0, &said);
         let full = in_force && self.served_full(&key.0).is_some();
         let mut body = json!({ "full": full, "decisions": decisions, "notes": notes });
         if let (Some(f), Some(usd)) = (from, here) {
@@ -693,6 +721,9 @@ struct Pump {
     busy: bool,
     /// The last take said Act fully is in force.
     said: bool,
+    /// Until when it is still taken, Act fully having lapsed, for the
+    /// notices the machine leaves the person ([`NOTED_FOR`]).
+    noting: Option<Instant>,
     /// When the machine last answered with its spend for the count that
     /// starts then ([`super::shared_budget`]): only a machine that counts
     /// the one budget is told Act fully is in force, within
@@ -761,12 +792,26 @@ impl Pump {
     }
 }
 
+impl Pump {
+    /// Whether to take now. Once Act fully lapses here the machine is told
+    /// at once; after, it is still taken now and then for a while, for what
+    /// was left to the person there.
+    fn due(&self, in_force: bool, now: Instant) -> bool {
+        let lapsed = !in_force && self.said;
+        let wanted = in_force
+            || self.noting.is_some_and(|until| now < until)
+            || !self.notes_taken.is_empty();
+        !self.busy && (lapsed || (wanted && now >= self.next))
+    }
+}
+
 impl Default for Pump {
     fn default() -> Self {
         Self {
             next: Instant::now(),
             busy: false,
             said: false,
+            noting: None,
             counts: None,
             calls: VecDeque::new(),
             at_once: Arc::new(tokio::sync::Semaphore::new(AT_ONCE)),
@@ -835,7 +880,7 @@ pub(crate) async fn pump_loop(crew: Arc<CrewHub>, cancel: CancellationToken) {
                 {
                     let mut p = pumps.lock();
                     let p = p.entry(k.clone()).or_default();
-                    if p.busy || (!in_force && !p.said) || (in_force && Instant::now() < p.next) {
+                    if !p.due(in_force, Instant::now()) {
                         continue;
                     }
                     p.busy = true;
@@ -929,10 +974,25 @@ async fn take(
     if let Some((f, usd)) = reported {
         crew.machine_reported(&agent, machine, group, f, usd).await;
     }
+    let notes: Vec<Note> = match &got {
+        Ok(a) if a.status == ServedStatus::Ok => a.body["notes"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .take(MOST_NOTES + 1)
+            .filter_map(|n| serde_json::from_value(n.clone()).ok())
+            .collect(),
+        _ => Vec::new(),
+    };
     {
         let mut p = pumps.lock();
         let p = p.entry(k.clone()).or_default();
         p.busy = false;
+        p.noting = match (in_force, p.said || !notes.is_empty()) {
+            (true, _) => None,
+            (false, true) => Some(Instant::now() + NOTED_FOR),
+            (false, false) => p.noting,
+        };
         p.said = says && got.is_ok();
         if let Some((f, _)) = reported {
             p.counts = Some((f, Instant::now()));
@@ -948,16 +1008,6 @@ async fn take(
                 _ => IDLE_EVERY,
             };
     }
-    let notes: Vec<Note> = match &got {
-        Ok(a) if a.status == ServedStatus::Ok => a.body["notes"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .take(MOST_NOTES)
-            .filter_map(|n| serde_json::from_value(n.clone()).ok())
-            .collect(),
-        _ => Vec::new(),
-    };
     if got.as_ref().is_ok_and(|a| a.status == ServedStatus::Ok) {
         let mut p = pumps.lock();
         let p = p.entry(k.clone()).or_default();
@@ -1119,6 +1169,56 @@ mod tests {
             takes: HashSet::new(),
         }
     }
+
+    #[test]
+    fn a_machine_is_taken_from_at_act_fully_and_for_a_while_after_it_lapses() {
+        let now = Instant::now();
+        let mut p = Pump {
+            next: now,
+            ..Pump::default()
+        };
+        assert!(!p.due(false, now), "never at Act fully");
+        assert!(p.due(true, now));
+        p.next = now + TAKE_EVERY;
+        assert!(!p.due(true, now));
+        p.said = true;
+        assert!(p.due(false, now), "told at once that it lapsed");
+        p.busy = true;
+        assert!(!p.due(false, now));
+        p.busy = false;
+        p.said = false;
+        p.noting = Some(now + NOTED_FOR);
+        assert!(!p.due(false, now));
+        assert!(p.due(false, now + IDLE_EVERY));
+        assert!(!p.due(false, now + NOTED_FOR));
+        p.notes_taken.push(Uuid::new_v4());
+        assert!(
+            p.due(false, now + NOTED_FOR),
+            "until it hears what was said"
+        );
+    }
+
+    #[test]
+    fn notices_past_the_most_kept_are_counted_and_said_never_lost() {
+        let mut out = Outbox::default();
+        let asks = |i: usize| Left::Asks {
+            session: format!("VEL-{i}"),
+            ask: "Ship it?".into(),
+        };
+        for i in 0..MOST_NOTES + 3 {
+            out.leave(SARAH, asks(i));
+        }
+        let notes = out.notes_of(SARAH, &HashSet::new());
+        assert_eq!(notes.len(), MOST_NOTES + 1);
+        assert_eq!(notes[0].left, asks(3), "the oldest made room");
+        assert_eq!(notes[MOST_NOTES].left, Left::Crowded { more: 3 });
+        // Taken: each is handed no more.
+        let said: HashSet<Uuid> = notes.iter().map(|n| n.id).collect();
+        assert!(out.notes_of(SARAH, &said).is_empty());
+        assert!(out.notes.is_empty() && out.crowded.is_empty());
+    }
+
+    const SARAH: &str = "home/sarah";
 
     /// A word that counted its boss's other grant here before that grant
     /// spent more is never behind it: what it spent since is added, once.

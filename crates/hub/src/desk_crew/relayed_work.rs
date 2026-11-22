@@ -127,14 +127,42 @@ pub(crate) struct Frame {
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct Taken {
-    /// Where the next take reads from: when it was made, or its last
-    /// event's time when it hands back as many as a take does.
+    /// When it was made: where the next take reads from, unless `after`
+    /// says.
     pub now: i64,
+    /// Its last event, when it hands back as many as a take does: the
+    /// next take reads on past it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after: Option<ReadTo>,
     pub sessions: Vec<Run>,
     pub events: Vec<Frame>,
     pub asks: Vec<Line>,
     pub reports: Vec<Line>,
     pub requests: Vec<Frame>,
+}
+
+/// The last event a take read: its time and id.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct ReadTo {
+    pub at: DateTime<Utc>,
+    pub id: String,
+}
+
+/// Where a take reads from: a time, or past an event.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ReadFrom {
+    Since(DateTime<Utc>),
+    After(ReadTo),
+}
+
+impl ReadFrom {
+    /// Where the take after `t` reads from.
+    fn after(t: &Taken) -> Option<Self> {
+        match &t.after {
+            Some(r) => Some(Self::After(r.clone())),
+            None => DateTime::from_timestamp_millis(t.now).map(Self::Since),
+        }
+    }
 }
 
 /// A boss and grant: the boss's party (`home/<agent>`) and the group's id.
@@ -145,7 +173,7 @@ pub(crate) struct Homes {
     /// When each boss and grant's home last took.
     took: HashMap<Key, Instant>,
     /// Where the next take of each reads from when its home doesn't say.
-    cursor: HashMap<Key, DateTime<Utc>>,
+    cursor: HashMap<Key, ReadFrom>,
     /// Until then, a boss no home took for yet may still be read: one
     /// restarted here is taken for again within [`WORK_FRESH`].
     grace: Instant,
@@ -205,6 +233,12 @@ impl AwayRun {
     /// nothing of now.
     fn of(&self, boss: &str) -> Option<&Run> {
         (self.boss == boss && self.at.elapsed() < WORK_FRESH).then_some(&self.run)
+    }
+
+    /// Whether it holds one of `boss`'s slots: as its last take said, however
+    /// old, so a link that drops never frees a slot the machine still uses.
+    fn holds_slot(&self, boss: &str) -> bool {
+        self.boss == boss && self.run.busy()
     }
 }
 
@@ -267,14 +301,16 @@ impl CrewHub {
     }
 
     /// Gives the person each open question to a boss relayed from the home
-    /// whose home no longer reads its line, at most every [`SWEEP_EVERY`].
+    /// whose home no longer reads its line, at most every [`SWEEP_EVERY`]:
+    /// while a relayed boss runs a session here, or any session waits on a
+    /// question (one whose relayed boss was let go since included).
     pub(super) async fn sweep_unread_homes(&self) {
         let relayed = self
             .desk
             .charges()
             .iter()
             .any(|c| super::relayed_decide::relayed_party(&c.boss));
-        if !relayed {
+        if !relayed && !self.desk.asks_waited_on() {
             return;
         }
         {
@@ -306,7 +342,7 @@ impl CrewHub {
     }
 
     /// The home's take of `boss`'s work under `group`'s grant
-    /// ([`WORK_TAKE`]): from `since` (else where its last take ended, else
+    /// ([`WORK_TAKE`]): from `since`, or past `after` (else where its last take ended, else
     /// now), acknowledging the reports it says it `taken`. One that only
     /// `peek`s reads what is open now and leaves where the next take reads
     /// from.
@@ -329,24 +365,32 @@ impl CrewHub {
         }
         let now = Utc::now();
         let peek = input["peek"].as_bool() == Some(true);
-        let since = {
+        let from = {
             let mut h = self.work_homes.lock();
             h.took.insert(key.clone(), Instant::now());
+            let said = serde_json::from_value::<ReadTo>(input["after"].clone())
+                .ok()
+                .map(ReadFrom::After)
+                .or_else(|| {
+                    input["since"]
+                        .as_i64()
+                        .and_then(DateTime::from_timestamp_millis)
+                        .map(ReadFrom::Since)
+                })
+                .filter(|f| match f {
+                    ReadFrom::Since(at) | ReadFrom::After(ReadTo { at, .. }) => *at <= now,
+                });
             match peek {
-                true => now,
-                false => input["since"]
-                    .as_i64()
-                    .and_then(DateTime::from_timestamp_millis)
-                    .filter(|s| *s <= now)
-                    .or_else(|| h.cursor.get(&key).copied())
-                    .unwrap_or(now),
+                true => ReadFrom::Since(now),
+                false => said
+                    .or_else(|| h.cursor.get(&key).cloned())
+                    .unwrap_or(ReadFrom::Since(now)),
             }
         };
-        match self.relayed_work_of(&g, &key.0, since, now, input).await {
+        match self.relayed_work_of(&g, &key.0, &from, now, input).await {
             Ok(taken) => {
-                if let Some(read_to) = DateTime::from_timestamp_millis(taken.now).filter(|_| !peek)
-                {
-                    self.work_homes.lock().cursor.insert(key, read_to);
+                if let Some(next) = ReadFrom::after(&taken).filter(|_| !peek) {
+                    self.work_homes.lock().cursor.insert(key, next);
                 }
                 let mut body = json!(taken);
                 super::served::cleaned(&mut body);
@@ -364,7 +408,7 @@ impl CrewHub {
         &self,
         g: &Grant,
         party: &str,
-        since: DateTime<Utc>,
+        from: &ReadFrom,
         now: DateTime<Utc>,
         input: &Value,
     ) -> eyre::Result<Taken> {
@@ -421,15 +465,29 @@ impl CrewHub {
             false => {
                 self.desk
                     .store()
-                    .events_from(since, &ids, MOST_EVENTS)
+                    .events_from(
+                        match from {
+                            ReadFrom::Since(at) => *at,
+                            ReadFrom::After(r) => r.at,
+                        },
+                        match from {
+                            ReadFrom::Since(_) => None,
+                            ReadFrom::After(r) => Some((r.at, r.id.as_str())),
+                        },
+                        &ids,
+                        MOST_EVENTS,
+                    )
                     .await?
             }
         };
-        // As many as one take hands back: the next reads on from the last.
-        let read_to = match events.len() as i64 {
-            n if n >= MOST_EVENTS => events.last().map_or(now, |e| e.at),
-            _ => now,
-        };
+        // As many as one take hands back: the next reads on past the last.
+        let after = events
+            .last()
+            .filter(|_| events.len() as i64 >= MOST_EVENTS)
+            .map(|e| ReadTo {
+                at: e.at,
+                id: e.id.clone(),
+            });
         let events = events
             .iter()
             .filter_map(|e| {
@@ -484,7 +542,8 @@ impl CrewHub {
             })
             .unzip();
         Ok(Taken {
-            now: read_to.timestamp_millis(),
+            now: now.timestamp_millis(),
+            after,
             sessions,
             events,
             asks,
@@ -544,8 +603,8 @@ impl Work {
 struct Pump {
     next: Instant,
     busy: bool,
-    /// Where the next take reads from: the last one's `now`.
-    cursor: Option<i64>,
+    /// Where the next take reads from: past the last one.
+    cursor: Option<ReadFrom>,
     /// The events the last take handed back: one at its cursor comes again.
     seen: HashSet<String>,
     /// The reports a turn took, for the next take to acknowledge.
@@ -692,13 +751,13 @@ impl CrewHub {
     }
 
     /// How many of `boss`'s sessions on machines, outside its plans
-    /// (`planned`), hold a slot.
+    /// (`planned`), hold a slot, as each machine's last take said.
     pub(crate) fn machine_runs_busy(&self, boss: &str, planned: impl Fn(&str) -> bool) -> usize {
         self.work_away
             .lock()
             .runs
             .iter()
-            .filter(|(k, r)| r.of(boss).is_some_and(Run::busy) && !planned(k))
+            .filter(|(k, r)| r.holds_slot(boss) && !planned(k))
             .count()
     }
 
@@ -812,9 +871,11 @@ pub(crate) async fn work_loop(crew: Arc<CrewHub>, cancel: CancellationToken) {
             () = cancel.cancelled() => return,
             _ = tick.tick() => {}
         }
+        // Desk not relaying (its link dropped): what the machines last said
+        // of their sessions still holds their slots, until a take says
+        // otherwise.
         if !crew.relaying() {
             pumps.lock().clear();
-            crew.away_forget(|_| false);
             continue;
         }
         let mut seen = HashSet::new();
@@ -861,9 +922,13 @@ async fn take(
     let (cursor, sent) = {
         let mut p = pumps.lock();
         let p = p.entry(k.clone()).or_default();
-        (p.cursor, p.acked.clone())
+        (p.cursor.clone(), p.acked.clone())
     };
-    let input = json!({ "since": cursor, "taken": sent });
+    let input = match cursor {
+        Some(ReadFrom::After(r)) => json!({ "after": r, "taken": sent }),
+        Some(ReadFrom::Since(at)) => json!({ "since": at.timestamp_millis(), "taken": sent }),
+        None => json!({ "taken": sent }),
+    };
     let ceiling = crew.ceiling_now(&agent, &o);
     let got = crew
         .relay(machine, group, WORK_TAKE, input, &agent, &ceiling)
@@ -892,7 +957,7 @@ async fn take(
         p.next = started + next_take(crew.timing.tick, runs, older);
         match &taken {
             Some(t) => {
-                p.cursor = Some(t.now);
+                p.cursor = ReadFrom::after(t).or(p.cursor.take());
                 p.acked.retain(|id| !sent.contains(id));
                 p.heard(t);
                 p.due()
@@ -1189,6 +1254,7 @@ mod tests {
         let report = line(s, LineKind::Tell);
         let t = Taken {
             now: 1,
+            after: None,
             sessions: vec![run(s)],
             events: vec![frame("e1", s), frame("e2", gone)],
             asks: vec![ask.clone()],
@@ -1221,6 +1287,7 @@ mod tests {
         let report = line(s, LineKind::Tell);
         let t = Taken {
             now: 1,
+            after: None,
             sessions: vec![run(s)],
             reports: vec![report.clone()],
             ..Taken::default()
@@ -1249,6 +1316,7 @@ mod tests {
         let (settled, lost) = (line(s, LineKind::Ask), line(s, LineKind::Ask));
         let t = Taken {
             now: 1,
+            after: None,
             sessions: vec![run(s)],
             asks: vec![settled.clone(), lost.clone()],
             ..Taken::default()
@@ -1300,6 +1368,8 @@ mod tests {
             away(Instant::now() - WORK_FRESH).of("home/desk").is_none(),
             "a take that old says nothing of now"
         );
+        // Its slot is still held until a take says otherwise.
+        assert!(away(Instant::now() - WORK_FRESH).holds_slot("home/desk"));
     }
 
     #[test]
@@ -1327,6 +1397,10 @@ mod tests {
         let s = Uuid::new_v4();
         let t = Taken {
             now: 42,
+            after: Some(ReadTo {
+                at: Utc::now(),
+                id: "e".into(),
+            }),
             sessions: vec![run(s)],
             events: vec![frame("e", s)],
             asks: vec![line(s, LineKind::Ask)],

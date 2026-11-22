@@ -260,21 +260,25 @@ impl DeskStore {
         rows.iter().map(event).collect()
     }
 
-    /// The first `limit` events from `since` on, oldest first, about the
-    /// subjects in `ids`: what a reader that goes on from the last of them
-    /// reads.
+    /// The first `limit` events about the subjects in `ids`, oldest first:
+    /// from `since` on, or past the event `after` (its time and id), so a
+    /// reader that goes on from the last of them misses none and reads
+    /// none twice, however many share a time.
     pub async fn events_from(
         &self,
         since: DateTime<Utc>,
+        after: Option<(DateTime<Utc>, &str)>,
         ids: &[String],
         limit: i64,
     ) -> Result<Vec<Event>> {
         let client = self.pool().get().await?;
+        let (at, id) = after.map_or((since, None), |(at, id)| (at, Some(id)));
         let rows = client
             .query(
-                "SELECT * FROM activity WHERE at >= $1 AND subject ->> 'id' = ANY($2) \
+                "SELECT * FROM activity WHERE subject ->> 'id' = ANY($2) \
+                 AND (($4::text IS NULL AND at >= $1) OR (at, id) > ($1, $4)) \
                  ORDER BY at, id LIMIT $3",
-                &[&since, &ids, &limit],
+                &[&at, &ids, &limit, &id],
             )
             .await?;
         rows.iter().map(event).collect()
@@ -769,10 +773,11 @@ mod tests {
         .await;
     }
 
-    /// A reader going on from the last of a full read misses none: the
-    /// oldest come first, and the last is read again, never one past it.
+    /// A reader going on from the last of a full read misses none and
+    /// reads none twice: the oldest come first, and the next read goes on
+    /// past the last, by its time and id, however many share its time.
     #[tokio::test]
-    async fn events_from_a_time_on_are_the_oldest_and_the_next_read_goes_on_from_the_last() {
+    async fn events_from_a_time_on_are_the_oldest_and_the_next_read_goes_on_past_the_last() {
         with_test_pool(build_pool, |pool| async move {
             DeskStore::migrate(&pool).await.unwrap();
             let store = DeskStore::from_pool(pool);
@@ -791,15 +796,30 @@ mod tests {
                     Some(subject.clone()),
                     format!("event {i}"),
                 );
-                e.at = from + chrono::Duration::seconds(i as i64);
+                // Events 0 to 2 share a time.
+                e.at = from + chrono::Duration::seconds(i.saturating_sub(2) as i64);
                 store.add_event(&e).await.unwrap();
             }
             let ids = ["scout".to_string()];
             let texts = |es: &[Event]| es.iter().map(|e| e.text.clone()).collect::<Vec<_>>();
-            let first = store.events_from(from, &ids, 2).await.unwrap();
-            assert_eq!(texts(&first), ["event 0", "event 1"]);
-            let next = store.events_from(first[1].at, &ids, 3).await.unwrap();
-            assert_eq!(texts(&next), ["event 1", "event 3", "event 4"]);
+            let first = store.events_from(from, None, &ids, 1).await.unwrap();
+            assert_eq!(first.len(), 1);
+            let last = (first[0].at, first[0].id.as_str());
+            let next = store.events_from(from, Some(last), &ids, 3).await.unwrap();
+            let mut read = texts(&first);
+            read.extend(texts(&next));
+            read.sort();
+            assert_eq!(
+                read,
+                ["event 0", "event 1", "event 3", "event 4"],
+                "each once"
+            );
+            let last = next.last().map(|e| (e.at, e.id.as_str()));
+            assert!(store
+                .events_from(from, last, &ids, 3)
+                .await
+                .unwrap()
+                .is_empty());
         })
         .await;
     }
