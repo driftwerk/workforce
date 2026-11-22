@@ -80,6 +80,10 @@ const LONG: &[(&str, &[&str])] = &[
 /// How much CPU a tree uses between two samples for it to be active.
 const ACTIVE_SECS: u64 = 1;
 
+/// How much earlier than its call a tool shell may read as started: `ps`
+/// and a record both keep whole seconds.
+pub const SKEW: Duration = Duration::seconds(2);
+
 fn said() -> &'static [(Wait, Regex, &'static str)] {
     static SAID_RE: OnceLock<Vec<(Wait, Regex, &'static str)>> = OnceLock::new();
     SAID_RE.get_or_init(|| {
@@ -92,16 +96,74 @@ fn said() -> &'static [(Wait, Regex, &'static str)] {
     })
 }
 
-/// What a command's output says it waits on: its newest line that says.
-pub fn said_wait(output: &[String]) -> Option<(Wait, String)> {
-    output.iter().rev().find_map(|line| {
-        said().iter().find_map(|(wait, re, words)| {
-            let caps = re.captures(line)?;
-            let mut out = String::new();
-            caps.expand(words, &mut out);
-            Some((*wait, out.split_whitespace().collect::<Vec<_>>().join(" ")))
-        })
+/// What an output line says its command waits on.
+pub fn said_wait(line: &str) -> Option<(Wait, String)> {
+    said().iter().find_map(|(wait, re, words)| {
+        let caps = re.captures(line)?;
+        let mut out = String::new();
+        caps.expand(words, &mut out);
+        Some((*wait, out.split_whitespace().collect::<Vec<_>>().join(" ")))
     })
+}
+
+/// What an open call's or a background shell's own output last said it
+/// waits on, and since when.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Said {
+    /// The call's or the shell's id.
+    pub call: String,
+    pub wait: Wait,
+    pub words: String,
+    /// When the line that says it first appeared.
+    pub since: DateTime<Utc>,
+}
+
+/// What `call`'s output says after `new` lines (oldest first) appeared in
+/// it at `at`, `held` having been said before: the wait its newest new line
+/// says, kept from when it was first said; with no new line, `held`, until
+/// the call's own processes work again.
+pub fn said_after(
+    held: Option<Said>,
+    call: &str,
+    new: &[String],
+    at: DateTime<Utc>,
+    busy: bool,
+) -> Option<Said> {
+    let held = held.filter(|h| h.call == call);
+    let Some(line) = new.last() else {
+        return held.filter(|_| !busy);
+    };
+    let (wait, words) = said_wait(line)?;
+    Some(match held {
+        Some(h) if (h.wait, h.words.as_str()) == (wait, words.as_str()) => h,
+        _ => Said {
+            call: call.to_string(),
+            wait,
+            words,
+            since: at,
+        },
+    })
+}
+
+/// The tool shell an open call runs in: the first of `tree`'s started at or
+/// after the call.
+pub fn call_shell<'a>(tree: &[&'a Stat], call: &OpenCall, now: DateTime<Utc>) -> Option<&'a Stat> {
+    tree.iter()
+        .copied()
+        .filter(|s| procs::is_tool_shell(&s.proc))
+        .filter(|s| started(now, s) >= call.since - SKEW)
+        .max_by_key(|s| (s.elapsed_secs, std::cmp::Reverse(s.proc.pid)))
+}
+
+/// `head` and every process of `tree` under it.
+pub fn subtree<'a>(tree: &[&'a Stat], head: &'a Stat) -> Vec<&'a Stat> {
+    std::iter::once(head)
+        .chain(procs::under(tree, head.proc.pid).into_iter().copied())
+        .collect()
+}
+
+fn started(now: DateTime<Utc>, s: &Stat) -> DateTime<Utc> {
+    now - Duration::seconds(i64::try_from(s.elapsed_secs).unwrap_or(i64::MAX / 2))
 }
 
 /// A process's program and the arguments after it: a script's own name
@@ -189,14 +251,22 @@ pub fn active(prev: &HashMap<u32, (u64, u64)>, tree: &[&Stat]) -> bool {
     cpu_growth(prev, tree) >= ACTIVE_SECS
 }
 
+/// Whether a session's work ([`work`], root first) used the CPU since
+/// `prev`: what runs under its root, never the root, whose own screen keeps
+/// it ticking.
+pub fn work_active(prev: &HashMap<u32, (u64, u64)>, tree: &[&Stat]) -> bool {
+    active(prev, tree.get(1..).unwrap_or_default())
+}
+
 /// What a classification reads from.
 #[derive(Debug, Clone, Copy)]
 pub struct Evidence<'a> {
     /// The session's work, root first ([`work`]).
     pub tree: &'a [&'a Stat],
     pub open_call: Option<&'a OpenCall>,
-    /// The newest lines of its output, oldest first, already redacted.
-    pub output: &'a [String],
+    /// What the open call's and its background shells' own output says
+    /// each waits on.
+    pub said: &'a [Said],
     /// When its processes last used the CPU.
     pub active_at: DateTime<Utc>,
     pub now: DateTime<Utc>,
@@ -206,7 +276,7 @@ pub struct Evidence<'a> {
 
 impl Evidence<'_> {
     fn started(&self, s: &Stat) -> DateTime<Utc> {
-        self.now - Duration::seconds(i64::try_from(s.elapsed_secs).unwrap_or(i64::MAX / 2))
+        started(self.now, s)
     }
 
     fn parent(&self, s: &Stat) -> Option<&Stat> {
@@ -238,6 +308,7 @@ impl Evidence<'_> {
             by: Some(command(&s.proc).0),
             on: None,
             pid: Some(s.proc.pid),
+            call: None,
         }
     }
 }
@@ -256,26 +327,22 @@ pub fn classify(e: &Evidence<'_>) -> Reading {
         .unwrap_or_else(|| otherwise(e, &below))
 }
 
+/// The open call's own wait, else its background shells' longest.
 fn said_rule(e: &Evidence<'_>, below: &[&Stat]) -> Option<Reading> {
-    if below.is_empty() && e.open_call.is_none() {
-        return None;
-    }
-    let (wait, words) = said_wait(e.output)?;
-    let oldest = below.iter().max_by_key(|s| s.elapsed_secs);
+    let own = e
+        .open_call
+        .and_then(|c| Some((e.said.iter().find(|s| s.call == c.id)?, Some(c))));
+    let (said, call) = own.or_else(|| Some((e.said.iter().min_by_key(|s| s.since)?, None)))?;
     Some(Reading {
-        kind: Kind::Waits(wait),
-        words,
-        since: e
-            .open_call
-            .map(|c| c.since)
-            .or_else(|| oldest.map(|s| e.started(s)))
-            .unwrap_or(e.now),
-        by: e
-            .open_call
-            .map(|c| c.tool.clone())
-            .or_else(|| oldest.map(|s| command(&s.proc).0)),
+        kind: Kind::Waits(said.wait),
+        words: said.words.clone(),
+        since: said.since,
+        by: call.map(|c| c.tool.clone()),
         on: None,
-        pid: oldest.map(|s| s.proc.pid),
+        pid: call
+            .and_then(|c| call_shell(below, c, e.now))
+            .map(|s| s.proc.pid),
+        call: Some(said.call.clone()),
     })
 }
 
@@ -381,8 +448,11 @@ fn remote(args: &[&str]) -> Option<(String, String)> {
         match w.strip_prefix('-') {
             Some("-") => break words.next()?,
             Some(flags) => {
-                let valued = flags.chars().last().is_some_and(|f| SSH_VALUED.contains(f));
-                if valued && flags.len() == 1 {
+                let value_next = flags
+                    .char_indices()
+                    .find(|(_, f)| SSH_VALUED.contains(*f))
+                    .is_some_and(|(at, f)| at + f.len_utf8() == flags.len());
+                if value_next {
                     words.next()?;
                 }
             }
@@ -443,6 +513,7 @@ fn otherwise(e: &Evidence<'_>, below: &[&Stat]) -> Reading {
             by: Some(call.tool.clone()),
             on: None,
             pid: None,
+            call: Some(call.id.clone()),
         },
         (None, None) => Reading::quiet(e.now),
     }
@@ -474,13 +545,29 @@ mod tests {
     const SHELL: &str =
         "/bin/zsh -c source /h/.claude/shell-snapshots/snapshot-zsh-1.sh && eval 'x'";
 
-    fn read(all: &[Stat], output: &[&str], active_ago: i64) -> Reading {
+    fn bash_call(ago: i64) -> OpenCall {
+        OpenCall {
+            id: "toolu_1".into(),
+            tool: "Bash".into(),
+            input: "~/bin/rbuild w -- cargo test".into(),
+            since: now() - Duration::minutes(ago),
+        }
+    }
+
+    fn appeared(call: &OpenCall, line: &str, ago: i64) -> Option<Said> {
+        let at = now() - Duration::minutes(ago);
+        said_after(None, &call.id, &[line.to_string()], at, false)
+    }
+
+    /// `all` read with an open Bash call whose output newly said `said`.
+    fn read(all: &[Stat], said: Option<&str>, active_ago: i64) -> Reading {
         let tree = work(all, 100, Engine::Claude, None);
-        let output: Vec<String> = output.iter().map(|l| l.to_string()).collect();
+        let call = bash_call(11);
+        let said = said.and_then(|line| appeared(&call, line, 10));
         classify(&Evidence {
             tree: &tree,
-            open_call: None,
-            output: &output,
+            open_call: said.as_ref().map(|_| &call),
+            said: said.as_slice(),
             active_at: now() - Duration::minutes(active_ago),
             now: now(),
             poll: Duration::minutes(10),
@@ -507,7 +594,7 @@ mod tests {
             101,
             "ssh devbox ~/bin/rbuild-run w cargo test",
         )]);
-        let r = read(&remote, &["Compiling…", BUSY], 0);
+        let r = read(&remote, Some(BUSY), 0);
         assert_eq!(r.kind, Kind::Waits(Wait::Queue));
         assert_eq!(r.words, "waiting for a build slot");
         assert_eq!(r.since, now() - Duration::minutes(10));
@@ -515,37 +602,130 @@ mod tests {
             stat(102, 101, "/bin/bash /h/bin/rbuild-run w cargo test"),
             stat(103, 102, "sleep 10"),
         ]);
-        assert_eq!(read(&local, &[BUSY], 0).words, "waiting for a build slot");
+        assert_eq!(
+            read(&local, Some(BUSY), 0).words,
+            "waiting for a build slot"
+        );
     }
 
     #[test]
     fn what_an_output_says_it_waits_on_is_read_in_its_own_words() {
-        let lines = |l: &str| said_wait(&[l.to_string()]);
         assert_eq!(
-            lines("Waiting for the database to start"),
+            said_wait("Waiting for the database to start"),
             Some((Wait::Queue, "waiting for the database to start".into()))
         );
         assert_eq!(
-            lines("Blocking waiting for file lock on build directory"),
+            said_wait("Blocking waiting for file lock on build directory"),
             Some((Wait::Lock, "waiting for a lock".into()))
         );
-        assert_eq!(lines("job is queued"), Some((Wait::Queue, "queued".into())));
         assert_eq!(
-            lines("Retrying in 30 seconds"),
+            said_wait("job is queued"),
+            Some((Wait::Queue, "queued".into()))
+        );
+        assert_eq!(
+            said_wait("Retrying in 30 seconds"),
             Some((Wait::Retry, "retrying".into()))
         );
         assert_eq!(
-            lines("all 2 slots busy"),
+            said_wait("all 2 slots busy"),
             Some((Wait::Queue, "waiting for a slot".into()))
         );
-        assert_eq!(lines("everything is fine"), None);
-        assert_eq!(said_wait(&[]), None);
+        assert_eq!(said_wait("everything is fine"), None);
+    }
+
+    #[test]
+    fn only_the_newest_new_line_of_the_calls_output_says_a_wait_from_when_it_appeared() {
+        let lines = |l: &[&str]| l.iter().map(|l| l.to_string()).collect::<Vec<_>>();
+        let at = |min| now() + Duration::minutes(min);
+        let said = said_after(None, "t1", &lines(&["Compiling x", BUSY]), at(0), true).unwrap();
+        assert_eq!((said.wait, said.since), (Wait::Queue, at(0)));
+        let kept = said_after(Some(said.clone()), "t1", &[], at(5), false);
+        assert_eq!(kept.as_ref(), Some(&said), "nothing new keeps the wait");
+        let again = said_after(Some(said.clone()), "t1", &lines(&[BUSY]), at(6), false);
+        assert_eq!(
+            again.map(|s| s.since),
+            Some(at(0)),
+            "said again, since first said"
+        );
+        assert_eq!(
+            said_after(
+                Some(said.clone()),
+                "t1",
+                &lines(&["test a ... ok"]),
+                at(7),
+                false
+            ),
+            None,
+            "a newer line that says no wait ends it"
+        );
+        assert_eq!(
+            said_after(
+                Some(said.clone()),
+                "t1",
+                &lines(&[BUSY, "Compiling x"]),
+                at(7),
+                false
+            ),
+            None
+        );
+        assert_eq!(
+            said_after(Some(said.clone()), "t1", &[], at(7), true),
+            None,
+            "its processes working again end it"
+        );
+        let other = said_after(Some(said), "t2", &lines(&[BUSY]), at(8), false).unwrap();
+        assert_eq!((other.call.as_str(), other.since), ("t2", at(8)));
+    }
+
+    #[test]
+    fn a_wait_reads_from_the_waiting_calls_own_shell_not_the_oldest_process() {
+        let all = claude(vec![
+            Stat {
+                elapsed_secs: 3600,
+                ..stat(102, 101, "npm run dev")
+            },
+            Stat {
+                elapsed_secs: 60,
+                ..stat(103, 100, SHELL)
+            },
+            Stat {
+                elapsed_secs: 59,
+                ..stat(104, 103, "ssh devbox ~/bin/rbuild-run w cargo test")
+            },
+        ]);
+        let tree = work(&all, 100, Engine::Claude, None);
+        let call = OpenCall {
+            since: now() - Duration::seconds(61),
+            ..bash_call(0)
+        };
+        let said = appeared(&call, BUSY, 0);
+        let r = classify(&Evidence {
+            tree: &tree,
+            open_call: Some(&call),
+            said: said.as_slice(),
+            active_at: now(),
+            now: now(),
+            poll: Duration::minutes(10),
+        });
+        assert_eq!(r.kind, Kind::Waits(Wait::Queue));
+        assert_eq!((r.pid, r.call.as_deref()), (Some(103), Some("toolu_1")));
+        assert_eq!(r.since, now());
+        assert_eq!(r.by.as_deref(), Some("Bash"));
+        let later = OpenCall {
+            since: now() - Duration::seconds(30),
+            ..call
+        };
+        assert_eq!(
+            call_shell(&tree, &later, now()),
+            None,
+            "no shell started since"
+        );
     }
 
     #[test]
     fn a_secret_beside_a_wait_never_reaches_its_words() {
         let line = format!("token SECRET-abc: {BUSY}");
-        let (_, words) = said_wait(&[line]).unwrap();
+        let (_, words) = said_wait(&line).unwrap();
         assert_eq!(words, "waiting for a build slot");
         assert!(!words.contains("SECRET"));
     }
@@ -558,21 +738,59 @@ mod tests {
     }
 
     #[test]
-    fn output_alone_with_nothing_running_is_no_wait() {
-        assert_eq!(read(&idle(), &[BUSY], 0).kind, Kind::Quiet);
+    fn the_open_calls_wait_comes_first_then_a_background_shells_longest() {
+        let all = idle();
+        let tree = work(&all, 100, Engine::Claude, None);
+        let call = bash_call(11);
+        let shell = |id: &str, line: &str, ago| {
+            let at = now() - Duration::minutes(ago);
+            said_after(None, id, &[line.to_string()], at, false).unwrap()
+        };
+        let shells = [shell("b1", "retrying in 30 s", 3), shell("b2", BUSY, 8)];
+        let own = [
+            shells.to_vec(),
+            appeared(&call, "job is queued", 1).into_iter().collect(),
+        ]
+        .concat();
+        let read = |open_call, said: &[Said]| {
+            classify(&Evidence {
+                tree: &tree,
+                open_call,
+                said,
+                active_at: now(),
+                now: now(),
+                poll: Duration::minutes(10),
+            })
+        };
+        let r = read(Some(&call), &own);
+        assert_eq!(
+            (r.words.as_str(), r.call.as_deref(), r.by.as_deref()),
+            ("queued", Some("toolu_1"), Some("Bash"))
+        );
+        for open_call in [None, Some(&call)] {
+            let r = read(open_call, &shells);
+            assert_eq!(r.kind, Kind::Waits(Wait::Queue));
+            assert_eq!(r.call.as_deref(), Some("b2"), "the longest-waiting shell");
+            assert_eq!(
+                (r.since, r.pid, r.by),
+                (now() - Duration::minutes(8), None, None)
+            );
+        }
+        assert_eq!(read(None, &[]).kind, Kind::Quiet);
+        assert_eq!(read(Some(&call), &[]).kind, Kind::Works);
     }
 
     #[test]
     fn a_lock_tool_waits_alone_and_reads_as_what_it_holds_with_a_child() {
         let waiting = claude(vec![stat(102, 101, "flock -x /tmp/build.lock make")]);
-        let r = read(&waiting, &[], 0);
+        let r = read(&waiting, None, 0);
         assert_eq!(r.kind, Kind::Waits(Wait::Lock));
         assert_eq!(r.words, "waiting for a lock (/tmp/build.lock)");
         let holding = claude(vec![
             stat(102, 101, "flock /tmp/build.lock cargo test"),
             stat(103, 102, "cargo test --workspace"),
         ]);
-        let r = read(&holding, &[], 0);
+        let r = read(&holding, None, 0);
         assert_eq!(r.kind, Kind::Works);
         assert_eq!(r.words, "running cargo test, under a lock");
         assert_eq!(r.pid, Some(103));
@@ -584,11 +802,11 @@ mod tests {
             stat(102, 101, "/bin/bash ./wait-for-db.sh"),
             stat(103, 102, "sleep 10"),
         ]);
-        let r = read(&polling, &[], 11);
+        let r = read(&polling, None, 11);
         assert_eq!(r.kind, Kind::Waits(Wait::Retry));
         assert_eq!(r.words, "waiting and retrying (wait-for-db.sh)");
         assert_eq!(r.since, now() - Duration::minutes(11));
-        assert_eq!(read(&polling, &[], 2).kind, Kind::Works);
+        assert_eq!(read(&polling, None, 2).kind, Kind::Works);
         let young = claude(vec![
             Stat {
                 elapsed_secs: 60,
@@ -596,10 +814,10 @@ mod tests {
             },
             stat(103, 102, "sleep 10"),
         ]);
-        assert_eq!(read(&young, &[], 11).kind, Kind::Works);
+        assert_eq!(read(&young, None, 11).kind, Kind::Works);
         let bare = claude(vec![stat(102, 101, "sleep 600")]);
         assert_eq!(
-            read(&bare, &[], 11).kind,
+            read(&bare, None, 11).kind,
             Kind::Works,
             "a sleep the tool runs itself is no loop"
         );
@@ -611,11 +829,11 @@ mod tests {
             foreground: true,
             ..stat(102, 101, "sudo apt install x")
         }]);
-        let r = read(&sudo, &[], 0);
+        let r = read(&sudo, None, 0);
         assert_eq!(r.kind, Kind::Input);
         assert_eq!(r.words, "may be waiting for input at its terminal (sudo)");
         let behind = claude(vec![stat(102, 101, "sudo apt install x")]);
-        assert_ne!(read(&behind, &[], 0).kind, Kind::Input);
+        assert_ne!(read(&behind, None, 0).kind, Kind::Input);
         let editor = claude(vec![
             stat(102, 101, "git commit"),
             Stat {
@@ -623,7 +841,7 @@ mod tests {
                 ..stat(103, 102, "vim .git/COMMIT_EDITMSG")
             },
         ]);
-        assert_eq!(read(&editor, &[], 0).kind, Kind::Input);
+        assert_eq!(read(&editor, None, 0).kind, Kind::Input);
     }
 
     #[test]
@@ -637,7 +855,7 @@ mod tests {
             ),
             ("aws ecs wait services-stable", "watching an AWS change"),
         ] {
-            let r = read(&claude(vec![stat(102, 101, args)]), &[], 0);
+            let r = read(&claude(vec![stat(102, 101, args)]), None, 0);
             assert_eq!((r.kind, r.words.as_str()), (Kind::Watches, what));
         }
     }
@@ -650,7 +868,7 @@ mod tests {
                 101,
                 "ssh -p 22 dev@devbox ~/bin/rbuild-run w cargo test",
             )]),
-            &[],
+            None,
             0,
         );
         assert_eq!(r.kind, Kind::Remote);
@@ -661,12 +879,28 @@ mod tests {
         );
         let script = read(
             &claude(vec![stat(102, 101, "/bin/sh /t/bin/ssh devbox make")]),
-            &[],
+            None,
             0,
         );
         assert_eq!(script.kind, Kind::Remote);
-        let shell = read(&claude(vec![stat(102, 101, "ssh devbox")]), &[], 0);
+        let shell = read(&claude(vec![stat(102, 101, "ssh devbox")]), None, 0);
         assert_eq!(shell.words, "connected to devbox over ssh");
+    }
+
+    #[test]
+    fn ssh_options_bundled_or_not_take_their_values_as_ssh_does() {
+        let host = |line: &str| {
+            let words: Vec<&str> = line.split_whitespace().collect();
+            remote(&words).map(|(host, run)| format!("{host}|{run}"))
+        };
+        assert_eq!(host("-vp 22 dev@box make").as_deref(), Some("box|make"));
+        assert_eq!(host("-p22 box").as_deref(), Some("box|"));
+        assert_eq!(host("-vp22 box ls").as_deref(), Some("box|ls"));
+        assert_eq!(host("-vo ProxyJump=x box").as_deref(), Some("box|"));
+        assert_eq!(host("-oX=y box").as_deref(), Some("box|"));
+        assert_eq!(host("-46v box").as_deref(), Some("box|"));
+        assert_eq!(host("-i key -- box ls -l").as_deref(), Some("box|ls -l"));
+        assert_eq!(host("-vp"), None);
     }
 
     #[test]
@@ -675,20 +909,20 @@ mod tests {
             stat(102, 101, "make check"),
             stat(103, 102, "cargo test -p x"),
         ]);
-        let r = read(&tests, &[], 0);
+        let r = read(&tests, None, 0);
         assert_eq!(
             (r.kind, r.words.as_str()),
             (Kind::Works, "running cargo test")
         );
         let other = claude(vec![stat(102, 101, "cargo fmt")]);
-        assert_eq!(read(&other, &[], 0).words, "running cargo");
+        assert_eq!(read(&other, None, 0).words, "running cargo");
     }
 
     #[test]
     fn with_nothing_known_it_reads_as_the_deepest_program_the_open_call_or_quiet() {
-        let r = read(&claude(vec![stat(102, 101, "python3 -c 'x'")]), &[], 0);
+        let r = read(&claude(vec![stat(102, 101, "python3 -c 'x'")]), None, 0);
         assert_eq!(r.words, "running python3");
-        assert_eq!(read(&idle(), &[], 0).kind, Kind::Quiet);
+        assert_eq!(read(&idle(), None, 0).kind, Kind::Quiet);
         let call = OpenCall {
             id: "t1".into(),
             tool: "WebFetch".into(),
@@ -700,7 +934,7 @@ mod tests {
         let r = classify(&Evidence {
             tree: &tree,
             open_call: Some(&call),
-            output: &[],
+            said: &[],
             active_at: now(),
             now: now(),
             poll: Duration::minutes(10),
@@ -764,6 +998,33 @@ mod tests {
     }
 
     #[test]
+    fn only_what_runs_under_the_root_is_work_not_the_ticking_root() {
+        let ran = |cpu| Stat {
+            cpu_secs: cpu,
+            ..stat(100, 1, "claude --session-id s1")
+        };
+        let all = claude(vec![stat(102, 101, "cargo test -p x")]);
+        let before = [vec![ran(40)], all[1..].to_vec()].concat();
+        let after = [vec![ran(45)], all[1..].to_vec()].concat();
+        let prev = runs(&work(&before, 100, Engine::Claude, None));
+        let tree = work(&after, 100, Engine::Claude, None);
+        assert!(active(&prev, &tree), "the root's own CPU grew");
+        assert!(!work_active(&prev, &tree), "nothing under it did");
+        let busy: Vec<Stat> = after
+            .iter()
+            .map(|s| match s.proc.pid {
+                102 => Stat {
+                    cpu_secs: 9,
+                    ..s.clone()
+                },
+                _ => s.clone(),
+            })
+            .collect();
+        assert!(work_active(&prev, &work(&busy, 100, Engine::Claude, None)));
+        assert!(!work_active(&prev, &[]));
+    }
+
+    #[test]
     fn the_output_rule_comes_before_every_other() {
         let all = claude(vec![
             stat(102, 101, "cargo test"),
@@ -772,7 +1033,7 @@ mod tests {
                 ..stat(103, 101, "sudo x")
             },
         ]);
-        assert_eq!(read(&all, &[BUSY], 0).kind, Kind::Waits(Wait::Queue));
-        assert_eq!(read(&all, &[], 0).kind, Kind::Input);
+        assert_eq!(read(&all, Some(BUSY), 0).kind, Kind::Waits(Wait::Queue));
+        assert_eq!(read(&all, None, 0).kind, Kind::Input);
     }
 }

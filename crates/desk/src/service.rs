@@ -5175,10 +5175,11 @@ impl Desk {
         }
     }
 
-    /// The end of what the terminal shows, as plain text.
+    /// The end of what the terminal shows, as plain text: its whole lines in
+    /// the last `max_chars`.
     pub fn terminal_text(&self, id: Uuid, max_chars: usize) -> Result<String, DeskError> {
         let text = crate::pty::plain_text(self.attach(id)?.text().as_bytes());
-        Ok(crew::tail_chars(&text, max_chars).to_string())
+        Ok(crew::tail_lines(&text, max_chars).to_string())
     }
 
     pub fn rooms(&self) -> Vec<Room> {

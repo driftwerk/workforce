@@ -24,16 +24,20 @@ use crate::gateway::GatewayState;
 use crate::serve::AgentService;
 use crate::serve::Compose as _;
 
-const FAST: Timing = Timing {
+pub(super) const FAST: Timing = Timing {
     tick: Duration::from_millis(50),
     coalesce: Duration::from_millis(150),
     minute: Duration::from_millis(100),
 };
 
-const PERSON: &str = "person-1";
+pub(super) const PERSON: &str = "person-1";
 
 /// An agent `id` whose model answers everything with `reply`.
-async fn agent(dir: &Path, id: &str, reply: &str) -> (Arc<AgentService>, wiremock::MockServer) {
+pub(super) async fn agent(
+    dir: &Path,
+    id: &str,
+    reply: &str,
+) -> (Arc<AgentService>, wiremock::MockServer) {
     agent_calling(dir, id, reply, &[]).await
 }
 
@@ -200,7 +204,7 @@ fn all_at_once(toml: &str) -> String {
 }
 
 /// A gateway serving `agents`, each knowing the registry.
-fn hub(agents: &[Arc<AgentService>]) -> Arc<GatewayState> {
+pub(super) fn hub(agents: &[Arc<AgentService>]) -> Arc<GatewayState> {
     let fixture = crate::remote_mcp::testing::fixture(false);
     let map: HashMap<String, Arc<AgentService>> = agents
         .iter()
@@ -1806,13 +1810,13 @@ async fn what_the_crew_tools_read_is_fenced_as_data() {
                 read("crew.account", json!({"session_id": s.id.to_string()})).await,
             ),
         ] {
-            let opens = out.find("<<<EXTERNAL_UNTRUSTED_CONTENT_");
             let said = out.find(SAID);
-            let closes = out.find("<<</EXTERNAL_UNTRUSTED_CONTENT_");
-            assert!(
-                matches!((opens, said, closes), (Some(o), Some(m), Some(c)) if o < m && m < c),
-                "{what}: {out}"
-            );
+            let opens = said.and_then(|m| out[..m].rfind("<<<EXTERNAL_UNTRUSTED_CONTENT_"));
+            let closes = said.and_then(|m| out[m..].find("<<</EXTERNAL_UNTRUSTED_CONTENT_"));
+            let between = opens
+                .zip(said)
+                .is_some_and(|(o, m)| !out[o..m].contains("<<</EXTERNAL_UNTRUSTED_CONTENT_"));
+            assert!(closes.is_some() && between, "{what}: {out}");
         }
     })
     .await;

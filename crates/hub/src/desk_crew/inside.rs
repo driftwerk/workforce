@@ -13,6 +13,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use futures::StreamExt as _;
 use serde_json::{json, Value};
 use workforce_common::oversight::Oversight;
 use workforce_desk::grant::{Grant, Sees};
@@ -44,6 +45,11 @@ const FACETS: [&str; 5] = ["glance", "transcript", "processes", "workspace", "lo
 const WORKSPACE_FOR: Duration = Duration::from_secs(60);
 /// The most sessions one glance at everything working gives.
 const GLANCES_MOST: usize = 20;
+/// How many of those are read at once.
+const GLANCES_AT_ONCE: usize = 5;
+/// How long one session's folder and PR are waited on before its glance is
+/// said from Desk's sample alone.
+const GLANCE_READ_FOR: Duration = Duration::from_secs(10);
 /// The most uncommitted paths the workspace facet names.
 const UNCOMMITTED_NAMED: usize = 20;
 /// What every session the boss sees means, with the glance facet.
@@ -176,6 +182,9 @@ impl CrewHub {
         let Some(id) = named else {
             return Ok(self.glances(b).await);
         };
+        if self.is_agent(&id.to_string()) {
+            return Err(NOT_A_SESSION.into());
+        }
         self.session_seen(id, &b.seen)?;
         let v = self
             .desk
@@ -236,16 +245,24 @@ impl CrewHub {
             .filter(busy)
             .collect();
         let more = busy.len().saturating_sub(GLANCES_MOST);
-        let mut lines = Vec::new();
-        for v in busy.iter().take(GLANCES_MOST) {
-            let g = self.glance_of(&b.service, v, &b.oversight).await;
-            lines.push(format!(
-                "{} ({}): {}",
-                v.label(),
-                v.id,
-                g.line(tz, chrono::Utc::now())
-            ));
-        }
+        let lines: Vec<String> = futures::stream::iter(busy.into_iter().take(GLANCES_MOST))
+            .map(|v| async move {
+                let g = tokio::time::timeout(
+                    GLANCE_READ_FOR,
+                    self.glance_of(&b.service, &v, &b.oversight),
+                )
+                .await
+                .unwrap_or_else(|_| self.desk.glance(&v));
+                format!(
+                    "{} ({}): {}",
+                    v.label(),
+                    v.id,
+                    g.line(tz, chrono::Utc::now())
+                )
+            })
+            .buffered(GLANCES_AT_ONCE)
+            .collect()
+            .await;
         let mut out = json!({
             "sessions": reported(&lines.join("\n"), "what Desk sees inside the working sessions"),
         });
@@ -292,6 +309,11 @@ impl CrewHub {
         let mut g = sees::glance(g, sees);
         g.stall = sight::verdict(&g, state, chrono::Utc::now(), self.stall_thresholds(o));
         g
+    }
+
+    /// Whether `id` names one of this hub's agents, whatever it looks like.
+    fn is_agent(&self, id: &str) -> bool {
+        self.services().iter().any(|s| s.agent_id.as_str() == id)
     }
 
     /// `g` rendered as the boss reads it, fenced.
