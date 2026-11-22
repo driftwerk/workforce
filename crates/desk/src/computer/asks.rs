@@ -2004,7 +2004,6 @@ fn classify_words(
     unknown: bool,
 ) -> Option<Asks> {
     let mut i = 0;
-    let mut unknown = unknown;
     // Assignments and keywords before the command name.
     while let Some(w) = words.get(i) {
         if is_assignment(w) || (!w.dynamic && KEYWORDS.contains(&w.text.as_str())) {
@@ -2524,9 +2523,11 @@ fn shell(args: &[&Word], simple: &Simple, place: &Place<'_>, unknown: bool) -> O
 /// place can't be read.
 fn tar(args: &[&Word], place: &Place<'_>) -> Option<Asks> {
     let bundled = args.first().filter(|w| !w.text.starts_with('-'));
-    let cluster = |w: &&Word| w.text.starts_with('-') && !w.text.starts_with("--");
+    fn cluster(w: &Word) -> bool {
+        w.text.starts_with('-') && !w.text.starts_with("--")
+    }
     let extracts = bundled.is_some_and(|w| w.text.contains('x'))
-        || args.iter().filter(cluster).any(|w| w.text.contains('x'))
+        || args.iter().any(|w| cluster(w) && w.text.contains('x'))
         || args
             .iter()
             .any(|w| matches!(w.text.as_str(), "--extract" | "--get"));
@@ -2549,7 +2550,7 @@ fn tar(args: &[&Word], place: &Place<'_>) -> Option<Asks> {
         let long = t.split_once('=').map_or(t, |(n, _)| n);
         if RUNS.contains(&long)
             || (cluster(w) && t.contains(['P', 'I', 'F']))
-            || w.dynamic && t.starts_with('-')
+            || (w.dynamic && t.starts_with('-'))
         {
             return Some(Asks::Unclear);
         }
