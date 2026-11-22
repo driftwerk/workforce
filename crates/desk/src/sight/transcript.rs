@@ -14,7 +14,7 @@ use serde_json::{json, Value};
 
 use crate::ledger;
 use crate::memory::harvest::CodexParts;
-use crate::memory::record::{elide_middle, fold, Exchange, Part};
+use crate::memory::record::{elide_middle, fold, Asker, Exchange, Part};
 use crate::memory::Redactor;
 use crate::model::Engine;
 
@@ -58,22 +58,17 @@ pub struct Budget {
     pub until: Option<Instant>,
 }
 
-impl Budget {
-    /// No more than a page needs.
-    pub const PAGE: Self = Self {
-        bytes: u64::MAX,
-        until: None,
-    };
-}
-
-/// One exchange's span of a record, and its parts in order.
+/// One exchange's span of a record, and its parts in order; `partial` when
+/// only its tail was read before the budget ran out.
 struct Span {
     start: u64,
     parts: Vec<Part>,
+    partial: bool,
 }
 
 /// A record's exchanges, newest first, each from the line that opens it
-/// (a prompt, or an engine's summary of what came before) to the next.
+/// (a prompt, or an engine's summary of what came before) to the next;
+/// the budget running out inside one, its tail.
 struct Spans<'a, R: ?Sized> {
     r: &'a R,
     engine: Engine,
@@ -81,10 +76,15 @@ struct Spans<'a, R: ?Sized> {
     carry: Vec<u8>,
     lines: VecDeque<(u64, Vec<u8>)>,
     parts: VecDeque<Part>,
+    /// The earliest line read of the exchange not yet opened.
+    earliest: Option<Vec<u8>>,
+    /// Where the last line read starts.
+    last: Option<u64>,
     read: u64,
     budget: Budget,
     /// Ran out of budget before the record's start.
     cut: bool,
+    tail_given: bool,
 }
 
 impl<'a, R: Ranges + ?Sized> Spans<'a, R> {
@@ -96,9 +96,12 @@ impl<'a, R: Ranges + ?Sized> Spans<'a, R> {
             carry: Vec::new(),
             lines: VecDeque::new(),
             parts: VecDeque::new(),
+            earliest: None,
+            last: None,
             read: 0,
             budget,
             cut: false,
+            tail_given: false,
         }
     }
 
@@ -161,14 +164,47 @@ impl<'a, R: Ranges + ?Sized> Spans<'a, R> {
                 .into_iter()
                 .rev()
                 .for_each(|p| self.parts.push_front(p));
+            self.last = Some(at);
             if opens {
+                self.earliest = None;
                 return Ok(Some(Span {
                     start: at,
                     parts: std::mem::take(&mut self.parts).into(),
+                    partial: false,
                 }));
             }
+            self.earliest = Some(line);
         }
-        Ok(None)
+        Ok(self.tail())
+    }
+
+    /// Once the budget runs out, what was read of the exchange it ran out
+    /// inside, opened at its earliest line's time, from that line: the
+    /// next read goes on from there, and from where reading stopped when
+    /// not a line was read whole.
+    fn tail(&mut self) -> Option<Span> {
+        if !self.cut || std::mem::replace(&mut self.tail_given, true) {
+            return None;
+        }
+        let opened = self
+            .earliest
+            .take()
+            .and_then(|line| serde_json::from_slice::<Value>(&line).ok())
+            .and_then(|v| crate::memory::harvest::time(&v, "/timestamp"))
+            .map(|at| Part::Ask {
+                key: String::new(),
+                at,
+                asker: Asker::Unknown,
+                text: String::new(),
+            });
+        Some(Span {
+            start: self.last.unwrap_or(self.pos),
+            parts: opened
+                .into_iter()
+                .chain(std::mem::take(&mut self.parts))
+                .collect(),
+            partial: true,
+        })
     }
 }
 
@@ -218,8 +254,8 @@ const SHOWN: [Shown; 3] = [
     },
 ];
 
-/// An exchange as a page shows it.
-fn render(x: &Exchange, s: Shown) -> Value {
+/// An exchange as a page shows it, `partial` when only its tail was read.
+fn render(x: &Exchange, partial: bool, s: Shown) -> Value {
     let earlier = x.steps.len().saturating_sub(s.steps);
     let steps: Vec<Value> = x.steps[earlier..]
         .iter()
@@ -249,6 +285,9 @@ fn render(x: &Exchange, s: Shown) -> Value {
     if earlier > 0 {
         v["earlier_steps"] = json!(earlier);
     }
+    if partial {
+        v["partial"] = json!(true);
+    }
     v
 }
 
@@ -265,14 +304,16 @@ pub struct Page {
 }
 
 /// The exchanges that end at `end`, newest first, as many as fit
-/// [`PAGE_CHARS`]; always at least one, cut to fit.
+/// [`PAGE_CHARS`] within `budget`; at least one, cut to fit, and only its
+/// tail, said partial, when the budget runs out inside it.
 pub fn page<R: Ranges + ?Sized>(
     r: &R,
     engine: Engine,
     end: u64,
     redactor: &dyn Redactor,
+    budget: Budget,
 ) -> io::Result<Page> {
-    let mut spans = Spans::new(r, engine, end, Budget::PAGE);
+    let mut spans = Spans::new(r, engine, end, budget);
     let mut exchanges = Vec::new();
     let mut used = 0;
     let mut before = None;
@@ -285,10 +326,10 @@ pub fn page<R: Ranges + ?Sized>(
         let shown = match first {
             true => SHOWN
                 .iter()
-                .map(|s| render(&x, *s))
+                .map(|s| render(&x, span.partial, *s))
                 .find(|v| chars_of(v) <= PAGE_CHARS)
-                .unwrap_or_else(|| render(&x, SHOWN[SHOWN.len() - 1])),
-            false => render(&x, SHOWN[0]),
+                .unwrap_or_else(|| render(&x, span.partial, SHOWN[SHOWN.len() - 1])),
+            false => render(&x, span.partial, SHOWN[0]),
         };
         let size = chars_of(&shown);
         if !first && used + size > PAGE_CHARS {
@@ -320,15 +361,28 @@ pub struct Found {
     pub before: Option<u64>,
 }
 
-/// `text` around the first place `lower` holds `query` (lowercased).
+/// `text`'s characters lowercased, each with the index of the character
+/// it was lowered from.
+fn lowered(text: &str) -> impl Iterator<Item = (usize, char)> + '_ {
+    text.chars()
+        .enumerate()
+        .flat_map(|(i, c)| c.to_lowercase().map(move |l| (i, l)))
+}
+
+/// `text` around the first place it holds `query`, in any case; none for
+/// an empty `query`.
 fn snippet(text: &str, query: &str) -> Option<String> {
-    let lower = text.to_lowercase();
-    let at = lower.find(query)?;
-    let chars: Vec<char> = text.chars().collect();
-    let first = lower[..at].chars().count().min(chars.len());
-    let from = first.saturating_sub(SNIPPET);
-    let to = (first + query.chars().count() + SNIPPET).min(chars.len());
-    Some(chars[from..to].iter().collect())
+    let needle: Vec<char> = lowered(query).map(|(_, c)| c).collect();
+    let hay: Vec<(usize, char)> = lowered(text).collect();
+    let at = (!needle.is_empty())
+        .then(|| {
+            hay.windows(needle.len())
+                .position(|w| w.iter().map(|(_, c)| c).eq(&needle))
+        })
+        .flatten()?;
+    let from = hay[at].0.saturating_sub(SNIPPET);
+    let to = hay[at + needle.len() - 1].0 + 1 + SNIPPET;
+    Some(text.chars().skip(from).take(to - from).collect())
 }
 
 /// Each place in `x` that holds `query`, as hits.
@@ -358,7 +412,8 @@ fn hits_in(x: &Exchange, query: &str) -> Vec<Hit> {
 /// The places in the exchanges that end at `end` holding `query` in any
 /// case, newest first: searched in their redacted text, so a secret is
 /// never found by its own words. Stops at [`HITS_MAX`] or `budget`, saying
-/// where to go on from.
+/// where to go on from; an exchange's hits are never split, all of the
+/// first's given however many.
 pub fn search<R: Ranges + ?Sized>(
     r: &R,
     engine: Engine,
@@ -367,21 +422,26 @@ pub fn search<R: Ranges + ?Sized>(
     query: &str,
     budget: Budget,
 ) -> io::Result<Found> {
-    let query = query.trim().to_lowercase();
+    let query = query.trim();
     let mut spans = Spans::new(r, engine, end, budget);
     let mut hits = Vec::new();
     let mut before = None;
-    while hits.len() < HITS_MAX {
-        let Some(span) = spans.next_span()? else {
-            break;
-        };
-        if let Some(x) = folded(span.parts, redactor) {
-            hits.extend(hits_in(&x, &query));
+    let mut full = false;
+    while let Some(span) = spans.next_span()? {
+        let found = folded(span.parts, redactor)
+            .map(|x| hits_in(&x, query))
+            .unwrap_or_default();
+        let over = !hits.is_empty() && hits.len() + found.len() > HITS_MAX;
+        if !over {
+            hits.extend(found);
+            before = Some(span.start);
         }
-        before = Some(span.start);
+        full = over || hits.len() >= HITS_MAX;
+        if full {
+            break;
+        }
     }
-    hits.truncate(HITS_MAX);
-    let more = hits.len() >= HITS_MAX || spans.cut;
+    let more = full || spans.cut;
     Ok(Found {
         hits,
         before: before.filter(|b| *b > 0 && more),
@@ -463,6 +523,11 @@ mod tests {
     use crate::memory::Redacted;
     use std::borrow::Cow;
 
+    const ALL: Budget = Budget {
+        bytes: u64::MAX,
+        until: None,
+    };
+
     struct Hides;
     impl Redactor for Hides {
         fn stored<'a>(&self, text: &'a str) -> Redacted<'a> {
@@ -536,17 +601,17 @@ mod tests {
     #[test]
     fn a_page_holds_the_newest_exchanges_first_and_says_where_the_next_ends() {
         let r = record(&exchanges(3));
-        let p = page(r.as_slice(), Engine::Claude, r.len() as u64, &Hides).unwrap();
+        let p = page(r.as_slice(), Engine::Claude, r.len() as u64, &Hides, ALL).unwrap();
         assert_eq!(asks(&p), ["question 2", "question 1", "question 0"]);
         assert_eq!(p.before, None, "the whole record fits");
         let big: Vec<String> = (0..40)
             .flat_map(|i| [ask(i, &"q".repeat(1500)), reply(i, &"a".repeat(2500))])
             .collect();
         let r = record(&big);
-        let p = page(r.as_slice(), Engine::Claude, r.len() as u64, &Hides).unwrap();
+        let p = page(r.as_slice(), Engine::Claude, r.len() as u64, &Hides, ALL).unwrap();
         assert!(p.exchanges.len() > 1 && p.exchanges.len() < 40);
         assert!(p.exchanges.iter().map(chars_of).sum::<usize>() <= PAGE_CHARS);
-        let next = page(r.as_slice(), Engine::Claude, p.before.unwrap(), &Hides).unwrap();
+        let next = page(r.as_slice(), Engine::Claude, p.before.unwrap(), &Hides, ALL).unwrap();
         assert_eq!(
             next.exchanges[0]["at"],
             json!(ts(40 - 1 - p.exchanges.len() as u32))
@@ -557,7 +622,7 @@ mod tests {
     fn a_page_always_holds_one_exchange_cut_to_fit() {
         let huge = vec![ask(0, &"q".repeat(50_000)), reply(0, &"a".repeat(80_000))];
         let r = record(&huge);
-        let p = page(r.as_slice(), Engine::Claude, r.len() as u64, &Hides).unwrap();
+        let p = page(r.as_slice(), Engine::Claude, r.len() as u64, &Hides, ALL).unwrap();
         assert_eq!(p.exchanges.len(), 1);
         assert!(chars_of(&p.exchanges[0]) <= PAGE_CHARS);
         assert!(p.exchanges[0]["answer"].as_str().unwrap().contains(ELIDED));
@@ -568,7 +633,7 @@ mod tests {
         let filler = "x".repeat(usize::try_from(CHUNK).unwrap());
         let mut r = record(&[ask(0, "first"), reply(0, &filler), ask(1, "second")]);
         r.extend_from_slice(b"{\"type\":\"assistant\",\"timest");
-        let p = page(r.as_slice(), Engine::Claude, r.len() as u64, &Hides).unwrap();
+        let p = page(r.as_slice(), Engine::Claude, r.len() as u64, &Hides, ALL).unwrap();
         assert_eq!(asks(&p)[0], "second");
         let found = search(
             r.as_slice(),
@@ -576,7 +641,7 @@ mod tests {
             r.len() as u64,
             &Hides,
             "FIRST",
-            Budget::PAGE,
+            ALL,
         )
         .unwrap();
         assert_eq!(found.hits.len(), 1, "found across the boundary");
@@ -591,17 +656,8 @@ mod tests {
             ask(1, "and again"),
             reply(1, "deployed again"),
         ]);
-        let all = |q: &str| {
-            search(
-                r.as_slice(),
-                Engine::Claude,
-                r.len() as u64,
-                &Hides,
-                q,
-                Budget::PAGE,
-            )
-            .unwrap()
-        };
+        let all =
+            |q: &str| search(r.as_slice(), Engine::Claude, r.len() as u64, &Hides, q, ALL).unwrap();
         assert!(all("SECRET-abc").hits.is_empty());
         assert_eq!(all("[secret]").hits.len(), 1);
         assert_eq!(all("deployed").hits.len(), 2);
@@ -646,7 +702,7 @@ mod tests {
             r.len() as u64,
             &Hides,
             "toolu_1",
-            Budget::PAGE,
+            ALL,
         )
         .unwrap()
         .unwrap();
@@ -665,7 +721,7 @@ mod tests {
                 r.len() as u64,
                 &Hides,
                 "nope",
-                Budget::PAGE
+                ALL
             )
             .unwrap(),
             None
@@ -685,6 +741,106 @@ mod tests {
     }
 
     #[test]
+    fn an_exchange_past_the_budget_is_paged_from_its_tail_to_its_head() {
+        let out = "o".repeat(200_000);
+        let lines: Vec<String> = [ask(0, "first"), reply(0, "done"), ask(1, "big")]
+            .into_iter()
+            .chain((0..20).flat_map(|i| {
+                let id = format!("toolu_{i}");
+                [call(2 + i, &id, "make"), result(2 + i, &id, &out)]
+            }))
+            .chain([reply(30, "finished")])
+            .collect();
+        let r = record(&lines);
+        let budget = Budget {
+            bytes: CHUNK,
+            until: None,
+        };
+        let p = page(r.as_slice(), Engine::Claude, r.len() as u64, &Hides, budget).unwrap();
+        assert_eq!(p.exchanges.len(), 1);
+        let tail = &p.exchanges[0];
+        assert_eq!(tail["partial"], json!(true));
+        assert_eq!(tail["answer"], json!("finished"));
+        assert_eq!(tail["ask"], json!(""));
+        assert!(tail["at"].as_str().unwrap() > ts(2).as_str());
+        let mut end = p.before.expect("it says where to page on from");
+        let mut asked = Vec::new();
+        for _ in 0..10 {
+            let p = page(r.as_slice(), Engine::Claude, end, &Hides, budget).unwrap();
+            asked.extend(asks(&p).into_iter().filter(|a| !a.is_empty()));
+            let Some(before) = p.before else { break };
+            assert!(before < end, "each page goes on");
+            end = before;
+        }
+        assert_eq!(asked, ["big", "first"]);
+    }
+
+    #[test]
+    fn a_newest_line_past_the_budget_is_stepped_over() {
+        let r = record(&[
+            ask(0, "first"),
+            reply(0, "done"),
+            reply(1, &"x".repeat(3 * usize::try_from(CHUNK).unwrap())),
+        ]);
+        let budget = Budget {
+            bytes: CHUNK,
+            until: None,
+        };
+        let mut end = r.len() as u64;
+        let mut asked = Vec::new();
+        for _ in 0..10 {
+            let p = page(r.as_slice(), Engine::Claude, end, &Hides, budget).unwrap();
+            asked.extend(asks(&p));
+            let Some(before) = p.before else { break };
+            assert!(before < end);
+            end = before;
+        }
+        assert_eq!(asked, ["first"]);
+    }
+
+    /// An exchange holding `query` in its ask and `steps` calls' input and
+    /// output.
+    fn hits(n: u32, steps: u32) -> Vec<String> {
+        std::iter::once(ask(n * 100, "hit"))
+            .chain((0..steps).flat_map(|i| {
+                let id = format!("toolu_{n}_{i}");
+                [
+                    call(n * 100 + i, &id, "hit"),
+                    result(n * 100 + i, &id, "hit"),
+                ]
+            }))
+            .chain([reply(n * 100 + 99, "done")])
+            .collect()
+    }
+
+    #[test]
+    fn a_search_never_splits_an_exchanges_hits_across_pages() {
+        let search_from =
+            |r: &[u8], end: u64| search(r, Engine::Claude, end, &Hides, "HIT", ALL).unwrap();
+        let r = record(&[hits(0, 5), hits(1, 7)].concat());
+        let first = search_from(&r, r.len() as u64);
+        assert_eq!(first.hits.len(), 15);
+        let rest = search_from(&r, first.before.expect("more to search"));
+        assert_eq!(rest.hits.len(), 11);
+        assert_eq!(rest.before, None);
+        let r = record(&[hits(0, 0), hits(1, 12)].concat());
+        let first = search_from(&r, r.len() as u64);
+        assert_eq!(first.hits.len(), 25, "the first exchange's hits whole");
+        let rest = search_from(&r, first.before.expect("more to search"));
+        assert_eq!(rest.hits.len(), 1);
+    }
+
+    #[test]
+    fn a_snippet_is_cut_around_its_hit_in_characters_whatever_their_case() {
+        let text = format!("{}NEEDLE{}", "İ".repeat(200), "z".repeat(200));
+        let got = snippet(&text, "needle").unwrap();
+        assert!(got.contains("NEEDLE"));
+        assert_eq!(got.chars().count(), SNIPPET * 2 + "needle".len());
+        assert_eq!(snippet("anything", ""), None);
+        assert_eq!(snippet("anything", "nope"), None);
+    }
+
+    #[test]
     fn a_codex_rollout_pages_through_its_own_reader() {
         let said = |n: u32, role: &str, kind: &str, text: &str| {
             json!({"timestamp": ts(n), "type": "response_item", "payload": {"type": "message",
@@ -696,7 +852,7 @@ mod tests {
             said(1, "assistant", "output_text", "fixed"),
             said(2, "user", "input_text", "now test it"),
         ]);
-        let p = page(r.as_slice(), Engine::Codex, r.len() as u64, &Hides).unwrap();
+        let p = page(r.as_slice(), Engine::Codex, r.len() as u64, &Hides, ALL).unwrap();
         assert_eq!(asks(&p), ["now test it", "fix the build"]);
     }
 }
