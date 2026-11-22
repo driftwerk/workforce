@@ -1191,6 +1191,12 @@ pub(super) async fn at_work_as(d: &Desk, base: &Path, s: uuid::Uuid, shape: Shap
         Shape::Silent => return,
         Shape::AtItsTerminal => tasks.join("c1.output"),
         Shape::InTheBackground => {
+            eventually("its build seen running before its turn ends", async || {
+                d.sight_pass().await;
+                d.sample(s)
+                    .filter(|x| x.tree.iter().any(|p| p.proc.args.contains("rbuild-run")))
+            })
+            .await;
             let transcript = transcript_of(base, s);
             let lines = [
                 test_call(chrono::Utc::now(), true),
