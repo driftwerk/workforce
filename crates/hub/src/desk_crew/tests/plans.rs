@@ -10,6 +10,7 @@ use super::*;
 use workforce_desk::board::TicketState;
 use workforce_desk::charge::How;
 use workforce_desk::crew::Party;
+use workforce_desk::model::SessionState;
 use workforce_desk::plan::{Draft, DraftTicket, PlanState};
 use workforce_desk::NewPlan;
 
@@ -180,7 +181,8 @@ async fn an_approved_plan_starts_four_sessions_and_the_fifth_when_one_finishes()
             .unwrap();
         assert_eq!(crew.gate(&mv, &o), Gate::Run);
 
-        // One finishes its turn: the fifth starts.
+        // One finishes its turn: it still holds its slot, so the fifth
+        // waits; closed, it doesn't, and the fifth starts.
         let one = four[0].id;
         let url = hook_url(dir.path(), one).await;
         hook(
@@ -188,11 +190,199 @@ async fn an_approved_plan_starts_four_sessions_and_the_fifth_when_one_finishes()
             json!({"hook_event_name": "SessionStart", "session_id": one.to_string()}),
         )
         .await;
+        eventually("its turn over", async || {
+            (d.view(one).unwrap().state != SessionState::Starting).then_some(())
+        })
+        .await;
+        assert_eq!(d.charges_busy("desk"), 3, "it is no longer working");
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        assert_eq!(
+            started(&d).len(),
+            4,
+            "a session that finished a turn holds its slot"
+        );
+        d.end(one, Some(By::you())).await.unwrap();
         eventually("the fifth session", async || {
-            (started(&d).len() == 5).then_some(())
+            let open: Vec<_> = started(&d)
+                .into_iter()
+                .filter(|v| v.state != SessionState::Closed)
+                .collect();
+            (open.len() == 4 && open.iter().all(|v| v.id != one)).then_some(())
         })
         .await;
         assert!(d.plan(id).await.unwrap().summary.progress.next.is_empty());
+    })
+    .await;
+}
+
+/// How many sessions plan `id` holds now.
+async fn held_now(d: &Desk, id: uuid::Uuid) -> usize {
+    workforce_desk::plan::held(&d.plan_tickets(id).await.unwrap())
+}
+
+/// A plan's session here keeps its slot until it is closed: a finished
+/// turn or being let go keeps it, its ticket still in Doing.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_plans_session_here_holds_its_slot_until_it_is_closed() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (_overseer, state, d, _llm) = hub_with(dir.path(), pool, ACTS).await;
+        let _crew = CrewHub::start(state, d.clone(), FAST, CancellationToken::new());
+        let p = proposed(&d, dir.path(), 2).await;
+        let id = p.summary.plan.id;
+        d.approve_plan(id, 1, &By::you()).await.unwrap();
+        let two = eventually("two sessions", async || {
+            let s = started(&d);
+            (s.len() == 2).then_some(s)
+        })
+        .await;
+        let (kept, let_go) = (two[0].id, two[1].id);
+        for id in [kept, let_go] {
+            let url = hook_url(dir.path(), id).await;
+            hook(
+                &url,
+                json!({"hook_event_name": "SessionStart", "session_id": id.to_string()}),
+            )
+            .await;
+        }
+        eventually("their turns over", async || {
+            [kept, let_go]
+                .iter()
+                .all(|id| d.view(*id).unwrap().state != SessionState::Starting)
+                .then_some(())
+        })
+        .await;
+        assert_eq!(held_now(&d, id).await, 2, "a finished turn holds it");
+        d.release(let_go, &By::you()).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(held_now(&d, id).await, 2, "let go, its ticket holds it");
+        d.end(kept, Some(By::you())).await.unwrap();
+        eventually("the closed one's slot free", async || {
+            (held_now(&d, id).await == 1).then_some(())
+        })
+        .await;
+        let line = workforce_desk::plan::full(&d.plan(id).await.unwrap().summary.progress, 1);
+        assert!(line.is_some_and(|l| l.starts_with("holds 1 of 1 session: DES-")));
+    })
+    .await;
+}
+
+/// A plan's session on a machine keeps its slot while the machine says it
+/// runs, was killed there or isn't listed; once the machine says it was
+/// closed or removed there, as `desk.sessions` says of the ids it is asked
+/// about, the slot is free and the next ticket starts.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_plans_session_on_a_machine_holds_its_slot_until_the_machine_says_it_was_closed() {
+    use super::super::relay::RelayAnswer;
+    use super::super::served::ServedStatus;
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (overseer, state, d, _llm) = hub_with(dir.path(), pool, ACTS).await;
+        let crew = CrewHub::start(state, d.clone(), FAST, CancellationToken::new());
+        eventually("the plan tools", async || {
+            overseer.tools.has("crew.plan").then_some(())
+        })
+        .await;
+        // devbox: its open sessions, and those closed there, said only of
+        // the ids it is asked about.
+        let there: Arc<parking_lot::Mutex<Vec<Value>>> = Arc::default();
+        let closed: Arc<parking_lot::Mutex<Vec<String>>> = Arc::default();
+        let poller = {
+            let (crew, there, closed) =
+                (Arc::clone(&crew), Arc::clone(&there), Arc::clone(&closed));
+            tokio::spawn(async move {
+                loop {
+                    for c in crew.relay_take(Duration::from_millis(100)).await {
+                        let body = match c.tool.as_str() {
+                            "desk.sessions" => {
+                                let mut all = there.lock().clone();
+                                let gone = closed.lock().clone();
+                                all.extend(
+                                    c.input["ids"]
+                                        .as_array()
+                                        .into_iter()
+                                        .flatten()
+                                        .filter_map(Value::as_str)
+                                        .filter(|i| gone.iter().any(|g| g == i))
+                                        .map(|i| json!({ "id": i, "state": "closed" })),
+                                );
+                                Value::Array(all)
+                            }
+                            "desk.session_start" => {
+                                let s = json!({
+                                    "id": uuid::Uuid::new_v4(), "name": c.input["name"],
+                                    "cwd": c.input["cwd"], "state": "working", "lastReply": null,
+                                });
+                                there.lock().push(s.clone());
+                                s
+                            }
+                            // The work loop's and the pump's takes, which this
+                            // machine doesn't answer.
+                            super::super::relayed_work::WORK_TAKE
+                            | super::super::relayed_decide::TAKE => Value::Null,
+                            other => panic!("{other} relayed"),
+                        };
+                        crew.relay_answer(
+                            c.id,
+                            RelayAnswer {
+                                status: ServedStatus::Ok,
+                                body,
+                            },
+                        );
+                    }
+                }
+            })
+        };
+        let r = overseer
+            .tools
+            .get("crew.plan")
+            .unwrap()
+            .execute(json!({
+                "goal": "Speed up vellev's recall",
+                "machine": "devbox",
+                "parallel": 1,
+                "tickets": [
+                    {"title": "Profile recall", "folder": "/home/dev/vellev"},
+                    {"title": "Cache embeddings", "folder": "/home/dev/vellev-cache"},
+                ],
+            }))
+            .await
+            .unwrap();
+        assert!(r.success, "{r:?}");
+        let id: uuid::Uuid = r.output["proposed"]["plan_id"]
+            .as_str()
+            .unwrap()
+            .parse()
+            .unwrap();
+        d.approve_plan(id, 1, &By::you()).await.unwrap();
+        eventually("its first session on devbox", async || {
+            (there.lock().len() == 1).then_some(())
+        })
+        .await;
+        let first = there.lock()[0]["id"].as_str().unwrap().to_string();
+        for state in ["idle", "interrupted"] {
+            there.lock()[0]["state"] = json!(state);
+            tokio::time::sleep(Duration::from_millis(600)).await;
+            assert_eq!(there.lock().len(), 1, "{state} there, it holds its slot");
+        }
+        // Gone from its list: not known closed, so it still holds it.
+        there.lock().clear();
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        assert_eq!(held_now(&d, id).await, 1, "unlisted, it holds its slot");
+        // Said closed there: free, and the next starts.
+        closed.lock().push(first.clone());
+        eventually("the second session on devbox", async || {
+            (there.lock().len() == 1).then_some(())
+        })
+        .await;
+        assert_ne!(there.lock()[0]["id"], json!(first));
+        let was = format!("devbox/{first}");
+        let tickets = d.plan_tickets(id).await.unwrap();
+        assert!(tickets
+            .iter()
+            .all(|t| t.session.as_deref() != Some(was.as_str())));
+        assert_eq!(held_now(&d, id).await, 1);
+        poller.abort();
     })
     .await;
 }
@@ -258,14 +448,10 @@ async fn an_unbound_boss_starts_its_own_plan_only_when_the_person_said_to() {
         })
         .await;
         let one = four[0].id;
-        let url = hook_url(dir.path(), one).await;
-        hook(
-            &url,
-            json!({"hook_event_name": "SessionStart", "session_id": one.to_string()}),
-        )
-        .await;
+        d.end(one, Some(By::you())).await.unwrap();
         eventually("the fifth session", async || {
-            (started(&d).len() == 5).then_some(())
+            let open = started(&d);
+            (open.len() == 4 && open.iter().all(|v| v.id != one)).then_some(())
         })
         .await;
 
@@ -346,8 +532,7 @@ async fn a_session_that_ended_while_the_hub_was_down_wakes_the_boss_once() {
         let start = workforce_desk::plan::next_starts(
             &p.summary.plan,
             &d.plan_tickets(id).await.unwrap(),
-            0,
-            4,
+            workforce_desk::plan::room(&p.summary.plan, 0, 0, 4),
             None,
         )
         .remove(0);
@@ -1078,6 +1263,49 @@ async fn a_start_the_person_dismissed_isnt_suggested_again_until_the_plan_change
     .await;
 }
 
+/// A start the person dismissed holds no slot: at one at a time, the next
+/// ticket is suggested in its place.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_dismissed_start_holds_no_slot_and_the_next_is_suggested() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (_overseer, state, d, _llm) = hub_with(
+            dir.path(),
+            pool,
+            "[oversight]\nenabled = true\nlevel = \"suggest\"\n[oversight.work]\nparallel = 1\n",
+        )
+        .await;
+        let p = proposed(&d, dir.path(), 2).await;
+        let id = p.summary.plan.id;
+        d.approve_plan(id, 1, &By::you()).await.unwrap();
+        let _crew = CrewHub::start(state, d.clone(), FAST, CancellationToken::new());
+        let suggested = async || {
+            d.store()
+                .suggestions_for("desk", "crew.assign_ticket")
+                .await
+                .unwrap()
+        };
+        let mut first = eventually("the first start suggested", async || {
+            suggested().await.pop()
+        })
+        .await;
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        assert_eq!(suggested().await.len(), 1, "one at a time");
+        first.state = workforce_desk::crew::SuggestionState::Dismissed;
+        d.store().put_suggestion(&first).await.unwrap();
+        let next = eventually("the next start suggested", async || {
+            suggested()
+                .await
+                .into_iter()
+                .find(|s| s.action["input"]["ticket_id"] != first.action["input"]["ticket_id"])
+        })
+        .await;
+        assert_eq!(next.state, workforce_desk::crew::SuggestionState::Open);
+        assert_eq!(suggested().await.len(), 2, "the dismissed one not again");
+    })
+    .await;
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn the_boss_is_told_in_plain_words_when_the_person_turns_its_change_down() {
     with_test_pool(workforce_desk::store::build_pool, |pool| async move {
@@ -1321,17 +1549,12 @@ async fn a_plan_at_its_warning_stops_starting_until_the_person_says_continue_and
             .unwrap_err();
         assert!(refused.contains("breaker"), "{refused}");
         assert_eq!(started(&d).len(), 1);
-        // The first session finishes its turn, freeing its slot: nothing
-        // starts while the plan is held.
+        // The first session is closed, freeing its slot: nothing starts
+        // while the plan is held.
         let key = d.view(first).unwrap().name;
-        let url = hook_url(dir.path(), first).await;
-        hook(
-            &url,
-            json!({"hook_event_name": "SessionStart", "session_id": first.to_string()}),
-        )
-        .await;
+        d.end(first, Some(By::you())).await.unwrap();
         tokio::time::sleep(Duration::from_millis(1200)).await;
-        assert_eq!(started(&d).len(), 1, "held: no start");
+        assert!(started(&d).is_empty(), "held: no start");
 
         // Its boss can't let it go on: no tool of its reaches the breaker,
         // and a higher budget waits for the person.
@@ -1362,7 +1585,7 @@ async fn a_plan_at_its_warning_stops_starting_until_the_person_says_continue_and
             d.plan(id).await.unwrap().summary.plan.paused,
             Some(Paused::Budget)
         );
-        assert_eq!(started(&d).len(), 1);
+        assert!(started(&d).is_empty());
         // The boss was told of the hold once, in one plan turn.
         said_only(&llm, "Desk's breaker holds its new starts", 1).await;
 
@@ -1401,7 +1624,7 @@ async fn a_plan_at_its_warning_stops_starting_until_the_person_says_continue_and
             d.count_spend_now().await;
         }
         said_only(&llm, "Desk's breaker holds its new starts", 2).await;
-        assert_eq!(started(&d).len(), 2);
+        assert_eq!(started(&d).len(), 1);
     })
     .await;
 }
@@ -2707,6 +2930,46 @@ async fn a_ticket_whose_session_on_a_machine_ends_as_it_starts_waits_in_to_do_it
         );
         assert_eq!(newly_said(&llm, "ended as it started").await, 1, "once");
         poller.abort();
+    })
+    .await;
+}
+
+/// What a home's watcher asks of a machine: `desk.sessions` lists its open
+/// sessions and says, of the ids it is asked about, those closed or removed
+/// there, by id alone.
+#[tokio::test(flavor = "multi_thread")]
+async fn desk_sessions_says_which_of_the_ids_asked_about_were_closed_or_removed_there() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (_overseer, _state, d, _llm) = hub_with(dir.path(), pool, ACTS).await;
+        let open = new_session(&d, dir.path(), "open").await.id;
+        let shut = new_session(&d, dir.path(), "shut").await.id;
+        d.end(shut, Some(By::you())).await.unwrap();
+        let removed = uuid::Uuid::new_v4();
+        let tool = crate::desk_tools::DeskTool::all(&d, "desk")
+            .into_iter()
+            .find(|t| workforce_agent::tools::Tool::name(t) == "desk.sessions")
+            .unwrap();
+        let out = workforce_agent::runner::CURRENT_AGENT_ID
+            .scope("desk".to_string(), async move {
+                workforce_agent::tools::Tool::execute(
+                    &tool,
+                    json!({ "ids": [open, shut, removed] }),
+                )
+                .await
+                .unwrap()
+            })
+            .await
+            .output;
+        let listed: Vec<workforce_desk::crew::MachineSession> =
+            serde_json::from_value(out).unwrap();
+        let closed: Vec<uuid::Uuid> = listed
+            .iter()
+            .filter(|s| s.state == "closed")
+            .map(|s| s.id)
+            .collect();
+        assert_eq!(closed, [shut, removed]);
+        assert!(listed.iter().all(|s| s.id != open || s.state != "closed"));
     })
     .await;
 }
