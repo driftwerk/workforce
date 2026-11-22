@@ -1101,6 +1101,43 @@ mod tests {
         )
     }
 
+    #[tokio::test]
+    async fn workspaces_names_the_connections_and_the_default() {
+        use super::super::config::{GithubSkillConfig, GithubWorkspaceConfig};
+        let server = MockServer::start().await;
+        let connection = |name: &str| {
+            (
+                name.to_string(),
+                GithubWorkspaceConfig {
+                    token: "ghp_test".into(),
+                    base_url: server.uri(),
+                    default_owner: Some(name.to_string()),
+                },
+            )
+        };
+        let skill = super::super::GithubSkill::new(GithubSkillConfig {
+            token: None,
+            base_url: server.uri(),
+            default_owner: None,
+            workspaces: HashMap::from([connection("mantis"), connection("driftwerk")]),
+            default_workspace: Some("mantis".into()),
+        })
+        .unwrap();
+        let tool = skill
+            .tools()
+            .into_iter()
+            .find(|t| t.name() == "github.workspaces")
+            .expect("github.workspaces is registered");
+        let out = tool.execute(json!({})).await.unwrap();
+        assert!(out.success);
+        assert_eq!(
+            out.output,
+            json!({ "workspaces": ["driftwerk", "mantis"], "default": "mantis" })
+        );
+        assert!(server.received_requests().await.unwrap().is_empty());
+        assert!(super::super::READ_TOOLS.contains(&"github.workspaces"));
+    }
+
     async fn graphql_answers(server: &MockServer, partial: Value, body: Value) {
         Mock::given(method("POST"))
             .and(path("/graphql"))
