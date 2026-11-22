@@ -3,7 +3,9 @@
 //! pass ([`crate::service::Desk::sight_pass`]). Pure; the reading is
 //! sampled by the service.
 
+pub mod logs;
 pub mod procs;
+pub mod transcript;
 
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};

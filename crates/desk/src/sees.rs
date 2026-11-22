@@ -18,6 +18,9 @@ pub enum Part {
     Reply,
     /// Its terminal's text.
     Terminal,
+    /// What Desk sees inside it: its transcript, processes, workspace and
+    /// logs in full.
+    Inside,
     /// The activity's reasons and texts.
     Words,
 }
@@ -29,7 +32,7 @@ pub fn shows(sees: Sees, part: Part) -> bool {
         Part::Question | Part::Reply | Part::Words => {
             matches!(sees, Sees::Replies | Sees::Everything)
         }
-        Part::Terminal => sees == Sees::Everything,
+        Part::Terminal | Part::Inside => sees == Sees::Everything,
     }
 }
 
@@ -59,13 +62,21 @@ mod tests {
 
     #[test]
     fn status_shows_only_status_and_everything_alone_shows_the_terminal() {
-        for p in [Part::Question, Part::Reply, Part::Words, Part::Terminal] {
+        for p in [
+            Part::Question,
+            Part::Reply,
+            Part::Words,
+            Part::Terminal,
+            Part::Inside,
+        ] {
             assert!(!shows(Sees::Status, p), "{p:?}");
         }
         assert!(shows(Sees::Status, Part::Status));
         assert!(shows(Sees::Replies, Part::Reply));
         assert!(!shows(Sees::Replies, Part::Terminal));
         assert!(shows(Sees::Everything, Part::Terminal));
+        assert!(!shows(Sees::Replies, Part::Inside));
+        assert!(shows(Sees::Everything, Part::Inside));
     }
 
     #[test]

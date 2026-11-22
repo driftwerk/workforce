@@ -285,7 +285,7 @@ impl DeskStore {
 }
 
 /// The folder `engine` keeps its transcripts in, under `home`.
-fn transcript_root(home: &Path, engine: Engine) -> Option<PathBuf> {
+pub(super) fn transcript_root(home: &Path, engine: Engine) -> Option<PathBuf> {
     match engine {
         Engine::Claude => Some(home.join(".claude/projects")),
         Engine::Codex => Some(home.join(".codex/sessions")),

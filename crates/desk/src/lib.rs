@@ -172,7 +172,9 @@ pub use service::{CommentPost, FileBytes, PostVia, READ_FRESH};
 pub use service::{EffectView, HandoverView, MoveAsk, MoveCommit, MoveDone, MovePreview, SentNote};
 pub use service::{GrantView, GrantWritten, GrantsView, Native, Paused};
 pub use service::{HandedOff, HandoffPreview, Hop, LineageView};
-pub use service::{ProcessRow, ProcessTree, Processes, Sample, SightOptions};
+pub use service::{
+    ProcessRow, ProcessTree, Processes, RecordInfo, Sample, SightOptions, Transcript, TranscriptAsk,
+};
 pub use service::{ALREADY_ANSWERED, ASKED_IN_TERMINAL};
 pub use speech::{Audio, Speak, SpeakError, Speech, SpeechProvider, VoiceKey};
 pub use store::DeskStore;

@@ -894,8 +894,22 @@ fn options(config: &WorkforceConfig) -> Options {
             machine: is_machine(desk),
             grant_hours: desk.bosses.grant_hours,
         },
-        sight: Default::default(),
+        sight: workforce_desk::SightOptions {
+            logs: logs_dir(desk),
+            ..Default::default()
+        },
     }
+}
+
+/// Desk's own logs folder: `[desk] logs_dir`, else the one beside the
+/// hub's folder when the hub runs in Desk's (`<Desk>/hub`, its config in
+/// it, beside `<Desk>/logs`).
+fn logs_dir(desk: &workforce_common::settings::DeskConfig) -> Option<PathBuf> {
+    desk.logs_dir.as_deref().map(PathBuf::from).or_else(|| {
+        let hub = std::env::current_dir().ok()?;
+        let logs = hub.parent()?.join("logs");
+        (hub.join("workforce.toml").is_file() && logs.is_dir()).then_some(logs)
+    })
 }
 
 /// Whether Desk's helper said this hub is a machine's (`[desk] machine =

@@ -145,7 +145,9 @@ pub(crate) use groups::put_layout_in;
 pub use groups::{
     local_agent_item, session_item, Group, Import, Imported, Layout, Ungrouped, UNGROUPED,
 };
-pub use sight::{ProcessRow, ProcessTree, Processes, Sample, SightOptions};
+pub use sight::{
+    ProcessRow, ProcessTree, Processes, RecordInfo, Sample, SightOptions, Transcript, TranscriptAsk,
+};
 
 pub use breaker::{
     agent_subject, plan_subject, pool_subject, session_subject, AgentSpend, AgentVerdict,

@@ -16,11 +16,14 @@ use chrono::{DateTime, Utc};
 use serde::Serialize;
 use uuid::Uuid;
 
+use super::memory::Why;
 use super::Desk;
 use crate::memory::Redactor;
 use crate::model::{Engine, SessionRecord, SessionState, WaitsView};
 use crate::procs::{self, Stat};
+use crate::sight::logs::{self, Logs};
 use crate::sight::procs::{self as sight_procs, Evidence};
+use crate::sight::transcript::{self, Budget, Call, Hit, Ranges};
 use crate::sight::{self, OpenCall, Reading};
 
 /// The most lines of output a sample keeps from each place it reads.
@@ -35,6 +38,27 @@ const TASK_TAIL: u64 = 64 * 1024;
 const TREE_ROWS: usize = 40;
 /// The most of a process's arguments shown.
 const ARGS_MAX: usize = 300;
+/// How long one search or step lookup may read for.
+const SCAN_FOR: Duration = Duration::from_secs(3);
+/// How far before a session's turn its logs are read from, and the most of
+/// them read.
+const LOGS_BEFORE: chrono::Duration = chrono::Duration::minutes(10);
+const LOGS_MOST: chrono::Duration = chrono::Duration::hours(6);
+
+/// Why a session's transcript isn't shown.
+pub const AGENT_TURN: &str = "That's an agent's own turn: read it with crew.history (agent_id).";
+pub const KEPT_OUT: &str = "The person keeps this session's conversation out of Desk.";
+pub const NO_REDACTOR: &str =
+    "Desk can't hide secrets on this computer, so it shows no transcript.";
+pub const REPLACED: &str =
+    "The transcript was replaced since that page: start again without before.";
+pub const STEP_UNSEEN: &str = "That call isn't in the newest 32 MB of its transcript.";
+pub const NO_SUCH_RECORD: &str = "It has no record by that name: use one of its records.";
+const UNREAD: &str = "Its transcript couldn't be read.";
+const UNCHECKED: &str = "Desk couldn't check whether this session's conversation may be read.";
+/// Why a session's logs aren't shown.
+pub const NO_LOGS: &str = "This hub keeps no Desk logs.";
+pub const LOGS_NO_REDACTOR: &str = "Desk can't hide secrets on this computer, so it shows no logs.";
 
 /// How Desk samples what runs in its sessions.
 #[derive(Debug, Clone)]
@@ -52,6 +76,8 @@ pub struct SightOptions {
     pub poll: Duration,
     /// How long a wait lasts before the overview says it.
     pub shown_after: Duration,
+    /// Desk's own logs folder, where this hub is Desk's.
+    pub logs: Option<PathBuf>,
 }
 
 impl Default for SightOptions {
@@ -65,6 +91,7 @@ impl Default for SightOptions {
             settled: Duration::from_secs(10 * 60),
             poll: Duration::from_secs(10 * 60),
             shown_after: Duration::from_secs(2 * 60),
+            logs: None,
         }
     }
 }
@@ -631,6 +658,290 @@ impl Desk {
     /// A session's sampled wait, for [`Self::view_of`].
     pub(super) fn waits_in(st: &super::State, id: Uuid) -> Option<WaitsView> {
         st.sight.get(&id).and_then(|s| s.waits.clone())
+    }
+}
+
+/// What the boss asks of a session's transcript: a page (before the cursor
+/// a page gave), a search, one call's output, or a sub-agent's record.
+#[derive(Debug, Clone, Default)]
+pub struct TranscriptAsk {
+    pub query: Option<String>,
+    pub before: Option<String>,
+    pub step: Option<String>,
+    pub record: Option<String>,
+}
+
+/// One of a session's records.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RecordInfo {
+    pub name: String,
+    pub bytes: u64,
+    pub last_write: Option<DateTime<Utc>>,
+}
+
+/// What a transcript read gives.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct Transcript {
+    pub records: Vec<RecordInfo>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub exchanges: Vec<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hits: Option<Vec<Hit>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub step: Option<Call>,
+    pub before: Option<String>,
+    pub open_call: Option<OpenCall>,
+}
+
+/// A record file, read by range.
+struct FileRanges {
+    file: std::cell::RefCell<std::fs::File>,
+    len: u64,
+}
+
+impl Ranges for FileRanges {
+    fn len(&self) -> u64 {
+        self.len
+    }
+
+    fn read(&self, at: u64, len: u64) -> std::io::Result<Vec<u8>> {
+        use std::io::{Read, Seek, SeekFrom};
+        let mut file = self.file.borrow_mut();
+        file.seek(SeekFrom::Start(at))?;
+        let mut buf = Vec::new();
+        (&mut *file).take(len).read_to_end(&mut buf)?;
+        Ok(buf)
+    }
+}
+
+/// What tells one file from another that took its place: its device and
+/// inode, else a hash of its start.
+fn file_id(file: &mut std::fs::File) -> std::io::Result<String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let meta = file.metadata()?;
+        Ok(format!("{}-{}", meta.dev(), meta.ino()))
+    }
+    #[cfg(not(unix))]
+    {
+        use sha2::Digest;
+        use std::io::{Read, Seek, SeekFrom};
+        let mut head = Vec::new();
+        file.seek(SeekFrom::Start(0))?;
+        (&mut *file).take(4096).read_to_end(&mut head)?;
+        Ok(hex::encode(&sha2::Sha256::digest(&head)[..12]))
+    }
+}
+
+/// `path`, when it is a plain file inside `root` (canonical) and no link.
+fn own_record(root: &Path, path: &Path) -> Option<PathBuf> {
+    let plain = std::fs::symlink_metadata(path).ok()?.file_type().is_file();
+    let real = path.canonicalize().ok()?;
+    (plain && real.starts_with(root)).then_some(real)
+}
+
+/// A session's record's name: `main` for its own, a sub-agent's file stem.
+fn record_name(i: usize, path: &Path) -> String {
+    match i {
+        0 => "main".into(),
+        _ => path
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default(),
+    }
+}
+
+/// What `ask` reads of the record at `path`, an `engine` one.
+fn read_transcript(
+    path: &Path,
+    engine: Engine,
+    ask: &TranscriptAsk,
+    redactor: &dyn Redactor,
+) -> Result<Transcript, String> {
+    let mut file = std::fs::File::open(path).map_err(|_| UNREAD.to_string())?;
+    let id = file_id(&mut file).map_err(|_| UNREAD.to_string())?;
+    let len = file.metadata().map_err(|_| UNREAD.to_string())?.len();
+    let end = match &ask.before {
+        None => len,
+        Some(c) => transcript::read_cursor(c)
+            .filter(|(of, at)| *of == id && *at <= len)
+            .map(|(_, at)| at)
+            .ok_or_else(|| REPLACED.to_string())?,
+    };
+    let r = FileRanges {
+        file: std::cell::RefCell::new(file),
+        len,
+    };
+    let budget = Budget {
+        bytes: transcript::SCAN_BYTES,
+        until: Some(std::time::Instant::now() + SCAN_FOR),
+    };
+    let unread = |_| UNREAD.to_string();
+    let cursor = |at: Option<u64>| at.map(|at| transcript::cursor(&id, at));
+    let empty = Transcript {
+        records: Vec::new(),
+        exchanges: Vec::new(),
+        hits: None,
+        step: None,
+        before: None,
+        open_call: None,
+    };
+    match (&ask.step, &ask.query) {
+        (Some(step), _) => transcript::step(&r, engine, end, redactor, step, budget)
+            .map_err(unread)?
+            .map(|call| Transcript {
+                step: Some(call),
+                ..empty
+            })
+            .ok_or_else(|| STEP_UNSEEN.to_string()),
+        (None, Some(query)) => {
+            let found =
+                transcript::search(&r, engine, end, redactor, query, budget).map_err(unread)?;
+            Ok(Transcript {
+                hits: Some(found.hits),
+                before: cursor(found.before),
+                ..empty
+            })
+        }
+        (None, None) => {
+            let page = transcript::page(&r, engine, end, redactor).map_err(unread)?;
+            Ok(Transcript {
+                exchanges: page.exchanges,
+                before: cursor(page.before),
+                ..empty
+            })
+        }
+    }
+}
+
+impl Desk {
+    /// A page of `id`'s own transcript, newest first, a search of it, or
+    /// one call's output, as `ask` says: read only where the person lets
+    /// Desk read it and secrets can be hidden. Why not, in a sentence.
+    pub async fn transcript_page(
+        &self,
+        id: Uuid,
+        ask: TranscriptAsk,
+    ) -> Result<Transcript, String> {
+        let r = self
+            .session_record(id)
+            .await
+            .ok_or_else(|| "There's no such session.".to_string())?;
+        if self.0.opts.hub_internal.holds(Path::new(&r.cwd))
+            || crate::ledger::agent_turn(&r.cwd, &r.name)
+        {
+            return Err(AGENT_TURN.into());
+        }
+        let records = {
+            let desk = self.clone();
+            let r = r.clone();
+            tokio::task::spawn_blocking(move || desk.records_of(&r))
+                .await
+                .unwrap_or_default()
+        };
+        if records.is_empty() {
+            return Err(format!(
+                "{} keeps no transcript Desk can read.",
+                r.engine.title()
+            ));
+        }
+        let Some(redactor) = self.0.ledger.redactor.clone() else {
+            return Err(NO_REDACTOR.into());
+        };
+        self.kept_out(&r, &records, false)
+            .await
+            .map_err(|why| match why {
+                Why::Skip(_) => KEPT_OUT.to_string(),
+                Why::Hold(_) => UNCHECKED.to_string(),
+            })?;
+        let path = match ask.record.as_deref() {
+            None | Some("main") => records[0].clone(),
+            Some(name) => records
+                .iter()
+                .enumerate()
+                .skip(1)
+                .find(|(i, p)| record_name(*i, p) == name)
+                .map(|(_, p)| p.clone())
+                .ok_or_else(|| NO_SUCH_RECORD.to_string())?,
+        };
+        let root = self
+            .0
+            .env
+            .get("HOME")
+            .and_then(|h| super::lifecycle::transcript_root(Path::new(h), r.engine))
+            .and_then(|root| root.canonicalize().ok());
+        let open_call = self.sample(id).and_then(|s| s.open_call);
+        let engine = r.engine;
+        tokio::task::spawn_blocking(move || {
+            let path = root
+                .and_then(|root| own_record(&root, &path))
+                .ok_or_else(|| UNREAD.to_string())?;
+            let infos = records
+                .iter()
+                .enumerate()
+                .map(|(i, p)| {
+                    let meta = std::fs::metadata(p).ok();
+                    RecordInfo {
+                        name: record_name(i, p),
+                        bytes: meta.as_ref().map_or(0, std::fs::Metadata::len),
+                        last_write: meta.and_then(|m| m.modified().ok()).map(to_utc),
+                    }
+                })
+                .collect();
+            read_transcript(&path, engine, &ask, redactor.as_ref()).map(|t| Transcript {
+                records: infos,
+                open_call,
+                ..t
+            })
+        })
+        .await
+        .unwrap_or_else(|_| Err(UNREAD.into()))
+    }
+
+    /// `id`'s own lines in Desk's logs around its turn, with `query` in
+    /// them when asked; why not, in a sentence.
+    pub async fn session_logs(&self, id: Uuid, query: Option<String>) -> Result<Logs, String> {
+        let Some(dir) = self.0.opts.sight.logs.clone() else {
+            return Err(NO_LOGS.into());
+        };
+        let Some(redactor) = self.0.ledger.redactor.clone() else {
+            return Err(LOGS_NO_REDACTOR.into());
+        };
+        let r = self
+            .session_record(id)
+            .await
+            .ok_or_else(|| "There's no such session.".to_string())?;
+        let now = Utc::now();
+        let start = self.state_since(id).unwrap_or(r.updated_at);
+        let from = (start - LOGS_BEFORE).max(now - LOGS_MOST);
+        tokio::task::spawn_blocking(move || {
+            let own = r.id.to_string();
+            let names: Vec<&str> = std::iter::once(own.as_str())
+                .chain(r.cli_session_id.as_deref())
+                .collect();
+            let ask = logs::Ask {
+                names: &names,
+                from,
+                to: now,
+                query: query.as_deref(),
+            };
+            let lines = logs::FILES
+                .iter()
+                .filter_map(|f| {
+                    let path = dir.join(f);
+                    let plain = std::fs::symlink_metadata(&path).ok()?.file_type().is_file();
+                    let text = plain
+                        .then(|| crate::transcript::tail_of(&path, logs::TAIL).ok())
+                        .flatten()?;
+                    Some(logs::lines_of(f, &text, &ask, Some(redactor.as_ref())))
+                })
+                .flatten()
+                .collect();
+            logs::picked(lines, &ask)
+        })
+        .await
+        .map_err(|_| "Desk's logs couldn't be read.".to_string())
     }
 }
 
