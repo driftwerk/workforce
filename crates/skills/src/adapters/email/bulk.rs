@@ -708,7 +708,7 @@ pub(crate) mod fake {
                     (src, uid)
                 })
                 .unzip();
-            copyuid.then(|| Landed {
+            copyuid.then_some(Landed {
                 validity: dest.validity,
                 source,
                 dest: landed,

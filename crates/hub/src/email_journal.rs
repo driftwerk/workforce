@@ -176,7 +176,7 @@ impl MailJournal for PgMailJournal {
         head.as_object_mut()
             .context("a bulk mail job that isn't an object")?
             .remove("done");
-        let (origin, state) = (word(&job.origin)?, word(&job.state)?);
+        let (origin, state) = (word(job.origin)?, word(job.state)?);
         let mut conn = self.pool.get().await?;
         let tx = conn.transaction().await?;
         let kept = tx

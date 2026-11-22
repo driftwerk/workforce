@@ -183,9 +183,11 @@ pub struct Mailbox {
     pub folders: Vec<Folder>,
 }
 
-fn starts_with_ignoring_case(name: &str, prefix: &str) -> bool {
+/// What follows `prefix` in `name`, when `name` starts with it in any case.
+fn after_ignoring_case<'a>(name: &'a str, prefix: &str) -> Option<&'a str> {
     name.get(..prefix.len())
-        .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
+        .filter(|head| head.eq_ignore_ascii_case(prefix))
+        .map(|_| &name[prefix.len()..])
 }
 
 fn has(listed: &Listed, attribute: &str) -> bool {
@@ -239,7 +241,7 @@ impl Mailbox {
                     .iter()
                     .filter(|l| !l.name.eq_ignore_ascii_case("INBOX"))
                     .peekable();
-                others.peek().is_some() && others.all(|l| starts_with_ignoring_case(&l.name, p))
+                others.peek().is_some() && others.all(|l| after_ignoring_case(&l.name, p).is_some())
             });
         Mailbox {
             caps: Caps::of(caps),
@@ -298,11 +300,8 @@ impl Mailbox {
             },
         }?;
         let name = match self.prefix.as_deref() {
-            Some(p)
-                if !joined.eq_ignore_ascii_case("INBOX")
-                    && !starts_with_ignoring_case(&joined, p) =>
-            {
-                format!("{p}{joined}")
+            Some(p) if !joined.eq_ignore_ascii_case("INBOX") => {
+                format!("{p}{}", after_ignoring_case(&joined, p).unwrap_or(&joined))
             }
             _ => joined,
         };
@@ -491,6 +490,10 @@ mod tests {
             "INBOX.Projects.2026"
         );
         assert_eq!(d.server_name("inbox/Clients").unwrap(), "INBOX.Clients");
+        assert_eq!(
+            d.server_name("inbox/Clients/Beta").unwrap(),
+            "INBOX.Clients.Beta"
+        );
         assert_eq!(d.server_name("INBOX").unwrap(), "INBOX");
         assert_eq!(gmail().prefix, None);
         let bare = Mailbox::of(["IMAP4rev1"], &[listed("INBOX", ".", &[])]);
