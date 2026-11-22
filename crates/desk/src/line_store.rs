@@ -454,6 +454,23 @@ impl DeskStore {
             .collect()
     }
 
+    /// Each question still open to a party whose id starts with `prefix`,
+    /// by its id and that party's: no more of it read.
+    pub async fn line_open_asks_to(&self, prefix: &str) -> Result<Vec<(Uuid, String)>> {
+        let client = self.pool().get().await?;
+        client
+            .query(
+                "SELECT id, recipient ->> 'id' AS party FROM line_messages \
+                 WHERE kind = 'ask' AND asked = 'open' \
+                 AND left(recipient ->> 'id', length($1)) = $1 ORDER BY at",
+                &[&prefix],
+            )
+            .await?
+            .iter()
+            .map(|r| Ok((r.try_get("id")?, r.try_get("party")?)))
+            .collect()
+    }
+
     /// The asker stopped waiting for the answer to `ask` and went on
     /// without it. With `on_you`, only a question waiting on the person
     /// moves (asked of them, or given to them); else any still open. One
@@ -960,6 +977,26 @@ mod tests {
                 "a second copy changes nothing"
             );
             assert!(s.line_inbox(&to.to_string()).await.unwrap().is_empty());
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn the_questions_open_to_a_kind_of_party_are_said_by_id_alone() {
+        with_test_pool(crate::store::build_pool, |pool| async move {
+            let s = DeskStore::with_pool(pool).await.unwrap();
+            let asker = session_party(Uuid::new_v4());
+            let home = ask(asker.clone(), Party::manager("home/desk", "Desk"));
+            let mut given = ask(asker.clone(), Party::manager("home/desk", "Desk"));
+            given.asked = Some(Asked::Escalated);
+            let here = ask(asker, Party::manager("homer", "Homer"));
+            for m in [&home, &given, &here] {
+                s.put_line(m).await.unwrap();
+            }
+            assert_eq!(
+                s.line_open_asks_to("home/").await.unwrap(),
+                [(home.id, "home/desk".to_string())]
+            );
         })
         .await;
     }

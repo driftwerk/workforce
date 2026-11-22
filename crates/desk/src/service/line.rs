@@ -1604,8 +1604,7 @@ impl Desk {
             .is_some_and(|q| q.asked == Some(Asked::Dismissed))
     }
 
-    /// Whether a tool call still waits on the question `ask`.
-    /// Whether a session's call still waits on any of its questions.
+    /// Whether any session's call still waits on one of its questions.
     pub fn asks_waited_on(&self) -> bool {
         let now = Instant::now();
         self.0
@@ -1617,6 +1616,7 @@ impl Desk {
             .any(|until| *until > now)
     }
 
+    /// Whether a tool call still waits on the question `ask`.
     fn waited_on_ask(&self, ask: Uuid) -> bool {
         self.0
             .state

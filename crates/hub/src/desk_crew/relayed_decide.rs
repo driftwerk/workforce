@@ -62,6 +62,10 @@ const IDLE_EVERY: Duration = Duration::from_secs(10);
 /// How long after Act fully lapses, or after its last notice for the person
 /// since, the Mac still takes from the machine for what it left to them.
 const NOTED_FOR: Duration = Duration::from_secs(60);
+/// The longest a machine that can't be reached waits between takes, each
+/// that fails in a row waiting twice as long as the last, from
+/// [`IDLE_EVERY`].
+const MOST_IDLE: Duration = Duration::from_secs(300);
 /// The most decisions one take hands out: no more than the Mac has room
 /// to decide at once, and fewer when it says so (`most`).
 const MOST_TAKEN: usize = AT_ONCE;
@@ -211,13 +215,14 @@ pub(crate) struct Outbox {
     homes: HashMap<Key, Home>,
     /// What waits to be taken, oldest first.
     queued: HashMap<Key, VecDeque<(Uuid, String, Call)>>,
-    /// What each boss (`home/<agent>`) leaves to the person, oldest first:
-    /// each of its home's takes hands it until one says it was taken.
-    notes: HashMap<String, VecDeque<Note>>,
-    /// How many of each boss's oldest notices made room for newer ones,
-    /// said as one notice of their own (by its id) until a take says it
-    /// was taken.
-    crowded: HashMap<String, (Uuid, usize)>,
+    /// What each boss (`home/<agent>`) leaves to the person, oldest first,
+    /// and whether a take handed it yet: each of its home's takes hands it
+    /// until one says it was taken.
+    notes: HashMap<String, VecDeque<(Note, bool)>>,
+    /// How many of each boss's notices, never handed, made room for newer
+    /// ones: each count said as a notice of its own until a take says it
+    /// was taken, and one handed already never grows.
+    crowded: HashMap<String, Vec<(Note, bool)>>,
     /// Who waits for each answer, and whose it is.
     waiting: HashMap<Uuid, (Key, oneshot::Sender<Result<String, Failed>>)>,
     /// What a take handed out: only these are answered.
@@ -232,47 +237,66 @@ pub(crate) struct Outbox {
     held: HashMap<Key, Option<Vec<workforce_desk::assignment::Assignment>>>,
 }
 
+/// A notice kept for a take, as it is handed out.
+fn handed((note, handed): &mut (Note, bool)) -> Note {
+    *handed = true;
+    note.clone()
+}
+
 impl Outbox {
-    /// Keeps `left` for `party`'s home to take: the oldest makes room once
-    /// [`MOST_NOTES`] wait, and is counted, never lost unsaid.
+    /// Keeps `left` for `party`'s home to take. Once [`MOST_NOTES`] wait,
+    /// the oldest never handed makes room (or `left` itself, when each was
+    /// handed and waits to be said taken), and is counted, never lost
+    /// unsaid.
     fn leave(&mut self, party: &str, left: Left) {
-        let notes = self.notes.entry(party.to_string()).or_default();
-        if notes.len() >= MOST_NOTES {
-            notes.pop_front();
-            self.crowded
-                .entry(party.to_string())
-                .or_insert_with(|| (Uuid::new_v4(), 0))
-                .1 += 1;
-        }
-        notes.push_back(Note {
+        let note = Note {
             id: Uuid::new_v4(),
             left,
-        });
+        };
+        let notes = self.notes.entry(party.to_string()).or_default();
+        if notes.len() < MOST_NOTES {
+            notes.push_back((note, false));
+            return;
+        }
+        if let Some(oldest) = notes.iter().position(|(_, handed)| !handed) {
+            notes.remove(oldest);
+            notes.push_back((note, false));
+        }
+        let counts = self.crowded.entry(party.to_string()).or_default();
+        match counts.last_mut().filter(|(_, handed)| !handed) {
+            Some((
+                Note {
+                    left: Left::Crowded { more },
+                    ..
+                },
+                _,
+            )) => *more += 1,
+            _ => counts.push((
+                Note {
+                    id: Uuid::new_v4(),
+                    left: Left::Crowded { more: 1 },
+                },
+                false,
+            )),
+        }
     }
 
     /// What `party`'s home takes now, once those it says it took (`said`)
-    /// are gone: each notice, then how many made room, if any did.
+    /// are gone, each handed from now: each notice, then each count of
+    /// those that made room.
     fn notes_of(&mut self, party: &str, said: &HashSet<Uuid>) -> Vec<Note> {
-        if self
-            .crowded
-            .get(party)
-            .is_some_and(|(id, _)| said.contains(id))
-        {
-            self.crowded.remove(party);
+        let mut out = Vec::new();
+        if let Some(n) = self.notes.get_mut(party) {
+            n.retain(|(note, _)| !said.contains(&note.id));
+            out.extend(n.iter_mut().map(handed));
         }
-        let mut notes: Vec<Note> = match self.notes.get_mut(party) {
-            Some(n) => {
-                n.retain(|note| !said.contains(&note.id));
-                Vec::from(n.clone())
-            }
-            None => Vec::new(),
-        };
+        if let Some(c) = self.crowded.get_mut(party) {
+            c.retain(|(note, _)| !said.contains(&note.id));
+            out.extend(c.iter_mut().map(handed));
+        }
         self.notes.retain(|_, n| !n.is_empty());
-        notes.extend(self.crowded.get(party).map(|(id, more)| Note {
-            id: *id,
-            left: Left::Crowded { more: *more },
-        }));
-        notes
+        self.crowded.retain(|_, c| !c.is_empty());
+        out
     }
 
     fn forget(&mut self, id: Uuid) {
@@ -735,6 +759,22 @@ struct Pump {
     /// The notices for the person the last takes handed that were said,
     /// for the next take to say were taken.
     notes_taken: Vec<Uuid>,
+    /// The machine may keep notices for the person not yet said taken:
+    /// its last take handed some, or none reached it yet.
+    notes_waiting: bool,
+    /// The takes in a row that didn't reach the machine.
+    failed: u32,
+}
+
+/// How long after a take a machine is taken from again while Act fully
+/// isn't in force, `failed` takes in a row not reaching it.
+fn idle_after(failed: u32) -> Duration {
+    match failed {
+        0 => IDLE_EVERY,
+        n => IDLE_EVERY
+            .saturating_mul(1 << (n - 1).min(8))
+            .min(MOST_IDLE),
+    }
 }
 
 /// The notices for the person the Mac said lately, from every machine.
@@ -795,11 +835,12 @@ impl Pump {
 impl Pump {
     /// Whether to take now. Once Act fully lapses here the machine is told
     /// at once; after, it is still taken now and then for a while, for what
-    /// was left to the person there.
+    /// was left to the person there, and while what it left waits.
     fn due(&self, in_force: bool, now: Instant) -> bool {
         let lapsed = !in_force && self.said;
         let wanted = in_force
             || self.noting.is_some_and(|until| now < until)
+            || self.notes_waiting
             || !self.notes_taken.is_empty();
         !self.busy && (lapsed || (wanted && now >= self.next))
     }
@@ -816,6 +857,8 @@ impl Default for Pump {
             calls: VecDeque::new(),
             at_once: Arc::new(tokio::sync::Semaphore::new(AT_ONCE)),
             notes_taken: Vec::new(),
+            notes_waiting: true,
+            failed: 0,
         }
     }
 }
@@ -863,8 +906,9 @@ pub(crate) async fn pump_loop(crew: Arc<CrewHub>, cancel: CancellationToken) {
             () = cancel.cancelled() => return,
             _ = tick.tick() => {}
         }
+        // What each pump keeps (the notices said and still to be said taken)
+        // waits for the link to come back.
         if !crew.relaying() {
-            pumps.lock().clear();
             continue;
         }
         let mut seen = HashSet::new();
@@ -979,7 +1023,7 @@ async fn take(
             .as_array()
             .into_iter()
             .flatten()
-            .take(MOST_NOTES + 1)
+            .take(2 * MOST_NOTES)
             .filter_map(|n| serde_json::from_value(n.clone()).ok())
             .collect(),
         _ => Vec::new(),
@@ -994,6 +1038,13 @@ async fn take(
             (false, false) => p.noting,
         };
         p.said = says && got.is_ok();
+        match &got {
+            Ok(a) => {
+                p.failed = 0;
+                p.notes_waiting = a.status == ServedStatus::Ok && !notes.is_empty();
+            }
+            Err(_) => p.failed = p.failed.saturating_add(1),
+        }
         if let Some((f, _)) = reported {
             p.counts = Some((f, Instant::now()));
         }
@@ -1005,7 +1056,7 @@ async fn take(
                 (_, true) => TAKE_EVERY,
                 (Ok(_), false) if in_force && reported.is_some() => TAKE_EVERY,
                 (Err(_), false) if in_force => TAKE_EVERY * 3,
-                _ => IDLE_EVERY,
+                _ => idle_after(p.failed),
             };
     }
     if got.as_ref().is_ok_and(|a| a.status == ServedStatus::Ok) {
@@ -1177,6 +1228,8 @@ mod tests {
             next: now,
             ..Pump::default()
         };
+        assert!(p.due(false, now), "once, for what it may have left");
+        p.notes_waiting = false;
         assert!(!p.due(false, now), "never at Act fully");
         assert!(p.due(true, now));
         p.next = now + TAKE_EVERY;
@@ -1196,6 +1249,18 @@ mod tests {
             p.due(false, now + NOTED_FOR),
             "until it hears what was said"
         );
+        p.notes_taken.clear();
+        p.notes_waiting = true;
+        assert!(p.due(false, now + NOTED_FOR), "while what it left waits");
+    }
+
+    #[test]
+    fn a_machine_that_cant_be_reached_is_taken_from_less_and_less_often() {
+        assert_eq!(idle_after(0), IDLE_EVERY);
+        assert_eq!(idle_after(1), IDLE_EVERY);
+        assert_eq!(idle_after(2), IDLE_EVERY * 2);
+        assert_eq!(idle_after(3), IDLE_EVERY * 4);
+        assert_eq!(idle_after(40), MOST_IDLE);
     }
 
     #[test]
@@ -1212,8 +1277,18 @@ mod tests {
         assert_eq!(notes.len(), MOST_NOTES + 1);
         assert_eq!(notes[0].left, asks(3), "the oldest made room");
         assert_eq!(notes[MOST_NOTES].left, Left::Crowded { more: 3 });
-        // Taken: each is handed no more.
+        // Each handed and not yet said taken: none makes room, and the
+        // count handed doesn't grow; the newer are counted on their own.
+        out.leave(SARAH, asks(90));
+        out.leave(SARAH, asks(91));
+        let again = out.notes_of(SARAH, &HashSet::new());
+        assert_eq!(&again[..MOST_NOTES + 1], &notes[..], "as handed");
+        assert_eq!(again[MOST_NOTES + 1].left, Left::Crowded { more: 2 });
         let said: HashSet<Uuid> = notes.iter().map(|n| n.id).collect();
+        let left = out.notes_of(SARAH, &said);
+        assert_eq!(left, again[MOST_NOTES + 1..], "the newer count alone");
+        // Taken: each is handed no more.
+        let said: HashSet<Uuid> = left.iter().map(|n| n.id).collect();
         assert!(out.notes_of(SARAH, &said).is_empty());
         assert!(out.notes.is_empty() && out.crowded.is_empty());
     }
