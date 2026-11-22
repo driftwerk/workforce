@@ -439,7 +439,8 @@ fn kept_scope(scope: Scope, home: &Path) -> Result<Scope, String> {
 }
 
 /// `scope` as it is kept, whatever is set there: a host lower-cased with
-/// any `user@` and IPv6 brackets dropped, a site lower-cased with no
+/// any `user@` and IPv6 brackets dropped, an IPv6 address in its standard
+/// form, a site lower-cased with no
 /// trailing `/`, a folder with `~` expanded and its links followed where
 /// it still leads somewhere.
 fn spelled(scope: Scope, home: &Path) -> Scope {
@@ -451,7 +452,7 @@ fn spelled(scope: Scope, home: &Path) -> Scope {
                 .strip_prefix('[')
                 .and_then(|h| h.strip_suffix(']'))
                 .unwrap_or(host);
-            Scope::Host(host.to_ascii_lowercase())
+            Scope::Host(super::asks::host_spelled(host))
         }
         Scope::Site(site) => Scope::Site(site.trim().trim_end_matches('/').to_ascii_lowercase()),
         Scope::Folder(folder) => {
@@ -809,6 +810,11 @@ mod tests {
             assert_eq!(put(v6).await.0, 204);
             let gone = json!({"agent": "kat", "kind": "network", "scope": {"kind": "host", "value": "fe80::1"}, "level": null});
             assert_eq!(put(gone).await.0, 204);
+            // Kept in its one standard form, as a command naming it is read.
+            let long = json!({"agent": "kat", "kind": "network", "scope": {"kind": "host", "value": "[FE80:0:0:0::0001]"}, "level": "anywhere"});
+            assert_eq!(put(long).await.0, 204);
+            let short = json!({"agent": "kat", "kind": "network", "scope": {"kind": "host", "value": "fe80::1"}, "level": null});
+            assert_eq!(put(short).await.0, 204);
 
             for decided_by in ["on_its_own", "person"] {
                 desk.store()

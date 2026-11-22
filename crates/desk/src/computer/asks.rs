@@ -8,10 +8,14 @@
 //! The command is split as a POSIX shell would split it, closely enough to
 //! find every simple command it runs: `;`, `&&`, `||`, `|`, `&`, newlines
 //! and subshells separate them, quotes and backslashes are honoured,
-//! `$(…)` is read as the commands it runs, and a heredoc's body is skipped.
-//! Whatever is not clear fails toward asking: a command name that is
-//! expanded at run time, `eval`, a shell fed from a pipe, a heredoc or a
-//! here-string, backticks, `<(…)`, `case` and function definitions.
+//! `$(…)` is read as the commands it runs, and a heredoc's body is skipped
+//! when the shell expands nothing in it. A no-ask verdict is reached only
+//! for forms read in full; whatever is not clear fails toward asking: a
+//! command name that is expanded at run time, `eval`, a shell fed from a
+//! pipe, a heredoc or a here-string, backticks, `<(…)`, `case` and function
+//! definitions, arithmetic on names, program text that can run a command
+//! (`awk`, `sed`, `sqlite3`, `vim -c`, `trap`), an option a reader's table
+//! doesn't hold, and a wrapper or shell it has no table for.
 //!
 //! Paths a command deletes, moves onto or overwrites are joined to its
 //! cwd and resolved as the filesystem resolves them ([`resolve_real`]):
@@ -590,34 +594,8 @@ pub fn always_asks(command: &str, place: &Place<'_>) -> Option<Asks> {
         if moved && !simple.after_and {
             here.cwd = None;
         }
-        let name = simple
-            .words
-            .iter()
-            .find(|w| !is_assignment(w) && !KEYWORDS.contains(&w.text.as_str()));
-        if let Some(name) = name.filter(|w| matches!(w.text.as_str(), "cd" | "pushd" | "popd")) {
-            let to = simple
-                .words
-                .iter()
-                .skip_while(|w| *w != name)
-                .skip(1)
-                .find(|w| !is_option(w));
-            here.cwd = match (name.text.as_str(), to) {
-                ("popd", _) => None,
-                (_, None) => Some(here.home.to_path_buf()),
-                (_, Some(w)) if w.text == "-" => None,
-                // A bare name may be found through `CDPATH` (set here or in
-                // the person's profile): known only when it is right here.
-                (_, Some(w)) if !w.text.starts_with(['/', '.', '~']) => here
-                    .cwd
-                    .as_ref()
-                    .filter(|c| c.join(&w.text).is_dir())
-                    .and_then(|_| here.resolve(w)),
-                (_, Some(w)) => here.resolve(w),
-            };
-            moved = true;
-            continue;
-        }
-        // Files a redirection empties: `>` truncates, `>>` only adds.
+        // Files a redirection empties: `>` truncates, `>>` only adds. They
+        // are opened where the command starts, before a `cd` moves.
         for (target, append) in &simple.writes {
             if matches!(
                 target.text.as_str(),
@@ -632,6 +610,40 @@ pub fn always_asks(command: &str, place: &Place<'_>) -> Option<Asks> {
             if let Some(asks) = asks {
                 add(asks);
             }
+        }
+        // The command name, past `builtin` and `command`, which run the
+        // shell's own `cd`; one given options can't be told.
+        let words = &simple.words;
+        let mut at = words
+            .iter()
+            .position(|w| !is_assignment(w) && !KEYWORDS.contains(&w.text.as_str()));
+        let mut plain = true;
+        while let Some(k) = at.filter(|&k| {
+            !words[k].dynamic && matches!(words[k].text.as_str(), "builtin" | "command")
+        }) {
+            let next = (k + 1..words.len()).find(|&j| !is_option(&words[j]));
+            plain &= next == Some(k + 1);
+            at = next;
+        }
+        let name = at.map(|k| &words[k]);
+        if let Some(name) = name
+            .filter(|w| !w.dynamic && matches!(w.text.as_str(), "cd" | "pushd" | "popd" | "chdir"))
+        {
+            let to = words[at.unwrap_or(0) + 1..].iter().find(|w| !is_option(w));
+            here.cwd = match (name.text.as_str(), to) {
+                // In a `$(…)`, the cd is its shell's: what follows is
+                // where it was, or there, as it may be either.
+                _ if simple.nested || !plain => None,
+                ("popd", _) => None,
+                (_, None) => Some(here.home.to_path_buf()),
+                (_, Some(w)) if w.text == "-" => None,
+                // A bare name may be found through `CDPATH` (set here or in
+                // the person's profile), even when it is right here too.
+                (_, Some(w)) if !w.text.starts_with(['/', '.', '~']) => None,
+                (_, Some(w)) => here.resolve(w),
+            };
+            moved = true;
+            continue;
         }
         if let Some(asks) = classify(simple, &here, false) {
             add(asks);
@@ -758,7 +770,7 @@ fn wrapped(name: &str, args: &[&Word]) -> Option<Result<usize, ()>> {
             no_long,
             0,
         ),
-        "builtin" | "nohup" => (
+        "builtin" | "nohup" | "busybox" => (
             Short {
                 flags: "",
                 valued: "",
@@ -840,6 +852,35 @@ fn wrapped(name: &str, args: &[&Word]) -> Option<Result<usize, ()>> {
                 valued: "",
             },
             |n| matches!(n, "ctty" | "fork" | "wait").then_some(false),
+            0,
+        ),
+        // A sandbox only takes away; what runs in it is what it runs.
+        "sandbox-exec" => (
+            Short {
+                flags: "",
+                valued: "fnpD",
+            },
+            no_long,
+            0,
+        ),
+        "taskpolicy" => (
+            Short {
+                flags: "abBsSx",
+                valued: "cdglptG",
+            },
+            no_long,
+            0,
+        ),
+        "xcrun" => (
+            Short {
+                flags: "vlnkr",
+                valued: "",
+            },
+            |n| match n {
+                "verbose" | "log" | "no-cache" | "kill-cache" | "run" => Some(false),
+                "sdk" | "toolchain" => Some(true),
+                _ => None,
+            },
             0,
         ),
         _ => return None,
@@ -945,14 +986,13 @@ fn plain_setting(value: &Word) -> bool {
         .unwrap_or((text, ""));
     let rest = rest.trim_start_matches(|c: char| c == '=' || c.is_whitespace());
     match key.to_ascii_lowercase().as_str() {
+        // No setting naming a file: a known-hosts file is written to.
         "port"
         | "user"
-        | "identityfile"
         | "identitiesonly"
         | "batchmode"
         | "connecttimeout"
         | "stricthostkeychecking"
-        | "userknownhostsfile"
         | "serveraliveinterval"
         | "serveralivecountmax"
         | "loglevel"
@@ -1171,7 +1211,7 @@ fn host_word(word: &Word, whole: bool) -> Option<Host> {
         return match (shaped, word.dynamic) {
             (false, _) => None,
             (true, true) => Some(Host::Unread),
-            (true, false) => Some(Host::Named(v6.to_ascii_lowercase())),
+            (true, false) => Some(Host::Named(host_spelled(v6))),
         };
     }
     let at = match address {
@@ -1196,7 +1236,16 @@ fn host_word(word: &Word, whole: bool) -> Option<Host> {
         None if address.is_some() => host.split(':').next().unwrap_or(host),
         None => host,
     };
-    (!host.is_empty()).then(|| Host::Named(host.to_ascii_lowercase()))
+    (!host.is_empty()).then(|| Host::Named(host_spelled(host)))
+}
+
+/// A host as it is kept and compared: lowercased, an IPv6 address in its
+/// one standard form (`0:0::1` is `::1`).
+pub fn host_spelled(host: &str) -> String {
+    match host.parse::<std::net::Ipv6Addr>() {
+        Ok(v6) => v6.to_string(),
+        Err(_) => host.to_ascii_lowercase(),
+    }
 }
 
 /// Whether `simple` could make a link for what follows it on the line:
@@ -1253,8 +1302,13 @@ fn default_branch(name: &str) -> bool {
 /// pushes it too. A script a shell runs (`zsh -lc '…'`) and a command
 /// behind `env`, `command`, `nohup` and the like are read as what runs.
 pub fn publishes_on(command: &str, branch: Option<&str>) -> bool {
+    // A line that can't be read is handed over when it could publish.
     let Ok(commands) = split(command) else {
-        return false;
+        return [
+            "push", "publish", "deploy", "release", "apply", "merge", "--prod",
+        ]
+        .iter()
+        .any(|k| command.contains(k));
     };
     let on_default = branch.is_some_and(default_branch);
     commands.iter().any(|c| {
@@ -1354,9 +1408,12 @@ struct Simple {
     fed: bool,
     /// It runs only if the command before it succeeded (`&&`).
     after_and: bool,
-    /// Files it writes by redirection (`>`, `>|`, `&>`), and whether each
-    /// only appends (`>>`).
+    /// Files it writes by redirection (`>`, `>|`, `&>`, `<>`), and whether
+    /// each only appends (`>>`).
     writes: Vec<(Word, bool)>,
+    /// It runs inside a `$(…)`, in a shell of its own: a `cd` there leaves
+    /// the line's cwd unknown.
+    nested: bool,
 }
 
 struct Splitter {
@@ -1365,14 +1422,19 @@ struct Splitter {
     out: Vec<Simple>,
     current: Simple,
     word: Option<Word>,
-    /// Heredoc delimiters waiting for the next newline: (delimiter, strip tabs).
-    heredocs: Vec<(String, bool)>,
+    /// Heredoc delimiters waiting for the next newline: (delimiter, strip
+    /// tabs, quoted).
+    heredocs: Vec<(String, bool, bool)>,
     /// The next word is a redirection's target, dropped.
     redirect: bool,
     /// That target is a file written: whether it is appended to.
     redirect_to: Option<bool>,
     /// The next word is a heredoc's delimiter.
     delimiter: Option<bool>,
+    /// That delimiter has a quote or a backslash in it: the body is text.
+    quoted: bool,
+    /// The last thing read closed a subshell: a `cd` in it is gone after.
+    closed: bool,
 }
 
 fn split(command: &str) -> Result<Vec<Simple>, ()> {
@@ -1386,6 +1448,8 @@ fn split(command: &str) -> Result<Vec<Simple>, ()> {
         redirect: false,
         redirect_to: None,
         delimiter: None,
+        quoted: false,
+        closed: false,
     };
     s.run()?;
     Ok(s.out)
@@ -1424,7 +1488,8 @@ impl Splitter {
             return;
         };
         if let Some(strip) = self.delimiter.take() {
-            self.heredocs.push((word.text, strip));
+            let quoted = std::mem::take(&mut self.quoted);
+            self.heredocs.push((word.text, strip, quoted));
         } else if self.redirect {
             self.redirect = false;
             if let Some(append) = self.redirect_to.take() {
@@ -1438,16 +1503,19 @@ impl Splitter {
     fn end_command(&mut self, piped: bool) {
         self.end_word();
         let done = std::mem::take(&mut self.current);
-        if !done.words.is_empty() || done.fed {
+        // A command of redirections alone (`> f`, `exec 3<> f`) still writes.
+        if !done.words.is_empty() || done.fed || !done.writes.is_empty() {
             self.out.push(done);
         }
         self.current.piped_in = piped;
     }
 
     /// Skips the bodies of the heredocs opened on the line just ended; one
-    /// never closed can't be read.
+    /// never closed can't be read, nor one whose delimiter isn't quoted
+    /// that holds a substitution (`$(…)`, a backtick, `${…}`): the shell
+    /// runs it.
     fn skip_heredocs(&mut self) -> Result<(), ()> {
-        for (delimiter, strip) in std::mem::take(&mut self.heredocs) {
+        for (delimiter, strip, quoted) in std::mem::take(&mut self.heredocs) {
             loop {
                 if self.at >= self.chars.len() {
                     return Err(());
@@ -1467,6 +1535,9 @@ impl Splitter {
                 };
                 if line == delimiter {
                     break;
+                }
+                if !quoted && (line.contains("$(") || line.contains('`') || line.contains("${")) {
+                    return Err(());
                 }
             }
         }
@@ -1591,20 +1662,24 @@ impl Splitter {
             Some('(') => {
                 self.at += 1;
                 if self.peek(0) == Some('(') {
-                    // Arithmetic runs nothing, unless it holds a command.
+                    // Arithmetic runs nothing, unless it holds a command or
+                    // a name whose value it evaluates.
                     let inner = self.substitution()?;
-                    return match inner.contains("$(") || inner.contains('`') {
-                        true => Err(()),
-                        false => Ok(()),
+                    return match plain_arithmetic(&inner) {
+                        true => Ok(()),
+                        false => Err(()),
                     };
                 }
                 let inner = self.substitution()?;
                 let commands = split(&inner)?;
-                self.out.extend(commands);
+                self.out
+                    .extend(commands.into_iter().map(|c| Simple { nested: true, ..c }));
             }
-            // `${…}` runs nothing, unless it holds a command (`${X:-$(…)}`),
-            // which can't be read.
+            // `${…}` runs nothing, unless it holds a command (`${X:-$(…)}`)
+            // or arithmetic on a name (`${A[i]}`, `${S:n}`), which can't be
+            // read.
             Some('{') => {
+                let start = self.at + 1;
                 let mut depth = 0;
                 while let Some(c) = self.peek(0) {
                     self.at += 1;
@@ -1615,7 +1690,11 @@ impl Splitter {
                         '}' => {
                             depth -= 1;
                             if depth == 0 {
-                                return Ok(());
+                                let inner: String = self.chars[start..self.at - 1].iter().collect();
+                                return match plain_expansion(&inner) {
+                                    true => Ok(()),
+                                    false => Err(()),
+                                };
                             }
                         }
                         _ => {}
@@ -1641,6 +1720,12 @@ impl Splitter {
 
     fn run(&mut self) -> Result<(), ()> {
         while let Some(c) = self.peek(0) {
+            if self.delimiter.is_some() && matches!(c, '\\' | '\'' | '"') {
+                self.quoted = true;
+            }
+            if !c.is_whitespace() && c != '&' {
+                self.closed = false;
+            }
             match c {
                 '\\' => {
                     self.at += 1;
@@ -1737,8 +1822,10 @@ impl Splitter {
                         if and {
                             self.at += 1;
                         }
+                        // After `(cd x) &&`, the cd is gone with its shell.
+                        let closed = std::mem::take(&mut self.closed);
                         self.end_command(false);
-                        self.current.after_and = and;
+                        self.current.after_and = and && !closed;
                     }
                 }
                 '|' => {
@@ -1755,6 +1842,15 @@ impl Splitter {
                         _ => true,
                     };
                     self.end_command(piped);
+                }
+                '(' if self.word.is_none() && self.peek(1) == Some('(') => {
+                    // `((…))`: arithmetic, read as `$((…))` is.
+                    self.end_command(false);
+                    self.at += 1;
+                    let inner = self.substitution()?;
+                    if !plain_arithmetic(&inner) {
+                        return Err(());
+                    }
                 }
                 '(' | ')' => {
                     self.at += 1;
@@ -1789,6 +1885,7 @@ impl Splitter {
                         continue;
                     }
                     self.end_command(false);
+                    self.closed = c == ')';
                 }
                 '<' | '>' => self.redirection(c)?,
                 '*' | '?' | '[' | '{' => {
@@ -1856,13 +1953,18 @@ impl Splitter {
             return Ok(());
         }
         let mut append = false;
+        // `<>` opens the file to read and write: what it writes lands in it.
+        let mut both = false;
         match self.peek(0) {
             Some('>') if c == '>' => {
                 append = true;
                 self.at += 1
             }
             Some('|') if c == '>' => self.at += 1,
-            Some('>') if c == '<' => self.at += 1,
+            Some('>') if c == '<' => {
+                both = true;
+                self.at += 1
+            }
             _ => {}
         }
         // `>&2`, `>&-`: onto another descriptor, no file. `>&file` writes
@@ -1873,8 +1975,89 @@ impl Splitter {
             self.at += 1;
         }
         self.redirect = true;
-        self.redirect_to = (c == '>' && !dup).then_some(append);
+        self.redirect_to = ((c == '>' || both) && !dup).then_some(append);
         Ok(())
+    }
+}
+
+/// Whether arithmetic (`$((…))`, `((…))`) is numbers and operators alone:
+/// a name in it, bare or as `$X`, is evaluated as arithmetic in turn, and a
+/// value such as `a[$(…)]` runs a command.
+fn plain_arithmetic(inner: &str) -> bool {
+    let number = |t: &str| {
+        t.chars().all(|c| c.is_ascii_digit())
+            || t.strip_prefix("0x")
+                .or_else(|| t.strip_prefix("0X"))
+                .is_some_and(|h| !h.is_empty() && h.chars().all(|c| c.is_ascii_hexdigit()))
+    };
+    !inner.contains(['$', '`', '\\', '#'])
+        && inner
+            .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .all(number)
+}
+
+/// Whether a `${…}`'s body (`X`, `X:-default`, `#X`) evaluates nothing as
+/// arithmetic: a subscript (`A[i]`), an offset (`S:n:m`) other than digits,
+/// or a name read from a value (`${!X}`) is evaluated, and could run a
+/// command held in a value. A `${…}` inside it is read the same way.
+fn plain_expansion(inner: &str) -> bool {
+    if inner.starts_with('!') {
+        return false;
+    }
+    let body = inner
+        .strip_prefix('#')
+        .filter(|b| !b.is_empty())
+        .unwrap_or(inner);
+    let name_end = body
+        .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+        .unwrap_or(body.len());
+    let rest = match name_end {
+        0 => body.get(1..).unwrap_or(""),
+        n => &body[n..],
+    };
+    let plain = match (rest.strip_prefix('['), rest.strip_prefix(':')) {
+        (Some(sub), _) => sub.split(']').next().is_some_and(|i| {
+            i.chars()
+                .all(|c| c.is_ascii_digit() || c == '@' || c == '*')
+        }),
+        (_, Some(after)) if !after.starts_with(['-', '=', '+', '?']) => after
+            .chars()
+            .all(|c| c.is_ascii_digit() || matches!(c, ' ' | ':' | '-' | '(' | ')')),
+        _ => true,
+    };
+    if !plain {
+        return false;
+    }
+    // Each `${…}` nested in what follows the name.
+    let mut nested = rest;
+    loop {
+        let Some(at) = nested.find("${") else {
+            return true;
+        };
+        let chars: Vec<char> = nested[at + 2..].chars().collect();
+        let mut depth = 1;
+        let mut len = None;
+        for (i, c) in chars.iter().enumerate() {
+            match c {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        len = Some(i);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let Some(len) = len else {
+            return false;
+        };
+        let body: String = chars[..len].iter().collect();
+        if !plain_expansion(&body) {
+            return false;
+        }
+        nested = &nested[at + 2 + body.len() + 1..];
     }
 }
 
@@ -2013,10 +2196,14 @@ fn classify_words(
         }
     }
     let first = words.get(i)?;
-    if first.dynamic {
+    if first.dynamic || subscripted(first) {
         return Some(Asks::Unclear);
     }
     let name = first.text.rsplit('/').next().unwrap_or(&first.text);
+    let name = name
+        .strip_prefix('g')
+        .filter(|n| GNU.contains(n))
+        .unwrap_or(name);
     let args = &words[i + 1..];
     match name {
         "for" | "select" => None,
@@ -2025,6 +2212,81 @@ fn classify_words(
             Some(Asks::Unclear)
         }
         "hash" if has_flag(args, 'p', &[]) => Some(Asks::Unclear),
+        // Arithmetic on names: a value such as `a[$(…)]` runs a command.
+        "let" => Some(Asks::Unclear),
+        "declare" | "typeset" | "local" | "export" | "readonly" | "unset" | "read" | "mapfile"
+        | "readarray" | "wait"
+            if args.iter().any(|w| subscripted(w)) =>
+        {
+            Some(Asks::Unclear)
+        }
+        // A name declared an integer (`-i`) or a reference (`-n`) has what
+        // is later put in it evaluated.
+        "declare" | "typeset" | "local"
+            if args
+                .iter()
+                .any(|w| w.text.starts_with(['-', '+']) && w.text[1..].contains(['i', 'n'])) =>
+        {
+            Some(Asks::Unclear)
+        }
+        "printf"
+            if args
+                .windows(2)
+                .any(|p| p[0].text == "-v" && (p[1].dynamic || subscripted(p[1]))) =>
+        {
+            Some(Asks::Unclear)
+        }
+        "[[" | "[" | "test" if compares_names(args) => Some(Asks::Unclear),
+        "trap" => trap(args, place),
+        _ if other_shell(name) => Some(Asks::Unclear),
+        _ if RUNS_ITS_ARGS.contains(&name) => Some(Asks::Unclear),
+        "awk" | "nawk" | "mawk" | "gawk" if awk_runs(args) => Some(Asks::Unclear),
+        "sed" if sed_runs(args) => Some(Asks::Unclear),
+        "sqlite3" if sqlite_runs(args, simple) => Some(Asks::Unclear),
+        "m4" => Some(Asks::Unclear),
+        "make"
+            if args
+                .iter()
+                .any(|w| w.text.starts_with("--eval") || w.text.starts_with("-E")) =>
+        {
+            Some(Asks::Unclear)
+        }
+        "cpio"
+            if args.iter().any(|w| {
+                matches!(w.text.as_str(), "--extract" | "--pass-through")
+                    || (w.text.starts_with('-')
+                        && !w.text.starts_with("--")
+                        && w.text.contains(['i', 'p']))
+            }) =>
+        {
+            Some(Asks::ForGood)
+        }
+        "pax" => {
+            let letters: String = args
+                .iter()
+                .filter(|w| w.text.starts_with('-') && !w.text.starts_with("--"))
+                .map(|w| &w.text[1..])
+                .collect();
+            match (letters.contains('r'), letters.contains('w')) {
+                (true, true) => {
+                    let ops = operands(args);
+                    match ops.split_last() {
+                        Some((dest, sources)) => place.copies_onto(dest, sources, true),
+                        None => Some(Asks::ForGood),
+                    }
+                }
+                (true, false) => Some(Asks::ForGood),
+                _ => None,
+            }
+        }
+        "script" => script(args, words, i, simple, place, unknown),
+        "arch" => match arch(args) {
+            Some(at) => {
+                let rest: Vec<&Word> = words[..i].iter().chain(&args[at..]).copied().collect();
+                classify_words(&rest, simple, place, unknown)
+            }
+            None => Some(Asks::Unclear),
+        },
         "env" if split_string(args).is_some() => match split_string(args)? {
             Some(script) => always_asks(&script, place),
             None => Some(Asks::Unclear),
@@ -2369,7 +2631,26 @@ fn classify_words(
             }
             place.overwrites(&ops, unknown)
         }
-        "ex" => place.overwrites(&operands(args), unknown),
+        // Ex commands given on the line, or read from stdin, can run one
+        // of their own (`!`, `system()`).
+        "ex" | "vim" | "vi" | "nvim" | "view" | "vimdiff" if ex_runs(name, args, simple) => {
+            Some(Asks::Unclear)
+        }
+        "ex" => {
+            let files: Vec<&Word> = args
+                .iter()
+                .enumerate()
+                .filter(|(k, w)| {
+                    !is_option(w)
+                        && !w.text.starts_with('+')
+                        && !(*k > 0
+                            && args[k - 1].text.starts_with('-')
+                            && args[k - 1].text.ends_with('c'))
+                })
+                .map(|(_, w)| *w)
+                .collect();
+            place.overwrites(&files, unknown)
+        }
         "vim" | "vi" | "nvim"
             if args.iter().any(|w| {
                 matches!(w.text.as_str(), "-c" | "-e" | "-es" | "-s" | "-E" | "-Es")
@@ -2435,6 +2716,520 @@ fn classify_words(
         "find" => find(args, simple, place),
         _ => None,
     }
+}
+
+/// Coreutils and the like as Homebrew names them (`gtimeout`, `gsed`):
+/// read as the program they are.
+const GNU: &[&str] = &[
+    "timeout", "env", "nice", "nohup", "stdbuf", "time", "sed", "awk", "tar", "find", "xargs",
+    "cp", "mv", "rm", "ln", "install", "truncate", "shred", "tee", "rmdir", "unlink", "chmod",
+    "chown", "chgrp", "dd", "split", "csplit", "touch", "mkdir",
+];
+
+/// Shells Desk doesn't read the options of: what they run can't be read.
+const OTHER_SHELLS: &[&str] = &[
+    "ash",
+    "mksh",
+    "yash",
+    "oksh",
+    "loksh",
+    "pdksh",
+    "posh",
+    "hush",
+    "rc",
+    "es",
+    "elvish",
+    "nu",
+    "xonsh",
+    "pwsh",
+    "powershell",
+    "osh",
+    "ysh",
+    "ion",
+    "murex",
+    "rbash",
+    "scsh",
+];
+
+/// Whether `name` runs scripts as a shell Desk doesn't read: one of
+/// [`OTHER_SHELLS`], or a known one by a versioned name (`bash5`,
+/// `zsh-5.9`).
+fn other_shell(name: &str) -> bool {
+    OTHER_SHELLS.contains(&name)
+        || ["bash", "zsh", "ksh", "dash", "fish", "tcsh", "csh", "sh"]
+            .iter()
+            .filter_map(|s| name.strip_prefix(s))
+            .any(|v| {
+                !v.is_empty() && v.starts_with(|c: char| c.is_ascii_digit() || c == '-' || c == '.')
+            })
+}
+
+/// Programs that run a command given to them, in a form Desk doesn't
+/// read (a string a shell runs, a debugger's, another user's or root's):
+/// what they run can't be read.
+const RUNS_ITS_ARGS: &[&str] = &[
+    "watch",
+    "hyperfine",
+    "parallel",
+    "flock",
+    "strace",
+    "ltrace",
+    "dtruss",
+    "dtrace",
+    "valgrind",
+    "gdb",
+    "lldb",
+    "fakeroot",
+    "unshare",
+    "nsenter",
+    "firejail",
+    "proxychains",
+    "proxychains4",
+    "torsocks",
+    "runuser",
+    "chroot",
+    "entr",
+    "unbuffer",
+    "chronic",
+    "expect",
+    "ssh-agent",
+    "dbus-run-session",
+    "xvfb-run",
+    "sg",
+    "newgrp",
+    "systemd-run",
+    "at",
+    "batch",
+    "emacs",
+    "emacsclient",
+];
+
+/// Whether `word` names an array element (`a[i]`, `a[i]=1`, `a[i]+=1`)
+/// whose subscript isn't digits: the shell evaluates it as arithmetic.
+fn subscripted(word: &Word) -> bool {
+    let text = word.text.as_str();
+    let Some((name, rest)) = text.split_once('[') else {
+        return false;
+    };
+    let named = name.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+    let Some((index, after)) = rest.split_once(']') else {
+        return false;
+    };
+    named
+        && (after.is_empty() || after.starts_with('=') || after.starts_with("+="))
+        && !(index
+            .chars()
+            .all(|c| c.is_ascii_digit() || c == '@' || c == '*')
+            && !word.dynamic)
+}
+
+/// Whether a test (`[[ … ]]`, `[ … ]`, `test`) compares as numbers what
+/// isn't a number written out: zsh, and bash's `[[`, evaluate each side
+/// as arithmetic, a name's value too.
+fn compares_names(args: &[&Word]) -> bool {
+    const NUMERIC: &[&str] = &["-eq", "-ne", "-lt", "-le", "-gt", "-ge"];
+    let number = |w: &Word| {
+        !w.dynamic && {
+            let t = w.text.strip_prefix(['-', '+']).unwrap_or(&w.text);
+            !t.is_empty() && t.chars().all(|c| c.is_ascii_digit())
+        }
+    };
+    args.iter().any(|w| subscripted(w))
+        || args.iter().enumerate().any(|(k, w)| {
+            NUMERIC.contains(&w.text.as_str())
+                && !(k > 0 && number(args[k - 1]) && args.get(k + 1).is_some_and(|n| number(n)))
+        })
+}
+
+/// `trap`: its action is a command run later, read as one, where the cwd
+/// can't be told; one made as it runs can't be read.
+fn trap(args: &[&Word], place: &Place<'_>) -> Option<Asks> {
+    let action = args.iter().find(|w| w.text != "--")?;
+    if matches!(action.text.as_str(), "-l" | "-p" | "-P") && !action.dynamic {
+        return None;
+    }
+    if action.dynamic {
+        return Some(Asks::Unclear);
+    }
+    // `trap - INT`, `trap '' INT`, `trap 2 3`: resets and ignores.
+    if action.text.is_empty()
+        || action.text == "-"
+        || action.text.chars().all(|c| c.is_ascii_digit())
+    {
+        return None;
+    }
+    let later = Place {
+        cwd: None,
+        set: place.set.clone(),
+        ..*place
+    };
+    always_asks(&action.text, &later)
+}
+
+/// Whether an awk program given as text can run a command or write a
+/// file: `system`, a pipe to or from a command, a redirection of
+/// `print`, an extension or include, or a program made as it runs.
+fn awk_runs(args: &[&Word]) -> bool {
+    let mut programs: Vec<&Word> = Vec::new();
+    let mut from_file = false;
+    let mut i = 0;
+    while let Some(w) = args.get(i) {
+        let t = w.text.as_str();
+        i += 1;
+        if w.dynamic && t.starts_with('-') {
+            return true;
+        }
+        match t {
+            "--" => break,
+            "-i" | "--include" if args.get(i).is_some_and(|v| v.text == "inplace") => i += 1,
+            "-f" | "--file" | "-i" | "--include" => {
+                from_file = true;
+                i += 1;
+            }
+            "-l" | "--load" | "-E" | "--exec" => return true,
+            "-e" | "--source" => {
+                programs.extend(args.get(i).copied());
+                i += 1;
+            }
+            "-v" | "-F" | "--assign" | "--field-separator" => i += 1,
+            _ if t.starts_with("--source=") || t.starts_with("--load") => return true,
+            _ if t.starts_with('-') && t.len() > 1 => {}
+            _ => {
+                i -= 1;
+                break;
+            }
+        }
+    }
+    if programs.is_empty() && !from_file {
+        programs.extend(args.get(i).copied());
+    }
+    programs.iter().any(|p| {
+        let t = p.text.as_str();
+        let redirected = t.match_indices('>').any(|(at, _)| {
+            t[at + 1..]
+                .trim_start_matches('>')
+                .trim_start()
+                .starts_with(|c: char| c == '"' || c.is_ascii_alphabetic() || c == '_' || c == '(')
+        });
+        p.dynamic || t.contains("system") || t.contains('|') || t.contains('@') || redirected
+    })
+}
+
+/// Whether a sed script given as text can run a command or write a file:
+/// the `e` command or flag, `w`/`W` or the `w` flag, or what can't be read.
+fn sed_runs(args: &[&Word]) -> bool {
+    let mut scripts: Vec<Word> = Vec::new();
+    let mut from_file = false;
+    let mut i = 0;
+    while let Some(w) = args.get(i) {
+        let t = w.text.as_str();
+        i += 1;
+        if w.dynamic && t.starts_with('-') {
+            return true;
+        }
+        match t {
+            "--" => break,
+            "-e" | "--expression" => {
+                scripts.extend(args.get(i).copied().cloned());
+                i += 1;
+            }
+            "-f" | "--file" => {
+                from_file = true;
+                i += 1;
+            }
+            "-l" | "--line-length" => i += 1,
+            // BSD's `-i ''` and `-i .bak`: the suffix is a word of its own.
+            "-i" | "-I"
+                if args
+                    .get(i)
+                    .is_some_and(|v| v.text.is_empty() || v.text.starts_with('.')) =>
+            {
+                i += 1
+            }
+            _ if t.starts_with("--expression=") => scripts.push(Word {
+                text: t["--expression=".len()..].to_string(),
+                ..(*w).clone()
+            }),
+            _ if t.starts_with("--file=") => from_file = true,
+            _ if t.starts_with('-') && t.len() > 1 && !t.starts_with("--") => {
+                // `-ne 's/a/b/'`: an `e` or `f` in a cluster takes the next word.
+                let letters = &t[1..];
+                if letters.starts_with('i') || letters.starts_with('I') {
+                    continue;
+                }
+                if letters.contains('e') {
+                    if !letters.ends_with('e') {
+                        return true;
+                    }
+                    scripts.extend(args.get(i).copied().cloned());
+                    i += 1;
+                } else if letters.contains('f') {
+                    from_file = true;
+                    i += 1;
+                }
+            }
+            _ if t.starts_with('-') && t.len() > 1 => {}
+            _ => {
+                i -= 1;
+                break;
+            }
+        }
+    }
+    if scripts.is_empty() && !from_file {
+        scripts.extend(args.get(i).copied().cloned());
+    }
+    scripts.iter().any(|s| s.dynamic || !sed_plain(&s.text))
+}
+
+/// Whether a sed script runs nothing and writes no file of its own: read
+/// command by command, its addresses, `s` and `y` taken apart; a command
+/// it doesn't know is not plain.
+fn sed_plain(script: &str) -> bool {
+    let c: Vec<char> = script.chars().collect();
+    let mut i = 0;
+    // The text up to an unescaped `delim`, past it.
+    let skip_to = |i: &mut usize, delim: char| -> bool {
+        while *i < c.len() {
+            match c[*i] {
+                '\\' => *i += 2,
+                d if d == delim => {
+                    *i += 1;
+                    return true;
+                }
+                _ => *i += 1,
+            }
+        }
+        false
+    };
+    while i < c.len() {
+        let ch = c[i];
+        if ch.is_whitespace() || ch == ';' || ch == '}' || ch == '!' || ch == ',' {
+            i += 1;
+            continue;
+        }
+        // Addresses: numbers, `$`, `first~step`, `/re/`, `\cREc`.
+        if ch.is_ascii_digit() || ch == '$' || ch == '~' || ch == '+' {
+            i += 1;
+            continue;
+        }
+        if ch == '/' {
+            i += 1;
+            if !skip_to(&mut i, '/') {
+                return false;
+            }
+            while i < c.len() && matches!(c[i], 'I' | 'M') {
+                i += 1;
+            }
+            continue;
+        }
+        if ch == '\\' {
+            let Some(&d) = c.get(i + 1) else {
+                return false;
+            };
+            i += 2;
+            if !skip_to(&mut i, d) {
+                return false;
+            }
+            continue;
+        }
+        i += 1;
+        match ch {
+            '{' | '=' | 'd' | 'D' | 'g' | 'G' | 'h' | 'H' | 'l' | 'n' | 'N' | 'p' | 'P' | 'x'
+            | 'z' | 'F' | 'q' | 'Q' => {}
+            // Labels, and text to the end of the line.
+            ':' | 'b' | 't' | 'T' | 'a' | 'i' | 'c' | 'r' | 'R' | '#' => {
+                let label = matches!(ch, ':' | 'b' | 't' | 'T');
+                while i < c.len() && c[i] != '\n' && !(label && c[i] == ';') {
+                    i += 1;
+                }
+            }
+            's' | 'y' => {
+                let Some(&d) = c.get(i) else {
+                    return false;
+                };
+                if d == '\n' || d == '\\' {
+                    return false;
+                }
+                i += 1;
+                if !skip_to(&mut i, d) || !skip_to(&mut i, d) {
+                    return false;
+                }
+                if ch == 's' {
+                    while i < c.len() && !matches!(c[i], ';' | '\n' | '}') {
+                        match c[i] {
+                            'g' | 'p' | 'i' | 'I' | 'm' | 'M' | ' ' => i += 1,
+                            d if d.is_ascii_digit() => i += 1,
+                            // `e` runs, `w` writes a file.
+                            _ => return false,
+                        }
+                    }
+                }
+            }
+            // `e` runs, `w`/`W` write a file, anything else isn't known.
+            _ => return false,
+        }
+    }
+    true
+}
+
+/// Whether sqlite3 is given what can run a command, load code, or write a
+/// file of its own: a dot-command (`.shell`, `.system`, `.output`, …),
+/// `ATTACH`, `VACUUM`, `writefile()`, `edit()`, `load_extension()`, an
+/// archive (`-A`), an init file, or commands from its stdin.
+fn sqlite_runs(args: &[&Word], simple: &Simple) -> bool {
+    let ops = operands(args);
+    if ops.len() < 2 && (simple.piped_in || simple.fed) {
+        return true;
+    }
+    let db = ops.first().copied();
+    args.iter().any(|w| {
+        let t = w.text.to_ascii_lowercase();
+        let dot = t.trim_start().starts_with('.') && !t.starts_with("./") && !t.starts_with("..")
+            || t.contains("\n.")
+            || t.contains(";.");
+        (w.dynamic && !db.is_some_and(|d| std::ptr::eq(d, *w)))
+            || dot
+            || t.starts_with("-a")
+            || t.starts_with("--a")
+            || matches!(t.trim_start_matches('-'), "init" | "cmd" | "unsafe-testing")
+            || [
+                "attach",
+                "vacuum",
+                "writefile",
+                "edit(",
+                "load_extension",
+                "fts3_tokenizer",
+            ]
+            .iter()
+            .any(|k| t.contains(k))
+    })
+}
+
+/// `script`: what it records to (a file written, or added to with `-a`)
+/// and the command it runs, read as macOS reads it. Linux's `-c` and
+/// options it doesn't know can't be read.
+fn script(
+    args: &[&Word],
+    words: &[&Word],
+    i: usize,
+    simple: &Simple,
+    place: &Place<'_>,
+    unknown: bool,
+) -> Option<Asks> {
+    let short = Short {
+        flags: "adeFkqr",
+        valued: "tT",
+    };
+    let Ok((given, ops)) = getopt(args, &short, no_long, 0) else {
+        return Some(Asks::Unclear);
+    };
+    let (&file, _) = ops.split_first()?;
+    let append = given.iter().any(|(o, _)| o == "-a");
+    let writes = match file.text.as_str() {
+        "/dev/null" => None,
+        _ if append => place.appends(&[file]),
+        _ => place.overwrites(&[file], unknown),
+    };
+    let at = args.len() - ops.len() + 1;
+    let rest: Vec<&Word> = words[..i].iter().chain(&args[at..]).copied().collect();
+    let runs = match rest.len() > i {
+        true => classify_words(&rest, simple, place, unknown),
+        false => None,
+    };
+    match (writes, runs) {
+        (Some(a), Some(b)) => Some(a.worst(b)),
+        (a, b) => a.or(b),
+    }
+}
+
+/// Where the command `arch` runs starts in its `args`, past its options
+/// (`-x86_64`, `-arm64`, `-d NAME`, `-e NAME=VALUE`); `None` for an option
+/// it doesn't know.
+fn arch(args: &[&Word]) -> Option<usize> {
+    let mut i = 0;
+    while let Some(w) = args.get(i) {
+        if w.dynamic {
+            return None;
+        }
+        match w.text.as_str() {
+            "-32" | "-64" | "-c" | "-h" | "-x86_64" | "-x86_64h" | "-arm64" | "-arm64e"
+            | "-i386" => i += 1,
+            "-arch" | "-d" | "-e" => i += 2,
+            t if t.starts_with('-') => return None,
+            _ => break,
+        }
+    }
+    Some(i.min(args.len()))
+}
+
+/// Whether vim or ex is given ex commands that can run a command: on the
+/// line (`-c`, `--cmd`, `+…`) and not [`plain_ex`], or from stdin in its
+/// silent mode (`-s`, `-es`); a script it sources (`-S`) is a file it runs.
+fn ex_runs(name: &str, args: &[&Word], simple: &Simple) -> bool {
+    let silent = name == "ex"
+        || args.iter().any(|w| {
+            w.text.starts_with('-') && !w.text.starts_with("--") && w.text.contains(['s', 'e', 'E'])
+        });
+    if silent && (simple.piped_in || simple.fed) {
+        return true;
+    }
+    args.iter().enumerate().any(|(k, w)| {
+        let t = w.text.as_str();
+        let given = k > 0 && {
+            let o = args[k - 1].text.as_str();
+            o == "--cmd" || (o.starts_with('-') && !o.starts_with("--") && o.ends_with('c'))
+        };
+        (given || (t.starts_with('+') && !t.starts_with("++")))
+            && !plain_ex(&Word {
+                text: t
+                    .strip_prefix('+')
+                    .filter(|_| !given)
+                    .unwrap_or(t)
+                    .to_string(),
+                ..(*w).clone()
+            })
+    })
+}
+
+/// Whether an ex command given to vim or ex (`-c`, `--cmd`, `+…`) is one
+/// that only moves, sets, substitutes or writes the file: anything else
+/// (`!`, `:r !`, `system()`, a script) can run a command.
+fn plain_ex(command: &Word) -> bool {
+    if command.dynamic {
+        return false;
+    }
+    command.text.split('|').all(|part| {
+        let t = part.trim().trim_start_matches(':');
+        let t = t.trim_start_matches('%');
+        matches!(
+            t,
+            "w" | "wq"
+                | "x"
+                | "q"
+                | "q!"
+                | "wq!"
+                | "x!"
+                | "wa"
+                | "qa"
+                | "qa!"
+                | "wqa"
+                | "xa"
+                | "$"
+                | ""
+        ) || t.chars().all(|c| c.is_ascii_digit())
+            || (t.starts_with("set ") || t.starts_with("se "))
+                && t.chars()
+                    .all(|c| c.is_ascii_alphanumeric() || " =,_-".contains(c))
+            || t.strip_prefix('s')
+                .and_then(|r| r.chars().next())
+                .is_some_and(|d| {
+                    !d.is_ascii_alphanumeric()
+                        && d != '\\'
+                        && !t.contains("\\=")
+                        && !t.contains('|')
+                })
+    })
 }
 
 /// The folder `-t`/`--target-directory` names.
@@ -2578,55 +3373,107 @@ fn tar(args: &[&Word], place: &Place<'_>) -> Option<Asks> {
     place.extracts(dest.as_ref())
 }
 
-/// `find`: `-delete` deletes under its start paths; `-exec` runs a command
-/// on what it finds.
+/// `find`: `-delete` deletes under its start paths, `-fprint` and the
+/// like write the file they name, `-exec` runs a command on what it
+/// finds. Its own options (`-H`, `-L`, `-x`, `-f path`, `--`) come before
+/// the start paths; one it doesn't know, or no start path at all, can't be
+/// read. Following links (`-L`, `-follow`) a delete can reach anywhere.
 fn find(args: &[&Word], simple: &Simple, place: &Place<'_>) -> Option<Asks> {
-    let starts: Vec<&Word> = args
-        .iter()
-        .take_while(|w| !w.text.starts_with('-') && w.text != "(" && w.text != "!")
-        .copied()
-        .collect();
-    if args.iter().any(|w| w.text == "-delete") {
-        let here = Word {
-            text: ".".into(),
-            dynamic: false,
-            glob: false,
-            brace: false,
-        };
-        let asks = match starts.is_empty() {
-            true => place.clears(&here),
-            false => starts
-                .iter()
-                .filter_map(|s| place.clears(s))
-                .reduce(Asks::worst),
-        };
-        if asks.is_some() {
-            return asks;
+    let mut starts: Vec<&Word> = Vec::new();
+    let mut follows = false;
+    let mut i = 0;
+    while let Some(w) = args.get(i) {
+        let t = w.text.as_str();
+        if w.dynamic && t.starts_with('-') {
+            return Some(Asks::Unclear);
+        }
+        match t {
+            "-H" | "-P" | "-E" | "-X" | "-d" | "-s" | "-x" => i += 1,
+            "-L" => {
+                follows = true;
+                i += 1;
+            }
+            "-f" => {
+                starts.extend(args.get(i + 1).copied());
+                i += 2;
+            }
+            "-D" => i += 2,
+            "--" => {
+                i += 1;
+                break;
+            }
+            _ if t.starts_with("-O") && t[2..].chars().all(|c| c.is_ascii_digit()) => i += 1,
+            _ => break,
         }
     }
-    let mut i = 0;
-    while i < args.len() {
-        if matches!(
-            args[i].text.as_str(),
-            "-exec" | "-execdir" | "-ok" | "-okdir"
-        ) {
-            let end = args[i + 1..]
-                .iter()
-                .position(|w| w.text == ";" || w.text == "+")
-                .map_or(args.len(), |p| i + 1 + p);
-            let inner: Vec<&Word> = args[i + 1..end]
-                .iter()
-                .copied()
-                .filter(|w| w.text != "{}")
-                .collect();
-            if let Some(asks) = classify_words(&inner, simple, place, true) {
-                return Some(asks);
-            }
-            i = end;
+    while let Some(w) = args.get(i) {
+        if w.text.starts_with('-') || matches!(w.text.as_str(), "(" | "!" | ")") {
+            break;
         }
+        starts.push(*w);
         i += 1;
     }
-    None
+    let expression = &args[i..];
+    let acts = |names: &[&str]| expression.iter().any(|w| names.contains(&w.text.as_str()));
+    let acting = acts(&[
+        "-delete", "-exec", "-execdir", "-ok", "-okdir", "-fprint", "-fprint0", "-fprintf", "-fls",
+    ]);
+    if !acting {
+        return None;
+    }
+    // A start path it can't see, or no start path: GNU's `.`, BSD's error.
+    if starts.is_empty() {
+        return Some(Asks::Unclear);
+    }
+    follows |= acts(&["-follow"]);
+    let mut found: Option<Asks> = None;
+    let mut add = |asks: Option<Asks>| {
+        if let Some(a) = asks {
+            found = Some(match found.take() {
+                Some(was) => was.worst(a),
+                None => a,
+            });
+        }
+    };
+    if acts(&["-delete"]) {
+        match follows {
+            true => add(Some(Asks::ForGood)),
+            false => {
+                for s in &starts {
+                    add(place.clears(s));
+                }
+            }
+        }
+    }
+    let mut k = 0;
+    while k < expression.len() {
+        let t = expression[k].text.as_str();
+        match t {
+            "-fprint" | "-fprint0" | "-fprintf" | "-fls" => {
+                match expression.get(k + 1) {
+                    Some(file) => add(place.overwrites(&[*file], false)),
+                    None => add(Some(Asks::Unclear)),
+                }
+                k += 1;
+            }
+            "-exec" | "-execdir" | "-ok" | "-okdir" => {
+                let end = expression[k + 1..]
+                    .iter()
+                    .position(|w| w.text == ";" || w.text == "+")
+                    .map_or(expression.len(), |p| k + 1 + p);
+                let inner: Vec<&Word> = expression[k + 1..end]
+                    .iter()
+                    .copied()
+                    .filter(|w| w.text != "{}")
+                    .collect();
+                add(classify_words(&inner, simple, place, true));
+                k = end;
+            }
+            _ => {}
+        }
+        k += 1;
+    }
+    found
 }
 
 /// Interpreters that run a program given to them as text.
@@ -2643,7 +3490,16 @@ fn interpreter(name: &str) -> bool {
                 | "php"
                 | "lua"
                 | "Rscript"
+                | "R"
                 | "tclsh"
+                | "swift"
+                | "julia"
+                | "groovy"
+                | "elixir"
+                | "racket"
+                | "guile"
+                | "sbcl"
+                | "erl"
         )
 }
 
@@ -2668,6 +3524,8 @@ fn evaluates(name: &str, args: &[&Word]) -> bool {
         "node" | "nodejs" | "bun" => short(&['e', 'p']) || long(&["--eval", "--print"]),
         "deno" => operands(args).first().is_some_and(|w| w.text == "eval"),
         "php" => short(&['r']),
+        "guile" => short(&['c']) || long(&["--eval"]),
+        "sbcl" => long(&["--eval", "--script"]),
         _ => short(&['e', 'E']),
     }
 }
@@ -2691,61 +3549,129 @@ const GIT_RUNS: &[&str] = &[
     "VISUAL",
 ];
 
-/// Whether a `git -c key=value` setting runs a program, reads more
-/// settings, or changes where git works or reaches: one with a value made
-/// as it runs can't be read either.
-fn runs_through(setting: &Word) -> bool {
-    if setting.dynamic {
-        return true;
-    }
-    let key = setting
-        .text
-        .split_once('=')
-        .map_or(setting.text.as_str(), |(k, _)| k)
-        .to_ascii_lowercase();
-    let last = key.rsplit('.').next().unwrap_or(&key);
-    matches!(
-        key.as_str(),
-        "core.sshcommand"
-            | "core.pager"
-            | "core.fsmonitor"
-            | "core.hookspath"
-            | "core.editor"
-            | "core.askpass"
-            | "core.gitproxy"
-            | "core.worktree"
-            | "core.alternaterefscommand"
-            | "sequence.editor"
-            | "diff.external"
-            | "init.templatedir"
-            | "include.path"
-            | "uploadpack.packobjectshook"
-    ) || [
-        "alias.",
-        "includeif.",
-        "pager.",
-        "filter.",
-        "difftool.",
-        "mergetool.",
-        "url.",
-        "protocol.",
-    ]
-    .iter()
-    .any(|p| key.starts_with(p))
-        || matches!(
-            last,
-            "command"
-                | "cmd"
-                | "textconv"
-                | "driver"
-                | "program"
-                | "helper"
-                | "tool"
-                | "receivepack"
-                | "uploadpack"
-                | "proxy"
-                | "sshcommand"
+/// Whether a git setting is one known to change only how git names,
+/// colours or advises, or where it begins: any other may run a program,
+/// read more settings, or change where git works or reaches. One made as
+/// it runs can't be read. `safe.directory` is a check given for one call
+/// (`-c`), never written for good.
+fn plain_git_setting(key: &str, written: bool) -> bool {
+    let key = key.to_ascii_lowercase();
+    ["user.", "color.", "advice."]
+        .iter()
+        .any(|p| key.starts_with(p) && key.len() > p.len())
+        || matches!(key.as_str(), "init.defaultbranch" | "core.autocrlf")
+        || (!written && key == "safe.directory")
+}
+
+/// Whether a `git -c key=value` setting is [`plain_git_setting`].
+fn plain_git_c(setting: &Word) -> bool {
+    !setting.dynamic
+        && plain_git_setting(
+            setting
+                .text
+                .split_once('=')
+                .map_or(setting.text.as_str(), |(k, _)| k),
+            false,
         )
+}
+
+/// `git config`: what it writes, read with its own options. Reading
+/// asks nothing; writing a setting that isn't [`plain_git_setting`]
+/// changes what git runs from then on, which is the computer's own; an
+/// editor opened on it, or an option it doesn't know, can't be read.
+fn git_config(rest: &[&Word], place: &Place<'_>) -> Option<Asks> {
+    let mut file: Option<Word> = None;
+    let mut ops: Vec<&Word> = Vec::new();
+    let mut write = false;
+    let mut ended = false;
+    let mut i = 0;
+    while let Some(w) = rest.get(i) {
+        i += 1;
+        let t = w.text.as_str();
+        if w.dynamic && t.starts_with('-') {
+            return Some(Asks::Unclear);
+        }
+        if ended || !t.starts_with('-') || t == "-" {
+            ops.push(*w);
+            continue;
+        }
+        let (name, joined) = match t.split_once('=') {
+            Some((n, v)) if n.starts_with("--") => (n, Some(v)),
+            _ => (t, None),
+        };
+        let value = |i: &mut usize| match joined {
+            Some(v) => Some(Word {
+                text: v.to_string(),
+                ..(*w).clone()
+            }),
+            None => {
+                *i += 1;
+                rest.get(*i - 1).copied().cloned()
+            }
+        };
+        match name {
+            "--" => ended = true,
+            "--global" | "--system" | "--local" | "--worktree" | "--includes" | "--no-includes"
+            | "--show-origin" | "--show-scope" | "--name-only" | "-z" | "--null" | "--bool"
+            | "--int" | "--bool-or-int" | "--path" | "--expiry-date" | "--fixed-value"
+            | "--all" | "--show-names" | "--regexp" | "--append" | "--no-type" | "--get"
+            | "--get-all" | "--get-regexp" | "--get-urlmatch" | "--get-color"
+            | "--get-colorbool" | "-l" | "--list" => {}
+            "--type" | "--default" | "--value" | "--comment" | "--url" | "--blob" => {
+                value(&mut i);
+            }
+            "-f" | "--file" => file = value(&mut i),
+            "--add" | "--replace-all" | "--unset" | "--unset-all" | "--rename-section"
+            | "--remove-section" => write = true,
+            _ => return Some(Asks::Unclear),
+        }
+    }
+    let sub = ops.first().map(|w| w.text.as_str());
+    let names: Vec<&Word> = match sub {
+        Some("edit") => return Some(Asks::Unclear),
+        Some("list" | "get") => return None,
+        Some("set" | "unset" | "rename-section" | "remove-section") => {
+            write = true;
+            ops[1..]
+                .iter()
+                .take(match sub {
+                    Some("rename-section") => 2,
+                    _ => 1,
+                })
+                .copied()
+                .collect()
+        }
+        _ if rest.iter().any(|w| w.text == "--rename-section") => {
+            ops.iter().take(2).copied().collect()
+        }
+        _ => {
+            write |= ops.len() >= 2;
+            ops.iter().take(1).copied().collect()
+        }
+    };
+    if !write {
+        return None;
+    }
+    let section = rest
+        .iter()
+        .any(|w| matches!(w.text.as_str(), "--rename-section" | "--remove-section"))
+        || matches!(sub, Some("rename-section" | "remove-section"));
+    let plain = !names.is_empty()
+        && names.iter().all(|n| {
+            !n.dynamic
+                && match section {
+                    true => matches!(
+                        n.text.to_ascii_lowercase().as_str(),
+                        "user" | "color" | "advice"
+                    ),
+                    false => plain_git_setting(&n.text, true),
+                }
+        });
+    match (plain, file) {
+        (false, _) => Some(Asks::System),
+        (true, Some(f)) => place.appends(&[&f]),
+        (true, None) => None,
+    }
 }
 
 /// `git`: what can't be undone, acting where its `-C`, `--git-dir` and
@@ -2773,7 +3699,7 @@ fn git(args: &[&Word], assigns: &[&Word], place: &Place<'_>) -> Option<Asks> {
             (false, None) => None,
         };
         match option {
-            "-c" if given.as_ref().is_none_or(runs_through) => return Some(Asks::Unclear),
+            "-c" if !given.as_ref().is_some_and(plain_git_c) => return Some(Asks::Unclear),
             "--config-env" | "--exec-path" => return Some(Asks::Unclear),
             "-C" => here.cwd = given.as_ref().and_then(|g| here.resolve(g)),
             "--git-dir" | "--work-tree" => at.push(given.as_ref().and_then(|g| here.resolve(g))),
@@ -2803,6 +3729,9 @@ fn git(args: &[&Word], assigns: &[&Word], place: &Place<'_>) -> Option<Asks> {
     let place = &here;
     let sub = args.get(i)?;
     let rest = &args[i + 1..];
+    if sub.text == "config" {
+        return git_config(rest, place);
+    }
     let irreversible = match sub.text.as_str() {
         "push" => {
             git_flag(
@@ -3104,6 +4033,8 @@ mod tests {
             "git stash drop",
             "git stash clear",
             "cd nope && rm -rf build",
+            // A bare name may be found through `CDPATH`.
+            "cd src && rm -rf build",
         ] {
             if asks(command).is_none() {
                 wrong.push(command);
@@ -3113,7 +4044,7 @@ mod tests {
         for ok in [
             "rm -rf ../l",
             "rm ../l",
-            "cd src && rm -rf build",
+            "cd ./src && rm -rf build",
             "echo x | tee -a /Users/sarah/notes.md",
             "echo x | tee out.txt",
             "cp a.txt /Users/sarah/dev/acme-web/new.txt",
@@ -3186,7 +4117,7 @@ mod tests {
             "rm -rf target/*",
             "rm -rf ./target/debug",
             "rm -f *.log",
-            "cd target && rm -rf debug",
+            "cd ./target && rm -rf debug",
             "cd .. && rm -rf work/target",
             "git push origin feat/date-picker",
             "git push -u origin HEAD",
@@ -3667,6 +4598,324 @@ mod tests {
         ] {
             assert_eq!(asks(command), None, "{command:?}");
         }
+    }
+
+    /// The second re-review: a heredoc's body the shell expands, a write
+    /// by `<>` or by redirections alone, and a delete reached past
+    /// `find`'s own options or a `cd` Desk can't follow.
+    #[test]
+    fn what_a_shell_expands_or_opens_on_its_own_is_read() {
+        for command in [
+            "cat <<EOF\n$(rm -rf ~)\nEOF",
+            "cat <<EOF > x\n`rm -rf ~`\nEOF",
+            "cat <<EOF\n${X:-$(rm -rf ~)}\nEOF",
+            "cat <<-EOF\n\t${HOME}\n\tEOF",
+            "git commit -m \"$(cat <<EOF\n$(rm -rf ~)\nEOF\n)\"",
+        ] {
+            assert_eq!(asks(command), Some(U), "{command:?}");
+        }
+        for command in [
+            "cat <<'EOF'\n$(rm -rf ~)\nEOF",
+            "cat <<\"EOF\"\n`rm -rf ~`\nEOF",
+            "cat <<\\EOF\n${X:-$(rm -rf ~)}\nEOF",
+            "cat <<EOF > notes.txt\nplain $HOME text\nEOF",
+        ] {
+            assert_eq!(asks(command), None, "{command:?}");
+        }
+        for command in [
+            "1<> ~/.zshrc",
+            "echo x 1<> ~/.zshrc",
+            "> ~/.zshrc",
+            "true && > ~/.zshrc",
+            "exec 3<> ~/.zshrc",
+            "exec > ~/.zshrc",
+            "cd /tmp > ~/.zshrc",
+        ] {
+            assert_eq!(asks(command), Some(Asks::System), "{command:?}");
+        }
+        let readme = Some(Asks::Overwrites(vec![p(
+            "/Users/sarah/dev/acme-web/README.md",
+        )]));
+        for command in [
+            "true && > /Users/sarah/dev/acme-web/README.md",
+            "exec 3<> /Users/sarah/dev/acme-web/README.md",
+            "3<>/Users/sarah/dev/acme-web/README.md",
+        ] {
+            assert_eq!(asks(command), readme, "{command:?}");
+        }
+        assert_eq!(asks("exec 3<> src/a.rs"), None);
+        for command in [
+            "find -H /Users/sarah/dev/acme-web -delete",
+            "find -x /Users/sarah/dev/acme-web -name '*.o' -delete",
+            "find -P -- /Users/sarah/dev/acme-web -delete",
+            "find -f /Users/sarah/dev/acme-web -delete",
+            "find -L . -delete",
+            "find . -follow -name x -delete",
+        ] {
+            assert_eq!(asks(command), Some(G), "{command:?}");
+        }
+        for command in [
+            "find -delete",
+            "find -name x -delete",
+            "find -Q . -delete",
+            "find -exec rm {} +",
+        ] {
+            assert_eq!(asks(command), Some(U), "{command:?}");
+        }
+        assert_eq!(asks("find . -fprint ~/.zshrc"), Some(Asks::System));
+        assert_eq!(asks("find . -name '*.o' -delete"), None);
+        assert_eq!(asks("find . -name '*.rs'"), None);
+        for command in [
+            "builtin cd ~ && rm -rf .ssh",
+            "command cd ~ && rm -rf .ssh",
+            "builtin command cd ~ && rm -rf .ssh",
+        ] {
+            assert_eq!(asks(command), Some(Asks::System), "{command:?}");
+        }
+        for command in [
+            "command -p cd ~ && rm -rf .ssh",
+            "cd target && rm -rf debug",
+            "(cd ~) && rm -rf .ssh",
+            "true && echo $(cd ~) && rm -rf .ssh",
+            "cd ./target && echo $(cd ~ && pwd) && rm -rf .ssh",
+        ] {
+            assert!(asks(command).is_some(), "{command:?}");
+        }
+        assert_eq!(asks("(cd ./target && rm -rf debug)"), None);
+    }
+
+    /// git's settings: only those that change how it names, colours or
+    /// advises are given (`-c`) or written (`git config`) without asking.
+    #[test]
+    fn git_settings_are_read_from_an_allowlist() {
+        for command in [
+            "git config --global core.hooksPath /x",
+            "git config core.fsmonitor x",
+            "git config --global alias.st '!rm -rf ~'",
+            "git config --system include.path /x",
+            "git config set --global core.pager x",
+            "git config --add --global credential.helper x",
+            "git config --global safe.directory '*'",
+            "git config --file ~/.gitconfig user.name x",
+            "git config -f ~/.gitconfig user.name x",
+            "git -C /Users/sarah/dev/acme-web config core.sshCommand x",
+            "git config --global \"$K\" x",
+            "git config --rename-section user core",
+        ] {
+            assert_eq!(asks(command), Some(Asks::System), "{command:?}");
+        }
+        for command in [
+            "git config --global --edit",
+            "git config -e",
+            "git config edit",
+            "git config --bogus x y",
+            "git -c core.editor=x commit",
+            "git -c http.proxy=x fetch",
+            "git -c remote.origin.url=x fetch",
+            "git -c gpg.program=x commit -S -m y",
+            "git -c core.hooksPath=/x commit -m x",
+        ] {
+            assert_eq!(asks(command), Some(U), "{command:?}");
+        }
+        for command in [
+            "git config --global user.name x",
+            "git config user.email x@y.z",
+            "git config core.autocrlf true",
+            "git config --global init.defaultBranch main",
+            "git config --get core.pager",
+            "git config -l",
+            "git config list --global",
+            "git config get user.name",
+            "git config user.email",
+            "git -c user.name=x commit -m y",
+            "git -c color.ui=always log",
+            "git -c advice.detachedHead=false log",
+            "git -c safe.directory=/x status",
+            "git -c init.defaultBranch=main init",
+            "git -c core.autocrlf=false status",
+        ] {
+            assert_eq!(asks(command), None, "{command:?}");
+        }
+    }
+
+    /// Program text Desk can't read as commands: a trap's action is read as
+    /// one, arithmetic on names, and awk, sed, sqlite3, vim and m4 given
+    /// what can run a command or write a file.
+    #[test]
+    fn program_text_and_evaluated_values_are_read_or_cant_be() {
+        assert_eq!(asks("trap 'rm -rf ~' EXIT"), Some(Asks::System));
+        assert_eq!(asks("trap -- 'rm -rf ~' INT TERM"), Some(Asks::System));
+        assert_eq!(asks("trap 'rm -rf build' EXIT"), Some(G));
+        assert_eq!(asks("trap \"$C\" EXIT"), Some(U));
+        for command in [
+            "trap - EXIT",
+            "trap '' INT",
+            "trap 'echo done' EXIT",
+            "trap -p",
+        ] {
+            assert_eq!(asks(command), None, "{command:?}");
+        }
+        for command in [
+            "echo $((x + 1))",
+            "echo $(( $x + 1 ))",
+            "i=$((i+1))",
+            "(( x > 1 ))",
+            "for ((i = 0; i < n; i++)); do ls; done",
+            "let x=y",
+            "[[ $x -eq 1 ]]",
+            "[[ x -eq 1 ]]",
+            "[ \"$n\" -gt 0 ]",
+            "test x -lt 2",
+            "declare -i n=x",
+            "typeset -i n",
+            "local -n r=a",
+            "a[x]=1",
+            "echo ${A[i]}",
+            "echo ${S:n}",
+            "echo ${!X}",
+            "echo ${X:-${A[i]}}",
+            "unset 'a[x]'",
+            "printf -v 'a[x]' %s 1",
+            "[[ -v a[x] ]]",
+        ] {
+            assert_eq!(asks(command), Some(U), "{command:?}");
+        }
+        for command in [
+            "echo $((1 + 2)) $((0x1F * 2))",
+            "(( 1 < 2 ))",
+            "[[ 1 -eq 1 ]]",
+            "[ 1 -lt 2 ]",
+            "[ -n \"$x\" ]",
+            "echo ${A[0]} ${A[@]} ${S:1:2} ${X:-y} ${#X}",
+            "a[0]=1",
+            "declare -a arr",
+        ] {
+            assert_eq!(asks(command), None, "{command:?}");
+        }
+        for command in [
+            "awk 'BEGIN{system(\"rm -rf ~\")}'",
+            "awk '{print | \"sh\"}' f",
+            "awk '{print > \"/Users/sarah/.zshrc\"}' f",
+            "gawk -e 'BEGIN{system(\"x\")}'",
+            "awk -l x 'BEGIN{}'",
+            "nawk 'BEGIN{\"id\" | getline}'",
+            "mawk '@include \"x\"'",
+            "awk \"$P\" f",
+            "awk -i inplace '{system(\"x\")}' f",
+            "sqlite3 db '.shell rm -rf ~'",
+            "sqlite3 db '.system rm -rf ~'",
+            "sqlite3 db '.output /Users/sarah/.zshrc'",
+            "sqlite3 -cmd '.shell x' db",
+            "sqlite3 db \"select writefile('/x', 'y')\"",
+            "sqlite3 db \"attach '/Users/sarah/x.db' as x\"",
+            "sqlite3 -A -x -f a.db",
+            "echo '.shell x' | sqlite3 db",
+            "sqlite3 db <<'EOF'\n.shell x\nEOF",
+            "sed 's/x/rm -rf ~/e' f",
+            "sed '1e rm -rf ~' f",
+            "sed -n 'w /Users/sarah/.zshrc' f",
+            "sed 's/a/b/w /Users/sarah/.zshrc' f",
+            "sed -e 'e id' f",
+            "sed -ne 'e id' f",
+            "sed --expression='e id' f",
+            "sed \"$S\" f",
+            "gsed 'e id' f",
+            "sed ':a;e id' f",
+            "vim -c '!rm -rf ~' f",
+            "vim +'!rm -rf ~' f",
+            "vim --cmd 'call system(\"x\")' f",
+            "ex -sc '!rm -rf ~' f",
+            "ex -s f <<'EOF'\n!rm -rf ~\nEOF",
+            "m4 x.m4",
+            "make --eval='x:;rm -rf ~' x",
+        ] {
+            assert_eq!(asks(command), Some(U), "{command:?}");
+        }
+        for command in [
+            "awk '{print $1}' f",
+            "awk -F: '$3 > 100 {print $1}' f",
+            "sqlite3 db 'select 1'",
+            "sed 's/a/b/g' f",
+            "sed -n '1,5p' f",
+            "sed -E 's/(a)/\\1/' f",
+            "sed ':a;N;$!ba;s/\\n/ /g' f",
+            "sed '/x/d;s|a|b|2' f",
+            "sed -i.bak 's/a/b/' src/a.rs",
+            "vim -c 'set ft=rust | wq' src/a.rs",
+        ] {
+            assert_eq!(asks(command), None, "{command:?}");
+        }
+    }
+
+    /// What runs a command it is given is read through to that command; a
+    /// shell or a runner Desk doesn't read can't be read.
+    #[test]
+    fn every_wrapper_is_read_through_or_cant_be() {
+        for command in [
+            "script -q /dev/null rm -rf ~",
+            "script /Users/sarah/.zshrc",
+            "arch -arm64 rm -rf ~",
+            "arch -x86_64 /bin/sh -c 'rm -rf ~'",
+            "taskpolicy -b rm -rf ~",
+            "sandbox-exec -n no-network rm -rf ~",
+            "xcrun rm -rf ~",
+            "gtimeout 5 rm -rf ~",
+            "gnice -n 5 rm -rf ~",
+            "nohup rm -rf ~",
+            "caffeinate -i rm -rf ~",
+            "busybox rm -rf ~",
+            "busybox sh -c 'rm -rf ~'",
+        ] {
+            assert_eq!(asks(command), Some(Asks::System), "{command:?}");
+        }
+        for command in [
+            "script -c 'rm -rf ~' log",
+            "arch -bogus rm -rf ~",
+            "mksh -c 'rm -rf ~'",
+            "yash -c 'rm -rf ~'",
+            "pwsh -c 'Remove-Item -Recurse ~'",
+            "bash5 -c 'rm -rf ~'",
+            "zsh-5.9 -c 'rm -rf ~'",
+            "watch 'rm -rf ~'",
+            "flock /tmp/l -c 'rm -rf ~'",
+            "ssh -o UserKnownHostsFile=/Users/sarah/.zshrc devbox ls",
+            "ssh -o GlobalKnownHostsFile=/x devbox ls",
+            "ssh -o IdentityFile=~/.ssh/k devbox ls",
+            "scp -o UserKnownHostsFile=/x a devbox:b",
+        ] {
+            assert_eq!(asks(command), Some(U), "{command:?}");
+        }
+        for command in [
+            "cpio -idv < a.cpio",
+            "cpio -i < a.cpio",
+            "cpio -pdm /Users/sarah/dev/acme-web < list",
+            "pax -r < a.pax",
+            "pax -rw src /Users/sarah",
+        ] {
+            assert_eq!(asks(command), Some(G), "{command:?}");
+        }
+        for command in [
+            "pax -w -f a.pax src",
+            "cpio -o < list > a.cpio",
+            "script -q /dev/null ls",
+        ] {
+            assert_eq!(asks(command), None, "{command:?}");
+        }
+    }
+
+    /// An IPv6 address is kept in one standard form, however it is written.
+    #[test]
+    fn an_ipv6_host_is_spelled_one_way() {
+        assert_eq!(host_spelled("0:0:0:0:0:0:0:1"), "::1");
+        assert_eq!(host_spelled("FE80:0::0001"), "fe80::1");
+        assert_eq!(host_spelled("DevBox"), "devbox");
+        // As Desk's card spells them.
+        assert_eq!(host_spelled("2001:db8:0:0:1:0:0:1"), "2001:db8::1:0:0:1");
+        assert_eq!(host_spelled("::ffff:102:304"), "::ffff:1.2.3.4");
+        let v6 = Some(Asks::Remote(vec![Host::Named("fe80::1".into())]));
+        assert_eq!(asks("ssh [FE80:0:0::1] 'rm -rf x'"), v6);
+        assert_eq!(asks("ssh dev@[fe80::0:1] 'rm -rf x'"), v6);
+        assert_eq!(asks("ssh FE80::0:1 'rm -rf x'"), v6);
     }
 
     /// Where what can't be undone acts: its cwd after any `cd`, git's own

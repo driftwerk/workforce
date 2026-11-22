@@ -2391,3 +2391,67 @@ fn stored_rows_read_into_levels_and_overrides() {
         ]
     );
 }
+
+/// The second re-review's bypasses, each exactly as it was found: with
+/// every kind on its own anywhere, none runs without asking.
+#[test]
+fn the_second_reviews_bypasses_ask_whatever_runs_on_its_own() {
+    let anywhere = [ActionKind::Commands, ActionKind::Files, ActionKind::Network]
+        .into_iter()
+        .fold(full(), |pol, kind| alone(pol, kind, Level::Anywhere));
+    for command in [
+        "cat <<EOF\n$(rm -rf ~)\nEOF",
+        "cat <<EOF\n`rm -rf ~`\nEOF",
+        "cat <<EOF\n${X:-$(rm -rf ~)}\nEOF",
+        "1<> ~/.zshrc",
+        "echo x 1<> ~/.zshrc",
+        "> ~/.zshrc",
+        "true && > ~/.zshrc",
+        "exec 3<> ~/.zshrc",
+        "find -L . -delete",
+        "find -H /Users/sarah/dev/other -delete",
+        "find -x /Users/sarah/dev/other -delete",
+        "find -delete",
+        "builtin cd ~ && rm -rf .ssh",
+        "command cd ~ && rm -rf .ssh",
+        "cd Library && rm -rf Keychains",
+        "git config --global core.hooksPath /x",
+        "git config core.fsmonitor x",
+        "git config --global alias.x '!rm -rf ~'",
+        "trap 'rm -rf ~' EXIT",
+        "echo $((x))",
+        "let x=y",
+        "[[ $x -eq 1 ]]",
+        "declare -i n=x",
+        "awk 'BEGIN{system(\"rm -rf ~\")}'",
+        "awk '{print | \"sh\"}' f",
+        "sqlite3 db '.shell rm -rf ~'",
+        "sqlite3 db '.system rm -rf ~'",
+        "sed 's/a/rm -rf ~/e' f",
+        "git -c core.editor=x commit",
+        "git -c http.proxy=x fetch",
+        "script -q /dev/null rm -rf ~",
+        "arch -arm64 rm -rf ~",
+        "taskpolicy -b rm -rf ~",
+        "sandbox-exec -n x rm -rf ~",
+        "xcrun rm -rf ~",
+        "gtimeout 5 rm -rf ~",
+        "mksh -c 'rm -rf ~'",
+        "yash -c 'rm -rf ~'",
+        "busybox sh -c 'rm -rf ~'",
+        "pwsh -c x",
+        "ssh -o UserKnownHostsFile=/Users/sarah/.zshrc devbox ls",
+        "ssh -o GlobalKnownHostsFile=/x devbox ls",
+        "ssh -o IdentityFile=/x devbox ls",
+        "cpio -i < a.cpio",
+        "pax -r < a.pax",
+    ] {
+        for pol in [&full(), &anywhere] {
+            let c = own(in_folder(exec(command, ACME), ACME));
+            assert!(
+                asks_with(&verdict(pol, false, &[], &c)).is_some(),
+                "{command:?} ran without asking"
+            );
+        }
+    }
+}
