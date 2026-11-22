@@ -132,10 +132,13 @@ pub fn run_key() -> Option<usize> {
 /// it ends; told at once (unread) outside any run.
 pub fn on_end(end: impl FnOnce(bool) + Send + 'static) {
     let mut end: Option<OnEnd> = Some(Box::new(end));
+    // A poisoned list is still the run's: `end` waits for the run's end
+    // there, never told early.
     let _ = RUN.try_with(|r| {
-        if let Ok(mut ends) = r.ends.lock() {
-            ends.extend(end.take());
-        }
+        r.ends
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .extend(end.take());
     });
     if let Some(end) = end {
         end(false);

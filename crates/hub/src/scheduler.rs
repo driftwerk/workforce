@@ -6768,7 +6768,7 @@ mod tests {
 
     /// A bank job is refused up front however it is made or changed (the
     /// REST POST and PUT included): it answers only in the person's own
-    /// Desk DM, and holds nothing beside the bank but reads.
+    /// Desk DM, and holds nothing but the bank's own tools.
     #[tokio::test]
     async fn a_bank_job_is_refused_up_front_by_every_path_that_makes_or_changes_it() {
         use workforce_common::channels::desk::{DeskPlace, DeskScope, DeskTarget};
@@ -6803,7 +6803,7 @@ mod tests {
         };
         assert_eq!(
             post(Some(dm()), &["bank", "messaging.send"]).await,
-            Err(crate::personal_access::ONLY_READS.to_string())
+            Err(crate::personal_access::ONLY_BANK.to_string())
         );
         assert_eq!(
             post(None, &["bank"]).await,
@@ -6828,7 +6828,7 @@ mod tests {
             .await;
         assert!(matches!(
             refused,
-            Err(EditRefused::Invalid(ref why)) if why == crate::personal_access::ONLY_READS
+            Err(EditRefused::Invalid(ref why)) if why == crate::personal_access::ONLY_BANK
         ));
         let kept = sched.get_job(&id).await.unwrap();
         assert!(matches!(

@@ -35,6 +35,10 @@ pub const SYSTEM_OWNER: &str = "__system__";
 /// auto-disable). Never a share grantee, so it does not taint auto-runs.
 pub const SYSTEM_EDITOR: &str = "system";
 
+/// What sharing a definition that was saved in a conversation that read
+/// the person's bank is told.
+pub const READ_PERSONAL_STAYS_PRIVATE: &str = "This was saved in a conversation that read the person's bank, so it stays private to them: it can't be shared with a team or everyone.";
+
 /// `def_revisions.kind` for agent identity files (`ref_id` =
 /// `{agent_id}/{filename}`); the operative file stays on disk.
 pub const KIND_IDENTITY_FILE: &str = "identity_file";
@@ -758,6 +762,8 @@ impl WorkflowStore {
     }
 
     /// Insert or update a definition owned by `owner` (`None` = system),
+    /// refused ([`READ_PERSONAL_STAYS_PRIVATE`]) when it would share one
+    /// marked [`Self::mark_read_personal`] with a team or everyone,
     /// recording a revision (and `last_modified_by`) in the same transaction.
     pub async fn save(
         &self,
@@ -774,8 +780,9 @@ impl WorkflowStore {
         let (set_run_as, run_as_value) = run_as.column_write();
         let mut conn = self.pool.get().await?;
         let tx = conn.transaction().await?;
-        tx.execute(
-            "INSERT INTO workflow_defs \
+        let saved = tx
+            .execute(
+                "INSERT INTO workflow_defs \
              (id, agent_id, kind, toml_source, parsed_json, owner_identity_id, visibility, \
               last_modified_by, created_at, updated_at, run_as_identity_id) \
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $9, $11) \
@@ -785,22 +792,26 @@ impl WorkflowStore {
                  last_modified_by = EXCLUDED.last_modified_by, \
                  updated_at = EXCLUDED.updated_at, \
                  run_as_identity_id = CASE WHEN $10 THEN $11 \
-                                      ELSE workflow_defs.run_as_identity_id END",
-            &[
-                &id,
-                &GLOBAL_AGENT,
-                &kind,
-                &toml_source,
-                &parsed_json,
-                &owner_column(owner),
-                &visibility.as_str(),
-                &edit.edited_by,
-                &now,
-                &set_run_as,
-                &run_as_value,
-            ],
-        )
-        .await?;
+                                      ELSE workflow_defs.run_as_identity_id END \
+             WHERE NOT (workflow_defs.read_personal AND EXCLUDED.visibility <> 'private')",
+                &[
+                    &id,
+                    &GLOBAL_AGENT,
+                    &kind,
+                    &toml_source,
+                    &parsed_json,
+                    &owner_column(owner),
+                    &visibility.as_str(),
+                    &edit.edited_by,
+                    &now,
+                    &set_run_as,
+                    &run_as_value,
+                ],
+            )
+            .await?;
+        if saved == 0 {
+            return Err(eyre::eyre!(READ_PERSONAL_STAYS_PRIVATE));
+        }
         record_revision_in(
             &tx,
             kind,
@@ -1219,11 +1230,47 @@ impl WorkflowStore {
         let n = conn
             .execute(
                 "UPDATE workflow_defs SET visibility = $4, updated_at = $5 \
-                 WHERE kind = $1 AND id = $2 AND owner_identity_id = $3",
+                 WHERE kind = $1 AND id = $2 AND owner_identity_id = $3 \
+                   AND (NOT read_personal OR $4 = 'private')",
                 &[&kind, &id, &owner, &visibility.as_str(), &Utc::now()],
             )
             .await?;
+        if n == 0 && self.read_personal(kind, id, Some(owner)).await? {
+            return Err(eyre::eyre!(READ_PERSONAL_STAYS_PRIVATE));
+        }
         Ok(n > 0)
+    }
+
+    /// Marks one definition, for good, as saved in a conversation that read
+    /// the person's bank: it is never shared with a team or everyone after.
+    pub async fn mark_read_personal(
+        &self,
+        kind: &str,
+        id: &str,
+        owner: Option<&str>,
+    ) -> Result<()> {
+        let conn = self.pool.get().await?;
+        conn.execute(
+            "UPDATE workflow_defs SET read_personal = TRUE \
+             WHERE kind = $1 AND id = $2 AND owner_identity_id = $3",
+            &[&kind, &id, &owner_column(owner)],
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Whether one definition was saved in a conversation that read the
+    /// person's bank.
+    pub async fn read_personal(&self, kind: &str, id: &str, owner: Option<&str>) -> Result<bool> {
+        let conn = self.pool.get().await?;
+        let row = conn
+            .query_opt(
+                "SELECT read_personal FROM workflow_defs \
+                 WHERE kind = $1 AND id = $2 AND owner_identity_id = $3",
+                &[&kind, &id, &owner_column(owner)],
+            )
+            .await?;
+        Ok(row.is_some_and(|r| r.get::<_, bool>("read_personal")))
     }
 
     /// Every grantee of one definition, ordered for a stable UI.

@@ -384,28 +384,29 @@ impl JsonlTraceWriter {
         if start {
             held.remove(&run);
         }
-        let lines = match held.entry(run) {
-            std::collections::hash_map::Entry::Occupied(lines) => lines.into_mut(),
-            // A footer with nothing before it closes nothing.
-            std::collections::hash_map::Entry::Vacant(_) if end => return Ok(()),
-            std::collections::hash_map::Entry::Vacant(lines) => {
-                // However the run ends, what it still holds goes then.
-                let kept = Arc::downgrade(&self.lines);
-                workforce_agent::personal::on_end(move |read| {
-                    if let Some(kept) = kept.upgrade() {
-                        kept.ended(run, read);
-                    }
-                });
-                lines.insert(Vec::new())
-            }
-        };
-        lines.push(line);
-        if !end {
+        let fresh = !held.contains_key(&run);
+        // A footer with nothing before it closes nothing.
+        if fresh && end {
             return Ok(());
         }
-        let lines = held.remove(&run).unwrap_or_default();
+        held.entry(run).or_default().push(line);
+        if end {
+            let lines = held.remove(&run).unwrap_or_default();
+            drop(held);
+            return self.lines.write(&lines);
+        }
         drop(held);
-        self.lines.write(&lines)
+        // However the run ends, what it still holds goes then. Told once
+        // the hold is let go, so the run's end never waits on it here.
+        if fresh {
+            let kept = Arc::downgrade(&self.lines);
+            workforce_agent::personal::on_end(move |read| {
+                if let Some(kept) = kept.upgrade() {
+                    kept.ended(run, read);
+                }
+            });
+        }
+        Ok(())
     }
 
     /// How many runs hold lines now.

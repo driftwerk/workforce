@@ -322,6 +322,18 @@ impl PlaybookTool {
             .await
         {
             Ok(()) => {
+                // Saved in a turn that read the bank: it stays private for
+                // good, whatever later saves or shares ask.
+                if workforce_agent::personal::read() {
+                    if let Some(store) = self.runtime.def_store() {
+                        if let Err(e) = store
+                            .mark_read_personal(KIND_PLAYBOOK, &id, grant.owner.as_deref())
+                            .await
+                        {
+                            tracing::warn!(error = %e, playbook = %id, "a playbook saved after reading the bank wasn't marked");
+                        }
+                    }
+                }
                 let message = if self.shadows_shared(&id, &grant).await {
                     format!(
                         "Saved as your {} copy of '{id}'; the shared '{id}' is unchanged.",
@@ -873,6 +885,81 @@ mod tests {
         }
         assert!(!dir.join("demo.toml").exists());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A member's playbook saved privately in a turn that read the bank is
+    /// marked for good: no later turn's save, nor a `cmd:` share, makes it
+    /// team or global, and each says why. Saving it privately still works.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_playbook_saved_in_a_bank_turn_is_never_shared_after() {
+        workforce_postgres::test_support::with_test_pool(
+            WorkflowStore::build_pool,
+            |pool| async move {
+                let store = WorkflowStore::new(pool).await.expect("store");
+                let (runtime, dir) = fs_runtime();
+                runtime.set_store(Arc::clone(&store));
+                let member = fs_tool(&runtime, false);
+                let shared = |toml: &str, visibility: &str| {
+                    serde_json::json!({
+                        "action": "save", "playbook_id": "demo",
+                        "toml_content": toml, "visibility": visibility,
+                    })
+                };
+
+                let saved = as_user(
+                    "alice",
+                    workforce_agent::personal::scoped(true, member.execute(save(GOOD))),
+                )
+                .await
+                .unwrap();
+                assert!(saved.success, "{saved:?}");
+                assert_eq!(saved.output["visibility"], "private");
+                assert!(store
+                    .read_personal(KIND_PLAYBOOK, "demo", Some("alice"))
+                    .await
+                    .unwrap());
+
+                // A later turn, nowhere near the bank.
+                for visibility in ["team", "global"] {
+                    let refused = as_user("alice", member.execute(shared(EDITED, visibility)))
+                        .await
+                        .unwrap();
+                    assert!(!refused.success, "{visibility}");
+                    assert!(
+                        refused.error.as_deref().unwrap_or_default().contains(
+                            workforce_orchestrator::workflow_store::READ_PERSONAL_STAYS_PRIVATE
+                        ),
+                        "{refused:?}"
+                    );
+                }
+                let shared_by_cmd = store
+                    .set_visibility(
+                        KIND_PLAYBOOK,
+                        "demo",
+                        "alice",
+                        workforce_core::access::Visibility::Global,
+                    )
+                    .await
+                    .unwrap_err();
+                assert!(shared_by_cmd
+                    .to_string()
+                    .contains(workforce_orchestrator::workflow_store::READ_PERSONAL_STAYS_PRIVATE));
+
+                let kept = as_user("alice", member.execute(shared(EDITED, "private")))
+                    .await
+                    .unwrap();
+                assert!(kept.success, "{kept:?}");
+                assert!(
+                    store
+                        .read_personal(KIND_PLAYBOOK, "demo", Some("alice"))
+                        .await
+                        .unwrap(),
+                    "a later save keeps the mark"
+                );
+                let _ = std::fs::remove_dir_all(&dir);
+            },
+        )
+        .await;
     }
 
     /// With a store, a member's save is their own copy and their delete removes

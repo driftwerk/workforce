@@ -1751,7 +1751,7 @@ mod tests {
     }
 
     #[test]
-    fn a_bank_job_answers_in_the_person_s_own_desk_and_names_only_reads_beside_it() {
+    fn a_bank_job_answers_in_the_person_s_own_desk_and_names_only_the_bank() {
         use workforce_common::channels::desk::{DeskPlace, DeskTarget};
         let at = |place: DeskPlace| DeskTarget::of_turn(&place, "desk", None, false);
         let dm = at(DeskPlace::Dm { thread: None });
@@ -1769,7 +1769,7 @@ mod tests {
         for named in [
             &["bank"][..],
             &["bank.accounts"],
-            &["bank.balances", "linear.issue_list"],
+            &["bank.balances", "bank.transactions"],
         ] {
             assert_eq!(
                 crate::personal_access::job_refusal(&tools(named), Some(&dm)),
@@ -1797,10 +1797,12 @@ mod tests {
             "http.request",
             "linear",
             "linear.issue_create",
+            "linear.issue_list",
+            "datadog.logs_search",
         ] {
             assert_eq!(
                 crate::personal_access::job_refusal(&tools(&["bank.accounts", beside]), Some(&dm)),
-                Some(crate::personal_access::ONLY_READS),
+                Some(crate::personal_access::ONLY_BANK),
                 "{beside}"
             );
         }

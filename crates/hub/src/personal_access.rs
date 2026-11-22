@@ -8,7 +8,7 @@
 
 use workforce_agent::tools::access::{ToolAccess, ToolAccessSnapshot};
 use workforce_common::channels::desk::{DeskPlace, DeskTarget};
-use workforce_common::connector_binding::{connector_of, is_read, names_personal, PERSONAL};
+use workforce_common::connector_binding::{names_personal, PERSONAL};
 
 const OFF_DESK: &str =
     "The person's bank is read only in a Desk conversation with them. Ask them there.";
@@ -22,8 +22,8 @@ pub const JOB_OFF_DESK: &str =
 
 /// What work that reads the person's bank is told when it holds more than
 /// reads beside it.
-pub const ONLY_READS: &str =
-    "Work that reads the person's bank names nothing beside it but a built-in connector's reads: nothing that writes or sends, no web, http or MCP tool, and no whole namespace.";
+pub const ONLY_BANK: &str =
+    "Work nobody is watching that reads the person's bank names nothing but the bank's own tools: even a read of another service sends what it asks to that service, where others can see it.";
 
 /// Whether `place` is the person's alone: their DM with the agent (or a
 /// thread on it), or a call.
@@ -78,32 +78,21 @@ fn why_not(tool: Option<&str>) -> Option<&'static str> {
     });
     match named {
         false => Some(UNNAMED),
-        true => only_reads_beside(&whitelist.tools).then_some(ONLY_READS),
+        true => beside_the_bank(&whitelist.tools).then_some(ONLY_BANK),
     }
 }
 
-/// Whether `tools` holds something beside the bank that isn't a known
-/// read: only a built-in connector's own tool whose read the hub knows (as
-/// its computer gate keeps it) may sit beside it. A name alone says
-/// nothing: `web.*`, `http.*` and an MCP server's tools reach out whatever
-/// they are called.
-fn only_reads_beside(tools: &[String]) -> bool {
-    tools.iter().any(|t| !names_personal(t) && !known_read(t))
-}
-
-/// A built-in connector's own tool that only reads.
-fn known_read(tool: &str) -> bool {
-    connector_of(tool).is_some_and(|connector| {
-        crate::skill_loader::static_skill_tool_names(connector)
-            .iter()
-            .any(|t| *t == tool)
-    }) && is_read(tool)
+/// Whether `tools` holds anything but the bank's own tools. Nothing else
+/// may sit beside it: a search of Datadog, Jira or Metabase, or a web or
+/// MCP call, carries its query to a service whose admins see it.
+fn beside_the_bank(tools: &[String]) -> bool {
+    tools.iter().any(|t| !names_personal(t))
 }
 
 /// Why a job given `tools`, answering at `desk`, may not read the person's
 /// bank; `None` when it may, or doesn't name it. It answers in their own
 /// Desk conversation (never a room, nor a channel it names), and names
-/// nothing beside the bank but reads. Checked when a job is made or changed,
+/// nothing but the bank's own tools. Checked when a job is made or changed,
 /// by any path; [`refusal`] holds it again as it runs.
 pub fn job_refusal(tools: &[String], desk: Option<&DeskTarget>) -> Option<&'static str> {
     if !tools.iter().any(|t| names_personal(t)) {
@@ -112,7 +101,7 @@ pub fn job_refusal(tools: &[String], desk: Option<&DeskTarget>) -> Option<&'stat
     if !desk.is_some_and(|t| is_private(&t.place)) {
         return Some(JOB_OFF_DESK);
     }
-    only_reads_beside(tools).then_some(ONLY_READS)
+    beside_the_bank(tools).then_some(ONLY_BANK)
 }
 
 /// Hides every personal connector's tools from a run that may not read them.
@@ -269,10 +258,11 @@ mod tests {
         }
     }
 
-    /// A heartbeat (or any unwatched run) that holds a tool that sends
-    /// beside the bank never reads it: what it read could leave with it.
+    /// A heartbeat (or any unwatched run) that holds anything beside the
+    /// bank's own tools never reads it: what it read could leave with it,
+    /// even in a read's query.
     #[tokio::test]
-    async fn unwatched_work_holding_a_send_beside_the_bank_never_reads_it() {
+    async fn unwatched_work_holding_anything_beside_the_bank_never_reads_it() {
         let holding = |tools: &[&str]| {
             Some(ToolWhitelist::for_turn(
                 &tools.iter().map(|t| t.to_string()).collect::<Vec<_>>(),
@@ -291,20 +281,25 @@ mod tests {
         };
         assert_eq!(
             heartbeat(holding(&["bank", "slack.post_message"])).await,
-            (Some(ONLY_READS), false)
+            (Some(ONLY_BANK), false)
         );
         assert_eq!(
             heartbeat(holding(&["bank", "messaging.send"])).await,
-            (Some(ONLY_READS), false)
+            (Some(ONLY_BANK), false)
         );
         assert_eq!(
-            heartbeat(holding(&["bank", "linear.issue_get"])).await,
+            heartbeat(holding(&["bank", "bank.transactions"])).await,
             (None, true)
         );
-        for beside in ["web.search", "acme_mcp.get_x"] {
+        for beside in [
+            "linear.issue_get",
+            "datadog.logs_search",
+            "web.search",
+            "acme_mcp.get_x",
+        ] {
             assert_eq!(
                 heartbeat(holding(&["bank", beside])).await,
-                (Some(ONLY_READS), false),
+                (Some(ONLY_BANK), false),
                 "{beside}"
             );
         }
@@ -317,7 +312,7 @@ mod tests {
     }
 
     #[test]
-    fn a_job_reads_the_bank_only_answering_in_the_person_s_dm_with_only_reads_beside_it() {
+    fn a_job_reads_the_bank_only_answering_in_the_person_s_dm_with_nothing_beside_it() {
         let at = |place: DeskPlace| DeskTarget::of_turn(&place, "desk", None, false);
         let tools = |t: &[&str]| t.iter().map(|t| t.to_string()).collect::<Vec<_>>();
         let dm = at(DeskPlace::Dm { thread: None });
@@ -326,15 +321,20 @@ mod tests {
         assert_eq!(job_refusal(&tools(&["bank"]), None), Some(JOB_OFF_DESK));
         assert_eq!(
             job_refusal(&tools(&["bank", "messaging.send"]), Some(&dm)),
-            Some(ONLY_READS)
+            Some(ONLY_BANK)
         );
         assert_eq!(
-            job_refusal(&tools(&["bank", "linear.issue_get"]), Some(&dm)),
+            job_refusal(&tools(&["bank", "bank.balances"]), Some(&dm)),
             None
         );
-        // Beside the bank, only a built-in connector's known reads: a name
-        // that reads like one says nothing of a web, http or MCP tool.
+        // Beside the bank, nothing: an org service's read carries its query
+        // to that service's admins, and a name says nothing of a web, http
+        // or MCP tool.
         for beside in [
+            "linear.issue_get",
+            "datadog.logs_search",
+            "jira.search",
+            "metabase.card_query",
             "web.search",
             "web.fetch",
             "http.get",
@@ -344,7 +344,7 @@ mod tests {
         ] {
             assert_eq!(
                 job_refusal(&tools(&["bank", beside]), Some(&dm)),
-                Some(ONLY_READS),
+                Some(ONLY_BANK),
                 "{beside}"
             );
         }
