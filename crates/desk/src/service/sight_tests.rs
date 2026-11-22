@@ -266,6 +266,8 @@ async fn a_background_shells_own_new_line_says_its_wait_once_the_turn_has_ended(
         append(&transcript, &format!("{result}\n{ended}\n"));
         let shell = tasks.join("b9.output");
         append(&shell, "rbuild: all 3 build slots are busy; waiting for one\n");
+        let first = sampled_until(&d, s.id, has_shell).await;
+        assert_eq!(first.open_call, None, "its call returned");
         post(
             &d,
             s.id,
@@ -273,10 +275,10 @@ async fn a_background_shells_own_new_line_says_its_wait_once_the_turn_has_ended(
                 {"id": "b9", "type": "shell", "status": "running", "command": "rbuild w -- cargo test"}]}),
         )
         .await;
-        assert_eq!(d.view(s.id).unwrap().state, SessionState::Done);
+        let v = d.view(s.id).unwrap();
+        assert_eq!(v.state, SessionState::Done);
+        assert_eq!(v.background.map(|b| b.count), Some(1), "its shell runs");
 
-        let first = sampled_until(&d, s.id, has_shell).await;
-        assert_eq!(first.open_call, None, "its turn ended");
         let next = sampled_until(&d, s.id, |s| s.at > first.at).await;
         assert_ne!(
             next.reading.kind,
