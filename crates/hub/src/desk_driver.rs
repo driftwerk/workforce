@@ -106,10 +106,11 @@ pub(crate) fn documents_line(workspace: &std::path::Path) -> Option<String> {
     })
 }
 
-/// Whether this hub is a machine's, as Desk's helper says (`[desk]
-/// machine = true`).
+/// Whether this hub might be a machine's ([`may_be_machine`]): unless
+/// Desk's helper said it is the person's own computer, it is taken to be
+/// one, so nothing that is the person's own is given out on a machine.
 pub(crate) fn machine(config: &workforce_common::settings::WorkforceConfig) -> bool {
-    is_machine(&config.desk)
+    may_be_machine(&config.desk)
 }
 
 /// Gives `service` the `desk.*` tools when desk sessions are on. Called for

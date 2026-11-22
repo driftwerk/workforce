@@ -2551,7 +2551,8 @@ async fn start(
         .into_response()
 }
 
-/// Agent `agent`'s documents folder, made where it isn't yet: `{path}`.
+/// Agent `agent`'s documents folder, `{path, exists}`: made when the agent
+/// is equipped, never here.
 async fn documents(
     State(r): S,
     h: HeaderMap,
@@ -2571,13 +2572,9 @@ async fn documents(
         Ok((service, _)) => service,
         Err(refused) => return refused.into_response(),
     };
-    match crate::desk_driver::documents(&service.workspace) {
-        Some(path) => Json(json!({ "path": path })).into_response(),
-        None => refusal(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "Desk couldn't make the agent's documents folder",
-        ),
-    }
+    let path = service.workspace.join("documents");
+    let exists = crate::desk_driver::documents_kept(&service.workspace).is_some();
+    Json(json!({ "path": path, "exists": exists })).into_response()
 }
 
 async fn flow(

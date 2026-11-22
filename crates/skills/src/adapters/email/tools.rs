@@ -4057,6 +4057,12 @@ impl Tool for EmailConfirmTool {
             ));
         }
 
+        // The account may have been made read only since it was staged.
+        let from = serde_json::json!({ "account": staged_email.account_name });
+        if let Some(refused) = refused_write(&self.connector, &from, start).await {
+            return Ok(refused);
+        }
+
         let result = send_staged_email(
             &staged_email.message,
             &staged_email.raw_message,
@@ -4427,6 +4433,72 @@ impl Tool for EmailRulesTool {
 
 #[cfg(test)]
 mod tests {
+    /// An email staged from `work` isn't sent once `work` only reads.
+    #[tokio::test]
+    async fn a_staged_email_is_not_sent_once_its_account_only_reads() {
+        use std::sync::Arc;
+        use workforce_agent::tools::Tool as _;
+        use workforce_common::credential_pin::{PinSlot, PinSource, TierPin, Writing};
+        struct Work;
+        impl PinSource for Work {
+            fn pin(&self, _: &str) -> TierPin {
+                TierPin::All
+            }
+            fn read_only_instance(&self, connector: &str, instance: &str) -> bool {
+                (connector, instance) == ("email", "work")
+            }
+        }
+        let config: super::super::config::EmailAccountConfig =
+            serde_json::from_value(serde_json::json!({
+                "imap_host": "imap.invalid",
+                "smtp_host": "smtp.invalid",
+                "username": "sarah@acme.example",
+                "password": "not-used",
+            }))
+            .unwrap();
+        let message = lettre::Message::builder()
+            .from("sarah@acme.example".parse().unwrap())
+            .to("bob@acme.example".parse().unwrap())
+            .subject("Invoice")
+            .body(String::from("Attached."))
+            .unwrap();
+        let staged = super::StagedEmail {
+            raw_message: message.formatted(),
+            message,
+            account_name: "work".into(),
+            config,
+            preview: super::EmailPreview {
+                to: vec!["bob@acme.example".into()],
+                cc: vec![],
+                bcc: vec![],
+                subject: "Invoice".into(),
+                body_preview: "Attached.".into(),
+                unknown_recipients: vec![],
+            },
+            staged_at: chrono::Utc::now(),
+            flags: vec![],
+        };
+        let store: super::StagedEmailStore = Default::default();
+        store.lock().await.insert("c1".into(), staged);
+        let skill: super::super::config::EmailSkillConfig =
+            serde_json::from_value(serde_json::json!({ "accounts": {} })).unwrap();
+        let connector = Arc::new(tokio::sync::Mutex::new(super::ImapConnector::new(&skill)));
+        let confirm = super::EmailConfirmTool::new(connector, store);
+        let pins = Arc::new(PinSlot::default());
+        pins.fill(Arc::new(Work));
+        let writing = Writing {
+            connector: "email".into(),
+            pins,
+        };
+        let result = writing
+            .scope(confirm.execute(serde_json::json!({ "confirmation_id": "c1" })))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        let said = result.error.unwrap_or_default();
+        assert!(said.contains("only reads"), "{said}");
+    }
+
     #[tokio::test]
     async fn a_write_to_a_read_only_account_is_refused_and_the_other_takes_it() {
         use std::sync::Arc;

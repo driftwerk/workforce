@@ -538,7 +538,7 @@ fn app_steps(service: &str, app: super::app::AppState, whose: &str) -> Vec<Step>
             recipe(service).map_or("Save the app's keys", |r| r.key_label),
             None,
             &match service {
-                "freeagent" => "On the app's page, read the OAuth identifier with browser.capture_key {connector: \"freeagent\", field: \"client_id\"}, then the OAuth secret with field: \"client_secret\", each with no selector: Desk finds them, and they never come back to you. They look alike, so name each.".to_string(),
+                "freeagent" => "On the app's page, read the OAuth identifier with browser.capture_key {connector: \"freeagent\", field: \"client_id\", selector: <the element showing it>}, then the OAuth secret with field: \"client_secret\" and its own element's selector. The two look alike, so Desk can't tell them apart on its own: give each one's selector from browser.snapshot. They never come back to you.".to_string(),
                 _ => "On the dialog that shows the new client, read the Client ID with browser.capture_key {connector: \"google\", field: \"client_id\"}, then the Client secret with field: \"client_secret\", each with no selector: Desk finds them, and they never come back to you.".to_string(),
             },
         )
@@ -3742,7 +3742,7 @@ fn say_card(view: &SetupView) -> String {
 }
 
 /// Registers `connections.*` for `service`, with Desk's browser they set
-/// connections up in, and makes its documents folder.
+/// connections up in and its documents folder ([`crate::desk_browser::equip`]).
 pub fn register(service: &crate::serve::AgentService) {
     for tool in SetupTool::all(service.agent_id.as_str()) {
         if !service.tools.has(tool.name) {
@@ -3750,5 +3750,4 @@ pub fn register(service: &crate::serve::AgentService) {
         }
     }
     crate::desk_browser::equip(service);
-    crate::desk_driver::documents(&service.workspace);
 }

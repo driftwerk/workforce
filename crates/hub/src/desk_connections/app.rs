@@ -286,6 +286,19 @@ impl App {
     }
 
     /// Whether `id` and `secret` look like this app's.
+    /// What the page is searched for to find `field` alone: its shape,
+    /// unanchored. `None` where the id and secret look alike (FreeAgent's),
+    /// so only a selector tells them apart.
+    pub fn find_shape(&self, field: &str) -> Option<&'static str> {
+        let shape = match field {
+            "client_id" => self.id_shape,
+            "client_secret" => self.secret_shape,
+            _ => return None,
+        };
+        (self.id_shape != self.secret_shape)
+            .then(|| shape.trim_start_matches('^').trim_end_matches('$'))
+    }
+
     pub fn shaped(&self, id: &str, secret: &str) -> bool {
         // FreeAgent's id and secret are shaped alike: one read twice is
         // neither.
@@ -810,11 +823,19 @@ impl Connections {
         }
         // A sign-in through this address worked: the app has it.
         if app.kind == Kind::FreeAgent {
+            let path = app.client_path("redirect_uri");
             let kept = self
                 .vault_at(VaultSource::Global, &Level::All)
                 .and_then(|v| {
-                    v.set(&app.client_path("redirect_uri"), &p.redirect)
-                        .map_err(Refusal::Internal)
+                    v.apply(
+                        &[VaultOp::Set {
+                            path: &path,
+                            value: &p.redirect,
+                        }],
+                        VaultActor::User(&f.person),
+                    )
+                    .map(drop)
+                    .map_err(Refusal::Internal)
                 });
             if let Err(e) = kept {
                 warn!(connector = c.id, error = ?e, "the app's address couldn't be kept after a sign-in");

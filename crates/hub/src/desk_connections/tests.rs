@@ -3684,6 +3684,24 @@ mod apps {
         );
     }
 
+    /// Google's id and secret are each found by their own shape;
+    /// FreeAgent's look alike, so neither is searched for alone.
+    #[test]
+    fn an_apps_keys_are_searched_for_by_their_own_shape() {
+        let google = app::of("google").unwrap();
+        let (id, secret) = (
+            google.find_shape("client_id").unwrap(),
+            google.find_shape("client_secret").unwrap(),
+        );
+        assert_ne!(id, secret);
+        assert!(!id.starts_with('^') && !secret.ends_with('$'));
+        assert!(regex::Regex::new(id).unwrap().is_match(&GOOGLE_ID));
+        assert!(!regex::Regex::new(id).unwrap().is_match(&GOOGLE_SECRET));
+        let freeagent = app::of("freeagent").unwrap();
+        assert_eq!(freeagent.find_shape("client_id"), None);
+        assert_eq!(google.find_shape("other"), None);
+    }
+
     /// Two sign-ins in flight: the one finishing second never writes over
     /// the first's connection, whatever key it started on.
     #[tokio::test]
@@ -4098,13 +4116,15 @@ async fn documents_folder_is_made_and_named_in_the_hint() {
     }
 }
 
-/// An agent's documents folder is only for those who may reach the
-/// agent: to anyone else it is no agent at all.
+/// An agent's documents folder is said only to the hub's own person, for
+/// an agent they may reach; asking never makes it.
 #[tokio::test]
-async fn the_documents_folder_is_refused_for_someone_elses_agent() {
+async fn the_documents_folder_is_said_only_to_the_hubs_person_and_never_made() {
     use axum::body::Body;
     use axum::http::Request;
     use tower::ServiceExt as _;
+    use workforce_identity::store::IdentityStore as _;
+    use workforce_identity::types::{Identity, IdentityRole};
     let h = hub().await;
     let dir = tempfile::tempdir().unwrap();
     let (service, _llm) = crate::desk_attachments::tests::agent(
@@ -4114,19 +4134,44 @@ async fn the_documents_folder_is_refused_for_someone_elses_agent() {
         std::time::Duration::ZERO,
     )
     .await;
-    // Alice and Bob are members; the agent is neither's.
+    // Alice and Bob are members, neither the hub's own person.
     let (state, [(_, alice), _]) = crate::desk_attachments::tests::gateway(&service);
-    let app = router(state, Arc::clone(&h.c));
-    let res = app
-        .oneshot(
-            Request::builder()
-                .uri("/api/desk/agents/scout/documents")
-                .header("authorization", format!("Bearer {alice}"))
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
+    let owner = Identity::new("Sarah", IdentityRole::SystemAdmin);
+    state
+        .identity_store
+        .as_ref()
+        .unwrap()
+        .create(&owner)
         .unwrap();
-    assert_eq!(res.status(), StatusCode::NOT_FOUND);
+    let jwt =
+        crate::jwt::JwtConfig::new("a-test-secret-of-at-least-32-bytes!!".into(), 3600).unwrap();
+    let sarah = crate::jwt::generate_token_with_identity(
+        &jwt,
+        "Sarah",
+        IdentityRole::SystemAdmin,
+        Some(owner.id.to_string()),
+    )
+    .unwrap();
+    let app = router(state, Arc::clone(&h.c));
+    let ask = |agent: &str, token: &str| {
+        Request::builder()
+            .uri(format!("/api/desk/agents/{agent}/documents"))
+            .header("authorization", format!("Bearer {token}"))
+            .body(Body::empty())
+            .unwrap()
+    };
+    let refused = app.clone().oneshot(ask("scout", &alice)).await.unwrap();
+    assert_eq!(refused.status(), StatusCode::FORBIDDEN);
+    let unknown = app.clone().oneshot(ask("nobody", &sarah)).await.unwrap();
+    assert_eq!(unknown.status(), StatusCode::NOT_FOUND);
+    let said = app.clone().oneshot(ask("scout", &sarah)).await.unwrap();
+    assert_eq!(said.status(), StatusCode::OK);
+    let body: Value = serde_json::from_slice(
+        &axum::body::to_bytes(said.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(body["exists"], false);
     assert!(!service.workspace.join("documents").exists());
 }

@@ -164,6 +164,12 @@ pub trait BrowserHooks: Send + Sync {
     ) -> Option<super::keys::KeyPage> {
         None
     }
+    /// What `connector`'s key `field` (an app's `client_id`) looks like,
+    /// where its keys differ: what the page is searched for when the agent
+    /// names the field, so one value is found. `None`: the page's shape.
+    fn key_shape(&self, _connector: &str, _field: &str) -> Option<String> {
+        None
+    }
     /// Holds a new key `read` says was read, for the setup [`Self::key_page`]
     /// gave its page for. What the setup says next (`ready: …`, or what it
     /// still needs); `Err` says why it wasn't kept. Nothing of the key is in
