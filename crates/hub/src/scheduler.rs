@@ -2435,8 +2435,9 @@ impl Scheduler {
                         // A stopped run's reason is the scheduler's to deliver
                         // whoever owns delivery: the agent posted no result.
                         // An answer of nothing to say is no one's to deliver.
-                        let agent_owns_delivery = (*agent_owns_delivery && answered)
-                            || (answered && crate::hub_core::schedules::says_nothing(&response));
+                        let agent_owns_delivery = answered
+                            && (*agent_owns_delivery
+                                || crate::hub_core::schedules::says_nothing(&response));
                         // A job asked from a voice bridge answers on it, and one
                         // made in Desk in its conversation; the Slack DM below
                         // stays the voice fallback. Self-delivering jobs already

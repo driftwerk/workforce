@@ -737,7 +737,8 @@ mod tests {
             assert!(outcome.unwrap_err().contains("never be granted"));
         }
         for origin in [None, Some("workflow")] {
-            let run = invoker.run(&ctx(), "bank.transactions", serde_json::json!({}));
+            let context = ctx();
+            let run = invoker.run(&context, "bank.transactions", serde_json::json!({}));
             let out = match origin {
                 Some(o) => CURRENT_AUTOMATED_ORIGIN.scope(o.into(), run).await,
                 None => run.await,
