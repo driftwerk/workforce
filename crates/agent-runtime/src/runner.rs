@@ -1880,8 +1880,9 @@ async fn conclude(
 /// content as it is. The URLs its prompt gives and its outside content
 /// carries are ones it may open. What an earlier turn read armed that turn;
 /// a turn resumed after it was held carries its guard as it was
-/// (`ContentScope` kept with the turn).
-fn guard_for_turn(
+/// (`ContentScope` kept with the turn). Every route of a turn makes its
+/// guard here: the runner's loop, and a CLI engine's rounds.
+pub fn guard_for_turn(
     messages: &[LlmMessage],
     tools: &ToolRegistry,
 ) -> Arc<crate::security::monitor::ContentGuard> {

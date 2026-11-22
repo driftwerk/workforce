@@ -643,13 +643,32 @@ impl TurnChain {
             (resolved.effort_level(), resolved.fast)
         };
         let kept = crate::monitor::scope::kept_guard(turn.session);
-        let keeper = crate::monitor::scope::turn_keeper(
+        let keeper = crate::monitor::scope::TurnKeeper::new(
             Arc::clone(&service.sessions),
             turn.session.id.clone(),
         );
+        // Every route runs under the turn's guard, made and armed from what
+        // started the turn as a runner's turn is: a CLI engine's round is
+        // guarded as the runner's loop is.
+        let started = turn
+            .prior
+            .iter()
+            .cloned()
+            .chain(std::iter::once(workforce_agent::llm::types::LlmMessage {
+                role: workforce_agent::llm::types::Role::User,
+                content: turn.task.clone(),
+            }))
+            .collect::<Vec<_>>();
         let routes = Box::pin(workforce_agent::runner::with_guard_keeper(
-            Some(keeper),
-            self.run_routes(service, turn),
+            Some(keeper.keeper()),
+            async move {
+                let guard = workforce_agent::runner::guard_for_turn(&started, &service.tools);
+                workforce_agent::runner::with_content_guard(
+                    Some(guard),
+                    self.run_routes(service, turn),
+                )
+                .await
+            },
         ));
         // A person's own route alone: what the turn finds missing or tells
         // them to connect is their own login, never a shared one.
@@ -668,11 +687,15 @@ impl TurnChain {
             )),
             None => routes,
         };
-        workforce_agent::llm::provider::with_effort_override(
+        let outcome = workforce_agent::llm::provider::with_effort_override(
             effort,
             workforce_agent::llm::provider::with_fast_mode(fast, routes),
         )
-        .await
+        .await;
+        // The turn's end is what it keeps: no write of its keeper lands
+        // after it.
+        keeper.finish().await;
+        outcome
     }
 
     async fn run_routes(&self, service: &AgentService, turn: TurnRun<'_>) -> Result<ChainOutcome> {

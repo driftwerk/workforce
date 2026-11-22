@@ -161,7 +161,7 @@ pub(crate) fn keep(session: &mut workforce_common::session::Session) {
 }
 
 /// The guard kept on `session` for a turn its caller set none for: the
-/// unfinished turn's as it stopped ([`keep_turn`], [`turn_keeper`]), else
+/// unfinished turn's as it stopped ([`keep_turn`], [`TurnKeeper`]), else
 /// the one a monitor's run set. A kept scope that can't be read is kept as
 /// strictly as any: armed, refusing.
 pub(crate) fn kept_guard(
@@ -205,48 +205,101 @@ pub(crate) fn keep_turn(
 }
 
 /// What keeps the guard of a turn on `session_id` as it arms and refuses,
-/// so a turn a restart cut off resumes guarded as it was. A turn that
-/// finishes replaces it ([`keep_turn`]).
-pub(crate) fn turn_keeper(
+/// so a turn a restart cut off resumes guarded as it was. Its writes run
+/// off the runtime's threads, in the order the guard changed; once the
+/// turn is [`finish`](Self::finish)ed none lands, so the turn's own
+/// end ([`keep_turn`]) is the last word.
+pub(crate) struct TurnKeeper {
     sessions: Arc<dyn workforce_common::session::SessionStore>,
     session_id: String,
-) -> workforce_agent::security::monitor::Keeper {
-    // Kept off the runtime's threads, in the order the guard changed: a
-    // write that lands after a later one is skipped.
-    let order = Arc::new(std::sync::atomic::AtomicU64::new(0));
-    let written = Arc::new(std::sync::Mutex::new(0u64));
-    Arc::new(move |scope: &ContentScope| {
-        let Ok(kept) = serde_json::to_value(scope) else {
-            return;
-        };
-        let at = order.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
-        let (sessions, session_id, written) = (
-            Arc::clone(&sessions),
-            session_id.clone(),
-            Arc::clone(&written),
-        );
-        let write = move || {
-            let mut last = written.lock().unwrap_or_else(|e| e.into_inner());
-            if *last > at {
-                return;
-            }
-            let mut patch = serde_json::Map::new();
-            patch.insert(
-                workforce_common::session::TURN_CONTENT_SCOPE.to_string(),
-                kept,
-            );
-            match sessions.merge_metadata(&session_id, patch, &[]) {
-                Ok(()) => *last = at,
-                Err(e) => {
-                    tracing::warn!(session = %session_id, error = %e, "The turn's guard could not be kept")
-                }
-            }
-        };
-        match tokio::runtime::Handle::try_current() {
-            Ok(runtime) => drop(runtime.spawn_blocking(write)),
-            Err(_) => write(),
+    state: Arc<KeeperState>,
+}
+
+#[derive(Default)]
+struct KeeperState {
+    order: std::sync::atomic::AtomicU64,
+    written: std::sync::Mutex<Written>,
+}
+
+#[derive(Default)]
+struct Written {
+    /// The change last written.
+    last: u64,
+    /// The turn ended: nothing more is written.
+    finished: bool,
+}
+
+impl TurnKeeper {
+    pub(crate) fn new(
+        sessions: Arc<dyn workforce_common::session::SessionStore>,
+        session_id: String,
+    ) -> Self {
+        Self {
+            sessions,
+            session_id,
+            state: Arc::default(),
         }
-    })
+    }
+
+    /// The keeper the turn's guard is kept by.
+    pub(crate) fn keeper(&self) -> workforce_agent::security::monitor::Keeper {
+        let (sessions, session_id, state) = (
+            Arc::clone(&self.sessions),
+            self.session_id.clone(),
+            Arc::clone(&self.state),
+        );
+        Arc::new(move |scope: &ContentScope| {
+            let Ok(kept) = serde_json::to_value(scope) else {
+                return;
+            };
+            let at = state
+                .order
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                + 1;
+            let (sessions, session_id, state) = (
+                Arc::clone(&sessions),
+                session_id.clone(),
+                Arc::clone(&state),
+            );
+            let write = move || {
+                let mut written = state.written.lock().unwrap_or_else(|e| e.into_inner());
+                if written.finished || written.last > at {
+                    return;
+                }
+                let mut patch = serde_json::Map::new();
+                patch.insert(
+                    workforce_common::session::TURN_CONTENT_SCOPE.to_string(),
+                    kept,
+                );
+                match sessions.merge_metadata(&session_id, patch, &[]) {
+                    Ok(()) => written.last = at,
+                    Err(e) => {
+                        tracing::warn!(session = %session_id, error = %e, "The turn's guard could not be kept")
+                    }
+                }
+            };
+            match tokio::runtime::Handle::try_current() {
+                Ok(runtime) => drop(runtime.spawn_blocking(write)),
+                Err(_) => write(),
+            }
+        })
+    }
+
+    /// The turn ended: once this returns, no write of its keeper lands,
+    /// one under way having finished first.
+    pub(crate) async fn finish(&self) {
+        let state = Arc::clone(&self.state);
+        let finish = move || {
+            state
+                .written
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .finished = true;
+        };
+        if tokio::task::spawn_blocking(finish).await.is_err() {
+            tracing::warn!(session = %self.session_id, "The turn's guard keeper could not be finished");
+        }
+    }
 }
 
 fn stopped_notice(monitor: &MonitorMeta, stops: &[AnomalySignal]) -> Option<String> {
@@ -270,6 +323,48 @@ fn stopped_notice(monitor: &MonitorMeta, stops: &[AnomalySignal]) -> Option<Stri
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_keepers_write_after_the_turn_ends_never_brings_its_guard_back() {
+        use workforce_common::session::{SessionStore, TURN_CONTENT_SCOPE};
+        let sessions: Arc<dyn SessionStore> =
+            Arc::new(workforce_common::session::InMemorySessionStore::new());
+        let id = sessions.get_or_create("web", "alice", "scout").unwrap().id;
+        let kept = |sessions: &Arc<dyn SessionStore>| {
+            sessions
+                .get(&id)
+                .unwrap()
+                .unwrap()
+                .turn_content_scope()
+                .is_some()
+        };
+        let turn = TurnKeeper::new(Arc::clone(&sessions), id.clone());
+        let keeper = turn.keeper();
+        let scope = ContentScope {
+            armed: Some("email.read".into()),
+            ..ContentScope::default()
+        };
+        keeper(&scope);
+        for _ in 0..200 {
+            if kept(&sessions) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert!(kept(&sessions), "an armed turn's guard is kept as it arms");
+        turn.finish().await;
+        // The turn's end clears it, as `keep_turn` does for a turn that
+        // waits on nothing.
+        sessions
+            .merge_metadata(&id, serde_json::Map::new(), &[TURN_CONTENT_SCOPE])
+            .unwrap();
+        keeper(&scope);
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(
+            !kept(&sessions),
+            "a write after the turn ended lands nowhere"
+        );
+    }
 
     const OUT_OF_SCOPE: &[&str] = &[
         "vault.get",

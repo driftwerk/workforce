@@ -405,6 +405,7 @@ const OWN_NAMESPACES: &[&str] = &[
 /// ledger and usage. Anything else of theirs shares, records or changes
 /// what it keeps, and is held.
 const KEPT_READS: &[&str] = &[
+    "decision.list",
     "artifact.list",
     "artifact.read",
     "artifact.search",
@@ -434,6 +435,25 @@ const KEPT_READS: &[&str] = &[
     "stats.task_history",
     "stats.ticket_cost",
     "stats.tool_costs",
+];
+
+/// What the agent keeps that others are shown or later turns build on: an
+/// artifact made, changed, shared, finalised or deleted, a decision
+/// recorded. Held like [`PERSISTING`], whoever named the tool: outside
+/// content never publishes or records through it. Called by tool and
+/// action (`artifact` doing `artifact.share`) or by leaf.
+const KEPT_WRITES: &[&str] = &[
+    "artifact.create",
+    "artifact.update",
+    "artifact.share",
+    "artifact.finalize",
+    "artifact.delete",
+    "artifacts.create",
+    "artifacts.update",
+    "artifacts.share",
+    "artifacts.finalize",
+    "artifacts.delete",
+    "decision.record",
 ];
 
 /// The fields of an `http.request` beyond its URL and method: anything in
@@ -875,6 +895,15 @@ pub fn assess(
     let (namespace, leaf) = tool.rsplit_once('.').unwrap_or((tool, tool));
     let root = tool.split('.').next().unwrap_or(tool);
     let exfiltration = |to: String| AnomalySignal::Exfiltration { tool: owned(), to };
+    // What the call does, by tool and action: `artifact` doing
+    // `artifact.share` (an action that names its tool) or `share`, or the
+    // tool alone.
+    let does = match action.as_str() {
+        "" => tool.to_string(),
+        named if named.contains('.') => named.to_string(),
+        bare => format!("{tool}.{bare}"),
+    };
+    let listed = |list: &[&str]| list.contains(&tool) || list.contains(&does.as_str());
     if CREDENTIAL_NAMESPACES.contains(&root) || names_a_secret(input) {
         return Some(AnomalySignal::CredentialAccess { tool: owned() });
     }
@@ -926,7 +955,7 @@ pub fn assess(
             });
         }
     }
-    if persists(tool, &action) {
+    if persists(tool, &action) || listed(KEPT_WRITES) {
         return Some(AnomalySignal::Persistence { tool: owned() });
     }
     if standing
@@ -948,9 +977,6 @@ pub fn assess(
     let system_read = tool.strip_prefix(SYSTEM_NAMESPACE).map(|rest| {
         rest.starts_with("list_") || rest.ends_with("_status") || SYSTEM_READS.contains(&rest)
     });
-    let listed = |list: &[&str]| {
-        list.contains(&tool) || (!action.is_empty() && list.contains(&&*format!("{tool}.{action}")))
-    };
     // A setup namespace's own tools: `mcp.install`, never `mcp.acme.x`.
     let setup_tool = SETUP_NAMESPACES.contains(&root) && namespace == root;
     let setup_read = setup_tool && listed(SETUP_READS);
@@ -1678,12 +1704,29 @@ mod tests {
         let guard = armed(delivering("C1"));
         for (tool, input) in [
             (
-                "artifact.share",
-                json!({ "id": "a1", "visibility": "global" }),
+                "artifact",
+                json!({ "action": "artifact.share", "id": "a1", "visibility": "public" }),
             ),
-            ("artifact.create", json!({})),
-            ("artifact.update", json!({})),
-            ("decision.record", json!({})),
+            (
+                "artifact",
+                json!({ "action": "artifact.create", "content": "x" }),
+            ),
+            (
+                "artifact",
+                json!({ "action": "artifact.update", "id": "a1" }),
+            ),
+            (
+                "artifact",
+                json!({ "action": "artifact.delete", "id": "a1" }),
+            ),
+            (
+                "artifact",
+                json!({ "action": "decision.record", "id": "d1" }),
+            ),
+            (
+                "artifact",
+                json!({ "action": "artifact.publish_everywhere" }),
+            ),
             ("deep_expertise.record_node", json!({})),
             ("stats.set_model_preference", json!({})),
             ("projects.create", json!({})),
@@ -1700,8 +1743,26 @@ mod tests {
         ] {
             assert!(guard.check(tool, &input, None).is_some(), "{tool} {input}");
         }
-        for tool in [
+        for action in [
             "artifact.read",
+            "artifact.list",
+            "artifact.search",
+            "decision.list",
+        ] {
+            let input = json!({ "action": action });
+            assert_eq!(guard.check("artifact", &input, None), None, "{action}");
+        }
+        // Named, it still never shares, records or changes what it keeps.
+        let named = armed(ContentScope {
+            named: vec!["artifact".into()],
+            ..delivering("C1")
+        });
+        let share = json!({ "action": "artifact.share", "id": "a1", "visibility": "public" });
+        assert!(matches!(
+            named.check("artifact", &share, None).map(|h| h.signal),
+            Some(AnomalySignal::Persistence { .. })
+        ));
+        for tool in [
             "knowledge.search",
             "projects.list",
             "stats.my_usage",
