@@ -862,9 +862,9 @@ pub trait Crew: Send + Sync {
     fn default_engine(&self, _agent: &str) -> Option<String> {
         None
     }
-    /// How many sessions the boss `agent` runs at once
-    /// (`[oversight.work] parallel`), while it oversees.
-    fn boss_limit(&self, _agent: &str) -> Option<usize> {
+    /// How many sessions `plan`'s boss runs at once
+    /// (`[oversight.work] parallel`), while it oversees the plan's scope.
+    fn boss_limit(&self, _plan: &crate::plan::Plan) -> Option<usize> {
         None
     }
     /// The start of today, in the person's time.

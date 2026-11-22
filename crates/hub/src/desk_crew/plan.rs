@@ -1859,7 +1859,7 @@ impl CrewHub {
 
     /// The boss of `p` and its settings, while it oversees the scope the
     /// plan is in.
-    fn boss_of_plan(&self, p: &Plan) -> Option<(Arc<AgentService>, Oversight)> {
+    pub(super) fn boss_of_plan(&self, p: &Plan) -> Option<(Arc<AgentService>, Oversight)> {
         self.overseer_named(&p.boss)
             .filter(|(_, o)| self.desk.seen_by(&o.scope).sees(p.group.as_deref()))
     }

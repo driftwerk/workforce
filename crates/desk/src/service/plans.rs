@@ -408,7 +408,7 @@ impl Desk {
 
     /// How many sessions `p` runs at once ([`PlanSummary::limit`]).
     fn plan_limit(&self, p: &Plan) -> Option<usize> {
-        self.crew()?.boss_limit(&p.boss).map(|l| p.limit(l))
+        self.crew()?.boss_limit(p).map(|l| p.limit(l))
     }
 
     /// What holds `p`'s new starts now, while it is open.

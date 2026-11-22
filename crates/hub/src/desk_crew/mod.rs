@@ -1574,8 +1574,8 @@ impl Crew for CrewHub {
         self.overseer_named(agent).map(|(_, o)| o.work.engine)
     }
 
-    fn boss_limit(&self, agent: &str) -> Option<usize> {
-        self.overseer_named(agent)
+    fn boss_limit(&self, plan: &workforce_desk::plan::Plan) -> Option<usize> {
+        self.boss_of_plan(plan)
             .map(|(_, o)| o.work.parallel as usize)
     }
 
