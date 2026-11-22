@@ -456,6 +456,7 @@ const CLAIMS: &[(&str, &str, &str, Claim)] = &[
     ("hub", "owners", "person", By(C::DecisionRecords)),
     ("hub", "daily", "person", By(C::DecisionRecords)),
     ("hub", "identity_pictures", "identity_id", By(C::Pictures)),
+    ("hub", "bulk_jobs", "owner", By(C::MailJobs)),
     ("hub", "intents", "person", By(C::KnowHow)),
     ("hub", "provenance", "person", By(C::KnowHow)),
     ("hub", "records", "person", By(C::DecisionRecords)),

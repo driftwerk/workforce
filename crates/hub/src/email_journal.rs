@@ -18,6 +18,13 @@ use workforce_postgres::{
 };
 use workforce_skills::adapters::email::journal::{self, BulkJob, JobState, MailJournal, Origin};
 
+static INSTALLED: std::sync::OnceLock<Arc<PgMailJournal>> = std::sync::OnceLock::new();
+
+/// The hub's journal, once [`install`] opened it.
+pub fn installed() -> Option<Arc<PgMailJournal>> {
+    INSTALLED.get().cloned()
+}
+
 /// How often jobs past their two weeks are let go.
 const PRUNE_EVERY: Duration = Duration::from_secs(6 * 3600);
 
@@ -81,6 +88,54 @@ impl PgMailJournal {
                 "DELETE FROM bulk_jobs WHERE updated_at < now() - interval '14 days'",
                 &[],
             )
+            .await?)
+    }
+
+    /// Everyone with jobs kept, with how many each.
+    pub async fn people(&self) -> Result<Vec<(String, usize)>> {
+        let conn = self.pool.get().await?;
+        Ok(conn
+            .query("SELECT owner, count(*) FROM bulk_jobs GROUP BY owner", &[])
+            .await?
+            .iter()
+            .map(|row| {
+                let held: i64 = row.get(1);
+                (row.get(0), usize::try_from(held).unwrap_or(usize::MAX))
+            })
+            .collect())
+    }
+
+    /// How many jobs are kept under any of `names`.
+    pub async fn held(&self, names: &[String]) -> Result<usize> {
+        let conn = self.pool.get().await?;
+        let held: i64 = conn
+            .query_one(
+                "SELECT count(*) FROM bulk_jobs WHERE owner = ANY($1)",
+                &[&names],
+            )
+            .await?
+            .get(0);
+        Ok(usize::try_from(held).unwrap_or(usize::MAX))
+    }
+
+    /// Hands the jobs kept under any of `names` to `into`, so they can
+    /// still be carried on and undone.
+    pub async fn reassign(&self, names: &[String], into: &str) -> Result<u64> {
+        let conn = self.pool.get().await?;
+        Ok(conn
+            .execute(
+                "UPDATE bulk_jobs SET owner = $2, job = jsonb_set(job, '{owner}', to_jsonb($2::text)) \
+                 WHERE owner = ANY($1)",
+                &[&names, &into],
+            )
+            .await?)
+    }
+
+    /// Erases the jobs kept under any of `names`, batches and all.
+    pub async fn erase(&self, names: &[String]) -> Result<u64> {
+        let conn = self.pool.get().await?;
+        Ok(conn
+            .execute("DELETE FROM bulk_jobs WHERE owner = ANY($1)", &[&names])
             .await?)
     }
 
@@ -196,6 +251,7 @@ pub async fn install(config: &WorkforceConfig) {
             match opened {
                 Ok(store) => {
                     let store = Arc::new(store);
+                    let _ = INSTALLED.set(Arc::clone(&store));
                     journal::install(Arc::clone(&store) as Arc<dyn MailJournal>);
                     tokio::spawn(async move {
                         let mut every = tokio::time::interval(PRUNE_EVERY);
@@ -351,6 +407,65 @@ mod tests {
                 journal.latest("kat", "home").await.unwrap().map(|j| j.id),
                 Some("mine".to_string())
             );
+        })
+        .await;
+    }
+
+    /// A person's jobs, by every name they go by, are counted, handed to
+    /// the one they are merged into and erased with them.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_persons_jobs_follow_a_merge_and_go_with_a_delete() {
+        with_test_pool(PgMailJournal::build_pool, |pool| async move {
+            let journal = PgMailJournal::with_pool(pool).await.unwrap();
+            let mut moved = job("j1", "u1", "home");
+            moved.done.push(batch(1));
+            for j in [
+                &moved,
+                &job("j2", "slack:U1", "home"),
+                &job("j3", "u2", "home"),
+            ] {
+                journal.save(j).await.unwrap();
+            }
+            let u1 = ["u1".to_string(), "slack:U1".to_string()];
+            let mut people = journal.people().await.unwrap();
+            people.sort();
+            assert_eq!(
+                people,
+                vec![
+                    ("slack:U1".to_string(), 1),
+                    ("u1".to_string(), 1),
+                    ("u2".to_string(), 1)
+                ]
+            );
+            assert_eq!(journal.held(&u1).await.unwrap(), 2);
+
+            assert_eq!(journal.reassign(&u1, "u2").await.unwrap(), 2);
+            assert_eq!(journal.held(&u1).await.unwrap(), 0);
+            let merged = journal.get("u2", "j1").await.unwrap().unwrap();
+            assert_eq!(merged.owner, "u2");
+            assert_eq!(merged.done.len(), 1, "a merged job can still be undone");
+            let mut undoing = merged;
+            undoing.state = JobState::Undoing;
+            journal.save(&undoing).await.unwrap();
+            assert_eq!(
+                journal.get("u2", "j1").await.unwrap().map(|j| j.state),
+                Some(JobState::Undoing),
+                "and its new owner can carry it on"
+            );
+
+            let u2 = ["u2".to_string()];
+            assert_eq!(journal.erase(&u2).await.unwrap(), 3);
+            assert!(journal.people().await.unwrap().is_empty());
+            let batches: i64 = journal
+                .pool
+                .get()
+                .await
+                .unwrap()
+                .query_one("SELECT count(*) FROM bulk_batches", &[])
+                .await
+                .unwrap()
+                .get(0);
+            assert_eq!(batches, 0, "its batches go with it");
         })
         .await;
     }
