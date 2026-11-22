@@ -1337,30 +1337,63 @@ pub fn publishes_on(command: &str, branch: Option<&str>) -> bool {
 }
 
 /// Whether a command run with something on its stdin surely doesn't run
-/// it: one simple command, written out with no options and nothing
-/// redirected, among a few that read stdin as data at most. Anything else
-/// (a shell, `sudo`, `env sh`, `. /dev/stdin`, `cat >> ~/.bashrc`) may run
-/// or keep what it is fed.
+/// it: one simple command, written out with nothing redirected, among a
+/// few that read stdin as data at most, given only options that shape
+/// what it prints (never a file, a program or an output). Anything else
+/// (a shell, `sudo`, `env sh`, `. /dev/stdin`, `cat >> ~/.bashrc`, `grep
+/// -f x`, `tail -f`) may run or keep what it is fed.
 fn reads_no_script(script: &str) -> bool {
-    const DATA: &[&str] = &[
-        "cat", "ls", "echo", "true", "false", "pwd", "uptime", "df", "uname", "hostname", "whoami",
-        "date", "wc", "head", "tail", "grep",
-    ];
     let Ok(commands) = split(script) else {
         return false;
     };
     let [only] = commands.as_slice() else {
         return false;
     };
-    only.writes.is_empty()
-        && only
-            .words
-            .first()
-            .is_some_and(|w| !w.dynamic && DATA.contains(&w.text.as_str()))
-        && only
-            .words
-            .iter()
-            .all(|w| !w.dynamic && !w.text.starts_with('-'))
+    let Some((first, args)) = only.words.split_first() else {
+        return false;
+    };
+    // The letters it may be given alone, and those taking a count.
+    let (flags, counts) = match first.text.as_str() {
+        "wc" => ("lcwm", ""),
+        "head" | "tail" => ("", "nc"),
+        "grep" => ("ivcnEFwxq", ""),
+        "ls" => ("lah1", ""),
+        "cat" => ("n", ""),
+        "echo" | "true" | "false" | "pwd" | "uptime" | "df" | "uname" | "hostname" | "whoami"
+        | "date" => ("", ""),
+        _ => return false,
+    };
+    let count = |t: &str| {
+        let t = t.strip_prefix(['+', '-']).unwrap_or(t);
+        !t.is_empty() && t.chars().all(|c| c.is_ascii_digit())
+    };
+    let mut i = 0;
+    while let Some(w) = args.get(i) {
+        i += 1;
+        let t = w.text.as_str();
+        if w.dynamic {
+            return false;
+        }
+        let Some(letters) = t.strip_prefix('-').filter(|l| !l.is_empty()) else {
+            continue;
+        };
+        let mut chars = letters.chars();
+        let fine = match chars.next() {
+            Some(c) if counts.contains(c) => match chars.as_str() {
+                "" => {
+                    i += 1;
+                    args.get(i - 1)
+                        .is_some_and(|n| !n.dynamic && count(&n.text))
+                }
+                rest => count(rest),
+            },
+            _ => letters.chars().all(|c| flags.contains(c)),
+        };
+        if !fine {
+            return false;
+        }
+    }
+    only.writes.is_empty() && !first.dynamic
 }
 
 /// The words a line that can't be read is told to publish by.
@@ -2869,16 +2902,7 @@ fn classify_words(
             Some(Asks::Unclear)
         }
         "open" if opens_to_run(args) => Some(Asks::Unclear),
-        // GNU sort runs `--compress-program` (any prefix down to `--co`);
-        // `--files0-from` reads names it can't see.
-        "sort" | "gsort"
-            if args.iter().any(|w| {
-                let t = w.text.as_str();
-                (w.dynamic && t.starts_with('-')) || t.starts_with("--co") || t.starts_with("--fil")
-            }) =>
-        {
-            Some(Asks::Unclear)
-        }
+        "sort" | "gsort" => sort(args, place, unknown),
         "make"
             if args.iter().enumerate().any(|(k, w)| {
                 w.text.starts_with("--eval")
@@ -4202,6 +4226,98 @@ fn find(args: &[&Word], simple: &Simple, place: &Place<'_>) -> Option<Asks> {
     found
 }
 
+/// GNU `sort`: the file `-o` (`--output`, any prefix) writes, read as a
+/// write. `--compress-program` runs a program and `--files0-from` reads
+/// names it can't see, in any prefix; an option made as it runs can't be
+/// read. Options end at `--`.
+fn sort(args: &[&Word], place: &Place<'_>, unknown: bool) -> Option<Asks> {
+    const VALUED: &[&str] = &[
+        "key",
+        "field-separator",
+        "buffer-size",
+        "temporary-directory",
+        "parallel",
+        "batch-size",
+        "sort",
+        "random-source",
+    ];
+    let mut targets: Vec<Word> = Vec::new();
+    let mut i = 0;
+    while let Some(w) = args.get(i) {
+        i += 1;
+        let t = w.text.as_str();
+        if t == "--" {
+            break;
+        }
+        if w.dynamic && (t.is_empty() || t.starts_with('-')) {
+            return Some(Asks::Unclear);
+        }
+        if let Some(long) = t.strip_prefix("--") {
+            let (name, value) = match long.split_once('=') {
+                Some((n, v)) => (n, Some(v)),
+                None => (long, None),
+            };
+            let given = |n: &str| name.len() >= 2 && n.starts_with(name);
+            if given("compress-program") || (name.len() >= 3 && given("files0-from")) {
+                return Some(Asks::Unclear);
+            }
+            if !name.is_empty() && "output".starts_with(name) {
+                let target = match value {
+                    Some(v) => Some(Word {
+                        text: v.to_string(),
+                        ..(*w).clone()
+                    }),
+                    None => {
+                        i += 1;
+                        args.get(i - 1).map(|v| (*v).clone())
+                    }
+                };
+                match target {
+                    Some(target) => targets.push(target),
+                    None => return Some(Asks::Unclear),
+                }
+            } else if value.is_none()
+                && name.len() >= 3
+                && VALUED.iter().any(|v| v.starts_with(name))
+            {
+                i += 1;
+            }
+            continue;
+        }
+        let Some(letters) = t.strip_prefix('-').filter(|l| !l.is_empty()) else {
+            continue;
+        };
+        for (k, c) in letters.char_indices() {
+            if !"kStTo".contains(c) {
+                continue;
+            }
+            let rest = &letters[k + 1..];
+            let value = match rest.is_empty() {
+                true => {
+                    i += 1;
+                    args.get(i - 1).map(|v| (*v).clone())
+                }
+                false => Some(Word {
+                    text: rest.to_string(),
+                    ..(*w).clone()
+                }),
+            };
+            if c == 'o' {
+                match value {
+                    Some(target) => targets.push(target),
+                    None => return Some(Asks::Unclear),
+                }
+            }
+            break;
+        }
+    }
+    let targets: Vec<&Word> = targets.iter().collect();
+    match targets.is_empty() {
+        true => None,
+        false => place.overwrites(&targets, unknown),
+    }
+}
+
 /// `fd`: what it runs for each file it finds (`-x`, `--exec`) or for all
 /// of them (`-X`, `--exec-batch`), read as `find -exec`'s is, on files it
 /// can't name. A search from elsewhere (`--base-directory`), a command
@@ -5505,6 +5621,7 @@ mod tests {
             "sort --compress=sh f",
             "sort --co sh f",
             "sort --files0-from=list",
+            "sort --compress-p=sh f",
         ] {
             assert_eq!(asks(command), Some(U), "{command:?}");
         }
@@ -5545,6 +5662,9 @@ mod tests {
             "echo ${x@Q} ${x@U} ${a[@]@A} ${x@k}",
             "grep \"[a$]\" f",
             "sort -u -S1 f",
+            "sort -- --config.txt",
+            "sort -o out.txt x",
+            "sort -k2 --output=out.txt x",
             "echo $ x; grep \"a$\" f; echo \"cost: $\"; echo $'a\\nb' ${#} ${?}",
         ] {
             assert_eq!(asks(command), None, "{command:?}");
@@ -5595,6 +5715,10 @@ mod tests {
             "echo x | ssh prod 'cat >> ~/.bashrc'",
             "echo x | ssh prod 'grep -f /dev/stdin x'",
             "echo x | ssh prod sort",
+            "echo x | ssh prod grep -f x",
+            "echo x | ssh prod tail -f",
+            "echo x | ssh prod wc --files0-from=x",
+            "echo x | ssh prod head -n $N",
         ] {
             assert!(publishes_on(command, Some("main")), "{command:?}");
         }
@@ -5615,6 +5739,10 @@ mod tests {
             "ssh prod 0<&-",
             "echo x | ssh prod cat",
             "ssh prod wc < f",
+            "echo x | ssh prod wc -l",
+            "echo x | ssh prod grep -ivc x",
+            "echo x | ssh prod tail -n 5",
+            "echo x | ssh prod head -c20",
             "ssh devbox 'git push origin feat/x'",
         ] {
             assert!(!publishes_on(command, Some("main")), "{command:?}");
@@ -5623,6 +5751,20 @@ mod tests {
 
     /// The last of the final review: `fd`'s commands, `rg --pre`, more
     /// runners, `open` running a script, and git settings that run.
+    #[test]
+    fn what_sort_writes_is_a_write() {
+        for command in [
+            "sort -o ~/.zshrc x",
+            "sort -o/Users/sarah/.zshrc x",
+            "sort --ou ~/.zshrc x",
+            "sort --output=/Users/sarah/dev/acme-web/README.md x",
+            "sort -ro /Users/sarah/dev/acme-web/README.md x",
+            "sort -o",
+        ] {
+            assert!(asks(command).is_some(), "{command:?}");
+        }
+    }
+
     #[test]
     fn fd_rg_runners_and_open_are_read() {
         assert_eq!(
