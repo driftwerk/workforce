@@ -580,6 +580,7 @@ mod tests {
             by: None,
             on: None,
             pid: None,
+            call: None,
         }
     }
 
