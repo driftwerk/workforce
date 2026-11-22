@@ -1125,10 +1125,13 @@ async fn directs_from_launch(
     let held = there.charge_of(id).expect("its boss's from launch");
     assert!(held.live() && held.boss == "home/desk", "{held:?}");
 
-    // It reads it, and its first message is delivered: no one handed it
-    // over.
-    let r = run(&main, "crew.history", json!({"session_id": session})).await;
-    assert!(r.success, "{r:?}");
+    // It reads it once the Mac has read its plan's sessions there, and its
+    // first message is delivered: no one handed it over.
+    eventually("read under its plan's grant", async || {
+        let r = run(&main, "crew.history", json!({"session_id": session})).await;
+        r.success.then_some(())
+    })
+    .await;
     let sent = carried.lock().last().cloned().unwrap();
     assert_eq!(
         (sent.group.as_str(), sent.boss.as_str()),
@@ -1375,8 +1378,9 @@ async fn holds_its_own(pool: workforce_postgres::PostgresPool) {
                             listed.lock().push(s.clone());
                             s
                         }
-                        // The pump's take, which isn't a call this counts.
-                        super::super::relayed_decide::TAKE => json!({}),
+                        // The Mac's own takes, which aren't calls this counts.
+                        super::super::relayed_work::WORK_TAKE
+                        | super::super::relayed_decide::TAKE => json!({}),
                         _ => {
                             carried.lock().push(c.clone());
                             json!({"done": "read"})
