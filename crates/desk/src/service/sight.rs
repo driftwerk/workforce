@@ -805,7 +805,7 @@ fn read_transcript(
             })
         }
         (None, None) => {
-            let page = transcript::page(&r, engine, end, redactor).map_err(unread)?;
+            let page = transcript::page(&r, engine, end, redactor, budget).map_err(unread)?;
             Ok(Transcript {
                 exchanges: page.exchanges,
                 before: cursor(page.before),
@@ -833,13 +833,7 @@ impl Desk {
         {
             return Err(AGENT_TURN.into());
         }
-        let records = {
-            let desk = self.clone();
-            let r = r.clone();
-            tokio::task::spawn_blocking(move || desk.records_of(&r))
-                .await
-                .unwrap_or_default()
-        };
+        let records = self.records_blocking(&r).await;
         if records.is_empty() {
             return Err(format!(
                 "{} keeps no transcript Desk can read.",
@@ -849,12 +843,7 @@ impl Desk {
         let Some(redactor) = self.0.ledger.redactor.clone() else {
             return Err(NO_REDACTOR.into());
         };
-        self.kept_out(&r, &records, false)
-            .await
-            .map_err(|why| match why {
-                Why::Skip(_) => KEPT_OUT.to_string(),
-                Why::Hold(_) => UNCHECKED.to_string(),
-            })?;
+        self.readable(&r, &records).await?;
         let path = match ask.record.as_deref() {
             None | Some("main") => records[0].clone(),
             Some(name) => records
@@ -899,8 +888,29 @@ impl Desk {
         .unwrap_or_else(|_| Err(UNREAD.into()))
     }
 
+    /// `r`'s records, read off the runtime.
+    async fn records_blocking(&self, r: &SessionRecord) -> Vec<PathBuf> {
+        let desk = self.clone();
+        let r = r.clone();
+        tokio::task::spawn_blocking(move || desk.records_of(&r))
+            .await
+            .unwrap_or_default()
+    }
+
+    /// Whether the person lets Desk read `r`'s conversation, its records
+    /// `records`; why not, in a sentence.
+    async fn readable(&self, r: &SessionRecord, records: &[PathBuf]) -> Result<(), String> {
+        self.kept_out(r, records, false)
+            .await
+            .map_err(|why| match why {
+                Why::Skip(_) => KEPT_OUT.to_string(),
+                Why::Hold(_) => UNCHECKED.to_string(),
+            })
+    }
+
     /// `id`'s own lines in Desk's logs around its turn, with `query` in
-    /// them when asked; why not, in a sentence.
+    /// them when asked, read only where the person lets Desk read its
+    /// conversation; why not, in a sentence.
     pub async fn session_logs(&self, id: Uuid, query: Option<String>) -> Result<Logs, String> {
         let Some(dir) = self.0.opts.sight.logs.clone() else {
             return Err(NO_LOGS.into());
@@ -912,6 +922,8 @@ impl Desk {
             .session_record(id)
             .await
             .ok_or_else(|| "There's no such session.".to_string())?;
+        let records = self.records_blocking(&r).await;
+        self.readable(&r, &records).await?;
         let now = Utc::now();
         let start = self.state_since(id).unwrap_or(r.updated_at);
         let from = (start - LOGS_BEFORE).max(now - LOGS_MOST);

@@ -292,7 +292,8 @@ async fn without_a_redactor_no_transcript_and_no_logs_are_shown() {
 }
 
 #[tokio::test]
-async fn a_sessions_own_log_lines_are_read_from_desks_logs_and_none_without_them() {
+async fn a_sessions_own_log_lines_are_read_from_desks_logs_where_the_person_lets_desk_and_none_without_them(
+) {
     with_test_pool(build_pool, |pool| async move {
         let dir = tempfile::tempdir().unwrap();
         let logs = dir.path().join("logs");
@@ -300,13 +301,17 @@ async fn a_sessions_own_log_lines_are_read_from_desks_logs_and_none_without_them
         let store = DeskStore::from_pool(pool.clone());
         DeskStore::migrate(&pool).await.unwrap();
         let r = kept(dir.path(), "web", dir.path());
+        let off = kept(dir.path(), "off", &dir.path().join("off"));
         store.put(&r).await.unwrap();
+        store.put(&off).await.unwrap();
+        store.set_session_memory(off.id, false).await.unwrap();
         let now = chrono::Utc::now().to_rfc3339();
         std::fs::write(
             logs.join("hub.log"),
             format!(
-                "{now}  WARN hub: session {} couldn't read SECRET-abc\n{now}  INFO hub: another\n",
-                r.id
+                "{now}  WARN hub: session {} couldn't read SECRET-abc\n{now}  INFO hub: another\n\
+                 {now}  INFO hub: session {} read\n",
+                r.id, off.id
             ),
         )
         .unwrap();
@@ -318,6 +323,10 @@ async fn a_sessions_own_log_lines_are_read_from_desks_logs_and_none_without_them
         let read = d.session_logs(r.id, None).await.unwrap();
         assert_eq!(read.lines.len(), 1);
         assert!(read.lines[0].text.contains("[secret]"));
+        assert_eq!(
+            d.session_logs(off.id, None).await.unwrap_err(),
+            super::sight::KEPT_OUT
+        );
     })
     .await;
 }
