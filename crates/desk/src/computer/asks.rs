@@ -540,6 +540,7 @@ impl Place<'_> {
                 dynamic: false,
                 glob: false,
                 brace: false,
+                int: false,
             };
             // The folder it matches in, and something in it.
             return self.resolve(&held).map(|d| d.join("*"));
@@ -637,9 +638,22 @@ pub fn always_asks(command: &str, place: &Place<'_>) -> Option<Asks> {
                 ("popd", _) => None,
                 (_, None) => Some(here.home.to_path_buf()),
                 (_, Some(w)) if w.text == "-" => None,
-                // A bare name may be found through `CDPATH` (set here or in
-                // the person's profile), even when it is right here too.
-                (_, Some(w)) if !w.text.starts_with(['/', '.', '~']) => None,
+                // A bare name is found through `CDPATH` when the line sets
+                // it, even when it is right here too; else it is here.
+                (_, Some(w)) if !w.text.starts_with(['/', '.', '~']) => {
+                    let cdpath = here.set.iter().any(|n| n == "CDPATH")
+                        || words[..at.unwrap_or(0)]
+                            .iter()
+                            .any(|w| w.text.starts_with("CDPATH="));
+                    match cdpath {
+                        true => None,
+                        false => here
+                            .cwd
+                            .as_ref()
+                            .filter(|c| c.join(&w.text).is_dir())
+                            .and_then(|_| here.resolve(w)),
+                    }
+                }
                 (_, Some(w)) => here.resolve(w),
             };
             moved = true;
@@ -1396,6 +1410,10 @@ struct Word {
     glob: bool,
     /// Holds an unquoted brace: what it expands to can't be told.
     brace: bool,
+    /// Is wholly one expansion that is always an integer: `$?`, `$#`,
+    /// `$$`, `$!`, `${#X}`, a name last set on the line to an integer, or
+    /// arithmetic the reader accepted.
+    int: bool,
 }
 
 /// One simple command.
@@ -1414,6 +1432,8 @@ struct Simple {
     /// It runs inside a `$(…)`, in a shell of its own: a `cd` there leaves
     /// the line's cwd unknown.
     nested: bool,
+    /// The names the line had set to integers when it runs.
+    ints: Vec<String>,
 }
 
 struct Splitter {
@@ -1435,6 +1455,22 @@ struct Splitter {
     quoted: bool,
     /// The last thing read closed a subshell: a `cd` in it is gone after.
     closed: bool,
+    /// Names the line has set to an integer, unconditionally and in its
+    /// own shell, with nothing since that could set them otherwise.
+    ints: std::collections::BTreeSet<String>,
+    /// Names the command being read sets to an integer by assignment
+    /// alone (`i=0`), and by arithmetic in it (`$((i = 1))`).
+    pending: Vec<String>,
+    counted: Vec<String>,
+    /// The current word's expansions, and how many of them are integers.
+    parts: (u32, u32),
+    /// The command being read may not run (after `&&`, `||`, in a pipe).
+    cond: bool,
+    /// Subshells open.
+    depth: usize,
+    /// A compound command (`if`, `while`, `for`, `case`) has begun, at this
+    /// command: what is set after may not happen.
+    compound: Option<usize>,
 }
 
 fn split(command: &str) -> Result<Vec<Simple>, ()> {
@@ -1450,6 +1486,13 @@ fn split(command: &str) -> Result<Vec<Simple>, ()> {
         delimiter: None,
         quoted: false,
         closed: false,
+        ints: Default::default(),
+        pending: vec![],
+        counted: vec![],
+        parts: (0, 0),
+        cond: false,
+        depth: 0,
+        compound: None,
     };
     s.run()?;
     Ok(s.out)
@@ -1467,6 +1510,7 @@ impl Splitter {
                 dynamic: false,
                 glob: false,
                 brace: false,
+                int: false,
             })
             .text
             .push(c);
@@ -1479,14 +1523,17 @@ impl Splitter {
                 dynamic: false,
                 glob: false,
                 brace: false,
+                int: false,
             })
             .dynamic = true;
     }
 
     fn end_word(&mut self) {
-        let Some(word) = self.word.take() else {
+        let parts = std::mem::take(&mut self.parts);
+        let Some(mut word) = self.word.take() else {
             return;
         };
+        word.int = word.text.is_empty() && parts == (1, 1);
         if let Some(strip) = self.delimiter.take() {
             let quoted = std::mem::take(&mut self.quoted);
             self.heredocs.push((word.text, strip, quoted));
@@ -1496,18 +1543,101 @@ impl Splitter {
                 self.current.writes.push((word, append));
             }
         } else {
+            // An assignment stands before the command name, keywords aside.
+            let prefix = self
+                .current
+                .words
+                .iter()
+                .all(|w| is_assignment(w) || KEYWORDS.contains(&w.text.as_str()));
+            if prefix && is_assignment(&word) {
+                let (name, value) = word.text.split_once('=').unwrap_or_default();
+                let literal =
+                    !word.dynamic && !value.is_empty() && value.chars().all(|c| c.is_ascii_digit());
+                let whole = word.dynamic && value.is_empty() && parts == (1, 1);
+                match literal || whole {
+                    true => self.pending.push(name.to_string()),
+                    false => {
+                        self.ints.remove(name);
+                        self.pending.retain(|n| n != name);
+                    }
+                }
+            } else if self.current.words.is_empty()
+                && !word.dynamic
+                && matches!(
+                    word.text.as_str(),
+                    "if" | "while" | "until" | "for" | "select" | "case" | "function"
+                )
+            {
+                self.compound.get_or_insert(self.out.len());
+            }
             self.current.words.push(word);
         }
     }
 
+    /// Ends the command being read; a pipe after it (`piped`) feeds the
+    /// next.
     fn end_command(&mut self, piped: bool) {
+        self.end_command_as(piped, piped, self.cond);
+    }
+
+    /// [`Self::end_command`], saying whether the command runs in a shell
+    /// of its own (`alone`: piped, or `&`) and whether the next may not run
+    /// (`cond`). What it set to integers counts only when it surely ran,
+    /// here.
+    fn end_command_as(&mut self, piped: bool, alone: bool, cond: bool) {
         self.end_word();
-        let done = std::mem::take(&mut self.current);
+        let mut done = std::mem::take(&mut self.current);
+        let pending = std::mem::take(&mut self.pending);
+        let counted = std::mem::take(&mut self.counted);
+        done.ints = self.ints.iter().cloned().collect();
+        let name = done
+            .words
+            .iter()
+            .find(|w| !is_assignment(w) && !KEYWORDS.contains(&w.text.as_str()));
+        // What sets names in this shell to what can't be told.
+        let sets_any = name.is_some_and(|w| {
+            w.dynamic
+                || matches!(
+                    w.text.as_str(),
+                    "source"
+                        | "."
+                        | "read"
+                        | "mapfile"
+                        | "readarray"
+                        | "getopts"
+                        | "printf"
+                        | "declare"
+                        | "typeset"
+                        | "local"
+                        | "export"
+                        | "readonly"
+                        | "unset"
+                        | "eval"
+                        | "exec"
+                        | "wait"
+                        | "set"
+                        | "select"
+                        | "shopt"
+                )
+                || (w.text == "for" && done.words.len() > 1)
+        });
+        if sets_any {
+            self.ints.clear();
+        }
+        let surely =
+            !self.cond && self.depth == 0 && !alone && !done.piped_in && self.compound.is_none();
+        if surely {
+            if name.is_none() {
+                self.ints.extend(pending);
+            }
+            self.ints.extend(counted);
+        }
         // A command of redirections alone (`> f`, `exec 3<> f`) still writes.
         if !done.words.is_empty() || done.fed || !done.writes.is_empty() {
             self.out.push(done);
         }
         self.current.piped_in = piped;
+        self.cond = cond;
     }
 
     /// Skips the bodies of the heredocs opened on the line just ended; one
@@ -1658,6 +1788,7 @@ impl Splitter {
     fn dollar(&mut self) -> Result<(), ()> {
         self.at += 1;
         self.mark_dynamic();
+        self.parts.0 += 1;
         match self.peek(0) {
             Some('(') => {
                 self.at += 1;
@@ -1665,10 +1796,10 @@ impl Splitter {
                     // Arithmetic runs nothing, unless it holds a command or
                     // a name whose value it evaluates.
                     let inner = self.substitution()?;
-                    return match plain_arithmetic(&inner) {
-                        true => Ok(()),
-                        false => Err(()),
-                    };
+                    let set = plain_arithmetic(&inner, &self.ints).ok_or(())?;
+                    self.counted.extend(set);
+                    self.parts.1 += 1;
+                    return Ok(());
                 }
                 let inner = self.substitution()?;
                 let commands = split(&inner)?;
@@ -1691,10 +1822,29 @@ impl Splitter {
                             depth -= 1;
                             if depth == 0 {
                                 let inner: String = self.chars[start..self.at - 1].iter().collect();
-                                return match plain_expansion(&inner) {
-                                    true => Ok(()),
-                                    false => Err(()),
-                                };
+                                if !plain_expansion(&inner) {
+                                    return Err(());
+                                }
+                                let name = inner
+                                    .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                                    .next()
+                                    .unwrap_or("");
+                                let rest = &inner[name.len()..];
+                                // `${X:=v}`, `${X=v}` set X.
+                                if rest.starts_with('=') || rest.starts_with(":=") {
+                                    self.ints.clear();
+                                    self.pending.clear();
+                                    self.counted.clear();
+                                }
+                                let length = inner.len() > 1
+                                    && inner.starts_with('#')
+                                    && inner[1..]
+                                        .chars()
+                                        .all(|c| c.is_ascii_alphanumeric() || c == '_');
+                                if length || (rest.is_empty() && self.ints.contains(name)) {
+                                    self.parts.1 += 1;
+                                }
+                                return Ok(());
                             }
                         }
                         _ => {}
@@ -1703,15 +1853,23 @@ impl Splitter {
                 return Err(());
             }
             _ => {
+                let start = self.at;
                 while let Some(c) = self.peek(0) {
                     if c.is_alphanumeric() || c == '_' {
                         self.at += 1;
                     } else {
-                        if matches!(c, '?' | '$' | '!' | '#' | '@' | '*' | '-') {
+                        if self.at == start && matches!(c, '?' | '$' | '!' | '#' | '@' | '*' | '-')
+                        {
                             self.at += 1;
                         }
                         break;
                     }
+                }
+                // `$?`, `$#`, `$$`, `$!` are numbers; so is a name the line
+                // set to one. A positional parameter is whatever was given.
+                let name: String = self.chars[start..self.at].iter().collect();
+                if matches!(name.as_str(), "?" | "#" | "$" | "!") || self.ints.contains(&name) {
+                    self.parts.1 += 1;
                 }
             }
         }
@@ -1796,7 +1954,7 @@ impl Splitter {
                 }
                 '\n' => {
                     self.at += 1;
-                    self.end_command(false);
+                    self.end_command_as(false, false, false);
                     self.skip_heredocs()?;
                 }
                 ';' => {
@@ -1804,7 +1962,7 @@ impl Splitter {
                     if self.peek(0) == Some(';') {
                         return Err(());
                     }
-                    self.end_command(false);
+                    self.end_command_as(false, false, false);
                 }
                 '&' => {
                     self.at += 1;
@@ -1824,7 +1982,8 @@ impl Splitter {
                         }
                         // After `(cd x) &&`, the cd is gone with its shell.
                         let closed = std::mem::take(&mut self.closed);
-                        self.end_command(false);
+                        // `&` alone runs it in a shell of its own.
+                        self.end_command_as(false, !and, and);
                         self.current.after_and = and && !closed;
                     }
                 }
@@ -1841,15 +2000,24 @@ impl Splitter {
                         }
                         _ => true,
                     };
-                    self.end_command(piped);
+                    self.end_command_as(piped, piped, true);
                 }
                 '(' if self.word.is_none() && self.peek(1) == Some('(') => {
-                    // `((…))`: arithmetic, read as `$((…))` is.
+                    // `((…))`: arithmetic, read as `$((…))` is. What it sets
+                    // counts when it surely runs: alone, or as the start of
+                    // the `for` just begun.
                     self.end_command(false);
                     self.at += 1;
                     let inner = self.substitution()?;
-                    if !plain_arithmetic(&inner) {
-                        return Err(());
+                    let set = plain_arithmetic(&inner, &self.ints).ok_or(())?;
+                    let for_start = self.compound.is_some()
+                        && self.compound == self.out.len().checked_sub(1)
+                        && self
+                            .out
+                            .last()
+                            .is_some_and(|c| c.words.len() == 1 && c.words[0].text == "for");
+                    if !self.cond && self.depth == 0 && (self.compound.is_none() || for_start) {
+                        self.ints.extend(set);
                     }
                 }
                 '(' | ')' => {
@@ -1886,6 +2054,10 @@ impl Splitter {
                     }
                     self.end_command(false);
                     self.closed = c == ')';
+                    match c {
+                        '(' => self.depth += 1,
+                        _ => self.depth = self.depth.saturating_sub(1),
+                    }
                 }
                 '<' | '>' => self.redirection(c)?,
                 '*' | '?' | '[' | '{' => {
@@ -1916,6 +2088,7 @@ impl Splitter {
             dynamic: false,
             glob: false,
             brace: false,
+            int: false,
         });
     }
 
@@ -1980,20 +2153,91 @@ impl Splitter {
     }
 }
 
-/// Whether arithmetic (`$((…))`, `((…))`) is numbers and operators alone:
-/// a name in it, bare or as `$X`, is evaluated as arithmetic in turn, and a
-/// value such as `a[$(…)]` runs a command.
-fn plain_arithmetic(inner: &str) -> bool {
-    let number = |t: &str| {
-        t.chars().all(|c| c.is_ascii_digit())
-            || t.strip_prefix("0x")
+/// The names arithmetic (`$((…))`, `((…))`) sets, when it is numbers,
+/// operators and names `known` to hold integers alone; `None` otherwise. A
+/// name holding anything else is evaluated as arithmetic in turn, and a
+/// value such as `a[$(…)]` runs a command. A name set to a number in it
+/// (`i = 0`) is known from there on.
+fn plain_arithmetic(
+    inner: &str,
+    known: &std::collections::BTreeSet<String>,
+) -> Option<Vec<String>> {
+    let c: Vec<char> = inner.chars().collect();
+    let word = |c: char| c.is_ascii_alphanumeric() || c == '_';
+    let mut set: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < c.len() {
+        let ch = c[i];
+        if ch.is_whitespace() || "+-*/%<>=!&|^~?:,;()".contains(ch) {
+            i += 1;
+            continue;
+        }
+        if ch.is_ascii_digit() {
+            let start = i;
+            while i < c.len() && word(c[i]) {
+                i += 1;
+            }
+            let t: String = c[start..i].iter().collect();
+            let hex = t
+                .strip_prefix("0x")
                 .or_else(|| t.strip_prefix("0X"))
-                .is_some_and(|h| !h.is_empty() && h.chars().all(|c| c.is_ascii_hexdigit()))
-    };
-    !inner.contains(['$', '`', '\\', '#'])
-        && inner
-            .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
-            .all(number)
+                .is_some_and(|h| !h.is_empty() && h.chars().all(|d| d.is_ascii_hexdigit()));
+            if !(hex || t.chars().all(|d| d.is_ascii_digit())) {
+                return None;
+            }
+            continue;
+        }
+        let dollar = ch == '$';
+        if dollar {
+            match c.get(i + 1) {
+                Some('?' | '#' | '$' | '!') => {
+                    i += 2;
+                    continue;
+                }
+                Some(n) if n.is_ascii_alphabetic() || *n == '_' => i += 1,
+                _ => return None,
+            }
+        }
+        if !(c[i].is_ascii_alphabetic() || c[i] == '_') {
+            return None;
+        }
+        let start = i;
+        while i < c.len() && word(c[i]) {
+            i += 1;
+        }
+        let name: String = c[start..i].iter().collect();
+        let mut j = i;
+        while j < c.len() && c[j].is_whitespace() {
+            j += 1;
+        }
+        if c.get(j) == Some(&'[') {
+            return None;
+        }
+        // `i = 0`: set to a number, what it held unread.
+        if !dollar && c.get(j) == Some(&'=') && c.get(j + 1) != Some(&'=') {
+            let mut k = j + 1;
+            while k < c.len() && c[k].is_whitespace() {
+                k += 1;
+            }
+            let from = k;
+            while k < c.len() && c[k].is_ascii_digit() {
+                k += 1;
+            }
+            let number = k > from;
+            while k < c.len() && c[k].is_whitespace() {
+                k += 1;
+            }
+            if number && matches!(c.get(k), None | Some(';' | ',' | ')')) {
+                set.push(name);
+                i = k;
+                continue;
+            }
+        }
+        if !known.contains(&name) && !set.contains(&name) {
+            return None;
+        }
+    }
+    Some(set)
 }
 
 /// Whether a `${…}`'s body (`X`, `X:-default`, `#X`) evaluates nothing as
@@ -2245,7 +2489,7 @@ fn classify_words(
         {
             Some(Asks::Unclear)
         }
-        "[[" | "[" | "test" if compares_names(args) => Some(Asks::Unclear),
+        "[[" | "[" | "test" if compares_names(args, simple) => Some(Asks::Unclear),
         "trap" => trap(args, place),
         // A file it reads its commands from is its own to run; stdin isn't.
         "source" | "."
@@ -2467,6 +2711,7 @@ fn classify_words(
                 dynamic: false,
                 glob: false,
                 brace: false,
+                int: false,
             };
             let (dest, sources): (&Word, &[&Word]) = match (into.as_ref(), ops.split_last()) {
                 (Some(dir), _) => (dir, &ops),
@@ -2890,13 +3135,17 @@ fn subscripted(word: &Word) -> bool {
 /// Whether a test (`[[ … ]]`, `[ … ]`, `test`) compares as numbers what
 /// isn't a number written out: zsh, and bash's `[[`, evaluate each side
 /// as arithmetic, a name's value too.
-fn compares_names(args: &[&Word]) -> bool {
+fn compares_names(args: &[&Word], simple: &Simple) -> bool {
     const NUMERIC: &[&str] = &["-eq", "-ne", "-lt", "-le", "-gt", "-ge"];
+    // A number written out, one of `$?`, `$#`, `$$`, `$!`, or a name the
+    // line set to a number.
     let number = |w: &Word| {
-        !w.dynamic && {
-            let t = w.text.strip_prefix(['-', '+']).unwrap_or(&w.text);
-            !t.is_empty() && t.chars().all(|c| c.is_ascii_digit())
-        }
+        w.int
+            || !w.dynamic && {
+                let t = w.text.strip_prefix(['-', '+']).unwrap_or(&w.text);
+                (!t.is_empty() && t.chars().all(|c| c.is_ascii_digit()))
+                    || simple.ints.iter().any(|n| *n == w.text)
+            }
     };
     args.iter().any(|w| subscripted(w))
         || args.iter().enumerate().any(|(k, w)| {
@@ -4120,8 +4369,11 @@ mod tests {
             "git stash drop",
             "git stash clear",
             "cd nope && rm -rf build",
-            // A bare name may be found through `CDPATH`.
-            "cd src && rm -rf build",
+            // A bare name may be found through a `CDPATH` the line sets.
+            "CDPATH=/Users/sarah/dev cd src && rm -rf build",
+            "export CDPATH=/Users/sarah/dev; cd src && rm -rf build",
+            "CDPATH=/Users/sarah/dev; cd src && rm -rf build",
+            "true && export CDPATH=/x && cd src && rm -rf build",
         ] {
             if asks(command).is_none() {
                 wrong.push(command);
@@ -4132,6 +4384,7 @@ mod tests {
             "rm -rf ../l",
             "rm ../l",
             "cd ./src && rm -rf build",
+            "cd src && rm -rf build",
             "echo x | tee -a /Users/sarah/notes.md",
             "echo x | tee out.txt",
             "cp a.txt /Users/sarah/dev/acme-web/new.txt",
@@ -4205,6 +4458,7 @@ mod tests {
             "rm -rf ./target/debug",
             "rm -f *.log",
             "cd ./target && rm -rf debug",
+            "cd target && rm -rf debug",
             "cd .. && rm -rf work/target",
             "git push origin feat/date-picker",
             "git push -u origin HEAD",
@@ -4761,7 +5015,7 @@ mod tests {
         }
         for command in [
             "command -p cd ~ && rm -rf .ssh",
-            "cd target && rm -rf debug",
+            "CDPATH=/x cd target && rm -rf debug",
             "(cd ~) && rm -rf .ssh",
             "true && echo $(cd ~) && rm -rf .ssh",
             "cd ./target && echo $(cd ~ && pwd) && rm -rf .ssh",
@@ -4864,6 +5118,23 @@ mod tests {
             "unset 'a[x]'",
             "printf -v 'a[x]' %s 1",
             "[[ -v a[x] ]]",
+            // A positional parameter is whatever was given.
+            "[ \"$1\" -gt 0 ]",
+            "echo $(( $1 + 1 ))",
+            // Set to something else, or maybe not set, since.
+            "i=0; i=x; [ $i -lt 3 ]",
+            "i=0; read i; [ $i -lt 3 ]",
+            "i=0; source ./env.sh; echo $((i))",
+            "i=0; : ${i:=x}; echo $((i))",
+            "false && i=0; [ $i -eq 0 ]",
+            "i=0 | true; [ $i -eq 0 ]",
+            "(i=0); [ $i -eq 0 ]",
+            "i=0 & [ $i -eq 0 ]",
+            "if true; then i=0; fi; [ $i -eq 0 ]",
+            "for i in a b; do echo $((i)); done",
+            "i=0; while true; do i=x; done; [ $i -eq 0 ]",
+            "i=0 ls; [ $i -eq 0 ]",
+            "i=$X; [ $i -eq 0 ]",
         ] {
             assert_eq!(asks(command), Some(U), "{command:?}");
         }
@@ -4877,6 +5148,18 @@ mod tests {
             "a[0]=1",
             "a[1]+=x",
             "declare -a arr",
+            // Always numbers, or names the line set to one for sure.
+            "[ $? -ne 0 ]",
+            "[ \"$#\" -gt 1 ]",
+            "test $$ -gt 1",
+            "[[ $! -gt 0 ]]",
+            "[ ${#X} -gt 3 ]",
+            "i=0; i=$((i+1)); [ $i -lt 3 ]",
+            "i=0\nwhile [ $i -lt 3 ]; do i=$((i + 1)); done",
+            "for ((i=0;i<3;i++)); do echo $((i * 2)); done",
+            "n=3; for ((i = 0; i < n; i++)); do ls; done",
+            "(( i = 2 )); echo $(( i + 1 ))",
+            "x=$((1 + 2)); [[ x -eq 3 ]]",
         ] {
             assert_eq!(asks(command), None, "{command:?}");
         }
