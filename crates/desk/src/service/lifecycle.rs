@@ -779,18 +779,16 @@ impl Desk {
 
     /// Which of the sessions `ids` were closed or removed here: not one
     /// open, and closed or no longer known to the store. Only those in a
-    /// group `sees` lets the asker see are said: a removed one is in none.
+    /// group `sees` lets the asker see are said: a closed one in its group
+    /// in the sidebar, a removed one in the group its boss's close kept
+    /// ([`KeptSession::group`]), else in none.
     pub async fn closed_among(
         &self,
         ids: &[Uuid],
         sees: impl Fn(Option<&str>) -> bool,
     ) -> Result<Vec<Uuid>, DeskError> {
-        let layout = self.layout();
-        let mut closed = Vec::new();
-        for &id in ids
-            .iter()
-            .filter(|&&id| sees(crate::scope::group_of(&super::session_item(id), &layout)))
-        {
+        let mut states = Vec::with_capacity(ids.len());
+        for &id in ids {
             let state = match self.view(id) {
                 Ok(v) => Some(v.state),
                 Err(_) => self
@@ -801,11 +799,31 @@ impl Desk {
                     .map_err(|e| DeskError::Internal(e.wrap_err("reading a session")))?
                     .map(|r| r.state),
             };
-            if state.is_none_or(|s| s == SessionState::Closed) {
-                closed.push(id);
-            }
+            states.push((id, state));
         }
-        Ok(closed)
+        let gone: Vec<Uuid> = states
+            .iter()
+            .filter(|(_, s)| s.is_none())
+            .map(|&(id, _)| id)
+            .collect();
+        let removed = self
+            .0
+            .store
+            .removed_groups(&gone)
+            .await
+            .map_err(|e| DeskError::Internal(e.wrap_err("reading removed sessions' groups")))?;
+        let layout = self.layout();
+        Ok(states
+            .into_iter()
+            .filter(|(id, state)| match state {
+                None => sees(removed.get(id).and_then(Option::as_deref)),
+                Some(s) => {
+                    *s == SessionState::Closed
+                        && sees(crate::scope::group_of(&super::session_item(*id), &layout))
+                }
+            })
+            .map(|(id, _)| id)
+            .collect())
     }
 
     /// Ends a session: stops it if it runs here and closes it, so it leaves
