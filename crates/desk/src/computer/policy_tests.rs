@@ -2579,6 +2579,11 @@ fn the_second_reviews_bypasses_ask_whatever_runs_on_its_own() {
         "git -c submodule.x.update='!rm -rf ~' submodule update",
         "git -c sendemail.smtpserver=/tmp/x send-email a.patch",
         "git -c web.browser=x help -w log",
+        // Round 5: `$[…]` and zsh's evaluating flags can't be read.
+        "x='a[$(rm -rf ~)]'; echo $[x]",
+        "echo $[CDPATH=1] >/dev/null; cd src && rm -rf build",
+        "zsh -c \"x='\\$(rm -rf ~)'; echo \\${(e)x}\"",
+        "echo ${(P)x}",
     ] {
         for pol in [&full(), &anywhere] {
             let c = own(in_folder(exec(command, ACME), ACME));

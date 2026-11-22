@@ -559,12 +559,16 @@ impl Why {
                 | Self::Unclear
                 | Self::ForGood
                 | Self::System
+                | Self::ChangesTheBooks(_)
         )
     }
 
     /// Whether an ask is refused, not run, where nobody can be asked.
     pub fn never_unattended(self) -> bool {
-        matches!(self, Self::Unclear | Self::ForGood | Self::System)
+        matches!(
+            self,
+            Self::Unclear | Self::ForGood | Self::System | Self::ChangesTheBooks(_)
+        )
     }
 }
 
@@ -696,5 +700,10 @@ mod tests {
             assert!(!why.held() && !why.never_unattended(), "{why:?}");
         }
         assert!(Why::SendsToPeople.held() && !Why::SendsToPeople.never_unattended());
+        // Payments and the books stay the person's, even unattended.
+        for books in [Books::FreeAgent, Books::Xero] {
+            let why = Why::ChangesTheBooks(books);
+            assert!(why.held() && why.never_unattended(), "{why:?}");
+        }
     }
 }

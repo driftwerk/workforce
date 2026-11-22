@@ -1336,6 +1336,32 @@ pub fn publishes_on(command: &str, branch: Option<&str>) -> bool {
     })
 }
 
+/// Whether a line starts a shell or an interpreter that runs what it reads
+/// from stdin (`bash -s`, `sh`, `python3 -`), or can't be read.
+fn runs_stdin(script: &str) -> bool {
+    let Ok(commands) = split(script) else {
+        return true;
+    };
+    commands.iter().any(|c| {
+        let words: Vec<&Word> = c.words.iter().filter(|w| !is_assignment(w)).collect();
+        let Some((first, args)) = words.split_first() else {
+            return false;
+        };
+        let name = first.text.rsplit('/').next().unwrap_or(&first.text);
+        if first.dynamic {
+            return true;
+        }
+        if SHELLS.contains(&name) || other_shell(name) {
+            return match shell_options(args) {
+                Ok((true, _, _)) => false,
+                Ok((false, stdin, at)) => stdin || args.get(at).is_none_or(|w| from_stdin(w)),
+                Err(()) => true,
+            };
+        }
+        interpreter(name) && operands(args).first().is_none_or(|w| from_stdin(w))
+    })
+}
+
 /// The words a line that can't be read is told to publish by.
 fn names_publishing(text: &str) -> bool {
     [
@@ -1403,10 +1429,20 @@ fn publishes_words(
             }
         }
         // What it runs there, on that machine's own branch.
+        // What it runs there: told only when it is written out, as words
+        // read on that machine's branch, which can't be known here (a bare
+        // `git push` may push its default). Commands fed in on stdin, to
+        // it or to a shell it starts there, can't be read.
         "ssh" | "mosh" => match ssh_call(name, args) {
             Some(ops) => match ops.split_first() {
-                Some((_, remote)) if remote.iter().any(|w| w.dynamic) => true,
-                Some((_, remote)) => publishes_on(&remote_script(remote), None),
+                Some((_, remote)) => {
+                    let fed = simple.fed || simple.piped_in || simple.reads_file;
+                    let script = remote_script(remote);
+                    remote.iter().any(|w| w.dynamic)
+                        || (remote.is_empty() && fed)
+                        || runs_stdin(&script)
+                        || publishes_on(&script, Some(DEFAULT_BRANCHES[0]))
+                }
                 None => false,
             },
             None => told(),
@@ -1499,6 +1535,8 @@ struct Simple {
     piped_in: bool,
     /// Its stdin is a heredoc or a here-string.
     fed: bool,
+    /// Its stdin is a file (`< f`).
+    reads_file: bool,
     /// It runs only if the command before it succeeded (`&&`).
     after_and: bool,
     /// Files it writes by redirection (`>`, `>|`, `&>`, `<>`), and whether
@@ -1987,6 +2025,16 @@ impl Splitter {
                         break;
                     }
                 }
+                // A `$` before nothing it expands stays a `$`; one before
+                // anything else (`$[x]`, arithmetic, or zsh's `$~x`, `$=x`)
+                // can't be read. `$'…'` and `$"…"` are quotes, read next.
+                if self.at == start
+                    && !self
+                        .peek(0)
+                        .is_none_or(|c| c.is_whitespace() || "'\"/.:,;|&)<>}%".contains(c))
+                {
+                    return Err(());
+                }
                 // `$?`, `$#`, `$$`, `$!` are numbers; so is a name the line
                 // set to one. A positional parameter is whatever was given.
                 let name: String = self.chars[start..self.at].iter().collect();
@@ -2274,6 +2322,9 @@ impl Splitter {
         if self.peek(0) == Some('&') {
             self.at += 1;
         }
+        if c == '<' && !both && !dup {
+            self.current.reads_file = true;
+        }
         self.redirect = true;
         self.redirect_to = ((c == '>' || both) && !dup).then_some(append);
         Ok(())
@@ -2382,8 +2433,11 @@ fn plain_expansion(inner: &str) -> bool {
     let name_end = body
         .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
         .unwrap_or(body.len());
+    // A name, or a special parameter; anything else first (zsh's flags,
+    // `${(e)x}`, `${(P)x}`, evaluate) can't be read.
     let rest = match name_end {
-        0 => body.get(1..).unwrap_or(""),
+        0 if body.starts_with(['?', '$', '!', '#', '@', '*', '-']) => &body[1..],
+        0 => return false,
         n => &body[n..],
     };
     let plain = match (rest.strip_prefix('['), rest.strip_prefix(':')) {
@@ -5406,6 +5460,14 @@ mod tests {
             "echo ${a[0]@P}",
             "echo ${x@Z}",
             "echo ${y:-${x@P}}",
+            // Only the `$` forms read: `$[…]` is arithmetic, zsh's flags
+            // evaluate.
+            "x='a[$(rm -rf ~)]'; echo $[x]",
+            "echo $[CDPATH=1] >/dev/null; cd src && rm -rf build",
+            "zsh -c \"x='\\$(rm -rf ~)'; echo \\${(e)x}\"",
+            "echo ${(P)x}",
+            "echo ${(e)x}",
+            "echo $~x $=x",
         ] {
             assert_eq!(asks(command), Some(U), "{command:?}");
         }
@@ -5444,6 +5506,7 @@ mod tests {
             "x=a; cd src && rm -rf build",
             "echo x; [ -d src ] && cd src && rm -rf build",
             "echo ${x@Q} ${x@U} ${a[@]@A} ${x@k}",
+            "echo $ x; grep \"a$\" f; echo \"cost: $\"; echo $'a\\nb' ${#} ${?}",
         ] {
             assert_eq!(asks(command), None, "{command:?}");
         }
@@ -5465,6 +5528,13 @@ mod tests {
             "ssh devbox 'cd repo && git push origin main'",
             "ssh prod 'npm publish'",
             "ssh prod 'kubectl apply -f x'",
+            // Fed in on stdin, or a push there on a branch not known here.
+            "ssh prod <<'EOF'\ngit push origin main\nEOF",
+            "echo 'npm publish' | ssh prod",
+            "ssh prod bash -s < deploy.sh",
+            "ssh prod 'bash -s' <<< 'kubectl apply -f x'",
+            "ssh prod < cmds.txt",
+            "ssh prod 'cd repo && git push'",
         ] {
             assert!(publishes_on(command, Some("main")), "{command:?}");
         }
@@ -5480,6 +5550,8 @@ mod tests {
             "eval 'ls'",
             "bash -c -- 'npm test'",
             "ssh devbox 'cd repo && cargo test'",
+            "ssh prod ls < /dev/null",
+            "ssh devbox 'git push origin feat/x'",
         ] {
             assert!(!publishes_on(command, Some("main")), "{command:?}");
         }
