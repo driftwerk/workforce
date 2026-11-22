@@ -14,7 +14,7 @@ use uuid::Uuid;
 use workforce_agent::security::external_content::wrap_external_content;
 use workforce_agent::tools::{Tool, ToolResult};
 use workforce_common::settings::RemoteMcpConfig;
-use workforce_desk::board::{Filter, Paused, System, TicketState, Via};
+use workforce_desk::board::{Filter, Paused, System, TicketState, Via, THIS_COMPUTER};
 use workforce_desk::{Desk, LinkBoard, NewBoard};
 use workforce_identity::store::IdentityStore;
 use workforce_identity::types::{Identity, IdentityRole};
@@ -1737,6 +1737,125 @@ async fn no_agent_with_jira_is_said_plainly() {
             "No agent on Atlas you can reach has Jira switched on."
         );
         assert_eq!(body["paused"]["kind"], "missing");
+    })
+    .await;
+}
+
+// ── This computer's own agents ───────────────────────────────────────────
+
+fn this_computer(system: &str) -> Value {
+    json!({ "system": system, "via": { "kind": "thisHub" } })
+}
+
+/// A person's own GitHub key, kept for this computer's agent, offers
+/// GitHub through it: the hub's own `github.clone` and `github.repos` don't
+/// pass for the adapter, so the probe loads it with the person's key.
+#[tokio::test]
+async fn a_person_s_own_github_key_offers_github_through_this_computer() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let desk = crate::desk_crew::tests::desk(pool, dir.path()).await;
+        let local = local_hub(desk, dir.path());
+        let service = crate::serve::testing::plain_service(&dir.path().join("agent")).await;
+        assert!(service.tools.has("github.clone") && service.tools.has("github.repos"));
+        let person = local.person.id.to_string();
+        service
+            .vault
+            .clone()
+            .expect("agent vault")
+            .set(
+                &format!("users/{person}/skills/github/workspaces/acme/token"),
+                "ghp_not-a-real-token",
+            )
+            .unwrap();
+        local.fx.state.registry.insert("default", service);
+        let reached = local
+            .sync
+            .offered(System::Github, &Via::ThisHub, &person, None, None)
+            .await
+            .map_err(|p| paused_words(THIS_COMPUTER, System::Github, &p))
+            .expect("GitHub is offered through this computer");
+        assert_eq!(reached.agent.as_deref(), Some("default"));
+        let tools = reached.remote.tools().await.unwrap();
+        assert!(tools.iter().any(|t| t == "github.workspaces"), "{tools:?}");
+    })
+    .await;
+}
+
+/// Through this computer every agent the person may reach is asked, as on
+/// a linked hub: the board goes through the one with Jira and keeps it, and
+/// with none it is said in plain words.
+#[tokio::test]
+async fn this_computer_finds_the_agent_that_has_jira() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let desk = crate::desk_crew::tests::desk(pool, dir.path()).await;
+        let local = local_hub(desk.clone(), dir.path());
+        let jira: Shared = Arc::default();
+        seed(&jira, "ACME-1", "Fix the login", &[]);
+        for (n, id) in ["default", "lattice"].into_iter().enumerate() {
+            let service =
+                crate::serve::testing::plain_service(&dir.path().join(format!("agent-{n}"))).await;
+            service.set_identity_store(Arc::clone(&local.fx.identities) as _);
+            if id == "lattice" {
+                register_jira(&service.tools, &jira, &[]);
+            }
+            local.fx.state.registry.insert(id, service);
+        }
+        let (status, body) = local
+            .send("POST", "/api/desk/boards/link/check", this_computer("jira"))
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["agent"], json!({ "id": "lattice", "name": "Lattice" }));
+        let b = board(&desk, "Acme").await;
+        let mut link = link_body(Filter::All {
+            include_done: false,
+        });
+        link["via"] = json!({ "kind": "thisHub" });
+        let (status, body) = local
+            .send("PUT", &format!("/api/desk/boards/{}/link", b.id), link)
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["sync"]["agent"], "lattice");
+        local.sync.pass_board(b.id, true).await.unwrap();
+        assert_eq!(
+            desk.tickets(b.id, &Default::default()).await.unwrap().len(),
+            1
+        );
+
+        // Its agent shut to the person: the board pauses, as missing the
+        // tools, and goes on through it once it lets them in again.
+        close_agent(&local.fx.state, "lattice", true);
+        local.sync.pass_board(b.id, true).await.unwrap();
+        local.sync.pass_board(b.id, true).await.unwrap();
+        let paused = desk.board_sync(b.id).await.unwrap().unwrap().1.paused;
+        assert_eq!(
+            paused.as_ref().map(|p| p.say(THIS_COMPUTER)).as_deref(),
+            Some("Paused: no agent on this computer you can reach has Jira switched on any more.")
+        );
+        close_agent(&local.fx.state, "lattice", false);
+        local.sync.pass_board(b.id, true).await.unwrap();
+        let s = desk.board_sync(b.id).await.unwrap().unwrap().1;
+        assert_eq!((s.agent.as_deref(), s.paused), (Some("lattice"), None));
+
+        close_agent(&local.fx.state, "lattice", true);
+        let (status, body) = local
+            .send("POST", "/api/desk/boards/link/check", this_computer("jira"))
+            .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+        assert_eq!(
+            body["error"],
+            "No agent on this computer you can reach has Jira switched on."
+        );
+        close_agent(&local.fx.state, "default", true);
+        let (status, body) = local
+            .send("POST", "/api/desk/boards/link/check", this_computer("jira"))
+            .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+        assert_eq!(
+            body["error"],
+            "This computer has no agent that lets you in; ask whoever runs it to let you use one."
+        );
     })
     .await;
 }

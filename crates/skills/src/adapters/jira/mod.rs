@@ -163,7 +163,12 @@ impl JiraSkill {
             Arc::new(tools::JiraGetAttachmentTool::with_instances(i(), p())),
             Arc::new(tools::JiraAttachmentReadTool::with_instances(i(), p())),
             Arc::new(tools::JiraListProjectsTool::with_instances(i(), p())),
-            Arc::new(tools::JiraWorkspacesTool::new(i())),
+            Arc::new(crate::adapters::utils::WorkspacesTool::new(
+                "jira.workspaces",
+                "The Jira sites (workspaces) you can use, by name, as {workspaces, default}: default is the one a call without `workspace` goes to, or null when you must pass one. Takes no arguments.",
+                i(),
+                None,
+            )),
             Arc::new(tools::JiraGetProjectTool::with_instances(i(), p())),
             Arc::new(tools::JiraSearchUsersTool::with_instances(i(), p())),
             Arc::new(tools::JiraMyselfTool::with_instances(i(), p())),

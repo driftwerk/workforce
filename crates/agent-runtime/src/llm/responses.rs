@@ -16,6 +16,7 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use futures::StreamExt;
+use regex::Regex;
 use reqwest::header::{HeaderMap, ACCEPT, RETRY_AFTER, USER_AGENT};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -23,6 +24,7 @@ use tokio::sync::mpsc;
 use url::Url;
 
 use super::anthropic::CACHE_BREAK_MARKER;
+use super::failover::INPUT_REFUSED_MARKER;
 use super::image_cap::{cap_images, RESPONSES_MAX_IMAGES};
 use super::oai_common::budget_to_effort;
 use super::provider::{effective_thinking_budget, reasoning_suppressed};
@@ -370,6 +372,8 @@ pub enum ResponsesError {
     InvalidReasoning(String),
     #[error("ChatGPT API error (400): response stopped by the content filter ({0})")]
     ContentFiltered(String),
+    #[error("ChatGPT API error: {marker} ({code}): {message}", marker = INPUT_REFUSED_MARKER)]
+    InvalidInput { code: String, message: String },
     #[error("ChatGPT API error (529): {0}")]
     Overloaded(String),
     #[error("ChatGPT API error ({status}): {body}")]
@@ -907,8 +911,7 @@ impl ResponseState {
                     }
                 }
             }
-            "response.failed" => return Err(failed_error(&event["response"]["error"])),
-            "error" => return Err(failed_error(event)),
+            "response.failed" | "error" => return Err(event_error(event)),
             "codex.rate_limits" => return Ok(vec![Emit::Limits(LimitSnapshot::from_event(event))]),
             "response.created"
             | "response.in_progress"
@@ -1060,10 +1063,71 @@ fn usage(usage: &Value) -> TokenUsage {
 
 // ─── Errors ─────────────────────────────────────────────────────────────────
 
-/// The error a `response.failed` / `error` event's error object names.
+/// Longest a provider's message is kept in an error: it can quote the input.
+const MAX_ERROR_MESSAGE_CHARS: usize = 500;
+const MAX_ERROR_PARAM_CHARS: usize = 100;
+
+/// The error a `response.failed` / `error` event names. The backend puts the
+/// error object under `response.error`, under `response.status_details`, under
+/// `error`, or flat on the event, so the first of those that says why wins.
+fn event_error(event: &Value) -> ResponsesError {
+    let says_why =
+        |error: &&Value| text_of(error, "message").is_some() || error_code(error).is_some();
+    let error = [
+        &event["response"]["error"],
+        &event["response"]["status_details"]["error"],
+        &event["error"],
+        event,
+    ]
+    .into_iter()
+    .find(says_why)
+    .unwrap_or(&event["response"]["error"]);
+    failed_error(error)
+}
+
+fn text_of<'a>(error: &'a Value, key: &str) -> Option<&'a str> {
+    error[key].as_str().filter(|s| !s.is_empty())
+}
+
+/// The error's own code, never the event's `type` (`error`, `response.failed`).
+fn error_code(error: &Value) -> Option<&str> {
+    text_of(error, "code")
+        .or_else(|| text_of(error, "type").filter(|t| *t != "error" && !t.starts_with("response.")))
+}
+
+/// `text` as a log-safe line: inlined `data:` URLs (an image the provider
+/// quotes back) cut out, the query strings of web URLs (signed links) dropped,
+/// and bounded to `max` characters.
+fn shown(text: &str, max: usize) -> String {
+    static DATA_URL: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r#"data:[^\s"'<>)]*"#).expect("a valid pattern"));
+    static QUERY: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r#"(https?://[^\s"'<>)?]*)\?[^\s"'<>)]*"#).expect("a valid pattern")
+    });
+    let text = DATA_URL.replace_all(text, "data:…");
+    QUERY.replace_all(&text, "$1").chars().take(max).collect()
+}
+
+/// Whether `code` names an image the provider refused, which no retry fixes.
+/// Server and generation errors that mention images are not that.
+fn is_invalid_input(code: &str) -> bool {
+    ["invalid_image", "unsupported_image", "image_"]
+        .iter()
+        .any(|prefix| code.starts_with(prefix))
+        && !code.contains("generation")
+}
+
+/// The error an error object names.
 fn failed_error(error: &Value) -> ResponsesError {
-    let message = error["message"].as_str().unwrap_or_default().to_string();
-    match error["code"].as_str().or_else(|| error["type"].as_str()) {
+    let reason = shown(
+        text_of(error, "message").unwrap_or("the provider gave no reason"),
+        MAX_ERROR_MESSAGE_CHARS,
+    );
+    let message = match text_of(error, "param") {
+        Some(param) => format!("{reason} (param: {})", shown(param, MAX_ERROR_PARAM_CHARS)),
+        None => reason,
+    };
+    match error_code(error) {
         Some("context_length_exceeded") => ResponsesError::ContextOverflow(message),
         Some("server_is_overloaded" | "slow_down") => ResponsesError::Overloaded(message),
         Some("invalid_encrypted_content") => ResponsesError::InvalidReasoning(message),
@@ -1071,6 +1135,10 @@ fn failed_error(error: &Value) -> ResponsesError {
         Some("usage_limit_reached") => usage_limit(error),
         Some("rate_limit_exceeded") => ResponsesError::Throttled {
             retry_after: retry_after_in(&message),
+        },
+        Some(code) if is_invalid_input(code) => ResponsesError::InvalidInput {
+            code: code.to_string(),
+            message,
         },
         code => ResponsesError::Stream(format!(
             "response failed ({}): {message}",
@@ -2146,6 +2214,107 @@ mod tests {
             "code": "server_is_overloaded", "message": "busy"}}});
         let err = emits(&format!("data: {overloaded}\n\n")).expect_err("failed response");
         assert_eq!(classify_error(&err.to_string()), ErrorKind::Overloaded);
+    }
+
+    fn failure(event: Value) -> String {
+        emits(&format!("data: {event}\n\n"))
+            .expect_err("failed response")
+            .to_string()
+    }
+
+    #[test]
+    fn a_failed_response_says_why_wherever_the_backend_put_it() {
+        assert_eq!(
+            failure(json!({"type": "response.failed", "response": {"error": {
+                "code": "invalid_image_format",
+                "message": "The image data you provided could not be decoded.",
+                "param": "input[3].content[1]"}}})),
+            "ChatGPT API error: request input refused (invalid_image_format): The image data you \
+             provided could not be decoded. (param: input[3].content[1])"
+        );
+        let status_details = failure(json!({"type": "response.failed", "response": {
+            "error": {"type": "error"},
+            "status_details": {"error": {"code": "invalid_prompt", "message": "Rejected."}}}}));
+        assert_eq!(
+            status_details,
+            "ChatGPT API error: response failed (invalid_prompt): Rejected."
+        );
+        let wrapped = failure(json!({"type": "error",
+            "error": {"type": "invalid_request_error", "message": "Bad input."}}));
+        assert_eq!(
+            wrapped,
+            "ChatGPT API error: response failed (invalid_request_error): Bad input."
+        );
+        let flat = failure(json!({"type": "error", "code": "unsupported_image_type",
+            "message": "HEIC is not supported."}));
+        assert_eq!(
+            flat,
+            "ChatGPT API error: request input refused (unsupported_image_type): HEIC is not \
+             supported."
+        );
+        let unexplained = failure(json!({"type": "response.failed", "response": {
+            "instructions": "secret system prompt", "error": {"type": "error"}}}));
+        assert_eq!(
+            unexplained,
+            "ChatGPT API error: response failed (unknown): the provider gave no reason"
+        );
+    }
+
+    #[test]
+    fn only_a_refused_image_is_a_refused_input() {
+        for code in ["invalid_image", "invalid_image_url", "image_parse_error"] {
+            assert!(is_invalid_input(code), "{code}");
+        }
+        for code in [
+            "server_error",
+            "image_generation_user_error",
+            "invalid_prompt",
+            "rate_limit_exceeded",
+        ] {
+            assert!(!is_invalid_input(code), "{code}");
+        }
+        let generation = failure(json!({"type": "response.failed", "response": {"error": {
+            "code": "server_error", "message": "An image could not be generated."}}}));
+        assert_eq!(classify_error(&generation), ErrorKind::Unknown);
+    }
+
+    #[test]
+    fn a_refused_input_is_a_client_error_and_never_quotes_an_image() {
+        let blob = "A".repeat(4000);
+        let text = failure(json!({"type": "response.failed", "response": {"error": {
+            "code": "invalid_image_url",
+            "message": format!("Invalid image data:image/heic;base64,{blob} (exceeded)"),
+            "param": "input[0].content[2]"}}}));
+        assert_eq!(
+            text,
+            "ChatGPT API error: request input refused (invalid_image_url): Invalid image data:… (exceeded) \
+             (param: input[0].content[2])"
+        );
+        assert_eq!(classify_error(&text), ErrorKind::ClientError);
+        let long = failure(json!({"type": "error", "code": "invalid_image",
+            "message": "x".repeat(2000), "param": "p".repeat(300)}));
+        assert!(
+            long.len() < 700 && long.ends_with(&format!("(param: {})", "p".repeat(100))),
+            "{long}"
+        );
+        let signed = failure(json!({"type": "error", "code": "invalid_image_url",
+            "message": "Could not fetch https://cdn.example.com/a.heic?X-Amz-Signature=abc&Expires=9 or http://h/p?q=1.",
+            "param": "https://h/x?token=t"}));
+        assert_eq!(
+            signed,
+            "ChatGPT API error: request input refused (invalid_image_url): Could not fetch \
+             https://cdn.example.com/a.heic or http://h/p (param: https://h/x)"
+        );
+    }
+
+    #[test]
+    fn a_refused_input_says_what_the_failover_classifier_keys_on() {
+        let refused = ResponsesError::InvalidInput {
+            code: "invalid_image".into(),
+            message: "the context exceeded".into(),
+        };
+        assert!(refused.to_string().contains(INPUT_REFUSED_MARKER));
+        assert_eq!(classify_error(&refused.to_string()), ErrorKind::ClientError);
     }
 
     // ── Client ──────────────────────────────────────────────────────────

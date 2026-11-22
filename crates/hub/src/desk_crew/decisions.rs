@@ -104,7 +104,7 @@ pub(crate) fn undo_of(action: &Action, done: &Done, before: &Before) -> (Undo, O
         Action::TakeOn { session } => {
             (Undo::Reverse, Some(UndoPlan::Release { session: *session }))
         }
-        Action::Release { session } => {
+        Action::Release { session, .. } => {
             (Undo::Reverse, Some(UndoPlan::TakeOn { session: *session }))
         }
         Action::MoveTicket {
@@ -163,7 +163,7 @@ pub(crate) fn undo_of(action: &Action, done: &Done, before: &Before) -> (Undo, O
 /// The session a decision about `action` is about.
 fn session_of(action: &Action, done: &Done) -> Option<Uuid> {
     match action {
-        Action::TakeOn { session } | Action::Release { session } => Some(*session),
+        Action::TakeOn { session } | Action::Release { session, .. } => Some(*session),
         Action::StartSession { .. } => done.started,
         a => CrewHub::session_of(a),
     }
@@ -804,7 +804,10 @@ impl CrewHub {
                 "crew.set_mode",
                 &json!({ "session_id": session.to_string(), "mode": mode }),
             )?,
-            UndoPlan::Release { session } => Action::Release { session: *session },
+            UndoPlan::Release { session } => Action::Release {
+                session: *session,
+                done: false,
+            },
             UndoPlan::TakeOn { session } => Action::TakeOn { session: *session },
             UndoPlan::MoveTicket { ticket, id, state } => {
                 let mut a = Action::parse(
@@ -992,7 +995,15 @@ mod tests {
             Some(UndoPlan::Release { session: s })
         );
         assert_eq!(
-            undo_of(&Action::Release { session: s }, &Done::default(), &none).1,
+            undo_of(
+                &Action::Release {
+                    session: s,
+                    done: false
+                },
+                &Done::default(),
+                &none
+            )
+            .1,
             Some(UndoPlan::TakeOn { session: s })
         );
         let mv = Action::MoveTicket {

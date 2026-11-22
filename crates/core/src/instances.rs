@@ -24,7 +24,7 @@ pub struct UnknownInstance {
 }
 
 /// The kinds of instance whose errors a board's sync reads back.
-const KINDS: [&str; 2] = ["Linear workspace", "Jira workspace"];
+const KINDS: [&str; 3] = ["Linear workspace", "Jira workspace", "GitHub workspace"];
 
 /// Reads [`unknown_instance_text`]'s words back, wherever they sit in
 /// `text` (a hub may put its own words around them). `None` for anything
@@ -95,6 +95,14 @@ mod tests {
         assert_eq!(u.what, "Jira workspace");
         assert_eq!(u.asked, "default");
         assert!(u.available.is_empty());
+
+        let github = unknown_instance_text("GitHub workspace", "acme", &["mantis"]);
+        let u = parse_unknown_instance(&github).unwrap();
+        assert_eq!(
+            (u.what.as_str(), u.asked.as_str()),
+            ("GitHub workspace", "acme")
+        );
+        assert_eq!(u.available, ["mantis"]);
     }
 
     #[test]

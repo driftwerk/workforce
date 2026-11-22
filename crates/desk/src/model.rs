@@ -282,6 +282,9 @@ pub struct SessionView {
     /// How its process last ended on its own, until it starts again.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub exited: Option<Exited>,
+    /// Its folder's dependencies, when Desk installs them as it starts.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub deps: Option<crate::deps::Deps>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -445,6 +448,7 @@ impl SessionView {
             grant: None,
             failure: None,
             exited: None,
+            deps: None,
             created_at: r.created_at,
             updated_at: r.updated_at,
         }

@@ -12,7 +12,7 @@ use std::collections::BTreeMap;
 use serde_json::{json, Value};
 
 use crate::board::{Assignee, Facts, Filter, IssueRef, Sprint, TicketState};
-use crate::board_sync::{remote_time, unfence, Issue, RemoteState};
+use crate::board_sync::{remote_time, unfence, Issue, RemoteError, RemoteState};
 
 /// The tools a GitHub board's sync needs ([`crate::board_sync::tools_of`]).
 pub const TOOLS: &[&str] = workforce_core::desk::BOARD_SYNC_GITHUB_TOOLS;
@@ -88,6 +88,98 @@ pub fn check_target(target: &str) -> Result<(), String> {
         None => Err(format!(
             "{target:?} isn't a GitHub project (owner/projects/7) or repository (owner/repo)."
         )),
+    }
+}
+
+/// The quiet read that says whether one of a person's GitHub connections
+/// reaches what a link names: its project, its repository, else the
+/// projects of the owner asked for. `None`: nothing named yet.
+pub fn reach_probe(target: Option<&str>, owner: Option<&str>) -> Option<(&'static str, Value)> {
+    match target.and_then(target_of) {
+        Some(Target::Project { owner, number }) => Some((
+            "github.project_get",
+            json!({ "owner": owner, "number": number }),
+        )),
+        Some(Target::Repo { owner, repo }) => Some((
+            "github.repo_labels",
+            json!({ "owner": owner, "repo": repo }),
+        )),
+        None => owner
+            .filter(|o| login_ok(o))
+            .map(|o| ("github.projects_list", json!({ "owner": o }))),
+    }
+}
+
+/// Whether `answer` to [`reach_probe`]'s `tool` says the connection reaches
+/// it: any answer for a project or repository, at least one project for
+/// an owner (an owner's empty list reads alike to every key).
+pub fn reached(tool: &str, answer: &Value) -> bool {
+    tool != "github.projects_list" || answer["projects"].as_array().is_some_and(|p| !p.is_empty())
+}
+
+/// Whether a connection reaches what a link names, as [`reach_probe`]'s
+/// read answered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Reach {
+    Yes,
+    /// GitHub said it can't: not found, or no access.
+    No,
+    /// It couldn't be asked (the hub away, a rate limit, an approval).
+    Unknown,
+}
+
+/// What `tool`'s `answer` says of a connection's reach: a failure is a
+/// No only where GitHub said the target isn't there for its key, or the key
+/// isn't good; any other (a rate limit, GitHub down) can't say.
+pub fn reach_of(tool: &str, answer: &Result<Value, RemoteError>) -> Reach {
+    match answer {
+        Ok(answer) if reached(tool, answer) => Reach::Yes,
+        Ok(_) | Err(RemoteError::Workspace { .. }) => Reach::No,
+        Err(RemoteError::Failed(why)) if turned_away(why) => Reach::No,
+        Err(_) => Reach::Unknown,
+    }
+}
+
+/// Whether the GitHub adapter's error `why` says no, in its own words: a
+/// 404, GraphQL's `NOT_FOUND` or `FORBIDDEN`, a 403 that isn't a rate limit,
+/// a key GitHub refused, or `project_get`'s missing project. Anything else
+/// (a tool the hub lacks, a rate limit) can't say.
+fn turned_away(why: &str) -> bool {
+    let limited = [
+        "rate limited",
+        "rate limit exceeded",
+        "secondary rate limit",
+    ];
+    let no = [
+        "Not found: ",
+        "GitHub GraphQL NOT_FOUND",
+        "GitHub GraphQL FORBIDDEN",
+        "Forbidden (rate limit or permissions): ",
+        "Authentication failed: ",
+        "No project ",
+    ];
+    let lower = why.to_ascii_lowercase();
+    !limited.iter().any(|l| lower.contains(l)) && no.iter().any(|n| why.contains(n))
+}
+
+/// Which of a person's several GitHub connections a link goes through,
+/// where neither the one picked nor the default does.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Connection {
+    Use(String),
+    /// More than one of the others reaches it: the person picks among
+    /// these.
+    Ask(Vec<String>),
+}
+
+/// Of the other connections that reach what a link names, the only one;
+/// several, the person picks; none, nothing is chosen, so the default's
+/// own answer says why.
+pub fn among(reaching: Vec<String>) -> Option<Connection> {
+    match reaching.len() {
+        0 => None,
+        1 => reaching.into_iter().next().map(Connection::Use),
+        _ => Some(Connection::Ask(reaching)),
     }
 }
 
