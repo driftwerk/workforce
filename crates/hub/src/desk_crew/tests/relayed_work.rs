@@ -382,6 +382,42 @@ async fn a_question_to_the_homes_boss_is_the_persons_once_desk_lets_the_boss_go(
     .await;
 }
 
+/// On devbox: what a take handed in an answer that never reached the home
+/// is handed again by the home's next take, made from where it last heard.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_event_whose_answer_was_lost_is_handed_again() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (crew, d, [vel9, _, _, _]) = devbox(dir.path(), pool).await;
+        let app = super::super::relay::routes(Arc::clone(&crew.state), Arc::clone(&crew));
+        let token = crew.state.auth_token.clone();
+        let out = post(&app, &token, take_on(vel9.id, true)).await;
+        assert_eq!(out["status"], "ok", "{out}");
+        take(&app, &token, json!({})).await;
+        let handed = |text: &str| {
+            workforce_desk::crew::Event::new(
+                workforce_desk::crew::Kind::HandedBack,
+                workforce_desk::crew::Party::you(),
+                Some(workforce_desk::crew::Party::session(&vel9)),
+                text.to_string(),
+            )
+        };
+        let first = handed("back once");
+        d.store().add_event(&first).await.unwrap();
+        let heard = take(&app, &token, json!({})).await;
+        assert!(heard.events.iter().any(|e| e.id == first.id), "{heard:?}");
+        let cursor = heard.after.clone().expect("read on past it");
+        let next = handed("back again");
+        d.store().add_event(&next).await.unwrap();
+        // Handed, but its answer never reaches the home.
+        let lost = take(&app, &token, json!({"after": cursor})).await;
+        assert!(lost.events.iter().any(|e| e.id == next.id), "{lost:?}");
+        let again = take(&app, &token, json!({"after": cursor})).await;
+        assert!(again.events.iter().any(|e| e.id == next.id), "{again:?}");
+    })
+    .await;
+}
+
 /// On devbox: a question VEL-9 asked the home's boss is the person's once
 /// that boss lets VEL-9 go itself.
 #[tokio::test(flavor = "multi_thread")]

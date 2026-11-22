@@ -66,6 +66,9 @@ const NOTED_FOR: Duration = Duration::from_secs(60);
 /// that fails in a row waiting twice as long as the last, from
 /// [`IDLE_EVERY`].
 const MOST_IDLE: Duration = Duration::from_secs(300);
+/// The takes in a row that may fail before a machine is no longer taken
+/// from for what it left the person, until Act fully is in force again.
+const GIVEN_UP_AFTER: u32 = 6;
 /// The most decisions one take hands out: no more than the Mac has room
 /// to decide at once, and fewer when it says so (`most`).
 const MOST_TAKEN: usize = AT_ONCE;
@@ -838,10 +841,10 @@ impl Pump {
     /// was left to the person there, and while what it left waits.
     fn due(&self, in_force: bool, now: Instant) -> bool {
         let lapsed = !in_force && self.said;
+        let left = self.notes_waiting || !self.notes_taken.is_empty();
         let wanted = in_force
             || self.noting.is_some_and(|until| now < until)
-            || self.notes_waiting
-            || !self.notes_taken.is_empty();
+            || (left && self.failed < GIVEN_UP_AFTER);
         !self.busy && (lapsed || (wanted && now >= self.next))
     }
 }
@@ -1252,6 +1255,9 @@ mod tests {
         p.notes_taken.clear();
         p.notes_waiting = true;
         assert!(p.due(false, now + NOTED_FOR), "while what it left waits");
+        p.failed = GIVEN_UP_AFTER;
+        assert!(!p.due(false, now + NOTED_FOR), "not reached: given up");
+        assert!(p.due(true, now + NOTED_FOR));
     }
 
     #[test]

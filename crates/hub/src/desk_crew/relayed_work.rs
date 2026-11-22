@@ -187,7 +187,7 @@ pub(crate) struct Homes {
     cursor: HashMap<Key, ReadFrom>,
     /// The events each was handed within [`SAVED_WITHIN`] of its cursor,
     /// with their times: read again, as one saved late is looked for, but
-    /// never handed again.
+    /// not handed again while its home reads on from that cursor.
     handed: HashMap<Key, HashMap<String, DateTime<Utc>>>,
     /// Until then, a boss no home took for yet may still be read: one
     /// restarted here is taken for again within [`WORK_FRESH`].
@@ -385,6 +385,12 @@ impl CrewHub {
                 .ok()
                 .filter(|r| r.at <= now)
                 .map(ReadFrom::After);
+            // The home reads on from somewhere else than this last handed
+            // it: that answer never reached it, so what it handed is handed
+            // again (the Mac knows what it heard).
+            if !peek && said.as_ref().is_some_and(|f| h.cursor.get(&key) != Some(f)) {
+                h.handed.remove(&key);
+            }
             let from = match peek {
                 true => ReadFrom::Since(now),
                 false => said
@@ -1315,6 +1321,26 @@ mod tests {
             vec![report.said.id],
             "acknowledged on the next take"
         );
+    }
+
+    #[test]
+    fn an_event_a_machine_hands_again_is_acted_on_once() {
+        let s = Uuid::new_v4();
+        let taken = |events: Vec<Frame>| Taken {
+            sessions: vec![run(s)],
+            events,
+            ..Taken::default()
+        };
+        let mut p = Pump::default();
+        p.heard(&taken(vec![frame("e1", s)]));
+        assert_eq!(p.due()[0].1.ended, vec!["e1 happened"]);
+        p.turned(s, &[], &Turned::ran(true), MINUTE);
+        // Its answer was lost: the next take hands both.
+        p.heard(&taken(vec![frame("e1", s), frame("e2", s)]));
+        assert_eq!(p.due()[0].1.ended, vec!["e2 happened"]);
+        p.turned(s, &[], &Turned::ran(true), MINUTE);
+        p.heard(&taken(vec![frame("e1", s), frame("e2", s)]));
+        assert!(p.due().is_empty());
     }
 
     #[test]
