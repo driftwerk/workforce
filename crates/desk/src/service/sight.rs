@@ -197,6 +197,8 @@ type Output = (String, Tracked);
 #[derive(Debug, Clone, PartialEq)]
 struct Tracked {
     path: PathBuf,
+    /// When it was made: when the command writing it started.
+    made: DateTime<Utc>,
     /// Its length then.
     len: u64,
     /// How far its whole lines were read.
@@ -208,9 +210,10 @@ struct Tracked {
 }
 
 impl Tracked {
-    fn from(path: PathBuf, read_to: u64) -> Self {
+    fn from(path: PathBuf, made: SystemTime, read_to: u64) -> Self {
         Self {
             path,
+            made: to_utc(made),
             len: read_to,
             read_to,
             lines: Vec::new(),
@@ -445,11 +448,12 @@ fn open_call_in(path: &Path, engine: Engine) -> Option<OpenCall> {
 /// the folder was first listed, from its end when it was there before.
 fn first_read(folder: &TaskFolder, path: &Path) -> Option<Tracked> {
     let meta = plain(path)?;
-    let from = match made(&meta)? >= folder.first {
+    let made = made(&meta)?;
+    let from = match made >= folder.first {
         true => 0,
         false => meta.len(),
     };
-    Some(Tracked::from(path.to_path_buf(), from))
+    Some(Tracked::from(path.to_path_buf(), made, from))
 }
 
 /// The output file `call` writes to in `folder`: the first made since it
@@ -831,13 +835,18 @@ impl Desk {
             Some(_) => now,
             None => last_write.unwrap_or(now),
         };
+        let started = |id: &str| match files.open_call.as_ref().filter(|c| c.id == id) {
+            Some(c) => Some(c.since),
+            None => files
+                .shells
+                .iter()
+                .find(|(shell, _)| shell == id)
+                .map(|(_, t)| t.made),
+        };
         let busy = |id: &str| {
-            let call = files.open_call.as_ref().filter(|c| c.id == id);
-            call.zip(prev).is_some_and(|(c, p)| {
-                sight_procs::call_shell(&refs, c, now).is_some_and(|shell| {
-                    sight_procs::active(&p.runs, &sight_procs::subtree(&refs, shell))
-                })
-            })
+            started(id)
+                .zip(prev)
+                .is_some_and(|(since, p)| sight_procs::shell_busy(&p.runs, &refs, since, now))
         };
         let said: Vec<Said> = files
             .new
@@ -984,6 +993,11 @@ pub(super) fn redactor_for_tests() -> std::sync::Arc<dyn Redactor> {
 mod tests {
     use super::*;
 
+    /// `path` as a file not yet read.
+    fn unread(path: &Path) -> Tracked {
+        Tracked::from(path.to_path_buf(), SystemTime::now(), 0)
+    }
+
     #[test]
     fn output_lines_are_redacted_and_none_are_kept_without_a_redactor() {
         let r = redactor_for_tests();
@@ -1073,7 +1087,7 @@ mod tests {
         let path = dir.path().join("b1.output");
         std::fs::write(&path, "one\nkey SECRET-abc\npart").unwrap();
         let r = redactor_for_tests();
-        let (t, new) = read_on(Tracked::from(path.clone(), 0), Some(r.as_ref()));
+        let (t, new) = read_on(unread(&path), Some(r.as_ref()));
         assert_eq!(new, ["one", "key [secret]"]);
         assert_eq!((t.read_to, t.len), (19, 23));
         append_to(&path, "ial\rwaiting for one\n");
@@ -1094,17 +1108,17 @@ mod tests {
         assert!(t.ended, "Claude Code's last line says its command ended");
         let (t, new) = read_on(t, Some(r.as_ref()));
         assert!(t.ended && new.is_empty(), "and it stays ended");
-        let (bare, lines) = read_on(Tracked::from(path.clone(), 0), None);
+        let (bare, lines) = read_on(unread(&path), None);
         assert!(lines.is_empty(), "nothing is read without a redactor");
         assert!(bare.ended, "but its end is");
         std::fs::write(&path, "[killed]\n").unwrap();
-        assert!(read_on(Tracked::from(path.clone(), 0), None).0.ended);
+        assert!(read_on(unread(&path), None).0.ended);
         std::fs::write(&path, "echo [exited with code 0] means done\n").unwrap();
-        assert!(!read_on(Tracked::from(path.clone(), 0), None).0.ended);
+        assert!(!read_on(unread(&path), None).0.ended);
         let big = dir.path().join("b2.output");
         let text = format!("{}\nlast\n", "x".repeat(TASK_TAIL as usize));
         std::fs::write(&big, text).unwrap();
-        let (_, new) = read_on(Tracked::from(big, 0), Some(r.as_ref()));
+        let (_, new) = read_on(unread(&big), Some(r.as_ref()));
         assert_eq!(new, ["last"], "a line cut by the tail is left out");
     }
 

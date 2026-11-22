@@ -145,14 +145,29 @@ pub fn said_after(
     })
 }
 
-/// The tool shell an open call runs in: the first of `tree`'s started at or
-/// after the call.
-pub fn call_shell<'a>(tree: &[&'a Stat], call: &OpenCall, now: DateTime<Utc>) -> Option<&'a Stat> {
+/// The tool shell an open call or a background shell started at `since`
+/// runs in: the first of `tree`'s started at or after it.
+pub fn shell_since<'a>(
+    tree: &[&'a Stat],
+    since: DateTime<Utc>,
+    now: DateTime<Utc>,
+) -> Option<&'a Stat> {
     tree.iter()
         .copied()
         .filter(|s| procs::is_tool_shell(&s.proc))
-        .filter(|s| started(now, s) >= call.since - SKEW)
+        .filter(|s| started(now, s) >= since - SKEW)
         .max_by_key(|s| (s.elapsed_secs, std::cmp::Reverse(s.proc.pid)))
+}
+
+/// Whether the tool shell started at `since` ([`shell_since`]) or anything
+/// under it used the CPU since `prev`.
+pub fn shell_busy(
+    prev: &HashMap<u32, (u64, u64)>,
+    tree: &[&Stat],
+    since: DateTime<Utc>,
+    now: DateTime<Utc>,
+) -> bool {
+    shell_since(tree, since, now).is_some_and(|shell| active(prev, &subtree(tree, shell)))
 }
 
 /// `head` and every process of `tree` under it.
@@ -340,7 +355,7 @@ fn said_rule(e: &Evidence<'_>, below: &[&Stat]) -> Option<Reading> {
         by: call.map(|c| c.tool.clone()),
         on: None,
         pid: call
-            .and_then(|c| call_shell(below, c, e.now))
+            .and_then(|c| shell_since(below, c.since, e.now))
             .map(|s| s.proc.pid),
         call: Some(said.call.clone()),
     })
@@ -678,6 +693,45 @@ mod tests {
     }
 
     #[test]
+    fn a_background_shells_held_wait_ends_once_its_own_shell_works_again() {
+        let made = now() - Duration::minutes(5);
+        let tree = |own: u64, other: u64| {
+            claude(vec![
+                Stat {
+                    elapsed_secs: 300,
+                    ..stat(103, 100, SHELL)
+                },
+                Stat {
+                    elapsed_secs: 299,
+                    cpu_secs: own,
+                    ..stat(104, 103, "cargo build")
+                },
+                Stat {
+                    elapsed_secs: 60,
+                    cpu_secs: other,
+                    ..stat(105, 100, SHELL)
+                },
+            ])
+        };
+        let prev = runs(&work(&tree(0, 0), 100, Engine::Claude, None));
+        let held = said_after(None, "b9", &[BUSY.to_string()], made, false);
+        let then = |own, other| {
+            let all = tree(own, other);
+            let work = work(&all, 100, Engine::Claude, None);
+            let busy = shell_busy(&prev, &work, made, now());
+            said_after(held.clone(), "b9", &[], now(), busy)
+        };
+        assert!(held.is_some());
+        assert_eq!(then(0, 0), held, "its shell still idle");
+        assert_eq!(then(3, 0), None, "its own shell works again");
+        assert_eq!(
+            then(0, 3),
+            held,
+            "a later call's shell working is not its own"
+        );
+    }
+
+    #[test]
     fn a_wait_reads_from_the_waiting_calls_own_shell_not_the_oldest_process() {
         let all = claude(vec![
             Stat {
@@ -716,7 +770,7 @@ mod tests {
             ..call
         };
         assert_eq!(
-            call_shell(&tree, &later, now()),
+            shell_since(&tree, later.since, now()),
             None,
             "no shell started since"
         );
