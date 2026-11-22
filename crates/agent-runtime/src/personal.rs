@@ -41,6 +41,13 @@ pub fn current() -> Option<Arc<RunPersonal>> {
     RUN.try_with(Arc::clone).ok()
 }
 
+/// The flag in scope, or a new one for a run that begins outside any (a
+/// CLI engine's round, bound for its turn): every call made under it, in
+/// any of the turn's rounds, marks the one flag.
+pub fn current_or_new() -> Arc<RunPersonal> {
+    current().unwrap_or_default()
+}
+
 /// `fut` as a run of its own, under the flag around it: it has read the
 /// bank already when `read`, or when the run around it has.
 pub async fn scoped<F: std::future::Future>(read: bool, fut: F) -> F::Output {
