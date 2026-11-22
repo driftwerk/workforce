@@ -1713,6 +1713,10 @@ pub struct PendingApprovalCore {
     /// ([`CURRENT_CHAT_ORIGIN`]): the turn resumed on its decision is then a
     /// chat turn too, on the conversation model.
     pub chat: bool,
+    /// The guard of the turn that asked, when it had read outside content
+    /// ([`ContentScope`](crate::security::monitor::ContentScope)): the turn
+    /// resumed on the decision runs under it.
+    pub content_scope: Option<serde_json::Value>,
 }
 
 /// One tool the resume turn executes deterministically before the first LLM
@@ -2149,13 +2153,16 @@ pub fn approval_route(
 /// "pending" result is returned. A missing router, no requester, no session
 /// linkage, or a persist failure all fall back to the self-serve prompt so a
 /// human still sees the request. Reads the requester, session and channel
-/// from the scoped task-locals.
+/// from the scoped task-locals. The routed row keeps `guard`'s scope, the
+/// turn's when it read outside content, so the turn resumed on the decision
+/// runs under it.
 pub fn route_approval(
     router: Option<&dyn ApprovalRouter>,
     agent_id: &str,
     tool_name: &str,
     reason: &str,
     input: &serde_json::Value,
+    guard: Option<&crate::security::monitor::ContentGuard>,
 ) -> RouteResolution {
     // A card only the person in Desk answers is never routed to approvers.
     if workforce_core::computer::person_only(tool_name) {
@@ -2183,6 +2190,9 @@ pub fn route_approval(
                 approver_user_ids: route.approver_user_ids.clone(),
                 ttl: route.ttl,
                 chat: chat_origin(),
+                content_scope: guard
+                    .and_then(|guard| guard.armed_scope())
+                    .and_then(|scope| serde_json::to_value(scope).ok()),
             };
             match router.defer(&core) {
                 Ok(()) => RouteResolution::Routed {
@@ -4901,6 +4911,7 @@ impl AgentRunner {
                             &tn,
                             &r,
                             &input,
+                            Some(&content_guard),
                         ) {
                             RouteResolution::Routed {
                                 request_id,
@@ -6274,6 +6285,7 @@ impl AgentRunner {
                             &tool_name,
                             &reason,
                             &input,
+                            Some(&content_guard),
                         ) {
                             RouteResolution::Routed {
                                 request_id,
@@ -9357,6 +9369,7 @@ mod tests {
             tool,
             reason,
             input,
+            None,
         )
     }
 
@@ -9436,6 +9449,47 @@ mod tests {
         assert_eq!(rows[0].approver_user_ids, vec!["bob".to_string()]);
         assert!(!rows[0].allow_self_approval);
         assert_eq!(rows[0].tool_input, serde_json::json!({"id": 1}));
+    }
+
+    /// A routed approval keeps the asking turn's guard on its row once the
+    /// turn read outside content, and nothing while it hasn't: the turn
+    /// resumed on the decision runs under it.
+    #[tokio::test]
+    async fn a_routed_approval_keeps_the_guard_of_the_turn_that_asked() {
+        let deferred = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let runner = runner_with_router(Arc::new(StubRouter {
+            decision: StubDecision::Routed(vec!["bob".to_string()], false),
+            deferred: Arc::clone(&deferred),
+        }));
+        let guard = crate::security::monitor::ContentGuard::new(
+            crate::security::monitor::ContentScope::delivering_to(Some("C1")),
+        );
+        let runner = &runner;
+        let ask = |guard| {
+            CURRENT_USER_ID.scope(
+                "alice".to_string(),
+                CURRENT_SESSION_KEY.scope("slack:ws:C1:T1".to_string(), async move {
+                    route_approval(
+                        runner.config.approval_router.as_deref(),
+                        runner.config.agent_id.as_str(),
+                        "vault.delete",
+                        "sensitive",
+                        &serde_json::json!({"id": 1}),
+                        guard,
+                    )
+                }),
+            )
+        };
+        ask(Some(&guard)).await;
+        guard.read_outside("see https://vendor.example/kb/1", "email.read");
+        ask(Some(&guard)).await;
+        let rows = deferred.lock().unwrap();
+        assert_eq!(rows[0].content_scope, None, "nothing outside read yet");
+        let kept: crate::security::monitor::ContentScope =
+            serde_json::from_value(rows[1].content_scope.clone().expect("kept")).unwrap();
+        assert_eq!(kept.armed.as_deref(), Some("email.read"));
+        assert_eq!(kept.seen, vec!["https://vendor.example/kb/1".to_string()]);
+        assert_eq!(kept.expected, guard.kept_scope().expected);
     }
 
     /// A routed approval records whether a person's message started the

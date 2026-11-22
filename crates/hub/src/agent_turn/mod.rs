@@ -394,14 +394,10 @@ pub enum ChainOutcome {
         route: RouteTag,
     },
     /// No route could serve, and the person the turn is for is told how to
-    /// make one: saved as the turn's answer, with nothing to bill. When
-    /// the turn `resumes` once they do, it keeps the `guard` it paused
-    /// under.
-    Notice {
-        text: String,
-        resumes: bool,
-        guard: Option<Box<workforce_agent::security::monitor::ContentScope>>,
-    },
+    /// make one: saved as the turn's answer, with nothing to bill. A
+    /// turn that waits on their sign-in keeps its guard on its waiter
+    /// ([`connect::ConnectWaiter`]).
+    Notice { text: String },
 }
 
 /// The route that served a turn.
@@ -617,11 +613,7 @@ async fn notice(text: String, progress: Option<&mpsc::Sender<ProgressEvent>>) ->
             let _ = progress.send(event).await;
         }
     }
-    ChainOutcome::Notice {
-        text,
-        resumes: false,
-        guard: None,
-    }
+    ChainOutcome::Notice { text }
 }
 
 /// No route of a turn could serve it; each says why.
@@ -706,20 +698,7 @@ impl TurnChain {
         // after it.
         keeper.finish().await;
         dropped.disarm();
-        // A notice the turn resumes from once the person connects keeps
-        // the guard it paused under.
-        outcome.map(|outcome| match outcome {
-            ChainOutcome::Notice {
-                text,
-                resumes: true,
-                ..
-            } => ChainOutcome::Notice {
-                text,
-                resumes: true,
-                guard: guard.armed_scope(),
-            },
-            outcome => outcome,
-        })
+        outcome
     }
 
     async fn run_routes(&self, service: &AgentService, turn: TurnRun<'_>) -> Result<ChainOutcome> {

@@ -620,6 +620,7 @@ mod tests {
             created_at: now,
             expires_at: now,
             chat: false,
+            content_scope: None,
         };
 
         let card = reconstructed_prompt(&service, &row).to_string();
@@ -706,6 +707,7 @@ mod tests {
             approver_user_ids: vec![person.clone()],
             ttl: std::time::Duration::from_secs(3600),
             chat: false,
+            content_scope: None,
         };
         store
             .insert_core(
@@ -813,6 +815,7 @@ mod tests {
             approver_user_ids: vec!["bob".to_string()],
             ttl: std::time::Duration::from_secs(3600),
             chat: false,
+            content_scope: None,
         };
         store
             .insert_core(

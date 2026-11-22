@@ -20,6 +20,35 @@ use workforce_agent::runner::PendingApprovalCore;
 /// the batch size to it.
 const PRUNABLE: &str = "status IN ('approved', 'denied', 'expired') AND expires_at < ";
 
+/// The asking turn's guard is kept on its row, for the turn resumed on the
+/// decision; a row asked with none reads as having none.
+#[cfg(test)]
+pub(crate) fn kept_scope_contract(store: &dyn PendingApprovalStore) {
+    let expires = Utc::now() + chrono::Duration::hours(1);
+    let scope = serde_json::json!({ "armed": "email.read", "seen": ["https://a.example/"] });
+    let asked = |content_scope: Option<serde_json::Value>| {
+        let core = PendingApprovalCore {
+            request_id: uuid::Uuid::new_v4().to_string(),
+            agent_id: "agent".into(),
+            session_key: "web".into(),
+            channel_id: String::new(),
+            requester_user_id: "alice".into(),
+            tool_name: "vault.delete".into(),
+            tool_input: serde_json::json!({}),
+            reason: "sensitive".into(),
+            allow_self_approval: true,
+            approver_user_ids: vec![],
+            ttl: std::time::Duration::from_secs(3600),
+            chat: false,
+            content_scope,
+        };
+        store.insert_core(&core, None, None, expires).unwrap();
+        store.get(&core.request_id).unwrap().unwrap().content_scope
+    };
+    assert_eq!(asked(Some(scope.clone())), Some(scope));
+    assert_eq!(asked(None), None);
+}
+
 /// What every backend's prune must do alike.
 #[cfg(test)]
 pub(crate) fn prune_contract(store: &dyn PendingApprovalStore) {
@@ -38,6 +67,7 @@ pub(crate) fn prune_contract(store: &dyn PendingApprovalStore) {
             approver_user_ids: vec![],
             ttl: std::time::Duration::from_secs(3600),
             chat: false,
+            content_scope: None,
         };
         store.insert_core(&core, None, None, expires_at).unwrap();
         store.add_target(&core.request_id, "dave", "U1").unwrap();
@@ -118,6 +148,7 @@ pub(crate) fn pending_for_contract(store: &dyn PendingApprovalStore) {
         approver_user_ids: vec![],
         ttl: std::time::Duration::from_secs(3600),
         chat: false,
+        content_scope: None,
     };
     let now = Utc::now();
     let later = now + chrono::Duration::hours(1);
@@ -188,6 +219,7 @@ pub(crate) fn identity_operations_contract(store: &dyn PendingApprovalStore) {
         approver_user_ids: vec![],
         ttl: std::time::Duration::from_secs(3600),
         chat: false,
+        content_scope: None,
     };
     let expires = Utc::now() + chrono::Duration::hours(1);
     let pending = core("alice");

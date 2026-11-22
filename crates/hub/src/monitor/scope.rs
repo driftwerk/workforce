@@ -173,15 +173,31 @@ pub(crate) fn kept_guard(
     let kept = session
         .turn_content_scope()
         .or_else(|| session.content_scope())?;
+    Some(guard_of(kept, &session.id))
+}
+
+/// The guard `kept` ([`ContentScope`], as a paused turn kept it for what
+/// it was waiting on, `what`) restores. One that can't be read is kept as
+/// strictly as any: armed, refusing.
+pub(crate) fn guard_of(kept: &serde_json::Value, what: &str) -> Arc<ContentGuard> {
     let scope = serde_json::from_value(kept.clone()).unwrap_or_else(|e| {
-        tracing::warn!(session = %session.id, error = %e, "A kept content scope could not be read; the turn refuses");
+        tracing::warn!(kept = %what, error = %e, "A kept content scope could not be read; the turn refuses");
         ContentScope {
             armed: Some("a turn kept before it was resumed".to_string()),
             refuses: true,
             ..ContentScope::default()
         }
     });
-    Some(Arc::new(ContentGuard::new(scope)))
+    Arc::new(ContentGuard::new(scope))
+}
+
+/// The scope of the guard this turn runs under, as a paused turn keeps it
+/// with what it waits on (an approval, a sign-in): `None` when it read no
+/// outside content.
+pub(crate) fn paused_scope() -> Option<serde_json::Value> {
+    workforce_agent::runner::caller_content_guard()
+        .and_then(|guard| guard.armed_scope())
+        .and_then(|scope| serde_json::to_value(scope).ok())
 }
 
 /// Keep on `session` the guard of the turn that just stopped while a call
@@ -194,16 +210,13 @@ pub(crate) fn keep_turn(
     keep_paused(session, result.guard.as_deref().filter(|_| paused(result)));
 }
 
-/// Whether the turn that gave `result` paused rather than finished: it
-/// waits on an approval, or stopped on its round budget for the person to
-/// say carry on. The turn that picks it up carries on from it.
+/// Whether the turn that gave `result` stopped on its round budget for the
+/// person to say carry on: the session's next turn carries on from it. A
+/// turn waiting on an approval or a sign-in keeps its guard with what it
+/// waits on instead ([`paused_scope`]), so another turn of the session
+/// finishing never clears it.
 fn paused(result: &workforce_agent::runner::RunResult) -> bool {
-    result.budget_capped
-        || result.hit_round_cap
-        || result
-            .tool_invocations
-            .iter()
-            .any(|call| call.policy_decision == "require_approval")
+    result.budget_capped || result.hit_round_cap
 }
 
 /// Keep `scope` on `session` as the guard of the turn that picks up where

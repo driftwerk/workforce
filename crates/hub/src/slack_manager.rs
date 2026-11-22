@@ -11775,7 +11775,14 @@ pub async fn rerun_unanswered(
         else {
             return Attempt::Done(Ok(()));
         };
-        match resume_turn(svc, &session, &waiter.principal, &delivery, prompt).await {
+        // The waiting turn's guard, kept on its waiter: the rerun runs
+        // under it.
+        let kept = waiter
+            .content_scope
+            .as_ref()
+            .map(|kept| crate::monitor::scope::guard_of(kept, &waiter.message_id));
+        let rerun = resume_turn(svc, &session, &waiter.principal, &delivery, prompt);
+        match workforce_agent::runner::with_content_guard(kept, rerun).await {
             Ok(answer) => {
                 deliver_resumed(svc, &delivery, surfaces, push, session_id, answer).await;
                 Attempt::Done(Ok(()))

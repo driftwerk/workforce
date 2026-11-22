@@ -1774,6 +1774,39 @@ mod tests {
         );
     }
 
+    /// A CLI round's call routed to approvers once the turn read outside
+    /// content keeps the turn's guard on its row, for the turn resumed on
+    /// the decision.
+    #[tokio::test]
+    async fn a_cli_rounds_routed_approval_keeps_the_turns_guard() {
+        use workforce_agent::security::monitor::{ContentGuard, ContentScope};
+        let (service, _, _) = asking().await;
+        let routes = Arc::new(Routes::default());
+        service.set_approval_router(routes.clone());
+        let guard = Arc::new(ContentGuard::new(ContentScope::delivering_to(Some("C1"))));
+        guard.read_outside("see https://vendor.example/kb/1", "email.read");
+        let turn =
+            workforce_agent::runner::with_content_guard(Some(guard), attended(&service)).await;
+
+        call(
+            turn.tools
+                .clone()
+                .resumed(RouteResume::InSession)
+                .endpoint(),
+            "catalogue_remove_entry",
+            serde_json::json!({ "name": "figma" }),
+        )
+        .await;
+
+        let kept = routes.0.lock()[0]
+            .content_scope
+            .clone()
+            .expect("the turn's guard is on the row");
+        let kept: ContentScope = serde_json::from_value(kept).unwrap();
+        assert_eq!(kept.armed.as_deref(), Some("email.read"));
+        assert_eq!(kept.seen, vec!["https://vendor.example/kb/1".to_string()]);
+    }
+
     #[tokio::test]
     async fn runner_and_mcp_share_route_approval() {
         let (service, _, _) = asking().await;
@@ -1832,6 +1865,7 @@ mod tests {
                     TOOL,
                     "Approval required",
                     &figma,
+                    None,
                 )
             })
             .await;
@@ -1874,7 +1908,10 @@ mod tests {
         let (is_error, text) =
             text_of(&call(tools.endpoint(), "approval_decide", serde_json::json!({})).await);
         assert!(is_error);
-        assert_eq!(text, Refusal::Unattended.tool_result());
+        assert!(
+            text.starts_with(Refusal::Unattended.tool_result()),
+            "{text}"
+        );
         assert_eq!(lookalike.runs(), 0);
     }
 
@@ -1966,7 +2003,10 @@ mod tests {
             .await,
         );
         assert!(is_error);
-        assert_eq!(text, Refusal::Unattended.tool_result());
+        assert!(
+            text.starts_with(Refusal::Unattended.tool_result()),
+            "{text}"
+        );
         assert!(tool.runs().is_empty());
         assert!(turn.progress.try_recv().is_err(), "nobody was asked");
     }

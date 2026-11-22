@@ -96,41 +96,54 @@ pub async fn launch_resume(
     // Whether the resumed turn read outside content: its answer is then
     // posted marked so.
     let armed = workforce_agent::security::monitor::Armed::new();
+    // The asking turn's guard, kept on its row: the continuation runs under
+    // it, whatever the session's other turns did meanwhile.
+    let kept = row
+        .content_scope
+        .as_ref()
+        .map(|kept| crate::monitor::scope::guard_of(kept, &row.request_id));
+    if let Some(guard) = &kept {
+        guard.kept_by(armed.keeper());
+    }
     let result = workforce_agent::runner::CURRENT_AUTOMATED_ORIGIN
         .scope(
             origin,
-            workforce_agent::runner::with_guard_keeper(Some(armed.keeper()), async {
-                match outcome {
-                    ApprovalOutcome::Approved => {
-                        let pre = PreExecutedTool {
-                            tool_name: row.tool_name.clone(),
-                            tool_input: row.tool_input.clone(),
-                        };
-                        with_desk(
-                            desk,
-                            CURRENT_CHANNEL_ID.scope(
-                                channel_id.clone(),
-                                CURRENT_THREAD_ID.scope(
-                                    thread_id.clone(),
-                                    CURRENT_PREEXECUTE.scope(pre, run_turn(svc, row, &directive)),
+            workforce_agent::runner::with_content_guard(
+                kept,
+                workforce_agent::runner::with_guard_keeper(Some(armed.keeper()), async {
+                    match outcome {
+                        ApprovalOutcome::Approved => {
+                            let pre = PreExecutedTool {
+                                tool_name: row.tool_name.clone(),
+                                tool_input: row.tool_input.clone(),
+                            };
+                            with_desk(
+                                desk,
+                                CURRENT_CHANNEL_ID.scope(
+                                    channel_id.clone(),
+                                    CURRENT_THREAD_ID.scope(
+                                        thread_id.clone(),
+                                        CURRENT_PREEXECUTE
+                                            .scope(pre, run_turn(svc, row, &directive)),
+                                    ),
                                 ),
-                            ),
-                        )
-                        .await
+                            )
+                            .await
+                        }
+                        ApprovalOutcome::Denied | ApprovalOutcome::Expired => {
+                            with_desk(
+                                desk,
+                                CURRENT_CHANNEL_ID.scope(
+                                    channel_id.clone(),
+                                    CURRENT_THREAD_ID
+                                        .scope(thread_id.clone(), run_turn(svc, row, &directive)),
+                                ),
+                            )
+                            .await
+                        }
                     }
-                    ApprovalOutcome::Denied | ApprovalOutcome::Expired => {
-                        with_desk(
-                            desk,
-                            CURRENT_CHANNEL_ID.scope(
-                                channel_id.clone(),
-                                CURRENT_THREAD_ID
-                                    .scope(thread_id.clone(), run_turn(svc, row, &directive)),
-                            ),
-                        )
-                        .await
-                    }
-                }
-            }),
+                }),
+            ),
         )
         .await;
 

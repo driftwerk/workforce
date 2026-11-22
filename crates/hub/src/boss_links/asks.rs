@@ -510,6 +510,7 @@ pub async fn asked(
         ttl,
         // A linked engine's ask: nothing resumes on it.
         chat: false,
+        content_scope: None,
     };
     if let Err(e) = store.insert_core(
         &core,
@@ -1027,6 +1028,7 @@ mod tests {
             created_at: Utc::now(),
             expires_at: Utc::now(),
             chat: false,
+            content_scope: None,
         };
         let anywhere = row(json!(["allow", "deny", "stop"]));
         assert_eq!(refuses(&anywhere, PermissionChoice::AllowOnce), None);

@@ -3851,8 +3851,7 @@ pub(crate) async fn process_admitted(
 
     let (mut result, route) = match outcome {
         crate::agent_turn::ChainOutcome::Served { result, route } => (*result, route),
-        crate::agent_turn::ChainOutcome::Notice { text, guard, .. } => {
-            crate::monitor::scope::keep_paused(&mut session, guard.as_deref());
+        crate::agent_turn::ChainOutcome::Notice { text } => {
             save_notice_turn(
                 service,
                 &mut session,
@@ -4406,7 +4405,7 @@ pub(crate) async fn run_isolated(
         .await?
     {
         crate::agent_turn::ChainOutcome::Served { result, route } => (*result, route),
-        crate::agent_turn::ChainOutcome::Notice { text, .. } => eyre::bail!("{text}"),
+        crate::agent_turn::ChainOutcome::Notice { text } => eyre::bail!("{text}"),
     };
 
     // Record tool invocations
@@ -5736,8 +5735,7 @@ pub(crate) async fn stream_admitted(
 
                 let (mut result, route) = match outcome {
                     crate::agent_turn::ChainOutcome::Served { result, route } => (*result, route),
-                    crate::agent_turn::ChainOutcome::Notice { text, guard, .. } => {
-                        crate::monitor::scope::keep_paused(&mut session, guard.as_deref());
+                    crate::agent_turn::ChainOutcome::Notice { text } => {
                         if let Some(log) = heard_for_task.as_ref() {
                             records::keep_heard(&mut session, log.take(), trust_level, desk_for_task.as_ref());
                         }

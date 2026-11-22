@@ -58,6 +58,10 @@ pub struct PendingApproval {
     /// its decision is a chat turn too (`serve::chat_turn`). False for rows
     /// written before this was recorded, which resume as they always did.
     pub chat: bool,
+    /// The guard of the turn that asked, armed by outside content it read:
+    /// the turn resumed on the decision runs under it. `None` when it read
+    /// none, and for rows written before this was kept.
+    pub content_scope: Option<serde_json::Value>,
 }
 
 impl PendingApproval {

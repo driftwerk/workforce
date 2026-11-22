@@ -6181,6 +6181,7 @@ async fn an_approval_resumes_on_the_model_of_the_turn_that_asked() {
         created_at: Utc::now(),
         expires_at: Utc::now(),
         chat,
+        content_scope: None,
     };
     let models = || async {
         server
@@ -6248,6 +6249,7 @@ async fn an_approval_decided_later_resumes_in_its_desk_conversation() {
         created_at: Utc::now(),
         expires_at: Utc::now(),
         chat: false,
+        content_scope: None,
     };
     let registry = Arc::new(crate::agent_registry::AgentRegistry::from_parts(
         [(agent.clone(), Arc::clone(&service))]
