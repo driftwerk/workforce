@@ -226,7 +226,7 @@ async fn a_take_hands_the_home_its_sessions_work_and_their_line_waits_for_it_whi
 
         // Its report waits for the home; its question stays open for it.
         let next = eventually("its report kept for the home", async || {
-            let t = take(&app, &token, json!({"since": first.now})).await;
+            let t = take(&app, &token, json!({})).await;
             t.reports.iter().any(|r| r.said.id == report).then_some(t)
         })
         .await;
@@ -236,12 +236,7 @@ async fn a_take_hands_the_home_its_sessions_work_and_their_line_waits_for_it_whi
         assert!(next.asks[0].said.text.contains("Ship VEL-9 now?"));
         assert!(next.reports.iter().all(|r| r.said.id != other));
         // Acknowledged, it is taken once.
-        let after = take(
-            &app,
-            &token,
-            json!({"since": next.now, "taken": [report, other]}),
-        )
-        .await;
+        let after = take(&app, &token, json!({"taken": [report, other]})).await;
         assert!(after.reports.is_empty(), "{after:?}");
         assert_eq!(
             d.store()
@@ -286,6 +281,51 @@ async fn a_take_hands_the_home_its_sessions_work_and_their_line_waits_for_it_whi
             d.store().line_message(later).await.unwrap().unwrap().to.id,
             HOME_DESK
         );
+    })
+    .await;
+}
+
+/// On devbox: an event stamped before the last a take handed back, but
+/// saved after that take, is handed back by the next, and never again.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_event_saved_late_is_still_handed_back_and_only_once() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (crew, d, [vel9, _, _, _]) = devbox(dir.path(), pool).await;
+        let app = super::super::relay::routes(Arc::clone(&crew.state), Arc::clone(&crew));
+        let token = crew.state.auth_token.clone();
+        let out = post(&app, &token, take_on(vel9.id, true)).await;
+        assert_eq!(out["status"], "ok", "{out}");
+        take(&app, &token, json!({})).await;
+        let handed = |text: &str| {
+            workforce_desk::crew::Event::new(
+                workforce_desk::crew::Kind::HandedBack,
+                workforce_desk::crew::Party::you(),
+                Some(workforce_desk::crew::Party::session(&vel9)),
+                text.to_string(),
+            )
+        };
+        let first = handed("back once");
+        d.store().add_event(&first).await.unwrap();
+        let read = take(&app, &token, json!({})).await;
+        assert!(read.events.iter().any(|e| e.id == first.id), "{read:?}");
+        let cursor = read.after.clone().expect("read on past it");
+        // Stamped before what that take read, saved only now.
+        let mut late = handed("back late");
+        late.at = first.at - chrono::Duration::seconds(1);
+        d.store().add_event(&late).await.unwrap();
+        let next = take(&app, &token, json!({"after": cursor})).await;
+        assert_eq!(
+            next.events
+                .iter()
+                .map(|e| e.id.as_str())
+                .collect::<Vec<_>>(),
+            [late.id.as_str()],
+            "the late one alone"
+        );
+        assert_eq!(next.after, read.after, "never moved back");
+        let again = take(&app, &token, json!({"after": cursor})).await;
+        assert!(again.events.is_empty(), "{again:?}");
     })
     .await;
 }
@@ -336,6 +376,55 @@ async fn a_question_to_the_homes_boss_is_the_persons_once_desk_lets_the_boss_go(
             q.escalation
                 .as_ref()
                 .is_some_and(|e| e.why.contains("no longer runs this session")),
+            "{q:?}"
+        );
+    })
+    .await;
+}
+
+/// On devbox: a question VEL-9 asked the home's boss is the person's once
+/// that boss lets VEL-9 go itself.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_question_to_the_homes_boss_is_the_persons_once_the_boss_lets_its_session_go() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (crew, d, [vel9, _, _, _]) = devbox(dir.path(), pool).await;
+        let app = super::super::relay::routes(Arc::clone(&crew.state), Arc::clone(&crew));
+        let token = crew.state.auth_token.clone();
+        let out = post(&app, &token, take_on(vel9.id, true)).await;
+        assert_eq!(out["status"], "ok", "{out}");
+        take(&app, &token, json!({})).await;
+        let asked = d
+            .line_call(
+                vel9.id,
+                "ask",
+                &json!({"to": "desk", "text": "Ship VEL-9 now?", "wait_seconds": 60}),
+                Some(Duration::from_millis(10)),
+            )
+            .await
+            .unwrap();
+        let ask: uuid::Uuid = serde_json::from_value(asked["id"].clone()).unwrap();
+
+        let release = relayed(
+            "crew.release",
+            json!({"session_id": vel9.id, "reason": "The person runs it now."}),
+            true,
+        );
+        let out = post(&app, &token, release).await;
+        assert_eq!(out["status"], "ok", "{out}");
+        let q = eventually("its question given to the person", async || {
+            d.store()
+                .line_message(ask)
+                .await
+                .unwrap()
+                .filter(|q| q.asked == Some(Asked::Escalated))
+        })
+        .await;
+        assert!(d.charge_of(vel9.id).is_none_or(|c| !c.live()), "let go");
+        assert!(
+            q.escalation
+                .as_ref()
+                .is_some_and(|e| e.why.contains("Its boss let this session go")),
             "{q:?}"
         );
     })
@@ -431,7 +520,10 @@ async fn a_machine_session_gone_quiet_is_said_in_the_check_in_as_one_here_is() {
                             "desk.machines" => {
                                 json!({"machines": [{"name": "devbox", "reached": true}]})
                             }
-                            "desk.sessions" => json!([{"id": id, "state": "working"}]),
+                            // As Desk lists them: each with the grant that holds it.
+                            "desk.sessions" => {
+                                json!([{"id": id, "state": "working", "grant": null}])
+                            }
                             _ => json!({}),
                         };
                         crew.relay_answer(

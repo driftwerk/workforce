@@ -19,7 +19,7 @@
 //! The take is the Mac hub's own: no crew tool sends it, and the machine
 //! takes it only on its native relay route, from `local:<agent>`.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -51,6 +51,11 @@ pub const WORK_TAKE: &str = "crew.work_take";
 pub(crate) const WORK_FRESH: Duration = Duration::from_secs(45);
 /// The most events one take hands back.
 const MOST_EVENTS: i64 = 100;
+/// How long after its time an event may still be saved: each take reads
+/// that far behind its cursor, and never hands back one it handed.
+const SAVED_WITHIN: chrono::TimeDelta = chrono::TimeDelta::seconds(10);
+/// How many of the events it heard last the Mac knows again.
+const HEARD_KEPT: usize = 4 * MOST_EVENTS as usize;
 /// How long a line message a turn was shown stays known for its tools.
 const LINES_KEPT: Duration = Duration::from_secs(3_600);
 /// How often the machine looks for questions whose home stopped reading.
@@ -127,11 +132,10 @@ pub(crate) struct Frame {
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct Taken {
-    /// When it was made: where the next take reads from, unless `after`
-    /// says.
+    /// When it was made.
     pub now: i64,
-    /// Its last event, when it hands back as many as a take does: the
-    /// next take reads on past it.
+    /// The latest event read so far, if any: the next take reads on past
+    /// it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub after: Option<ReadTo>,
     pub sessions: Vec<Run>,
@@ -148,7 +152,7 @@ pub(crate) struct ReadTo {
     pub id: String,
 }
 
-/// Where a take reads from: a time, or past an event.
+/// Where a take reads from: the first take's time, or past an event.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ReadFrom {
     Since(DateTime<Utc>),
@@ -156,11 +160,18 @@ enum ReadFrom {
 }
 
 impl ReadFrom {
-    /// Where the take after `t` reads from.
-    fn after(t: &Taken) -> Option<Self> {
-        match &t.after {
-            Some(r) => Some(Self::After(r.clone())),
-            None => DateTime::from_timestamp_millis(t.now).map(Self::Since),
+    fn at(&self) -> DateTime<Utc> {
+        match self {
+            Self::Since(at) | Self::After(ReadTo { at, .. }) => *at,
+        }
+    }
+
+    /// The time a take reads from: past an event, [`SAVED_WITHIN`] behind
+    /// it, for one saved late.
+    fn since(&self) -> DateTime<Utc> {
+        match self {
+            Self::Since(at) => *at,
+            Self::After(r) => r.at - SAVED_WITHIN,
         }
     }
 }
@@ -174,6 +185,10 @@ pub(crate) struct Homes {
     took: HashMap<Key, Instant>,
     /// Where the next take of each reads from when its home doesn't say.
     cursor: HashMap<Key, ReadFrom>,
+    /// The events each was handed within [`SAVED_WITHIN`] of its cursor,
+    /// with their times: read again, as one saved late is looked for, but
+    /// never handed again.
+    handed: HashMap<Key, HashMap<String, DateTime<Utc>>>,
     /// Until then, a boss no home took for yet may still be read: one
     /// restarted here is taken for again within [`WORK_FRESH`].
     grace: Instant,
@@ -185,6 +200,7 @@ impl Default for Homes {
         Self {
             took: HashMap::new(),
             cursor: HashMap::new(),
+            handed: HashMap::new(),
             grace: Instant::now() + WORK_FRESH,
             swept: None,
         }
@@ -320,20 +336,17 @@ impl CrewHub {
             }
             h.swept = Some(Instant::now());
         }
-        let asks = match self.desk.store().line_open_asks(None).await {
+        let home = format!("{}/", workforce_desk::grant::HOME_HUB);
+        let asks = match self.desk.store().line_open_asks_to(&home).await {
             Ok(asks) => asks,
             Err(e) => {
                 tracing::warn!(error = %e, "reading questions to bosses on the Mac failed");
                 return;
             }
         };
-        for ask in asks.iter().filter(|a| {
-            a.asked == Some(Asked::Open)
-                && super::relayed_decide::relayed_party(&a.to.id)
-                && !self.home_reads(&a.to.id)
-        }) {
+        for (ask, _) in asks.iter().filter(|(_, to)| !self.home_reads(to)) {
             if let Err(e) = self
-                .escalate(ask.id, &By::desk(UNREAD), UNREAD, Vec::new(), None)
+                .escalate(*ask, &By::desk(UNREAD), UNREAD, Vec::new(), None)
                 .await
             {
                 tracing::info!(error = %e, "a question wasn't given to the person");
@@ -342,10 +355,10 @@ impl CrewHub {
     }
 
     /// The home's take of `boss`'s work under `group`'s grant
-    /// ([`WORK_TAKE`]): from `since`, or past `after` (else where its last take ended, else
-    /// now), acknowledging the reports it says it `taken`. One that only
-    /// `peek`s reads what is open now and leaves where the next take reads
-    /// from.
+    /// ([`WORK_TAKE`]): past `after`, the last event it read (else where
+    /// its last take ended, else now), acknowledging the reports it says it
+    /// `taken`. One that only `peek`s reads what is open now and leaves
+    /// where the next take reads from.
     pub(crate) async fn work_take(
         &self,
         boss: &BossRef,
@@ -365,32 +378,45 @@ impl CrewHub {
         }
         let now = Utc::now();
         let peek = input["peek"].as_bool() == Some(true);
-        let from = {
+        let (from, skip) = {
             let mut h = self.work_homes.lock();
             h.took.insert(key.clone(), Instant::now());
             let said = serde_json::from_value::<ReadTo>(input["after"].clone())
                 .ok()
-                .map(ReadFrom::After)
-                .or_else(|| {
-                    input["since"]
-                        .as_i64()
-                        .and_then(DateTime::from_timestamp_millis)
-                        .map(ReadFrom::Since)
-                })
-                .filter(|f| match f {
-                    ReadFrom::Since(at) | ReadFrom::After(ReadTo { at, .. }) => *at <= now,
-                });
-            match peek {
+                .filter(|r| r.at <= now)
+                .map(ReadFrom::After);
+            let from = match peek {
                 true => ReadFrom::Since(now),
                 false => said
                     .or_else(|| h.cursor.get(&key).cloned())
                     .unwrap_or(ReadFrom::Since(now)),
-            }
+            };
+            let skip: Vec<String> = h
+                .handed
+                .get(&key)
+                .into_iter()
+                .flat_map(HashMap::keys)
+                .cloned()
+                .chain(match &from {
+                    ReadFrom::After(r) => Some(r.id.clone()),
+                    ReadFrom::Since(_) => None,
+                })
+                .collect();
+            (from, skip)
         };
-        match self.relayed_work_of(&g, &key.0, &from, now, input).await {
-            Ok(taken) => {
-                if let Some(next) = ReadFrom::after(&taken).filter(|_| !peek) {
-                    self.work_homes.lock().cursor.insert(key, next);
+        match self
+            .relayed_work_of(&g, &key.0, &from, &skip, now, input)
+            .await
+        {
+            Ok((taken, read)) => {
+                if !peek {
+                    let mut h = self.work_homes.lock();
+                    let next = taken.after.clone().map_or(from, ReadFrom::After);
+                    let floor = next.at() - SAVED_WITHIN;
+                    let handed = h.handed.entry(key.clone()).or_default();
+                    handed.extend(read);
+                    handed.retain(|_, at| *at >= floor);
+                    h.cursor.insert(key, next);
                 }
                 let mut body = json!(taken);
                 super::served::cleaned(&mut body);
@@ -403,15 +429,18 @@ impl CrewHub {
         }
     }
 
-    /// What `party` is to hear of the sessions it runs under `g`.
+    /// What `party` is to hear of the sessions it runs under `g`, and each
+    /// event read for it (but those in `skip`, handed already), with its
+    /// time.
     async fn relayed_work_of(
         &self,
         g: &Grant,
         party: &str,
         from: &ReadFrom,
+        skip: &[String],
         now: DateTime<Utc>,
         input: &Value,
-    ) -> eyre::Result<Taken> {
+    ) -> eyre::Result<(Taken, Vec<(String, DateTime<Utc>)>)> {
         let runs: Vec<ChargeView> = self
             .desk
             .charges()
@@ -465,29 +494,24 @@ impl CrewHub {
             false => {
                 self.desk
                     .store()
-                    .events_from(
-                        match from {
-                            ReadFrom::Since(at) => *at,
-                            ReadFrom::After(r) => r.at,
-                        },
-                        match from {
-                            ReadFrom::Since(_) => None,
-                            ReadFrom::After(r) => Some((r.at, r.id.as_str())),
-                        },
-                        &ids,
-                        MOST_EVENTS,
-                    )
+                    .events_from(from.since(), skip, &ids, MOST_EVENTS)
                     .await?
             }
         };
-        // As many as one take hands back: the next reads on past the last.
+        let read: Vec<(String, DateTime<Utc>)> =
+            events.iter().map(|e| (e.id.clone(), e.at)).collect();
+        // The latest event read so far: never past one not read yet.
         let after = events
-            .last()
-            .filter(|_| events.len() as i64 >= MOST_EVENTS)
+            .iter()
             .map(|e| ReadTo {
                 at: e.at,
                 id: e.id.clone(),
-            });
+            })
+            .chain(match from {
+                ReadFrom::After(r) => Some(r.clone()),
+                ReadFrom::Since(_) => None,
+            })
+            .max_by(|a, b| (a.at, &a.id).cmp(&(b.at, &b.id)));
         let events = events
             .iter()
             .filter_map(|e| {
@@ -541,15 +565,18 @@ impl CrewHub {
                 Some((run, request))
             })
             .unzip();
-        Ok(Taken {
-            now: now.timestamp_millis(),
-            after,
-            sessions,
-            events,
-            asks,
-            reports: reports.iter().map(Line::from).collect(),
-            requests: requests.into_iter().flatten().collect(),
-        })
+        Ok((
+            Taken {
+                now: now.timestamp_millis(),
+                after,
+                sessions,
+                events,
+                asks,
+                reports: reports.iter().map(Line::from).collect(),
+                requests: requests.into_iter().flatten().collect(),
+            },
+            read,
+        ))
     }
 }
 
@@ -603,10 +630,11 @@ impl Work {
 struct Pump {
     next: Instant,
     busy: bool,
-    /// Where the next take reads from: past the last one.
-    cursor: Option<ReadFrom>,
-    /// The events the last take handed back: one at its cursor comes again.
-    seen: HashSet<String>,
+    /// Where the next take reads from: past the latest event read.
+    cursor: Option<ReadTo>,
+    /// The events heard last ([`HEARD_KEPT`]): one a machine hands again,
+    /// as it restarted, is not heard twice.
+    seen: VecDeque<String>,
     /// The reports a turn took, for the next take to acknowledge.
     acked: Vec<Uuid>,
     /// What was given to a turn, while it is still open: none to be given
@@ -622,7 +650,7 @@ impl Default for Pump {
             next: Instant::now(),
             busy: false,
             cursor: None,
-            seen: HashSet::new(),
+            seen: VecDeque::new(),
             acked: Vec::new(),
             offered: HashMap::new(),
             gathered: HashMap::new(),
@@ -686,7 +714,14 @@ impl Pump {
                     .push(l.clone());
             }
         }
-        self.seen = t.events.iter().map(|e| e.id.clone()).collect();
+        for e in &t.events {
+            if !self.seen.contains(&e.id) {
+                self.seen.push_back(e.id.clone());
+            }
+        }
+        while self.seen.len() > HEARD_KEPT {
+            self.seen.pop_front();
+        }
         self.gathered
             .retain(|s, w| run.contains(s) && !w.is_empty());
     }
@@ -925,8 +960,7 @@ async fn take(
         (p.cursor.clone(), p.acked.clone())
     };
     let input = match cursor {
-        Some(ReadFrom::After(r)) => json!({ "after": r, "taken": sent }),
-        Some(ReadFrom::Since(at)) => json!({ "since": at.timestamp_millis(), "taken": sent }),
+        Some(r) => json!({ "after": r, "taken": sent }),
         None => json!({ "taken": sent }),
     };
     let ceiling = crew.ceiling_now(&agent, &o);
@@ -957,7 +991,9 @@ async fn take(
         p.next = started + next_take(crew.timing.tick, runs, older);
         match &taken {
             Some(t) => {
-                p.cursor = ReadFrom::after(t).or(p.cursor.take());
+                if let Some(r) = &t.after {
+                    p.cursor = Some(r.clone());
+                }
                 p.acked.retain(|id| !sent.contains(id));
                 p.heard(t);
                 p.due()

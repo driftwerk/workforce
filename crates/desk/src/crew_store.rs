@@ -260,25 +260,22 @@ impl DeskStore {
         rows.iter().map(event).collect()
     }
 
-    /// The first `limit` events about the subjects in `ids`, oldest first:
-    /// from `since` on, or past the event `after` (its time and id), so a
-    /// reader that goes on from the last of them misses none and reads
-    /// none twice, however many share a time.
+    /// The first `limit` events about the subjects in `ids` from `since` on,
+    /// oldest first, but those in `skip`: a reader that skips what it read
+    /// misses none and reads none twice, however many share a time.
     pub async fn events_from(
         &self,
         since: DateTime<Utc>,
-        after: Option<(DateTime<Utc>, &str)>,
+        skip: &[String],
         ids: &[String],
         limit: i64,
     ) -> Result<Vec<Event>> {
         let client = self.pool().get().await?;
-        let (at, id) = after.map_or((since, None), |(at, id)| (at, Some(id)));
         let rows = client
             .query(
                 "SELECT * FROM activity WHERE subject ->> 'id' = ANY($2) \
-                 AND (($4::text IS NULL AND at >= $1) OR (at, id) > ($1, $4)) \
-                 ORDER BY at, id LIMIT $3",
-                &[&at, &ids, &limit, &id],
+                 AND at >= $1 AND NOT (id = ANY($4)) ORDER BY at, id LIMIT $3",
+                &[&since, &ids, &limit, &skip],
             )
             .await?;
         rows.iter().map(event).collect()
@@ -773,11 +770,10 @@ mod tests {
         .await;
     }
 
-    /// A reader going on from the last of a full read misses none and
-    /// reads none twice: the oldest come first, and the next read goes on
-    /// past the last, by its time and id, however many share its time.
+    /// A reader that skips what it read misses none and reads none twice:
+    /// the oldest come first, however many share a time.
     #[tokio::test]
-    async fn events_from_a_time_on_are_the_oldest_and_the_next_read_goes_on_past_the_last() {
+    async fn events_from_a_time_on_are_the_oldest_and_none_skipped_is_read_again() {
         with_test_pool(build_pool, |pool| async move {
             DeskStore::migrate(&pool).await.unwrap();
             let store = DeskStore::from_pool(pool);
@@ -802,10 +798,10 @@ mod tests {
             }
             let ids = ["scout".to_string()];
             let texts = |es: &[Event]| es.iter().map(|e| e.text.clone()).collect::<Vec<_>>();
-            let first = store.events_from(from, None, &ids, 1).await.unwrap();
+            let first = store.events_from(from, &[], &ids, 1).await.unwrap();
             assert_eq!(first.len(), 1);
-            let last = (first[0].at, first[0].id.as_str());
-            let next = store.events_from(from, Some(last), &ids, 3).await.unwrap();
+            let mut skip: Vec<String> = first.iter().map(|e| e.id.clone()).collect();
+            let next = store.events_from(from, &skip, &ids, 3).await.unwrap();
             let mut read = texts(&first);
             read.extend(texts(&next));
             read.sort();
@@ -814,9 +810,9 @@ mod tests {
                 ["event 0", "event 1", "event 3", "event 4"],
                 "each once"
             );
-            let last = next.last().map(|e| (e.at, e.id.as_str()));
+            skip.extend(next.iter().map(|e| e.id.clone()));
             assert!(store
-                .events_from(from, last, &ids, 3)
+                .events_from(from, &skip, &ids, 3)
                 .await
                 .unwrap()
                 .is_empty());
