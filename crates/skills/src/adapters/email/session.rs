@@ -10,7 +10,7 @@ use futures::TryStreamExt;
 use tokio::io::{AsyncRead, AsyncWrite};
 
 use super::client::ImapClient;
-use super::error::EmailError;
+use super::error::{from_imap_error, EmailError};
 use super::uids::UidSet;
 
 /// One folder as LIST reports it.
@@ -21,11 +21,22 @@ pub struct Listed {
     pub attributes: Vec<String>,
 }
 
-/// What SELECT reports about the folder it opened.
+/// What SELECT reports about the folder it opened. `validity` is unknown
+/// when the server gave no UIDVALIDITY: its uids may then be renumbered
+/// unseen.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Selected {
-    pub validity: u32,
+    pub validity: Option<u32>,
     pub exists: u32,
+}
+
+/// What STATUS reports about a folder: how many messages it holds, its
+/// numbering, and the uid its next message will get.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FolderStatus {
+    pub messages: u32,
+    pub validity: Option<u32>,
+    pub next: Option<u32>,
 }
 
 /// Where copied or moved messages landed, from a COPYUID response code
@@ -69,14 +80,14 @@ pub trait MailSession: Send {
         fields: &[&str],
     ) -> Result<Vec<(u32, String)>, EmailError>;
     async fn summaries(&mut self, uids: &UidSet) -> Result<Vec<Summary>, EmailError>;
-    async fn messages_in(&mut self, folder: &str) -> Result<u32, EmailError>;
+    async fn status(&mut self, folder: &str) -> Result<FolderStatus, EmailError>;
     async fn create(&mut self, folder: &str) -> Result<(), EmailError>;
     async fn rename(&mut self, from: &str, to: &str) -> Result<(), EmailError>;
     async fn delete(&mut self, folder: &str) -> Result<(), EmailError>;
 }
 
-fn imap(what: &str) -> impl Fn(async_imap::error::Error) -> EmailError + '_ {
-    move |e| EmailError::Imap(format!("{what} failed: {e}"))
+fn imap<E: Into<async_imap::error::Error>>(what: &str) -> impl Fn(E) -> EmailError + '_ {
+    move |e| from_imap_error(what, e.into())
 }
 
 fn attribute_name(attribute: &NameAttribute<'_>) -> String {
@@ -99,7 +110,7 @@ fn attribute_name(attribute: &NameAttribute<'_>) -> String {
 
 fn selected(mailbox: async_imap::types::Mailbox) -> Selected {
     Selected {
-        validity: mailbox.uid_validity.unwrap_or(0),
+        validity: mailbox.uid_validity,
         exists: mailbox.exists,
     }
 }
@@ -157,14 +168,14 @@ where
         async_imap::Session::select(self, folder)
             .await
             .map(selected)
-            .map_err(|e| EmailError::Imap(format!("Failed to select folder {folder}: {e}")))
+            .map_err(|e| from_imap_error(&format!("SELECT {folder}"), e))
     }
 
     async fn examine(&mut self, folder: &str) -> Result<Selected, EmailError> {
         async_imap::Session::examine(self, folder)
             .await
             .map(selected)
-            .map_err(|e| EmailError::Imap(format!("Failed to open folder {folder}: {e}")))
+            .map_err(|e| from_imap_error(&format!("EXAMINE {folder}"), e))
     }
 
     async fn search(&mut self, query: &str) -> Result<UidSet, EmailError> {
@@ -250,10 +261,14 @@ where
             .collect())
     }
 
-    async fn messages_in(&mut self, folder: &str) -> Result<u32, EmailError> {
-        async_imap::Session::status(self, folder, "(MESSAGES)")
+    async fn status(&mut self, folder: &str) -> Result<FolderStatus, EmailError> {
+        async_imap::Session::status(self, folder, "(MESSAGES UIDNEXT UIDVALIDITY)")
             .await
-            .map(|m| m.exists)
+            .map(|m| FolderStatus {
+                messages: m.exists,
+                validity: m.uid_validity,
+                next: m.uid_next,
+            })
             .map_err(imap("STATUS"))
     }
 
@@ -334,13 +349,10 @@ async fn landing<T>(
 where
     T: AsyncRead + AsyncWrite + Unpin + fmt::Debug + Send,
 {
-    let failed = |e: &dyn fmt::Display| EmailError::MoveFailure {
-        detail: format!("{command}: {e}"),
-    };
-    let tag = session.run_command(command).await.map_err(|e| failed(&e))?;
+    let tag = session.run_command(command).await.map_err(imap(command))?;
     let mut landed = None;
     while let Some(response) = session.read_response().await {
-        let response = response.map_err(|e| failed(&e))?;
+        let response = response.map_err(imap(command))?;
         let (done, status, code, information) = match response.parsed() {
             Response::Done {
                 tag: done,
@@ -361,19 +373,23 @@ where
         match (done, status) {
             (Some(true), Status::Ok) => return Ok(landed),
             (Some(true), _) => {
-                return Err(failed(
-                    &information.as_deref().unwrap_or("refused").to_string(),
-                ))
+                return Err(EmailError::MoveFailure {
+                    detail: format!("{command}: {}", information.as_deref().unwrap_or("refused")),
+                })
             }
             _ => {}
         }
     }
-    Err(failed(&"the connection closed before the server answered"))
+    Err(EmailError::Disconnected {
+        operation: command.to_string(),
+        detail: "the connection closed before the server answered".to_string(),
+    })
 }
 
 /// An account's session whose every command gives up after the account's
 /// command timeout, and then drops the connection, which may still carry
-/// the late answer: a stalled server never holds the account's lock.
+/// the late answer: a stalled server never holds the account's lock. A
+/// connection that dropped is let go too, so the next use connects afresh.
 pub struct Timed<'a> {
     client: &'a mut ImapClient,
     limit: Duration,
@@ -392,6 +408,10 @@ macro_rules! timed {
         let limit = $self.limit;
         let session = $self.client.current()?;
         match tokio::time::timeout(limit, MailSession::$method(session, $($arg),*)).await {
+            Ok(Err(e)) if e.is_transient() => {
+                $self.client.forget();
+                Err(e)
+            }
             Ok(done) => done,
             Err(_) => {
                 $self.client.forget();
@@ -454,8 +474,8 @@ impl MailSession for Timed<'_> {
         timed!(self, "FETCH", summaries(uids))
     }
 
-    async fn messages_in(&mut self, folder: &str) -> Result<u32, EmailError> {
-        timed!(self, "STATUS", messages_in(folder))
+    async fn status(&mut self, folder: &str) -> Result<FolderStatus, EmailError> {
+        timed!(self, "STATUS", status(folder))
     }
 
     async fn create(&mut self, folder: &str) -> Result<(), EmailError> {

@@ -11849,8 +11849,9 @@ async fn monitor_list(
     Ok(Json(serde_json::json!({ "monitors": defs })))
 }
 
-/// The caller's mail sort rules, in words, each with the other monitors
-/// that watch the mail it takes.
+/// The caller's own mail sort rules, in words, each with the other
+/// monitors that watch the mail it takes: never a colleague's, though an
+/// administrator may see their monitors.
 async fn monitor_sort_rules(
     Query(query): Query<WsQuery>,
     headers: axum::http::HeaderMap,
@@ -11872,9 +11873,10 @@ async fn monitor_sort_rules(
         engine.list_visible(&listing).await,
     )
     .await;
-    Ok(Json(serde_json::json!({
-        "rules": crate::monitor::sort_rule::rules_in(&monitors)
-    })))
+    let rules = caller.identity_id.as_deref().map_or_else(Vec::new, |me| {
+        crate::monitor::sort_rule::rules_in(&monitors, me)
+    });
+    Ok(Json(serde_json::json!({ "rules": rules })))
 }
 
 #[derive(serde::Deserialize)]

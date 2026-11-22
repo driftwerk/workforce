@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use eyre::{Context, ContextCompat, Result};
+use eyre::{bail, ensure, Context, ContextCompat, Result};
 use serde::Serialize;
 use serde_json::Value;
 use tracing::warn;
@@ -95,7 +95,10 @@ impl PgMailJournal {
     pub async fn people(&self) -> Result<Vec<(String, usize)>> {
         let conn = self.pool.get().await?;
         Ok(conn
-            .query("SELECT owner, count(*) FROM bulk_jobs GROUP BY owner", &[])
+            .query(
+                "SELECT owner, count(*) FROM bulk_jobs WHERE owner <> '' GROUP BY owner",
+                &[],
+            )
             .await?
             .iter()
             .map(|row| {
@@ -176,6 +179,7 @@ impl MailJournal for PgMailJournal {
         head.as_object_mut()
             .context("a bulk mail job that isn't an object")?
             .remove("done");
+        ensure!(!job.owner.is_empty(), "a mail job needs an owner");
         let (origin, state) = (word(job.origin)?, word(job.state)?);
         let mut conn = self.pool.get().await?;
         let tx = conn.transaction().await?;
@@ -189,7 +193,7 @@ impl MailJournal for PgMailJournal {
             )
             .await?;
         if kept == 0 {
-            return Ok(());
+            bail!("job {} is another person's", job.id);
         }
         let stored: i32 = tx
             .query_one(
@@ -224,12 +228,16 @@ impl MailJournal for PgMailJournal {
     }
 
     async fn latest(&self, owner: &str, account: &str) -> Result<Option<BulkJob>> {
-        let (person, undone) = (word(Origin::Person)?, word(JobState::Undone)?);
+        let person = word(Origin::Person)?;
+        let settled = JobState::SETTLED
+            .into_iter()
+            .map(word)
+            .collect::<Result<Vec<_>>>()?;
         self.one(
             "SELECT id, job FROM bulk_jobs \
-             WHERE owner = $1 AND account = $2 AND origin = $3 AND state <> $4 \
+             WHERE owner = $1 AND account = $2 AND origin = $3 AND state <> ALL($4) \
              ORDER BY created_at DESC LIMIT 1",
-            &[&owner, &account, &person, &undone],
+            &[&owner, &account, &person, &settled],
         )
         .await
     }
@@ -294,7 +302,7 @@ mod tests {
                 label: None,
             },
             asked: "messages from news@shop.com".to_string(),
-            validity: 7,
+            validity: Some(7),
             pending: (1..=300_000).collect::<UidSet>(),
             in_flight: None,
             done: Vec::new(),
@@ -310,6 +318,7 @@ mod tests {
             src: (from..from + 500).collect(),
             dst: None,
             dst_validity: None,
+            dst_next: None,
             message_ids: (from..from + 500)
                 .map(|uid| (uid, format!("<{uid}@shop.com>")))
                 .collect(),
@@ -341,7 +350,17 @@ mod tests {
             let mut stolen = job("j1", "bob", "home");
             stolen.state = JobState::Undone;
             stolen.done.push(batch(1));
-            journal.save(&stolen).await.unwrap();
+            assert!(
+                journal.save(&stolen).await.is_err(),
+                "a save under another owner fails, so the job stops"
+            );
+            assert!(journal.save(&job("j9", "", "home")).await.is_err());
+            assert!(journal
+                .people()
+                .await
+                .unwrap()
+                .iter()
+                .all(|(p, _)| !p.is_empty()));
             let kept = journal.get("kat", "j1").await.unwrap().unwrap();
             assert_eq!(
                 kept.state,
@@ -400,7 +419,10 @@ mod tests {
             let mut undone = job("undone", "kat", "home");
             undone.state = JobState::Undone;
             undone.created = base + chrono::Duration::seconds(10);
-            for j in [&mine, &sorted, &undone] {
+            let mut past = job("past", "kat", "home");
+            past.state = JobState::Irreversible;
+            past.created = base + chrono::Duration::seconds(15);
+            for j in [&mine, &sorted, &undone, &past] {
                 journal.save(j).await.unwrap();
             }
             assert_eq!(

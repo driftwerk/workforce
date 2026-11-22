@@ -67,23 +67,32 @@ impl UidSet {
         (UidSet(head), UidSet(rest))
     }
 
+    /// The uids of this set not in `other`, in one pass over both: a run
+    /// of `other` that reaches past one of these runs is kept for the next.
     pub fn without(&self, other: &UidSet) -> UidSet {
-        let cut = |(a, b): (u32, u32)| {
-            other.0.iter().filter(|&&(x, y)| x <= b && y >= a).fold(
-                vec![(a, b)],
-                |pieces, &(x, y)| {
-                    pieces
-                        .into_iter()
-                        .flat_map(|(p, q)| {
-                            let below = (p < x).then(|| (p, q.min(x - 1)));
-                            let above = (q > y).then(|| (p.max(y + 1), q));
-                            below.into_iter().chain(above)
-                        })
-                        .collect()
-                },
-            )
-        };
-        UidSet(self.0.iter().copied().flat_map(cut).collect())
+        let mut cuts = other.0.iter().copied().peekable();
+        let mut left = Vec::with_capacity(self.0.len());
+        for &(a, b) in &self.0 {
+            while cuts.next_if(|&(_, y)| y < a).is_some() {}
+            let mut from = u64::from(a);
+            while let Some(&(x, y)) = cuts.peek() {
+                if x > b {
+                    break;
+                }
+                if u64::from(x) > from {
+                    left.push((from as u32, x - 1));
+                }
+                from = from.max(u64::from(y) + 1);
+                if y > b {
+                    break;
+                }
+                cuts.next();
+            }
+            if from <= u64::from(b) {
+                left.push((from as u32, b));
+            }
+        }
+        UidSet(left)
     }
 
     pub fn intersection(&self, other: &UidSet) -> UidSet {
@@ -204,5 +213,25 @@ mod tests {
         assert_eq!(set.union(&holes).to_string(), "1:10,20");
         assert!(set.contains(10) && !set.contains(11) && !holes.contains(4));
         assert_eq!(set.split_first(20), (set.clone(), UidSet::default()));
+    }
+
+    #[test]
+    fn a_subtraction_walks_both_sets_once_whatever_their_runs() {
+        let set = UidSet::parse("1:10,20:30,40,50:4294967295").unwrap();
+        let cut = UidSet::parse("5:25,28,40:60,4294967295").unwrap();
+        assert_eq!(
+            set.without(&cut).to_string(),
+            "1:4,26:27,29:30,61:4294967294"
+        );
+        assert_eq!(set.without(&UidSet::default()), set);
+        assert!(set.without(&set).is_empty());
+        assert!(UidSet::default().without(&set).is_empty());
+        let wide = UidSet::parse("1:4294967295").unwrap();
+        assert!(set.without(&wide).is_empty());
+        assert_eq!(wide.without(&set).to_string(), "11:19,31:39,41:49");
+        let evens: UidSet = (1..=20_000).map(|u| u * 2).collect();
+        let all: UidSet = (1..=40_000).collect();
+        assert_eq!(all.without(&evens).len(), 20_000);
+        assert_eq!(all.intersection(&evens), evens);
     }
 }

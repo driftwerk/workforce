@@ -119,7 +119,13 @@ async fn live_folders_are_made_nested_renamed_and_deleted_only_empty() {
     .unwrap();
     let mailbox = Mailbox::probe(&mut session).await.unwrap();
     let old = mailbox.server_name("Clients/Acme/Old").unwrap();
-    assert_eq!(session.messages_in(&old).await.unwrap(), 1);
+    assert_eq!(
+        MailSession::status(&mut session, &old)
+            .await
+            .unwrap()
+            .messages,
+        1
+    );
     let empty = mailbox.server_name("Clients/Empty").unwrap();
     session.create(&empty).await.unwrap();
     let mailbox = Mailbox::probe(&mut session).await.unwrap();
@@ -158,7 +164,13 @@ async fn live_two_thousand_messages_move_over_several_calls_and_undo() {
     .unwrap();
     assert_eq!(plan["count"], 2_000);
     assert_eq!(plan["sample"].as_array().unwrap().len(), 10);
-    assert_eq!(session.messages_in("INBOX").await.unwrap(), 2_007);
+    assert_eq!(
+        MailSession::status(&mut session, "INBOX")
+            .await
+            .unwrap()
+            .messages,
+        2_007
+    );
 
     let journal = MemoryJournal::default();
     let action = BulkAction::Move {
@@ -183,8 +195,20 @@ async fn live_two_thousand_messages_move_over_several_calls_and_undo() {
         "the first call ran out of time and the job carried on"
     );
     assert_eq!(job.state, JobState::Done);
-    assert_eq!(session.messages_in("News").await.unwrap(), 2_000);
-    assert_eq!(session.messages_in("INBOX").await.unwrap(), 7);
+    assert_eq!(
+        MailSession::status(&mut session, "News")
+            .await
+            .unwrap()
+            .messages,
+        2_000
+    );
+    assert_eq!(
+        MailSession::status(&mut session, "INBOX")
+            .await
+            .unwrap()
+            .messages,
+        7
+    );
 
     bulk::undo(
         &mut session,
@@ -197,8 +221,20 @@ async fn live_two_thousand_messages_move_over_several_calls_and_undo() {
     .unwrap();
     assert_eq!(job.state, JobState::Undone);
     assert_eq!(job.unfound, 0);
-    assert_eq!(session.messages_in("INBOX").await.unwrap(), 2_007);
-    assert_eq!(session.messages_in("News").await.unwrap(), 0);
+    assert_eq!(
+        MailSession::status(&mut session, "INBOX")
+            .await
+            .unwrap()
+            .messages,
+        2_007
+    );
+    assert_eq!(
+        MailSession::status(&mut session, "News")
+            .await
+            .unwrap()
+            .messages,
+        0
+    );
 }
 
 #[tokio::test]
@@ -297,8 +333,20 @@ async fn moved_beside_a_deleted_message(without_move: bool) {
     )
     .await
     .unwrap();
-    assert_eq!(session.messages_in("INBOX").await.unwrap(), 1);
-    assert_eq!(session.messages_in("News").await.unwrap(), 3);
+    assert_eq!(
+        MailSession::status(&mut session, "INBOX")
+            .await
+            .unwrap()
+            .messages,
+        1
+    );
+    assert_eq!(
+        MailSession::status(&mut session, "News")
+            .await
+            .unwrap()
+            .messages,
+        3
+    );
     bulk::undo(
         &mut session,
         &mailbox,
@@ -309,8 +357,20 @@ async fn moved_beside_a_deleted_message(without_move: bool) {
     .await
     .unwrap();
     assert_eq!(job.state, JobState::Undone);
-    assert_eq!(session.messages_in("INBOX").await.unwrap(), 4);
-    assert_eq!(session.messages_in("News").await.unwrap(), 0);
+    assert_eq!(
+        MailSession::status(&mut session, "INBOX")
+            .await
+            .unwrap()
+            .messages,
+        4
+    );
+    assert_eq!(
+        MailSession::status(&mut session, "News")
+            .await
+            .unwrap()
+            .messages,
+        0
+    );
 }
 
 #[tokio::test]

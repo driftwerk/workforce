@@ -66,7 +66,7 @@ pub fn bulk(tool: &str) -> Value {
         "email.delete" => (
             json!({
                 "folder": { "type": "string", "description": IN_FOLDER },
-                "permanent": { "type": "boolean", "description": "Delete the named uids for good instead (irreversible; never by search)" }
+                "permanent": { "type": "boolean", "description": "Delete the named uids for good instead (irreversible; never by search; needs their folder's validity)" }
             }),
             &[],
         ),
@@ -119,11 +119,12 @@ pub fn unsubscribe(leave: bool) -> Value {
                         "type": "object",
                         "properties": {
                             "id": { "type": "string" },
-                            "via": { "type": "string" }
+                            "via": { "type": "string" },
+                            "mixed": { "type": "boolean" }
                         },
                         "required": ["id"]
                     },
-                    "description": "The lists to leave, each with its id and via exactly as email.unsubscribe_lists gave them"
+                    "description": "The lists to leave, each with its id, via and mixed exactly as email.unsubscribe_lists gave them"
                 } }),
             ],
             &["lists"],

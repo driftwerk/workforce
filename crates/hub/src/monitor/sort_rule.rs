@@ -260,12 +260,22 @@ async fn call(monitors: &MonitorTool, input: Value) -> Result<Value, String> {
     }
 }
 
-/// The sort rules among `monitors` (each with its owner), in words, each
-/// with the other monitors that watch the mail it takes.
-pub fn rules_in(monitors: &[(MonitorMeta, Option<String>)]) -> Vec<Value> {
+/// The monitors among `monitors` that are `owner`'s own sort rules, each
+/// with its rule: never another person's, whoever else the caller may see.
+fn owned_by<'a>(
+    monitors: &'a [(MonitorMeta, Option<String>)],
+    owner: &'a str,
+) -> impl Iterator<Item = (&'a MonitorMeta, &'a Option<String>, SortRule)> + 'a {
     monitors
         .iter()
-        .filter_map(|(meta, owner)| SortRule::of(meta).map(|rule| (meta, owner, rule)))
+        .filter(move |(_, theirs)| theirs.as_deref() == Some(owner))
+        .filter_map(|(meta, theirs)| SortRule::of(meta).map(|rule| (meta, theirs, rule)))
+}
+
+/// `owner`'s sort rules among `monitors` (each with its owner), in words,
+/// each with the other monitors that watch the mail it takes.
+pub fn rules_in(monitors: &[(MonitorMeta, Option<String>)], owner: &str) -> Vec<Value> {
+    owned_by(monitors, owner)
         .map(|(meta, owner, rule)| {
             json!({
                 "rule_id": rule.rule_id,
@@ -318,17 +328,23 @@ fn rule_id_of(input: &Value) -> Result<String, String> {
         .ok_or_else(|| "Say which rule: its rule_id from list.".to_string())
 }
 
-/// The sort rule `id` among `monitors`, with its owner: never a monitor of
-/// another shape that took a rule's id.
-fn existing<'a>(
-    monitors: &'a [(MonitorMeta, Option<String>)],
+/// `owner`'s sort rule `id` among `monitors`: never a monitor of another
+/// shape that took a rule's id, nor another person's rule.
+fn existing(
+    monitors: &[(MonitorMeta, Option<String>)],
+    owner: &str,
     id: &str,
-) -> Result<(SortRule, &'a Option<String>), String> {
-    monitors
-        .iter()
-        .filter(|(meta, _)| meta.id == id)
-        .find_map(|(meta, owner)| SortRule::of(meta).map(|rule| (rule, owner)))
+) -> Result<SortRule, String> {
+    owned_by(monitors, owner)
+        .find(|(meta, _, _)| meta.id == id)
+        .map(|(_, _, rule)| rule)
         .ok_or_else(|| format!("There is no sort rule {id}; list them to see their ids."))
+}
+
+/// The person a sort rule call acts for: rules are each person's own.
+fn person() -> Result<String, String> {
+    current_turn_user()
+        .ok_or_else(|| "Sort rules are a person's own, and this call acts for no one.".to_string())
 }
 
 /// Whether the rule's account and folders are there, by a dry run of
@@ -363,20 +379,20 @@ impl SortRulesTool {
     }
 
     async fn run(&self, input: &Value) -> Result<Value, String> {
+        let owner = person()?;
         let monitors = self.monitors.mail_monitors().await;
         match input["action"].as_str().unwrap_or_default() {
             "list" => {
-                let rules = rules_in(&monitors);
+                let rules = rules_in(&monitors, &owner);
                 Ok(json!({ "rules": rules, "count": rules.len() }))
             }
             "propose" => {
                 let mut rule = rule_of(input)?;
-                let owner = match rule.rule_id.is_empty() {
-                    true => current_turn_user(),
-                    false => existing(&monitors, &rule.rule_id)?.1.clone(),
-                };
+                if !rule.rule_id.is_empty() {
+                    existing(&monitors, &owner, &rule.rule_id)?;
+                }
                 let matches_now = checked(&self.tools, &rule).await?;
-                rule.watched_by = rule.watchers(owner.as_deref(), &monitors);
+                rule.watched_by = rule.watchers(Some(&owner), &monitors);
                 let next = match rule.watched_by.is_empty() {
                     true => "Show the person the rule in words; on their yes, save it with email.sort_rule_save, passing `rule` as it is.".to_string(),
                     false => format!(
@@ -397,7 +413,7 @@ impl SortRulesTool {
                     .as_bool()
                     .ok_or("Say whether the rule is on: enabled = true or false.")?;
                 let id = rule_id_of(input)?;
-                let (_, owner) = existing(&monitors, &id)?;
+                existing(&monitors, &owner, &id)?;
                 call(
                     &self.monitors,
                     json!({ "action": "set_enabled", "monitor_id": id, "enabled": enabled, "owner": owner }),
@@ -406,7 +422,7 @@ impl SortRulesTool {
             }
             "remove" => {
                 let id = rule_id_of(input)?;
-                let (_, owner) = existing(&monitors, &id)?;
+                existing(&monitors, &owner, &id)?;
                 call(
                     &self.monitors,
                     json!({ "action": "delete", "monitor_id": id, "owner": owner }),
@@ -476,22 +492,17 @@ impl SortRuleSaveTool {
 
     async fn run(&self, input: &Value) -> Result<Value, String> {
         let rule = rule_of(input)?;
+        let owner = person()?;
         let monitors = self.monitors.mail_monitors().await;
-        let (id, owner) = match rule.rule_id.is_empty() {
-            true => (
-                format!(
-                    "{PREFIX}{}",
-                    &uuid::Uuid::new_v4().simple().to_string()[..12]
-                ),
-                current_turn_user(),
+        let id = match rule.rule_id.is_empty() {
+            true => format!(
+                "{PREFIX}{}",
+                &uuid::Uuid::new_v4().simple().to_string()[..12]
             ),
-            false => (
-                rule.rule_id.clone(),
-                existing(&monitors, &rule.rule_id)?.1.clone(),
-            ),
+            false => existing(&monitors, &owner, &rule.rule_id)?.rule_id,
         };
         let unnamed: Vec<String> = rule
-            .watchers(owner.as_deref(), &monitors)
+            .watchers(Some(&owner), &monitors)
             .into_iter()
             .filter(|w| !rule.watched_by.contains(w))
             .collect();
@@ -699,10 +710,62 @@ mod tests {
             "the owner's own and the hub's, never another person's"
         );
         owned.push((r.monitor("sort-me").monitor, kat));
-        let listed = rules_in(&owned);
+        let listed = rules_in(&owned, "kat");
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0]["owner"], "kat");
         assert_eq!(listed[0]["watched_by"], json!(["boss-mail", "all-mail"]));
+    }
+
+    #[test]
+    fn a_person_sees_and_changes_only_their_own_rules() {
+        let theirs = |id: &str, owner: Option<&str>| {
+            (
+                rule(Then::Archive).monitor(id).monitor,
+                owner.map(str::to_string),
+            )
+        };
+        let monitors = vec![
+            theirs("sort-kat", Some("kat")),
+            theirs("sort-bob", Some("bob")),
+            theirs("sort-hub", None),
+        ];
+        let ids = |owner: &str| -> Vec<Value> {
+            rules_in(&monitors, owner)
+                .into_iter()
+                .map(|r| r["rule_id"].clone())
+                .collect()
+        };
+        assert_eq!(ids("kat"), vec![json!("sort-kat")]);
+        assert_eq!(ids("bob"), vec![json!("sort-bob")]);
+        assert!(ids("admin").is_empty(), "seeing a monitor isn't owning it");
+        assert!(existing(&monitors, "kat", "sort-kat").is_ok());
+        for other in ["sort-bob", "sort-hub"] {
+            assert!(existing(&monitors, "kat", other)
+                .unwrap_err()
+                .contains("no sort rule"));
+        }
+    }
+
+    #[tokio::test]
+    async fn a_rule_call_that_acts_for_no_one_is_refused() {
+        let (_dir, rules, save) = tools();
+        assert!(rules
+            .run(&json!({"action": "list"}))
+            .await
+            .unwrap_err()
+            .contains("acts for no one"));
+        let input = json!({"account": "home", "match": {"from": "x"}, "then": {"do": "archive"}});
+        assert!(save
+            .run(&input)
+            .await
+            .unwrap_err()
+            .contains("acts for no one"));
+    }
+
+    async fn as_kat<T>(work: impl std::future::Future<Output = T>) -> T {
+        workforce_agent::runner::CURRENT_USER_ID
+            .scope("kat".to_string(), work)
+            .await
     }
 
     #[test]
@@ -788,14 +851,16 @@ mod tests {
 
     fn tools() -> (tempfile::TempDir, SortRulesTool, SortRuleSaveTool) {
         let dir = tempfile::tempdir().unwrap();
-        let monitors = Arc::new(MonitorTool::new(
-            Arc::new(MonitorRuntime::new(dir.path().to_path_buf())),
-            None,
-        ));
+        let runtime = Arc::new(MonitorRuntime::new(dir.path().to_path_buf()));
+        let (rules, save) = tools_over(runtime);
+        (dir, rules, save)
+    }
+
+    fn tools_over(runtime: Arc<MonitorRuntime>) -> (SortRulesTool, SortRuleSaveTool) {
+        let monitors = Arc::new(MonitorTool::new(runtime, None));
         let registry = Arc::new(ToolRegistry::new());
         registry.register(Arc::new(DryRun("email.move")));
         (
-            dir,
             SortRulesTool::new(Arc::clone(&monitors), Arc::clone(&registry)),
             SortRuleSaveTool::new(monitors, registry),
         )
@@ -816,9 +881,27 @@ mod tests {
         assert!(rules.approval_requirement().is_none());
     }
 
-    #[tokio::test]
+    /// A person's rule is a member-owned monitor, which only a database
+    /// store keeps.
+    #[tokio::test(flavor = "multi_thread")]
     async fn a_proposed_rule_saves_as_a_monitor_and_lists_back() {
-        let (_dir, rules, save) = tools();
+        use workforce_orchestrator::workflow_store::WorkflowStore;
+        workforce_postgres::test_support::with_test_pool(
+            WorkflowStore::build_pool,
+            |pool| async move {
+                let dir = tempfile::tempdir().unwrap();
+                let runtime = Arc::new(MonitorRuntime::new(dir.path().to_path_buf()));
+                runtime.set_store(WorkflowStore::new(pool).await.unwrap());
+                runtime.reload().await.unwrap();
+                as_kat(a_proposed_rule_saves_and_lists_back(tools_over(runtime))).await;
+            },
+        )
+        .await;
+    }
+
+    async fn a_proposed_rule_saves_and_lists_back(
+        (rules, save): (SortRulesTool, SortRuleSaveTool),
+    ) {
         let proposed = rules
             .run(&json!({
                 "action": "propose", "account": "home",
@@ -854,6 +937,10 @@ mod tests {
 
     #[tokio::test]
     async fn a_rule_to_a_missing_folder_or_on_another_monitor_is_refused() {
+        as_kat(a_rule_on_nothing_or_another_monitor_is_refused()).await;
+    }
+
+    async fn a_rule_on_nothing_or_another_monitor_is_refused() {
         let (_dir, rules, save) = tools();
         let err = rules
             .run(&json!({

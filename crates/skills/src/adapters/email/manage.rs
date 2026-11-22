@@ -18,6 +18,7 @@ use super::bulk::{self, Ask, Budget};
 use super::config::EmailAccountConfig;
 use super::connector::ImapConnector;
 use super::criteria::{folder_named, quoted, validity_of, Selection};
+use super::error::server_said;
 use super::journal::{self, BulkAction, BulkJob, MarkFlag, Origin};
 use super::mailbox::{decoded, Mailbox, Role};
 use super::schemas;
@@ -29,10 +30,15 @@ use super::unsubscribe::{self, Method};
 /// The most recent messages an unsubscribe reads headers from.
 const LIST_SCAN: usize = 2_000;
 
-fn owner() -> String {
+/// The person a bulk call acts for: its jobs are theirs alone.
+fn owner() -> Result<String, String> {
     workforce_agent::runner::CURRENT_USER_ID
         .try_with(String::clone)
-        .unwrap_or_default()
+        .ok()
+        .filter(|user| !user.is_empty())
+        .ok_or_else(|| {
+            "Managing mail in bulk is done for a person, and this call acts for no one.".to_string()
+        })
 }
 
 /// Who is acting: automation when the work descends from a monitor, a
@@ -66,24 +72,26 @@ fn job_of(input: &Value) -> Option<&str> {
     input["job"].as_str().filter(|j| !j.is_empty())
 }
 
-/// The account's live session, its settings, and its mailbox as the server
-/// describes it.
-async fn open<'a>(
-    connector: &'a mut ImapConnector,
+/// Runs `work` on the account's live session, with its settings and its
+/// mailbox as the server describes it. The account's client is lent out of
+/// the connector meanwhile, so the work holds up no other account.
+async fn on_account<T>(
+    connector: &Mutex<ImapConnector>,
     account: &str,
-) -> Result<(Timed<'a>, EmailAccountConfig, Mailbox), String> {
-    let config = connector.resolve_account_config(account).ok_or_else(|| {
-        format!("Email account '{account}' not found — check configured account names")
-    })?;
-    let client = connector
-        .get(Some(account))
+    work: impl AsyncFnOnce(&mut Timed<'_>, &EmailAccountConfig, &Mailbox) -> Result<T, String>,
+) -> Result<T, String> {
+    let mut lent = ImapConnector::lend(connector, account)
         .await
         .map_err(|e| e.to_string())?;
-    let mut session = Timed::new(client);
-    let mailbox = Mailbox::probe(&mut session)
-        .await
-        .map_err(|e| e.to_string())?;
-    Ok((session, config, mailbox))
+    let config = lent.config.clone();
+    let done = async {
+        let mut session = Timed::new(lent.client().await.map_err(|e| e.fenced())?);
+        let mailbox = Mailbox::probe(&mut session).await.map_err(|e| e.fenced())?;
+        work(&mut session, &config, &mailbox).await
+    }
+    .await;
+    connector.lock().await.restore(lent);
+    done
 }
 
 fn budget(config: &EmailAccountConfig) -> Budget {
@@ -253,17 +261,17 @@ async fn delete_for_good(
         plan["permanent"] = json!(true);
         return Ok(fenced(plan, "sample", "email headers"));
     }
-    bulk::open_folder(session, &name, validity, true).await?;
+    let validity = validity.ok_or(
+        "Deleting for good needs the folder's `validity` the uids were read under (a dry run or a read gives it), so no other message is ever removed.",
+    )?;
+    bulk::open_folder(session, &name, Some(validity), true).await?;
     let held = bulk::present(session, &uids).await?;
     if !held.is_empty() {
         session
             .store(&held, "+FLAGS.SILENT (\\Deleted)")
             .await
-            .map_err(|e| e.to_string())?;
-        session
-            .expunge_uids(&held)
-            .await
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| e.fenced())?;
+        session.expunge_uids(&held).await.map_err(|e| e.fenced())?;
     }
     Ok(json!({ "deleted_for_good": held.len(), "folder": decoded(&name) }))
 }
@@ -295,8 +303,7 @@ pub async fn bulk_call(
     let validity = validity_of(input)?;
     let journal = journal::installed();
     let journal = journal.as_deref();
-    let owner = owner();
-    let mut connector = connector.lock().await;
+    let owner = owner()?;
     if let Some(id) = job_of(input) {
         let journal =
             journal.ok_or("This hub keeps no job journal, so there is no job to carry on.")?;
@@ -307,65 +314,50 @@ pub async fn bulk_call(
             .filter(|j| j.account == account)
             .ok_or_else(|| format!("There is no job {id} on {account}."))?;
         resumable(&job, intent, dry_run)?;
-        let (mut session, config, mailbox) = open(&mut connector, account).await?;
-        bulk::run(
-            &mut session,
-            &mailbox,
-            &mut job,
-            budget(&config),
-            Some(journal),
-        )
-        .await?;
-        return Ok(bulk::report(&job));
+        return on_account(connector, account, async |session, config, mailbox| {
+            bulk::run(session, mailbox, &mut job, budget(config), Some(journal)).await?;
+            Ok(bulk::report(&job, true))
+        })
+        .await;
     }
-    let (mut session, config, mailbox) = open(&mut connector, account).await?;
-    if intent == Intent::Trash && input["permanent"].as_bool().unwrap_or(false) {
-        return delete_for_good(&mut session, &mailbox, input, dry_run).await;
-    }
-    let action = action_of(intent, &mailbox, input)?;
-    let selection = Selection::from_input(input)?;
-    if dry_run {
-        let plan = bulk::plan(
-            &mut session,
-            &mailbox,
-            action.source(),
-            &selection,
+    on_account(connector, account, async |session, config, mailbox| {
+        if intent == Intent::Trash && input["permanent"].as_bool().unwrap_or(false) {
+            return delete_for_good(session, mailbox, input, dry_run).await;
+        }
+        let action = action_of(intent, mailbox, input)?;
+        let selection = Selection::from_input(input)?;
+        if dry_run {
+            let plan = bulk::plan(session, mailbox, action.source(), &selection, validity).await?;
+            return Ok(fenced(
+                plan,
+                "sample",
+                &format!("email headers in {account}"),
+            ));
+        }
+        if journal.is_none() && matches!(selection, Selection::Search(_)) {
+            return Err(
+                "Acting on a search needs the hub's job journal so it can be undone, and this hub keeps none; name the messages by uid instead."
+                    .to_string(),
+            );
+        }
+        let ask = Ask {
+            owner: &owner,
+            account,
+            tool: intent.tool(),
+            origin: origin(),
+            selection: &selection,
             validity,
-        )
-        .await?;
-        return Ok(fenced(
-            plan,
-            "sample",
-            &format!("email headers in {account}"),
-        ));
-    }
-    if journal.is_none() && matches!(selection, Selection::Search(_)) {
-        return Err(
-            "Acting on a search needs the hub's job journal so it can be undone, and this hub keeps none; name the messages by uid instead."
-                .to_string(),
-        );
-    }
-    let ask = Ask {
-        owner: &owner,
-        account,
-        tool: intent.tool(),
-        origin: origin(),
-        selection: &selection,
-        validity,
-    };
-    let mut job = bulk::begin(&mut session, &mailbox, action, ask).await?;
-    if job.pending.is_empty() {
-        return Ok(
-            json!({ "handled": 0, "note": format!("No {} matched.", selection.describe()) }),
-        );
-    }
-    bulk::run(&mut session, &mailbox, &mut job, budget(&config), journal).await?;
-    let mut out = bulk::report(&job);
-    if journal.is_none() {
-        out["note"] =
-            json!("Done. This hub keeps no job journal, so it can't be undone with email.undo.");
-    }
-    Ok(out)
+        };
+        let mut job = bulk::begin(session, mailbox, action, ask).await?;
+        if job.pending.is_empty() {
+            return Ok(
+                json!({ "handled": 0, "note": format!("No {} matched.", selection.describe()) }),
+            );
+        }
+        bulk::run(session, mailbox, &mut job, budget(config), journal).await?;
+        Ok(bulk::report(&job, journal.is_some()))
+    })
+    .await
 }
 
 /// What a bulk call does, in words, for its approval card.
@@ -436,8 +428,11 @@ impl Tool for EmailBulkTool {
 
     async fn execute(&self, input: Value) -> Result<ToolResult> {
         let start = Instant::now();
-        if let Some(refused) = refused_write(&self.connector, &input, start).await {
-            return Ok(refused);
+        let counts_only = input["dry_run"].as_bool().unwrap_or(false);
+        if !counts_only {
+            if let Some(refused) = refused_write(&self.connector, &input, start).await {
+                return Ok(refused);
+            }
         }
         Ok(ToolResult::timed(
             bulk_call(&self.connector, &input, self.intent).await,
@@ -460,8 +455,7 @@ async fn undo_call(connector: &Mutex<ImapConnector>, input: &Value) -> Result<Va
     let account = account_of(input)?;
     let journal = journal::installed()
         .ok_or("This hub keeps no job journal, so there is nothing to undo.")?;
-    let owner = owner();
-    let mut connector = connector.lock().await;
+    let owner = owner()?;
     let mut job = match job_of(input) {
         Some(id) => journal.get(&owner, id).await,
         None => journal.latest(&owner, account).await,
@@ -469,16 +463,11 @@ async fn undo_call(connector: &Mutex<ImapConnector>, input: &Value) -> Result<Va
     .map_err(|e| e.to_string())?
     .filter(|j| j.account == account)
     .ok_or_else(|| format!("There is nothing on {account} to undo."))?;
-    let (mut session, config, mailbox) = open(&mut connector, account).await?;
-    bulk::undo(
-        &mut session,
-        &mailbox,
-        &mut job,
-        budget(&config),
-        Some(&*journal),
-    )
-    .await?;
-    Ok(bulk::report(&job))
+    on_account(connector, account, async |session, config, mailbox| {
+        bulk::undo(session, mailbox, &mut job, budget(config), Some(&*journal)).await?;
+        Ok(bulk::report(&job, true))
+    })
+    .await
 }
 
 #[async_trait]
@@ -550,7 +539,7 @@ pub(super) async fn folder_call(
                 );
             }
             for folder in &made {
-                session.create(folder).await.map_err(|e| e.to_string())?;
+                session.create(folder).await.map_err(|e| e.fenced())?;
             }
             let made: Vec<String> = made.iter().map(|f| decoded(f)).collect();
             Ok(json!({ "folder": shown, "created": made }))
@@ -565,26 +554,26 @@ pub(super) async fn folder_call(
                 return Err(why);
             }
             for parent in mailbox.to_create(&to).iter().filter(|p| **p != to) {
-                session.create(parent).await.map_err(|e| e.to_string())?;
+                session.create(parent).await.map_err(|e| e.fenced())?;
             }
-            session
-                .rename(&name, &to)
-                .await
-                .map_err(|e| e.to_string())?;
+            session.rename(&name, &to).await.map_err(|e| e.fenced())?;
             Ok(json!({ "folder": decoded(&to), "renamed_from": shown }))
         }
         FolderOp::Delete => {
             let messages = match mailbox.get(&name) {
-                Some(f) if f.selectable => session
-                    .messages_in(&name)
-                    .await
-                    .map_err(|e| e.to_string())?,
+                Some(f) if f.selectable => {
+                    session
+                        .status(&name)
+                        .await
+                        .map_err(|e| e.fenced())?
+                        .messages
+                }
                 _ => 0,
             };
             if let Some(why) = mailbox.refuse_delete(&name, messages) {
                 return Err(why);
             }
-            session.delete(&name).await.map_err(|e| e.to_string())?;
+            session.delete(&name).await.map_err(|e| e.fenced())?;
             Ok(json!({ "deleted": shown }))
         }
     }
@@ -619,9 +608,10 @@ impl Tool for EmailFolderTool {
         }
         let outcome: Result<Value, String> = async {
             let account = account_of(&input)?;
-            let mut connector = self.connector.lock().await;
-            let (mut session, _, mailbox) = open(&mut connector, account).await?;
-            folder_call(&mut session, &mailbox, self.op, &input).await
+            on_account(&self.connector, account, async |session, _, mailbox| {
+                folder_call(session, mailbox, self.op, &input).await
+            })
+            .await
         }
         .await;
         Ok(ToolResult::timed(outcome, start))
@@ -636,13 +626,13 @@ async fn lists_in(
     input: &Value,
 ) -> Result<Vec<unsubscribe::List>, String> {
     let name = folder(mailbox, folder_named(input, "folder"))?;
-    session.examine(&name).await.map_err(|e| e.to_string())?;
+    session.examine(&name).await.map_err(|e| e.fenced())?;
     let query = match Selection::named(input)? {
         Some(Selection::Uids(uids)) => format!("UID {uids}"),
         Some(Selection::Search(criteria)) => criteria.to_imap(mailbox.caps.gmail)?,
         None => "ALL".to_string(),
     };
-    let uids = session.search(&query).await.map_err(|e| e.to_string())?;
+    let uids = session.search(&query).await.map_err(|e| e.fenced())?;
     let newest: Vec<u32> = uids.iter().rev().take(LIST_SCAN).collect();
     let mut headers = Vec::new();
     for chunk in newest.chunks(bulk::BATCH) {
@@ -651,7 +641,7 @@ async fn lists_in(
             session
                 .headers(&set, unsubscribe::HEADERS)
                 .await
-                .map_err(|e| e.to_string())?,
+                .map_err(|e| e.fenced())?,
         );
     }
     Ok(unsubscribe::lists(&headers))
@@ -675,12 +665,15 @@ impl EmailUnsubscribeTool {
     }
 }
 
-/// A list the person chose to leave, and the way out they were shown.
+/// A list the person chose to leave, the way out they were shown, and
+/// whether they were told its messages disagree on it.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 struct Chosen {
     id: String,
     #[serde(default)]
     via: Option<String>,
+    #[serde(default)]
+    mixed: bool,
 }
 
 impl Chosen {
@@ -690,11 +683,18 @@ impl Chosen {
             Some(via) if !unsubscribe::same_site(&self.id, via) => " — not the list's own domain",
             _ => "",
         };
+        let mixed = match self.mixed {
+            true => " — its messages don't all offer this way out",
+            false => "",
+        };
         match self.via.as_deref() {
             Some(via) if via.contains('@') => {
-                format!("{} (an email to {via}{elsewhere})", self.id)
+                format!("{} (an email to {via}{elsewhere}{mixed})", self.id)
             }
-            Some(via) => format!("{} (a one-click request to {via}{elsewhere})", self.id),
+            Some(via) => format!(
+                "{} (a one-click request to {via}{elsewhere}{mixed})",
+                self.id
+            ),
             None => format!("{} (it offers no way to leave)", self.id),
         }
     }
@@ -712,11 +712,30 @@ fn chosen(input: &Value) -> Vec<Chosen> {
                     Some(Chosen {
                         id: clean(&c.id)?,
                         via: c.via.as_deref().and_then(clean),
+                        mixed: c.mixed,
                     })
                 })
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// Desk's own unsubscribe email from the account to `to`: its subject and
+/// body Desk's words, never the list's.
+fn unsubscribe_message(config: &EmailAccountConfig, to: &str) -> Result<lettre::Message, String> {
+    let person = config
+        .display_name
+        .clone()
+        .filter(|n| !n.trim().is_empty())
+        .unwrap_or_else(|| config.username.clone());
+    lettre::Message::builder()
+        .from(super::tools::build_from_mailbox(config).map_err(|e| e.to_string())?)
+        .to(to
+            .parse()
+            .map_err(|_| "The list's unsubscribe address isn't one.".to_string())?)
+        .subject(unsubscribe::SUBJECT)
+        .body(unsubscribe::request(&person))
+        .map_err(|e| e.to_string())
 }
 
 /// Leaves one list as its headers offer, as the person: a one-click
@@ -732,23 +751,12 @@ async fn leave(
         Method::OneClick { url } => unsubscribe::one_click(url)
             .await
             .map(|_| "unsubscribed with the list's one-click request".to_string()),
-        Method::Mailto { to, subject } => {
-            let person = config
-                .display_name
-                .clone()
-                .filter(|n| !n.trim().is_empty())
-                .unwrap_or_else(|| config.username.clone());
-            let message = lettre::Message::builder()
-                .from(super::tools::build_from_mailbox(config).map_err(|e| e.to_string())?)
-                .to(to
-                    .parse()
-                    .map_err(|_| "The list's unsubscribe address isn't one.".to_string())?)
-                .subject(subject)
-                .body(unsubscribe::request(&person))
-                .map_err(|e| e.to_string())?;
+        Method::Mailto { to } => {
+            let message = unsubscribe_message(config, to)?;
             super::tools::send_staged_email(&message, &message.formatted(), account, config, connector)
                 .await
                 .map(|_| "sent Desk's unsubscribe email from the account (kept in Sent)".to_string())
+                .map_err(|e| server_said(&e))
         }
         Method::None { page: Some(_) } => Err(
             "This list only offers a web page (email.unsubscribe_lists shows it); open it yourself to leave."
@@ -760,23 +768,42 @@ async fn leave(
     }
 }
 
+/// The list `choice` names, when its way out is still the one the person
+/// approved, as they were told it.
+fn approved<'a>(
+    lists: &'a [unsubscribe::List],
+    choice: &Chosen,
+) -> Result<&'a unsubscribe::List, String> {
+    match lists.iter().find(|l| l.id == choice.id) {
+        None => Err("None of the selected messages came from this list.".to_string()),
+        Some(list) if list.method.via() != choice.via => Err(
+            "This list's way out isn't the one the person approved; list it again with email.unsubscribe_lists."
+                .to_string(),
+        ),
+        Some(list) if list.others > 0 && !choice.mixed => Err(
+            "This list's messages don't all offer this way out, and the person wasn't told; list it again with email.unsubscribe_lists and tell them."
+                .to_string(),
+        ),
+        Some(list) => Ok(list),
+    }
+}
+
 async fn unsubscribe_call(
     connector: &Arc<Mutex<ImapConnector>>,
     step: UnsubscribeStep,
     input: &Value,
 ) -> Result<Value, String> {
     let account = account_of(input)?;
-    let (lists, config) = {
-        let mut connector = connector.lock().await;
-        let (mut session, config, mailbox) = open(&mut connector, account).await?;
-        (lists_in(&mut session, &mailbox, input).await?, config)
-    };
+    let (lists, config) = on_account(connector, account, async |session, config, mailbox| {
+        Ok((lists_in(session, mailbox, input).await?, config.clone()))
+    })
+    .await?;
     if step == UnsubscribeStep::Lists {
         let views: Vec<Value> = lists.iter().map(unsubscribe::List::view).collect();
         return Ok(fenced(
             json!({
                 "lists": views,
-                "note": "Show the person each list, how it is left and where to (`via`; `elsewhere` means not the list's own domain). Pass the ones they chose to email.unsubscribe as {id, via}, with the same account, folder and selection."
+                "note": "Show the person each list, how it is left and where to (`via`; `elsewhere` means not the list's own domain; `mixed` means some of its messages offer another way out, which they should know). Pass the ones they chose to email.unsubscribe as {id, via, mixed}, with the same account, folder and selection."
             }),
             "lists",
             &format!("mailing list headers in {account}"),
@@ -791,13 +818,9 @@ async fn unsubscribe_call(
     }
     let mut results = Vec::new();
     for choice in &wanted {
-        let outcome = match lists.iter().find(|l| l.id == choice.id) {
-            None => Err("None of the selected messages came from this list.".to_string()),
-            Some(list) if list.method.via() != choice.via => Err(
-                "This list's way out isn't the one the person approved; list it again with email.unsubscribe_lists."
-                    .to_string(),
-            ),
-            Some(list) => leave(list, account, &config, connector).await,
+        let outcome = match approved(&lists, choice) {
+            Ok(list) => leave(list, account, &config, connector).await,
+            Err(why) => Err(why),
         };
         results.push(match outcome {
             Ok(done) => json!({ "list": choice.id, "done": done }),
@@ -1009,7 +1032,7 @@ mod tests {
                 label: None,
             },
             asked: "1 message".to_string(),
-            validity: 1,
+            validity: Some(1),
             pending: UidSet::default(),
             in_flight: None,
             done: Vec::new(),
@@ -1091,17 +1114,45 @@ mod tests {
         )
         .await
         .is_err());
-        let out = delete_for_good(&mut server, &mailbox, &json!({"uid": 1}), false)
+        let unread = delete_for_good(&mut server, &mailbox, &json!({"uid": 1}), false)
             .await
-            .unwrap();
+            .unwrap_err();
+        assert!(unread.contains("needs the folder's `validity`"), "{unread}");
+        assert_eq!(
+            server.count("INBOX"),
+            3,
+            "nothing goes without its numbering"
+        );
+        let out = delete_for_good(
+            &mut server,
+            &mailbox,
+            &json!({"uid": 1, "validity": 100}),
+            false,
+        )
+        .await
+        .unwrap();
         assert_eq!(out["deleted_for_good"], 1);
         assert_eq!(server.count("INBOX"), 2, "only the named message is gone");
         let old = FakeServer::new(&["MOVE"], &["INBOX"]).mailbox();
-        assert!(
-            delete_for_good(&mut server, &old, &json!({"uid": 2}), false)
-                .await
-                .is_err()
-        );
+        assert!(delete_for_good(
+            &mut server,
+            &old,
+            &json!({"uid": 2, "validity": 100}),
+            false
+        )
+        .await
+        .is_err());
+        server.folders.get_mut("INBOX").unwrap().validity = None;
+        let unnumbered = delete_for_good(
+            &mut server,
+            &mailbox,
+            &json!({"uid": 2, "validity": 100}),
+            false,
+        )
+        .await
+        .unwrap_err();
+        assert!(unnumbered.contains("no UIDVALIDITY"), "{unnumbered}");
+        assert_eq!(server.count("INBOX"), 2);
     }
 
     #[tokio::test]
@@ -1210,5 +1261,121 @@ mod tests {
         assert!(lists.surface_effect(&input).is_none());
         assert!(lists.reads_outside_content());
         assert!(chosen(&json!({"lists": ["bare-id", {"via": "x"}]})).is_empty());
+        let mixed =
+            json!({"lists": [{"id": "news.shop.com", "via": "leave@shop.com", "mixed": true}]});
+        assert!(
+            leave
+                .approval_summary(&mixed)
+                .unwrap()
+                .contains("its messages don't all offer this way out"),
+            "the card says the list's messages disagree"
+        );
+    }
+
+    fn list(via: &str, others: usize) -> unsubscribe::List {
+        unsubscribe::List {
+            id: "news.shop.com".to_string(),
+            name: "Shop".to_string(),
+            messages: 3,
+            method: Method::Mailto {
+                to: via.to_string(),
+            },
+            others,
+        }
+    }
+
+    #[test]
+    fn a_list_is_left_only_the_way_the_person_was_shown() {
+        let choice = |via: &str, mixed: bool| Chosen {
+            id: "news.shop.com".to_string(),
+            via: Some(via.to_string()),
+            mixed,
+        };
+        let agreed = [list("leave@shop.com", 0)];
+        assert!(approved(&agreed, &choice("leave@shop.com", false)).is_ok());
+        assert!(approved(&agreed, &choice("boss@victim.com", false))
+            .unwrap_err()
+            .contains("isn't the one the person approved"));
+        let disputed = [list("leave@shop.com", 1)];
+        assert!(approved(&disputed, &choice("leave@shop.com", false))
+            .unwrap_err()
+            .contains("wasn't told"));
+        assert!(approved(&disputed, &choice("leave@shop.com", true)).is_ok());
+        assert!(approved(&[], &choice("leave@shop.com", true)).is_err());
+    }
+
+    #[test]
+    fn an_unsubscribe_email_is_desks_own_words() {
+        let config: EmailAccountConfig = serde_json::from_value(json!({
+            "imap_host": "imap.invalid",
+            "smtp_host": "smtp.invalid",
+            "username": "kat@home.example",
+            "password": "not-used",
+            "display_name": "Kat",
+        }))
+        .unwrap();
+        let message = unsubscribe_message(&config, "leave@shop.com").unwrap();
+        let raw = String::from_utf8(message.formatted()).unwrap();
+        assert!(raw.contains("Subject: unsubscribe\r\n"), "{raw}");
+        assert!(raw.contains("To: leave@shop.com"), "{raw}");
+        assert!(raw.contains("on behalf of Kat"), "{raw}");
+        assert!(unsubscribe_message(&config, "not an address").is_err());
+    }
+
+    fn bulk_tool(intent: Intent) -> EmailBulkTool {
+        let skill: super::super::EmailSkillConfig = serde_json::from_value(json!({
+            "accounts": { "work": {
+                "imap_host": "imap.invalid", "smtp_host": "smtp.invalid",
+                "username": "kat@work.example", "password": "not-used"
+            }}
+        }))
+        .unwrap();
+        EmailBulkTool::new(Arc::new(Mutex::new(ImapConnector::new(&skill))), intent)
+    }
+
+    #[tokio::test]
+    async fn a_bulk_call_acts_for_a_person_or_not_at_all() {
+        let out = bulk_tool(Intent::Move)
+            .execute(json!({"account": "work", "uid": 1, "to_folder": "News"}))
+            .await
+            .unwrap();
+        assert!(!out.success);
+        assert!(out.error.unwrap().contains("acts for no one"));
+        let undo = EmailUndoTool::new(bulk_tool(Intent::Move).connector)
+            .execute(json!({"account": "work"}))
+            .await
+            .unwrap();
+        assert!(!undo.success);
+    }
+
+    #[tokio::test]
+    async fn a_dry_run_on_an_account_that_only_reads_still_counts() {
+        use workforce_common::credential_pin::{PinSlot, PinSource, TierPin, Writing};
+        struct Work;
+        impl PinSource for Work {
+            fn pin(&self, _: &str) -> TierPin {
+                TierPin::All
+            }
+            fn read_only_instance(&self, connector: &str, instance: &str) -> bool {
+                (connector, instance) == ("email", "work")
+            }
+        }
+        let pins = Arc::new(PinSlot::default());
+        pins.fill(Arc::new(Work));
+        let writing = Writing {
+            connector: "email".into(),
+            pins,
+        };
+        let tool = bulk_tool(Intent::Trash);
+        let call = |input: Value| writing.clone().scope(tool.execute(input));
+        let write = call(json!({"account": "work", "uid": 1})).await.unwrap();
+        assert!(write.error.unwrap().contains("only reads"));
+        let count = call(json!({"account": "work", "uid": 1, "dry_run": true}))
+            .await
+            .unwrap();
+        assert!(
+            !count.error.unwrap_or_default().contains("only reads"),
+            "a dry run changes nothing, so it isn't refused as a write"
+        );
     }
 }

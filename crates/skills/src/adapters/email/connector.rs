@@ -29,8 +29,34 @@ pub struct ImapConnector {
     configs: HashMap<String, EmailAccountConfig>,
     /// Active clients keyed by (account_name, username) for multi-user support.
     clients: HashMap<(String, String), ImapClient>,
+    /// Each client's turn to be lent out, by the same key.
+    turns: HashMap<(String, String), Arc<tokio::sync::Mutex<()>>>,
     default_account: String,
     store: Option<Arc<dyn SecretStore>>,
+}
+
+/// One account's client, lent out of its connector for a call that holds it
+/// long, so the connector serves every other account meanwhile. It is the
+/// account's turn while lent: [`ImapConnector::restore`] gives both back.
+pub struct Lent {
+    key: (String, String),
+    pub config: EmailAccountConfig,
+    client: Option<ImapClient>,
+    _turn: tokio::sync::OwnedMutexGuard<()>,
+}
+
+impl Lent {
+    /// The lent client, connected.
+    pub async fn client(&mut self) -> Result<&mut ImapClient, EmailError> {
+        let client = match self.client.take() {
+            Some(mut client) => {
+                client.ensure_connected().await?;
+                client
+            }
+            None => ImapClient::connect(self.config.clone()).await?,
+        };
+        Ok(self.client.insert(client))
+    }
 }
 
 impl ImapConnector {
@@ -44,6 +70,7 @@ impl ImapConnector {
         Self {
             configs: config.accounts.clone(),
             clients: HashMap::new(),
+            turns: HashMap::new(),
             default_account,
             store: None,
         }
@@ -156,6 +183,43 @@ impl ImapConnector {
     }
 
     /// List all configured account names.
+    /// Lends `account`'s client out of `connector`, once any other call
+    /// that has it lent gave it back: one account's long calls run one at a
+    /// time, and the connector is never held while they wait or run.
+    pub async fn lend(
+        connector: &tokio::sync::Mutex<ImapConnector>,
+        account: &str,
+    ) -> Result<Lent, EmailError> {
+        let (key, config, turn) = {
+            let mut connector = connector.lock().await;
+            let config =
+                connector
+                    .resolve_config(account)
+                    .ok_or_else(|| EmailError::AccountNotFound {
+                        name: account.to_string(),
+                    })?;
+            let key = (account.to_string(), config.username.clone());
+            let turn = Arc::clone(connector.turns.entry(key.clone()).or_default());
+            (key, config, turn)
+        };
+        let turn = turn.lock_owned().await;
+        let client = connector.lock().await.clients.remove(&key);
+        Ok(Lent {
+            key,
+            config,
+            client,
+            _turn: turn,
+        })
+    }
+
+    /// Takes back what [`ImapConnector::lend`] lent, keeping a client made
+    /// for the account meanwhile over the lent one.
+    pub fn restore(&mut self, lent: Lent) {
+        if let Some(client) = lent.client {
+            self.clients.entry(lent.key).or_insert(client);
+        }
+    }
+
     pub fn account_names(&self) -> Vec<&str> {
         self.configs.keys().map(|s| s.as_str()).collect()
     }
@@ -269,6 +333,39 @@ mod tests {
             EmailError::AccountNotFound { name } => assert_eq!(name, "nonexistent"),
             other => panic!("Expected AccountNotFound, got: {other}"),
         }
+    }
+
+    #[tokio::test]
+    async fn an_account_lent_out_holds_up_only_itself() {
+        let connector = tokio::sync::Mutex::new(ImapConnector::new(&test_skill_config()));
+        let work = ImapConnector::lend(&connector, "work").await.unwrap();
+        assert_eq!(work.config.username, "me@work.com");
+        let personal = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            ImapConnector::lend(&connector, "personal"),
+        )
+        .await
+        .expect("another account isn't held up")
+        .unwrap();
+        assert!(
+            connector.try_lock().is_ok(),
+            "nothing holds the connector while lent"
+        );
+        let again = ImapConnector::lend(&connector, "work");
+        tokio::pin!(again);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), &mut again)
+                .await
+                .is_err(),
+            "the same account waits its turn"
+        );
+        connector.lock().await.restore(work);
+        assert!(again.await.is_ok());
+        connector.lock().await.restore(personal);
+        assert!(matches!(
+            ImapConnector::lend(&connector, "nope").await,
+            Err(EmailError::AccountNotFound { .. })
+        ));
     }
 
     #[test]

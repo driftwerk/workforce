@@ -6,6 +6,10 @@ use std::time::Duration;
 
 use mailparse::MailHeaderMap;
 
+/// The subject of every unsubscribe email Desk sends: its own, never one a
+/// list's header asks for.
+pub const SUBJECT: &str = "unsubscribe";
+
 /// The headers an unsubscribe reads.
 pub const HEADERS: &[&str] = &[
     "LIST-UNSUBSCRIBE",
@@ -19,9 +23,8 @@ pub enum Method {
     /// An RFC 8058 POST to an https URL, which unsubscribes with no page to
     /// read.
     OneClick { url: String },
-    /// A message to the list's unsubscribe address, with the subject it
-    /// asks for: some lists read a token there. Its body is Desk's own.
-    Mailto { to: String, subject: String },
+    /// A message to the list's unsubscribe address, in Desk's own words.
+    Mailto { to: String },
     /// Nothing Desk can do for you: the list offers only a web page, or
     /// nothing.
     None { page: Option<String> },
@@ -36,9 +39,32 @@ impl Method {
                 .ok()?
                 .host_str()
                 .map(str::to_ascii_lowercase),
-            Method::Mailto { to, .. } => Some(to.to_ascii_lowercase()),
+            Method::Mailto { to } => Some(to.to_ascii_lowercase()),
             Method::None { .. } => None,
         }
+    }
+
+    pub fn how(&self) -> &'static str {
+        match self {
+            Method::OneClick { .. } => "one_click",
+            Method::Mailto { .. } => "email",
+            Method::None { page: Some(_) } => "web_page_only",
+            Method::None { page: None } => "none",
+        }
+    }
+
+    /// What tells this way out from another: how, and to which host or
+    /// mail domain, so a token a list puts in each message's address or
+    /// link never makes two ways of one.
+    fn way(&self) -> (&'static str, Option<String>) {
+        let to = match self {
+            Method::None { page: Some(page) } => url::Url::parse(page)
+                .ok()
+                .and_then(|u| u.host_str().map(str::to_ascii_lowercase)),
+            Method::Mailto { to } => Some(domain_of(to).to_ascii_lowercase()),
+            other => other.via(),
+        };
+        (self.how(), to)
     }
 }
 
@@ -48,26 +74,29 @@ pub struct List {
     pub name: String,
     pub messages: usize,
     pub method: Method,
+    /// Messages of the list offering another way out than `method`.
+    pub others: usize,
 }
 
 impl List {
-    /// The list as `email.unsubscribe_lists` shows it: how it is left, and
-    /// whether that goes somewhere other than the list's own domain.
+    /// The list as `email.unsubscribe_lists` shows it: how it is left,
+    /// whether that goes somewhere other than the list's own domain, and
+    /// whether its messages disagree on it.
     pub fn view(&self) -> serde_json::Value {
         let via = self.method.via();
-        let (how, page) = match &self.method {
-            Method::OneClick { .. } => ("one_click", None),
-            Method::Mailto { .. } => ("email", None),
-            Method::None { page: Some(page) } => ("web_page_only", Some(page)),
-            Method::None { page: None } => ("none", None),
+        let page = match &self.method {
+            Method::None { page } => page.as_deref(),
+            _ => None,
         };
         serde_json::json!({
             "id": self.id,
             "name": self.name,
             "messages": self.messages,
-            "how": how,
+            "how": self.method.how(),
             "via": via,
             "elsewhere": via.as_deref().is_some_and(|v| !same_site(&self.id, v)),
+            "mixed": self.others > 0,
+            "offering_another_way": self.others,
             "page": page,
         })
     }
@@ -120,28 +149,15 @@ fn percent_decoded(text: &str) -> String {
         .unwrap_or_default()
 }
 
-/// The address and subject a `mailto:` URL asks for.
-pub fn mailto(target: &str) -> Option<(String, String)> {
+/// The address a `mailto:` URL writes to; what else it asks for (a
+/// subject, a body) is the list's words and never used.
+pub fn mailto(target: &str) -> Option<String> {
     let rest = target
         .get(..7)
         .filter(|scheme| scheme.eq_ignore_ascii_case("mailto:"))
         .map(|_| &target[7..])?;
-    let (to, query) = rest.split_once('?').unwrap_or((rest, ""));
-    let to = percent_decoded(to);
-    if !to.contains('@') || to.contains(['\r', '\n', ',']) {
-        return None;
-    }
-    let field = |name: &str| {
-        query
-            .split('&')
-            .filter_map(|pair| pair.split_once('='))
-            .find(|(k, _)| k.eq_ignore_ascii_case(name))
-            .map(|(_, v)| percent_decoded(v).replace(['\r', '\n'], " "))
-    };
-    Some((
-        to,
-        field("subject").unwrap_or_else(|| "unsubscribe".to_string()),
-    ))
+    let to = percent_decoded(rest.split_once('?').map_or(rest, |(to, _)| to));
+    (to.contains('@') && !to.contains(['\r', '\n', ','])).then_some(to)
 }
 
 fn method(unsubscribe: &str, post: Option<&str>) -> Method {
@@ -157,7 +173,7 @@ fn method(unsubscribe: &str, post: Option<&str>) -> Method {
     let mail = targets.iter().find_map(|t| mailto(t));
     match (https, one_click, mail) {
         (Some(url), true, _) => Method::OneClick { url: url.clone() },
-        (_, _, Some((to, subject))) => Method::Mailto { to, subject },
+        (_, _, Some(to)) => Method::Mailto { to },
         _ => Method::None {
             page: targets
                 .iter()
@@ -206,10 +222,30 @@ fn list_of(headers: &[mailparse::MailHeader<'_>]) -> Option<(String, String)> {
     }
 }
 
-/// The lists `headers` (one header block per message) belong to, each with
-/// how to leave it, most messages first.
+/// The way out most of `offers` (one per message offering any, newest
+/// first) agree on, and how many offer another. A tie goes to the way the
+/// older messages offered, so one new message never replaces an
+/// established way out; the newest message of the way taken gives it.
+fn agreed(offers: &[Method]) -> (Method, usize) {
+    let mut ways: BTreeMap<(&'static str, Option<String>), (usize, usize, &Method)> =
+        BTreeMap::new();
+    for (at, offer) in offers.iter().enumerate() {
+        let way = ways.entry(offer.way()).or_insert((0, at, offer));
+        way.0 += 1;
+        way.1 = at;
+    }
+    ways.into_values()
+        .max_by_key(|(agree, oldest, _)| (*agree, *oldest))
+        .map_or((Method::None { page: None }, 0), |(agree, _, offer)| {
+            (offer.clone(), offers.len() - agree)
+        })
+}
+
+/// The lists `headers` (one header block per message, newest first) belong
+/// to, each with the way out most of its messages offer, most messages
+/// first.
 pub fn lists(headers: &[(u32, String)]) -> Vec<List> {
-    let mut by_id: BTreeMap<String, List> = BTreeMap::new();
+    let mut by_id: BTreeMap<String, (String, usize, Vec<Method>)> = BTreeMap::new();
     for (_, block) in headers {
         let Ok((parsed, _)) = mailparse::parse_headers(block.as_bytes()) else {
             continue;
@@ -217,33 +253,30 @@ pub fn lists(headers: &[(u32, String)]) -> Vec<List> {
         let Some((id, name)) = list_of(&parsed) else {
             continue;
         };
-        let found = parsed
-            .get_first_value("List-Unsubscribe")
-            .map(|u| {
-                method(
-                    &u,
-                    parsed.get_first_value("List-Unsubscribe-Post").as_deref(),
-                )
-            })
-            .unwrap_or(Method::None { page: None });
-        let entry = by_id.entry(id.clone()).or_insert_with(|| List {
-            id,
-            name,
-            messages: 0,
-            method: Method::None { page: None },
-        });
-        entry.messages += 1;
-        let better = |m: &Method| match m {
-            Method::OneClick { .. } => 2,
-            Method::Mailto { .. } => 1,
-            Method::None { page: Some(_) } => 0,
-            Method::None { page: None } => -1,
-        };
-        if better(&found) > better(&entry.method) {
-            entry.method = found;
+        let (_, messages, offers) = by_id.entry(id).or_insert((name, 0, Vec::new()));
+        *messages += 1;
+        if let Some(unsubscribe) = parsed.get_first_value("List-Unsubscribe") {
+            let post = parsed.get_first_value("List-Unsubscribe-Post");
+            offers.push(method(&unsubscribe, post.as_deref()));
         }
     }
-    let mut lists: Vec<List> = by_id.into_values().collect();
+    let mut lists: Vec<List> = by_id
+        .into_iter()
+        .map(|(id, (name, messages, offers))| {
+            let offers: Vec<Method> = offers
+                .into_iter()
+                .filter(|m| *m != Method::None { page: None })
+                .collect();
+            let (method, others) = agreed(&offers);
+            List {
+                id,
+                name,
+                messages,
+                method,
+                others,
+            }
+        })
+        .collect();
     lists.sort_by(|a, b| b.messages.cmp(&a.messages).then_with(|| a.id.cmp(&b.id)));
     lists
 }
@@ -317,22 +350,70 @@ mod tests {
     }
 
     #[test]
-    fn a_mailto_gives_its_address_and_subject_never_its_body() {
+    fn a_mailto_gives_its_address_and_nothing_of_the_lists_words() {
         assert_eq!(
             mailto("mailto:leave%40list.com?subject=Unsubscribe%20me&body=please"),
-            Some(("leave@list.com".to_string(), "Unsubscribe me".to_string()))
+            Some("leave@list.com".to_string())
         );
-        assert_eq!(
-            mailto("MAILTO:u@x.com").map(|m| m.1),
-            Some("unsubscribe".to_string())
-        );
+        assert_eq!(mailto("MAILTO:u@x.com"), Some("u@x.com".to_string()));
         assert_eq!(mailto("mailto:a@x.com,b@y.com"), None);
         assert_eq!(mailto("mailto:a@x.com%0D%0ABcc:evil@y.com"), None);
         assert_eq!(mailto("https://x.com"), None);
         assert_eq!(
-            mailto("mailto:a@x.com?subject=hi%0D%0ABcc:%20e@y.com").map(|m| m.1),
-            Some("hi  Bcc: e@y.com".to_string())
+            method("<mailto:a@x.com?subject=Wire%20the%20money>", None),
+            Method::Mailto {
+                to: "a@x.com".to_string()
+            }
         );
+        assert_eq!(SUBJECT, "unsubscribe");
+    }
+
+    #[test]
+    fn one_new_message_never_replaces_the_way_out_the_list_has_offered() {
+        let offer = |unsubscribe: &str| {
+            block(&[
+                "From: Shop <news@shop.com>",
+                "List-Id: Shop News <news.shop.com>",
+                &format!("List-Unsubscribe: {unsubscribe}"),
+            ])
+        };
+        let newest_first = vec![
+            offer("<mailto:boss@victim.com>"),
+            offer("<mailto:leave+3@shop.com>"),
+            offer("<mailto:leave+2@shop.com>"),
+            block(&[
+                "From: Shop <news@shop.com>",
+                "List-Id: Shop News <news.shop.com>",
+            ]),
+        ];
+        let shop = &lists(&newest_first)[0];
+        assert_eq!(shop.messages, 4);
+        assert_eq!(
+            shop.method,
+            Method::Mailto {
+                to: "leave+3@shop.com".to_string()
+            },
+            "the way most messages offer, as the newest of them gives it"
+        );
+        assert_eq!(shop.others, 1);
+        assert_eq!(shop.view()["mixed"], true);
+        assert_eq!(shop.view()["offering_another_way"], 1);
+
+        let tied = vec![
+            offer("<mailto:boss@victim.com>"),
+            offer("<mailto:leave@shop.com>"),
+        ];
+        assert_eq!(
+            lists(&tied)[0].method.via().as_deref(),
+            Some("leave@shop.com"),
+            "a tie keeps the way offered first"
+        );
+        let agreed = vec![
+            offer("<mailto:leave@shop.com>"),
+            offer("<mailto:leave@shop.com>"),
+        ];
+        assert_eq!(lists(&agreed)[0].others, 0);
+        assert_eq!(lists(&agreed)[0].view()["mixed"], false);
     }
 
     #[test]
@@ -384,8 +465,8 @@ mod tests {
             messages: 1,
             method: Method::Mailto {
                 to: "ceo@victim.com".to_string(),
-                subject: "unsubscribe".to_string(),
             },
+            others: 0,
         };
         assert_eq!(list.view()["elsewhere"], true);
     }

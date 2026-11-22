@@ -72,8 +72,13 @@ pub struct Batch {
     pub src: UidSet,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dst: Option<UidSet>,
+    /// The destination's numbering `dst` and `dst_next` are in.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dst_validity: Option<u32>,
+    /// The destination's UIDNEXT before the batch was sent: its copies
+    /// landed at or above it, and nothing below it is one of them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dst_next: Option<u32>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub message_ids: BTreeMap<u32, String>,
 }
@@ -97,6 +102,13 @@ pub enum JobState {
     Undone,
     /// Stopped for good; `BulkJob::stopped` says why.
     Stopped,
+    /// What it did can no longer be put back; `BulkJob::stopped` says why.
+    Irreversible,
+}
+
+impl JobState {
+    /// The states `email.undo` has nothing left to do in.
+    pub const SETTLED: [JobState; 2] = [JobState::Undone, JobState::Irreversible];
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -111,8 +123,10 @@ pub struct BulkJob {
     pub action: BulkAction,
     /// What was asked for, in words.
     pub asked: String,
-    /// The source folder's UIDVALIDITY when the job began.
-    pub validity: u32,
+    /// The source folder's UIDVALIDITY when the job began, when the server
+    /// gave one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub validity: Option<u32>,
     pub pending: UidSet,
     /// The batch sent to the server and not yet known to have landed, kept
     /// first so a call that ends mid-batch is settled before anything else.
@@ -136,17 +150,18 @@ impl BulkJob {
 
     /// Whether `email.undo` with no job named takes this one.
     pub fn undoable(&self) -> bool {
-        self.origin == Origin::Person && self.state != JobState::Undone
+        self.origin == Origin::Person && !JobState::SETTLED.contains(&self.state)
     }
 }
 
 #[async_trait]
 pub trait MailJournal: Send + Sync {
-    /// Keeps `job` as it now stands, replacing what was kept under its id.
+    /// Keeps `job` as it now stands, replacing what was kept under its id;
+    /// refused for a job with no owner or one kept under another.
     async fn save(&self, job: &BulkJob) -> eyre::Result<()>;
     async fn get(&self, owner: &str, id: &str) -> eyre::Result<Option<BulkJob>>;
     /// The owner's most recent job on `account` that they started
-    /// themselves and that is not undone yet.
+    /// themselves and that undo still has work in.
     async fn latest(&self, owner: &str, account: &str) -> eyre::Result<Option<BulkJob>>;
 }
 
@@ -175,7 +190,12 @@ pub(crate) mod memory {
     #[async_trait]
     impl MailJournal for MemoryJournal {
         async fn save(&self, job: &BulkJob) -> eyre::Result<()> {
-            self.0.lock().unwrap().insert(job.id.clone(), job.clone());
+            let mut jobs = self.0.lock().unwrap();
+            eyre::ensure!(!job.owner.is_empty(), "a mail job needs an owner");
+            if let Some(kept) = jobs.get(&job.id).filter(|kept| kept.owner != job.owner) {
+                eyre::bail!("job {} is another person's", kept.id);
+            }
+            jobs.insert(job.id.clone(), job.clone());
             Ok(())
         }
 

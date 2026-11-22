@@ -460,10 +460,6 @@ impl ToolResult {
 mod tool_result_tests {
     use super::*;
 
-    /// An empty lookup is a success carrying a fact, not a failure. It must
-    /// leave `error` unset: the post-turn notice reads exactly that field, and
-    /// an empty result with an error is what told readers to doubt a correct
-    /// "you didn't attach anything".
     #[test]
     fn a_timed_outcome_is_a_success_or_a_failure() {
         let started = std::time::Instant::now();
@@ -474,6 +470,10 @@ mod tool_result_tests {
         assert_eq!(failed.error.as_deref(), Some("no"));
     }
 
+    /// An empty lookup is a success carrying a fact, not a failure. It must
+    /// leave `error` unset: the post-turn notice reads exactly that field, and
+    /// an empty result with an error is what told readers to doubt a correct
+    /// "you didn't attach anything".
     #[test]
     fn empty_is_a_success_that_reports_finding_nothing() {
         let r = ToolResult::empty("no files found in this conversation", 3);

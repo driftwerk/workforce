@@ -453,6 +453,7 @@ const NAMED: &[(&str, bool)] = &[
     ("freeagent.workspaces", true),
     ("freeagent.company", true),
     ("freeagent.profit_and_loss_summary", true),
+    ("email.unsubscribe_lists", true),
 ];
 
 /// Whether connector `tool` only reads. Its name after the connector, split
@@ -495,6 +496,7 @@ mod tests {
             "google.gmail.search",
             "google.chat.messages_list",
             "email.inbox",
+            "email.unsubscribe_lists",
             "slack.read",
             "slack.lookup_user_by_email",
             "datadog.logs_search",
@@ -523,6 +525,7 @@ mod tests {
             "google.gmail.draft_send",
             "email.send",
             "email.rules",
+            "email.unsubscribe",
             "slack.post_message",
             "slack.send",
             "slack.react",
