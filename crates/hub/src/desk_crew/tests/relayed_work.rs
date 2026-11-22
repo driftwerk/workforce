@@ -290,6 +290,58 @@ async fn a_take_hands_the_home_its_sessions_work_and_their_line_waits_for_it_whi
     .await;
 }
 
+/// On devbox: a question VEL-9 asked the home's boss is the person's once
+/// Desk lets that boss go, its grant stopped, though its home still takes.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_question_to_the_homes_boss_is_the_persons_once_desk_lets_the_boss_go() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (crew, d, [vel9, _, _, _]) = devbox(dir.path(), pool).await;
+        let app = super::super::relay::routes(Arc::clone(&crew.state), Arc::clone(&crew));
+        let token = crew.state.auth_token.clone();
+        let out = post(&app, &token, take_on(vel9.id, true)).await;
+        assert_eq!(out["status"], "ok", "{out}");
+        take(&app, &token, json!({})).await;
+        let asked = d
+            .line_call(
+                vel9.id,
+                "ask",
+                &json!({"to": "desk", "text": "Ship VEL-9 now?", "wait_seconds": 60}),
+                Some(Duration::from_millis(10)),
+            )
+            .await
+            .unwrap();
+        let ask: uuid::Uuid = serde_json::from_value(asked["id"].clone()).unwrap();
+
+        let (code, _) = native(
+            &d,
+            "POST",
+            "/api/desk/bosses/stop",
+            json!({"group": "ungrouped", "from": "desk"}),
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK);
+        // Its home took just now: it isn't for not reading that it is given.
+        assert!(crew.home_reads(HOME_DESK));
+        let q = eventually("its question given to the person", async || {
+            d.store()
+                .line_message(ask)
+                .await
+                .unwrap()
+                .filter(|q| q.asked == Some(Asked::Escalated))
+        })
+        .await;
+        assert!(d.charge_of(vel9.id).is_none_or(|c| !c.live()), "let go");
+        assert!(
+            q.escalation
+                .as_ref()
+                .is_some_and(|e| e.why.contains("no longer runs this session")),
+            "{q:?}"
+        );
+    })
+    .await;
+}
+
 /// On devbox: a take is for the home's own boss of a live grant alone.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_take_is_refused_to_any_boss_but_the_grants_own_from_its_home() {
@@ -361,6 +413,7 @@ async fn a_machine_session_gone_quiet_is_said_in_the_check_in_as_one_here_is() {
                         let body = match c.tool.as_str() {
                             WORK_TAKE => json!(Taken {
                                 now: chrono::Utc::now().timestamp_millis(),
+                                after: None,
                                 sessions: vec![super::super::relayed_work::Run {
                                     id,
                                     name: "VEL-9".into(),

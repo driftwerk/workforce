@@ -1605,6 +1605,18 @@ impl Desk {
     }
 
     /// Whether a tool call still waits on the question `ask`.
+    /// Whether a session's call still waits on any of its questions.
+    pub fn asks_waited_on(&self) -> bool {
+        let now = Instant::now();
+        self.0
+            .state
+            .lock()
+            .lines
+            .waiting
+            .values()
+            .any(|until| *until > now)
+    }
+
     fn waited_on_ask(&self, ask: Uuid) -> bool {
         self.0
             .state
