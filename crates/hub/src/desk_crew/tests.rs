@@ -24,16 +24,20 @@ use crate::gateway::GatewayState;
 use crate::serve::AgentService;
 use crate::serve::Compose as _;
 
-const FAST: Timing = Timing {
+pub(super) const FAST: Timing = Timing {
     tick: Duration::from_millis(50),
     coalesce: Duration::from_millis(150),
     minute: Duration::from_millis(100),
 };
 
-const PERSON: &str = "person-1";
+pub(super) const PERSON: &str = "person-1";
 
 /// An agent `id` whose model answers everything with `reply`.
-async fn agent(dir: &Path, id: &str, reply: &str) -> (Arc<AgentService>, wiremock::MockServer) {
+pub(super) async fn agent(
+    dir: &Path,
+    id: &str,
+    reply: &str,
+) -> (Arc<AgentService>, wiremock::MockServer) {
     agent_calling(dir, id, reply, &[]).await
 }
 
@@ -200,7 +204,7 @@ fn all_at_once(toml: &str) -> String {
 }
 
 /// A gateway serving `agents`, each knowing the registry.
-fn hub(agents: &[Arc<AgentService>]) -> Arc<GatewayState> {
+pub(super) fn hub(agents: &[Arc<AgentService>]) -> Arc<GatewayState> {
     let fixture = crate::remote_mcp::testing::fixture(false);
     let map: HashMap<String, Arc<AgentService>> = agents
         .iter()

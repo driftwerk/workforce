@@ -318,18 +318,9 @@ impl GithubClient {
         if !response.status().is_success() {
             return Self::handle_response(response).await;
         }
-        let header_u64 = |name: &str| {
-            response
-                .headers()
-                .get(name)
-                .and_then(|v| v.to_str().ok())
-                .and_then(|v| v.trim().parse::<u64>().ok())
-        };
-        let exhausted = header_u64("x-ratelimit-remaining") == Some(0);
-        let retry_after = retry_after_secs(response.headers()).or_else(|| {
-            header_u64("x-ratelimit-reset")
-                .map(|reset| reset.saturating_sub(Utc::now().timestamp().max(0) as u64))
-        });
+        let headers = response.headers();
+        let exhausted = header_u64(headers, "x-ratelimit-remaining") == Some(0);
+        let retry_after = retry_after_secs(headers).or_else(|| reset_in(headers));
         let mut body = response.json::<Value>().await?;
         let errors = body["errors"].as_array().filter(|e| !e.is_empty());
         let Some(errors) = errors else {
@@ -386,28 +377,7 @@ impl GithubClient {
         if status.is_success() {
             Ok(response.text().await?)
         } else {
-            let retry_after = retry_after_secs(response.headers());
-            let body = response.text().await.unwrap_or_default();
-            let message = serde_json::from_str::<Value>(&body)
-                .ok()
-                .and_then(|v| v["message"].as_str().map(String::from))
-                .unwrap_or(body);
-            match status.as_u16() {
-                401 => Err(eyre!("Authentication failed: {}", message)),
-                403 if retry_after.is_some() => Err(RateLimitedError::new(
-                    format!("Forbidden (rate limit or permissions): {}", message),
-                    retry_after,
-                )
-                .into()),
-                403 => Err(eyre!("Forbidden (rate limit or permissions): {}", message)),
-                404 => Err(eyre!("Not found: {}", message)),
-                429 => Err(RateLimitedError::new(
-                    format!("GitHub API rate limited: {}", message),
-                    retry_after,
-                )
-                .into()),
-                _ => Err(eyre!("GitHub API error ({}): {}", status, message)),
-            }
+            Err(Self::failure(response).await)
         }
     }
 
@@ -423,31 +393,66 @@ impl GithubClient {
             let body = response.json::<Value>().await?;
             Ok(body)
         } else {
-            let retry_after = retry_after_secs(response.headers());
-            let body = response.text().await.unwrap_or_default();
-            let message = serde_json::from_str::<Value>(&body)
-                .ok()
-                .and_then(|v| v["message"].as_str().map(String::from))
-                .unwrap_or(body);
-
-            match status.as_u16() {
-                401 => Err(eyre!("Authentication failed: {}", message)),
-                403 if retry_after.is_some() => Err(RateLimitedError::new(
-                    format!("Forbidden (rate limit or permissions): {}", message),
-                    retry_after,
-                )
-                .into()),
-                403 => Err(eyre!("Forbidden (rate limit or permissions): {}", message)),
-                404 => Err(eyre!("Not found: {}", message)),
-                422 => Err(eyre!("Validation error: {}", message)),
-                429 => Err(RateLimitedError::new(
-                    format!("GitHub API rate limited: {}", message),
-                    retry_after,
-                )
-                .into()),
-                _ => Err(eyre!("GitHub API error ({}): {}", status, message)),
-            }
+            Err(Self::failure(response).await)
         }
+    }
+
+    /// A failed answer's error: a rate limit as [`RateLimitedError`], with
+    /// how long GitHub says to wait ([`limited_for`]).
+    async fn failure(response: reqwest::Response) -> eyre::Report {
+        let status = response.status();
+        let limited = limited_for(response.headers());
+        let body = response.text().await.unwrap_or_default();
+        let message = serde_json::from_str::<Value>(&body)
+            .ok()
+            .and_then(|v| v["message"].as_str().map(String::from))
+            .unwrap_or(body);
+        match (status.as_u16(), limited) {
+            (401, _) => eyre!("Authentication failed: {}", message),
+            (403, Some(retry_after)) => RateLimitedError::new(
+                format!("Forbidden (rate limit or permissions): {}", message),
+                retry_after,
+            )
+            .into(),
+            (403, None) => eyre!("Forbidden (rate limit or permissions): {}", message),
+            (404, _) => eyre!("Not found: {}", message),
+            (422, _) => eyre!("Validation error: {}", message),
+            (429, limited) => RateLimitedError::new(
+                format!("GitHub API rate limited: {}", message),
+                limited.flatten(),
+            )
+            .into(),
+            _ => eyre!("GitHub API error ({}): {}", status, message),
+        }
+    }
+}
+
+/// The header `name` as a number, when it is one.
+fn header_u64(headers: &HeaderMap, name: &str) -> Option<u64> {
+    headers
+        .get(name)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.trim().parse().ok())
+}
+
+/// How long until GitHub's rate limit resets (`x-ratelimit-reset`): 0
+/// once it has.
+fn reset_in(headers: &HeaderMap) -> Option<u64> {
+    header_u64(headers, "x-ratelimit-reset")
+        .map(|reset| reset.saturating_sub(Utc::now().timestamp().max(0) as u64))
+}
+
+/// Whether `headers` say GitHub is rate-limiting the caller, and for how
+/// long when they say: a `Retry-After` (a secondary limit), or the primary
+/// limit spent (`x-ratelimit-remaining: 0`) until it resets.
+fn limited_for(headers: &HeaderMap) -> Option<Option<u64>> {
+    match (
+        retry_after_secs(headers),
+        header_u64(headers, "x-ratelimit-remaining"),
+    ) {
+        (Some(secs), _) => Some(Some(secs)),
+        (None, Some(0)) => Some(reset_in(headers)),
+        _ => None,
     }
 }
 
@@ -688,6 +693,32 @@ mod tests {
             limited.message,
             "Forbidden (rate limit or permissions): You have exceeded a secondary rate limit"
         );
+    }
+
+    #[tokio::test]
+    async fn a_403_with_the_primary_limit_spent_is_typed_until_its_reset() {
+        let spent = |remaining: &str| {
+            let reset = (Utc::now().timestamp() + 120).to_string();
+            reqwest::Response::from(
+                http::Response::builder()
+                    .status(403)
+                    .header("x-ratelimit-remaining", remaining)
+                    .header("x-ratelimit-reset", reset)
+                    .body(r#"{"message":"API rate limit exceeded for user ID 1."}"#)
+                    .unwrap(),
+            )
+        };
+        let err = GithubClient::handle_response(spent("0")).await.unwrap_err();
+        let limited = err
+            .downcast_ref::<RateLimitedError>()
+            .expect("a spent primary limit is a rate limit");
+        assert!(limited
+            .retry_after_secs
+            .is_some_and(|s| (110..=120).contains(&s)));
+        let err = GithubClient::handle_response(spent("12"))
+            .await
+            .unwrap_err();
+        assert!(err.downcast_ref::<RateLimitedError>().is_none());
     }
 
     #[tokio::test]

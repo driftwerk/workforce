@@ -9,6 +9,8 @@
 //!   what is kept, said with when it was read.
 //! - **Held off.** GitHub rate-limiting Desk, nothing is read until it says
 //!   (else [`HOLD`]); not connected, nothing for [`NOT_CONNECTED_FOR`].
+//! - **Once.** One read at a time of each: whoever asks for it meanwhile is
+//!   given that read's answer.
 
 use std::collections::{HashMap, VecDeque};
 use std::future::Future;
@@ -19,6 +21,7 @@ use std::time::{Duration, Instant};
 use chrono::{DateTime, Utc};
 use parking_lot::Mutex;
 use serde_json::{json, Value};
+use tokio::sync::watch;
 
 use super::github::{self, GithubError};
 use super::{AgentService, CrewHub};
@@ -158,6 +161,8 @@ pub(crate) enum Unseen {
     Failed(String),
 }
 
+type Answer<T> = Result<Seen<T>, Unseen>;
+
 /// One answer kept: when it was read and last used.
 #[derive(Debug, Clone)]
 struct Kept<T> {
@@ -180,9 +185,43 @@ impl<T: Clone> Kept<T> {
 /// What is known of GitHub between reads.
 #[derive(Debug, Default)]
 pub(crate) struct GithubSeen {
-    pulls: HashMap<(String, u64), Kept<Pull>>,
-    branches: HashMap<(String, String), Kept<Vec<Listed>>>,
+    pulls: Shelf<(String, u64), Pull>,
+    branches: Shelf<(String, String), Vec<Listed>>,
     gate: Gate,
+}
+
+/// One kind of answer: what is kept of each, and the reads of them being
+/// made, each to be answered to whoever waits on it.
+#[derive(Debug, Default)]
+struct Shelf<K, T> {
+    kept: HashMap<K, Kept<T>>,
+    reading: HashMap<K, watch::Receiver<Option<Answer<T>>>>,
+}
+
+/// Where in what is known one kind of answer is.
+type Side<K, T> = fn(&mut GithubSeen) -> (&mut Shelf<K, T>, &mut Gate);
+
+fn pulls(s: &mut GithubSeen) -> (&mut Shelf<(String, u64), Pull>, &mut Gate) {
+    (&mut s.pulls, &mut s.gate)
+}
+
+fn branches(s: &mut GithubSeen) -> (&mut Shelf<(String, String), Vec<Listed>>, &mut Gate) {
+    (&mut s.branches, &mut s.gate)
+}
+
+/// A read being made of `key`: dropped before it is answered, it is no
+/// longer waited on, and whoever waited reads it again.
+struct Flight<'a, K: Eq + Hash, T> {
+    seen: &'a Mutex<GithubSeen>,
+    on: Side<K, T>,
+    key: K,
+    answer: watch::Sender<Option<Answer<T>>>,
+}
+
+impl<K: Eq + Hash, T> Drop for Flight<'_, K, T> {
+    fn drop(&mut self) {
+        (self.on)(&mut self.seen.lock()).0.reading.remove(&self.key);
+    }
 }
 
 /// Whether GitHub may be read now.
@@ -302,6 +341,65 @@ fn failed<T>(kept: Option<Seen<T>>, error: GithubError) -> Result<Seen<T>, Unsee
     }
 }
 
+/// What `key` answers through `seen`, `on` its kind's shelf: what is kept
+/// when it is `fresh`, else what `read` gets, made a `T` by `of`, when
+/// GitHub may be read now, else what is kept, said held. One read of `key`
+/// at a time: whoever asks meanwhile is given its answer, and reads again
+/// when it is dropped unanswered.
+async fn through<K, T, F>(
+    seen: &Mutex<GithubSeen>,
+    on: Side<K, T>,
+    key: K,
+    fresh: impl Fn(&Kept<T>) -> bool,
+    read: impl FnOnce() -> F,
+    of: impl FnOnce(&Value) -> T,
+    now: Instant,
+) -> Answer<T>
+where
+    K: Eq + Hash + Clone,
+    T: Clone,
+    F: Future<Output = Result<Value, GithubError>>,
+{
+    let answer = loop {
+        let mut waiting = {
+            let mut s = seen.lock();
+            let (shelf, gate) = on(&mut s);
+            match shelf.reading.get(&key) {
+                Some(waiting) => waiting.clone(),
+                None => {
+                    if let Some(answer) = kept_or_read(&mut shelf.kept, gate, &key, &fresh, now)? {
+                        return Ok(answer);
+                    }
+                    let (answer, waiting) = watch::channel(None);
+                    shelf.reading.insert(key.clone(), waiting);
+                    break answer;
+                }
+            }
+        };
+        if let Ok(Some(answer)) = waiting.wait_for(Option::is_some).await.map(|a| a.clone()) {
+            return answer;
+        }
+    };
+    let flight = Flight {
+        seen,
+        on,
+        key,
+        answer,
+    };
+    let got = read().await;
+    let answer = {
+        let mut s = seen.lock();
+        let (shelf, gate) = on(&mut s);
+        gate.learn(&got, now);
+        match got {
+            Ok(got) => Ok(keep(&mut shelf.kept, flight.key.clone(), of(&got), now)),
+            Err(e) => failed(shelf.kept.get(&flight.key).map(|k| k.seen(None)), e),
+        }
+    };
+    flight.answer.send_replace(Some(answer.clone()));
+    answer
+}
+
 /// Pull request `n` of `repo`, through `seen`, read with `read` when GitHub
 /// is to be read at `now`.
 pub(crate) async fn pull<R, F>(
@@ -310,27 +408,23 @@ pub(crate) async fn pull<R, F>(
     repo: &str,
     n: u64,
     now: Instant,
-) -> Result<Seen<Pull>, Unseen>
+) -> Answer<Pull>
 where
     R: Fn(&'static str, Value) -> F,
     F: Future<Output = Result<Value, GithubError>>,
 {
-    let key = (repo.to_string(), n);
-    {
-        let s = &mut *seen.lock();
-        let fresh =
-            |k: &Kept<Pull>| !k.value.open || now.saturating_duration_since(k.read) < PULL_AGAIN;
-        if let Some(answer) = kept_or_read(&mut s.pulls, &mut s.gate, &key, fresh, now)? {
-            return Ok(answer);
-        }
-    }
-    let got = read(github::PR, json!({ "repo": repo, "number": n })).await;
-    let s = &mut *seen.lock();
-    s.gate.learn(&got, now);
-    match got {
-        Ok(got) => Ok(keep(&mut s.pulls, key, Pull::of(n, &got), now)),
-        Err(e) => failed(s.pulls.get(&key).map(|k| k.seen(None)), e),
-    }
+    let fresh =
+        |k: &Kept<Pull>| !k.value.open || now.saturating_duration_since(k.read) < PULL_AGAIN;
+    through(
+        seen,
+        pulls,
+        (repo.to_string(), n),
+        fresh,
+        || read(github::PR, json!({ "repo": repo, "number": n })),
+        |got| Pull::of(n, got),
+        now,
+    )
+    .await
 }
 
 /// The pull request that is `branch`'s work on `repo` (its newest open,
@@ -341,29 +435,22 @@ pub(crate) async fn branch_pull<R, F>(
     repo: &str,
     branch: &str,
     now: Instant,
-) -> Result<Seen<Option<Pull>>, Unseen>
+) -> Answer<Option<Pull>>
 where
     R: Fn(&'static str, Value) -> F,
     F: Future<Output = Result<Value, GithubError>>,
 {
-    let key = (repo.to_string(), branch.to_string());
-    let answered = {
-        let s = &mut *seen.lock();
-        let fresh = |k: &Kept<Vec<Listed>>| now.saturating_duration_since(k.read) < BRANCH_AGAIN;
-        kept_or_read(&mut s.branches, &mut s.gate, &key, fresh, now)?
-    };
-    let listed = match answered {
-        Some(listed) => listed,
-        None => {
-            let got = read(github::BRANCH, json!({ "repo": repo, "branch": branch })).await;
-            let s = &mut *seen.lock();
-            s.gate.learn(&got, now);
-            match got {
-                Ok(got) => keep(&mut s.branches, key, listed_of(&got), now),
-                Err(e) => failed(s.branches.get(&key).map(|k| k.seen(None)), e)?,
-            }
-        }
-    };
+    let fresh = |k: &Kept<Vec<Listed>>| now.saturating_duration_since(k.read) < BRANCH_AGAIN;
+    let listed = through(
+        seen,
+        branches,
+        (repo.to_string(), branch.to_string()),
+        fresh,
+        || read(github::BRANCH, json!({ "repo": repo, "branch": branch })),
+        listed_of,
+        now,
+    )
+    .await?;
     let Some(n) = its_pull(&listed.value) else {
         return Ok(listed.map(|_| None));
     };
@@ -391,18 +478,19 @@ fn listed_of(got: &Value) -> Vec<Listed> {
         .collect()
 }
 
+/// One of GitHub's reads being made.
+type Reading = std::pin::Pin<Box<dyn Future<Output = Result<Value, GithubError>> + Send>>;
+
 impl CrewHub {
-    /// How `service`'s GitHub reads are made: as the person.
+    /// How `service`'s GitHub reads are made: as the person; none without
+    /// one, so nothing is read or learnt of GitHub for anyone.
     fn github_reader(
         &self,
         service: &Arc<AgentService>,
-    ) -> impl Fn(
-        &'static str,
-        Value,
-    ) -> std::pin::Pin<Box<dyn Future<Output = Result<Value, GithubError>> + Send>> {
-        let person = self.person(Some(service)).unwrap_or_default();
+    ) -> Option<impl Fn(&'static str, Value) -> Reading> {
+        let person = self.person(Some(service))?;
         let service = Arc::clone(service);
-        move |name, input| {
+        Some(move |name, input| -> Reading {
             let (person, service) = (person.clone(), Arc::clone(&service));
             Box::pin(async move {
                 workforce_agent::runner::CURRENT_USER_ID
@@ -419,7 +507,7 @@ impl CrewHub {
                     )
                     .await
             })
-        }
+        })
     }
 
     /// Pull request `n` of `repo` as GitHub says, read as the person: a
@@ -430,7 +518,7 @@ impl CrewHub {
         repo: &str,
         n: u64,
     ) -> Option<Pull> {
-        let read = self.github_reader(service);
+        let read = self.github_reader(service)?;
         match pull(&self.github_seen, &read, repo, n, Instant::now()).await {
             Ok(seen) => Some(seen.value),
             Err(e) => {
@@ -449,7 +537,7 @@ impl CrewHub {
         repo: &str,
         branch: &str,
     ) -> Result<Seen<Option<Pull>>, Unseen> {
-        let read = self.github_reader(service);
+        let read = self.github_reader(service).ok_or(Unseen::NotConnected)?;
         branch_pull(&self.github_seen, &read, repo, branch, Instant::now()).await
     }
 
@@ -457,7 +545,7 @@ impl CrewHub {
     #[cfg(test)]
     pub(crate) fn pull_seen(&self, repo: &str, n: u64, p: Pull) {
         keep(
-            &mut self.github_seen.lock().pulls,
+            &mut self.github_seen.lock().pulls.kept,
             (repo.to_string(), n),
             p,
             Instant::now(),
@@ -567,22 +655,24 @@ mod tests {
         assert_eq!(p.held, None, "a minute on, it reads again");
     }
 
-    #[tokio::test]
-    async fn a_rate_limit_stops_every_read_until_github_says() {
+    /// GitHub refusing pull request 9 for its rate limit, as `limited`
+    /// says, between two reads of it.
+    async fn limits_every_read_until_github_says(limited: ResponseTemplate) {
         let server = MockServer::start().await;
         no_writes(&server).await;
-        let pr = |status| {
+        let pr = |template: ResponseTemplate| {
             Mock::given(method("GET"))
                 .and(path("/repos/acme/web/pulls/9"))
-                .respond_with(
-                    ResponseTemplate::new(status)
-                        .insert_header("retry-after", "120")
-                        .set_body_json(json!({"number": 9, "state": "open", "message": "limit"})),
-                )
+                .respond_with(template)
         };
-        pr(200).up_to_n_times(1).expect(1).mount(&server).await;
-        pr(429).up_to_n_times(1).expect(1).mount(&server).await;
-        pr(200).expect(1).mount(&server).await;
+        let open = ResponseTemplate::new(200).set_body_json(json!({"number": 9, "state": "open"}));
+        pr(open.clone())
+            .up_to_n_times(1)
+            .expect(1)
+            .mount(&server)
+            .await;
+        pr(limited).up_to_n_times(1).expect(1).mount(&server).await;
+        pr(open).expect(1).mount(&server).await;
         Mock::given(method("GET"))
             .and(path("/repos/acme/web/pulls/10"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({"state": "open"})))
@@ -611,6 +701,126 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(again.held, None, "past its retry, it reads again");
+    }
+
+    #[tokio::test]
+    async fn a_rate_limit_stops_every_read_until_github_says() {
+        let message = json!({"message": "You have exceeded a secondary rate limit"});
+        limits_every_read_until_github_says(
+            ResponseTemplate::new(429)
+                .insert_header("retry-after", "120")
+                .set_body_json(message),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn a_403_with_the_primary_limit_spent_stops_every_read_until_it_resets() {
+        let reset = (Utc::now().timestamp() + 120).to_string();
+        limits_every_read_until_github_says(
+            ResponseTemplate::new(403)
+                .insert_header("x-ratelimit-remaining", "0")
+                .insert_header("x-ratelimit-reset", reset.as_str())
+                .set_body_json(json!({"message": "API rate limit exceeded for user ID 1."})),
+        )
+        .await;
+    }
+
+    /// A read that counts itself in `reads` and answers pull request
+    /// `number` open after `taking`.
+    fn slow_read(
+        reads: &std::sync::atomic::AtomicUsize,
+        taking: Duration,
+    ) -> impl Fn(&'static str, Value) -> Reading + '_ {
+        move |_, input| {
+            reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Box::pin(async move {
+                tokio::time::sleep(taking).await;
+                Ok(json!({"number": input["number"], "state": "open"}))
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn two_asking_at_once_share_one_read() {
+        let reads = std::sync::atomic::AtomicUsize::new(0);
+        let read = slow_read(&reads, Duration::from_millis(100));
+        let seen = Mutex::new(GithubSeen::default());
+        let t0 = Instant::now();
+        let (a, b) = tokio::join!(
+            pull(&seen, &read, "acme/web", 4, t0),
+            pull(&seen, &read, "acme/web", 4, t0)
+        );
+        assert_eq!(reads.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(a, b);
+        assert!(a.unwrap().value.open);
+        assert!(seen.lock().pulls.reading.is_empty());
+        assert_eq!(seen.lock().gate.reads.len(), 1, "paced once");
+    }
+
+    #[tokio::test]
+    async fn a_read_dropped_unanswered_is_made_by_whoever_waited() {
+        let reads = std::sync::atomic::AtomicUsize::new(0);
+        let read = slow_read(&reads, Duration::from_millis(100));
+        let seen = Mutex::new(GithubSeen::default());
+        let t0 = Instant::now();
+        let dropped = tokio::time::timeout(
+            Duration::from_millis(20),
+            pull(&seen, &read, "acme/web", 4, t0),
+        );
+        let waited = async {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            pull(&seen, &read, "acme/web", 4, t0).await
+        };
+        let (dropped, waited) = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(dropped, waited)
+        })
+        .await
+        .expect("whoever waited isn't left waiting");
+        assert!(dropped.is_err());
+        assert!(waited.unwrap().value.open);
+        assert_eq!(reads.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert!(seen.lock().pulls.reading.is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn with_no_person_nothing_is_read_or_learnt_of_github() {
+        use super::super::tests::{agent, desk, hub, FAST, PERSON};
+        workforce_postgres::test_support::with_test_pool(
+            workforce_desk::store::build_pool,
+            |pool| async move {
+                let dir = tempfile::tempdir().unwrap();
+                let (a, _llm) = agent(dir.path(), "desk", "ok").await;
+                let d = desk(pool, dir.path()).await;
+                let crew = CrewHub::start(
+                    hub(std::slice::from_ref(&a)),
+                    d,
+                    FAST,
+                    tokio_util::sync::CancellationToken::new(),
+                );
+                assert_eq!(
+                    crew.branch_pull(&a, "acme/web", "fix").await,
+                    Err(Unseen::NotConnected)
+                );
+                assert_eq!(crew.pull(&a, "acme/web", 7).await, None);
+                {
+                    let s = crew.github_seen.lock();
+                    assert!(s.gate.not_connected_at.is_none() && s.gate.reads.is_empty());
+                }
+                let dm = a
+                    .sessions
+                    .get_or_create(workforce_common::channels::DESK_CHANNEL, PERSON, "desk")
+                    .unwrap();
+                a.sessions.save(&dm).unwrap();
+                assert_eq!(
+                    crew.branch_pull(&a, "acme/web", "fix").await,
+                    Err(Unseen::NotConnected),
+                    "the person's GitHub isn't connected"
+                );
+                assert_eq!(crew.github_seen.lock().gate.reads.len(), 1, "read as them");
+            },
+        )
+        .await;
     }
 
     #[test]
