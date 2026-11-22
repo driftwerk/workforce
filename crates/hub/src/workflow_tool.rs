@@ -2900,8 +2900,7 @@ mod write_auth_tests {
                         "alice",
                     )
                     .await
-                    .err()
-                    .expect("never handed on");
+                    .expect_err("never handed on");
                 assert_eq!(handed.to_string(), stays);
             },
         )

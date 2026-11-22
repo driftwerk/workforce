@@ -3242,7 +3242,17 @@ async fn a_bank_connects_only_on_a_key_that_reads_and_says_when_its_approval_lap
         .await;
     assert!(lapsed.is_err(), "a bank whose approval lapsed is refused");
 
-    let natwest =
+    // BankSync allows ten requests a minute, and a check makes three; each
+    // step from here is counted as a different caller's, as it is by the
+    // process's limiter, which the test would otherwise spend in one go.
+    fn apart<F: std::future::Future>(
+        who: &str,
+        step: F,
+    ) -> impl std::future::Future<Output = F::Output> {
+        workforce_agent::runner::CURRENT_USER_ID.scope(who.to_string(), step)
+    }
+    let natwest = apart(
+        "first",
         h.c.connect(
             SARAH,
             "bank",
@@ -3250,9 +3260,10 @@ async fn a_bank_connects_only_on_a_key_that_reads_and_says_when_its_approval_lap
             "agent",
             Some("allan"),
             bank(BS_GOOD, "natwest"),
-        )
-        .await
-        .unwrap();
+        ),
+    )
+    .await
+    .unwrap();
     assert_eq!(natwest.account.as_deref(), Some("NatWest"));
     let approval = natwest.approval.expect("an approval date");
     assert!(approval.estimated && !approval.due);
@@ -3282,13 +3293,18 @@ async fn a_bank_connects_only_on_a_key_that_reads_and_says_when_its_approval_lap
         )
         .unwrap();
 
-    let tested = h.c.test(SARAH, "bank", &natwest.id).await.unwrap();
+    let tested = apart("second", h.c.test(SARAH, "bank", &natwest.id))
+        .await
+        .unwrap();
     assert_eq!(stamp(), long_ago, "a Test moves nothing");
     let lapsed = tested.approval.unwrap();
     assert!(lapsed.due && lapsed.days_left < 0);
-    h.c.reconnect(SARAH, "bank", &natwest.id, bank(BS_GOOD, "natwest"))
-        .await
-        .unwrap();
+    apart(
+        "third",
+        h.c.reconnect(SARAH, "bank", &natwest.id, bank(BS_GOOD, "natwest")),
+    )
+    .await
+    .unwrap();
     assert_eq!(stamp(), long_ago, "nor does a new key");
     let key = natwest.id.rsplit('~').next().unwrap().to_string();
     h.c.keep(
@@ -3306,7 +3322,9 @@ async fn a_bank_connects_only_on_a_key_that_reads_and_says_when_its_approval_lap
         "nor a setup run again, which keeps it the same way"
     );
 
-    let renewed = h.c.renew(SARAH, "bank", &natwest.id).await.unwrap();
+    let renewed = apart("fourth", h.c.renew(SARAH, "bank", &natwest.id))
+        .await
+        .unwrap();
     assert_ne!(stamp(), long_ago, "the person's renewal does");
     assert_eq!(renewed.approval.unwrap().days_left, 90);
 

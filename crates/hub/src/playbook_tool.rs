@@ -998,8 +998,7 @@ mod tests {
                         "alice",
                     )
                     .await
-                    .err()
-                    .expect("never handed on");
+                    .expect_err("never handed on");
                 assert_eq!(handed.to_string(), stays);
                 assert!(store
                     .get("demo", KIND_PLAYBOOK, Some("bob"))

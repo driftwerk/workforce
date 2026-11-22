@@ -6814,9 +6814,12 @@ mod tests {
             Err(crate::personal_access::JOB_OFF_DESK.to_string()),
             "never a room"
         );
-        let id = post(Some(dm()), &["bank", "linear.issue_get"])
-            .await
-            .unwrap();
+        assert_eq!(
+            post(Some(dm()), &["bank", "linear.issue_get"]).await,
+            Err(crate::personal_access::ONLY_BANK.to_string()),
+            "not even a read of another service"
+        );
+        let id = post(Some(dm()), &["bank", "bank.balances"]).await.unwrap();
 
         let put = |tools: &[&str]| JobEdit {
             tools: Some(tools.iter().map(|t| t.to_string()).collect()),
@@ -6833,7 +6836,7 @@ mod tests {
         let kept = sched.get_job(&id).await.unwrap();
         assert!(matches!(
             &kept.payload,
-            JobPayload::AgentTurn { tools: Some(t), .. } if t == &["bank", "linear.issue_get"]
+            JobPayload::AgentTurn { tools: Some(t), .. } if t == &["bank", "bank.balances"]
         ));
         let off_bank = sched.update_job(&id, put(&["messaging.send"]), "ann").await;
         assert!(matches!(off_bank, Ok(Some(_))), "without the bank, as ever");
