@@ -22,7 +22,7 @@ use uuid::Uuid;
 use serde_json::Value;
 
 use crate::computer::boss;
-use crate::computer::policy::sends_to_people;
+use crate::computer::policy::always_asks;
 use crate::engine::{Deliver, Engine};
 use crate::model::{text_enum, Origin, PendingApproval, Request, SessionState, SessionView};
 use crate::scope::{sees, Scope};
@@ -39,8 +39,11 @@ text_enum!(How {
 text_enum!(ReleasedBy {
     // The person took it back.
     Person => "person",
-    // Its boss let it go (or Desk did, for a boss gone).
+    // Its boss let it go, or Desk did for a boss gone: no longer the boss's
+    // to close.
     Boss => "boss",
+    // Its boss let it go because its work was done.
+    Done => "done",
 });
 
 /// Who drives a charged session now.
@@ -130,6 +133,17 @@ impl Charge {
     /// Whether a boss runs it now: it hasn't been released.
     pub fn live(&self) -> bool {
         self.released_at.is_none()
+    }
+
+    /// Whether the person took it back from its boss.
+    pub fn taken_back(&self) -> bool {
+        self.released_by == Some(ReleasedBy::Person)
+    }
+
+    /// Whether its boss may still end it: it runs it, or let it go as done.
+    pub fn closable_by_boss(&self) -> bool {
+        matches!(self.how, How::Started | How::Handed)
+            && (self.live() || self.released_by == Some(ReleasedBy::Done))
     }
 }
 
@@ -785,7 +799,7 @@ pub fn answerable(
         } => {
             let named = format!("{server} · {tool}");
             let dotted = format!("{}.{tool}", server.rsplit('_').next().unwrap_or(server));
-            let sends = sends_to_people(&dotted)
+            let sends = always_asks(&dotted) == Some(workforce_core::computer::Why::SendsToPeople)
                 || ["post", "send", "reply", "invite", "share"]
                     .iter()
                     .any(|w| tool.contains(w));

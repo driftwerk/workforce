@@ -39,6 +39,7 @@ mod crew_store;
 mod cwd;
 pub mod decision;
 pub mod decision_store;
+pub mod deps;
 mod devin;
 mod devin_config;
 pub mod directive;
@@ -57,6 +58,7 @@ pub mod grant_store;
 pub mod handoff;
 pub mod holder;
 pub mod identity;
+pub mod issues;
 pub mod knows;
 mod knows_api;
 pub mod knows_collect;
@@ -151,10 +153,11 @@ pub use service::{
 };
 pub use service::{check_hub_id, check_hub_url, hub_id_for_url, LinkBoard};
 pub use service::{
-    local_agent_item, session_item, Clearing, Desk, DeskError, Floor, Group, Hidden, HolderOptions,
-    Import, Imported, KeptSession, Layout, LedgerPage, LineError, MemoryHitView, MemorySearch,
-    NewTerminal, Options, Removal, Removed, RestorePolicy, Sender as LineSender, SessionMcp,
-    SessionMemory, SpendQuery, TerminalPatch, TerminalState, TerminalView, Ungrouped, UNGROUPED,
+    local_agent_item, session_item, Clearing, Closing, Desk, DeskError, Floor, Group, Hidden,
+    HolderOptions, Import, Imported, KeptSession, Layout, LedgerPage, LineError, MemoryHitView,
+    MemorySearch, NewTerminal, Options, Removal, Removed, RestorePolicy, Sender as LineSender,
+    SessionMcp, SessionMemory, SpendQuery, TerminalPatch, TerminalState, TerminalView, Ungrouped,
+    UNGROUPED,
 };
 pub use service::{AccountAnswer, AccountMoment, AccountRead};
 pub use service::{

@@ -652,6 +652,37 @@ fn unread_inbox(
     }
 }
 
+/// The account a write names that only reads for this agent, refused in
+/// words: `account` (or the default) and, for a forward, `send_from`. Each
+/// account takes writes on its own (`email:work` read only, `home` not).
+fn read_only_account(names: &[String], default: &str, input: &serde_json::Value) -> Option<String> {
+    let clients: HashMap<String, ()> = names.iter().map(|n| (n.clone(), ())).collect();
+    let account = input["account"].as_str();
+    [account, input["send_from"].as_str().or(account)]
+        .into_iter()
+        .find_map(|requested| {
+            workforce_agent::llm::environment::resolve_instance(
+                "email", requested, default, &clients,
+            )
+            .err()
+        })
+        .map(|refused| refused.message)
+}
+
+/// [`read_only_account`] for a write tool's call, as its failure.
+async fn refused_write(
+    connector: &tokio::sync::Mutex<ImapConnector>,
+    input: &serde_json::Value,
+    start: std::time::Instant,
+) -> Option<ToolResult> {
+    let (names, default) = {
+        let c = connector.lock().await;
+        (c.resolve_account_names(), c.default_account().to_string())
+    };
+    read_only_account(&names, &default, input)
+        .map(|said| ToolResult::failure(said, start.elapsed().as_millis() as u64))
+}
+
 /// Fetch inbox messages for a single account.
 async fn fetch_inbox_for_account(
     connector: &mut ImapConnector,
@@ -2105,6 +2136,9 @@ impl Tool for EmailSendTool {
 
     async fn execute(&self, input: serde_json::Value) -> Result<ToolResult> {
         let start = std::time::Instant::now();
+        if let Some(refused) = refused_write(&self.connector, &input, start).await {
+            return Ok(refused);
+        }
 
         // ── Parse required parameters ────────────────────────────────
         let to_str = match input["to"].as_str() {
@@ -2501,6 +2535,9 @@ impl Tool for EmailDraftTool {
 
     async fn execute(&self, input: serde_json::Value) -> Result<ToolResult> {
         let start = std::time::Instant::now();
+        if let Some(refused) = refused_write(&self.connector, &input, start).await {
+            return Ok(refused);
+        }
 
         let to_str = match input["to"].as_str() {
             Some(t) if !t.trim().is_empty() => t,
@@ -2793,6 +2830,9 @@ impl Tool for EmailMarkTool {
 
     async fn execute(&self, input: serde_json::Value) -> Result<ToolResult> {
         let start = std::time::Instant::now();
+        if let Some(refused) = refused_write(&self.connector, &input, start).await {
+            return Ok(refused);
+        }
 
         let account = match input["account"].as_str() {
             Some(a) => a,
@@ -2936,6 +2976,9 @@ impl Tool for EmailMoveTool {
 
     async fn execute(&self, input: serde_json::Value) -> Result<ToolResult> {
         let start = std::time::Instant::now();
+        if let Some(refused) = refused_write(&self.connector, &input, start).await {
+            return Ok(refused);
+        }
 
         let account = match input["account"].as_str() {
             Some(a) => a,
@@ -3102,6 +3145,9 @@ impl Tool for EmailArchiveTool {
 
     async fn execute(&self, input: serde_json::Value) -> Result<ToolResult> {
         let start = std::time::Instant::now();
+        if let Some(refused) = refused_write(&self.connector, &input, start).await {
+            return Ok(refused);
+        }
 
         let account = match input["account"].as_str() {
             Some(a) => a,
@@ -3277,6 +3323,9 @@ impl Tool for EmailDeleteTool {
 
     async fn execute(&self, input: serde_json::Value) -> Result<ToolResult> {
         let start = std::time::Instant::now();
+        if let Some(refused) = refused_write(&self.connector, &input, start).await {
+            return Ok(refused);
+        }
 
         let account = match input["account"].as_str() {
             Some(a) => a,
@@ -3563,6 +3612,9 @@ impl Tool for EmailForwardTool {
 
     async fn execute(&self, input: serde_json::Value) -> Result<ToolResult> {
         let start = std::time::Instant::now();
+        if let Some(refused) = refused_write(&self.connector, &input, start).await {
+            return Ok(refused);
+        }
 
         // ── Parse required parameters ────────────────────────────────
         let MessageLocator {
@@ -4020,6 +4072,12 @@ impl Tool for EmailConfirmTool {
             ));
         }
 
+        // The account may have been made read only since it was staged.
+        let from = serde_json::json!({ "account": staged_email.account_name });
+        if let Some(refused) = refused_write(&self.connector, &from, start).await {
+            return Ok(refused);
+        }
+
         let result = send_staged_email(
             &staged_email.message,
             &staged_email.raw_message,
@@ -4390,6 +4448,119 @@ impl Tool for EmailRulesTool {
 
 #[cfg(test)]
 mod tests {
+    /// An email staged from `work` isn't sent once `work` only reads.
+    #[tokio::test]
+    async fn a_staged_email_is_not_sent_once_its_account_only_reads() {
+        use std::sync::Arc;
+        use workforce_agent::tools::Tool as _;
+        use workforce_common::credential_pin::{PinSlot, PinSource, TierPin, Writing};
+        struct Work;
+        impl PinSource for Work {
+            fn pin(&self, _: &str) -> TierPin {
+                TierPin::All
+            }
+            fn read_only_instance(&self, connector: &str, instance: &str) -> bool {
+                (connector, instance) == ("email", "work")
+            }
+        }
+        let config: super::super::config::EmailAccountConfig =
+            serde_json::from_value(serde_json::json!({
+                "imap_host": "imap.invalid",
+                "smtp_host": "smtp.invalid",
+                "username": "sarah@acme.example",
+                "password": "not-used",
+            }))
+            .unwrap();
+        let message = lettre::Message::builder()
+            .from("sarah@acme.example".parse().unwrap())
+            .to("bob@acme.example".parse().unwrap())
+            .subject("Invoice")
+            .body(String::from("Attached."))
+            .unwrap();
+        let staged = super::StagedEmail {
+            raw_message: message.formatted(),
+            message,
+            account_name: "work".into(),
+            config,
+            preview: super::EmailPreview {
+                to: vec!["bob@acme.example".into()],
+                cc: vec![],
+                bcc: vec![],
+                subject: "Invoice".into(),
+                body_preview: "Attached.".into(),
+                unknown_recipients: vec![],
+            },
+            staged_at: chrono::Utc::now(),
+            flags: vec![],
+        };
+        let store: super::StagedEmailStore = Default::default();
+        store.lock().await.insert("c1".into(), staged);
+        let skill: super::super::config::EmailSkillConfig =
+            serde_json::from_value(serde_json::json!({ "accounts": {} })).unwrap();
+        let connector = Arc::new(tokio::sync::Mutex::new(super::ImapConnector::new(&skill)));
+        let confirm = super::EmailConfirmTool::new(connector, store);
+        let pins = Arc::new(PinSlot::default());
+        pins.fill(Arc::new(Work));
+        let writing = Writing {
+            connector: "email".into(),
+            pins,
+        };
+        let result = writing
+            .scope(confirm.execute(serde_json::json!({ "confirmation_id": "c1" })))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        let said = result.error.unwrap_or_default();
+        assert!(said.contains("only reads"), "{said}");
+    }
+
+    #[tokio::test]
+    async fn a_write_to_a_read_only_account_is_refused_and_the_other_takes_it() {
+        use std::sync::Arc;
+        use workforce_common::credential_pin::{PinSlot, PinSource, TierPin, Writing};
+        struct Work;
+        impl PinSource for Work {
+            fn pin(&self, _: &str) -> TierPin {
+                TierPin::All
+            }
+            fn read_only_instance(&self, connector: &str, instance: &str) -> bool {
+                (connector, instance) == ("email", "work")
+            }
+        }
+        let pins = Arc::new(PinSlot::default());
+        pins.fill(Arc::new(Work));
+        let writing = Writing {
+            connector: "email".into(),
+            pins,
+        };
+        let names = ["home".to_string(), "work".to_string()];
+        let ask = |input: serde_json::Value| {
+            let writing = writing.clone();
+            let names = names.clone();
+            async move {
+                writing
+                    .scope(async move { super::read_only_account(&names, "work", &input) })
+                    .await
+            }
+        };
+        let refused = ask(serde_json::json!({"account": "work"})).await.unwrap();
+        assert!(refused.contains("only reads"), "{refused}");
+        // The default is `work`: a call naming none is refused too.
+        assert!(ask(serde_json::json!({})).await.is_some());
+        assert_eq!(ask(serde_json::json!({"account": "home"})).await, None);
+        // A forward sent from `work` is a write through it.
+        assert!(
+            ask(serde_json::json!({"account": "home", "send_from": "work"}))
+                .await
+                .is_some()
+        );
+        // Outside a write, nothing is refused.
+        assert_eq!(
+            super::read_only_account(&names, "work", &serde_json::json!({"account": "work"})),
+            None
+        );
+    }
+
     #[test]
     fn an_inbox_that_could_not_be_read_is_a_failure_not_an_empty_one() {
         use super::unread_inbox;

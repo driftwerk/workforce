@@ -2,3 +2,7 @@
 # (crates/hub/src/desk_chrome/protocol-v1.json), made up and public by
 # nature; later commits name no key at all.
 feac6f68038b4c68dadc336426fbd2a0b09eea21:crates/hub/src/desk_chrome/protocol-v1.json:generic-api-key:8
+
+# A macOS test's made-up install run marker (DESK_DEPS_RUN=tok) in
+# crates/desk/src/procs.rs, no secret; later commits name it run-1.
+90904d6dc51612f6b228282beac4f6e5477b2d0f:crates/desk/src/procs.rs:generic-api-key:308

@@ -66,6 +66,53 @@ pub(crate) fn install_desk_for_test(desk: Desk) -> bool {
     DESK.set(desk).is_ok()
 }
 
+/// A local agent's documents folder, `<workspace>/documents`, made where it
+/// isn't yet: where it keeps invoices, statements and the files it makes or
+/// downloads for the person. Inside its workspace, so its file tools reach
+/// it; keyed by its id, so a rename keeps it. A `documents` that is a link,
+/// or not a folder, is refused: it could lead anywhere.
+pub(crate) fn documents(workspace: &std::path::Path) -> Option<std::path::PathBuf> {
+    let dir = workspace.join("documents");
+    if std::fs::symlink_metadata(&dir).is_err() {
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            tracing::warn!(dir = %dir.display(), error = %e, "an agent's documents folder couldn't be made");
+            return None;
+        }
+    }
+    documents_kept(workspace)
+}
+
+/// [`documents`] where it is made already, a real folder: none is made.
+pub(crate) fn documents_kept(workspace: &std::path::Path) -> Option<std::path::PathBuf> {
+    let dir = workspace.join("documents");
+    match std::fs::symlink_metadata(&dir) {
+        Ok(m) if m.file_type().is_dir() => Some(dir),
+        Ok(_) => {
+            tracing::warn!(dir = %dir.display(), "an agent's documents folder is a link or a file, so it isn't used");
+            None
+        }
+        Err(_) => None,
+    }
+}
+
+/// The context's line naming the agent's documents folder, where it is
+/// made: never made here, on every prompt.
+pub(crate) fn documents_line(workspace: &std::path::Path) -> Option<String> {
+    documents_kept(workspace).map(|dir| {
+        format!(
+            "- Your documents folder is {}. Keep invoices, statements and files you make or download for the person there.",
+            dir.display()
+        )
+    })
+}
+
+/// Whether this hub might be a machine's ([`may_be_machine`]): unless
+/// Desk's helper said it is the person's own computer, it is taken to be
+/// one, so nothing that is the person's own is given out on a machine.
+pub(crate) fn machine(config: &workforce_common::settings::WorkforceConfig) -> bool {
+    may_be_machine(&config.desk)
+}
+
 /// Gives `service` the `desk.*` tools when desk sessions are on. Called for
 /// every agent at boot and for agents spawned later.
 pub fn register_tools(service: &AgentService) {
@@ -1171,6 +1218,21 @@ pub async fn mount(
     let (board_sync, board_sync_routes) = crate::desk_board_sync::install(state, desk.clone());
     board_sync.start(cancel_sync.clone());
     let app = app.merge(crate::gateway::hardened(board_sync_routes));
+    // Sessions' Linear and Jira: through this computer's board links, or,
+    // on a machine, through Desk on the person's Mac.
+    let issues_routes = match is_machine(&config.desk) {
+        true => {
+            let issues = crate::desk_issues::MachineIssues::new(Arc::clone(&crew.native));
+            desk.issues_with(Arc::clone(&issues) as _);
+            crate::desk_issues::machine_routes(Arc::clone(state), issues)
+        }
+        false => {
+            let issues = crate::desk_issues::HomeIssues::new(Arc::clone(&board_sync));
+            desk.issues_with(Arc::clone(&issues) as _);
+            crate::desk_issues::home_routes(Arc::clone(state), issues)
+        }
+    };
+    let app = app.merge(crate::gateway::hardened(issues_routes));
     let app = app.merge(crate::desk_ticket_files::install(Arc::clone(&board_sync)));
     let app = app.merge(crate::desk_ticket_comments::install(Arc::clone(
         &board_sync,
@@ -1183,7 +1245,8 @@ pub async fn mount(
         });
     knows_sync.start(cancel_sync);
     let app = app.merge(crate::gateway::hardened(knows_routes));
-    Ok(app.merge(workforce_desk::router(
+    let native = Arc::clone(&crew.native);
+    let app = app.merge(workforce_desk::router(
         desk,
         Arc::new(SystemAdmins(Arc::clone(state))),
         Arc::new(voice),
@@ -1210,7 +1273,14 @@ pub async fn mount(
                 }),
         }),
         crew,
-    )))
+    ));
+    // On a machine, Desk's native side reaching it by any route is seen,
+    // so a Desk that never asks for its sessions' issue calls is known to
+    // be older.
+    Ok(match is_machine(&config.desk) {
+        true => crate::desk_crew::relay::noting_native(app, state.auth_token.clone(), native),
+        false => app,
+    })
 }
 
 #[cfg(test)]

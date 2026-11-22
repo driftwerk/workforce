@@ -305,6 +305,28 @@ pub enum SessionMode {
     Pinned,
 }
 
+/// A job the hub keeps for a person rather than one they asked for (a
+/// bank's approval watch): owned by them, answering where `deliver_to`
+/// says, and never capped, as it lasts while what it watches does.
+#[derive(Debug, Clone)]
+pub struct HubJob {
+    /// What the person's job list calls it; they may rename it.
+    pub name: String,
+    pub description: String,
+    pub schedule: Schedule,
+    pub payload: JobPayload,
+    pub deliver_to: DeliveryTarget,
+}
+
+/// A job's whole answer when it has nothing to tell anyone: the scheduler
+/// delivers nothing of it.
+pub const NOTHING_TO_SAY: &str = "NOTHING_TO_SAY";
+
+/// Whether `answer` is a job's [`NOTHING_TO_SAY`].
+pub fn says_nothing(answer: &str) -> bool {
+    answer.trim().trim_matches(['`', '*', '.']) == NOTHING_TO_SAY
+}
+
 /// The edits [`Scheduler::update_job`] applies; an unset field is left as it
 /// is.
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -627,6 +649,19 @@ impl JobPayload {
             Self::Reminder { user_id, .. } => Some(user_id),
             Self::Consolidation { identity_id } => identity_id.as_deref(),
             Self::WorkflowStart { .. } | Self::MonitorSweep | Self::CrewSummary { .. } => None,
+        }
+    }
+
+    /// What the payload says to the agent or the person, when it says
+    /// anything.
+    pub fn words(&self) -> Option<&str> {
+        match self {
+            Self::SystemEvent { text, .. } | Self::Reminder { text, .. } => Some(text),
+            Self::AgentTurn { message, .. } => Some(message),
+            Self::WorkflowStart { .. }
+            | Self::MonitorSweep
+            | Self::Consolidation { .. }
+            | Self::CrewSummary { .. } => None,
         }
     }
 

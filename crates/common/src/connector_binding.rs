@@ -6,6 +6,7 @@
 //! [skills]
 //! enabled        = ["linear", "github", "jira"]  # present: only these connectors' tools reach it
 //! read_only      = ["github", "jira:globex"]     # a connector's writes are hidden; one connection's are refused
+//! writable       = ["freeagent:harbor"]          # a connector that starts read only takes writes here
 //! own_credential = ["linear"]                    # "its own connection"; the rest use "my connection"
 //!
 //! [skills.connections]
@@ -34,8 +35,22 @@ type Table = toml::map::Map<String, Value>;
 /// each agent's Connectors tab. Every other built-in adapter (`browser`,
 /// `xero`, …) is not chosen per agent and always reaches it.
 pub const CONNECTORS: &[&str] = &[
-    "github", "google", "email", "jira", "linear", "slack", "datadog", "metabase",
+    "github",
+    "google",
+    "email",
+    "jira",
+    "linear",
+    "slack",
+    "datadog",
+    "metabase",
+    "freeagent",
+    "bank",
 ];
+
+/// The connectors that read a person's own private life (their bank): only
+/// ever in a Desk conversation, never remembered, and on automated work only
+/// where it names their tools.
+pub const PERSONAL: &[&str] = &["bank"];
 
 /// Where each connector keeps its instances, one connection each: every
 /// connector but Slack, which holds one.
@@ -47,13 +62,65 @@ pub const INSTANCE_PREFIXES: &[(&str, &str)] = &[
     ("linear", "skills/linear/workspaces/"),
     ("datadog", "skills/datadog/accounts/"),
     ("metabase", "skills/metabase/instances/"),
+    ("bank", "skills/bank/workspaces/"),
+    ("freeagent", "skills/freeagent/workspaces/"),
 ];
 
 /// The connectors whose tools resolve one instance per call
 /// (`environment::resolve_instance`), so one connection of theirs can be
-/// read only while another takes writes. Email's and Google's read only
-/// whole.
-pub const READ_ONLY_EACH: &[&str] = &["github", "jira", "linear", "datadog", "metabase"];
+/// read only while another takes writes.
+pub const READ_ONLY_EACH: &[&str] = &[
+    "github",
+    "google",
+    "email",
+    "jira",
+    "linear",
+    "datadog",
+    "metabase",
+    "freeagent",
+    "bank",
+];
+
+/// The connectors whose connections only read until `writable` names them:
+/// a change there is one the person makes deliberately.
+pub const READ_ONLY_FIRST: &[&str] = &["freeagent"];
+
+/// Whether `tool` is one of a [`PERSONAL`] connector's.
+pub fn is_personal(tool: &str) -> bool {
+    connector_of(tool).is_some_and(|c| PERSONAL.contains(&c))
+}
+
+/// Whether `entry` of a run's or a job's `tools` names a [`PERSONAL`]
+/// connector: all of it (`bank`) or one of its tools (`bank.accounts`).
+pub fn names_personal(entry: &str) -> bool {
+    is_personal(entry) || PERSONAL.contains(&entry)
+}
+
+/// Whether vault `path` holds a [`PERSONAL`] connector's key (its flat one,
+/// or one of its instances'), at any tier, however it is spelled: never
+/// shown to an agent or put into a request, whatever the vault's redaction.
+pub fn is_personal_secret(path: &str) -> bool {
+    let segments: Vec<String> = path
+        .split('/')
+        .map(str::trim)
+        .filter(|s| !s.is_empty() && *s != ".")
+        .map(str::to_lowercase)
+        .collect();
+    let logical = match segments.first().map(String::as_str) {
+        Some("users") => segments.get(2..).unwrap_or_default(),
+        _ => &segments[..],
+    };
+    match logical {
+        [skills, connector, rest @ ..]
+            if skills == "skills" && PERSONAL.contains(&connector.as_str()) =>
+        {
+            matches!(rest, [key] if key == "api_key")
+                || matches!(rest, [_, _, key] if key == "api_key")
+                || rest.iter().any(|s| s == "..")
+        }
+        _ => false,
+    }
+}
 
 /// Where `connector` keeps its instances.
 pub fn instance_prefix(connector: &str) -> Option<&'static str> {
@@ -93,6 +160,9 @@ pub struct ConnectorBinding {
     /// Connectors (`github`), and single connections (`jira:globex`), that
     /// only read.
     pub read_only: Vec<String>,
+    /// Connectors, and single connections (`freeagent:harbor`), of
+    /// [`READ_ONLY_FIRST`] that take writes. `read_only` wins over it.
+    pub writable: Vec<String>,
     pub own_credential: Vec<String>,
     /// `[skills.connections]`: per connector, the instances it uses, the
     /// first its default.
@@ -111,13 +181,18 @@ impl ConnectorBinding {
     /// Whether `connector` only reads for the agent. One connection of a
     /// connector that can't hold a single connection back (`email:work`)
     /// makes the whole connector read-only, so the entry never holds
-    /// nothing back.
+    /// nothing back. One of [`READ_ONLY_FIRST`] that `writable` names no
+    /// connection of takes no writes anywhere.
     pub fn reads_only(&self, connector: &str) -> bool {
         self.read_only.iter().any(|r| {
             r == connector
                 || (!READ_ONLY_EACH.contains(&connector)
                     && r.split_once(':').is_some_and(|(c, _)| c == connector))
-        })
+        }) || (READ_ONLY_FIRST.contains(&connector)
+            && !self
+                .writable
+                .iter()
+                .any(|w| w == connector || w.split_once(':').is_some_and(|(c, _)| c == connector)))
     }
 
     /// The instances of `connector` it uses, the first its default, where
@@ -127,13 +202,27 @@ impl ConnectorBinding {
     }
 
     /// Whether instance `instance` of `connector` only reads for the agent:
-    /// the connector does, or that one connection does.
+    /// the connector does, or that one connection does, or the connector
+    /// starts read only and `writable` names neither it nor that connection.
     pub fn reads_only_instance(&self, connector: &str, instance: &str) -> bool {
-        self.reads_only(connector)
-            || self
-                .read_only
-                .iter()
+        let names = |list: &[String]| {
+            list.iter()
                 .any(|r| r.split_once(':') == Some((connector, instance)))
+        };
+        self.reads_only(connector)
+            || names(&self.read_only)
+            || (READ_ONLY_FIRST.contains(&connector)
+                && !self.writable.iter().any(|w| w == connector)
+                && !names(&self.writable))
+    }
+
+    /// Whether every connection of `connector` takes writes, as far as the
+    /// connector as a whole goes: it doesn't read only, and one that starts
+    /// read only is named whole in `writable`.
+    fn writes_whole(&self, connector: &str) -> bool {
+        !self.reads_only(connector)
+            && (!READ_ONLY_FIRST.contains(&connector)
+                || self.writable.iter().any(|w| w == connector))
     }
 
     /// Whether the agent uses its own connection to `connector`.
@@ -176,23 +265,20 @@ pub fn widened(before: &ConnectorBinding, after: &ConnectorBinding) -> Vec<Strin
         if before.own(c) != after.own(c) {
             said.push(format!("{c}: uses a different connection"));
         }
-        let writes = |b: &ConnectorBinding, k: Option<&str>| match k {
-            Some(k) => !b.reads_only_instance(c, k),
-            None => !b.reads_only(c),
-        };
-        if !writes(before, None) && writes(after, None) && after.picks(c).is_none() {
+        if !before.writes_whole(c) && after.writes_whole(c) && after.picks(c).is_none() {
             said.push(format!("{c}: may now change things"));
         }
         // Every connection that only read before and may change things
-        // now: those it names, and those `before` made read-only one by one
-        // (it may reach them still, named or not).
+        // now: those it names, those `before` made read-only one by one and
+        // those `after` makes writable one by one (it may reach them still,
+        // named or not).
         let mut keys: Vec<&str> = after
             .picks(c)
             .unwrap_or_default()
             .iter()
             .map(String::as_str)
             .collect();
-        for r in &before.read_only {
+        for r in before.read_only.iter().chain(&after.writable) {
             if let Some((rc, k)) = r.split_once(':') {
                 if rc == *c && !keys.contains(&k) {
                     keys.push(k);
@@ -203,7 +289,7 @@ pub fn widened(before: &ConnectorBinding, after: &ConnectorBinding) -> Vec<Strin
             if after.picks(c).is_some_and(|p| !p.iter().any(|x| x == k)) {
                 continue;
             }
-            if !writes(before, Some(k)) && writes(after, Some(k)) {
+            if before.reads_only_instance(c, k) && !after.reads_only_instance(c, k) {
                 said.push(format!("{c}: may now change things through `{k}`"));
             }
         }
@@ -272,6 +358,7 @@ pub fn from_value(value: &Value) -> Result<ConnectorBinding, String> {
     Ok(ConnectorBinding {
         enabled: names(t, "enabled", "The connectors an agent has")?,
         read_only,
+        writable: names(t, "writable", "The connectors an agent may change")?.unwrap_or_default(),
         own_credential: names(
             t,
             "own_credential",
@@ -380,10 +467,40 @@ const READS: &[&str] = &[
 /// `github.ci_status` but sets a board column in `github.project_item_status`.
 const NAMED: &[(&str, bool)] = &[
     ("github.viewer", true),
+    ("github.workspaces", true),
+    ("jira.workspaces", true),
+    ("linear.workspaces", true),
     ("github.issues_changed", true),
     ("github.repo_labels", true),
     ("github.project_item_status", false),
     ("github.issue_labels", false),
+    ("bank.workspaces", true),
+    ("bank.balances", true),
+    ("bank.transactions", true),
+    ("linear.workspaces", true),
+    ("linear.viewer", true),
+    ("linear.upload_read", true),
+    ("jira.workspaces", true),
+    ("jira.myself", true),
+    ("jira.board_order", true),
+    ("google.workspaces", true),
+    ("google.calendar.calendars", true),
+    ("google.calendar.events", true),
+    ("google.calendar.freebusy", true),
+    ("google.calendar.colors", true),
+    ("google.drive.ls", true),
+    ("google.drive.download", true),
+    ("google.drive.permissions", true),
+    ("google.drive.drives", true),
+    ("google.docs.cat", true),
+    ("google.docs.find_replace", false),
+    ("google.gmail.attachment", true),
+    ("google.gmail.draft_get", true),
+    ("google.tasks.lists", true),
+    ("google.people.me", true),
+    ("freeagent.workspaces", true),
+    ("freeagent.company", true),
+    ("freeagent.profit_and_loss_summary", true),
 ];
 
 /// Whether connector `tool` only reads. Its name after the connector, split
@@ -407,6 +524,45 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_bank_s_keys_are_secret_at_every_tier_and_spelling() {
+        for key in [
+            "skills/bank/api_key",
+            "skills/bank/workspaces/natwest/api_key",
+            "users/ann/skills/bank/workspaces/revolut/api_key",
+            "Skills//Bank/./workspaces/natwest/API_KEY",
+            "skills/bank/workspaces/../api_key",
+        ] {
+            assert!(is_personal_secret(key), "{key}");
+        }
+        for not in [
+            "skills/bank/workspaces/natwest/bank",
+            "skills/bank/default_workspace",
+            "skills/linear/workspaces/acme/api_key",
+        ] {
+            assert!(!is_personal_secret(not), "{not}");
+        }
+    }
+
+    #[test]
+    fn a_bank_s_tools_are_personal_and_nothing_else_is() {
+        assert!(is_personal("bank.transactions"));
+        assert!(is_personal("bank.workspaces"));
+        for other in ["linear.issue_get", "bank", "banking.list", "memory.recall"] {
+            assert!(!is_personal(other), "{other}");
+        }
+    }
+
+    #[test]
+    fn the_bank_is_named_by_its_namespace_or_any_of_its_tools() {
+        for named in ["bank", "bank.accounts", "bank.transactions"] {
+            assert!(names_personal(named), "{named}");
+        }
+        for other in ["banking", "linear", "linear.issue_get", "bankbook.read"] {
+            assert!(!names_personal(other), "{other}");
+        }
+    }
+
+    #[test]
     fn reads_and_writes_are_told_apart_and_what_is_unclear_is_a_write() {
         for read in [
             "linear.issue_get",
@@ -415,6 +571,9 @@ mod tests {
             "github.pr_diff",
             "github.workflow_run_logs",
             "github.viewer",
+            "github.workspaces",
+            "jira.workspaces",
+            "linear.workspaces",
             "github.projects_list",
             "github.project_get",
             "github.project_items",
@@ -427,6 +586,10 @@ mod tests {
             "slack.lookup_user_by_email",
             "datadog.logs_search",
             "metabase.card_query",
+            "bank.workspaces",
+            "bank.accounts",
+            "bank.balances",
+            "bank.transactions",
         ] {
             assert!(is_read(read), "{read} reads");
         }
@@ -545,10 +708,12 @@ mod tests {
             widened(&ro, &all),
             ["jira: may now change things through `globex`"]
         );
-        // A connector that can't hold one connection back only reads, whole.
+        // Email holds each account back on its own: `work` reads only,
+        // `home` still takes writes.
         let email = parse("[skills]\nread_only = [\"email:work\"]\n").unwrap();
-        assert!(email.reads_only("email"));
-        assert!(!email.reads_only("jira"));
+        assert!(!email.reads_only("email"));
+        assert!(email.reads_only_instance("email", "work"));
+        assert!(!email.reads_only_instance("email", "home"));
         // An empty instance segment is no pick's, never the listing.
         assert_eq!(
             instance_of("jira", "skills/jira/workspaces//globex/x"),
@@ -595,6 +760,105 @@ mod tests {
             .iter()
             .all(|(c, _)| CONNECTORS.contains(c)));
         assert!(READ_ONLY_EACH.iter().all(|c| instance_prefix(c).is_some()));
+    }
+
+    #[test]
+    fn freeagent_and_google_resolve_each_connection() {
+        for c in ["google", "freeagent"] {
+            assert!(CONNECTORS.contains(&c), "{c}");
+            assert!(READ_ONLY_EACH.contains(&c), "{c}");
+        }
+        assert_eq!(
+            instance_of(
+                "freeagent",
+                "skills/freeagent/workspaces/harbor/refresh_token"
+            ),
+            Some(Some("harbor"))
+        );
+        assert_eq!(connector_of("freeagent.invoices_list"), Some("freeagent"));
+        let b = parse("[skills]\nread_only = [\"google:work\"]\n").unwrap();
+        assert!(b.reads_only_instance("google", "work"));
+        assert!(!b.reads_only_instance("google", "home"));
+        assert!(!b.reads_only("google"));
+    }
+
+    #[test]
+    fn a_freeagent_connection_reads_only_until_writable_names_it() {
+        // No picks, as "all my agents" reaches it: read only.
+        let none = parse("").unwrap();
+        assert!(none.reads_only("freeagent"));
+        assert!(none.reads_only_instance("freeagent", "harbor"));
+        // One named: that one takes writes, the others still read.
+        let one = parse("[skills]\nwritable = [\"freeagent:harbor\"]\n").unwrap();
+        assert!(!one.reads_only("freeagent"));
+        assert!(!one.reads_only_instance("freeagent", "harbor"));
+        assert!(one.reads_only_instance("freeagent", "lumen"));
+        // Named whole: every one takes writes.
+        let all = parse("[skills]\nwritable = [\"freeagent\"]\n").unwrap();
+        assert!(!all.reads_only_instance("freeagent", "lumen"));
+        // `read_only` wins.
+        for source in [
+            "[skills]\nwritable = [\"freeagent\"]\nread_only = [\"freeagent\"]\n",
+            "[skills]\nwritable = [\"freeagent:harbor\"]\nread_only = [\"freeagent:harbor\"]\n",
+        ] {
+            assert!(
+                parse(source)
+                    .unwrap()
+                    .reads_only_instance("freeagent", "harbor"),
+                "{source}"
+            );
+        }
+        // Other connectors don't start read only, and `writable` doesn't
+        // reach them.
+        assert!(!none.reads_only_instance("jira", "acme"));
+        assert!(
+            parse("[skills]\nread_only = [\"jira\"]\nwritable = [\"jira\"]\n")
+                .unwrap()
+                .reads_only_instance("jira", "acme")
+        );
+        assert!(parse("[skills]\nwritable = 1\n")
+            .unwrap_err()
+            .contains("may change"));
+    }
+
+    #[test]
+    fn a_bare_google_read_only_keeps_every_google_connection_read_only() {
+        let bare = parse("[skills]\nread_only = [\"google\"]\n").unwrap();
+        assert!(bare.reads_only("google"));
+        for k in ["default", "work", "home"] {
+            assert!(bare.reads_only_instance("google", k), "{k}");
+        }
+        let one = parse("[skills]\nread_only = [\"google:work\"]\n").unwrap();
+        assert!(!one.reads_only("google"));
+        assert!(!one.reads_only_instance("google", "home"));
+    }
+
+    #[test]
+    fn writable_gaining_an_entry_is_widened() {
+        let b = |src: &str| parse(src).unwrap();
+        let none = b("[skills]\nenabled = [\"freeagent\"]\n");
+        let harbor = b("[skills]\nenabled = [\"freeagent\"]\nwritable = [\"freeagent:harbor\"]\n");
+        assert_eq!(
+            widened(&none, &harbor),
+            ["freeagent: may now change things through `harbor`"]
+        );
+        let whole = b("[skills]\nenabled = [\"freeagent\"]\nwritable = [\"freeagent\"]\n");
+        assert_eq!(
+            widened(&harbor, &whole),
+            ["freeagent: may now change things"]
+        );
+        let picked = |w: &str| {
+            b(&format!(
+                "[skills]\nenabled = [\"freeagent\"]\nwritable = [{w}]\n\n[skills.connections]\nfreeagent = [\"harbor\", \"lumen\"]\n"
+            ))
+        };
+        assert_eq!(
+            widened(&picked(""), &picked("\"freeagent:lumen\"")),
+            ["freeagent: may now change things through `lumen`"]
+        );
+        // Losing one only narrows.
+        assert!(widened(&harbor, &none).is_empty());
+        assert!(widened(&whole, &harbor).is_empty());
     }
 
     #[test]

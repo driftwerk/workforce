@@ -557,6 +557,12 @@ pub const ACCOUNT_REFUSALS: &[&str] = &[
 /// `classify_error` keys on it.
 pub const UNSUPPORTED_REQUEST_MARKER: &str = "request unsupported by provider";
 
+/// Marker carried by errors for input the provider refused as it was given
+/// (an image it cannot decode). Another model may take it; the same one never
+/// will. `classify_error` keys on it, ahead of the words of the provider's
+/// message, which can say "exceeded" or "too long" of an image.
+pub const INPUT_REFUSED_MARKER: &str = "request input refused";
+
 /// Classify an error string into an `ErrorKind`.
 ///
 /// Precedence: watchdog markers, pool cached-skip markers, a status parsed
@@ -601,6 +607,9 @@ pub fn classify_error(error: &str) -> ErrorKind {
     }
     if lower.contains(UNSUPPORTED_REQUEST_MARKER) {
         return ErrorKind::Unsupported;
+    }
+    if lower.contains(INPUT_REFUSED_MARKER) {
+        return ErrorKind::ClientError;
     }
 
     if let Some(kind) = parse_status_marker(&lower).and_then(|s| classify_status(s, &lower)) {
@@ -2823,6 +2832,43 @@ mod tests {
             failure_action(&ErrorKind::ServerError, &retry, 2, None),
             FailureAction::Failover
         );
+    }
+
+    #[test]
+    fn a_refused_input_is_a_client_error_whatever_its_message_says() {
+        assert_eq!(
+            classify_error(&format!(
+                "ChatGPT API error: {INPUT_REFUSED_MARKER} (invalid_image_format): the image \
+                 exceeded the prompt's limits and is too long"
+            )),
+            ErrorKind::ClientError
+        );
+    }
+
+    #[tokio::test]
+    async fn a_refused_input_fails_over_without_retrying_the_model() {
+        let inner = Arc::new(MockFailThenSucceed::new(
+            1,
+            "ChatGPT API error: request input refused (invalid_image_format): could not be decoded",
+        ));
+        let config = FailoverConfig {
+            failover: vec!["backup-model".to_string()],
+            retry: RetryConfig {
+                max_retries: 4,
+                initial_backoff_ms: 1,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let provider = FailoverProvider::new(inner.clone(), config);
+
+        provider
+            .create_message(None, &[], &[], Some("primary"), None, true)
+            .await
+            .unwrap();
+
+        assert_eq!(inner.fail_count.load(Ordering::SeqCst), 2);
+        assert_eq!(provider.last_used_model().as_deref(), Some("backup-model"));
     }
 
     #[tokio::test]

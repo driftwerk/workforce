@@ -790,7 +790,7 @@ async fn scan_one_session(
         let result = crate::passive_memory::extract_and_store(
             Arc::clone(&service.llm),
             Arc::clone(&extraction.store),
-            service.agent_id.clone(),
+            crate::passive_memory::Assistant::of(service),
             &session.channel,
             Some(session.id.clone()),
             vec![pair.user_id.clone(), pair.assistant_id.clone()],
@@ -883,12 +883,14 @@ pub fn preseed_consolidation_cursor(workspace: &Path, since: DateTime<Utc>) -> R
 /// Whether a session's talk may be consolidated into its agent's memory:
 /// one that leaves memory at all, of a single user (a shared room belongs to
 /// no one person, and consolidating it would widen one room's content into
-/// memory recalled for people never in it), and not one its agent had as
-/// the boss of a Desk group it has left since (that group's alone).
+/// memory recalled for people never in it), not one its agent had as
+/// the boss of a Desk group it has left since (that group's alone), and not
+/// one that read the person's bank.
 fn consolidatable(s: &workforce_common::session::Session) -> bool {
     !crate::turn_extraction::leaves_no_memory(&s.channel)
         && !s.is_shared_conversation()
         && !s.kept_apart()
+        && !s.read_personal()
 }
 
 #[cfg(test)]
@@ -948,6 +950,13 @@ mod tests {
         left.metadata =
             serde_json::json!({ workforce_common::session::LEFT_SCOPE_KEY: "desk-group:acme" });
         assert!(!consolidatable(&left));
+    }
+
+    #[test]
+    fn a_session_that_read_the_person_s_bank_is_never_consolidated() {
+        let mut banked = workforce_common::session::Session::new("desk", "kings", "kat");
+        banked.mark_read_personal();
+        assert!(!consolidatable(&banked));
     }
 
     #[test]

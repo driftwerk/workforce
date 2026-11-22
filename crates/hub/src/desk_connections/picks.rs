@@ -14,7 +14,7 @@
 
 use serde::{Deserialize, Serialize};
 use toml_edit::{Array, DocumentMut, Item, Table, Value as TomlValue};
-use workforce_common::connector_binding::{CONNECTORS, READ_ONLY_EACH};
+use workforce_common::connector_binding::{CONNECTORS, READ_ONLY_EACH, READ_ONLY_FIRST};
 
 use super::*;
 
@@ -48,6 +48,10 @@ pub struct ServicePicks {
     /// Each connection takes writes or not on its own; otherwise the
     /// service does, all together.
     pub read_only_each: bool,
+    /// It is only ever read (a bank): there are no writes to allow.
+    pub reads_only: bool,
+    /// Its approval lapses at the service and is renewed there (a bank's).
+    pub renewable: bool,
     /// The agent's connections of it are chosen one by one, rather than
     /// following the levels it reads from.
     pub chosen: bool,
@@ -179,6 +183,8 @@ impl Connections {
                     name: c.name,
                     several: c.named(),
                     read_only_each: READ_ONLY_EACH.contains(&c.id),
+                    reads_only: c.reads_only,
+                    renewable: c.renewal.is_some(),
                     chosen: a.binding.picks(c.id).is_some(),
                     connections,
                 }
@@ -342,28 +348,36 @@ pub fn choose(
         }
     }
 
+    let of_service = |r: &String| r.as_str() == service || r.starts_with(&format!("{service}:"));
     let mut read_only = strings(skills.get("read_only"));
-    read_only.retain(|r| r.as_str() != service && !r.starts_with(&format!("{service}:")));
-    let reading: Vec<&str> = picked
-        .iter()
-        .filter(|(_, write)| !write)
-        .map(|(k, _)| k.as_str())
-        .collect();
-    if !picked.is_empty() && reading.len() == picked.len() {
+    read_only.retain(|r| !of_service(r));
+    let mut writable = strings(skills.get("writable"));
+    writable.retain(|r| !of_service(r));
+    let keys = |write: bool| -> Vec<&str> {
+        picked
+            .iter()
+            .filter(|(_, w)| *w == write)
+            .map(|(k, _)| k.as_str())
+            .collect()
+    };
+    let (writing, reading) = (keys(true), keys(false));
+    if READ_ONLY_FIRST.contains(&service) {
+        // It reads only until it is named: each connection that takes
+        // writes is.
+        writable.extend(writing.iter().map(|k| format!("{service}:{k}")));
+    } else if !picked.is_empty() && reading.len() == picked.len() {
         read_only.push(service.to_string());
     } else if read_only_each {
         read_only.extend(reading.iter().map(|k| format!("{service}:{k}")));
-    } else if !reading.is_empty() {
-        return Err(format!(
-            "{service}'s connections take writes all together or not at all"
-        ));
     }
-    match read_only.is_empty() {
-        true => {
-            skills.remove("read_only");
-        }
-        false => {
-            skills.insert("read_only", array(&read_only));
+    for (key, list) in [("read_only", &read_only), ("writable", &writable)] {
+        match list.is_empty() {
+            true => {
+                skills.remove(key);
+            }
+            false => {
+                skills.insert(key, array(list));
+            }
         }
     }
 
@@ -497,14 +511,47 @@ mod tests {
     }
 
     #[test]
-    fn email_takes_writes_all_together() {
-        assert!(
-            chosen("", "email", &[("work", true), ("home", false)], None)
-                .unwrap_err()
-                .contains("all together")
-        );
+    fn email_takes_writes_per_account() {
+        let one = chosen("", "email", &[("work", true), ("home", false)], None).unwrap();
+        let b = binding(&one);
+        assert!(!b.reads_only("email"));
+        assert!(!b.reads_only_instance("email", "work"));
+        assert!(b.reads_only_instance("email", "home"));
         let all = chosen("", "email", &[("work", false), ("home", false)], None).unwrap();
         assert!(binding(&all).reads_only("email"));
+    }
+
+    #[test]
+    fn freeagent_takes_writes_only_where_writable_names_it() {
+        let body = chosen(
+            "[skills]\nread_only = [\"freeagent:old\"]\nwritable = [\"freeagent:old\", \"freeagent\"]\n",
+            "freeagent",
+            &[("harbor", true), ("lumen", false)],
+            Some("harbor"),
+        )
+        .unwrap();
+        let b = binding(&body);
+        assert_eq!(b.writable, ["freeagent:harbor"]);
+        assert!(b.read_only.is_empty(), "{body}");
+        assert!(!b.reads_only_instance("freeagent", "harbor"));
+        assert!(b.reads_only_instance("freeagent", "lumen"));
+        // All of them read only: nothing is writable, and nothing more is
+        // written.
+        let reading = chosen(&body, "freeagent", &[("harbor", false)], None).unwrap();
+        let b = binding(&reading);
+        assert!(b.writable.is_empty() && b.read_only.is_empty(), "{reading}");
+        assert!(b.reads_only_instance("freeagent", "harbor"));
+        assert!(!reading.contains("writable"), "{reading}");
+    }
+
+    #[test]
+    fn an_unpicked_freeagent_connection_shows_no_writes() {
+        let b = Binding::parse("");
+        assert!(b.reads_only("freeagent", "harbor"));
+        assert!(!b.reads_only("jira", "acme"));
+        let named = Binding::parse("[skills]\nwritable = [\"freeagent:harbor\"]\n");
+        assert!(!named.reads_only("freeagent", "harbor"));
+        assert!(named.reads_only("freeagent", "lumen"));
     }
 
     #[test]

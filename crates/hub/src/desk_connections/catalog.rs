@@ -21,8 +21,9 @@ pub enum SignIn {
     Fields,
     /// GitHub's device flow, or a token in the fields.
     Github,
-    /// Google's sign-in on the person's own OAuth client.
-    Google,
+    /// The service's own sign-in page, on the person's own app
+    /// ([`super::app`]).
+    App,
 }
 
 /// One thing the person types to connect.
@@ -118,7 +119,40 @@ pub struct Connector {
     /// the form): where a single connection kept each, and where an
     /// instance does, under `<prefix><key>/`.
     pub extras: &'static [(&'static str, &'static str)],
+    /// How the person renews their approval at the service, for one whose
+    /// approval lapses (a bank's): when it was given is kept as
+    /// [`CONSENTED_AT`] when it is first connected, and again only when
+    /// they say they renewed it.
+    pub renewal: Option<Renewal>,
+    /// It only ever reads: there is nothing to allow writes to.
+    pub reads_only: bool,
 }
+
+/// How a service's approval, which lapses, is renewed: by the person, at
+/// the service. The service doesn't say when it lapses, so Desk estimates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Renewal {
+    /// Who holds the approval, as the person knows them: "BankSync".
+    pub service: &'static str,
+    /// What the approval is called: "Bank approval".
+    pub label: &'static str,
+    /// Where it is renewed.
+    pub page: &'static str,
+    /// The button that opens it.
+    pub open: &'static str,
+    /// What renewing takes, and that Desk takes the person's word for it.
+    pub about: &'static str,
+    /// The button the person presses once they have.
+    pub done: &'static str,
+}
+
+/// Where a connection whose approval lapses keeps when it was last given.
+pub const CONSENTED_AT: &str = "consented_at";
+
+/// BankSync's web app: where a bank's keys are made and its approval
+/// renewed.
+pub const BANKSYNC_APP: &str = "https://app.banksync.io";
 
 /// Where an instance keeps the name the person gave it.
 pub const LABEL: &str = "label";
@@ -133,18 +167,19 @@ const GOOGLE_HELD: &[&str] = &[
     "skills/google/workspaces/default/expires_at",
     "skills/google/workspaces/default/scopes",
     "skills/google/workspaces/default/email",
+    "skills/google/workspaces/default/account_id",
+    "skills/google/workspaces/default/client_id",
 ];
 
-/// The Google OAuth client the person brings: hub-wide, as the callback
-/// reads it.
-pub const GOOGLE_CLIENT_ID: &str = "skills/google/oauth_client/client_id";
-pub const GOOGLE_CLIENT_SECRET: &str = "skills/google/oauth_client/client_secret";
-pub const GOOGLE_REDIRECT_URI: &str = "skills/google/oauth_client/redirect_uri";
-/// Where Google's account email is kept beside its tokens.
-pub const GOOGLE_EMAIL: &str = "skills/google/workspaces/default/email";
-pub const GOOGLE_WORKSPACE: &str = "default";
-/// The email account a connection is kept as.
-pub const EMAIL_ACCOUNT: &str = "default";
+const FREEAGENT_HELD: &[&str] = &[
+    "skills/freeagent/workspaces/default/refresh_token",
+    "skills/freeagent/workspaces/default/access_token",
+    "skills/freeagent/workspaces/default/expires_at",
+    "skills/freeagent/workspaces/default/scopes",
+    "skills/freeagent/workspaces/default/company",
+    "skills/freeagent/workspaces/default/company_id",
+    "skills/freeagent/workspaces/default/client_id",
+];
 
 const GITHUB_FIELDS: &[Field] = &[secret(
     "token",
@@ -251,6 +286,20 @@ const DATADOG_HELD: &[&str] = &[
     "skills/datadog/app_key",
     "skills/datadog/site",
 ];
+const BANK_FIELDS: &[Field] = &[
+    secret(
+        "api_key",
+        "BankSync API key",
+        "skills/bank/api_key",
+        "api_key",
+    ),
+    plain("bank", "Bank", "NatWest", "skills/bank/bank", "bank"),
+];
+const BANK_HELD: &[&str] = &[
+    "skills/bank/api_key",
+    "skills/bank/bank",
+    "skills/bank/consented_at",
+];
 const METABASE_HELD: &[&str] = &["skills/metabase/site_url", "skills/metabase/api_key"];
 
 /// The connectors of v1, in the order Settings lists them.
@@ -274,12 +323,14 @@ pub const CATALOG: &[Connector] = &[
             ("skills/github/app_id", "app_id"),
             ("skills/github/app_private_key", "app_private_key"),
         ],
+        renewal: None,
+        reads_only: false,
     },
     Connector {
         id: "google",
         name: "Google",
         about: "Gmail, Calendar, Drive, Docs and Sheets.",
-        sign_in: SignIn::Google,
+        sign_in: SignIn::App,
         fields: &[],
         shared: false,
         held: GOOGLE_HELD,
@@ -291,11 +342,42 @@ pub const CATALOG: &[Connector] = &[
             "expires_at",
             "scopes",
             "email",
+            "account_id",
+            "client_id",
         ],
         primary_sub: "refresh_token",
         site: None,
         name_hint: "Work, Personal",
         extras: &[],
+        renewal: None,
+        reads_only: false,
+    },
+    Connector {
+        id: "freeagent",
+        name: "FreeAgent",
+        about:
+            "Your business accounts: bank balances and transactions, invoices, bills and expenses.",
+        sign_in: SignIn::App,
+        fields: &[],
+        shared: false,
+        held: FREEAGENT_HELD,
+        primary: "skills/freeagent/workspaces/default/refresh_token",
+        prefix: Some("skills/freeagent/workspaces/"),
+        subs: &[
+            "refresh_token",
+            "access_token",
+            "expires_at",
+            "scopes",
+            "company",
+            "company_id",
+            "client_id",
+        ],
+        primary_sub: "refresh_token",
+        site: None,
+        name_hint: "The business, like Harbor",
+        extras: &[],
+        renewal: None,
+        reads_only: false,
     },
     Connector {
         id: "email",
@@ -325,6 +407,8 @@ pub const CATALOG: &[Connector] = &[
                 "command_timeout_secs",
             ),
         ],
+        renewal: None,
+        reads_only: false,
     },
     Connector {
         id: "jira",
@@ -341,6 +425,8 @@ pub const CATALOG: &[Connector] = &[
         site: Some("site"),
         name_hint: "Acme",
         extras: &[("skills/jira/default_project", "default_project")],
+        renewal: None,
+        reads_only: false,
     },
     Connector {
         id: "linear",
@@ -357,6 +443,8 @@ pub const CATALOG: &[Connector] = &[
         site: None,
         name_hint: "Acme",
         extras: &[("skills/linear/default_team_id", "default_team_id")],
+        renewal: None,
+        reads_only: false,
     },
     Connector {
         id: "slack",
@@ -373,6 +461,8 @@ pub const CATALOG: &[Connector] = &[
         site: None,
         name_hint: "",
         extras: &[],
+        renewal: None,
+        reads_only: false,
     },
     Connector {
         id: "datadog",
@@ -389,6 +479,8 @@ pub const CATALOG: &[Connector] = &[
         site: Some("site"),
         name_hint: "Production",
         extras: &[("skills/datadog/base_url", "base_url")],
+        renewal: None,
+        reads_only: false,
     },
     Connector {
         id: "metabase",
@@ -412,6 +504,33 @@ pub const CATALOG: &[Connector] = &[
                 "access_client_secret",
             ),
         ],
+        renewal: None,
+        reads_only: false,
+    },
+    Connector {
+        id: "bank",
+        name: "Bank",
+        about: "Your own bank accounts' balances and transactions, through BankSync. Read only: nothing can move money.",
+        sign_in: SignIn::Fields,
+        fields: BANK_FIELDS,
+        shared: false,
+        held: BANK_HELD,
+        primary: "skills/bank/api_key",
+        prefix: Some("skills/bank/workspaces/"),
+        subs: &["api_key", "bank", CONSENTED_AT],
+        primary_sub: "api_key",
+        site: Some("bank"),
+        name_hint: "NatWest",
+        extras: &[("skills/bank/consented_at", CONSENTED_AT)],
+        renewal: Some(Renewal {
+            service: "BankSync",
+            label: "Bank approval",
+            page: BANKSYNC_APP,
+            open: "Open BankSync",
+            about: "Renew the approval in BankSync: it takes you to your bank to approve it again. BankSync doesn't tell Desk when an approval lapses, so Desk takes your word that you renewed it and counts about 90 days from then.",
+            done: "I’ve renewed it, check it",
+        }),
+        reads_only: true,
     },
 ];
 
@@ -564,8 +683,8 @@ mod tests {
 
     #[test]
     fn a_flat_connection_becomes_the_default_instance_the_adapters_already_name() {
-        // Email and Google always kept theirs at `default`.
-        for id in ["email", "google"] {
+        // Email, Google and FreeAgent always kept theirs at `default`.
+        for id in ["email", "google", "freeagent"] {
             let c = find(id).unwrap();
             assert_eq!(c.primary, c.primary_at(DEFAULT_INSTANCE), "{id}");
         }

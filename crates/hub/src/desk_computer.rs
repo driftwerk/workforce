@@ -176,6 +176,22 @@ fn uses_their_chrome(tool: &str, effect: &Effect) -> bool {
         || matches!(effect, Effect::Connector { connector, .. } if is_browser_key(connector))
 }
 
+/// Why a browser call on BankSync's site, in the person's Chrome or Desk's
+/// own headless browser, may not be made in this run: its pages show the person's banks, accounts and transactions, so they are
+/// opened only where the bank may be read (the person's own Desk, watched).
+fn banksync_refusal(effect: &Effect) -> Option<&'static str> {
+    let Effect::Connector { connector, .. } = effect else {
+        return None;
+    };
+    let origin = connector
+        .strip_prefix("chrome-visit:")
+        .or_else(|| connector.strip_prefix("chrome:"))
+        .or_else(|| connector.strip_prefix("browser:"))?;
+    (origin == crate::desk_connections::catalog::BANKSYNC_APP)
+        .then(crate::personal_access::read_refusal)
+        .flatten()
+}
+
 /// Where the person's home is.
 fn home() -> PathBuf {
     std::env::var_os("HOME")
@@ -247,8 +263,9 @@ fn works_in_of(subject: &ComputerSubject, config: &WorkforceConfig, home: &Path)
 }
 
 /// This agent's `[skills]` binding, as the verdict reads it: `None` (every
-/// connector) where it names no `enabled` nor `read_only`. One that can't be
-/// read turns every connector off: admission refuses it before it is written.
+/// connector) where it names no `enabled` nor connections and no connector
+/// only reads. One that can't be read turns every connector off: admission
+/// refuses it before it is written.
 fn connectors_of(subject: &ComputerSubject) -> Option<workforce_desk::computer::Connectors> {
     let binding = match AgentWorkspaceConfig::load(&subject.workspace) {
         Ok(Some(config)) => config.connectors().unwrap_or_else(|e| {
@@ -260,18 +277,22 @@ fn connectors_of(subject: &ComputerSubject) -> Option<workforce_desk::computer::
         }),
         _ => return None,
     };
-    if binding.enabled.is_none() && binding.read_only.is_empty() && binding.connections.is_empty() {
+    let connectors = workforce_common::connector_binding::CONNECTORS;
+    if binding.enabled.is_none()
+        && binding.connections.is_empty()
+        && !connectors.iter().any(|c| binding.reads_only(c))
+    {
         return None;
     }
     // A connector it uses no connection of is off; one connection that only
     // reads is refused where the adapter resolves it, not here.
     Some(workforce_desk::computer::Connectors {
-        enabled: workforce_common::connector_binding::CONNECTORS
+        enabled: connectors
             .iter()
             .filter(|c| binding.is_on(c))
             .map(|c| c.to_string())
             .collect(),
-        read_only: workforce_common::connector_binding::CONNECTORS
+        read_only: connectors
             .iter()
             .filter(|c| binding.reads_only(c))
             .map(|c| c.to_string())
@@ -685,6 +706,15 @@ pub fn prune_daily(computer: Computer, cancel: tokio_util::sync::CancellationTok
     });
 }
 
+/// The connector `tool` is of, as Desk decides it: a bound connector's,
+/// or a books service's (Xero's isn't bound, but its writes still ask).
+fn books_connector(tool: &str) -> Option<&str> {
+    workforce_common::connector_binding::connector_of(tool).or_else(|| {
+        let (prefix, _) = tool.split_once('.')?;
+        workforce_core::computer::Books::of(prefix).map(|_| prefix)
+    })
+}
+
 impl ComputerGate for HubComputerGate {
     fn decides(&self, tool: &str) -> bool {
         match namespace(tool) {
@@ -692,7 +722,7 @@ impl ComputerGate for HubComputerGate {
             Some(Namespace::Connector) => {
                 tool.starts_with("browser.")
                     || tool.starts_with("connections.")
-                    || workforce_common::connector_binding::connector_of(tool).is_some()
+                    || books_connector(tool).is_some()
             }
             // Its own `[skills]`: a change that widens what it reaches.
             None => tool == "system.config",
@@ -713,10 +743,7 @@ impl ComputerGate for HubComputerGate {
                 write: changes_a_page(tool),
             };
         }
-        match (
-            effect,
-            workforce_common::connector_binding::connector_of(tool),
-        ) {
+        match (effect, books_connector(tool)) {
             (Effect::Unknown, Some(connector)) => Effect::Connector {
                 connector: connector.to_string(),
                 write: !workforce_common::connector_binding::is_read(tool),
@@ -936,6 +963,16 @@ impl ComputerGate for HubComputerGate {
                 },
             };
         }
+        // BankSync's pages show the person's banks and their transactions:
+        // the browser opens them only where the bank itself may be read.
+        if let Some(why) = banksync_refusal(effect) {
+            return Verdict::Refuse {
+                refusal: Refusal {
+                    rule: Refused::OutsideLevel,
+                    sentence: why.to_string(),
+                },
+            };
+        }
         // "Sign in for me" is for the person in Desk on this computer, who
         // can see Desk's browser: never a turn in Slack or another client.
         if (tool == SIGN_IN || tool == SIGNED_IN)
@@ -1063,6 +1100,48 @@ pub fn install(computer: Computer, config: Arc<WorkforceConfig>) {
 mod tests {
     use std::path::Path;
     use std::time::Duration;
+
+    /// BankSync's site is opened in the browser only where the bank itself
+    /// may be read: never off Desk, in a room, or unwatched; another site is
+    /// left to the gate.
+    #[tokio::test]
+    async fn banksync_s_pages_are_opened_only_where_the_bank_is_read() {
+        use workforce_common::channels::desk::{DeskPlace, DeskScope, DeskTarget};
+        let at = |site: &str, visit: bool| Effect::Connector {
+            connector: workforce_skills::adapters::browser::site_key(visit, Some(site)),
+            write: false,
+        };
+        let bank = crate::desk_connections::catalog::BANKSYNC_APP;
+        assert!(
+            super::banksync_refusal(&at(bank, true)).is_some(),
+            "off Desk"
+        );
+        assert!(super::banksync_refusal(&at(bank, false)).is_some());
+        assert!(super::banksync_refusal(&at("https://linear.app", true)).is_none());
+        let headless = Effect::Connector {
+            connector: format!("browser:{bank}"),
+            write: false,
+        };
+        assert!(super::banksync_refusal(&headless).is_some(), "headless too");
+        let desk = |place: DeskPlace, attended: bool| DeskScope {
+            target: DeskTarget::of_turn(&place, "desk", None, false),
+            owner: "ann".into(),
+            attended,
+            relayed: false,
+        };
+        let in_dm = workforce_agent::runner::with_desk(
+            Some(desk(DeskPlace::Dm { thread: None }, true)),
+            async { super::banksync_refusal(&at(bank, true)) },
+        )
+        .await;
+        assert_eq!(in_dm, None);
+        let unwatched = workforce_agent::runner::with_desk(
+            Some(desk(DeskPlace::Dm { thread: None }, false)),
+            async { super::banksync_refusal(&at(bank, false)) },
+        )
+        .await;
+        assert!(unwatched.is_some());
+    }
 
     use async_trait::async_trait;
     use serde_json::{json, Value};
@@ -1393,6 +1472,10 @@ mod tests {
                 "github.pr_get",
                 "jira.search",
                 "browser.navigate",
+                "freeagent.invoices_list",
+                "freeagent.invoice_create",
+                "xero.invoices_list",
+                "xero.invoice_create",
             ] {
                 tools.register(Arc::new(Elsewhere(name)));
             }
@@ -1423,6 +1506,18 @@ mod tests {
             // No binding: every connector, as before; a send still asks.
             assert_eq!(decide_with("", "jira.search").0, "run");
             assert_eq!(decide_with("", "slack.send").0, "asks once");
+            // FreeAgent reads only until a connection of it is writable,
+            // and a change to the books then asks, unless it asks never.
+            assert_eq!(decide_with("", "freeagent.invoices_list").0, "run");
+            assert_eq!(decide_with("", "freeagent.invoice_create").0, "refused");
+            let harbor = "[skills]\nwritable = [\"freeagent:harbor\"]\n";
+            assert_eq!(decide_with(harbor, "freeagent.invoice_create").0, "asks once");
+            let never = format!("[computer]\nasks = \"never\"\n\n{harbor}");
+            assert_eq!(decide_with(&never, "freeagent.invoice_create").0, "run");
+            // Xero isn't bound by connection, but its writes still ask in
+            // Desk's words, and its reads run.
+            assert_eq!(decide_with("", "xero.invoices_list").0, "run");
+            assert_eq!(decide_with("", "xero.invoice_create").0, "asks once");
         })
         .await;
     }

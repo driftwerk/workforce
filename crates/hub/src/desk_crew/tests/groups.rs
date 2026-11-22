@@ -1749,3 +1749,109 @@ async fn an_order_sent_on_for_the_person_is_kept_as_theirs() {
     })
     .await;
 }
+
+/// What a machine says closed to a group's boss asking after its plan's
+/// sessions there: one closed in its group, and one the person removed,
+/// from its group or any other, so the slot it held is free; never one
+/// closed in another group.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_groups_boss_hears_its_plans_session_was_removed_by_the_person() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let c = clients(dir.path(), pool).await;
+        let d = &c.d;
+        let removed = async |group: Option<&str>, name: &str| {
+            let s = new_session(d, dir.path(), name).await;
+            if let Some(g) = group {
+                d.change_layout(|l| l.put(&workforce_desk::session_item(s.id), g, None))
+                    .await
+                    .unwrap();
+            }
+            d.remove(s.id, workforce_desk::Removal::default())
+                .await
+                .unwrap();
+            s.id
+        };
+        let mine = removed(Some(c.acme.group.as_str()), "acme-gone").await;
+        let theirs = removed(Some(c.atlas.group.as_str()), "atlas-gone").await;
+        let loose = removed(None, "loose-gone").await;
+        let shut = c.acme.session.id;
+        d.end(shut, Some(By::you())).await.unwrap();
+        let other_shut = c.atlas.session.id;
+        d.end(other_shut, Some(By::you())).await.unwrap();
+        let tool = crate::desk_tools::DeskTool::all(d, "sarah")
+            .into_iter()
+            .find(|t| workforce_agent::tools::Tool::name(t) == "desk.sessions")
+            .unwrap();
+        let ids = json!({ "ids": [mine, theirs, loose, shut, other_shut] });
+        let out = workforce_agent::runner::CURRENT_AGENT_ID
+            .scope("sarah".to_string(), async move {
+                workforce_agent::tools::Tool::execute(&tool, ids)
+                    .await
+                    .unwrap()
+            })
+            .await
+            .output;
+        for gone in [mine, theirs, loose] {
+            let said: Vec<&Value> = out
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|s| s["id"] == json!(gone))
+                .collect();
+            assert_eq!(said, [&json!({ "id": gone, "state": "closed" })]);
+        }
+        let listed: Vec<workforce_desk::crew::MachineSession> =
+            serde_json::from_value(out).unwrap();
+        let closed: Vec<uuid::Uuid> = listed
+            .iter()
+            .filter(|s| s.state == "closed")
+            .map(|s| s.id)
+            .collect();
+        assert_eq!(closed, [mine, theirs, loose, shut]);
+    })
+    .await;
+}
+
+/// A plan's limit is its boss's while the boss oversees the plan's group:
+/// one of Sarah's in Acme runs her `parallel`, one named hers in a group
+/// she doesn't oversee has none.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_plans_limit_is_its_bosss_only_in_the_group_it_oversees() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let c = clients(dir.path(), pool).await;
+        let limit = async |id: uuid::Uuid| c.d.plan(id).await.unwrap().summary.limit;
+        eventually("Sarah's limit in Acme", async || {
+            limit(c.acme.plan).await.is_some().then_some(())
+        })
+        .await;
+        let elsewhere =
+            c.d.propose_plan(
+                workforce_desk::NewPlan {
+                    draft: workforce_desk::plan::Draft {
+                        goal: "Tidy the infra".into(),
+                        tickets: vec![workforce_desk::plan::DraftTicket {
+                            title: "Rotate the keys".into(),
+                            folder: dir.path().to_string_lossy().into_owned(),
+                            ..Default::default()
+                        }],
+                    },
+                    board: None,
+                    parallel: None,
+                    engine: Engine::Claude,
+                    group: Some("infra".into()),
+                    budget: None,
+                },
+                &Party::manager("sarah", "sarah"),
+                &By::manager("sarah", "sarah", "For the test."),
+            )
+            .await
+            .unwrap()
+            .summary
+            .plan
+            .id;
+        assert_eq!(limit(elsewhere).await, None);
+    })
+    .await;
+}

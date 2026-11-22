@@ -451,6 +451,7 @@ pub fn router(state: Arc<GatewayState>) -> Router {
             get(get_agent).put(update_agent).patch(patch_agent).delete(delete_agent),
         )
         .route("/api/agents/{id}/tools", get(get_agent_tools))
+        .route("/api/agents/{id}/mentions", get(get_agent_mentions))
         .route("/api/agents/{id}/identity/{filename}", get(get_agent_identity).put(put_agent_identity))
         .route(
             "/api/agents/{id}/identity/{filename}/revisions",
@@ -6097,6 +6098,40 @@ async fn get_agent(
     Ok(Json(serde_json::to_value(response).unwrap_or_default()))
 }
 
+#[derive(Deserialize)]
+struct MentionsQuery {
+    name: String,
+}
+
+/// `GET /api/agents/{id}/mentions?name=<old>` — where the hub's agents
+/// still call agent `id` by `name`, a name it had before a rename.
+async fn get_agent_mentions(
+    Path(id): Path<String>,
+    Query(query): Query<WsQuery>,
+    Query(asked): Query<MentionsQuery>,
+    headers: axum::http::HeaderMap,
+    State(state): State<Arc<GatewayState>>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    require_admin_action(&state, &headers, query.token.as_deref()).await?;
+    resolve_agent(&state, &id)?;
+    let name = crate::agent_rename::valid_name(&asked.name).map_err(|e| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": e.to_string()})),
+        )
+    })?;
+    let config_path = resolve_config_path(&state)?;
+    let mentions = crate::agent_rename::mentions(
+        &*state.registry,
+        &config_path,
+        &id,
+        &name,
+        crate::agent_rename::Reach::Hub,
+    )
+    .await;
+    Ok(Json(serde_json::json!({ "mentions": mentions })))
+}
+
 /// `GET /api/agents/{id}/tools` — Agent tools with full JSON schemas.
 async fn get_agent_tools(
     Path(id): Path<String>,
@@ -7031,6 +7066,10 @@ async fn delete_agent(
         }
     }
 
+    #[cfg(feature = "postgres")]
+    if gone {
+        crate::desk_connections::agent_removed(&state).await;
+    }
     info!(agent_id = %id, gone, "Agent removed via API (overlay)");
 
     Ok(Json(serde_json::json!({

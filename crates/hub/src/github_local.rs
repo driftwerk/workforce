@@ -11,6 +11,7 @@ use std::time::Instant;
 use async_trait::async_trait;
 use eyre::Result;
 use serde::Deserialize;
+use workforce_agent::tools::registry::ToolRegistry;
 use workforce_agent::tools::{Tool, ToolResult};
 
 use crate::git_hardening::hardened_git;
@@ -23,15 +24,19 @@ pub struct GithubLocalContext {
     pub workspace: PathBuf,
 }
 
-pub fn github_local_tools(ctx: GithubLocalContext) -> Vec<Arc<dyn Tool>> {
-    vec![
+/// Registers `github.clone` and `github.repos` on `tools` as the hub's own,
+/// so they never read as the GitHub adapter's.
+pub fn register(tools: &ToolRegistry, ctx: GithubLocalContext) {
+    let own: [Arc<dyn Tool>; 2] = [
         Arc::new(GithubCloneTool::with_fallback_or_agent(
             ctx.vault,
             ctx.global_vault,
             ctx.workspace.clone(),
         )),
         Arc::new(GithubReposTool::new(ctx.workspace)),
-    ]
+    ];
+    own.into_iter()
+        .for_each(|tool| tools.register_builtin(tool));
 }
 
 // ---------------------------------------------------------------------------
