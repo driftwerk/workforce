@@ -56,6 +56,9 @@ pub struct Reading {
     /// The process it was read from.
     #[serde(skip)]
     pub pid: Option<u32>,
+    /// The open call it was read from: the waiting call's id.
+    #[serde(skip)]
+    pub call: Option<String>,
 }
 
 impl Reading {
@@ -68,6 +71,7 @@ impl Reading {
             by: None,
             on: None,
             pid: None,
+            call: None,
         }
     }
 }
@@ -204,13 +208,21 @@ mod tests {
             by: Some("ssh".into()),
             on: None,
             pid: Some(7),
+            call: Some("toolu_1".into()),
         };
         let v = serde_json::to_value(&r).unwrap();
         assert_eq!(v["kind"], "waits");
         assert_eq!(v["wait"], "queue");
-        assert!(v.get("pid").is_none());
+        assert!(v.get("pid").is_none() && v.get("call").is_none());
         let back: Reading = serde_json::from_value(v).unwrap();
-        assert_eq!(back, Reading { pid: None, ..r });
+        assert_eq!(
+            back,
+            Reading {
+                pid: None,
+                call: None,
+                ..r
+            }
+        );
         let works = serde_json::to_value(Reading::quiet(at(0))).unwrap();
         assert_eq!(works["kind"], "quiet");
         assert!(works.get("wait").is_none());

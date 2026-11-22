@@ -1,14 +1,16 @@
 //! Desk's sight of its working sessions: one `ps` read a pass for all of
 //! them, a `stat` of each record, the record's tail only when it grew, and
-//! the newest lines of what the session prints. Each session keeps its last
-//! [`Sample`], which the overview, the boss and the stall checks read
-//! without any I/O of their own.
+//! what its open call and background shells print, read on from where the
+//! last pass left off. Each session keeps its last [`Sample`], which the
+//! overview, the boss and the stall checks read without any I/O of their
+//! own.
 
-use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet};
-use std::hash::{Hash, Hasher};
+use std::ffi::OsString;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use chrono::{DateTime, Utc};
@@ -19,17 +21,20 @@ use super::Desk;
 use crate::memory::Redactor;
 use crate::model::{Engine, SessionRecord, SessionState, WaitsView};
 use crate::procs::{self, Stat};
-use crate::sight::procs::{self as sight_procs, Evidence};
-use crate::sight::{self, OpenCall, Reading};
+use crate::sight::procs::{self as sight_procs, Evidence, Said};
+use crate::sight::{self, Kind, OpenCall, Reading};
 
 /// The most lines of output a sample keeps from each place it reads.
 const OUTPUT_LINES: usize = 20;
 /// How much of the screen is read for them.
 const SCREEN_CHARS: usize = 4000;
-/// How many of Claude Code's newest task output files are read.
-const TASK_FILES: usize = 3;
-/// How much of the end of a task output file is read.
+/// How many of the newest task output files made since the folder was first
+/// listed are kept as the ones an open call may write to.
+const BORN_KEPT: usize = 64;
+/// The most of a task output file read in one pass.
 const TASK_TAIL: u64 = 64 * 1024;
+/// The tool whose calls write their output to a task output file.
+const SHELL_TOOL: &str = "Bash";
 /// The most rows a process tree shows.
 const TREE_ROWS: usize = 40;
 /// The most of a process's arguments shown.
@@ -92,21 +97,28 @@ pub struct Sample {
     /// Its work's processes, root first.
     pub tree: Vec<Stat>,
     runs: HashMap<u32, (u64, u64)>,
-    /// Whether its work used the CPU since the sample before.
+    /// Which of its processes used the CPU since the sample before.
     pub cpu_growing: HashSet<u32>,
+    /// When what runs under its root last used the CPU.
     pub active_at: DateTime<Utc>,
     records: Vec<RecordSeen>,
     /// When one of its records last grew.
     pub grew_at: DateTime<Utc>,
     /// How many records it has.
     pub record_count: usize,
+    /// Its open call; its input left out where the person keeps the
+    /// session out of Desk.
     pub open_call: Option<OpenCall>,
-    tasks: Vec<(PathBuf, SystemTime)>,
-    task_lines: Vec<String>,
-    /// Its newest output lines, redacted, oldest first.
+    folder: Option<Arc<TaskFolder>>,
+    /// The open call's own task output, by the call's id.
+    call_output: Option<(String, Tracked)>,
+    shells: Vec<Tracked>,
+    said: Option<Said>,
+    /// Its newest lines on screen, then from its open call's and its
+    /// background shells' output, redacted, oldest first; none where the
+    /// person keeps the session out of Desk.
     pub output: Vec<String>,
-    output_hash: u64,
-    /// When its output last changed.
+    /// When its open call's or background shells' output last grew.
     pub output_at: DateTime<Utc>,
     pub reading: Reading,
     /// The wait the overview says, once it has lasted
@@ -166,21 +178,77 @@ struct Due {
     record: SessionRecord,
     root: u32,
     baseline: Option<HashSet<u32>>,
+    /// The ids of its background shells.
+    shells: Vec<String>,
     prev: Option<Sample>,
+}
+
+/// A task output file as last read.
+#[derive(Debug, Clone, PartialEq)]
+struct Tracked {
+    path: PathBuf,
+    /// Its length then.
+    len: u64,
+    /// How far its whole lines were read.
+    read_to: u64,
+    /// Its newest lines, redacted, oldest first.
+    lines: Vec<String>,
+}
+
+impl Tracked {
+    fn from(path: PathBuf, read_to: u64) -> Self {
+        Self {
+            path,
+            len: read_to,
+            read_to,
+            lines: Vec::new(),
+        }
+    }
+}
+
+/// A session's task output folder as last listed: its last write, every
+/// name in it, and the newest output files made since it was first listed
+/// (all of them that first time), with when each was made.
+#[derive(Debug)]
+struct TaskFolder {
+    path: PathBuf,
+    changed: SystemTime,
+    names: HashSet<OsString>,
+    born: Vec<(PathBuf, SystemTime)>,
 }
 
 /// What one session's files said this pass.
 struct Files {
     records: Vec<RecordSeen>,
-    open_call: Option<Option<OpenCall>>,
-    tasks: Vec<(PathBuf, SystemTime)>,
-    task_lines: Option<Vec<String>>,
+    open_call: Option<OpenCall>,
+    folder: Option<Arc<TaskFolder>>,
+    call_output: Option<(String, Tracked)>,
+    /// The lines that appeared in the open call's own output this pass.
+    call_new: Vec<String>,
+    shells: Vec<Tracked>,
 }
 
-fn hash_of(lines: &[String]) -> u64 {
-    let mut h = DefaultHasher::new();
-    lines.hash(&mut h);
-    h.finish()
+impl Files {
+    /// What `prev` read, read again with nothing new.
+    fn kept(prev: Option<&Sample>) -> Self {
+        Self {
+            records: prev.map(|p| p.records.clone()).unwrap_or_default(),
+            open_call: prev.and_then(|p| p.open_call.clone()),
+            folder: prev.and_then(|p| p.folder.clone()),
+            call_output: prev.and_then(|p| p.call_output.clone()),
+            call_new: Vec::new(),
+            shells: prev.map(|p| p.shells.clone()).unwrap_or_default(),
+        }
+    }
+}
+
+/// Each task output file read and its length.
+fn lengths<'a>(call: Option<&'a (String, Tracked)>, shells: &'a [Tracked]) -> Vec<(&'a Path, u64)> {
+    call.map(|(_, t)| t)
+        .into_iter()
+        .chain(shells)
+        .map(|t| (t.path.as_path(), t.len))
+        .collect()
 }
 
 fn to_utc(t: SystemTime) -> DateTime<Utc> {
@@ -219,24 +287,111 @@ fn tasks_folder(root: &Path, transcript: &Path, cli: &str) -> Option<PathBuf> {
     (plain && real.starts_with(&root)).then_some(real)
 }
 
-/// The newest task output files in `folder`, plain files only, newest
-/// first.
-fn newest_tasks(folder: &Path) -> Vec<(PathBuf, SystemTime)> {
-    let Ok(entries) = std::fs::read_dir(folder) else {
-        return Vec::new();
-    };
-    let mut found: Vec<(PathBuf, SystemTime)> = entries
+/// `path`'s own metadata when it is a plain file, never a link.
+fn plain(path: &Path) -> Option<std::fs::Metadata> {
+    std::fs::symlink_metadata(path)
+        .ok()
+        .filter(|m| m.file_type().is_file())
+}
+
+/// `folder` listed again only when it changed since `prev`: it as listed,
+/// and the output files new to it since `prev` (none the first time, when
+/// everything in it was there before Desk looked). Only the names it did
+/// not hold before are looked at.
+fn listed(
+    folder: &Path,
+    prev: Option<&Arc<TaskFolder>>,
+) -> Option<(Arc<TaskFolder>, Vec<PathBuf>)> {
+    let changed = std::fs::metadata(folder).ok()?.modified().ok()?;
+    let prev = prev.filter(|f| f.path == folder);
+    if let Some(same) = prev.filter(|f| f.changed == changed) {
+        return Some((same.clone(), Vec::new()));
+    }
+    let names: HashSet<OsString> = std::fs::read_dir(folder)
+        .ok()?
         .flatten()
-        .filter(|e| e.path().extension().is_some_and(|x| x == "output"))
-        .filter_map(|e| {
-            let meta = std::fs::symlink_metadata(e.path()).ok()?;
-            meta.file_type().is_file().then_some(())?;
-            Some((e.path(), meta.modified().ok()?))
+        .map(|e| e.file_name())
+        .collect();
+    let new: Vec<(PathBuf, SystemTime)> = names
+        .iter()
+        .filter(|n| prev.is_none_or(|f| !f.names.contains(*n)))
+        .map(|n| folder.join(n))
+        .filter(|p| p.extension().is_some_and(|x| x == "output"))
+        .filter_map(|p| {
+            let meta = plain(&p)?;
+            let made = meta.created().or_else(|_| meta.modified()).ok()?;
+            Some((p, made))
         })
         .collect();
-    found.sort_by(|a, b| b.1.cmp(&a.1));
-    found.truncate(TASK_FILES);
-    found
+    let fresh = match prev {
+        Some(_) => new.iter().map(|(p, _)| p.clone()).collect(),
+        None => Vec::new(),
+    };
+    let mut born: Vec<(PathBuf, SystemTime)> = prev
+        .map(|f| f.born.clone())
+        .unwrap_or_default()
+        .into_iter()
+        .chain(new)
+        .collect();
+    born.sort_by_key(|(_, made)| *made);
+    born.drain(..born.len().saturating_sub(BORN_KEPT));
+    let folder = TaskFolder {
+        path: folder.to_path_buf(),
+        changed,
+        names,
+        born,
+    };
+    Some((Arc::new(folder), fresh))
+}
+
+/// `t` read on to the end of its whole lines: it as read, and its lines
+/// new since, redacted. A file cut shorter is read from its start; one
+/// gone is kept as it was.
+fn read_on(t: Tracked, redactor: Option<&dyn Redactor>) -> (Tracked, Vec<String>) {
+    let Some(len) = plain(&t.path).map(|m| m.len()) else {
+        return (t, Vec::new());
+    };
+    let from = match len < t.read_to {
+        true => 0,
+        false => t.read_to,
+    };
+    let start = from.max(len.saturating_sub(TASK_TAIL));
+    let mut raw = Vec::new();
+    let read = std::fs::File::open(&t.path).and_then(|mut f| {
+        f.seek(SeekFrom::Start(start))?;
+        f.take(len - start).read_to_end(&mut raw)
+    });
+    let whole = raw.iter().rposition(|b| matches!(b, b'\n' | b'\r'));
+    let (read_to, text) = match (read, whole) {
+        (Ok(_), Some(end)) => (
+            start + end as u64 + 1,
+            String::from_utf8_lossy(&raw[..=end]).replace('\r', "\n"),
+        ),
+        (Ok(_), None) if start > from => (len, String::new()),
+        _ => (from, String::new()),
+    };
+    let text = match start > from {
+        true => text.split_once('\n').map_or("", |(_, rest)| rest),
+        false => text.as_str(),
+    };
+    let new = redacted_lines(text, redactor);
+    let lines = t.lines.iter().chain(&new).cloned().collect::<Vec<_>>();
+    let lines = lines[lines.len().saturating_sub(OUTPUT_LINES)..].to_vec();
+    let t = Tracked {
+        len,
+        read_to,
+        lines,
+        ..t
+    };
+    (t, new)
+}
+
+/// Whether `id` names a file of its own in a task folder.
+fn plain_name(id: &str) -> bool {
+    !id.is_empty()
+        && id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-'))
 }
 
 /// The open call at the end of `path`, an `engine` record.
@@ -261,13 +416,35 @@ fn open_call_in(path: &Path, engine: Engine) -> Option<OpenCall> {
     sight::open_call(lines)
 }
 
+/// The output file `call` writes to in `folder`: the first made since it
+/// started, not a background shell's, read from its start when it is new
+/// since the last pass (`fresh`) and from its end otherwise.
+fn call_file(
+    call: &OpenCall,
+    folder: &TaskFolder,
+    fresh: &[PathBuf],
+    shells: &[PathBuf],
+) -> Option<Tracked> {
+    let (path, _) = folder
+        .born
+        .iter()
+        .filter(|(p, made)| to_utc(*made) >= call.since - sight_procs::SKEW && !shells.contains(p))
+        .min_by_key(|(_, made)| *made)?;
+    let from = match fresh.contains(path) {
+        true => 0,
+        false => plain(path)?.len(),
+    };
+    Some(Tracked::from(path.clone(), from))
+}
+
 /// What a session's files say since `prev`: each record's length and last
-/// write, the open call when one grew, and the task output when a file
-/// changed.
+/// write, its open call (read again only when a record grew), and what its
+/// open call and background shells (`shells`, by id) printed since.
 fn read_files(
     records: &[PathBuf],
     engine: Engine,
     tasks: Option<PathBuf>,
+    shells: &[String],
     prev: Option<&Sample>,
     redactor: Option<&dyn Redactor>,
 ) -> Files {
@@ -278,9 +455,10 @@ fn read_files(
             Some((p.clone(), meta.len(), meta.modified().ok()?))
         })
         .collect();
-    let grew = prev.is_none_or(|s| s.records != seen);
-    let open_call = grew.then(|| {
-        seen.iter()
+    let open_call = match prev.filter(|s| s.records == seen) {
+        Some(p) => p.open_call.clone(),
+        None => seen
+            .iter()
             .filter_map(|(p, ..)| open_call_in(p, engine))
             .max_by_key(|c| c.since)
             .map(|c| OpenCall {
@@ -293,23 +471,53 @@ fn read_files(
                     })
                     .unwrap_or_default(),
                 ..c
-            })
-    });
-    let newest = tasks.as_deref().map(newest_tasks).unwrap_or_default();
-    let changed = prev.is_none_or(|s| s.tasks != newest);
-    let task_lines = changed.then(|| {
-        newest
-            .iter()
-            .rev()
-            .filter_map(|(p, _)| crate::transcript::tail_of(p, TASK_TAIL).ok())
-            .flat_map(|t| redacted_lines(&t, redactor))
-            .collect()
-    });
+            }),
+    };
+    let Some((folder, fresh)) =
+        tasks.and_then(|t| listed(&t, prev.and_then(|p| p.folder.as_ref())))
+    else {
+        return Files {
+            records: seen,
+            open_call,
+            ..Files::kept(None)
+        };
+    };
+    let shell_paths: Vec<PathBuf> = shells
+        .iter()
+        .filter(|id| plain_name(id))
+        .map(|id| folder.path.join(format!("{id}.output")))
+        .collect();
+    let held = prev.and_then(|p| p.call_output.as_ref());
+    let (call_output, call_new) = open_call
+        .as_ref()
+        .filter(|c| c.tool == SHELL_TOOL)
+        .and_then(|c| {
+            let tracked = match held {
+                Some((id, t)) if *id == c.id => t.clone(),
+                _ => call_file(c, &folder, &fresh, &shell_paths)?,
+            };
+            let (tracked, new) = read_on(tracked, redactor);
+            Some(((c.id.clone(), tracked), new))
+        })
+        .unzip();
+    let shells = shell_paths
+        .into_iter()
+        .filter(|p| plain(p).is_some())
+        .map(|path| {
+            let t = prev
+                .and_then(|p| p.shells.iter().find(|t| t.path == path))
+                .cloned()
+                .unwrap_or_else(|| Tracked::from(path, 0));
+            read_on(t, redactor).0
+        })
+        .collect();
     Files {
         records: seen,
         open_call,
-        tasks: newest,
-        task_lines,
+        folder: Some(folder),
+        call_output,
+        call_new: call_new.unwrap_or_default(),
+        shells,
     }
 }
 
@@ -384,13 +592,18 @@ impl Desk {
     }
 
     /// What Desk saw of `id`, sampled again first when the last sample is
-    /// older than [`SightOptions::fresh`].
+    /// older than [`SightOptions::fresh`] and a pass would sample it.
     pub async fn sample_fresh(&self, id: Uuid) -> Option<Sample> {
-        let stale = self.sample(id).is_none_or(|s| {
-            (Utc::now() - s.at).to_std().unwrap_or_default() >= self.0.opts.sight.fresh
-        });
-        if stale {
-            self.sight_pass().await;
+        let stale = || {
+            self.sample(id).is_none_or(|s| {
+                (Utc::now() - s.at).to_std().unwrap_or_default() >= self.0.opts.sight.fresh
+            })
+        };
+        if stale() && self.sight_samples(id) {
+            let _pass = self.0.sight.pass.lock().await;
+            if stale() {
+                self.sight_pass_held().await;
+            }
         }
         self.sample(id)
     }
@@ -411,30 +624,44 @@ impl Desk {
         }
     }
 
-    /// The sessions a pass samples: those working, or waiting on their own
-    /// background work.
+    /// Whether a pass samples `r`: working, or waiting on its own
+    /// background work, and running here.
+    fn sampled_by_pass(st: &super::State, r: &SessionRecord) -> bool {
+        let background = st
+            .live
+            .get(&r.id)
+            .is_some_and(|l| l.background.view().is_some());
+        let working = matches!(
+            r.state,
+            SessionState::Starting | SessionState::Working | SessionState::Blocked
+        );
+        (background || working) && Self::root_in(st, r).is_some()
+    }
+
+    /// Whether a pass samples `id` now.
+    fn sight_samples(&self, id: Uuid) -> bool {
+        let st = self.0.state.lock();
+        st.records
+            .get(&id)
+            .is_some_and(|r| Self::sampled_by_pass(&st, r))
+    }
+
+    /// The sessions a pass samples.
     fn sight_due(&self) -> Vec<Due> {
         let st = self.0.state.lock();
         st.records
             .values()
-            .filter(|r| {
-                let background = st
-                    .live
-                    .get(&r.id)
-                    .is_some_and(|l| l.background.view().is_some());
-                background
-                    || matches!(
-                        r.state,
-                        SessionState::Starting | SessionState::Working | SessionState::Blocked
-                    )
-            })
+            .filter(|r| Self::sampled_by_pass(&st, r))
             .filter_map(|r| {
-                let root = Self::root_in(&st, r)?;
+                let live = st.live.get(&r.id);
                 Some(Due {
                     id: r.id,
                     record: r.clone(),
-                    root,
-                    baseline: st.live.get(&r.id).and_then(|l| l.baseline.clone()),
+                    root: Self::root_in(&st, r)?,
+                    baseline: live.and_then(|l| l.baseline.clone()),
+                    shells: live
+                        .map(|l| l.background.shells().map(str::to_string).collect())
+                        .unwrap_or_default(),
                     prev: st.sight.get(&r.id).cloned(),
                 })
             })
@@ -446,6 +673,11 @@ impl Desk {
     /// Reads nothing when there are none.
     pub async fn sight_pass(&self) {
         let _pass = self.0.sight.pass.lock().await;
+        self.sight_pass_held().await;
+    }
+
+    /// [`Self::sight_pass`], its lock held.
+    async fn sight_pass_held(&self) {
         let due = self.sight_due();
         let live: Vec<Uuid> = self.0.state.lock().live.keys().copied().collect();
         let background = self.background_due(&live);
@@ -499,7 +731,8 @@ impl Desk {
         let files = {
             let desk = self.clone();
             let record = d.record.clone();
-            let prev = prev.cloned();
+            let shells = d.shells.clone();
+            let before = prev.cloned();
             let task_root = self.0.opts.sight.task_root.clone();
             let redactor = redactor.clone();
             tokio::task::spawn_blocking(move || {
@@ -512,28 +745,16 @@ impl Desk {
                     &records,
                     record.engine,
                     tasks,
-                    prev.as_ref(),
+                    &shells,
+                    before.as_ref(),
                     redactor.as_deref(),
                 )
             })
             .await
-            .ok()
+            .unwrap_or_else(|_| Files::kept(prev))
         };
-        let files = files.unwrap_or_else(|| Files {
-            records: prev.map(|p| p.records.clone()).unwrap_or_default(),
-            open_call: None,
-            tasks: prev.map(|p| p.tasks.clone()).unwrap_or_default(),
-            task_lines: None,
-        });
-        let screen = self
-            .terminal_text(d.id, SCREEN_CHARS)
-            .map(|t| redacted_lines(&t, redactor.as_deref()))
-            .unwrap_or_default();
-        let task_lines = files
-            .task_lines
-            .unwrap_or_else(|| prev.map(|p| p.task_lines.clone()).unwrap_or_default());
-        let output: Vec<String> = screen.into_iter().chain(task_lines.clone()).collect();
-        let output_hash = hash_of(&output);
+        let paths: Vec<PathBuf> = files.records.iter().map(|(p, ..)| p.clone()).collect();
+        let kept_out = self.kept_out(&d.record, &paths, false).await.is_err();
         let refs: Vec<&Stat> = tree.iter().collect();
         let growing: HashSet<u32> = prev
             .map(|p| {
@@ -544,7 +765,7 @@ impl Desk {
             })
             .unwrap_or_default();
         let active_at = match prev {
-            Some(p) if !sight_procs::active(&p.runs, &refs) => p.active_at,
+            Some(p) if !sight_procs::work_active(&p.runs, &refs) => p.active_at,
             _ => now,
         };
         let last_write = files.records.iter().map(|(_, _, t)| to_utc(*t)).max();
@@ -553,29 +774,69 @@ impl Desk {
             Some(_) => now,
             None => last_write.unwrap_or(now),
         };
-        let open_call = files
+        let said = files
             .open_call
-            .unwrap_or_else(|| prev.and_then(|p| p.open_call.clone()));
+            .as_ref()
+            .zip(files.call_output.as_ref())
+            .filter(|(c, (id, _))| c.id == *id)
+            .and_then(|(c, _)| {
+                let busy = prev.is_some_and(|p| {
+                    sight_procs::call_shell(&refs, c, now).is_some_and(|shell| {
+                        sight_procs::active(&p.runs, &sight_procs::subtree(&refs, shell))
+                    })
+                });
+                let held = prev.and_then(|p| p.said.clone());
+                sight_procs::said_after(held, &c.id, &files.call_new, now, busy)
+            });
         let reading = sight_procs::classify(&Evidence {
             tree: &refs,
-            open_call: open_call.as_ref(),
-            output: &output,
+            open_call: files.open_call.as_ref(),
+            said: said.as_ref(),
             active_at,
             now,
             poll: chrono::Duration::from_std(self.0.opts.sight.poll).unwrap_or_default(),
         });
+        fn same(r: &Reading) -> (&Kind, &str, Option<u32>, Option<&str>) {
+            (&r.kind, &r.words, r.pid, r.call.as_deref())
+        }
         let reading = match prev {
-            Some(p)
-                if (&p.reading.kind, &p.reading.words, p.reading.pid)
-                    == (&reading.kind, &reading.words, reading.pid) =>
-            {
-                Reading {
-                    since: p.reading.since.min(reading.since),
-                    ..reading
-                }
-            }
+            Some(p) if same(&p.reading) == same(&reading) => Reading {
+                since: p.reading.since.min(reading.since),
+                ..reading
+            },
             _ => reading,
         };
+        let output = match kept_out {
+            true => Vec::new(),
+            false => {
+                let screen = self
+                    .terminal_text(d.id, SCREEN_CHARS)
+                    .map(|t| redacted_lines(&t, redactor.as_deref()))
+                    .unwrap_or_default();
+                let call = files.call_output.iter().flat_map(|(_, t)| &t.lines);
+                let shells = files.shells.iter().flat_map(|t| &t.lines);
+                screen
+                    .into_iter()
+                    .chain(call.chain(shells).cloned())
+                    .collect()
+            }
+        };
+        let output_at = match prev {
+            Some(p)
+                if lengths(p.call_output.as_ref(), &p.shells)
+                    == lengths(files.call_output.as_ref(), &files.shells) =>
+            {
+                p.output_at
+            }
+            _ => now,
+        };
+        let open_call = files.open_call.map(|c| match kept_out {
+            true => OpenCall {
+                input: String::new(),
+                ..c
+            },
+            false => c,
+        });
         Sample {
             at: now,
             first_at: prev.map_or(now, |p| p.first_at),
@@ -589,14 +850,12 @@ impl Desk {
             records: files.records,
             grew_at,
             open_call,
-            tasks: files.tasks,
-            task_lines,
-            output_at: match prev {
-                Some(p) if p.output_hash == output_hash => p.output_at,
-                _ => now,
-            },
+            folder: files.folder,
+            call_output: files.call_output,
+            shells: files.shells,
+            said,
             output,
-            output_hash,
+            output_at,
             reading,
             tree,
         }
@@ -710,29 +969,118 @@ mod tests {
         assert_eq!(tasks_folder(&root, linked, "cli-1"), None);
     }
 
-    #[test]
-    fn the_newest_task_files_are_read_and_links_are_not() {
-        let dir = tempfile::tempdir().unwrap();
-        for (n, name) in ["a", "b", "c", "d"].iter().enumerate() {
-            let p = dir.path().join(format!("{name}.output"));
-            std::fs::write(&p, format!("{name}\n")).unwrap();
-            let t = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000 + n as u64);
-            std::fs::File::options()
-                .write(true)
-                .open(&p)
-                .unwrap()
-                .set_modified(t)
-                .unwrap();
-        }
-        #[cfg(unix)]
-        std::os::unix::fs::symlink(dir.path().join("a.output"), dir.path().join("z.output"))
+    fn made(path: &Path, secs: u64) {
+        std::fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(SystemTime::UNIX_EPOCH + Duration::from_secs(secs))
             .unwrap();
+    }
+
+    #[test]
+    fn a_task_folder_is_listed_again_only_when_it_changed_and_never_follows_links() {
+        let dir = tempfile::tempdir().unwrap();
+        let old = dir.path().join("b-old.output");
+        std::fs::write(&old, "all 3 build slots are busy\n").unwrap();
         std::fs::write(dir.path().join("notes.txt"), "x").unwrap();
-        let names: Vec<String> = newest_tasks(dir.path())
-            .iter()
-            .map(|(p, _)| p.file_stem().unwrap().to_string_lossy().into_owned())
-            .collect();
-        assert_eq!(names, ["d", "c", "b"]);
+        let transcript = dir.path().join("agent.jsonl");
+        std::fs::write(&transcript, "waiting for a review\n").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&transcript, dir.path().join("a-agent.output")).unwrap();
+        let (first, fresh) = listed(dir.path(), None).unwrap();
+        assert!(fresh.is_empty(), "what was there before Desk looked is old");
+        let born: Vec<&PathBuf> = first.born.iter().map(|(p, _)| p).collect();
+        assert_eq!(
+            born,
+            [&old],
+            "a sub-agent's linked transcript is never read"
+        );
+        let (again, fresh) = listed(dir.path(), Some(&first)).unwrap();
+        assert!(Arc::ptr_eq(&first, &again) && fresh.is_empty());
+        std::thread::sleep(Duration::from_millis(20));
+        let new = dir.path().join("b-new.output");
+        std::fs::write(&new, "").unwrap();
+        let (next, fresh) = listed(dir.path(), Some(&first)).unwrap();
+        assert_eq!(fresh, std::slice::from_ref(&new));
+        assert_eq!(next.born.len(), 2);
+        assert!(next.names.len() == 5 && next.born.iter().any(|(p, _)| *p == new));
+    }
+
+    #[test]
+    fn a_task_file_is_read_on_from_where_it_was_left_in_whole_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("b1.output");
+        std::fs::write(&path, "one\nkey SECRET-abc\npart").unwrap();
+        let r = redactor_for_tests();
+        let (t, new) = read_on(Tracked::from(path.clone(), 0), Some(r.as_ref()));
+        assert_eq!(new, ["one", "key [secret]"]);
+        assert_eq!((t.read_to, t.len), (19, 23));
+        let mut f = std::fs::File::options().append(true).open(&path).unwrap();
+        std::io::Write::write_all(&mut f, b"ial\rwaiting for one\n").unwrap();
+        let (t, new) = read_on(t, Some(r.as_ref()));
+        assert_eq!(new, ["partial", "waiting for one"]);
+        assert_eq!(
+            t.lines,
+            ["one", "key [secret]", "partial", "waiting for one"]
+        );
+        let (t, new) = read_on(t, Some(r.as_ref()));
+        assert!(new.is_empty(), "nothing new since");
+        std::fs::write(&path, "again\n").unwrap();
+        let (t, new) = read_on(t, Some(r.as_ref()));
+        assert_eq!((new, t.read_to), (vec!["again".to_string()], 6));
+        let (_, bare) = read_on(Tracked::from(path.clone(), 0), None);
+        assert!(bare.is_empty(), "nothing is read without a redactor");
+        let big = dir.path().join("b2.output");
+        let text = format!("{}\nlast\n", "x".repeat(TASK_TAIL as usize));
+        std::fs::write(&big, text).unwrap();
+        let (_, new) = read_on(Tracked::from(big, 0), Some(r.as_ref()));
+        assert_eq!(new, ["last"], "a line cut by the tail is left out");
+    }
+
+    #[test]
+    fn an_open_calls_file_is_the_first_made_since_it_started_and_no_shells() {
+        let dir = tempfile::tempdir().unwrap();
+        let at = |secs: u64| SystemTime::UNIX_EPOCH + Duration::from_secs(secs);
+        let file = |name: &str| {
+            let p = dir.path().join(name);
+            std::fs::write(&p, "printed before\n").unwrap();
+            made(&p, 1);
+            p
+        };
+        let (before, shell, own, later) = (file("b0"), file("b1"), file("b2"), file("b3"));
+        let folder = TaskFolder {
+            path: dir.path().to_path_buf(),
+            changed: at(0),
+            names: HashSet::new(),
+            born: vec![
+                (before, at(990)),
+                (shell.clone(), at(1001)),
+                (own.clone(), at(1002)),
+                (later.clone(), at(1005)),
+            ],
+        };
+        let call = OpenCall {
+            id: "toolu_1".into(),
+            tool: "Bash".into(),
+            input: String::new(),
+            since: to_utc(at(1000)),
+        };
+        let fresh = call_file(
+            &call,
+            &folder,
+            std::slice::from_ref(&own),
+            std::slice::from_ref(&shell),
+        )
+        .unwrap();
+        assert_eq!((fresh.path.as_path(), fresh.read_to), (own.as_path(), 0));
+        let old = call_file(&call, &folder, &[], &[shell]).unwrap();
+        assert_eq!(old.read_to, 15, "a file there before is read from its end");
+        let late = OpenCall {
+            since: to_utc(at(1100)),
+            ..call
+        };
+        assert!(call_file(&late, &folder, &[], &[]).is_none());
     }
 
     #[test]
@@ -768,10 +1116,11 @@ mod tests {
             grew_at: now,
             record_count: 0,
             open_call: None,
-            tasks: vec![],
-            task_lines: vec![],
+            folder: None,
+            call_output: None,
+            shells: vec![],
+            said: None,
             output: vec![],
-            output_hash: 0,
             output_at: now,
             reading: Reading {
                 pid: Some(3),
