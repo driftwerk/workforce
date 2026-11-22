@@ -537,11 +537,11 @@ c. Call `google.setup(action='login_poll', workspace='<name>')`.\n\
      • status='denied' → they clicked Cancel; check if they meant to.\n\
 d. (Optional) Verify with `google.setup(action='status', workspace='<name>')`. \
    `authenticated: true` means every google.* tool can now use that \
-   workspace via the `account` parameter.\n\
+   workspace via the `workspace` parameter.\n\
 \n\
 ━━━ Multi-account tips ━━━\n\
 \n\
-• Set a default so tools without an `account` parameter pick the right one:\n\
+• Set a default so tools without a `workspace` parameter pick the right one:\n\
     vault.set(scope='agent_specific', path='skills/google/default_workspace', value='<name>')\n\
   (shared by every user of this agent — an admin sets it)\n\
 • List connected accounts: `google.setup(action='list')`.\n\
@@ -582,6 +582,18 @@ path.",
                 WorkspaceCredentialMeta {
                     key: "email",
                     description: "Connected account email (auto-managed by google.setup)",
+                    required: false,
+                    addable: false,
+                },
+                WorkspaceCredentialMeta {
+                    key: "account_id",
+                    description: "Connected Google account's id (auto-managed)",
+                    required: false,
+                    addable: false,
+                },
+                WorkspaceCredentialMeta {
+                    key: "client_id",
+                    description: "The app the connection was approved on (auto-managed)",
                     required: false,
                     addable: false,
                 },
@@ -1155,6 +1167,18 @@ system.enable_skill('freeagent') to reload.",
                 WorkspaceCredentialMeta {
                     key: "company",
                     description: "Connected company name (auto-managed)",
+                    required: false,
+                    addable: false,
+                },
+                WorkspaceCredentialMeta {
+                    key: "company_id",
+                    description: "Connected company's FreeAgent id (auto-managed)",
+                    required: false,
+                    addable: false,
+                },
+                WorkspaceCredentialMeta {
+                    key: "client_id",
+                    description: "The app the connection was approved on (auto-managed)",
                     required: false,
                     addable: false,
                 },
@@ -1808,6 +1832,11 @@ const DEFAULT_SELECTORS: &[(&str, &str, &str)] = &[
     ),
     ("xero", "skills/xero/default_entity", "Default entity name"),
     (
+        "freeagent",
+        "skills/freeagent/default_workspace",
+        "Default workspace name",
+    ),
+    (
         "postmark",
         "skills/postmark/default_workspace",
         "Default workspace name",
@@ -2397,7 +2426,7 @@ pub fn load_skill_from_vault(
         .map(|_| layered_user_store(Arc::clone(&vault), global_vault.clone()));
     let loaded = match skill_name {
         "github" => load_github_from_vault(vault, global_vault, config, registry),
-        "google" => load_google_from_vault(vault, global_vault, registry),
+        "google" => load_google_from_vault(vault, global_vault, config, registry),
         "linear" => load_linear_from_vault(vault, global_vault, config, registry),
         "jira" => load_jira_from_vault(vault, global_vault, config, registry),
         "datadog" => load_datadog_from_vault(vault, global_vault, config, registry),
@@ -2675,135 +2704,63 @@ pub(crate) fn github_skill_for(
     workforce_skills::adapters::github::GithubSkill::with_store(skill_config, store)
 }
 
+/// What a loader on a `[desk]` hub says while `service` has no connection:
+/// the agent sets one up itself.
+fn set_up_on_desk(service: &str, what: &str) -> String {
+    format!(
+        "No {what} is connected yet. To connect one, run connections.setup with service {service}."
+    )
+}
+
 fn load_google_from_vault(
     vault: Arc<Vault>,
     global_vault: Option<Arc<Vault>>,
+    config: &WorkforceConfig,
     registry: &ToolRegistry,
 ) -> eyre::Result<SkillLoadResult> {
-    use workforce_skills::adapters::google::api::{self, GoogleApi, GoogleApiContext};
+    use workforce_skills::adapters::google::api::{self, GoogleApi, GoogleApis};
     use workforce_skills::adapters::google::oauth::OAuthClientCreds;
-    use workforce_skills::adapters::google::token_store::{self, TokenStore};
+    use workforce_skills::adapters::google::token_store::TokenStore;
 
-    let store = layered_user_store(Arc::clone(&vault), global_vault);
-
-    // Load OAuth client credentials (bundled or BYO from vault).
-    let creds = match OAuthClientCreds::from_store_or_bundled(store.as_ref()) {
-        Ok(c) => c,
-        Err(e) => {
-            warn!(error = %e, "Google OAuth client not configured — the one-time admin step (vault.set skills/google/oauth_client/{{client_id,client_secret}}) must complete before any user can call google.setup(action='login')");
-            OAuthClientCreds {
-                client_id: String::new(),
-                client_secret: String::new(),
-                redirect_uri: None,
-            }
-        }
-    };
-
+    let store = layered_user_store(vault, global_vault);
     let http = api::build_http_client()?;
-
-    // Discover workspaces by refresh_token presence.
-    let workspace_names = token_store::list_workspaces(store.as_ref());
-
-    // Legacy migration: if only skills/google/account exists (old gog path)
-    // and no new workspaces are configured, warn.
-    if workspace_names.is_empty() {
-        if let Some(legacy_email) = vault.get("skills/google/account") {
-            warn!(
-                email = %legacy_email,
-                "Legacy Google account found (skills/google/account). Call google.setup(action='login', no_browser=true) to re-authorize with the new pure-Rust skill."
-            );
-        }
-    }
-
-    let default_ws =
-        pinned_default("google").or_else(|| vault.get("skills/google/default_workspace"));
-
-    // Build GoogleApi per workspace.
-    let mut account_apis: std::collections::HashMap<String, Arc<GoogleApi>> =
-        std::collections::HashMap::new();
-    for ws_name in &workspace_names {
-        let ts = TokenStore::new(store.clone(), ws_name.clone(), creds.clone(), http.clone());
-        let api = Arc::new(GoogleApi::new(http.clone(), ts));
-        account_apis.insert(ws_name.clone(), api);
-    }
-
-    // Determine the default API.
-    let default_api = if let Some(ref dw) = default_ws {
-        account_apis.get(dw).cloned()
-    } else {
-        account_apis.values().next().cloned()
+    let paths = workforce_skills::adapters::google::instance_paths();
+    let apis = {
+        let store = Arc::clone(&store);
+        Arc::new(GoogleApis::live(
+            Arc::clone(&store),
+            paths.clone(),
+            selector(store.as_ref(), "google", "skills/google/default_workspace"),
+            move |name| {
+                let client = OAuthClientCreds::from_store_or_bundled(store.as_ref())?;
+                let tokens = TokenStore::new(Arc::clone(&store), name.into(), client, http.clone());
+                Ok(GoogleApi::new(http.clone(), tokens))
+            },
+        ))
     };
-    let default_api = default_api.unwrap_or_else(|| {
-        let ts = TokenStore::new(
-            store.clone(),
-            "default".to_string(),
-            creds.clone(),
-            http.clone(),
-        );
-        Arc::new(GoogleApi::new(http.clone(), ts))
-    });
-
-    let ctx = Arc::new(GoogleApiContext::multi(default_api, account_apis));
-
-    // Build all service tools.
-    let tools = workforce_skills::adapters::google::services::build_all(ctx);
-    let mut names: Vec<String> = Vec::with_capacity(tools.len() + 1);
-    for tool in tools {
+    registry.set_instance_source(
+        "google",
+        Arc::clone(&apis) as Arc<dyn workforce_agent::llm::environment::InstanceSource>,
+    );
+    let mut names: Vec<String> = Vec::new();
+    for tool in workforce_skills::adapters::google::services::build_all(apis) {
         names.push(tool.name().to_string());
         registry.register(tool);
     }
-
-    // Register the setup tool, wired to the hub's process-wide web-flow state
-    // store so `action='login'` can emit a browser redirect URL when
-    // `skills/google/oauth_client/redirect_uri` is configured.
-    let setup_tool = Arc::new(
-        workforce_skills::adapters::google::setup::GoogleSetupTool::new(store.clone())
-            .with_web_flow_store(crate::google_oauth_callback::google_web_flow_store()),
-    );
-    names.push(setup_tool.name().to_string());
-    registry.register(setup_tool);
-
-    // Context hint for agent system prompt.
-    // Every turn sees this hint: it names only the shared accounts (with
-    // their addresses), never the loader's own.
-    let shared_accounts = shared_instance_names(
-        store.as_ref(),
-        &workforce_skills::adapters::utils::InstancePaths::new(
-            "skills/google/workspaces/",
-            "refresh_token",
-            "",
-        ),
-    );
-    let context_hint = if !shared_accounts.is_empty() {
-        let mut parts: Vec<String> = shared_accounts
-            .iter()
-            .map(|ws| {
-                let email = shared_get(
-                    store.as_ref(),
-                    &format!("skills/google/workspaces/{ws}/email"),
-                )
-                .unwrap_or_else(|| "(unknown)".to_string());
-                let is_default = default_ws.as_deref() == Some(ws.as_str());
-                if is_default {
-                    format!("\"{}\" = {} (default)", ws, email)
-                } else {
-                    format!("\"{}\" = {}", ws, email)
-                }
-            })
-            .collect();
-        parts.sort();
-        Some(format!(
-            "Shared accounts: {}\nEach person's own Google accounts are used when they call.\nUse the `account` parameter on any Google tool to select which account.",
-            parts.join(", ")
-        ))
-    } else if !workspace_names.is_empty() {
-        Some(
-            "Google accounts: each person's own, used when they call. Use the `account` parameter on any Google tool to select which account; if a call says the account isn't connected, call google.setup(action='login', no_browser=true)."
-                .to_string(),
-        )
-    } else {
-        Some(
-            "No Google account connected for this user yet. To connect one:\n\
+    let desk = config.desk.enabled;
+    // `google.setup` signs in on a hub-admin app with a public callback, a
+    // dead end on Desk, where `connections.setup` connects an account.
+    if !desk {
+        let setup_tool = Arc::new(
+            workforce_skills::adapters::google::setup::GoogleSetupTool::new(Arc::clone(&store))
+                .with_web_flow_store(crate::google_oauth_callback::google_web_flow_store()),
+        );
+        names.push(setup_tool.name().to_string());
+        registry.register(setup_tool);
+    }
+    let unconnected = match desk {
+        true => set_up_on_desk("google", "Google account"),
+        false => "No Google account connected for this user yet. To connect one:\n\
              1. Call google.setup(action='login', no_browser=true, workspace='default') — \
                 it returns a `user_code` and a `verification_url` (google.com/device).\n\
              2. Present BOTH to the user verbatim and ask them to open the URL and \
@@ -2814,15 +2771,20 @@ fn load_google_from_vault(
              set skills/google/oauth_client/{client_id,client_secret} in the hub's \
              GLOBAL vault from the CLI (`workforce vault set ...` on the hub host) \
              — these are org-wide and cannot be set via the agent vault.set tool."
-                .to_string(),
-        )
+            .to_string(),
     };
-
+    let context_hint = shared_hint(
+        store.as_ref(),
+        &paths,
+        "skills/google/default_workspace",
+        "Google accounts",
+        "Use the `workspace` parameter on Google tools to select which account.",
+        Some(unconnected),
+    );
     info!(
         skill = "google",
         count = names.len(),
-        workspaces = workspace_names.len(),
-        "Loaded Google skill (pure-Rust)"
+        "Loaded skill from vault"
     );
     Ok(SkillLoadResult {
         tool_names: names,
@@ -3776,61 +3738,51 @@ fn load_spotify_from_vault(
 fn load_freeagent_from_vault(
     vault: Arc<Vault>,
     global_vault: Option<Arc<Vault>>,
-    _config: &WorkforceConfig,
+    config: &WorkforceConfig,
     registry: &ToolRegistry,
 ) -> eyre::Result<SkillLoadResult> {
     use workforce_skills::adapters::freeagent::setup::FreeAgentSetupTool;
     use workforce_skills::adapters::freeagent::FreeAgentSkill;
 
     let store = layered_user_store(vault, global_vault);
+    let skill = FreeAgentSkill::with_store(
+        Arc::clone(&store),
+        selector(
+            store.as_ref(),
+            "freeagent",
+            "skills/freeagent/default_workspace",
+        ),
+    )?;
+    registry.set_instance_source("freeagent", skill.instance_source());
     let mut names: Vec<String> = Vec::new();
-
-    // Data tools need the admin OAuth app. When it's unconfigured, register
-    // only the setup tool so users can still see the onboarding instructions.
-    match FreeAgentSkill::with_store(Arc::clone(&store)) {
-        Ok(skill) => {
-            for tool in skill.tools() {
-                names.push(tool.name().to_string());
-                registry.register(tool);
-            }
-        }
-        Err(e) => warn!(
-            error = %e,
-            "FreeAgent OAuth app not configured — only freeagent.setup is available until the \
-             one-time admin step (vault.set skills/freeagent/oauth_client/{{client_id,client_secret,redirect_uri}}) completes"
-        ),
+    for tool in skill.tools() {
+        names.push(tool.name().to_string());
+        registry.register(tool);
     }
-
-    // Always register the setup tool, wired to the hub's shared state store so
-    // `action='login'` can emit a browser redirect URL.
-    let setup_tool = Arc::new(
-        FreeAgentSetupTool::new(Arc::clone(&store))
-            .with_state_store(crate::freeagent_oauth_callback::freeagent_state_store()),
-    );
-    names.push(setup_tool.name().to_string());
-    registry.register(setup_tool);
-
-    // Every turn sees this hint: it names only the shared companies, never
-    // the loader's own.
-    let connected = shared_instance_names(
-        store.as_ref(),
-        &workforce_skills::adapters::utils::InstancePaths::new(
-            "skills/freeagent/workspaces/",
-            "refresh_token",
-            "",
-        ),
-    );
-    let context_hint = if connected.is_empty() {
-        Some(
-            "FreeAgent companies are each person's own. If a call says none is connected, run freeagent.setup(action='login') to connect one."
-                .to_string(),
-        )
-    } else {
-        Some(format!(
-            "Shared FreeAgent companies: {}. Each person's own are used when they call. Use the `workspace` parameter on freeagent.* tools to select one.",
-            connected.join(", ")
-        ))
+    let desk = config.desk.enabled;
+    // `freeagent.setup` signs in on a hub-admin app with a public callback,
+    // a dead end on Desk, where `connections.setup` connects a business.
+    if !desk {
+        let setup_tool = Arc::new(
+            FreeAgentSetupTool::new(Arc::clone(&store))
+                .with_state_store(crate::freeagent_oauth_callback::freeagent_state_store()),
+        );
+        names.push(setup_tool.name().to_string());
+        registry.register(setup_tool);
+    }
+    let unconnected = match desk {
+        true => set_up_on_desk("freeagent", "FreeAgent business"),
+        false => "FreeAgent companies are each person's own. If a call says none is connected, run freeagent.setup(action='login') to connect one."
+            .to_string(),
     };
+    let context_hint = shared_hint(
+        store.as_ref(),
+        &FreeAgentSkill::instance_paths(),
+        "skills/freeagent/default_workspace",
+        "FreeAgent businesses",
+        "Use the `workspace` parameter on freeagent.* tools to select which business.",
+        Some(unconnected),
+    );
     info!(
         skill = "freeagent",
         count = names.len(),
@@ -6517,5 +6469,158 @@ mod tests {
             !google_ready(&vault),
             "per-user google token must not read as ready unscoped (shared/cached block)"
         );
+    }
+
+    /// A hub with Google's and FreeAgent's app kept, and two shared
+    /// connections of each: Google's "home" and "work", FreeAgent's "harbor"
+    /// and "lumen".
+    fn two_of_each() -> (Arc<Vault>, Arc<Vault>) {
+        let dir = tempfile::tempdir().unwrap();
+        let agent = Arc::new(Vault::open(&dir.path().join("agent"), "k").unwrap());
+        let global = Arc::new(Vault::open(&dir.path().join("global"), "k").unwrap());
+        std::mem::forget(dir);
+        for (path, value) in [
+            ("skills/google/oauth_client/client_id", "cid"),
+            ("skills/google/oauth_client/client_secret", "secret"),
+            ("skills/freeagent/oauth_client/client_id", "cid"),
+            ("skills/freeagent/oauth_client/client_secret", "secret"),
+            ("skills/google/workspaces/home/refresh_token", "rt"),
+            ("skills/google/workspaces/work/refresh_token", "rt"),
+            ("skills/freeagent/workspaces/harbor/refresh_token", "rt"),
+            ("skills/freeagent/workspaces/lumen/refresh_token", "rt"),
+        ] {
+            global.set(path, value).unwrap();
+        }
+        (agent, global)
+    }
+
+    fn desk() -> WorkforceConfig {
+        let mut config = WorkforceConfig::default();
+        config.desk.enabled = true;
+        config
+    }
+
+    fn loaded(
+        skill: &str,
+        vaults: &(Arc<Vault>, Arc<Vault>),
+        config: &WorkforceConfig,
+        registry: &ToolRegistry,
+    ) -> SkillLoadResult {
+        load_skill_from_vault(
+            skill,
+            Arc::clone(&vaults.0),
+            Some(Arc::clone(&vaults.1)),
+            config,
+            registry,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn on_desk_the_setup_tools_are_not_registered() {
+        for (skill, setup) in [("google", "google.setup"), ("freeagent", "freeagent.setup")] {
+            let vaults = two_of_each();
+            let on_desk = ToolRegistry::new();
+            let names = loaded(skill, &vaults, &desk(), &on_desk).tool_names;
+            assert!(!names.iter().any(|n| n == setup), "{skill}: {names:?}");
+            assert!(on_desk.get(setup).is_none(), "{skill}");
+            assert!(
+                on_desk.get(&format!("{skill}.workspaces")).is_some(),
+                "{skill}"
+            );
+            let server = ToolRegistry::new();
+            let names = loaded(skill, &vaults, &WorkforceConfig::default(), &server).tool_names;
+            assert!(names.iter().any(|n| n == setup), "{skill}: {names:?}");
+            assert!(server.get(setup).is_some(), "{skill}");
+        }
+    }
+
+    #[test]
+    fn freeagent_and_google_hints_name_connections_setup_on_desk() {
+        for skill in ["google", "freeagent"] {
+            let dir = tempfile::tempdir().unwrap();
+            let agent = Arc::new(Vault::open(&dir.path().join("agent"), "k").unwrap());
+            let global = Arc::new(Vault::open(&dir.path().join("global"), "k").unwrap());
+            let none = (agent, global);
+            let hint = loaded(skill, &none, &desk(), &ToolRegistry::new())
+                .context_hint
+                .unwrap();
+            assert!(
+                hint.contains(&format!("run connections.setup with service {skill}")),
+                "{hint}"
+            );
+            assert!(!hint.contains(&format!("{skill}.setup")), "{hint}");
+            let server = loaded(
+                skill,
+                &none,
+                &WorkforceConfig::default(),
+                &ToolRegistry::new(),
+            )
+            .context_hint
+            .unwrap();
+            assert!(server.contains(&format!("{skill}.setup")), "{server}");
+            assert!(!server.contains("connections.setup"), "{server}");
+            // Connected, it names the shared connections instead.
+            let hint = loaded(skill, &two_of_each(), &desk(), &ToolRegistry::new())
+                .context_hint
+                .unwrap();
+            assert!(hint.contains("`workspace` parameter"), "{hint}");
+            assert!(!hint.contains("connections.setup"), "{hint}");
+        }
+    }
+
+    #[tokio::test]
+    async fn the_agent_default_is_the_google_and_freeagent_selector() {
+        use workforce_common::credential_pin::{PinSource, TierPin};
+        struct Picked;
+        impl PinSource for Picked {
+            fn pin(&self, _: &str) -> TierPin {
+                TierPin::All
+            }
+            fn default_instance(&self, connector: &str) -> Option<String> {
+                match connector {
+                    "google" => Some("work".into()),
+                    "freeagent" => Some("lumen".into()),
+                    _ => None,
+                }
+            }
+        }
+        let vaults = two_of_each();
+        let default_of = |registry: &ToolRegistry, tool: &str| {
+            let tool = registry.get(tool).unwrap();
+            async move { tool.execute(serde_json::json!({})).await.unwrap().output["default"].clone() }
+        };
+        // Neither the agent nor the hub names one: two, so none.
+        let unpicked = ToolRegistry::new();
+        for skill in ["google", "freeagent"] {
+            loaded(skill, &vaults, &desk(), &unpicked);
+        }
+        assert!(default_of(&unpicked, "google.workspaces").await.is_null());
+        assert!(default_of(&unpicked, "freeagent.workspaces")
+            .await
+            .is_null());
+        // The hub-wide selector.
+        vaults
+            .1
+            .set("skills/google/default_workspace", "home")
+            .unwrap();
+        vaults
+            .1
+            .set("skills/freeagent/default_workspace", "harbor")
+            .unwrap();
+        let hub = ToolRegistry::new();
+        for skill in ["google", "freeagent"] {
+            loaded(skill, &vaults, &desk(), &hub);
+        }
+        assert_eq!(default_of(&hub, "google.workspaces").await, "home");
+        assert_eq!(default_of(&hub, "freeagent.workspaces").await, "harbor");
+        // The agent's own pick wins over it.
+        let picked = ToolRegistry::new();
+        picked.credential_pins().fill(Arc::new(Picked));
+        for skill in ["google", "freeagent"] {
+            loaded(skill, &vaults, &desk(), &picked);
+        }
+        assert_eq!(default_of(&picked, "google.workspaces").await, "work");
+        assert_eq!(default_of(&picked, "freeagent.workspaces").await, "lumen");
     }
 }

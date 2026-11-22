@@ -2263,6 +2263,12 @@ pub(crate) async fn build_enhanced_prompt_with_context(
     if let Some(line) = works_in_line(&service.workspace) {
         meta_lines.push(line);
     }
+    #[cfg(feature = "postgres")]
+    if let Some(line) = crate::desk_driver::desk()
+        .and_then(|_| crate::desk_driver::documents_line(&service.workspace))
+    {
+        meta_lines.push(line);
+    }
     // An overseer asked in its Desk DM acts within its switches from the
     // first request, not after a suggestion comes back.
     #[cfg(feature = "postgres")]

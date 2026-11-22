@@ -33,8 +33,12 @@ pub struct Services {
     /// BankSync's per-person limit, which a check spends: the process's one
     /// outside tests.
     pub bank_limiter: std::sync::Arc<workforce_skills::adapters::bank::banksync::Limiter>,
+    pub google_auth: String,
     pub google_token: String,
     pub google_userinfo: String,
+    /// FreeAgent's API, whose `approve_app` and `token_endpoint` its
+    /// sign-in uses too.
+    pub freeagent_api: String,
     /// The shortest wait between two polls of a device sign-in.
     pub poll_floor: Duration,
     /// The GitHub CLI's sign-in on this computer, a GitHub setup offers.
@@ -59,8 +63,10 @@ impl Services {
             datadog_api: None,
             bank_api: workforce_skills::adapters::bank::banksync::API.into(),
             bank_limiter: workforce_skills::adapters::bank::banksync::Limiter::shared(),
+            google_auth: workforce_skills::adapters::google::oauth::AUTH_URL.into(),
             google_token: workforce_skills::adapters::google::oauth::TOKEN_URL.into(),
             google_userinfo: workforce_skills::adapters::google::oauth::USERINFO_URL.into(),
+            freeagent_api: "https://api.freeagent.com/v2".into(),
             poll_floor: Duration::from_secs(5),
             gh: super::gh::GhCli::live(),
         }
@@ -355,57 +361,6 @@ impl Services {
             },
             false => refused_or_failed("GitHub", status, &body, "token"),
         })
-    }
-
-    /// Whether a Google refresh token still signs in, on the person's own
-    /// client.
-    pub async fn google(
-        &self,
-        client_id: &str,
-        client_secret: &str,
-        refresh_token: &str,
-        email: Option<String>,
-    ) -> Found {
-        let refreshed = answer(
-            "Google",
-            self.http.post(&self.google_token).form(&[
-                ("client_id", client_id),
-                ("client_secret", client_secret),
-                ("refresh_token", refresh_token),
-                ("grant_type", "refresh_token"),
-            ]),
-        )
-        .await;
-        let (status, body) = match refreshed {
-            Ok(answer) => answer,
-            Err(found) => return found,
-        };
-        let v: Value = serde_json::from_str(&body).unwrap_or_default();
-        if !status.is_success() {
-            return match v.get("error").and_then(Value::as_str) {
-                Some("invalid_grant" | "unauthorized_client" | "invalid_client") => {
-                    Found::Refused("Google says this sign-in has expired or was revoked".into())
-                }
-                _ => refused_or_failed("Google", status, &body, "sign-in"),
-            };
-        }
-        let Some(access) = v.get("access_token").and_then(Value::as_str) else {
-            return Found::Failed("Google answered without a token".into());
-        };
-        let looked_up = answer(
-            "Google",
-            self.http.get(&self.google_userinfo).bearer_auth(access),
-        )
-        .await;
-        let account = looked_up
-            .ok()
-            .filter(|(status, _)| status.is_success())
-            .and_then(|(_, body)| {
-                account(&serde_json::from_str(&body).unwrap_or_default(), &["email"])
-            })
-            .or(email)
-            .unwrap_or_else(|| "Google".into());
-        Found::Works { account }
     }
 }
 

@@ -1,8 +1,8 @@
 //! Which connectors' tools reach an agent, on a hub with `[desk]`: what the
 //! agent's own `[skills]` turns on (`enabled`), and of those, the ones that
-//! only read (`read_only`). An agent whose `[skills]` names no `enabled`
-//! keeps every connector, as before the key existed; every other hub never
-//! builds this.
+//! only read (`read_only`, and those that start read only until `writable`
+//! names them). An agent whose `[skills]` names no `enabled` keeps every
+//! connector, as before the key existed; every other hub never builds this.
 //!
 //! A connector is one Desk lists ([`CONNECTORS`](workforce_common::connector_binding::CONNECTORS)),
 //! matched by its adapter's `tool_prefix`; every other built-in adapter
@@ -88,9 +88,6 @@ impl ConnectorToolAccess {
 impl ToolAccess for ConnectorToolAccess {
     fn snapshot(&self) -> ToolAccessSnapshot {
         match self.binding() {
-            Ok(binding) if binding.enabled.is_none() && binding.read_only.is_empty() => {
-                ToolAccessSnapshot::default()
-            }
             Ok(binding) => hidden(&binding, self.tools.names()),
             // Unreadable: no connector reaches it until it reads again.
             Err(_) => hidden(
@@ -107,6 +104,7 @@ impl ToolAccess for ConnectorToolAccess {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use workforce_common::connector_binding::CONNECTORS;
 
     fn names(list: &[&str]) -> Vec<String> {
         list.iter().map(|s| s.to_string()).collect()
@@ -126,10 +124,238 @@ mod tests {
         "web.search",
     ];
 
+    /// Every read of every connector Desk lists, by name: what a read-only
+    /// connection still lets through.
+    const READS: &[&str] = &[
+        "github.list_repos",
+        "github.get_repo",
+        "github.list_issues",
+        "github.get_issue",
+        "github.list_pulls",
+        "github.get_pull",
+        "github.get_file",
+        "github.pr_diff",
+        "github.dir_list",
+        "github.compare",
+        "github.search_code",
+        "github.search_commits",
+        "github.branch_list",
+        "github.ci_status",
+        "github.workflow_runs",
+        "github.workflow_run_logs",
+        "github.workflow_run_failed_logs",
+        "github.viewer",
+        "github.projects_list",
+        "github.project_get",
+        "github.project_items",
+        "github.issues_changed",
+        "github.repo_labels",
+        "github.workspaces",
+        "google.calendar.calendars",
+        "google.calendar.events",
+        "google.calendar.event_get",
+        "google.calendar.search",
+        "google.calendar.freebusy",
+        "google.calendar.colors",
+        "google.drive.ls",
+        "google.drive.search",
+        "google.drive.get",
+        "google.drive.download",
+        "google.drive.permissions",
+        "google.drive.comments_list",
+        "google.drive.drives",
+        "google.sheets.get",
+        "google.sheets.metadata",
+        "google.docs.cat",
+        "google.docs.info",
+        "google.gmail.search",
+        "google.gmail.get",
+        "google.gmail.thread_get",
+        "google.gmail.attachment",
+        "google.gmail.history",
+        "google.gmail.labels_list",
+        "google.gmail.label_get",
+        "google.gmail.draft_get",
+        "google.gmail.drafts_list",
+        "google.gmail.filters_list",
+        "google.gmail.forwarding_list",
+        "google.gmail.sendas_list",
+        "google.gmail.vacation_get",
+        "google.tasks.lists",
+        "google.tasks.list",
+        "google.tasks.get",
+        "google.contacts.list",
+        "google.contacts.get",
+        "google.contacts.search",
+        "google.contacts.other_list",
+        "google.contacts.directory_search",
+        "google.people.me",
+        "google.people.get",
+        "google.people.search",
+        "google.chat.spaces_list",
+        "google.chat.spaces_find",
+        "google.chat.messages_list",
+        "google.chat.threads_list",
+        "google.chat.reactions_list",
+        "google.slides.info",
+        "google.slides.list_slides",
+        "google.slides.read_slide",
+        "google.slides.export",
+        "google.workspaces",
+        "email.accounts",
+        "email.inbox",
+        "email.folders",
+        "email.read",
+        "email.get_attachment",
+        "email.search",
+        "email.contacts",
+        "jira.search",
+        "jira.get_issue",
+        "jira.list_comments",
+        "jira.list_transitions",
+        "jira.get_attachment",
+        "jira.attachment_read",
+        "jira.list_projects",
+        "jira.workspaces",
+        "jira.get_project",
+        "jira.search_users",
+        "jira.myself",
+        "jira.list_fields",
+        "jira.dev_status",
+        "jira.list_remote_links",
+        "jira.list_boards",
+        "jira.board_order",
+        "jira.list_sprints",
+        "linear.issue_list",
+        "linear.issue_get",
+        "linear.issue_search",
+        "linear.issue_children",
+        "linear.issue_history",
+        "linear.comment_list",
+        "linear.states_list",
+        "linear.teams_list",
+        "linear.workspaces",
+        "linear.project_list",
+        "linear.project_get",
+        "linear.labels_list",
+        "linear.members_list",
+        "linear.viewer",
+        "linear.view_ordering",
+        "linear.upload_read",
+        "linear.document_get",
+        "linear.document_list",
+        "linear.document_search",
+        "slack.list_channels",
+        "slack.list_users",
+        "slack.lookup_user_by_email",
+        "slack.list_channel_members",
+        "slack.list_user_conversations",
+        "slack.search_messages",
+        "slack.get_message_replies",
+        "slack.user_info",
+        "slack.list_files",
+        "datadog.metrics_query",
+        "datadog.metrics_scalar",
+        "datadog.metrics_list",
+        "datadog.metrics_metadata",
+        "datadog.logs_search",
+        "datadog.logs_export",
+        "datadog.logs_aggregate",
+        "datadog.monitors_list",
+        "datadog.monitors_get",
+        "datadog.monitors_search",
+        "datadog.dashboards_list",
+        "datadog.dashboards_get",
+        "datadog.events_list",
+        "datadog.incidents_list",
+        "datadog.incidents_get",
+        "datadog.slos_list",
+        "datadog.slos_get",
+        "datadog.hosts_list",
+        "datadog.downtimes_list",
+        "datadog.synthetics_list",
+        "metabase.card_list",
+        "metabase.card_get",
+        "metabase.card_query",
+        "metabase.dashboard_list",
+        "metabase.dashboard_get",
+        "metabase.dashboard_query",
+        "metabase.collection_list",
+        "metabase.collection_get",
+        "metabase.collection_items",
+        "metabase.database_list",
+        "metabase.database_tables",
+        "metabase.table_fields",
+        "metabase.search",
+        "freeagent.company",
+        "freeagent.contacts_list",
+        "freeagent.contact_get",
+        "freeagent.invoices_list",
+        "freeagent.invoice_get",
+        "freeagent.bills_list",
+        "freeagent.bill_get",
+        "freeagent.estimates_list",
+        "freeagent.expenses_list",
+        "freeagent.bank_accounts_list",
+        "freeagent.bank_transactions_list",
+        "freeagent.projects_list",
+        "freeagent.project_get",
+        "freeagent.tasks_list",
+        "freeagent.timeslips_list",
+        "freeagent.categories_list",
+        "freeagent.users_list",
+        "freeagent.profit_and_loss_summary",
+        "freeagent.workspaces",
+        "bank.workspaces",
+        "bank.accounts",
+        "bank.balances",
+        "bank.transactions",
+    ];
+
+    fn registered(connector: &str) -> Vec<&'static str> {
+        match connector {
+            "slack" => workforce_skills::adapters::slack::NEW_SLACK_TOOL_NAMES.to_vec(),
+            c => crate::skill_loader::static_skill_tool_names(c),
+        }
+    }
+
+    #[test]
+    fn every_connector_tool_is_read_or_written_as_the_table_says() {
+        let every: Vec<&str> = CONNECTORS.iter().flat_map(|c| registered(c)).collect();
+        for c in CONNECTORS {
+            assert!(!registered(c).is_empty(), "{c} registers no tools");
+        }
+        for read in READS {
+            assert!(every.contains(read), "{read} isn't a registered tool");
+        }
+        let wrong: Vec<String> = every
+            .iter()
+            .filter(|t| is_read(t) != READS.contains(t))
+            .map(|t| format!("{t}: is_read says {}", is_read(t)))
+            .collect();
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
     #[test]
     fn an_agent_with_no_enabled_keeps_every_connector() {
         let snapshot = hidden(&ConnectorBinding::default(), names(TOOLS));
         assert!(snapshot.is_empty());
+    }
+
+    #[test]
+    fn freeagent_loses_its_writes_until_writable_names_a_connection() {
+        let tools = names(&["freeagent.invoices_list", "freeagent.invoice_create"]);
+        let snapshot = hidden(&ConnectorBinding::default(), tools.clone());
+        assert!(!snapshot.is_blocked("freeagent.invoices_list"));
+        assert!(snapshot
+            .block_reason("freeagent.invoice_create")
+            .unwrap()
+            .contains("only reads freeagent"));
+        let harbor = ConnectorBinding {
+            writable: names(&["freeagent:harbor"]),
+            ..Default::default()
+        };
+        assert!(hidden(&harbor, tools).is_empty());
     }
 
     #[test]

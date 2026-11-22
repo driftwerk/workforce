@@ -9,7 +9,7 @@ use eyre::Result;
 use serde_json::{json, Map, Value};
 use workforce_agent::tools::Tool;
 
-use crate::adapters::google::api::{GoogleApi, GoogleApiContext};
+use crate::adapters::google::api::{GoogleApi, GoogleApis};
 
 use crate::adapters::google::tool_helpers::{
     handler, object_schema, optional_str, optional_u64, props, required_str, tool, urlencode,
@@ -19,7 +19,7 @@ const BASE: &str = "https://people.googleapis.com/v1";
 const PERSON_FIELDS: &str =
     "names,emailAddresses,phoneNumbers,organizations,addresses,photos,biographies";
 
-pub fn tools(ctx: Arc<GoogleApiContext>) -> Vec<Arc<dyn Tool>> {
+pub fn tools(ctx: Arc<GoogleApis>) -> Vec<Arc<dyn Tool>> {
     let mut out: Vec<Arc<dyn Tool>> = Vec::new();
 
     // ── contacts list ────────────────────────────────────────────────────────

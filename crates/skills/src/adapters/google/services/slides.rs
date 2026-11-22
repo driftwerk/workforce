@@ -9,7 +9,7 @@ use eyre::Result;
 use serde_json::{json, Value};
 use workforce_agent::tools::Tool;
 
-use crate::adapters::google::api::{GoogleApi, GoogleApiContext};
+use crate::adapters::google::api::{GoogleApi, GoogleApis};
 
 use crate::adapters::google::tool_helpers::{
     handler, object_schema, optional_str, props, required_str, tool, urlencode,
@@ -17,7 +17,7 @@ use crate::adapters::google::tool_helpers::{
 
 const BASE: &str = "https://slides.googleapis.com/v1/presentations";
 
-pub fn tools(ctx: Arc<GoogleApiContext>) -> Vec<Arc<dyn Tool>> {
+pub fn tools(ctx: Arc<GoogleApis>) -> Vec<Arc<dyn Tool>> {
     let mut out: Vec<Arc<dyn Tool>> = Vec::new();
 
     // ── info ─────────────────────────────────────────────────────────────────

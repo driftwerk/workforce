@@ -12,7 +12,8 @@
         "blocked": 0,
         "waiting": 0,
         "total": 0,
-        "next": []
+        "next": [],
+        "holding": []
       }
     },
     {
@@ -47,7 +48,8 @@
         "blocked": 0,
         "waiting": 2,
         "total": 2,
-        "next": []
+        "next": [],
+        "holding": []
       }
     },
     {
@@ -128,7 +130,8 @@
         "next": [
           "ACM-3",
           "ACM-4"
-        ]
+        ],
+        "holding": []
       }
     },
     {
@@ -174,6 +177,9 @@
         "total": 3,
         "next": [
           "ACM-3"
+        ],
+        "holding": [
+          "ACM-1"
         ]
       }
     },
@@ -218,7 +224,8 @@
         "blocked": 1,
         "waiting": 0,
         "total": 2,
-        "next": []
+        "next": [],
+        "holding": []
       }
     },
     {
@@ -243,7 +250,8 @@
         "total": 1,
         "next": [
           "00000000-0000-4000-8000-000000000001"
-        ]
+        ],
+        "holding": []
       }
     },
     {
@@ -279,6 +287,91 @@
         "total": 2,
         "next": [
           "ACM-2"
+        ],
+        "holding": []
+      }
+    },
+    {
+      "name": "each session a plan holds, once, until it is closed: a closed one's ticket has none",
+      "tickets": [
+        {
+          "id": "00000000-0000-4000-8000-000000000001",
+          "state": "doing",
+          "rank": 1024,
+          "needs": [],
+          "engine": "claude",
+          "folder": "/work/acme-web",
+          "key": "ACM-1",
+          "session": "s1",
+          "assigned": true
+        },
+        {
+          "id": "00000000-0000-4000-8000-000000000002",
+          "state": "review",
+          "rank": 2048,
+          "needs": [],
+          "engine": "claude",
+          "folder": "/work/acme-web",
+          "key": "ACM-2",
+          "session": "s1",
+          "assigned": true
+        },
+        {
+          "id": "00000000-0000-4000-8000-000000000003",
+          "state": "review",
+          "rank": 3072,
+          "needs": [],
+          "engine": "claude",
+          "folder": "/work/acme-web",
+          "key": "ACM-3",
+          "session": "devbox/s3",
+          "assigned": true
+        },
+        {
+          "id": "00000000-0000-4000-8000-000000000004",
+          "state": "doing",
+          "rank": 4096,
+          "needs": [],
+          "engine": "claude",
+          "folder": "/work/acme-web",
+          "key": "ACM-4",
+          "assigned": true
+        },
+        {
+          "id": "00000000-0000-4000-8000-000000000005",
+          "state": "done",
+          "rank": 5120,
+          "needs": [],
+          "engine": "claude",
+          "folder": "/work/acme-web",
+          "key": "ACM-5",
+          "session": "s5",
+          "assigned": true
+        },
+        {
+          "id": "00000000-0000-4000-8000-000000000006",
+          "state": "todo",
+          "rank": 6144,
+          "needs": [],
+          "engine": "claude",
+          "folder": "/work/acme-web",
+          "key": "ACM-6"
+        }
+      ],
+      "progress": {
+        "done": 1,
+        "doing": 2,
+        "review": 2,
+        "ready": 1,
+        "blocked": 0,
+        "waiting": 0,
+        "total": 6,
+        "next": [
+          "ACM-6"
+        ],
+        "holding": [
+          "ACM-1",
+          "ACM-3"
         ]
       }
     }

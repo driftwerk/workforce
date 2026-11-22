@@ -230,7 +230,22 @@ impl DeskTool {
                     .into_iter()
                     .filter(|v| seen.sees(v.group.as_ref().map(|g| g.id.as_str())))
                     .collect();
-                out(mine)
+                let named: Vec<Uuid> = input["ids"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|i| i.as_str()?.parse().ok())
+                    .collect();
+                let closed = d.closed_among(&named, |g| seen.sees(g)).await?;
+                let mut all = out(mine)?;
+                if let Some(all) = all.as_array_mut() {
+                    all.extend(
+                        closed
+                            .iter()
+                            .map(|id| json!({ "id": id, "state": "closed" })),
+                    );
+                }
+                Ok(all)
             }
             Verb::Start => {
                 let i: StartInput = parse(input)?;
@@ -426,7 +441,8 @@ impl Tool for DeskTool {
             Verb::List => json!({
                 "type": "object",
                 "properties": {
-                    "query": { "type": "string", "description": "Words that name the sessions: a name the person gave, the hub's name, the folder, or the group" }
+                    "query": { "type": "string", "description": "Words that name the sessions: a name the person gave, the hub's name, the folder, or the group" },
+                    "ids": { "type": "array", "items": { "type": "string" }, "description": "Session ids to say of too when they were closed or removed here: each such is listed with only its id and state closed" }
                 }
             }),
             Verb::Start => json!({

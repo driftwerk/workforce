@@ -8,9 +8,10 @@
 //! 3. The call is outside the agent's level: refuse, in a plain sentence
 //!    naming the level and Settings.
 //! 4. A connector that is off, or read only and given a write: refuse.
-//! 5. The call is on the always-asks list (it can't be undone, or can't be
-//!    read as simple commands): ask, offering Allow once and Deny. An agent
-//!    at Full access that asks never skips this.
+//! 5. The call is on the always-asks list (it can't be undone, can't be
+//!    read as simple commands, sends to people or changes the books): ask,
+//!    offering Allow once and Deny. An agent at Full access that asks never
+//!    skips this.
 //! 6. Anything at Full access; a read, a change inside the own folder, or a
 //!    contained command at a lower level: run.
 //! 7. A grant or a session allowance covers it: run.
@@ -32,11 +33,11 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 use workforce_core::computer::{
-    Ability, Access, Always, Asking, By, Choice, ComputerAccess, Effect, Refusal, Refused, Verdict,
-    Why,
+    Ability, Access, Always, Asking, Books, By, Choice, ComputerAccess, Effect, Refusal, Refused,
+    Verdict, Why,
 };
 
-use super::asks::{always_asks, Asks, Place};
+use super::asks::{self, Asks, Place};
 use super::boss::fold;
 
 /// What a namespace's tools touch.
@@ -93,8 +94,20 @@ pub fn namespace(tool: &str) -> Option<Namespace> {
         .map(|(_, ns)| *ns)
 }
 
-/// Whether a connector tool sends to other people: on the always-asks list.
-pub fn sends_to_people(tool: &str) -> bool {
+/// Why a connector tool's write is on the always-asks list, if it is: it
+/// sends to other people, or it changes the person's books.
+pub fn always_asks(tool: &str) -> Option<Why> {
+    let books = || {
+        let (connector, _) = tool.split_once('.')?;
+        Books::of(connector).filter(|_| !workforce_common::connector_binding::is_read(tool))
+    };
+    sends_to_people(tool)
+        .then_some(Why::SendsToPeople)
+        .or_else(|| books().map(Why::ChangesTheBooks))
+}
+
+/// Whether a connector tool sends to other people.
+fn sends_to_people(tool: &str) -> bool {
     match tool.split_once('.') {
         Some(("slack", name)) => {
             name.contains("post") || name == "send" || name.starts_with("send_")
@@ -326,6 +339,8 @@ impl AgentPolicy {
     fn connector(&self, id: &str) -> (bool, bool) {
         match &self.connectors {
             None => (true, false),
+            // Xero isn't bound by connection: no `[skills]` turns it off.
+            Some(_) if Books::of(id) == Some(Books::Xero) => (true, false),
             Some(c) => (
                 c.enabled.iter().any(|e| e == id),
                 c.read_only.iter().any(|e| e == id),
@@ -642,15 +657,17 @@ pub fn verdict(p: &AgentPolicy, stopped: bool, grants: &[Grant], call: &CallFact
         }
         Effect::Exec { command, cwd } => {
             let place = Place::new(cwd.clone(), &p.own, &p.scratch, &p.home);
-            match always_asks(command, &place) {
+            match asks::always_asks(command, &place) {
                 Some(Asks::Deletes(targets)) => return deleting(p, grants, call, &targets),
                 Some(Asks::Irreversible) => return ask(once(), Why::CantBeUndone),
                 Some(Asks::Unclear) => return ask(once(), Why::Unclear),
                 None => {}
             }
         }
-        Effect::Connector { write: true, .. } if sends_to_people(&call.tool) => {
-            return ask(once(), Why::SendsToPeople);
+        Effect::Connector { write: true, .. } => {
+            if let Some(why) = always_asks(&call.tool) {
+                return ask(once(), why);
+            }
         }
         _ => {}
     }

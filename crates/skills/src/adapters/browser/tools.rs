@@ -404,7 +404,8 @@ fn specs() -> Vec<ToolSpec> {
                 "type": "object",
                 "properties": {
                     "selector": { "type": "string", "description": "Only if Desk didn't find the key itself: CSS selector of the element showing it" },
-                    "connector": { "type": "string", "description": "The connection being set up: linear, github, …" }
+                    "connector": { "type": "string", "description": "The connection being set up: linear, github, …" },
+                    "field": { "type": "string", "description": "Which of its keys this is, where the setup names them (an app's client_id or client_secret). Leave it out for a service with one key." }
                 },
                 "required": ["connector"]
             }),
@@ -416,7 +417,12 @@ fn specs() -> Vec<ToolSpec> {
                         .map(str::trim)
                         .filter(|s| !s.is_empty());
                     let connector = require_str(&input, "connector")?;
-                    c.capture_key(selector, connector).await
+                    let field = input
+                        .get("field")
+                        .and_then(Value::as_str)
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty());
+                    c.capture_key(selector, connector, field).await
                 }
                 .boxed()
             }),

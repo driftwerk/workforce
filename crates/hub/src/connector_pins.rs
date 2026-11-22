@@ -154,11 +154,13 @@ pub fn changed(before: &ConnectorBinding, after: &ConnectorBinding) -> Vec<&'sta
         .copied()
         .filter(|c| {
             let path = primary(c).unwrap_or_default();
-            // The connections it names, and which only read, are in what
-            // its adapter loads with: its clients, its default, its words.
-            let read_only = |b: &ConnectorBinding| -> Vec<String> {
+            // The connections it names, and which only read or take
+            // writes, are in what its adapter loads with: its clients, its
+            // default, its words.
+            let access = |b: &ConnectorBinding| -> Vec<String> {
                 b.read_only
                     .iter()
+                    .chain(&b.writable)
                     .filter(|r| r.as_str() == *c || r.starts_with(&format!("{c}:")))
                     .cloned()
                     .collect()
@@ -166,7 +168,7 @@ pub fn changed(before: &ConnectorBinding, after: &ConnectorBinding) -> Vec<&'sta
             pin_of(before, path) != pin_of(after, path)
                 || before.is_on(c) != after.is_on(c)
                 || before.picks(c) != after.picks(c)
-                || read_only(before) != read_only(after)
+                || access(before) != access(after)
         })
         .collect()
 }
@@ -218,6 +220,7 @@ fn primary(connector: &str) -> Option<&'static str> {
         "datadog" => "skills/datadog/api_key",
         "metabase" => "skills/metabase/api_key",
         "bank" => "skills/bank/api_key",
+        "freeagent" => "skills/freeagent/workspaces/default/refresh_token",
         _ => return None,
     })
 }
