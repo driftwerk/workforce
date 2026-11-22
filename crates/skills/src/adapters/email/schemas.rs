@@ -76,8 +76,9 @@ pub fn bulk(tool: &str) -> Value {
         ),
     };
     let running = json!({
+        "validity": { "type": "integer", "description": "The folder's UIDVALIDITY that email.inbox or email.search gave with the uids; the call is refused if the folder was renumbered since" },
         "dry_run": { "type": "boolean", "description": "Count the matches and show a sample; change nothing" },
-        "job": { "type": "string", "description": "Carry on a job a previous call left unfinished" }
+        "job": { "type": "string", "description": "Carry on a job this tool left unfinished (never with dry_run)" }
     });
     object(&[own, selection(), running], required)
 }
@@ -113,10 +114,17 @@ pub fn unsubscribe(leave: bool) -> Value {
                 folder,
                 selection(),
                 json!({ "lists": {
-                "type": "array",
-                "items": { "type": "string" },
-                "description": "Ids of the lists to leave, from email.unsubscribe_lists"
-            } }),
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "id": { "type": "string" },
+                            "via": { "type": "string" }
+                        },
+                        "required": ["id"]
+                    },
+                    "description": "The lists to leave, each with its id and via exactly as email.unsubscribe_lists gave them"
+                } }),
             ],
             &["lists"],
         ),
@@ -132,7 +140,9 @@ mod tests {
     fn every_bulk_tool_takes_a_selection_a_dry_run_and_a_job() {
         for tool in ["email.mark", "email.move", "email.archive", "email.delete"] {
             let schema = bulk(tool);
-            for key in ["account", "uid", "uids", "search", "dry_run", "job"] {
+            for key in [
+                "account", "uid", "uids", "search", "validity", "dry_run", "job",
+            ] {
                 assert!(schema["properties"].get(key).is_some(), "{tool} {key}");
             }
             assert_eq!(schema["required"][0], "account");

@@ -28,13 +28,16 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use serde_json::{json, Value};
-use workforce_agent::runner::CURRENT_AGENT_ID;
+use workforce_agent::runner::{CURRENT_AGENT_ID, CURRENT_AUTOMATED_ORIGIN};
 use workforce_agent::tools::access::ToolAccessSnapshot;
 use workforce_agent::tools::dispatch::{execute_gated, unattended_refusal, GateOutcome, ToolGates};
 use workforce_agent::tools::registry::ToolRegistry;
 use workforce_common::session::TurnPrincipal;
 use workforce_policy::engine::PolicyEngine;
 use workforce_wasm_runtime::manifest::is_denied_tool;
+
+/// What a tool a monitor calls is told it descends from.
+const MONITOR_ORIGIN: &str = "monitor";
 
 /// How a monitor's missing tool is loaded: the agent's own path to it.
 const ENABLE_SKILL: &str = "system.enable_skill";
@@ -371,7 +374,10 @@ impl GovernedInvoker {
         let run = CURRENT_AGENT_ID
             .scope(
                 gates.agent_id.as_str().to_string(),
-                execute_gated(&self.tools, &(self.access)(), tool, &input, exec_input),
+                CURRENT_AUTOMATED_ORIGIN.scope(
+                    MONITOR_ORIGIN.to_string(),
+                    execute_gated(&self.tools, &(self.access)(), tool, &input, exec_input),
+                ),
             )
             .await;
         if let Some(reason) = run.deny_reason {

@@ -5,7 +5,6 @@ use std::collections::BTreeMap;
 use std::time::Duration;
 
 use mailparse::MailHeaderMap;
-use serde::Serialize;
 
 /// The headers an unsubscribe reads.
 pub const HEADERS: &[&str] = &[
@@ -15,33 +14,91 @@ pub const HEADERS: &[&str] = &[
     "FROM",
 ];
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[serde(tag = "method", rename_all = "snake_case")]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Method {
     /// An RFC 8058 POST to an https URL, which unsubscribes with no page to
     /// read.
     OneClick { url: String },
-    /// A message to the list's unsubscribe address.
-    Mailto {
-        to: String,
-        subject: String,
-        body: String,
-    },
+    /// A message to the list's unsubscribe address, with the subject it
+    /// asks for: some lists read a token there. Its body is Desk's own.
+    Mailto { to: String, subject: String },
     /// Nothing Desk can do for you: the list offers only a web page, or
     /// nothing.
-    None {
-        #[serde(skip_serializing_if = "Option::is_none")]
-        page: Option<String>,
-    },
+    None { page: Option<String> },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+impl Method {
+    /// Where leaving writes to: the address an email goes to, or the host
+    /// a one-click request is sent to.
+    pub fn via(&self) -> Option<String> {
+        match self {
+            Method::OneClick { url } => url::Url::parse(url)
+                .ok()?
+                .host_str()
+                .map(str::to_ascii_lowercase),
+            Method::Mailto { to, .. } => Some(to.to_ascii_lowercase()),
+            Method::None { .. } => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct List {
     pub id: String,
     pub name: String,
     pub messages: usize,
-    #[serde(flatten)]
     pub method: Method,
+}
+
+impl List {
+    /// The list as `email.unsubscribe_lists` shows it: how it is left, and
+    /// whether that goes somewhere other than the list's own domain.
+    pub fn view(&self) -> serde_json::Value {
+        let via = self.method.via();
+        let (how, page) = match &self.method {
+            Method::OneClick { .. } => ("one_click", None),
+            Method::Mailto { .. } => ("email", None),
+            Method::None { page: Some(page) } => ("web_page_only", Some(page)),
+            Method::None { page: None } => ("none", None),
+        };
+        serde_json::json!({
+            "id": self.id,
+            "name": self.name,
+            "messages": self.messages,
+            "how": how,
+            "via": via,
+            "elsewhere": via.as_deref().is_some_and(|v| !same_site(&self.id, v)),
+            "page": page,
+        })
+    }
+}
+
+/// The domain of an address, or a host as it is.
+fn domain_of(text: &str) -> &str {
+    text.rsplit_once('@').map_or(text, |(_, domain)| domain)
+}
+
+/// The registrable part of `host`, near enough with no public suffix list:
+/// its last two labels, or three under a country's own second level
+/// (`shop.co.uk`).
+fn site(host: &str) -> String {
+    const SECOND_LEVELS: &[&str] = &["ac", "co", "com", "edu", "gov", "ne", "net", "or", "org"];
+    let labels: Vec<String> = host
+        .trim_end_matches('.')
+        .split('.')
+        .filter(|l| !l.is_empty())
+        .map(str::to_ascii_lowercase)
+        .collect();
+    let keep = match labels.as_slice() {
+        [.., second, tld] if tld.len() == 2 && SECOND_LEVELS.contains(&second.as_str()) => 3,
+        _ => 2,
+    };
+    labels[labels.len().saturating_sub(keep)..].join(".")
+}
+
+/// Whether `a` and `b` (addresses, hosts or list ids) are of one domain.
+pub fn same_site(a: &str, b: &str) -> bool {
+    site(domain_of(a)) == site(domain_of(b))
 }
 
 fn angle_parts(header: &str) -> Vec<String> {
@@ -63,8 +120,8 @@ fn percent_decoded(text: &str) -> String {
         .unwrap_or_default()
 }
 
-/// The address, subject and body a `mailto:` URL asks for.
-pub fn mailto(target: &str) -> Option<(String, String, String)> {
+/// The address and subject a `mailto:` URL asks for.
+pub fn mailto(target: &str) -> Option<(String, String)> {
     let rest = target
         .get(..7)
         .filter(|scheme| scheme.eq_ignore_ascii_case("mailto:"))
@@ -84,7 +141,6 @@ pub fn mailto(target: &str) -> Option<(String, String, String)> {
     Some((
         to,
         field("subject").unwrap_or_else(|| "unsubscribe".to_string()),
-        field("body").unwrap_or_default(),
     ))
 }
 
@@ -101,7 +157,7 @@ fn method(unsubscribe: &str, post: Option<&str>) -> Method {
     let mail = targets.iter().find_map(|t| mailto(t));
     match (https, one_click, mail) {
         (Some(url), true, _) => Method::OneClick { url: url.clone() },
-        (_, _, Some((to, subject, body))) => Method::Mailto { to, subject, body },
+        (_, _, Some((to, subject))) => Method::Mailto { to, subject },
         _ => Method::None {
             page: targets
                 .iter()
@@ -212,16 +268,17 @@ pub async fn one_click(url: &str) -> Result<(), String> {
         .body("List-Unsubscribe=One-Click")
         .send()
         .await
-        .map_err(|e| format!("The list's server didn't answer: {e}"))?;
+        .map_err(|e| format!("The list's server didn't answer: {}", e.without_url()))?;
     match response.status() {
         s if s.is_success() => Ok(()),
         s => Err(format!("The list's server answered {s}.")),
     }
 }
 
-/// The line every unsubscribe message Desk sends carries.
-pub fn on_behalf_of(person: &str) -> String {
-    format!("Sent by Desk on behalf of {person}.")
+/// The body of every unsubscribe message Desk sends: its own words, never
+/// the list's.
+pub fn request(person: &str) -> String {
+    format!("Please unsubscribe this address from the list.\n\nSent by Desk on behalf of {person}.")
 }
 
 #[cfg(test)]
@@ -260,14 +317,10 @@ mod tests {
     }
 
     #[test]
-    fn a_mailto_gives_its_address_subject_and_body() {
+    fn a_mailto_gives_its_address_and_subject_never_its_body() {
         assert_eq!(
             mailto("mailto:leave%40list.com?subject=Unsubscribe%20me&body=please"),
-            Some((
-                "leave@list.com".to_string(),
-                "Unsubscribe me".to_string(),
-                "please".to_string()
-            ))
+            Some(("leave@list.com".to_string(), "Unsubscribe me".to_string()))
         );
         assert_eq!(
             mailto("MAILTO:u@x.com").map(|m| m.1),
@@ -312,6 +365,35 @@ mod tests {
         assert!(matches!(weekly.method, Method::Mailto { .. }));
         let friend = lists.iter().find(|l| l.id == "friend@x.com").unwrap();
         assert_eq!(friend.method, Method::None { page: None });
+        assert_eq!(lists[0].view()["via"], "shop.com");
+        assert_eq!(lists[0].view()["elsewhere"], false);
+        assert_eq!(weekly.view()["via"], "leave@blog.com");
+        assert_eq!(weekly.view()["how"], "email");
+    }
+
+    #[test]
+    fn a_way_out_on_another_domain_is_told_apart() {
+        assert!(same_site("news.shop.com", "shop.com"));
+        assert!(same_site("weekly@blog.com", "leave@mail.blog.com"));
+        assert!(same_site("news@shop.co.uk", "u.shop.co.uk"));
+        assert!(!same_site("news@shop.co.uk", "other.co.uk"));
+        assert!(!same_site("news.shop.com", "boss@victim.com"));
+        let list = List {
+            id: "news.shop.com".to_string(),
+            name: "Shop".to_string(),
+            messages: 1,
+            method: Method::Mailto {
+                to: "ceo@victim.com".to_string(),
+                subject: "unsubscribe".to_string(),
+            },
+        };
+        assert_eq!(list.view()["elsewhere"], true);
+    }
+
+    #[test]
+    fn the_request_is_desks_own_words() {
+        let body = request("Kat");
+        assert!(body.ends_with("Sent by Desk on behalf of Kat."));
     }
 
     #[tokio::test]

@@ -2,6 +2,7 @@
 //! call's time ran out and be put back with `email.undo`. The hub keeps
 //! jobs in Postgres; with none installed, nothing done in bulk is journaled.
 
+use std::collections::BTreeMap;
 use std::sync::{Arc, OnceLock};
 
 use async_trait::async_trait;
@@ -63,9 +64,9 @@ impl BulkAction {
     }
 }
 
-/// One batch done: the uids it took in the source folder and, for a move,
-/// where they landed (from COPYUID) or, where the server didn't say, their
-/// Message-IDs to find them again by.
+/// One batch: the uids it took in the source folder and, for a move, where
+/// they landed (from COPYUID, when the server said) and each one's
+/// Message-ID, to find it again by where it didn't.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Batch {
     pub src: UidSet,
@@ -73,8 +74,18 @@ pub struct Batch {
     pub dst: Option<UidSet>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dst_validity: Option<u32>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub message_ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub message_ids: BTreeMap<u32, String>,
+}
+
+/// Who started a job: a person, or automation (a sort rule, a monitor's or
+/// a scheduled turn) that `email.undo` never takes for the person's latest.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Origin {
+    #[default]
+    Person,
+    Automation,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -93,12 +104,21 @@ pub struct BulkJob {
     pub id: String,
     pub owner: String,
     pub account: String,
+    /// The tool that started it, and the only one that carries it on.
+    pub tool: String,
+    #[serde(default)]
+    pub origin: Origin,
     pub action: BulkAction,
     /// What was asked for, in words.
     pub asked: String,
     /// The source folder's UIDVALIDITY when the job began.
     pub validity: u32,
     pub pending: UidSet,
+    /// The batch sent to the server and not yet known to have landed, kept
+    /// first so a call that ends mid-batch is settled before anything else.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub in_flight: Option<Batch>,
+    #[serde(default)]
     pub done: Vec<Batch>,
     pub state: JobState,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -113,6 +133,11 @@ impl BulkJob {
     pub fn handled(&self) -> usize {
         self.done.iter().map(|b| b.src.len()).sum()
     }
+
+    /// Whether `email.undo` with no job named takes this one.
+    pub fn undoable(&self) -> bool {
+        self.origin == Origin::Person && self.state != JobState::Undone
+    }
 }
 
 #[async_trait]
@@ -120,7 +145,8 @@ pub trait MailJournal: Send + Sync {
     /// Keeps `job` as it now stands, replacing what was kept under its id.
     async fn save(&self, job: &BulkJob) -> eyre::Result<()>;
     async fn get(&self, owner: &str, id: &str) -> eyre::Result<Option<BulkJob>>;
-    /// The owner's most recent job on `account`.
+    /// The owner's most recent job on `account` that they started
+    /// themselves and that is not undone yet.
     async fn latest(&self, owner: &str, account: &str) -> eyre::Result<Option<BulkJob>>;
 }
 
@@ -169,7 +195,7 @@ pub(crate) mod memory {
                 .lock()
                 .unwrap()
                 .values()
-                .filter(|j| j.owner == owner && j.account == account)
+                .filter(|j| j.owner == owner && j.account == account && j.undoable())
                 .max_by_key(|j| j.created)
                 .cloned())
         }

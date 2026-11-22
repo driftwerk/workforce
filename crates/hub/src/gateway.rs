@@ -11832,16 +11832,11 @@ async fn monitor_sort_rules(
     )
     .await;
     let engine = monitor_engine(&state)?;
-    let runtime = engine.definitions();
-    let mut monitors = Vec::new();
-    for summary in engine.list_visible(&listing).await {
-        if let Some(def) = runtime
-            .stored_definition(&summary.id, summary.owner.as_deref())
-            .await
-        {
-            monitors.push((def.monitor, summary.owner));
-        }
-    }
+    let monitors = crate::monitor::sort_rule::mail_monitors(
+        engine.definitions(),
+        engine.list_visible(&listing).await,
+    )
+    .await;
     Ok(Json(serde_json::json!({
         "rules": crate::monitor::sort_rule::rules_in(&monitors)
     })))
@@ -11872,12 +11867,20 @@ async fn monitor_enabled_put(
     .await?;
     let engine =
         monitor_engine(&state).map_err(|s| (s, "monitor engine unavailable".to_string()))?;
+    if engine
+        .definitions()
+        .stored_definition(&id, ctx.owner.as_deref())
+        .await
+        .is_none()
+    {
+        return Err((StatusCode::NOT_FOUND, format!("Unknown monitor '{id}'.")));
+    }
     let edit =
         workforce_orchestrator::workflow_store::EditContext::new("web", ctx.actor.as_deref());
     engine
         .set_enabled(&id, ctx.owner.as_deref(), body.enabled, edit)
         .await
-        .map_err(|e| (StatusCode::NOT_FOUND, format!("{e:#}")))?;
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
     Ok(Json(
         serde_json::json!({ "monitor_id": id, "enabled": body.enabled }),
     ))

@@ -993,6 +993,9 @@ pub fn assess(
             host_of(url).unwrap_or("a web address").to_string(),
         ));
     }
+    if tool == "email.unsubscribe" {
+        return Some(exfiltration("outside".to_string()));
+    }
     // A write that says where it goes runs only there. A message that
     // names nowhere goes to the conversation the turn is in, and is judged
     // as going there; with no conversation to go to, it is held. Any other
@@ -1016,11 +1019,8 @@ pub fn assess(
             )));
         }
     }
-    // An unsubscribe writes to the sender, at the address or link their
-    // own mail gave.
     if crate::runner::is_outbound_delivery_tool(tool)
         || (tool == "email.confirm" && action != "cancel")
-        || tool == "email.unsubscribe"
     {
         return Some(exfiltration("outside".to_string()));
     }
@@ -1499,11 +1499,26 @@ mod tests {
             guard.check("email.confirm", &json!({ "action": "cancel" }), None),
             None
         );
+        let leaving = SurfaceEffect::Writes {
+            platform: "email".to_string(),
+            destination: "leave@shop.com".to_string(),
+        };
+        let expecting_it = armed(ContentScope {
+            expected: vec![Place::on("email", "leave@shop.com")],
+            ..ContentScope::default()
+        });
         assert!(
-            guard
-                .check("email.unsubscribe", &json!({ "uid": 7 }), None)
-                .is_some(),
-            "an unsubscribe a mail asked for reaches its sender"
+            matches!(
+                expecting_it
+                    .check(
+                        "email.unsubscribe",
+                        &json!({ "lists": [{ "id": "news.shop.com", "via": "leave@shop.com" }] }),
+                        Some(&leaving),
+                    )
+                    .map(|h| h.signal),
+                Some(AnomalySignal::Exfiltration { .. })
+            ),
+            "an unsubscribe a mail asked for reaches its sender, wherever the turn delivers"
         );
         assert_eq!(
             guard.check("email.unsubscribe_lists", &json!({}), None),

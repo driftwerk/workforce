@@ -215,9 +215,11 @@ pub(crate) async fn wire(
     // they meet its ownership and binding rules.
     service.register_tool(Arc::new(super::sort_rule::SortRulesTool::new(
         Arc::clone(&monitor_tool),
+        Arc::clone(&service.tools),
     )));
     service.register_tool(Arc::new(super::sort_rule::SortRuleSaveTool::new(
         Arc::clone(&monitor_tool),
+        Arc::clone(&service.tools),
     )));
     service.register_tool(monitor_tool);
 }

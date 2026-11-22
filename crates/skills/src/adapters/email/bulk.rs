@@ -1,18 +1,22 @@
 //! Moving and marking many messages at once, matched on the server: in
 //! batches, within a time budget, carried on by job id, every batch journaled
-//! so `email.undo` puts it back. Nothing is ever deleted: the only expunge is
-//! `UID EXPUNGE` of uids already copied elsewhere.
+//! before it is sent and again once it landed, so a call that ends mid-batch
+//! is settled and `email.undo` puts it all back. Nothing is ever deleted: the
+//! only expunge is `UID EXPUNGE` of uids already copied elsewhere.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
 use chrono::Utc;
+use mailparse::MailHeaderMap;
 use serde_json::{json, Value};
 use tokio::time::Instant;
+use workforce_agent::security::external_content::wrap_external_content;
 
 use super::criteria::{quoted, Selection};
-use super::journal::{Batch, BulkAction, BulkJob, JobState, MailJournal};
-use super::mailbox::Mailbox;
-use super::session::{Landed, MailSession};
+use super::journal::{Batch, BulkAction, BulkJob, JobState, MailJournal, Origin};
+use super::mailbox::{decoded, Mailbox};
+use super::session::{Landed, MailSession, Selected};
 use super::uids::UidSet;
 
 pub const BATCH: usize = 500;
@@ -40,18 +44,68 @@ impl Budget {
     }
 }
 
+/// What a new job is asked to do, and who asked.
+#[derive(Debug, Clone, Copy)]
+pub struct Ask<'a> {
+    pub owner: &'a str,
+    pub account: &'a str,
+    pub tool: &'a str,
+    pub origin: Origin,
+    pub selection: &'a Selection,
+    /// The source folder's UIDVALIDITY its uids were read under, when said.
+    pub validity: Option<u32>,
+}
+
 fn text(e: impl std::fmt::Display) -> String {
     e.to_string()
 }
 
-/// The uids `selection` means in the selected folder.
+fn renumbered(folder: &str) -> String {
+    format!(
+        "{}'s message numbers changed since they were read (the server rebuilt the folder), so nothing more was done. Read the messages again and retry.",
+        decoded(folder)
+    )
+}
+
+/// Opens `folder`, to change it or only to look, where its numbering is
+/// the one `expected` names.
+pub(super) async fn open_folder(
+    session: &mut (impl MailSession + ?Sized),
+    folder: &str,
+    expected: Option<u32>,
+    change: bool,
+) -> Result<Selected, String> {
+    let selected = match change {
+        true => session.select(folder).await,
+        false => session.examine(folder).await,
+    }
+    .map_err(text)?;
+    match expected {
+        Some(validity) if validity != selected.validity => Err(renumbered(folder)),
+        _ => Ok(selected),
+    }
+}
+
+/// Which of `uids` the selected folder still holds.
+pub(super) async fn present(
+    session: &mut (impl MailSession + ?Sized),
+    uids: &UidSet,
+) -> Result<UidSet, String> {
+    match uids.is_empty() {
+        true => Ok(UidSet::default()),
+        false => session.search(&format!("UID {uids}")).await.map_err(text),
+    }
+}
+
+/// The uids `selection` means in the selected folder: only messages it
+/// holds.
 async fn resolve(
     session: &mut (impl MailSession + ?Sized),
     mailbox: &Mailbox,
     selection: &Selection,
 ) -> Result<UidSet, String> {
     match selection {
-        Selection::Uids(uids) => Ok(uids.clone()),
+        Selection::Uids(uids) => present(session, uids).await,
         Selection::Search(criteria) => {
             let query = criteria.to_imap(mailbox.caps.gmail)?;
             session.search(&query).await.map_err(text)
@@ -65,8 +119,9 @@ pub async fn plan(
     mailbox: &Mailbox,
     folder: &str,
     selection: &Selection,
+    validity: Option<u32>,
 ) -> Result<Value, String> {
-    session.examine(folder).await.map_err(text)?;
+    let selected = open_folder(session, folder, validity, false).await?;
     let uids = resolve(session, mailbox, selection).await?;
     let newest: UidSet = uids.iter().rev().take(SAMPLE).collect();
     let sample = match newest.is_empty() {
@@ -78,28 +133,35 @@ pub async fn plan(
         .map(|s| json!({"uid": s.uid, "from": s.from, "subject": s.subject, "date": s.date}))
         .collect();
     sample.sort_by_key(|s| std::cmp::Reverse(s["uid"].as_u64()));
-    Ok(json!({ "dry_run": true, "folder": folder, "count": uids.len(), "sample": sample }))
+    Ok(json!({
+        "dry_run": true,
+        "folder": decoded(folder),
+        "validity": selected.validity,
+        "count": uids.len(),
+        "sample": sample
+    }))
 }
 
-/// A new job for `action` over what `selection` means in its source folder.
+/// A new job for `action` over what was asked for in its source folder.
 pub async fn begin(
     session: &mut (impl MailSession + ?Sized),
     mailbox: &Mailbox,
-    owner: &str,
-    account: &str,
     action: BulkAction,
-    selection: &Selection,
+    ask: Ask<'_>,
 ) -> Result<BulkJob, String> {
-    let selected = session.select(action.source()).await.map_err(text)?;
-    let pending = resolve(session, mailbox, selection).await?;
+    let selected = open_folder(session, action.source(), ask.validity, true).await?;
+    let pending = resolve(session, mailbox, ask.selection).await?;
     Ok(BulkJob {
         id: uuid::Uuid::new_v4().to_string(),
-        owner: owner.to_string(),
-        account: account.to_string(),
-        asked: selection.describe(),
+        owner: ask.owner.to_string(),
+        account: ask.account.to_string(),
+        tool: ask.tool.to_string(),
+        origin: ask.origin,
+        asked: ask.selection.describe(),
         action,
         validity: selected.validity,
         pending,
+        in_flight: None,
         done: Vec::new(),
         state: JobState::Running,
         stopped: None,
@@ -123,23 +185,61 @@ fn stop(job: &mut BulkJob, why: String) {
     job.stopped = Some(why);
 }
 
-/// Message-IDs of `uids`, for a server that won't say where moved messages
-/// land.
+fn message_id_in(block: &str) -> Option<String> {
+    let (headers, _) = mailparse::parse_headers(block.as_bytes()).ok()?;
+    headers
+        .get_first_value("Message-ID")
+        .map(|id| id.trim().to_string())
+        .filter(|id| !id.is_empty())
+}
+
+/// Which of `uids` the selected folder holds, and the Message-ID of each
+/// that has one.
 async fn message_ids(
     session: &mut (impl MailSession + ?Sized),
     uids: &UidSet,
-) -> Result<Vec<String>, String> {
-    let headers = session.headers(uids, &["MESSAGE-ID"]).await.map_err(text)?;
-    Ok(headers
+) -> Result<(UidSet, BTreeMap<u32, String>), String> {
+    let headers = match uids.is_empty() {
+        true => Vec::new(),
+        false => session.headers(uids, &["MESSAGE-ID"]).await.map_err(text)?,
+    };
+    let held = headers.iter().map(|(uid, _)| *uid).collect::<UidSet>();
+    let ids = headers
+        .into_iter()
+        .filter_map(|(uid, block)| Some((uid, message_id_in(&block)?)))
+        .collect();
+    Ok((held.intersection(uids), ids))
+}
+
+/// The newest message in the selected folder with each of `ids`, by
+/// Message-ID: one each, so an earlier copy of the same message stays.
+async fn newest_by_id<'a>(
+    session: &mut (impl MailSession + ?Sized),
+    ids: impl IntoIterator<Item = &'a String>,
+) -> Result<BTreeMap<String, u32>, String> {
+    let wanted: BTreeSet<&str> = ids.into_iter().map(String::as_str).collect();
+    let keys: Vec<String> = wanted
         .iter()
-        .filter_map(|(_, block)| {
-            let (headers, _) = mailparse::parse_headers(block.as_bytes()).ok()?;
-            use mailparse::MailHeaderMap;
-            headers.get_first_value("Message-ID")
-        })
-        .map(|id| id.trim().to_string())
-        .filter(|id| !id.is_empty())
-        .collect())
+        .filter_map(|id| quoted(id).ok())
+        .map(|q| format!("HEADER Message-ID {q}"))
+        .collect();
+    let mut hits = UidSet::default();
+    for chunk in keys.chunks(IDS_PER_SEARCH) {
+        let query = chunk
+            .iter()
+            .skip(1)
+            .fold(chunk[0].clone(), |acc, key| format!("OR {acc} {key}"));
+        hits = hits.union(&session.search(&query).await.map_err(text)?);
+    }
+    let (_, found) = message_ids(session, &hits).await?;
+    Ok(found
+        .into_iter()
+        .filter(|(_, id)| wanted.contains(id.as_str()))
+        .fold(BTreeMap::new(), |mut newest, (uid, id)| {
+            let at = newest.entry(id).or_insert(uid);
+            *at = (*at).max(uid);
+            newest
+        }))
 }
 
 /// Moves `uids` from the selected folder to `to` with only these uids ever
@@ -168,46 +268,158 @@ async fn relocate(
     }
 }
 
-async fn run_batch(
+/// The batch `uids` will be, read before anything is sent: for a move, the
+/// messages there and their Message-IDs; for a mark, the messages it
+/// changes.
+async fn prepare(
     session: &mut (impl MailSession + ?Sized),
-    mailbox: &Mailbox,
     action: &BulkAction,
     uids: &UidSet,
 ) -> Result<Batch, String> {
+    let (src, message_ids) = match action {
+        BulkAction::Move { .. } => message_ids(session, uids).await?,
+        BulkAction::Mark { flag, on, .. } => (
+            session
+                .search(&format!("UID {uids} {}", flag.changes(*on)))
+                .await
+                .map_err(text)?,
+            BTreeMap::new(),
+        ),
+    };
+    Ok(Batch {
+        src,
+        dst: None,
+        dst_validity: None,
+        message_ids,
+    })
+}
+
+/// Sends `batch`, and what it then is: for a move the server reported
+/// where, the uids that left and where they landed.
+async fn apply(
+    session: &mut (impl MailSession + ?Sized),
+    mailbox: &Mailbox,
+    action: &BulkAction,
+    batch: Batch,
+) -> Result<Batch, String> {
+    if batch.src.is_empty() {
+        return Ok(batch);
+    }
     match action {
         BulkAction::Move { to, .. } => {
-            let ids = match mailbox.caps.uidplus {
-                true => Vec::new(),
-                false => message_ids(session, uids).await?,
-            };
-            let landed = relocate(session, mailbox, uids, to).await?;
-            Ok(Batch {
-                src: uids.clone(),
-                dst: landed.as_ref().map(|l| l.dest.iter().copied().collect()),
-                dst_validity: landed.map(|l| l.validity),
-                message_ids: ids,
+            Ok(match relocate(session, mailbox, &batch.src, to).await? {
+                Some(landed) => Batch {
+                    src: landed.source.into_iter().collect(),
+                    dst: Some(landed.dest.into_iter().collect()),
+                    dst_validity: Some(landed.validity),
+                    ..batch
+                },
+                None => batch,
             })
         }
         BulkAction::Mark { flag, on, .. } => {
-            let changing = session
-                .search(&format!("UID {uids} {}", flag.changes(*on)))
+            let sign = if *on { '+' } else { '-' };
+            session
+                .store(&batch.src, &format!("{sign}FLAGS.SILENT ({})", flag.imap()))
                 .await
                 .map_err(text)?;
-            if !changing.is_empty() {
-                let sign = if *on { '+' } else { '-' };
-                session
-                    .store(&changing, &format!("{sign}FLAGS.SILENT ({})", flag.imap()))
-                    .await
-                    .map_err(text)?;
-            }
-            Ok(Batch {
-                src: changing,
-                dst: None,
-                dst_validity: None,
-                message_ids: Vec::new(),
-            })
+            Ok(batch)
         }
     }
+}
+
+/// One batch of `job`, journaled before it is sent and once it landed.
+async fn step(
+    session: &mut (impl MailSession + ?Sized),
+    mailbox: &Mailbox,
+    job: &mut BulkJob,
+    uids: &UidSet,
+    journal: Option<&dyn MailJournal>,
+) -> Result<(), String> {
+    let batch = prepare(session, &job.action, uids).await?;
+    job.in_flight = Some(batch.clone());
+    keep(journal, job).await?;
+    let done = apply(session, mailbox, &job.action, batch).await?;
+    job.pending = job.pending.without(uids);
+    job.done.push(done);
+    job.in_flight = None;
+    keep(journal, job).await
+}
+
+/// What became of the batch `job` sent last and never heard back on, now
+/// counted done: a mark either changed its messages or undo leaves them as
+/// they were; a move's messages that left the source landed (found by
+/// Message-ID), and any a copy left behind are taken out after it.
+async fn settle(
+    session: &mut (impl MailSession + ?Sized),
+    mailbox: &Mailbox,
+    job: &mut BulkJob,
+    journal: Option<&dyn MailJournal>,
+) -> Result<(), String> {
+    let Some(batch) = job.in_flight.clone() else {
+        return Ok(());
+    };
+    let settled = match &job.action {
+        BulkAction::Mark { .. } => batch,
+        BulkAction::Move { from, to, .. } => {
+            let dest = session.select(to).await.map_err(text)?;
+            let copies = newest_by_id(session, batch.message_ids.values()).await?;
+            let copied: BTreeMap<u32, u32> = batch
+                .message_ids
+                .iter()
+                .filter_map(|(src, id)| Some((*src, *copies.get(id)?)))
+                .collect();
+            let copied_src: UidSet = copied.keys().copied().collect();
+            let numbered = session.select(from).await.map_err(text)?.validity == job.validity;
+            let still = match numbered {
+                true => present(session, &batch.src).await?,
+                false => batch.src.without(&copied_src),
+            };
+            let left_behind = still.intersection(&copied_src);
+            let still = match numbered && !mailbox.caps.moves && mailbox.caps.uidplus {
+                true if !left_behind.is_empty() => {
+                    session
+                        .store(&left_behind, "+FLAGS.SILENT (\\Deleted)")
+                        .await
+                        .map_err(text)?;
+                    session.expunge_uids(&left_behind).await.map_err(text)?;
+                    still.without(&left_behind)
+                }
+                _ => still,
+            };
+            let gone = batch.src.without(&still);
+            Batch {
+                dst: Some(
+                    gone.iter()
+                        .filter_map(|u| copied.get(&u).copied())
+                        .collect(),
+                ),
+                dst_validity: Some(dest.validity),
+                message_ids: batch
+                    .message_ids
+                    .into_iter()
+                    .filter(|(uid, _)| gone.contains(*uid))
+                    .collect(),
+                src: gone,
+            }
+        }
+    };
+    job.pending = job.pending.without(&settled.src);
+    if !settled.src.is_empty() {
+        job.done.push(settled);
+    }
+    job.in_flight = None;
+    keep(journal, job).await
+}
+
+/// Why `job` stopped, as a call reports it: the server's words fenced.
+fn stopped_note(job: &BulkJob) -> String {
+    let why = job.stopped.as_deref().unwrap_or("it stopped");
+    format!(
+        "Job {} stopped; email.undo puts back what it did. {}",
+        job.id,
+        wrap_external_content(why, "why the mail job stopped").wrapped_content
+    )
 }
 
 /// Carries `job` on, batch by batch, until it is done or the budget is spent.
@@ -221,32 +433,23 @@ pub async fn run(
     if job.state != JobState::Running {
         return Ok(());
     }
-    let selected = session.select(job.action.source()).await.map_err(text)?;
-    if selected.validity != job.validity {
-        stop(
-            job,
-            format!(
-                "{} was rebuilt by the server since the job began, so its message numbers changed; nothing more was done.",
-                job.action.source()
-            ),
-        );
+    let source = job.action.source().to_string();
+    if session.select(&source).await.map_err(text)?.validity != job.validity {
+        stop(job, renumbered(&source));
         return keep(journal, job).await;
     }
     keep(journal, job).await?;
+    if job.in_flight.is_some() {
+        settle(session, mailbox, job, journal).await?;
+        session.select(&source).await.map_err(text)?;
+    }
     while !job.pending.is_empty() && !budget.spent() {
-        let (batch, rest) = job.pending.split_first(BATCH);
-        let done = run_batch(session, mailbox, &job.action, &batch).await;
-        match done {
-            Ok(done) => {
-                job.done.push(done);
-                job.pending = rest;
-                keep(journal, job).await?;
-            }
-            Err(why) => {
-                stop(job, why.clone());
-                keep(journal, job).await?;
-                return Err(why);
-            }
+        let (uids, _) = job.pending.split_first(BATCH);
+        if let Err(why) = step(session, mailbox, job, &uids, journal).await {
+            stop(job, why);
+            let _ = settle(session, mailbox, job, journal).await;
+            keep(journal, job).await?;
+            return Err(stopped_note(job));
         }
     }
     if job.pending.is_empty() {
@@ -256,72 +459,59 @@ pub async fn run(
     Ok(())
 }
 
-/// Where one moved batch is now: its uids in `to`, found by COPYUID when the
-/// server gave it and still holds that folder's numbering, else by
-/// Message-ID.
+/// Where one moved batch is now: its uids in `to` that are still there, by
+/// COPYUID when the server gave it and still holds that folder's numbering,
+/// else the newest copy of each by Message-ID.
 async fn landed_now(
     session: &mut (impl MailSession + ?Sized),
     batch: &Batch,
     validity: u32,
 ) -> Result<UidSet, String> {
     match (&batch.dst, batch.dst_validity) {
-        (Some(dst), Some(v)) if v == validity => Ok(dst.clone()),
-        _ => {
-            let mut found = UidSet::default();
-            for ids in batch.message_ids.chunks(IDS_PER_SEARCH) {
-                let keys = ids
-                    .iter()
-                    .map(|id| quoted(id).map(|q| format!("HEADER Message-ID {q}")))
-                    .collect::<Result<Vec<_>, _>>()?;
-                let query = keys
-                    .iter()
-                    .skip(1)
-                    .fold(keys[0].clone(), |acc, key| format!("OR {acc} {key}"));
-                let uids = session.search(&query).await.map_err(text)?;
-                found = found.iter().chain(uids.iter()).collect();
-            }
-            Ok(found)
-        }
+        (Some(dst), Some(v)) if v == validity => present(session, dst).await,
+        _ => Ok(newest_by_id(session, batch.message_ids.values())
+            .await?
+            .into_values()
+            .collect()),
     }
 }
 
+/// Puts one batch back; how many of its messages were no longer there.
 async fn undo_batch(
     session: &mut (impl MailSession + ?Sized),
     mailbox: &Mailbox,
     action: &BulkAction,
     batch: &Batch,
 ) -> Result<usize, String> {
-    match action {
+    let back = match action {
         BulkAction::Move { from, to, label } => {
             let selected = session.select(to).await.map_err(text)?;
             let back = landed_now(session, batch, selected.validity).await?;
-            if !back.is_empty() {
-                match label {
-                    Some(label) => {
-                        session
-                            .store(&back, &format!("+X-GM-LABELS.SILENT ({label})"))
-                            .await
-                            .map_err(text)?;
-                    }
-                    None => {
-                        relocate(session, mailbox, &back, from).await?;
-                    }
+            match (label, back.is_empty()) {
+                (_, true) => {}
+                (Some(label), false) => session
+                    .store(&back, &format!("+X-GM-LABELS.SILENT ({label})"))
+                    .await
+                    .map_err(text)?,
+                (None, false) => {
+                    relocate(session, mailbox, &back, from).await?;
                 }
             }
-            Ok(batch.src.len().saturating_sub(back.len()))
+            back
         }
-        BulkAction::Mark { folder, flag, on } => {
-            session.select(folder).await.map_err(text)?;
-            if !batch.src.is_empty() {
+        BulkAction::Mark { flag, on, .. } => {
+            let back = present(session, &batch.src).await?;
+            if !back.is_empty() {
                 let sign = if *on { '-' } else { '+' };
                 session
-                    .store(&batch.src, &format!("{sign}FLAGS.SILENT ({})", flag.imap()))
+                    .store(&back, &format!("{sign}FLAGS.SILENT ({})", flag.imap()))
                     .await
                     .map_err(text)?;
             }
-            Ok(0)
+            back
         }
-    }
+    };
+    Ok(batch.src.len().saturating_sub(back.len()))
 }
 
 /// Puts back what `job` did, newest batch first, until all of it is back or
@@ -333,14 +523,21 @@ pub async fn undo(
     budget: Budget,
     journal: Option<&dyn MailJournal>,
 ) -> Result<(), String> {
-    match job.state {
-        JobState::Undone => return Ok(()),
-        JobState::Running | JobState::Done | JobState::Stopped => {
-            job.state = JobState::Undoing;
-            job.pending = UidSet::default();
-            keep(journal, job).await?;
+    if job.state == JobState::Undone {
+        return Ok(());
+    }
+    settle(session, mailbox, job, journal).await?;
+    if job.state != JobState::Undoing {
+        job.state = JobState::Undoing;
+        job.pending = UidSet::default();
+        keep(journal, job).await?;
+    }
+    if let BulkAction::Mark { folder, .. } = &job.action {
+        let folder = folder.clone();
+        if let Err(why) = open_folder(session, &folder, Some(job.validity), true).await {
+            stop(job, why);
+            return keep(journal, job).await;
         }
-        JobState::Undoing => {}
     }
     while !budget.spent() {
         let Some(batch) = job.done.last().cloned() else {
@@ -367,23 +564,23 @@ pub fn report(job: &BulkJob) -> Value {
         "remaining": job.pending.len(),
     });
     let note = match job.state {
-        JobState::Running => Some(format!(
+        JobState::Running => format!(
             "Not finished: call again with job = \"{}\" to carry on.",
             job.id
-        )),
-        JobState::Undoing => Some(format!(
+        ),
+        JobState::Undoing => format!(
             "Still putting messages back: call email.undo with job = \"{}\" to carry on.",
             job.id
-        )),
-        JobState::Done => Some("Done. email.undo puts it back.".to_string()),
-        JobState::Undone if job.unfound > 0 => Some(format!(
+        ),
+        JobState::Done => "Done. email.undo puts it back.".to_string(),
+        JobState::Undone if job.unfound > 0 => format!(
             "Put back, except {} message(s) that were no longer where they had been moved to.",
             job.unfound
-        )),
-        JobState::Undone => Some("Put back.".to_string()),
-        JobState::Stopped => job.stopped.clone(),
+        ),
+        JobState::Undone => "Put back.".to_string(),
+        JobState::Stopped => stopped_note(job),
     };
-    if let (Some(obj), Some(note)) = (out.as_object_mut(), note) {
+    if let Some(obj) = out.as_object_mut() {
         obj.insert("note".to_string(), Value::String(note));
     }
     out
@@ -422,6 +619,8 @@ pub(crate) mod fake {
         pub commands: Vec<String>,
         pub step: Duration,
         pub copyuid: bool,
+        /// A command (by its start) that fails, once.
+        pub fail: Option<String>,
     }
 
     impl FakeServer {
@@ -446,19 +645,25 @@ pub(crate) mod fake {
         }
 
         pub fn deliver(&mut self, folder: &str, from: &str, n: usize) {
-            let f = self.folders.get_mut(folder).unwrap();
             for _ in 0..n {
-                let uid = f.next;
-                f.next += 1;
-                f.messages.insert(
-                    uid,
-                    Message {
-                        from: from.to_string(),
-                        message_id: format!("<{uid}.{from}@test>"),
-                        flags: Vec::new(),
-                    },
-                );
+                let uid = self.folders[folder].next;
+                self.deliver_as(folder, from, &format!("<{uid}.{from}@test>"));
             }
+        }
+
+        /// One message with `message_id`, as a copy of another may carry.
+        pub fn deliver_as(&mut self, folder: &str, from: &str, message_id: &str) {
+            let f = self.folders.get_mut(folder).unwrap();
+            let uid = f.next;
+            f.next += 1;
+            f.messages.insert(
+                uid,
+                Message {
+                    from: from.to_string(),
+                    message_id: message_id.to_string(),
+                    flags: Vec::new(),
+                },
+            );
         }
 
         pub fn count(&self, folder: &str) -> usize {
@@ -510,9 +715,20 @@ pub(crate) mod fake {
             })
         }
 
-        async fn tick(&mut self, command: String) {
-            self.commands.push(command);
+        async fn tick(&mut self, command: String) -> Result<(), EmailError> {
             tokio::time::sleep(self.step).await;
+            let failing = self
+                .fail
+                .as_deref()
+                .is_some_and(|start| command.starts_with(start));
+            self.commands.push(command);
+            match failing {
+                true => {
+                    self.fail = None;
+                    Err(EmailError::Imap("the server went away".to_string()))
+                }
+                false => Ok(()),
+            }
         }
     }
 
@@ -536,7 +752,7 @@ pub(crate) mod fake {
         }
 
         async fn select(&mut self, folder: &str) -> Result<Selected, EmailError> {
-            self.tick(format!("SELECT {folder}")).await;
+            self.tick(format!("SELECT {folder}")).await?;
             let f = self
                 .folders
                 .get(folder)
@@ -554,7 +770,7 @@ pub(crate) mod fake {
         }
 
         async fn search(&mut self, query: &str) -> Result<UidSet, EmailError> {
-            self.tick(format!("UID SEARCH {query}")).await;
+            self.tick(format!("UID SEARCH {query}")).await?;
             let here = self.here().clone();
             let within = query
                 .strip_prefix("UID ")
@@ -590,7 +806,7 @@ pub(crate) mod fake {
             uids: &UidSet,
             to: &str,
         ) -> Result<Option<Landed>, EmailError> {
-            self.tick(format!("UID MOVE {uids} {to}")).await;
+            self.tick(format!("UID MOVE {uids} {to}")).await?;
             let messages = self.take(uids);
             let here = self.here();
             messages.iter().for_each(|(u, _)| {
@@ -604,13 +820,13 @@ pub(crate) mod fake {
             uids: &UidSet,
             to: &str,
         ) -> Result<Option<Landed>, EmailError> {
-            self.tick(format!("UID COPY {uids} {to}")).await;
+            self.tick(format!("UID COPY {uids} {to}")).await?;
             let messages = self.take(uids);
             Ok(self.put(to, messages))
         }
 
         async fn store(&mut self, uids: &UidSet, change: &str) -> Result<(), EmailError> {
-            self.tick(format!("UID STORE {uids} {change}")).await;
+            self.tick(format!("UID STORE {uids} {change}")).await?;
             if let Some(labels) = change.strip_prefix("+X-GM-LABELS.SILENT (") {
                 let label = labels.trim_end_matches(')').to_string();
                 let into = if label == "\\Inbox" {
@@ -639,7 +855,7 @@ pub(crate) mod fake {
         }
 
         async fn expunge_uids(&mut self, uids: &UidSet) -> Result<(), EmailError> {
-            self.tick(format!("UID EXPUNGE {uids}")).await;
+            self.tick(format!("UID EXPUNGE {uids}")).await?;
             let here = self.here();
             here.messages.retain(|uid, m| {
                 !(uids.contains(*uid) && m.flags.iter().any(|f| f == "\\Deleted"))
@@ -652,7 +868,7 @@ pub(crate) mod fake {
             uids: &UidSet,
             _fields: &[&str],
         ) -> Result<Vec<(u32, String)>, EmailError> {
-            self.tick(format!("UID FETCH {uids} HEADER")).await;
+            self.tick(format!("UID FETCH {uids} HEADER")).await?;
             Ok(self
                 .take(uids)
                 .into_iter()
@@ -681,20 +897,24 @@ pub(crate) mod fake {
         }
 
         async fn create(&mut self, folder: &str) -> Result<(), EmailError> {
-            self.tick(format!("CREATE {folder}")).await;
-            self.folders.insert(folder.to_string(), Folder::default());
+            self.tick(format!("CREATE {folder}")).await?;
+            let made = Folder {
+                next: 1,
+                ..Folder::default()
+            };
+            self.folders.insert(folder.to_string(), made);
             Ok(())
         }
 
         async fn rename(&mut self, from: &str, to: &str) -> Result<(), EmailError> {
-            self.tick(format!("RENAME {from} {to}")).await;
+            self.tick(format!("RENAME {from} {to}")).await?;
             let f = self.folders.remove(from).unwrap();
             self.folders.insert(to.to_string(), f);
             Ok(())
         }
 
         async fn delete(&mut self, folder: &str) -> Result<(), EmailError> {
-            self.tick(format!("DELETE {folder}")).await;
+            self.tick(format!("DELETE {folder}")).await?;
             self.folders.remove(folder);
             Ok(())
         }
@@ -724,11 +944,52 @@ mod tests {
         }
     }
 
+    fn ask(selection: &Selection) -> Ask<'_> {
+        Ask {
+            owner: "kat",
+            account: "home",
+            tool: "email.move",
+            origin: Origin::Person,
+            selection,
+            validity: None,
+        }
+    }
+
     async fn job(server: &mut FakeServer, action: BulkAction, selection: Selection) -> BulkJob {
         let mailbox = server.mailbox();
-        begin(server, &mailbox, "kat", "home", action, &selection)
+        begin(server, &mailbox, action, ask(&selection))
             .await
             .unwrap()
+    }
+
+    async fn moved_all(
+        server: &mut FakeServer,
+        job: &mut BulkJob,
+        journal: Option<&dyn MailJournal>,
+    ) {
+        let mailbox = server.mailbox();
+        run(
+            server,
+            &mailbox,
+            job,
+            Budget::of(Duration::from_secs(60)),
+            journal,
+        )
+        .await
+        .unwrap();
+    }
+
+    async fn undone(server: &mut FakeServer, job: &mut BulkJob) {
+        let mailbox = server.mailbox();
+        undo(
+            server,
+            &mailbox,
+            job,
+            Budget::of(Duration::from_secs(60)),
+            None,
+        )
+        .await
+        .unwrap();
     }
 
     #[tokio::test(start_paused = true)]
@@ -737,10 +998,11 @@ mod tests {
         server.deliver("INBOX", "news@shop.com", 25);
         server.deliver("INBOX", "friend@x.com", 3);
         let mailbox = server.mailbox();
-        let out = plan(&mut server, &mailbox, "INBOX", &from("news@shop.com"))
+        let out = plan(&mut server, &mailbox, "INBOX", &from("news@shop.com"), None)
             .await
             .unwrap();
         assert_eq!(out["count"], 25);
+        assert_eq!(out["validity"], 100);
         let sample = out["sample"].as_array().unwrap();
         assert_eq!(sample.len(), 10);
         assert_eq!(sample[0]["uid"], 25, "newest first");
@@ -840,7 +1102,14 @@ mod tests {
         .await
         .unwrap_err();
         assert!(err.contains("can't move just these messages safely"));
+        assert!(err.contains(&job.id), "the job is named");
+        assert!(
+            err.contains("<<<EXTERNAL_UNTRUSTED_CONTENT_"),
+            "what the server said is fenced"
+        );
         assert_eq!(job.state, JobState::Stopped);
+        assert_eq!(job.in_flight, None);
+        assert!(job.done.is_empty());
         assert_eq!(server.count("INBOX"), 3);
     }
 
@@ -914,6 +1183,7 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(job.done[0].message_ids.len(), 45);
+        assert_eq!(job.done[0].src.len(), 45);
         assert!(job.done[0].dst.is_none());
         undo(
             &mut server,
@@ -1048,5 +1318,176 @@ mod tests {
         .unwrap();
         assert_eq!(again.state, JobState::Undone);
         assert_eq!(server.count("INBOX"), 1_500);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn every_moved_batch_keeps_its_message_ids_and_where_the_server_put_it() {
+        let mut server = FakeServer::new(&["MOVE", "UIDPLUS"], &["INBOX", "News"]);
+        server.deliver("INBOX", "news@shop.com", 3);
+        let mut job = job(&mut server, move_to("News"), from("news@shop.com")).await;
+        moved_all(&mut server, &mut job, None).await;
+        let batch = &job.done[0];
+        assert_eq!(batch.message_ids.len(), 3);
+        assert_eq!(batch.message_ids[&1], "<1.news@shop.com@test>");
+        assert_eq!(batch.dst.as_ref().unwrap().to_string(), "1:3");
+        assert_eq!(batch.dst_validity, Some(101));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn named_uids_that_arent_there_are_never_counted() {
+        let mut server = FakeServer::new(&["MOVE", "UIDPLUS"], &["INBOX", "News"]);
+        server.deliver("INBOX", "news@shop.com", 2);
+        let named = Selection::Uids([1, 2, 99].into_iter().collect());
+        let mut job = job(&mut server, move_to("News"), named).await;
+        assert_eq!(job.pending.to_string(), "1:2");
+        moved_all(&mut server, &mut job, None).await;
+        assert_eq!(job.handled(), 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn uids_read_under_another_numbering_are_refused_before_anything_changes() {
+        let mut server = FakeServer::new(&["MOVE", "UIDPLUS"], &["INBOX", "News"]);
+        server.deliver("INBOX", "news@shop.com", 2);
+        let mailbox = server.mailbox();
+        let named = Selection::Uids(std::iter::once(1).collect());
+        let stale = Ask {
+            validity: Some(7),
+            ..ask(&named)
+        };
+        let err = begin(&mut server, &mailbox, move_to("News"), stale)
+            .await
+            .unwrap_err();
+        assert!(err.contains("message numbers changed"));
+        let current = Ask {
+            validity: Some(100),
+            ..ask(&named)
+        };
+        assert!(begin(&mut server, &mailbox, move_to("News"), current)
+            .await
+            .is_ok());
+        assert!(plan(&mut server, &mailbox, "INBOX", &named, Some(7))
+            .await
+            .is_err());
+        assert_eq!(server.count("INBOX"), 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_copy_cut_off_before_its_expunge_is_settled_without_duplicates() {
+        let mut server = FakeServer::new(&["UIDPLUS"], &["INBOX", "News"]);
+        server.deliver("INBOX", "news@shop.com", 3);
+        server.copyuid = false;
+        server.fail = Some("UID EXPUNGE".to_string());
+        let journal = MemoryJournal::default();
+        let mailbox = server.mailbox();
+        let mut job = job(&mut server, move_to("News"), from("news@shop.com")).await;
+        let err = run(
+            &mut server,
+            &mailbox,
+            &mut job,
+            Budget::of(Duration::from_secs(60)),
+            Some(&journal),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.contains("went away"));
+        assert_eq!(server.count("INBOX"), 0, "the copies' originals are gone");
+        assert_eq!(server.count("News"), 3);
+        let kept = journal.get("kat", &job.id).await.unwrap().unwrap();
+        assert_eq!(kept.in_flight, None);
+        assert_eq!(kept.handled(), 3);
+        let mut kept = kept;
+        undone(&mut server, &mut kept).await;
+        assert_eq!(server.count("INBOX"), 3);
+        assert_eq!(server.count("News"), 0);
+        assert_eq!(kept.unfound, 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_move_that_never_heard_back_is_found_again_and_undone() {
+        let mut server = FakeServer::new(&["MOVE", "UIDPLUS"], &["INBOX", "News"]);
+        server.deliver("INBOX", "news@shop.com", 4);
+        let mailbox = server.mailbox();
+        let mut job = job(&mut server, move_to("News"), from("news@shop.com")).await;
+        let (uids, _) = job.pending.split_first(BATCH);
+        let batch = prepare(&mut server, &job.action, &uids).await.unwrap();
+        server.move_uids(&uids, "News").await.unwrap();
+        job.in_flight = Some(batch);
+        assert_eq!(server.count("INBOX"), 0);
+
+        let mut resumed = job.clone();
+        moved_all(&mut server, &mut resumed, None).await;
+        assert_eq!(resumed.state, JobState::Done);
+        assert_eq!(resumed.handled(), 4);
+        assert_eq!(resumed.done[0].dst.as_ref().unwrap().len(), 4);
+
+        undo(
+            &mut server,
+            &mailbox,
+            &mut job,
+            Budget::of(Duration::from_secs(60)),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(job.state, JobState::Undone);
+        assert_eq!(server.count("INBOX"), 4);
+        assert_eq!(server.count("News"), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_undo_by_message_id_takes_back_one_copy_each() {
+        let mut server = FakeServer::new(&["MOVE"], &["INBOX", "News"]);
+        server.copyuid = false;
+        server.deliver("INBOX", "news@shop.com", 2);
+        server.deliver_as("News", "news@shop.com", "<1.news@shop.com@test>");
+        let mut job = job(&mut server, move_to("News"), from("news@shop.com")).await;
+        moved_all(&mut server, &mut job, None).await;
+        assert_eq!(server.count("News"), 3);
+        undone(&mut server, &mut job).await;
+        assert_eq!(server.count("INBOX"), 2);
+        assert_eq!(server.count("News"), 1, "the earlier copy stays");
+        assert_eq!(
+            server.folders["News"]
+                .messages
+                .keys()
+                .copied()
+                .collect::<Vec<_>>(),
+            vec![1]
+        );
+        assert_eq!(job.unfound, 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_undo_counts_what_was_no_longer_there() {
+        let mut server = FakeServer::new(&["MOVE", "UIDPLUS"], &["INBOX", "News"]);
+        server.deliver("INBOX", "news@shop.com", 3);
+        let mut job = job(&mut server, move_to("News"), from("news@shop.com")).await;
+        moved_all(&mut server, &mut job, None).await;
+        server.folders.get_mut("News").unwrap().messages.remove(&2);
+        undone(&mut server, &mut job).await;
+        assert_eq!(server.count("INBOX"), 2);
+        assert_eq!(job.unfound, 1);
+        assert!(report(&job)["note"].as_str().unwrap().contains("except 1"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_mark_undo_in_a_renumbered_folder_stops_and_says_why() {
+        let mut server = FakeServer::new(&["MOVE", "UIDPLUS"], &["INBOX"]);
+        server.deliver("INBOX", "news@shop.com", 2);
+        let action = BulkAction::Mark {
+            folder: "INBOX".to_string(),
+            flag: MarkFlag::Seen,
+            on: true,
+        };
+        let mut job = job(&mut server, action, from("news@shop.com")).await;
+        moved_all(&mut server, &mut job, None).await;
+        server.folders.get_mut("INBOX").unwrap().validity = 999;
+        undone(&mut server, &mut job).await;
+        assert_eq!(job.state, JobState::Stopped);
+        assert!(job.stopped.as_deref().unwrap().contains("numbers changed"));
+        assert!(server.folders["INBOX"]
+            .messages
+            .values()
+            .all(|m| m.flags.iter().any(|f| f == "\\Seen")));
     }
 }

@@ -14,7 +14,7 @@ use eyre::Result;
 use serde::Deserialize;
 
 use workforce_agent::tools::{Tool, ToolResult};
-use workforce_orchestrator::monitor::{MonitorDefinition, MonitorKey};
+use workforce_orchestrator::monitor::{MonitorDefinition, MonitorKey, MonitorMeta};
 use workforce_orchestrator::workflow_store::{EditContext, KIND_MONITOR};
 
 use crate::authz::{always_admin, IsAdminFn};
@@ -403,6 +403,14 @@ impl MonitorTool {
         }
     }
 
+    /// The monitors this turn may see that read mail, with their owners.
+    pub(crate) async fn mail_monitors(&self) -> Vec<(MonitorMeta, Option<String>)> {
+        let scope =
+            DefListing::for_turn(&self.write_auth, self.runtime.def_store(), KIND_MONITOR).await;
+        let summaries = self.list_visible(&scope).await;
+        super::sort_rule::mail_monitors(self.runtime.as_ref(), summaries).await
+    }
+
     async fn summary(&self, id: &str, owner: Option<&str>) -> Option<MonitorSummary> {
         match &self.engine {
             Some(engine) => engine.summary_of(id, owner).await,
@@ -659,7 +667,11 @@ impl MonitorTool {
         let via = self.edited_via();
         let edit = EditContext::new(&via, grant.actor.as_deref());
         let result = match &self.engine {
-            Some(engine) => engine.set_enabled(&id, owner.as_deref(), enabled, edit).await,
+            Some(engine) => {
+                engine
+                    .set_enabled(&id, owner.as_deref(), enabled, edit)
+                    .await
+            }
             None => self
                 .runtime
                 .set_definition_enabled(&id, owner.as_deref(), enabled, edit)

@@ -644,6 +644,7 @@ async fn fetch_inbox_for_account(
     if exists == 0 {
         return Ok(Vec::new());
     }
+    let validity = mailbox.uid_validity.unwrap_or(0);
 
     // Fetch the most recent N messages by sequence number
     let start_seq = if exists > limit as u32 {
@@ -703,6 +704,8 @@ async fn fetch_inbox_for_account(
 
         messages.push(serde_json::json!({
             "uid": uid,
+            "validity": validity,
+            "key": message_key(validity, uid),
             "account": account,
             "sender": from,
             "subject": subject,
@@ -714,6 +717,12 @@ async fn fetch_inbox_for_account(
     }
 
     Ok(messages)
+}
+
+/// A message's key across renumberings: its folder's UIDVALIDITY and its
+/// uid, so a rebuilt folder's new mail is never taken for mail already seen.
+fn message_key(validity: u32, uid: u32) -> String {
+    format!("{validity}:{uid}")
 }
 
 // ── email.folders ────────────────────────────────────────────────────
@@ -802,7 +811,7 @@ impl Tool for EmailFoldersTool {
             let friendly = folder
                 .role
                 .map(|r| r.label().to_string())
-                .unwrap_or_else(|| friendly_folder_name(name));
+                .unwrap_or_else(|| friendly_folder_name(&super::mailbox::decoded(name)));
 
             let (messages, unseen) = match folder.selectable {
                 false => (0, 0),
@@ -816,7 +825,7 @@ impl Tool for EmailFoldersTool {
             };
 
             folders.push(serde_json::json!({
-                "name": name,
+                "name": super::mailbox::decoded(name),
                 "friendly_name": friendly,
                 "role": folder.role,
                 "holds_mail": folder.selectable,
@@ -1452,6 +1461,7 @@ async fn search_account(
         if mailbox.exists == 0 {
             continue;
         }
+        let validity = mailbox.uid_validity.unwrap_or(0);
 
         // UID SEARCH with our criteria
         let uids: Vec<u32> = match session.uid_search(criteria).await {
@@ -1560,6 +1570,8 @@ async fn search_account(
 
             all_results.push(serde_json::json!({
                 "uid": uid,
+                "validity": validity,
+                "key": message_key(validity, uid),
                 "account": account,
                 "folder": folder,
                 "sender": from_addr,
@@ -2343,7 +2355,7 @@ impl Tool for EmailSendTool {
     }
 }
 
-async fn send_staged_email(
+pub(super) async fn send_staged_email(
     message: &lettre::Message,
     raw_message: &[u8],
     account_name: &str,

@@ -11,7 +11,7 @@ use tokio::net::TcpStream;
 use super::bulk::{self, Budget};
 use super::criteria::{Criteria, Selection};
 use super::journal::memory::MemoryJournal;
-use super::journal::{BulkAction, JobState, MailJournal, MarkFlag};
+use super::journal::{BulkAction, JobState, MailJournal, MarkFlag, Origin};
 use super::mailbox::{Caps, Mailbox};
 use super::manage::{folder_call, FolderOp};
 use super::session::MailSession;
@@ -44,6 +44,17 @@ async fn seed(session: &mut Live, folder: &str, from: &str, n: usize, tag: &str)
 
 fn user() -> String {
     format!("it{}@test", uuid::Uuid::new_v4().simple())
+}
+
+fn ask(selection: &Selection) -> bulk::Ask<'_> {
+    bulk::Ask {
+        owner: "kat",
+        account: "it",
+        tool: "email.move",
+        origin: Origin::Person,
+        selection,
+        validity: None,
+    }
 }
 
 fn from(sender: &str) -> Selection {
@@ -136,9 +147,15 @@ async fn live_two_thousand_messages_move_over_several_calls_and_undo() {
         mailbox.caps
     );
 
-    let plan = bulk::plan(&mut session, &mailbox, "INBOX", &from("news@shop.com"))
-        .await
-        .unwrap();
+    let plan = bulk::plan(
+        &mut session,
+        &mailbox,
+        "INBOX",
+        &from("news@shop.com"),
+        None,
+    )
+    .await
+    .unwrap();
     assert_eq!(plan["count"], 2_000);
     assert_eq!(plan["sample"].as_array().unwrap().len(), 10);
     assert_eq!(session.messages_in("INBOX").await.unwrap(), 2_007);
@@ -149,16 +166,9 @@ async fn live_two_thousand_messages_move_over_several_calls_and_undo() {
         to: "News".to_string(),
         label: None,
     };
-    let mut job = bulk::begin(
-        &mut session,
-        &mailbox,
-        "kat",
-        "it",
-        action,
-        &from("news@shop.com"),
-    )
-    .await
-    .unwrap();
+    let mut job = bulk::begin(&mut session, &mailbox, action, ask(&from("news@shop.com")))
+        .await
+        .unwrap();
     let mut calls = 0;
     while job.state == JobState::Running {
         calls += 1;
@@ -212,16 +222,9 @@ async fn live_a_mark_and_its_undo_change_exactly_what_they_should() {
         flag: MarkFlag::Seen,
         on: true,
     };
-    let mut job = bulk::begin(
-        &mut session,
-        &mailbox,
-        "kat",
-        "it",
-        action,
-        &from("news@shop.com"),
-    )
-    .await
-    .unwrap();
+    let mut job = bulk::begin(&mut session, &mailbox, action, ask(&from("news@shop.com")))
+        .await
+        .unwrap();
     bulk::run(
         &mut session,
         &mailbox,
@@ -282,16 +285,9 @@ async fn moved_beside_a_deleted_message(without_move: bool) {
         to: "News".to_string(),
         label: None,
     };
-    let mut job = bulk::begin(
-        &mut session,
-        &mailbox,
-        "kat",
-        "it",
-        action,
-        &from("news@shop.com"),
-    )
-    .await
-    .unwrap();
+    let mut job = bulk::begin(&mut session, &mailbox, action, ask(&from("news@shop.com")))
+        .await
+        .unwrap();
     bulk::run(
         &mut session,
         &mailbox,

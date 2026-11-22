@@ -385,6 +385,15 @@ impl ToolResult {
         }
     }
 
+    /// What a call that answered `outcome` reports, timed from `started`.
+    pub fn timed(outcome: Result<serde_json::Value, String>, started: std::time::Instant) -> Self {
+        let duration_ms = started.elapsed().as_millis() as u64;
+        match outcome {
+            Ok(output) => Self::success(output, duration_ms),
+            Err(why) => Self::failure(why, duration_ms),
+        }
+    }
+
     /// A refusal-for-rate-limiting failure carrying the typed signal.
     pub fn rate_limited(
         error: impl Into<String>,
@@ -455,6 +464,16 @@ mod tool_result_tests {
     /// leave `error` unset: the post-turn notice reads exactly that field, and
     /// an empty result with an error is what told readers to doubt a correct
     /// "you didn't attach anything".
+    #[test]
+    fn a_timed_outcome_is_a_success_or_a_failure() {
+        let started = std::time::Instant::now();
+        let ok = ToolResult::timed(Ok(serde_json::json!({ "n": 1 })), started);
+        assert!(ok.success && ok.error.is_none());
+        let failed = ToolResult::timed(Err("no".to_string()), started);
+        assert!(!failed.success);
+        assert_eq!(failed.error.as_deref(), Some("no"));
+    }
+
     #[test]
     fn empty_is_a_success_that_reports_finding_nothing() {
         let r = ToolResult::empty("no files found in this conversation", 3);

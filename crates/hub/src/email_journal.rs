@@ -1,18 +1,25 @@
 //! The hub's journal of bulk mail jobs (schema `mail`): what each
 //! `email.move` / `archive` / `mark` / `delete` job did, so it carries on
-//! across calls and `email.undo` puts it back. A job is kept two weeks.
+//! across calls and `email.undo` puts it back. A job is a row and each batch
+//! it did a row of its own, so a batch writes only itself. A job is kept two
+//! weeks after it last changed.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
-use eyre::{Context, Result};
-use tokio_postgres::Row;
+use eyre::{Context, ContextCompat, Result};
+use serde::Serialize;
+use serde_json::Value;
 use tracing::warn;
 use workforce_common::settings::WorkforceConfig;
 use workforce_postgres::{
     MigrationRun, MigrationRunner, MigrationSet, PostgresConfig, PostgresError, PostgresPool,
 };
-use workforce_skills::adapters::email::journal::{self, BulkJob, MailJournal};
+use workforce_skills::adapters::email::journal::{self, BulkJob, JobState, MailJournal, Origin};
+
+/// How often jobs past their two weeks are let go.
+const PRUNE_EVERY: Duration = Duration::from_secs(6 * 3600);
 
 // Own directory, never a subdir of another embed root: refinery's
 // embed_migrations is recursive.
@@ -34,9 +41,12 @@ pub struct PgMailJournal {
     pool: PostgresPool,
 }
 
-fn job_of(row: &Row) -> Result<BulkJob> {
-    let job: serde_json::Value = row.try_get("job")?;
-    serde_json::from_value(job).context("reading a kept bulk mail job")
+/// A job field as the column that keeps it: its serde name.
+fn word(value: impl Serialize) -> Result<String> {
+    serde_json::to_value(value)?
+        .as_str()
+        .map(str::to_string)
+        .context("a job field that isn't a word")
 }
 
 impl PgMailJournal {
@@ -62,59 +72,116 @@ impl PgMailJournal {
         Ok(Self { pool })
     }
 
-    async fn one(&self, sql: &str, owner: &str, key: &str) -> Result<Option<BulkJob>> {
+    /// Lets go of the jobs that haven't changed in two weeks, batches and
+    /// all.
+    pub async fn prune(&self) -> Result<u64> {
         let conn = self.pool.get().await?;
-        conn.query_opt(sql, &[&owner, &key])
+        Ok(conn
+            .execute(
+                "DELETE FROM bulk_jobs WHERE updated_at < now() - interval '14 days'",
+                &[],
+            )
+            .await?)
+    }
+
+    /// The job kept under `sql`'s one row, its batches put back in order.
+    async fn one(
+        &self,
+        sql: &str,
+        params: &[&(dyn tokio_postgres::types::ToSql + Sync)],
+    ) -> Result<Option<BulkJob>> {
+        let conn = self.pool.get().await?;
+        let Some(row) = conn.query_opt(sql, params).await? else {
+            return Ok(None);
+        };
+        let id: String = row.try_get("id")?;
+        let mut head: Value = row.try_get("job")?;
+        let done = conn
+            .query(
+                "SELECT batch FROM bulk_batches WHERE job_id = $1 ORDER BY seq",
+                &[&id],
+            )
             .await?
-            .as_ref()
-            .map(job_of)
-            .transpose()
+            .iter()
+            .map(|row| row.try_get::<_, Value>("batch"))
+            .collect::<Result<Vec<_>, _>>()?;
+        head.as_object_mut()
+            .context("a kept bulk mail job that isn't an object")?
+            .insert("done".to_string(), Value::Array(done));
+        serde_json::from_value(head)
+            .map(Some)
+            .context("reading a kept bulk mail job")
     }
 }
 
 #[async_trait]
 impl MailJournal for PgMailJournal {
     async fn save(&self, job: &BulkJob) -> Result<()> {
-        let conn = self.pool.get().await?;
-        let kept = serde_json::to_value(job)?;
-        conn.execute(
-            "INSERT INTO bulk_jobs (id, owner, account, job, created_at, updated_at) \
-             VALUES ($1, $2, $3, $4, $5, now()) \
-             ON CONFLICT (id) DO UPDATE SET job = EXCLUDED.job, updated_at = now() \
-             WHERE bulk_jobs.owner = EXCLUDED.owner",
-            &[&job.id, &job.owner, &job.account, &kept, &job.created],
+        let mut head = serde_json::to_value(job)?;
+        head.as_object_mut()
+            .context("a bulk mail job that isn't an object")?
+            .remove("done");
+        let (origin, state) = (word(&job.origin)?, word(&job.state)?);
+        let mut conn = self.pool.get().await?;
+        let tx = conn.transaction().await?;
+        let kept = tx
+            .execute(
+                "INSERT INTO bulk_jobs (id, owner, account, origin, state, job, created_at, updated_at) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, now()) \
+                 ON CONFLICT (id) DO UPDATE SET state = EXCLUDED.state, job = EXCLUDED.job, updated_at = now() \
+                 WHERE bulk_jobs.owner = EXCLUDED.owner",
+                &[&job.id, &job.owner, &job.account, &origin, &state, &head, &job.created],
+            )
+            .await?;
+        if kept == 0 {
+            return Ok(());
+        }
+        let stored: i32 = tx
+            .query_one(
+                "SELECT COALESCE(MAX(seq) + 1, 0) FROM bulk_batches WHERE job_id = $1",
+                &[&job.id],
+            )
+            .await?
+            .try_get(0)?;
+        let len = i32::try_from(job.done.len())?;
+        tx.execute(
+            "DELETE FROM bulk_batches WHERE job_id = $1 AND seq >= $2",
+            &[&job.id, &len],
         )
         .await?;
-        conn.execute(
-            "DELETE FROM bulk_jobs WHERE updated_at < now() - interval '14 days'",
-            &[],
-        )
-        .await?;
+        for (seq, batch) in job.done.iter().enumerate().skip(stored.max(0) as usize) {
+            tx.execute(
+                "INSERT INTO bulk_batches (job_id, seq, batch) VALUES ($1, $2, $3)",
+                &[&job.id, &i32::try_from(seq)?, &serde_json::to_value(batch)?],
+            )
+            .await?;
+        }
+        tx.commit().await?;
         Ok(())
     }
 
     async fn get(&self, owner: &str, id: &str) -> Result<Option<BulkJob>> {
         self.one(
-            "SELECT job FROM bulk_jobs WHERE owner = $1 AND id = $2",
-            owner,
-            id,
+            "SELECT id, job FROM bulk_jobs WHERE owner = $1 AND id = $2",
+            &[&owner, &id],
         )
         .await
     }
 
     async fn latest(&self, owner: &str, account: &str) -> Result<Option<BulkJob>> {
+        let (person, undone) = (word(Origin::Person)?, word(JobState::Undone)?);
         self.one(
-            "SELECT job FROM bulk_jobs WHERE owner = $1 AND account = $2 \
+            "SELECT id, job FROM bulk_jobs \
+             WHERE owner = $1 AND account = $2 AND origin = $3 AND state <> $4 \
              ORDER BY created_at DESC LIMIT 1",
-            owner,
-            account,
+            &[&owner, &account, &person, &undone],
         )
         .await
     }
 }
 
-/// Opens the journal once when the hub has Postgres, and hands it to the
-/// email tools.
+/// Opens the journal once when the hub has Postgres, hands it to the email
+/// tools, and lets go of old jobs from then on.
 pub async fn install(config: &WorkforceConfig) {
     static OPENED: tokio::sync::OnceCell<()> = tokio::sync::OnceCell::const_new();
     OPENED
@@ -127,7 +194,19 @@ pub async fn install(config: &WorkforceConfig) {
                 Err(e) => Err(e.into()),
             };
             match opened {
-                Ok(store) => journal::install(Arc::new(store)),
+                Ok(store) => {
+                    let store = Arc::new(store);
+                    journal::install(Arc::clone(&store) as Arc<dyn MailJournal>);
+                    tokio::spawn(async move {
+                        let mut every = tokio::time::interval(PRUNE_EVERY);
+                        loop {
+                            every.tick().await;
+                            if let Err(e) = store.prune().await {
+                                warn!(error = %format!("{e:#}"), "pruning the mail journal failed");
+                            }
+                        }
+                    });
+                }
                 Err(e) => warn!(
                     error = %format!("{e:#}"),
                     "mail journal unavailable; email actions by search are refused and nothing can be undone"
@@ -141,7 +220,7 @@ pub async fn install(config: &WorkforceConfig) {
 mod tests {
     use chrono::Utc;
     use workforce_postgres::test_support::with_test_pool;
-    use workforce_skills::adapters::email::journal::{BulkAction, JobState};
+    use workforce_skills::adapters::email::journal::{Batch, BulkAction};
     use workforce_skills::adapters::email::uids::UidSet;
 
     use super::*;
@@ -151,6 +230,8 @@ mod tests {
             id: id.to_string(),
             owner: owner.to_string(),
             account: account.to_string(),
+            tool: "email.move".to_string(),
+            origin: Origin::Person,
             action: BulkAction::Move {
                 from: "INBOX".to_string(),
                 to: "News".to_string(),
@@ -159,11 +240,23 @@ mod tests {
             asked: "messages from news@shop.com".to_string(),
             validity: 7,
             pending: (1..=300_000).collect::<UidSet>(),
+            in_flight: None,
             done: Vec::new(),
             state: JobState::Running,
             stopped: None,
             unfound: 0,
             created: Utc::now(),
+        }
+    }
+
+    fn batch(from: u32) -> Batch {
+        Batch {
+            src: (from..from + 500).collect(),
+            dst: None,
+            dst_validity: None,
+            message_ids: (from..from + 500)
+                .map(|uid| (uid, format!("<{uid}@shop.com>")))
+                .collect(),
         }
     }
 
@@ -191,12 +284,99 @@ mod tests {
 
             let mut stolen = job("j1", "bob", "home");
             stolen.state = JobState::Undone;
+            stolen.done.push(batch(1));
             journal.save(&stolen).await.unwrap();
+            let kept = journal.get("kat", "j1").await.unwrap().unwrap();
             assert_eq!(
-                journal.get("kat", "j1").await.unwrap().map(|j| j.state),
-                Some(JobState::Done),
+                kept.state,
+                JobState::Done,
                 "another person can't overwrite a job"
             );
+            assert!(kept.done.is_empty());
+        })
+        .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn batches_are_kept_one_row_each_and_undo_takes_them_off() {
+        with_test_pool(PgMailJournal::build_pool, |pool| async move {
+            let journal = PgMailJournal::with_pool(pool).await.unwrap();
+            let mut moving = job("j1", "kat", "home");
+            moving.in_flight = Some(batch(1));
+            journal.save(&moving).await.unwrap();
+            for from in [1, 501, 1001] {
+                moving.in_flight = None;
+                moving.done.push(batch(from));
+                journal.save(&moving).await.unwrap();
+            }
+            assert_eq!(
+                journal.get("kat", "j1").await.unwrap(),
+                Some(moving.clone())
+            );
+            let rows: i64 = journal
+                .pool
+                .get()
+                .await
+                .unwrap()
+                .query_one("SELECT count(*) FROM bulk_batches WHERE job_id = 'j1'", &[])
+                .await
+                .unwrap()
+                .get(0);
+            assert_eq!(rows, 3);
+            moving.state = JobState::Undoing;
+            moving.done.pop();
+            journal.save(&moving).await.unwrap();
+            assert_eq!(journal.get("kat", "j1").await.unwrap(), Some(moving));
+        })
+        .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_latest_to_undo_is_the_persons_own_and_not_yet_undone() {
+        with_test_pool(PgMailJournal::build_pool, |pool| async move {
+            let journal = PgMailJournal::with_pool(pool).await.unwrap();
+            let base = Utc::now();
+            let mut mine = job("mine", "kat", "home");
+            mine.created = base;
+            let mut sorted = job("sorted", "kat", "home");
+            sorted.origin = Origin::Automation;
+            sorted.created = base + chrono::Duration::seconds(5);
+            let mut undone = job("undone", "kat", "home");
+            undone.state = JobState::Undone;
+            undone.created = base + chrono::Duration::seconds(10);
+            for j in [&mine, &sorted, &undone] {
+                journal.save(j).await.unwrap();
+            }
+            assert_eq!(
+                journal.latest("kat", "home").await.unwrap().map(|j| j.id),
+                Some("mine".to_string())
+            );
+        })
+        .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn jobs_untouched_for_two_weeks_are_let_go() {
+        with_test_pool(PgMailJournal::build_pool, |pool| async move {
+            let journal = PgMailJournal::with_pool(pool).await.unwrap();
+            let mut old = job("old", "kat", "home");
+            old.done.push(batch(1));
+            journal.save(&old).await.unwrap();
+            journal.save(&job("new", "kat", "home")).await.unwrap();
+            journal
+                .pool
+                .get()
+                .await
+                .unwrap()
+                .execute(
+                    "UPDATE bulk_jobs SET updated_at = now() - interval '15 days' WHERE id = 'old'",
+                    &[],
+                )
+                .await
+                .unwrap();
+            assert_eq!(journal.prune().await.unwrap(), 1);
+            assert_eq!(journal.get("kat", "old").await.unwrap(), None);
+            assert!(journal.get("kat", "new").await.unwrap().is_some());
         })
         .await;
     }

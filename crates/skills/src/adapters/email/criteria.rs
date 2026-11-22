@@ -43,7 +43,8 @@ pub fn imap_date(when: &str) -> Result<String, String> {
                 "Invalid relative date '{when}': days must be positive"
             ))
         }
-        Some(days) => Some(chrono::Utc::now().date_naive() - chrono::Duration::days(days)),
+        Some(days) => chrono::TimeDelta::try_days(days)
+            .and_then(|back| chrono::Utc::now().date_naive().checked_sub_signed(back)),
         None => NaiveDate::parse_from_str(trimmed, "%Y-%m-%d").ok(),
     };
     date.map(|d| d.format("%d-%b-%Y").to_string()).ok_or_else(|| {
@@ -55,7 +56,7 @@ pub fn imap_date(when: &str) -> Result<String, String> {
 
 /// `text` as an IMAP quoted string.
 pub fn quoted(text: &str) -> Result<String, String> {
-    match text.contains(['\r', '\n']) {
+    match text.contains(['\r', '\n', '\0']) {
         true => Err("A search can't contain a line break.".to_string()),
         false => Ok(format!(
             "\"{}\"",
@@ -64,8 +65,29 @@ pub fn quoted(text: &str) -> Result<String, String> {
     }
 }
 
-fn given(field: &Option<String>) -> Option<&str> {
-    field.as_deref().map(str::trim).filter(|s| !s.is_empty())
+/// What `text` says, when it says anything.
+pub fn given(text: Option<&str>) -> Option<&str> {
+    text.map(str::trim).filter(|s| !s.is_empty())
+}
+
+/// The folder `input[key]` names, else the inbox.
+pub fn folder_named<'a>(input: &'a Value, key: &str) -> &'a str {
+    given(input[key].as_str()).unwrap_or("INBOX")
+}
+
+/// The UIDVALIDITY a call's uids were read under (`email.inbox` and
+/// `email.search` give it with each message), when it says.
+pub fn validity_of(input: &Value) -> Result<Option<u32>, String> {
+    match input.get("validity") {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(s)) if s.trim().is_empty() => Ok(None),
+        Some(v) => coerce_to_u64(v)
+            .and_then(|v| u32::try_from(v).ok())
+            .map(Some)
+            .ok_or_else(|| {
+                format!("Invalid validity {v}: expected the folder's UIDVALIDITY number")
+            }),
+    }
 }
 
 impl Criteria {
@@ -73,19 +95,23 @@ impl Criteria {
     /// attachments with its own search, which sees them where headers don't.
     pub fn to_imap(&self, gmail: bool) -> Result<String, String> {
         let keyed = [
-            ("FROM", given(&self.from)),
-            ("TO", given(&self.to)),
-            ("SUBJECT", given(&self.subject)),
-            ("TEXT", given(&self.text)),
+            ("FROM", given(self.from.as_deref())),
+            ("TO", given(self.to.as_deref())),
+            ("SUBJECT", given(self.subject.as_deref())),
+            ("TEXT", given(self.text.as_deref())),
         ];
+        let charset = keyed
+            .iter()
+            .any(|(_, value)| value.is_some_and(|v| !v.is_ascii()))
+            .then(|| "CHARSET UTF-8".to_string());
         let mut keys = keyed
             .into_iter()
             .filter_map(|(key, value)| value.map(|v| quoted(v).map(|q| format!("{key} {q}"))))
             .collect::<Result<Vec<_>, _>>()?;
-        if let Some(before) = given(&self.before) {
+        if let Some(before) = given(self.before.as_deref()) {
             keys.push(format!("BEFORE {}", imap_date(before)?));
         }
-        if let Some(after) = given(&self.after) {
+        if let Some(after) = given(self.after.as_deref()) {
             keys.push(format!("SINCE {}", imap_date(after)?));
         }
         match self.unread {
@@ -104,19 +130,19 @@ impl Criteria {
                 "An empty search would match every message; say what to match (from, to, subject, text, before, after, unread or has_attachment)."
                     .to_string(),
             ),
-            false => Ok(keys.join(" ")),
+            false => Ok(charset.into_iter().chain(keys).collect::<Vec<_>>().join(" ")),
         }
     }
 
     /// The search in words, for a summary or an approval card.
     pub fn describe(&self) -> String {
         let quoted_words = [
-            ("from", given(&self.from)),
-            ("to", given(&self.to)),
-            ("with subject", given(&self.subject)),
-            ("mentioning", given(&self.text)),
-            ("before", given(&self.before)),
-            ("since", given(&self.after)),
+            ("from", given(self.from.as_deref())),
+            ("to", given(self.to.as_deref())),
+            ("with subject", given(self.subject.as_deref())),
+            ("mentioning", given(self.text.as_deref())),
+            ("before", given(self.before.as_deref())),
+            ("since", given(self.after.as_deref())),
         ];
         let mut words: Vec<String> = quoted_words
             .into_iter()
@@ -144,18 +170,22 @@ pub enum Selection {
 impl Selection {
     /// `uid`, `uids` or `search` from a call's input.
     pub fn from_input(input: &Value) -> Result<Selection, String> {
+        Selection::named(input)?.ok_or_else(|| {
+            "Say which messages: 'uid', 'uids', or a 'search' (from, to, subject, text, before, after, unread, has_attachment)."
+                .to_string()
+        })
+    }
+
+    /// The selection a call's input names, if it names one.
+    pub fn named(input: &Value) -> Result<Option<Selection>, String> {
         let search = input.get("search").filter(|s| !s.is_null());
-        let uids = uid_list(input)?;
-        match (uids, search) {
+        match (uid_list(input)?, search) {
             (Some(_), Some(_)) => Err("Give either uids or a search, not both.".to_string()),
-            (Some(uids), None) => Ok(Selection::Uids(uids)),
+            (Some(uids), None) => Ok(Some(Selection::Uids(uids))),
             (None, Some(search)) => serde_json::from_value::<Criteria>(search.clone())
-                .map(Selection::Search)
+                .map(|c| Some(Selection::Search(c)))
                 .map_err(|e| format!("Invalid search: {e}")),
-            (None, None) => Err(
-                "Say which messages: 'uid', 'uids', or a 'search' (from, to, subject, text, before, after, unread, has_attachment)."
-                    .to_string(),
-            ),
+            (None, None) => Ok(None),
         }
     }
 
@@ -259,6 +289,7 @@ mod tests {
         assert!(Selection::from_input(&json!({"uids": []})).is_err());
         assert!(Selection::from_input(&json!({"uids": [0]})).is_err());
         assert!(Selection::from_input(&json!({})).is_err());
+        assert_eq!(Selection::named(&json!({})).unwrap(), None);
     }
 
     #[test]
@@ -267,6 +298,34 @@ mod tests {
         assert!(imap_date("7d").is_ok());
         assert!(imap_date("0d").is_err());
         assert!(imap_date("yesterday").is_err());
+        assert!(imap_date("9223372036854775807d").is_err(), "never panics");
+        assert!(imap_date("99999999d").is_err());
+    }
+
+    #[test]
+    fn a_search_beyond_ascii_says_its_charset() {
+        assert_eq!(
+            search(json!({"from": "Zoë", "unread": true}))
+                .to_imap(false)
+                .unwrap(),
+            "CHARSET UTF-8 FROM \"Zoë\" UNSEEN"
+        );
+        assert!(!search(json!({"from": "zoe"}))
+            .to_imap(false)
+            .unwrap()
+            .contains("CHARSET"));
+    }
+
+    #[test]
+    fn validity_is_a_number_when_given() {
+        assert_eq!(validity_of(&json!({})).unwrap(), None);
+        assert_eq!(validity_of(&json!({"validity": ""})).unwrap(), None);
+        assert_eq!(validity_of(&json!({"validity": "42"})).unwrap(), Some(42));
+        assert_eq!(validity_of(&json!({"validity": 7})).unwrap(), Some(7));
+        assert!(validity_of(&json!({"validity": "x"})).is_err());
+        assert!(validity_of(&json!({"validity": 5_000_000_000u64})).is_err());
+        assert_eq!(folder_named(&json!({"folder": " "}), "folder"), "INBOX");
+        assert_eq!(folder_named(&json!({"to": "News"}), "to"), "News");
     }
 
     #[test]

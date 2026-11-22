@@ -13,12 +13,16 @@ use async_trait::async_trait;
 use eyre::Result;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use workforce_agent::tools::registry::ToolRegistry;
 use workforce_agent::tools::{Tool, ToolResult};
 use workforce_orchestrator::monitor::{Action, MonitorDefinition, MonitorMeta, Source};
-use workforce_skills::adapters::email::criteria::Criteria;
+use workforce_skills::adapters::email::criteria::{folder_named, Criteria};
 use workforce_skills::adapters::email::schemas;
 
+use super::binding_access::current_turn_user;
+use super::runtime::MonitorSummary;
 use super::MonitorTool;
+use crate::hosts::MonitorDefinitions;
 
 /// Every sort rule's monitor id starts so.
 pub const PREFIX: &str = "sort-";
@@ -26,7 +30,11 @@ const EVERY_SECS: u64 = 300;
 /// How far back each poll looks: new mail, cheaply.
 const RECENT: &str = "2d";
 const POLL_LIMIT: u64 = 100;
+/// The tools a monitor reads mail with. Either one, given no account,
+/// reads every account of the person it polls as.
 const MAIL_READERS: &[&str] = &["email.inbox", "email.search"];
+/// What a polled message is known by: its folder's UIDVALIDITY and its uid.
+const ITEM_KEY: &str = "/key";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "do", rename_all = "snake_case")]
@@ -55,13 +63,6 @@ pub struct SortRule {
     /// person approved it.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub watched_by: Vec<String>,
-}
-
-fn folder_of(input: &Value) -> &str {
-    input["folder"]
-        .as_str()
-        .filter(|f| !f.is_empty())
-        .unwrap_or("INBOX")
 }
 
 impl SortRule {
@@ -100,42 +101,45 @@ impl SortRule {
         self.matches.to_imap(false).map(|_| ())
     }
 
-    fn tool_and_input(&self, uid: Value) -> (&'static str, Value) {
+    /// The mail tool this rule calls, and its input for the messages `which`
+    /// names.
+    fn tool_and_input(&self, which: Value) -> (&'static str, Value) {
         let (account, folder) = (self.account.as_str(), self.folder.as_str());
-        match &self.then {
+        let (tool, mut input) = match &self.then {
             Then::Move { to } => (
                 "email.move",
-                json!({ "account": account, "from_folder": folder, "to_folder": to, "uid": uid }),
+                json!({ "account": account, "from_folder": folder, "to_folder": to }),
             ),
             Then::Archive => (
                 "email.archive",
-                json!({ "account": account, "folder": folder, "uid": uid }),
+                json!({ "account": account, "folder": folder }),
             ),
             Then::MarkRead => (
                 "email.mark",
-                json!({ "account": account, "folder": folder, "uid": uid, "action": "read" }),
+                json!({ "account": account, "folder": folder, "action": "read" }),
             ),
             Then::Flag => (
                 "email.mark",
-                json!({ "account": account, "folder": folder, "uid": uid, "action": "flag" }),
+                json!({ "account": account, "folder": folder, "action": "flag" }),
             ),
+        };
+        if let (Some(input), Value::Object(which)) = (input.as_object_mut(), which) {
+            input.extend(which);
         }
+        (tool, input)
     }
 
     /// The call that applies this rule once to the mail already there.
     pub fn apply_once(&self) -> Value {
-        let (tool, mut input) = self.tool_and_input(Value::Null);
-        if let Some(obj) = input.as_object_mut() {
-            obj.remove("uid");
-            obj.insert("search".to_string(), json!(self.matches));
-            obj.insert("dry_run".to_string(), json!(true));
-        }
+        let (tool, input) = self.tool_and_input(json!({ "search": self.matches, "dry_run": true }));
         json!({ "tool": tool, "input": input })
     }
 
-    /// The monitor that is this rule.
+    /// The monitor that is this rule: each new message is handed on by its
+    /// uid under the numbering it was read with.
     pub fn monitor(&self, id: &str) -> MonitorDefinition {
-        let (tool, input) = self.tool_and_input(json!("{{id}}"));
+        let (tool, input) = self
+            .tool_and_input(json!({ "uid": "{{json:/uid}}", "validity": "{{json:/validity}}" }));
         let watched = match self.watched_by.is_empty() {
             true => String::new(),
             false => format!(
@@ -165,7 +169,7 @@ impl SortRule {
                     }),
                     every_secs: Some(EVERY_SECS),
                     items: Some("/messages".to_string()),
-                    item_id: Some("/uid".to_string()),
+                    item_id: Some(ITEM_KEY.to_string()),
                     path: None,
                     text: None,
                 }),
@@ -185,7 +189,7 @@ impl SortRule {
         let source = meta.source().filter(|s| {
             s.tool == "email.search"
                 && s.items.as_deref() == Some("/messages")
-                && s.item_id() == "/uid"
+                && s.item_id() == ITEM_KEY
         })?;
         if !meta.id.starts_with(PREFIX) {
             return None;
@@ -205,7 +209,7 @@ impl SortRule {
         Some(SortRule {
             rule_id: meta.id.clone(),
             account: source.input["account"].as_str()?.to_string(),
-            folder: folder_of(&source.input).to_string(),
+            folder: folder_named(&source.input, "folder").to_string(),
             matches: serde_json::from_value(source.input["search"].clone()).ok()?,
             then,
             watched_by: Vec::new(),
@@ -213,7 +217,7 @@ impl SortRule {
     }
 
     /// Whether `other`, another enabled monitor, watches the mail this rule
-    /// takes: it reads the same account's folder.
+    /// takes: it reads the same account's folder, or every account's.
     pub fn watched_by_monitor(&self, other: &MonitorMeta) -> bool {
         other.id != self.rule_id
             && other.enabled
@@ -222,21 +226,25 @@ impl SortRule {
                     && s.input["account"]
                         .as_str()
                         .is_none_or(|a| a == self.account)
-                    && folder_of(&s.input).eq_ignore_ascii_case(&self.folder)
+                    && folder_named(&s.input, "folder").eq_ignore_ascii_case(&self.folder)
             })
     }
 
-    fn watchers<'a>(&self, monitors: impl IntoIterator<Item = &'a MonitorMeta>) -> Vec<String> {
+    /// The names of the monitors among `monitors` that watch this rule's
+    /// mail: the rule owner's own, or the hub's.
+    fn watchers(
+        &self,
+        owner: Option<&str>,
+        monitors: &[(MonitorMeta, Option<String>)],
+    ) -> Vec<String> {
         monitors
-            .into_iter()
-            .filter(|m| self.watched_by_monitor(m))
-            .map(|m| m.name.clone())
+            .iter()
+            .filter(|(m, theirs)| {
+                (theirs.is_none() || theirs.as_deref() == owner) && self.watched_by_monitor(m)
+            })
+            .map(|(m, _)| m.name.clone())
             .collect()
     }
-}
-
-fn ms(start: Instant) -> u64 {
-    start.elapsed().as_millis() as u64
 }
 
 async fn call(monitors: &MonitorTool, input: Value) -> Result<Value, String> {
@@ -264,7 +272,7 @@ pub fn rules_in(monitors: &[(MonitorMeta, Option<String>)]) -> Vec<Value> {
                 "owner": owner,
                 "says": rule.says(),
                 "enabled": meta.enabled,
-                "watched_by": rule.watchers(monitors.iter().map(|(m, _)| m)),
+                "watched_by": rule.watchers(owner.as_deref(), monitors),
                 "apply_once": rule.apply_once(),
                 "rule": rule,
             })
@@ -272,43 +280,27 @@ pub fn rules_in(monitors: &[(MonitorMeta, Option<String>)]) -> Vec<Value> {
         .collect()
 }
 
-/// The turn's user's monitors that read mail, by their definitions, with
-/// their owners.
-async fn mail_monitors(
-    monitors: &MonitorTool,
-) -> Result<Vec<(MonitorMeta, Option<String>)>, String> {
-    let listed = call(monitors, json!({ "action": "list" })).await?;
-    let readers: Vec<(String, Option<String>)> = listed["monitors"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter(|m| {
-            m["source"]
-                .as_str()
-                .is_some_and(|tool| MAIL_READERS.contains(&tool))
-        })
-        .filter_map(|m| {
-            Some((
-                m["id"].as_str()?.to_string(),
-                m["owner"].as_str().map(str::to_string),
-            ))
-        })
-        .collect();
-    let mut metas = Vec::new();
-    for (id, owner) in readers {
-        let got = call(
-            monitors,
-            json!({ "action": "get", "monitor_id": id, "owner": owner.clone().unwrap_or_default() }),
-        )
-        .await?;
-        if let Some(def) = got["toml"]
-            .as_str()
-            .and_then(|toml| MonitorDefinition::from_toml(toml).ok())
+/// The monitors among `summaries` that read mail, by their definitions,
+/// with their owners. A summary names the tool it polls, so only readers'
+/// definitions are fetched.
+pub(crate) async fn mail_monitors(
+    definitions: &dyn MonitorDefinitions,
+    summaries: Vec<MonitorSummary>,
+) -> Vec<(MonitorMeta, Option<String>)> {
+    let mut monitors = Vec::new();
+    for summary in summaries.into_iter().filter(|s| {
+        s.source
+            .as_deref()
+            .is_some_and(|tool| MAIL_READERS.contains(&tool))
+    }) {
+        if let Some(def) = definitions
+            .stored_definition(&summary.id, summary.owner.as_deref())
+            .await
         {
-            metas.push((def.monitor, owner));
+            monitors.push((def.monitor, summary.owner));
         }
     }
-    Ok(metas)
+    monitors
 }
 
 fn rule_of(input: &Value) -> Result<SortRule, String> {
@@ -326,25 +318,65 @@ fn rule_id_of(input: &Value) -> Result<String, String> {
         .ok_or_else(|| "Say which rule: its rule_id from list.".to_string())
 }
 
+/// The sort rule `id` among `monitors`, with its owner: never a monitor of
+/// another shape that took a rule's id.
+fn existing<'a>(
+    monitors: &'a [(MonitorMeta, Option<String>)],
+    id: &str,
+) -> Result<(SortRule, &'a Option<String>), String> {
+    monitors
+        .iter()
+        .filter(|(meta, _)| meta.id == id)
+        .find_map(|(meta, owner)| SortRule::of(meta).map(|rule| (rule, owner)))
+        .ok_or_else(|| format!("There is no sort rule {id}; list them to see their ids."))
+}
+
+/// Whether the rule's account and folders are there, by a dry run of
+/// applying it once: how many messages it takes now.
+async fn checked(tools: &ToolRegistry, rule: &SortRule) -> Result<Value, String> {
+    let once = rule.apply_once();
+    let name = once["tool"].as_str().unwrap_or_default();
+    let tool = tools.get(name).ok_or_else(|| {
+        format!("The email tools aren't loaded for this agent, so {name} can't check the rule's folders; turn on the email skill and try again.")
+    })?;
+    let result = tool
+        .execute(once["input"].clone())
+        .await
+        .map_err(|e| format!("{e:#}"))?;
+    match result.success {
+        true => Ok(result.output["count"].clone()),
+        false => Err(format!(
+            "The rule can't run as it is: {}",
+            result.error.unwrap_or_default()
+        )),
+    }
+}
+
 pub struct SortRulesTool {
     monitors: Arc<MonitorTool>,
+    tools: Arc<ToolRegistry>,
 }
 
 impl SortRulesTool {
-    pub fn new(monitors: Arc<MonitorTool>) -> Self {
-        Self { monitors }
+    pub fn new(monitors: Arc<MonitorTool>, tools: Arc<ToolRegistry>) -> Self {
+        Self { monitors, tools }
     }
 
     async fn run(&self, input: &Value) -> Result<Value, String> {
+        let monitors = self.monitors.mail_monitors().await;
         match input["action"].as_str().unwrap_or_default() {
             "list" => {
-                let rules = rules_in(&mail_monitors(&self.monitors).await?);
+                let rules = rules_in(&monitors);
                 Ok(json!({ "rules": rules, "count": rules.len() }))
             }
             "propose" => {
                 let mut rule = rule_of(input)?;
-                let monitors = mail_monitors(&self.monitors).await?;
-                rule.watched_by = rule.watchers(monitors.iter().map(|(m, _)| m));
+                let owner = match rule.rule_id.is_empty() {
+                    true => current_turn_user(),
+                    false => existing(&monitors, &rule.rule_id)?.1.clone(),
+                };
+                let matches_now = checked(&self.tools, &rule).await?;
+                rule.watched_by = rule.watchers(owner.as_deref(), &monitors);
                 let next = match rule.watched_by.is_empty() {
                     true => "Show the person the rule in words; on their yes, save it with email.sort_rule_save, passing `rule` as it is.".to_string(),
                     false => format!(
@@ -352,24 +384,32 @@ impl SortRulesTool {
                         rule.watched_by.join(", ")
                     ),
                 };
-                Ok(
-                    json!({ "says": rule.says(), "watched_by": rule.watched_by, "rule": rule, "next": next }),
-                )
+                Ok(json!({
+                    "says": rule.says(),
+                    "matches_now": matches_now,
+                    "watched_by": rule.watched_by,
+                    "rule": rule,
+                    "next": next
+                }))
             }
             "set_enabled" => {
                 let enabled = input["enabled"]
                     .as_bool()
                     .ok_or("Say whether the rule is on: enabled = true or false.")?;
+                let id = rule_id_of(input)?;
+                let (_, owner) = existing(&monitors, &id)?;
                 call(
                     &self.monitors,
-                    json!({ "action": "set_enabled", "monitor_id": rule_id_of(input)?, "enabled": enabled }),
+                    json!({ "action": "set_enabled", "monitor_id": id, "enabled": enabled, "owner": owner }),
                 )
                 .await
             }
             "remove" => {
+                let id = rule_id_of(input)?;
+                let (_, owner) = existing(&monitors, &id)?;
                 call(
                     &self.monitors,
-                    json!({ "action": "delete", "monitor_id": rule_id_of(input)? }),
+                    json!({ "action": "delete", "monitor_id": id, "owner": owner }),
                 )
                 .await
             }
@@ -387,7 +427,7 @@ impl Tool for SortRulesTool {
     }
 
     fn description(&self) -> &str {
-        "Standing rules that sort new mail as it arrives (move, archive, mark read, flag), on any account: list them, propose one (says it in words and names any monitor that watches the same mail), pause or resume one, or remove one. Saving needs the person's yes: email.sort_rule_save. Each listed rule carries `apply_once`, the call that applies it to mail already there."
+        "Standing rules that sort new mail as it arrives (move, archive, mark read, flag), on any account: list them, propose one (checks its folders, says it in words and names any monitor that watches the same mail), pause or resume one, or remove one. Saving needs the person's yes: email.sort_rule_save. Each listed rule carries `apply_once`, the call that applies it to mail already there."
     }
 
     fn input_schema(&self) -> Value {
@@ -395,7 +435,7 @@ impl Tool for SortRulesTool {
             "type": "object",
             "properties": {
                 "action": { "type": "string", "enum": ["list", "propose", "set_enabled", "remove"] },
-                "rule_id": { "type": "string", "description": "The rule (set_enabled, remove)" },
+                "rule_id": { "type": "string", "description": "The rule (set_enabled, remove; propose when editing one)" },
                 "enabled": { "type": "boolean", "description": "On or off (set_enabled)" },
                 "account": { "type": "string", "description": "The account it sorts (propose)" },
                 "folder": { "type": "string", "description": "The folder it watches (default: INBOX)" },
@@ -408,10 +448,7 @@ impl Tool for SortRulesTool {
 
     async fn execute(&self, input: Value) -> Result<ToolResult> {
         let start = Instant::now();
-        Ok(match self.run(&input).await {
-            Ok(out) => ToolResult::success(out, ms(start)),
-            Err(why) => ToolResult::failure(why, ms(start)),
-        })
+        Ok(ToolResult::timed(self.run(&input).await, start))
     }
 }
 
@@ -429,18 +466,32 @@ fn then_schema() -> Value {
 
 pub struct SortRuleSaveTool {
     monitors: Arc<MonitorTool>,
+    tools: Arc<ToolRegistry>,
 }
 
 impl SortRuleSaveTool {
-    pub fn new(monitors: Arc<MonitorTool>) -> Self {
-        Self { monitors }
+    pub fn new(monitors: Arc<MonitorTool>, tools: Arc<ToolRegistry>) -> Self {
+        Self { monitors, tools }
     }
 
     async fn run(&self, input: &Value) -> Result<Value, String> {
         let rule = rule_of(input)?;
-        let monitors = mail_monitors(&self.monitors).await?;
+        let monitors = self.monitors.mail_monitors().await;
+        let (id, owner) = match rule.rule_id.is_empty() {
+            true => (
+                format!(
+                    "{PREFIX}{}",
+                    &uuid::Uuid::new_v4().simple().to_string()[..12]
+                ),
+                current_turn_user(),
+            ),
+            false => (
+                rule.rule_id.clone(),
+                existing(&monitors, &rule.rule_id)?.1.clone(),
+            ),
+        };
         let unnamed: Vec<String> = rule
-            .watchers(monitors.iter().map(|(m, _)| m))
+            .watchers(owner.as_deref(), &monitors)
             .into_iter()
             .filter(|w| !rule.watched_by.contains(w))
             .collect();
@@ -450,17 +501,11 @@ impl SortRuleSaveTool {
                 unnamed.join(", ")
             ));
         }
-        let id = match rule.rule_id.is_empty() {
-            true => format!(
-                "{PREFIX}{}",
-                &uuid::Uuid::new_v4().simple().to_string()[..12]
-            ),
-            false => rule.rule_id.clone(),
-        };
+        checked(&self.tools, &rule).await?;
         let toml = toml::to_string(&rule.monitor(&id)).map_err(|e| e.to_string())?;
         let saved = call(
             &self.monitors,
-            json!({ "action": "save", "monitor_id": id, "toml_content": toml }),
+            json!({ "action": "save", "monitor_id": id, "toml_content": toml, "owner": owner }),
         )
         .await?;
         Ok(
@@ -515,10 +560,7 @@ impl Tool for SortRuleSaveTool {
 
     async fn execute(&self, input: Value) -> Result<ToolResult> {
         let start = Instant::now();
-        Ok(match self.run(&input).await {
-            Ok(out) => ToolResult::success(out, ms(start)),
-            Err(why) => ToolResult::failure(why, ms(start)),
-        })
+        Ok(ToolResult::timed(self.run(&input).await, start))
     }
 }
 
@@ -564,7 +606,7 @@ mod tests {
     }
 
     #[test]
-    fn each_new_message_is_handed_to_the_mail_tool_by_its_uid() {
+    fn each_new_message_is_handed_to_the_mail_tool_by_its_uid_and_numbering() {
         let def = rule(Then::Move {
             to: "News".to_string(),
         })
@@ -577,7 +619,13 @@ mod tests {
             panic!("a rule runs a tool");
         };
         assert_eq!(tool, "email.move");
-        assert_eq!(input["uid"], "{{id}}");
+        assert_eq!(
+            source.item_id(),
+            "/key",
+            "a renumbered folder's mail is new mail"
+        );
+        assert_eq!(input["uid"], "{{json:/uid}}");
+        assert_eq!(input["validity"], "{{json:/validity}}");
         assert_eq!(input["to_folder"], "News");
     }
 
@@ -638,10 +686,20 @@ mod tests {
             watcher("paused", "email.inbox", json!({"account": "home"}), false),
             watcher("sort-me", "email.search", json!({"account": "home"}), true),
         ];
-        assert_eq!(r.watchers(&monitors), vec!["boss-mail", "all-mail"]);
-        let owned: Vec<_> = monitors.into_iter().map(|m| (m, None)).collect();
-        let rule_monitor = (r.monitor("sort-me").monitor, Some("kat".to_string()));
-        let listed = rules_in(&[owned, vec![rule_monitor]].concat());
+        let kat = Some("kat".to_string());
+        let mut owned: Vec<_> = monitors.into_iter().map(|m| (m, kat.clone())).collect();
+        owned[1].1 = None;
+        owned.push((
+            watcher("bobs-mail", "email.inbox", json!({"account": "home"}), true),
+            Some("bob".to_string()),
+        ));
+        assert_eq!(
+            r.watchers(Some("kat"), &owned),
+            vec!["boss-mail", "all-mail"],
+            "the owner's own and the hub's, never another person's"
+        );
+        owned.push((r.monitor("sort-me").monitor, kat));
+        let listed = rules_in(&owned);
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0]["owner"], "kat");
         assert_eq!(listed[0]["watched_by"], json!(["boss-mail", "all-mail"]));
@@ -693,13 +751,59 @@ mod tests {
     }
 
     #[test]
-    fn saving_a_rule_needs_the_persons_yes_and_names_who_else_watches() {
+    fn the_hub_names_its_mail_tools_for_the_skill() {
+        use workforce_skills::adapters::email::HUB_TOOLS;
+        let (_dir, rules, save) = tools();
+        assert!(HUB_TOOLS.contains(&rules.name()) && HUB_TOOLS.contains(&save.name()));
+    }
+
+    /// A stand-in for the email skill's tool: a dry run that counts two
+    /// messages, or finds no folder `Nowhere`.
+    struct DryRun(&'static str);
+
+    #[async_trait]
+    impl Tool for DryRun {
+        fn name(&self) -> &str {
+            self.0
+        }
+
+        fn description(&self) -> &str {
+            "dry run"
+        }
+
+        fn input_schema(&self) -> Value {
+            json!({ "type": "object" })
+        }
+
+        async fn execute(&self, input: Value) -> Result<ToolResult> {
+            assert_eq!(input["dry_run"], true, "checking a rule changes nothing");
+            Ok(match input["to_folder"].as_str() {
+                Some("Nowhere") => {
+                    ToolResult::failure("There is no folder Nowhere.".to_string(), 0)
+                }
+                _ => ToolResult::success(json!({ "count": 2 }), 0),
+            })
+        }
+    }
+
+    fn tools() -> (tempfile::TempDir, SortRulesTool, SortRuleSaveTool) {
         let dir = tempfile::tempdir().unwrap();
         let monitors = Arc::new(MonitorTool::new(
             Arc::new(MonitorRuntime::new(dir.path().to_path_buf())),
             None,
         ));
-        let save = SortRuleSaveTool::new(Arc::clone(&monitors));
+        let registry = Arc::new(ToolRegistry::new());
+        registry.register(Arc::new(DryRun("email.move")));
+        (
+            dir,
+            SortRulesTool::new(Arc::clone(&monitors), Arc::clone(&registry)),
+            SortRuleSaveTool::new(monitors, registry),
+        )
+    }
+
+    #[test]
+    fn saving_a_rule_needs_the_persons_yes_and_names_who_else_watches() {
+        let (_dir, rules, save) = tools();
         assert!(save.approval_requirement().is_some());
         let input = json!({
             "account": "home", "match": {"from": "news@shop.com"},
@@ -709,18 +813,12 @@ mod tests {
             save.approval_summary(&input).unwrap(),
             "New mail in home INBOX from news@shop.com → archive it — takes mail boss-mail also watch"
         );
-        assert!(SortRulesTool::new(monitors)
-            .approval_requirement()
-            .is_none());
+        assert!(rules.approval_requirement().is_none());
     }
 
     #[tokio::test]
     async fn a_proposed_rule_saves_as_a_monitor_and_lists_back() {
-        let dir = tempfile::tempdir().unwrap();
-        let runtime = Arc::new(MonitorRuntime::new(dir.path().to_path_buf()));
-        let monitors = Arc::new(MonitorTool::new(Arc::clone(&runtime), None));
-        let rules = SortRulesTool::new(Arc::clone(&monitors));
-        let save = SortRuleSaveTool::new(Arc::clone(&monitors));
+        let (_dir, rules, save) = tools();
         let proposed = rules
             .run(&json!({
                 "action": "propose", "account": "home",
@@ -728,6 +826,7 @@ mod tests {
             }))
             .await
             .unwrap();
+        assert_eq!(proposed["matches_now"], 2);
         let saved = save.run(&proposed["rule"]).await.unwrap();
         let id = saved["rule_id"].as_str().unwrap().to_string();
         assert!(id.starts_with(PREFIX));
@@ -746,5 +845,50 @@ mod tests {
             rules.run(&json!({"action": "list"})).await.unwrap()["count"],
             0
         );
+        assert!(rules
+            .run(&json!({"action": "remove", "rule_id": id}))
+            .await
+            .unwrap_err()
+            .contains("no sort rule"));
+    }
+
+    #[tokio::test]
+    async fn a_rule_to_a_missing_folder_or_on_another_monitor_is_refused() {
+        let (_dir, rules, save) = tools();
+        let err = rules
+            .run(&json!({
+                "action": "propose", "account": "home",
+                "match": {"from": "news@shop.com"}, "then": {"do": "move", "to": "Nowhere"}
+            }))
+            .await
+            .unwrap_err();
+        assert!(err.contains("There is no folder Nowhere"), "{err}");
+        let mut digest = rule(Then::Archive).monitor("sort-digest");
+        digest.monitor.action = Action::RunSkill {
+            tool: "email.forward".to_string(),
+            input: json!({ "uid": "{{json:/uid}}", "to": "me@home.com" }),
+        };
+        let other = toml::to_string(&digest).unwrap();
+        call(
+            &rules.monitors,
+            json!({ "action": "save", "monitor_id": "sort-digest", "toml_content": other }),
+        )
+        .await
+        .unwrap();
+        for input in [
+            json!({"action": "set_enabled", "rule_id": "sort-digest", "enabled": false}),
+            json!({"action": "remove", "rule_id": "sort-digest"}),
+        ] {
+            assert!(rules
+                .run(&input)
+                .await
+                .unwrap_err()
+                .contains("no sort rule"));
+        }
+        let edit = json!({
+            "rule_id": "sort-digest", "account": "home",
+            "match": {"from": "news@shop.com"}, "then": {"do": "archive"}
+        });
+        assert!(save.run(&edit).await.unwrap_err().contains("no sort rule"));
     }
 }

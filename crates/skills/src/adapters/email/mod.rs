@@ -71,7 +71,13 @@ pub const WRITE_TOOLS: &[&str] = &[
     "email.folder_rename",
     "email.folder_delete",
     "email.unsubscribe",
+    "email.sort_rules",
+    "email.sort_rule_save",
 ];
+
+/// The email tools the hub registers itself, beside the skill's own: sort
+/// rules are monitors, so they live with the monitor engine.
+pub const HUB_TOOLS: &[&str] = &["email.sort_rules", "email.sort_rule_save"];
 
 /// The Email skill — multi-account IMAP/SMTP integration.
 ///
@@ -748,7 +754,10 @@ mod tests {
     #[test]
     fn read_and_write_tools_partition_the_skill() {
         crate::adapters::test_support::assert_read_write_partition(
-            EmailSkill::tool_names(),
+            EmailSkill::tool_names()
+                .into_iter()
+                .chain(HUB_TOOLS.iter().copied())
+                .collect(),
             READ_TOOLS,
             WRITE_TOOLS,
         );

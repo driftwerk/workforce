@@ -2,10 +2,67 @@
 //! (CAPABILITY) and its folders with their special uses (LIST, RFC 6154), so
 //! nothing depends on which provider hosts it.
 
+use base64::alphabet::IMAP_MUTF7;
+use base64::engine::general_purpose::{GeneralPurpose, NO_PAD};
+use base64::Engine;
 use serde::Serialize;
 
 use super::error::EmailError;
 use super::session::{Listed, MailSession};
+
+/// The base64 of IMAP's modified UTF-7 (RFC 3501 §5.1.3).
+const MUTF7: GeneralPurpose = GeneralPurpose::new(&IMAP_MUTF7, NO_PAD);
+
+fn printable(c: char) -> bool {
+    (' '..='~').contains(&c)
+}
+
+/// `name` in modified UTF-7, as a server without `ENABLE UTF8=ACCEPT`
+/// (never sent here) takes and lists folder names.
+pub fn encoded(name: &str) -> String {
+    let chars: Vec<char> = name.chars().collect();
+    chars
+        .chunk_by(|a, b| printable(*a) == printable(*b))
+        .map(|run| match printable(run[0]) {
+            true => run.iter().collect::<String>().replace('&', "&-"),
+            false => {
+                let bytes: Vec<u8> = run
+                    .iter()
+                    .flat_map(|c| c.encode_utf16(&mut [0u16; 2]).to_vec())
+                    .flat_map(u16::to_be_bytes)
+                    .collect();
+                format!("&{}-", MUTF7.encode(bytes))
+            }
+        })
+        .collect()
+}
+
+/// `name` as a person reads it: modified UTF-7 decoded, or as it is where
+/// it isn't valid modified UTF-7.
+pub fn decoded(name: &str) -> String {
+    fn shifted(inside: &str) -> Option<String> {
+        if inside.is_empty() {
+            return Some("&".to_string());
+        }
+        let bytes = MUTF7.decode(inside).ok()?;
+        let units: Vec<u16> = bytes
+            .chunks(2)
+            .map(|pair| match pair {
+                [hi, lo] => Some(u16::from_be_bytes([*hi, *lo])),
+                _ => None,
+            })
+            .collect::<Option<_>>()?;
+        String::from_utf16(&units).ok()
+    }
+    let mut parts = name.split('&');
+    let head = parts.next().unwrap_or_default().to_string();
+    parts
+        .try_fold(head, |out, part| {
+            let (inside, after) = part.split_once('-')?;
+            Some(out + &shifted(inside)? + after)
+        })
+        .unwrap_or_else(|| name.to_string())
+}
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
 pub struct Caps {
@@ -118,7 +175,17 @@ pub struct Folder {
 pub struct Mailbox {
     pub caps: Caps,
     pub delimiter: Option<String>,
+    /// What every folder of the person's but the inbox sits under, where
+    /// the server keeps them all inside it (`INBOX.` on Courier and many
+    /// Dovecots). Read from LIST: the NAMESPACE response is one async-imap
+    /// can't parse.
+    pub prefix: Option<String>,
     pub folders: Vec<Folder>,
+}
+
+fn starts_with_ignoring_case(name: &str, prefix: &str) -> bool {
+    name.get(..prefix.len())
+        .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
 }
 
 fn has(listed: &Listed, attribute: &str) -> bool {
@@ -164,9 +231,20 @@ impl Mailbox {
                 }
             })
             .collect();
+        let prefix = delimiter
+            .as_deref()
+            .map(|d| format!("INBOX{d}"))
+            .filter(|p| {
+                let mut others = listed
+                    .iter()
+                    .filter(|l| !l.name.eq_ignore_ascii_case("INBOX"))
+                    .peekable();
+                others.peek().is_some() && others.all(|l| starts_with_ignoring_case(&l.name, p))
+            });
         Mailbox {
             caps: Caps::of(caps),
             delimiter,
+            prefix,
             folders,
         }
     }
@@ -188,10 +266,14 @@ impl Mailbox {
             .map(|f| f.name.as_str())
     }
 
-    /// The server's name for `path`: an existing folder's own name as given,
-    /// else `path` with `/` between its levels in the server's delimiter.
+    /// The server's name for `path`: an existing folder's own name as given
+    /// or as a person reads it, else `path` with `/` between its levels in
+    /// the server's delimiter, in modified UTF-7, under the server's prefix.
     pub fn server_name(&self, path: &str) -> Result<String, String> {
         let path = path.trim().trim_matches('/');
+        if path.contains(['\r', '\n', '\0']) {
+            return Err("A folder name can't contain a line break.".to_string());
+        }
         if let Some(folder) = self.get(path) {
             return Ok(folder.name.clone());
         }
@@ -199,18 +281,32 @@ impl Mailbox {
         if path.is_empty() || levels.iter().any(|l| l.is_empty()) {
             return Err(format!("'{path}' is not a folder name."));
         }
-        match self.delimiter.as_deref() {
+        let joined = match self.delimiter.as_deref() {
             None if levels.len() > 1 => Err(format!(
                 "This account has no nested folders, so '{path}' can't be made."
             )),
-            None => Ok(path.to_string()),
+            None => Ok(encoded(path)),
             Some(d) => match levels.iter().find(|l| d != "/" && l.contains(d)) {
                 Some(level) => Err(format!(
                     "'{level}' contains '{d}', which this server uses between folder levels."
                 )),
-                None => Ok(levels.join(d)),
+                None => Ok(levels
+                    .iter()
+                    .map(|l| encoded(l))
+                    .collect::<Vec<_>>()
+                    .join(d)),
             },
-        }
+        }?;
+        let name = match self.prefix.as_deref() {
+            Some(p)
+                if !joined.eq_ignore_ascii_case("INBOX")
+                    && !starts_with_ignoring_case(&joined, p) =>
+            {
+                format!("{p}{joined}")
+            }
+            _ => joined,
+        };
+        Ok(self.get(&name).map_or(name, |f| f.name.clone()))
     }
 
     /// The folders `name` and its missing parents, outermost first, that a
@@ -241,14 +337,14 @@ impl Mailbox {
     }
 
     fn system(&self, folder: &Folder) -> Option<String> {
-        let name = &folder.name;
+        let name = decoded(&folder.name);
         match folder.role {
             Some(Role::Inbox) => Some("The inbox can't be renamed or deleted.".to_string()),
             Some(role) => Some(format!(
                 "{name} is this account's {} folder, which the provider keeps.",
                 role.label()
             )),
-            None if self.caps.gmail && (!folder.selectable || self.under_a_root(name)) => {
+            None if self.caps.gmail && (!folder.selectable || self.under_a_root(&folder.name)) => {
                 Some(format!("{name} is one of Gmail's own folders."))
             }
             None => None,
@@ -257,10 +353,16 @@ impl Mailbox {
 
     /// Why `from` can't be renamed to `to`, when it can't.
     pub fn refuse_rename(&self, from: &str, to: &str) -> Option<String> {
+        let inside = self
+            .delimiter
+            .as_deref()
+            .and_then(|d| to.strip_prefix(from)?.strip_prefix(d))
+            .is_some();
         match (self.get(from), self.get(to)) {
-            (None, _) => Some(format!("There is no folder {from}.")),
+            (None, _) => Some(format!("There is no folder {}.", decoded(from))),
             (Some(folder), _) if self.system(folder).is_some() => self.system(folder),
-            (_, Some(_)) => Some(format!("A folder {to} already exists.")),
+            (_, Some(_)) => Some(format!("A folder {} already exists.", decoded(to))),
+            _ if inside => Some(format!("{} can't be moved inside itself.", decoded(from))),
             _ => None,
         }
     }
@@ -269,9 +371,10 @@ impl Mailbox {
     /// an empty folder with no folders inside it is ever deleted.
     pub fn refuse_delete(&self, name: &str, messages: u32) -> Option<String> {
         let folder = match self.get(name) {
-            None => return Some(format!("There is no folder {name}.")),
+            None => return Some(format!("There is no folder {}.", decoded(name))),
             Some(folder) => folder,
         };
+        let name = decoded(name);
         match (self.system(folder), folder.has_children, messages) {
             (Some(why), _, _) => Some(why),
             (None, true, _) => Some(format!(
@@ -375,6 +478,45 @@ mod tests {
             gmail().server_name("Receipts/2026").unwrap(),
             "Receipts/2026"
         );
+        assert!(gmail().server_name("a\r\nA1 DELETE INBOX").is_err());
+        assert!(gmail().server_name("a\0b").is_err());
+    }
+
+    #[test]
+    fn a_server_that_keeps_folders_inside_the_inbox_gets_new_ones_there_too() {
+        let d = dovecot();
+        assert_eq!(d.prefix.as_deref(), Some("INBOX."));
+        assert_eq!(
+            d.server_name("Projects/2026").unwrap(),
+            "INBOX.Projects.2026"
+        );
+        assert_eq!(d.server_name("inbox/Clients").unwrap(), "INBOX.Clients");
+        assert_eq!(d.server_name("INBOX").unwrap(), "INBOX");
+        assert_eq!(gmail().prefix, None);
+        let bare = Mailbox::of(["IMAP4rev1"], &[listed("INBOX", ".", &[])]);
+        assert_eq!(bare.prefix, None, "nothing shows a prefix yet");
+    }
+
+    #[test]
+    fn names_beyond_ascii_are_sent_in_modified_utf7_and_read_back() {
+        assert_eq!(encoded("Reçus"), "Re&AOc-us");
+        assert_eq!(encoded("Tom & Jerry"), "Tom &- Jerry");
+        assert_eq!(encoded("日本語"), "&ZeVnLIqe-");
+        for name in ["Reçus", "Tom & Jerry", "日本語/Ünïcode", "📬 Inbox"] {
+            assert_eq!(decoded(&encoded(name)), name);
+        }
+        assert_eq!(decoded("&broken"), "&broken");
+        let g = Mailbox::of(
+            ["IMAP4rev1"],
+            &[listed("INBOX", "/", &[]), listed("Re&AOc-us", "/", &[])],
+        );
+        assert_eq!(g.server_name("Reçus").unwrap(), "Re&AOc-us");
+        assert_eq!(g.server_name("Re&AOc-us").unwrap(), "Re&AOc-us");
+        assert_eq!(g.server_name("Reçus/2026").unwrap(), "Re&AOc-us/2026");
+        assert_eq!(
+            g.refuse_delete("Re&AOc-us", 2).unwrap(),
+            "Reçus still holds 2 messages; move them out first, then delete the folder."
+        );
     }
 
     #[test]
@@ -411,6 +553,11 @@ mod tests {
         assert!(g.refuse_rename("Archive", "Old").is_none());
         assert!(g.refuse_rename("Archive", "Receipts").is_some());
         assert!(g.refuse_rename("Nope", "Old").is_some());
+        assert!(g
+            .refuse_rename("Receipts", "Receipts/2025/Old")
+            .unwrap()
+            .contains("inside itself"));
+        assert!(g.refuse_rename("Receipts/2025", "Receipts2025").is_none());
     }
 
     #[test]

@@ -82,6 +82,8 @@ pub use workforce_hub_core::def_write_auth;
 pub mod desk_floor;
 pub mod edge_memory_move;
 pub mod effective_settings;
+#[cfg(feature = "postgres")]
+pub mod email_journal;
 pub mod embeddings;
 pub mod endpoint_cmd;
 pub mod engagement_tool;
@@ -272,8 +274,6 @@ pub mod store_bridge;
 pub mod store_tool;
 #[cfg(feature = "postgres")]
 pub mod surface_allows;
-#[cfg(feature = "postgres")]
-pub mod email_journal;
 
 /// Re-export parse_relative_time for CLI use.
 pub use scheduler_tool::parse_relative_time as scheduler_tool_parse_relative_time;

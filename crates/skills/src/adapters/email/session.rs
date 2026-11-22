@@ -2,12 +2,14 @@
 //! implements it over async-imap, and tests drive the same code with a fake.
 
 use std::fmt;
+use std::time::Duration;
 
 use async_imap::imap_proto::types::{NameAttribute, Response, ResponseCode, Status, UidSetMember};
 use async_trait::async_trait;
 use futures::TryStreamExt;
 use tokio::io::{AsyncRead, AsyncWrite};
 
+use super::client::ImapClient;
 use super::error::EmailError;
 use super::uids::UidSet;
 
@@ -173,11 +175,13 @@ where
     }
 
     async fn move_uids(&mut self, uids: &UidSet, to: &str) -> Result<Option<Landed>, EmailError> {
-        landing(self, &format!("UID MOVE {uids} {}", mailbox_arg(to))).await
+        let command = format!("UID MOVE {uids} {}", mailbox_arg(to)?);
+        landing(self, &command, uids.len()).await
     }
 
     async fn copy_uids(&mut self, uids: &UidSet, to: &str) -> Result<Option<Landed>, EmailError> {
-        landing(self, &format!("UID COPY {uids} {}", mailbox_arg(to))).await
+        let command = format!("UID COPY {uids} {}", mailbox_arg(to)?);
+        landing(self, &command, uids.len()).await
     }
 
     async fn store(&mut self, uids: &UidSet, change: &str) -> Result<(), EmailError> {
@@ -272,28 +276,60 @@ where
     }
 }
 
-/// The uids a COPYUID response code lists, in its order.
-fn ordered(members: &[UidSetMember]) -> Vec<u32> {
-    members
+/// The uids a COPYUID response code lists, in its order, when it lists no
+/// more than `most`: a server's claim is never expanded past the batch.
+fn ordered(members: &[UidSetMember], most: usize) -> Option<Vec<u32>> {
+    let runs: Vec<(u32, u32)> = members
         .iter()
-        .flat_map(|m| match m {
-            UidSetMember::Uid(u) => *u..=*u,
-            UidSetMember::UidRange(r) => r.clone(),
+        .map(|m| match m {
+            UidSetMember::Uid(u) => (*u, *u),
+            UidSetMember::UidRange(r) => (*r.start().min(r.end()), *r.start().max(r.end())),
         })
-        .collect()
+        .collect();
+    let size: u64 = runs.iter().map(|(a, b)| u64::from(b - a) + 1).sum();
+    (size <= most as u64).then(|| runs.into_iter().flat_map(|(a, b)| a..=b).collect())
 }
 
-/// A mailbox name as a command argument.
-fn mailbox_arg(name: &str) -> String {
-    format!("\"{}\"", name.replace('\\', "\\\\").replace('"', "\\\""))
+/// Where a COPYUID code says `expect` messages landed, when it accounts for
+/// each of them once.
+fn landed_of(
+    validity: u32,
+    source: &[UidSetMember],
+    dest: &[UidSetMember],
+    expect: usize,
+) -> Option<Landed> {
+    ordered(source, expect)
+        .zip(ordered(dest, expect))
+        .filter(|(source, dest)| source.len() == dest.len())
+        .map(|(source, dest)| Landed {
+            validity,
+            source,
+            dest,
+        })
 }
 
-/// Runs a COPY or MOVE and reads its responses to the tagged end, keeping
-/// the COPYUID the server reports: on the tagged OK for a COPY, on an
-/// untagged OK for a MOVE (RFC 6851 §4.3). async-imap's own calls drop it.
+/// A mailbox name as a command argument; never one that could end the
+/// command early.
+fn mailbox_arg(name: &str) -> Result<String, EmailError> {
+    match name.contains(['\r', '\n', '\0']) {
+        true => Err(EmailError::Imap(
+            "A folder name can't contain a line break or a NUL.".to_string(),
+        )),
+        false => Ok(format!(
+            "\"{}\"",
+            name.replace('\\', "\\\\").replace('"', "\\\"")
+        )),
+    }
+}
+
+/// Runs a COPY or MOVE of `expect` messages and reads its responses to the
+/// tagged end, keeping the COPYUID the server reports: on the tagged OK for
+/// a COPY, on an untagged OK for a MOVE (RFC 6851 §4.3). async-imap's own
+/// calls drop it.
 async fn landing<T>(
     session: &mut async_imap::Session<T>,
     command: &str,
+    expect: usize,
 ) -> Result<Option<Landed>, EmailError>
 where
     T: AsyncRead + AsyncWrite + Unpin + fmt::Debug + Send,
@@ -320,11 +356,7 @@ where
             _ => continue,
         };
         if let Some(ResponseCode::CopyUid(validity, source, dest)) = code {
-            landed = Some(Landed {
-                validity: *validity,
-                source: ordered(source),
-                dest: ordered(dest),
-            });
+            landed = landed_of(*validity, source, dest, expect);
         }
         match (done, status) {
             (Some(true), Status::Ok) => return Ok(landed),
@@ -339,6 +371,106 @@ where
     Err(failed(&"the connection closed before the server answered"))
 }
 
+/// An account's session whose every command gives up after the account's
+/// command timeout, and then drops the connection, which may still carry
+/// the late answer: a stalled server never holds the account's lock.
+pub struct Timed<'a> {
+    client: &'a mut ImapClient,
+    limit: Duration,
+}
+
+impl<'a> Timed<'a> {
+    /// `client`, whose session was just checked.
+    pub fn new(client: &'a mut ImapClient) -> Self {
+        let limit = client.command_timeout();
+        Self { client, limit }
+    }
+}
+
+macro_rules! timed {
+    ($self:ident, $what:literal, $method:ident($($arg:expr),*)) => {{
+        let limit = $self.limit;
+        let session = $self.client.current()?;
+        match tokio::time::timeout(limit, MailSession::$method(session, $($arg),*)).await {
+            Ok(done) => done,
+            Err(_) => {
+                $self.client.forget();
+                Err(EmailError::Timeout {
+                    operation: $what.to_string(),
+                    duration: limit,
+                })
+            }
+        }
+    }};
+}
+
+#[async_trait]
+impl MailSession for Timed<'_> {
+    async fn capabilities(&mut self) -> Result<Vec<String>, EmailError> {
+        timed!(self, "CAPABILITY", capabilities())
+    }
+
+    async fn list(&mut self) -> Result<Vec<Listed>, EmailError> {
+        timed!(self, "LIST", list())
+    }
+
+    async fn select(&mut self, folder: &str) -> Result<Selected, EmailError> {
+        timed!(self, "SELECT", select(folder))
+    }
+
+    async fn examine(&mut self, folder: &str) -> Result<Selected, EmailError> {
+        timed!(self, "EXAMINE", examine(folder))
+    }
+
+    async fn search(&mut self, query: &str) -> Result<UidSet, EmailError> {
+        timed!(self, "SEARCH", search(query))
+    }
+
+    async fn move_uids(&mut self, uids: &UidSet, to: &str) -> Result<Option<Landed>, EmailError> {
+        timed!(self, "UID MOVE", move_uids(uids, to))
+    }
+
+    async fn copy_uids(&mut self, uids: &UidSet, to: &str) -> Result<Option<Landed>, EmailError> {
+        timed!(self, "UID COPY", copy_uids(uids, to))
+    }
+
+    async fn store(&mut self, uids: &UidSet, change: &str) -> Result<(), EmailError> {
+        timed!(self, "UID STORE", store(uids, change))
+    }
+
+    async fn expunge_uids(&mut self, uids: &UidSet) -> Result<(), EmailError> {
+        timed!(self, "UID EXPUNGE", expunge_uids(uids))
+    }
+
+    async fn headers(
+        &mut self,
+        uids: &UidSet,
+        fields: &[&str],
+    ) -> Result<Vec<(u32, String)>, EmailError> {
+        timed!(self, "FETCH", headers(uids, fields))
+    }
+
+    async fn summaries(&mut self, uids: &UidSet) -> Result<Vec<Summary>, EmailError> {
+        timed!(self, "FETCH", summaries(uids))
+    }
+
+    async fn messages_in(&mut self, folder: &str) -> Result<u32, EmailError> {
+        timed!(self, "STATUS", messages_in(folder))
+    }
+
+    async fn create(&mut self, folder: &str) -> Result<(), EmailError> {
+        timed!(self, "CREATE", create(folder))
+    }
+
+    async fn rename(&mut self, from: &str, to: &str) -> Result<(), EmailError> {
+        timed!(self, "RENAME", rename(from, to))
+    }
+
+    async fn delete(&mut self, folder: &str) -> Result<(), EmailError> {
+        timed!(self, "DELETE", delete(folder))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -346,11 +478,35 @@ mod tests {
     #[test]
     fn copyuid_members_keep_their_order() {
         let members = vec![UidSetMember::UidRange(5..=7), UidSetMember::Uid(2)];
-        assert_eq!(ordered(&members), vec![5, 6, 7, 2]);
+        assert_eq!(ordered(&members, 4), Some(vec![5, 6, 7, 2]));
     }
 
     #[test]
-    fn a_mailbox_argument_is_quoted() {
-        assert_eq!(mailbox_arg("Clients/\"Acme\""), "\"Clients/\\\"Acme\\\"\"");
+    fn a_copyuid_wider_than_its_batch_is_never_expanded() {
+        let all = [UidSetMember::UidRange(1..=u32::MAX)];
+        assert_eq!(ordered(&all, 500), None);
+        let two = [UidSetMember::UidRange(1..=2)];
+        let three = [UidSetMember::UidRange(10..=12)];
+        assert_eq!(landed_of(7, &two, &three, 3), None, "not one to one");
+        assert_eq!(landed_of(7, &all, &three, 3), None);
+        assert_eq!(
+            landed_of(7, &two, &[UidSetMember::UidRange(10..=11)], 2),
+            Some(Landed {
+                validity: 7,
+                source: vec![1, 2],
+                dest: vec![10, 11]
+            })
+        );
+    }
+
+    #[test]
+    fn a_mailbox_argument_is_quoted_and_never_breaks_the_line() {
+        assert_eq!(
+            mailbox_arg("Clients/\"Acme\"").unwrap(),
+            "\"Clients/\\\"Acme\\\"\""
+        );
+        for bad in ["a\r\nA1 DELETE INBOX", "a\nb", "a\0b"] {
+            assert!(mailbox_arg(bad).is_err(), "{bad:?}");
+        }
     }
 }

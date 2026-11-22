@@ -413,6 +413,12 @@ impl ImapClient {
     /// Most real-world IMAP servers use TLS, so this is the common path.
     pub async fn session(&mut self) -> Result<&mut ImapSession, EmailError> {
         self.ensure_connected().await?;
+        self.current()
+    }
+
+    /// The TLS session as it stands, unchecked: the next command of work
+    /// under way on a session [`Self::session`] checked.
+    pub(super) fn current(&mut self) -> Result<&mut ImapSession, EmailError> {
         match &mut self.session {
             Some(SessionInner::Tls(s)) => Ok(s),
             Some(SessionInner::Plain(_)) => Err(EmailError::Imap(
@@ -422,6 +428,16 @@ impl ImapClient {
                 account: self.config.username.clone(),
             }),
         }
+    }
+
+    /// Drops the session unread, so the next use connects afresh: a command
+    /// that timed out may still have its answer on the way.
+    pub(super) fn forget(&mut self) {
+        self.session = None;
+    }
+
+    pub(super) fn command_timeout(&self) -> Duration {
+        self.command_timeout
     }
 
     /// Get a mutable reference to the plain TCP session.
