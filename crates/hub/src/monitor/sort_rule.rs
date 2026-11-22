@@ -865,8 +865,8 @@ mod tests {
         assert!(err.contains("There is no folder Nowhere"), "{err}");
         let mut digest = rule(Then::Archive).monitor("sort-digest");
         digest.monitor.action = Action::RunSkill {
-            tool: "email.forward".to_string(),
-            input: json!({ "uid": "{{json:/uid}}", "to": "me@home.com" }),
+            tool: "email.mark".to_string(),
+            input: json!({ "account": "home", "uid": "{{json:/uid}}", "action": "unread" }),
         };
         let other = toml::to_string(&digest).unwrap();
         call(

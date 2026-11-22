@@ -408,7 +408,7 @@ impl MonitorTool {
         let scope =
             DefListing::for_turn(&self.write_auth, self.runtime.def_store(), KIND_MONITOR).await;
         let summaries = self.list_visible(&scope).await;
-        super::sort_rule::mail_monitors(self.runtime.as_ref(), summaries).await
+        super::sort_rule::mail_monitors(&*self.runtime, summaries).await
     }
 
     async fn summary(&self, id: &str, owner: Option<&str>) -> Option<MonitorSummary> {
