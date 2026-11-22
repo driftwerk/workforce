@@ -2070,6 +2070,27 @@ impl MonitorEngine {
             .collect()
     }
 
+    /// Pause or resume a monitor. A resume starts it from now: the paused
+    /// gap is the owner's decision, and no other monitor is affected.
+    pub async fn set_enabled(
+        &self,
+        id: &str,
+        owner: Option<&str>,
+        enabled: bool,
+        edit: EditContext<'_>,
+    ) -> Result<MonitorDefinition> {
+        let (was_enabled, def) = self
+            .runtime
+            .set_definition_enabled(id, owner, enabled, edit)
+            .await?;
+        let mut previous = def.clone();
+        previous.monitor.enabled = was_enabled;
+        self.apply_catch_up_policy(&MonitorKey::new(id, owner), &def, Some(&previous))
+            .await;
+        self.reconcile_personas().await;
+        Ok(def)
+    }
+
     /// Delete a monitor together with its runtime state.
     pub async fn delete_monitor(
         &self,
@@ -2251,6 +2272,16 @@ impl crate::hosts::MonitorHost for MonitorEngine {
         edit: EditContext<'_>,
     ) -> Result<()> {
         MonitorEngine::delete_monitor(self, id, owner, edit).await
+    }
+
+    async fn set_enabled(
+        &self,
+        id: &str,
+        owner: Option<&str>,
+        enabled: bool,
+        edit: EditContext<'_>,
+    ) -> Result<MonitorDefinition> {
+        MonitorEngine::set_enabled(self, id, owner, enabled, edit).await
     }
 
     async fn apply_catch_up_policy(

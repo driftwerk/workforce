@@ -2052,6 +2052,8 @@ impl Setup {
         crate::floor::install(config).await;
         #[cfg(feature = "postgres")]
         crate::surface_allows::install(config).await;
+        #[cfg(feature = "postgres")]
+        crate::email_journal::install(config).await;
         workforce_agent::security::monitor::know(crate::monitor::scope::knowledge());
         let effective_memory = resolved_at_build.memory.clone();
 

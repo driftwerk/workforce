@@ -272,6 +272,8 @@ const STANDING_RULES: &[(&str, &[&str])] = &[
     ("google.gmail.filter_create", &[]),
     ("google.gmail.filter_delete", &[]),
     ("google.gmail.vacation_set", &[]),
+    ("email.sort_rules", &["set_enabled", "remove"]),
+    ("email.sort_rule_save", &[]),
 ];
 
 /// Tools that keep what they're told for the agent's later turns, with the
@@ -1014,8 +1016,11 @@ pub fn assess(
             )));
         }
     }
+    // An unsubscribe writes to the sender, at the address or link their
+    // own mail gave.
     if crate::runner::is_outbound_delivery_tool(tool)
         || (tool == "email.confirm" && action != "cancel")
+        || tool == "email.unsubscribe"
     {
         return Some(exfiltration("outside".to_string()));
     }
@@ -1494,6 +1499,16 @@ mod tests {
             guard.check("email.confirm", &json!({ "action": "cancel" }), None),
             None
         );
+        assert!(
+            guard
+                .check("email.unsubscribe", &json!({ "uid": 7 }), None)
+                .is_some(),
+            "an unsubscribe a mail asked for reaches its sender"
+        );
+        assert_eq!(
+            guard.check("email.unsubscribe_lists", &json!({}), None),
+            None
+        );
     }
 
     #[test]
@@ -1548,6 +1563,14 @@ mod tests {
         );
         assert!(signal("monitor", "save").is_some());
         assert!(signal("monitor", " Save ").is_some(), "in any case");
+        assert!(signal("email.sort_rules", "set_enabled").is_some());
+        assert!(signal("email.sort_rules", "list").is_none());
+        assert_eq!(
+            guard
+                .check("email.sort_rule_save", &json!({"account": "home"}), None)
+                .map(|h| h.signal.description()),
+            Some("`email.sort_rule_save` would change standing automation".to_string())
+        );
         assert!(signal("scheduler", "create").is_some());
         assert!(signal("scheduler", "run").is_some());
         assert!(signal("scheduler", "set_bill_to").is_some());

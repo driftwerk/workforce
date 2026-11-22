@@ -656,32 +656,18 @@ impl MonitorTool {
             Err(refused) => return Ok(refused),
         };
         let owner = grant.owner;
-        let result = self
-            .runtime
-            .set_definition_enabled(
-                &id,
-                owner.as_deref(),
-                enabled,
-                EditContext::new(&self.edited_via(), grant.actor.as_deref()),
-            )
-            .await;
+        let via = self.edited_via();
+        let edit = EditContext::new(&via, grant.actor.as_deref());
+        let result = match &self.engine {
+            Some(engine) => engine.set_enabled(&id, owner.as_deref(), enabled, edit).await,
+            None => self
+                .runtime
+                .set_definition_enabled(&id, owner.as_deref(), enabled, edit)
+                .await
+                .map(|(_, def)| def),
+        };
         match result {
-            Ok((was_enabled, def)) => {
-                // A disabled→enabled resume starts this monitor from now — the
-                // paused gap is the owner's decision, and no other monitor on
-                // the channel is affected.
-                if let Some(engine) = &self.engine {
-                    let mut previous = def.clone();
-                    previous.monitor.enabled = was_enabled;
-                    engine
-                        .apply_catch_up_policy(
-                            &MonitorKey::new(&id, owner.as_deref()),
-                            &def,
-                            Some(&previous),
-                        )
-                        .await;
-                    engine.reconcile_personas().await;
-                }
+            Ok(_) => {
                 let mut output = serde_json::json!({ "monitor_id": id, "enabled": enabled });
                 merge(&mut output, self.watch_report(&id, owner.as_deref()).await);
                 Ok(ToolResult::success(

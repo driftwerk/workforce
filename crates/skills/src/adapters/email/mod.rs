@@ -4,16 +4,32 @@
 //! across multiple IMAP/SMTP accounts.
 
 #[cfg(feature = "email")]
+pub mod bulk;
+#[cfg(feature = "email")]
 pub mod client;
 pub mod config;
 #[cfg(feature = "email")]
 pub mod connector;
+pub mod criteria;
 pub mod error;
+pub mod journal;
+#[cfg(all(test, feature = "email"))]
+mod live_tests;
+#[cfg(feature = "email")]
+pub mod mailbox;
+#[cfg(feature = "email")]
+pub mod manage;
 pub mod presets;
+pub mod schemas;
+#[cfg(feature = "email")]
+pub mod session;
 #[cfg(feature = "email")]
 pub mod setup;
 #[cfg(feature = "email")]
 pub mod tools;
+pub mod uids;
+#[cfg(feature = "email")]
+pub mod unsubscribe;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -34,6 +50,7 @@ pub const READ_TOOLS: &[&str] = &[
     "email.read",
     "email.get_attachment",
     "email.search",
+    "email.unsubscribe_lists",
 ];
 
 /// The email tools that send, change mail or folders, or keep something.
@@ -49,6 +66,11 @@ pub const WRITE_TOOLS: &[&str] = &[
     "email.confirm",
     "email.contacts",
     "email.rules",
+    "email.undo",
+    "email.folder_create",
+    "email.folder_rename",
+    "email.folder_delete",
+    "email.unsubscribe",
 ];
 
 /// The Email skill — multi-account IMAP/SMTP integration.
@@ -151,10 +173,43 @@ impl EmailSkill {
                     Arc::clone(&self.rules),
                 )),
                 Arc::new(tools::EmailDraftTool::new(Arc::clone(&self.connector))),
-                Arc::new(tools::EmailMarkTool::new(Arc::clone(&self.connector))),
-                Arc::new(tools::EmailMoveTool::new(Arc::clone(&self.connector))),
-                Arc::new(tools::EmailArchiveTool::new(Arc::clone(&self.connector))),
-                Arc::new(tools::EmailDeleteTool::new(Arc::clone(&self.connector))),
+                Arc::new(manage::EmailBulkTool::new(
+                    Arc::clone(&self.connector),
+                    manage::Intent::Mark,
+                )),
+                Arc::new(manage::EmailBulkTool::new(
+                    Arc::clone(&self.connector),
+                    manage::Intent::Move,
+                )),
+                Arc::new(manage::EmailBulkTool::new(
+                    Arc::clone(&self.connector),
+                    manage::Intent::Archive,
+                )),
+                Arc::new(manage::EmailBulkTool::new(
+                    Arc::clone(&self.connector),
+                    manage::Intent::Trash,
+                )),
+                Arc::new(manage::EmailUndoTool::new(Arc::clone(&self.connector))),
+                Arc::new(manage::EmailFolderTool::new(
+                    Arc::clone(&self.connector),
+                    manage::FolderOp::Create,
+                )),
+                Arc::new(manage::EmailFolderTool::new(
+                    Arc::clone(&self.connector),
+                    manage::FolderOp::Rename,
+                )),
+                Arc::new(manage::EmailFolderTool::new(
+                    Arc::clone(&self.connector),
+                    manage::FolderOp::Delete,
+                )),
+                Arc::new(manage::EmailUnsubscribeTool::new(
+                    Arc::clone(&self.connector),
+                    manage::UnsubscribeStep::Lists,
+                )),
+                Arc::new(manage::EmailUnsubscribeTool::new(
+                    Arc::clone(&self.connector),
+                    manage::UnsubscribeStep::Leave,
+                )),
                 Arc::new(tools::EmailForwardTool::new(
                     Arc::clone(&self.connector),
                     Arc::clone(&self.staged),
@@ -196,6 +251,12 @@ impl EmailSkill {
             "email.confirm",
             "email.contacts",
             "email.rules",
+            "email.undo",
+            "email.folder_create",
+            "email.folder_rename",
+            "email.folder_delete",
+            "email.unsubscribe_lists",
+            "email.unsubscribe",
         ]
     }
 
@@ -393,124 +454,53 @@ impl EmailSkill {
                 },
                 SkillTool {
                     name: "email.mark".to_string(),
-                    description: "Mark email messages as read/unread or flagged/unflagged. Supports bulk operations via 'uids' array.".to_string(),
-                    input_schema: serde_json::json!({
-                        "type": "object",
-                        "properties": {
-                            "account": {
-                                "type": "string",
-                                "description": "Account name (required)"
-                            },
-                            "uid": {
-                                "type": "integer",
-                                "description": "Single message UID (integer — NOT a string)"
-                            },
-                            "uids": {
-                                "type": "array",
-                                "items": { "type": "integer" },
-                                "description": "Array of message UIDs (integers)"
-                            },
-                            "folder": {
-                                "type": "string",
-                                "description": "Folder containing the messages (default: INBOX)"
-                            },
-                            "action": {
-                                "type": "string",
-                                "enum": ["read", "unread", "flag", "unflag"],
-                                "description": "Action to perform: read, unread, flag, or unflag"
-                            }
-                        },
-                        "required": ["account", "action"]
-                    }),
+                    description: "Mark messages read, unread, flagged or unflagged — by uids or every message a server-side search matches. Undo with email.undo.".to_string(),
+                    input_schema: schemas::bulk("email.mark"),
                 },
                 SkillTool {
                     name: "email.move".to_string(),
-                    description: "Move email messages from one folder to another. Supports bulk operations via 'uids' array.".to_string(),
-                    input_schema: serde_json::json!({
-                        "type": "object",
-                        "properties": {
-                            "account": {
-                                "type": "string",
-                                "description": "Account name (required)"
-                            },
-                            "uid": {
-                                "type": "integer",
-                                "description": "Single message UID (integer — NOT a string)"
-                            },
-                            "uids": {
-                                "type": "array",
-                                "items": { "type": "integer" },
-                                "description": "Array of message UIDs (integers)"
-                            },
-                            "from_folder": {
-                                "type": "string",
-                                "description": "Source folder (default: INBOX)"
-                            },
-                            "to_folder": {
-                                "type": "string",
-                                "description": "Destination folder (required)"
-                            }
-                        },
-                        "required": ["account", "to_folder"]
-                    }),
+                    description: "Move messages between folders — by uids or every message a server-side search matches, however many; dry_run counts them first, a long job carries on by job id. Undo with email.undo.".to_string(),
+                    input_schema: schemas::bulk("email.move"),
                 },
                 SkillTool {
                     name: "email.archive".to_string(),
-                    description: "Archive email messages. Automatically detects the provider-specific archive folder (e.g. Gmail → All Mail, iCloud → Archive). Supports bulk operations via 'uids' array.".to_string(),
-                    input_schema: serde_json::json!({
-                        "type": "object",
-                        "properties": {
-                            "account": {
-                                "type": "string",
-                                "description": "Account name (required)"
-                            },
-                            "uid": {
-                                "type": "integer",
-                                "description": "Single message UID (integer — NOT a string)"
-                            },
-                            "uids": {
-                                "type": "array",
-                                "items": { "type": "integer" },
-                                "description": "Array of message UIDs (integers)"
-                            },
-                            "folder": {
-                                "type": "string",
-                                "description": "Source folder (default: INBOX)"
-                            }
-                        },
-                        "required": ["account"]
-                    }),
+                    description: "Archive messages out of the inbox (Gmail: remove the Inbox label), found by the account's own archive folder. Undo with email.undo.".to_string(),
+                    input_schema: schemas::bulk("email.archive"),
                 },
                 SkillTool {
                     name: "email.delete".to_string(),
-                    description: "Delete email messages. By default, moves to the provider-specific Trash folder. Set permanent=true for irreversible deletion. Supports bulk operations via 'uids' array.".to_string(),
-                    input_schema: serde_json::json!({
-                        "type": "object",
-                        "properties": {
-                            "account": {
-                                "type": "string",
-                                "description": "Account name (required)"
-                            },
-                            "uid": {
-                                "type": "integer",
-                                "description": "Single message UID (integer — NOT a string)"
-                            },
-                            "uids": {
-                                "type": "array",
-                                "items": { "type": "integer" },
-                                "description": "Array of message UIDs (integers)"
-                            },
-                            "folder": {
-                                "type": "string",
-                                "description": "Folder containing the messages (default: INBOX)"
-                            },
-                            "permanent": {
-                                "type": "boolean",
-                                "description": "If true, permanently delete (default: false)"
-                            }
-                        },
-                        "required": ["account"]
-                    }),
+                    description: "Move messages to the account's trash (undo with email.undo); permanent=true deletes named uids for good.".to_string(),
+                    input_schema: schemas::bulk("email.delete"),
+                },
+                SkillTool {
+                    name: "email.undo".to_string(),
+                    description: "Put back what the latest (or a named) email.move, email.archive, email.mark or email.delete job did.".to_string(),
+                    input_schema: schemas::undo(),
+                },
+                SkillTool {
+                    name: "email.folder_create".to_string(),
+                    description: "Create a folder (a label on Gmail), nested as 'Clients/Acme'.".to_string(),
+                    input_schema: schemas::folder(false),
+                },
+                SkillTool {
+                    name: "email.folder_rename".to_string(),
+                    description: "Rename or move a folder; the inbox and the provider's own folders are never renamed.".to_string(),
+                    input_schema: schemas::folder(true),
+                },
+                SkillTool {
+                    name: "email.folder_delete".to_string(),
+                    description: "Delete an empty folder with nothing inside it; the provider's own folders are never deleted.".to_string(),
+                    input_schema: schemas::folder(false),
+                },
+                SkillTool {
+                    name: "email.unsubscribe_lists".to_string(),
+                    description: "The mailing lists the selected messages came from, and how each can be left.".to_string(),
+                    input_schema: schemas::unsubscribe(false),
+                },
+                SkillTool {
+                    name: "email.unsubscribe".to_string(),
+                    description: "Leave the lists the person chose, the way each list's headers offer, on the person's behalf.".to_string(),
+                    input_schema: schemas::unsubscribe(true),
                 },
                 SkillTool {
                     name: "email.forward".to_string(),
@@ -703,6 +693,30 @@ impl EmailSkill {
                     tool: "email.rules".to_string(),
                     action: "require_approval".to_string(),
                 },
+                SkillPolicy {
+                    tool: "email.undo".to_string(),
+                    action: "allow".to_string(),
+                },
+                SkillPolicy {
+                    tool: "email.folder_create".to_string(),
+                    action: "allow".to_string(),
+                },
+                SkillPolicy {
+                    tool: "email.folder_rename".to_string(),
+                    action: "require_approval".to_string(),
+                },
+                SkillPolicy {
+                    tool: "email.folder_delete".to_string(),
+                    action: "require_approval".to_string(),
+                },
+                SkillPolicy {
+                    tool: "email.unsubscribe_lists".to_string(),
+                    action: "allow".to_string(),
+                },
+                SkillPolicy {
+                    tool: "email.unsubscribe".to_string(),
+                    action: "require_approval".to_string(),
+                },
             ],
             memory_schemas: Vec::new(),
 
@@ -752,6 +766,35 @@ mod tests {
             .default_policies
             .iter()
             .any(|p| p.tool == "email.get_attachment" && p.action == "allow"));
+    }
+
+    #[test]
+    fn mail_management_tools_are_defined_with_a_policy() {
+        let definition = EmailSkill::definition();
+        let policy = |name: &str| {
+            definition
+                .default_policies
+                .iter()
+                .find(|p| p.tool == name)
+                .map(|p| p.action.as_str())
+        };
+        for name in [
+            "email.mark",
+            "email.move",
+            "email.archive",
+            "email.delete",
+            "email.undo",
+            "email.folder_create",
+            "email.folder_rename",
+            "email.folder_delete",
+            "email.unsubscribe_lists",
+            "email.unsubscribe",
+        ] {
+            assert!(definition.tools.iter().any(|t| t.name == name), "{name}");
+            assert!(policy(name).is_some(), "{name}");
+        }
+        assert_eq!(policy("email.unsubscribe"), Some("require_approval"));
+        assert_eq!(policy("email.folder_delete"), Some("require_approval"));
     }
 
     #[cfg(feature = "email")]
