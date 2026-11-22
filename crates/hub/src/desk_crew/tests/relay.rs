@@ -246,7 +246,12 @@ async fn a_local_boss_reaches_its_groups_machine_sessions_through_desk() {
             tokio::spawn(async move {
                 loop {
                     for c in crew.relay_take(Duration::from_millis(200)).await {
-                        if c.tool != super::super::relayed_work::WORK_TAKE {
+                        // The Mac's own takes aren't the calls this counts.
+                        let takes = [
+                            super::super::relayed_work::WORK_TAKE,
+                            super::super::relayed_decide::TAKE,
+                        ];
+                        if !takes.contains(&c.tool.as_str()) {
                             seen.lock().push(c.clone());
                         }
                         let body = match c.tool.as_str() {
@@ -693,7 +698,12 @@ async fn a_job_held_here_or_on_a_machine_is_one_job_and_an_approval_there_carrie
             tokio::spawn(async move {
                 loop {
                     for c in crew.relay_take(Duration::from_millis(200)).await {
-                        if c.tool != super::super::relayed_work::WORK_TAKE {
+                        // The Mac's own takes aren't the calls this counts.
+                        let takes = [
+                            super::super::relayed_work::WORK_TAKE,
+                            super::super::relayed_decide::TAKE,
+                        ];
+                        if !takes.contains(&c.tool.as_str()) {
                             seen.lock().push(c.clone());
                         }
                         crew.relay_answer(
@@ -904,7 +914,8 @@ const START_FIELDS: [&str; 8] = [
 ];
 
 /// Desk's native side for devbox, as it carries each call: devbox's
-/// sessions, and each start as Desk sends it (its own fields, and a plan's
+/// sessions (each with the grant there that holds it, or none; none said at
+/// all by an `older` Desk there), and each start as Desk sends it (its own fields, and a plan's
 /// grant and the call's boss when it is under one), to devbox's sessions
 /// route; each crew call to devbox's served route, kept in `carried`.
 fn carrying(
@@ -913,6 +924,7 @@ fn carrying(
     served: &axum::Router,
     token: &str,
     carried: &Arc<parking_lot::Mutex<Vec<RelayCall>>>,
+    older: bool,
 ) -> tokio::task::JoinHandle<()> {
     let (crew, there, served, token, carried) = (
         Arc::clone(crew),
@@ -927,7 +939,17 @@ fn carrying(
             for c in crew.relay_take(Duration::from_millis(200)).await {
                 let (code, body) = match c.tool.as_str() {
                     "desk.sessions" => {
-                        native(&there, "GET", "/api/desk/sessions", Value::Null).await
+                        let (code, mut listed) =
+                            native(&there, "GET", "/api/desk/sessions", Value::Null).await;
+                        for s in listed.as_array_mut().into_iter().flatten() {
+                            let Some(s) = s.as_object_mut() else { continue };
+                            if older {
+                                s.remove("grant");
+                            } else {
+                                s.entry("grant").or_insert(Value::Null);
+                            }
+                        }
+                        (code, listed)
                     }
                     // Desk's own machines, as it answers them itself.
                     "desk.machines" => (
@@ -1059,7 +1081,7 @@ async fn directs_from_launch(
     let served = super::super::relay::routes(Arc::clone(&there_state), Arc::clone(&there_crew));
     let token = there_state.auth_token.clone();
     let carried: Arc<parking_lot::Mutex<Vec<RelayCall>>> = Arc::default();
-    let poller = carrying(&crew, &there, &served, &token, &carried);
+    let poller = carrying(&crew, &there, &served, &token, &carried, false);
     let sessions = "/api/desk/sessions";
 
     // The plan is approved: its grant is said before its ticket starts,
@@ -1648,6 +1670,7 @@ async fn works_a_machine_session(
         &served,
         &there_crew.state.auth_token,
         &carried,
+        false,
     );
     eventually("Desk relaying", async || crew.relaying().then_some(())).await;
 
@@ -1768,4 +1791,83 @@ async fn works_a_machine_session(
         "its turn ran on the machine session's own line"
     );
     poller.abort();
+}
+
+/// devbox's Desk is older and doesn't say which grant holds each of its
+/// sessions: VEL-20, which another home's grant holds there, can't be told
+/// from one in no group, so devbox is never written an Ungrouped grant and
+/// none of its sessions is reached by it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_machine_whose_listing_doesnt_say_its_grants_is_never_written_ungrouped() {
+    with_test_pool(workforce_desk::store::build_pool, |mac_pool| async move {
+        with_test_pool(
+            workforce_desk::store::build_pool,
+            |devbox_pool| async move {
+                let (mac_dir, devbox_dir) =
+                    (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+                let (main, crew, _d, _llm) =
+                    overseeing(mac_dir.path(), mac_pool, "ok", MAIN_ALL, &[]).await;
+                let (_any, there_crew, there, _there_llm) = overseeing(
+                    devbox_dir.path(),
+                    devbox_pool,
+                    "ok",
+                    "[oversight]\nenabled = false\n",
+                    &[],
+                )
+                .await;
+                let started = super::relayed_work::person_started;
+                let vel20 = started(&there, devbox_dir.path(), "VEL-20").await;
+                let theirs = super::served::grant(&[vel20.id], devbox_dir.path(), "act", "status");
+                let (code, out) =
+                    super::served::native(&there, "PUT", "/api/desk/grants/g-globex", theirs).await;
+                assert_eq!(code, StatusCode::OK, "{out}");
+                eventually("the main overseer", async || {
+                    crew.overseer_named("desk").map(drop)
+                })
+                .await;
+                let served = super::super::relay::routes(
+                    Arc::clone(&there_crew.state),
+                    Arc::clone(&there_crew),
+                );
+                let carried: Arc<parking_lot::Mutex<Vec<RelayCall>>> = Arc::default();
+                let poller = carrying(
+                    &crew,
+                    &there,
+                    &served,
+                    &there_crew.state.auth_token,
+                    &carried,
+                    true,
+                );
+                eventually("Desk relaying", async || crew.relaying().then_some(())).await;
+                eventually("the grants", async || {
+                    crew.machine_grants(true, true).map(drop)
+                })
+                .await;
+                eventually("devbox's sessions read", async || {
+                    crew.machine_known
+                        .lock()
+                        .contains_key("devbox")
+                        .then_some(())
+                })
+                .await;
+                let w = crew.machine_grants(true, true).unwrap();
+                assert!(
+                    w.machines.values().all(|m| m.grants.is_empty()),
+                    "{:?}",
+                    w.machines
+                );
+                let r = run(
+                    &main,
+                    "crew.take_on",
+                    json!({"session_id": format!("devbox/{}", vel20.id), "reason": "Mine?"}),
+                )
+                .await;
+                assert!(!r.success, "{r:?}");
+                assert!(carried.lock().iter().all(|c| c.tool != "crew.take_on"));
+                poller.abort();
+            },
+        )
+        .await;
+    })
+    .await;
 }

@@ -329,8 +329,7 @@ pub struct CrewHub {
     /// Each of the person's machines' open sessions, as Desk there last
     /// listed them, and when: what the sidebar shows of it
     /// ([`machine_grants`]).
-    machine_known:
-        Mutex<HashMap<String, (std::time::Instant, std::collections::BTreeSet<uuid::Uuid>)>>,
+    machine_known: Mutex<HashMap<String, machine_grants::Listed>>,
     machine_read: Mutex<HashMap<String, std::time::Instant>>,
     /// Each machine's plan reads that failed in a row.
     machine_down: Mutex<HashMap<String, u32>>,

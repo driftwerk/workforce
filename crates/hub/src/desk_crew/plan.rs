@@ -1739,11 +1739,7 @@ impl CrewHub {
             let listed: Vec<MachineSession> = match listed {
                 Ok(v) => {
                     self.machine_down.lock().remove(&machine);
-                    let listed = serde_json::from_value::<Vec<MachineSession>>(v).ok();
-                    if let Some(l) = &listed {
-                        self.machine_listed(&machine, l);
-                    }
-                    listed.unwrap_or_default()
+                    self.machine_listed(&machine, v).unwrap_or_default()
                 }
                 Err(e) => {
                     tracing::debug!(%machine, error = %e, "a machine's plan sessions weren't read");

@@ -206,6 +206,16 @@ const UNGROUPED_ASKED_FOR: std::time::Duration = std::time::Duration::from_secs(
 /// the plan's goal: none yet where its tickets are still to start.
 pub(crate) type PlanSessions = BTreeMap<(String, Uuid), (String, BTreeSet<Uuid>)>;
 
+/// A machine's open sessions, as Desk there last listed them, and when.
+pub(crate) struct Listed {
+    at: std::time::Instant,
+    /// The listing says which grant holds each session there. One that
+    /// doesn't (an older Desk) is as if not read: a session another grant
+    /// holds there can't be told apart, so none is written Ungrouped.
+    grants_said: bool,
+    open: BTreeSet<Uuid>,
+}
+
 /// How long one machine's sessions are waited for, as the Ungrouped grants
 /// are read.
 const MACHINE_READ_WITHIN: std::time::Duration = std::time::Duration::from_secs(5);
@@ -296,8 +306,8 @@ impl CrewHub {
     /// overseer `o` reaches by its machine's Ungrouped grant: none for
     /// a group's boss, and none of its plans' (a machine holds a session in
     /// one grant only). As the sidebar resolves it: each machine's open
-    /// sessions, as last read there, in no group; the ones it lists in
-    /// Ungrouped for a machine not read yet.
+    /// sessions, as last read there, in no group; none of a machine not
+    /// read yet, or whose listing doesn't say which grant holds each.
     pub(crate) fn ungrouped_sessions(&self, o: &Oversight) -> MachineSessions {
         if o.scope != Scope::Ungrouped {
             return MachineSessions::new();
@@ -318,18 +328,11 @@ impl CrewHub {
             .flat_map(|g| g.items.iter())
             .filter_map(|i| machine_item(i))
             .collect();
-        let known = self.machine_known.lock();
-        let present = known
+        self.machine_known
+            .lock()
             .iter()
-            .flat_map(|(m, (_, ids))| ids.iter().map(move |id| (m.clone(), *id)));
-        let unread = layout
-            .ungrouped
-            .items
-            .iter()
-            .filter_map(|i| machine_item(i))
-            .filter(|(m, _)| !known.contains_key(m));
-        present
-            .chain(unread)
+            .filter(|(_, l)| l.grants_said)
+            .flat_map(|(m, l)| l.open.iter().map(move |id| (m.clone(), *id)))
             .filter(|k| !grouped.contains(k) && !planned.contains(k))
             .fold(MachineSessions::new(), |mut out, (m, id)| {
                 out.entry(m).or_default().insert(id);
@@ -342,9 +345,23 @@ impl CrewHub {
         self.timing.tick.min(std::time::Duration::from_secs(15))
     }
 
-    /// Keeps `listed`, `machine`'s sessions as Desk there just listed them,
-    /// but those closed.
-    pub(super) fn machine_listed(&self, machine: &str, listed: &[MachineSession]) {
+    /// Keeps `machine`'s sessions as Desk there just `listed` them, but
+    /// those closed, and gives them back read.
+    pub(super) fn machine_listed(
+        &self,
+        machine: &str,
+        listed: Value,
+    ) -> Option<Vec<MachineSession>> {
+        let grants_said = listed
+            .as_array()
+            .is_some_and(|l| l.iter().all(|s| s.get("grant").is_some()));
+        let listed: Vec<MachineSession> = match serde_json::from_value(listed) {
+            Ok(l) => l,
+            Err(e) => {
+                tracing::debug!(%machine, error = %e, "a machine's sessions couldn't be read");
+                return None;
+            }
+        };
         // One another grant there holds (another home's, or a group's) is
         // never asked for: the machine would refuse the whole grant.
         let open = listed
@@ -353,9 +370,13 @@ impl CrewHub {
             .filter(|s| s.grant.as_deref().is_none_or(|g| g == UNGROUPED))
             .map(|s| s.id)
             .collect();
-        self.machine_known
-            .lock()
-            .insert(machine.to_string(), (std::time::Instant::now(), open));
+        let l = Listed {
+            at: std::time::Instant::now(),
+            grants_said,
+            open,
+        };
+        self.machine_known.lock().insert(machine.to_string(), l);
+        Some(listed)
     }
 
     /// Reads the sessions of each of the person's machines Desk reaches, at
@@ -411,7 +432,7 @@ impl CrewHub {
                 self.machine_known
                     .lock()
                     .get(*m)
-                    .is_none_or(|(at, _)| at.elapsed() >= gap)
+                    .is_none_or(|l| l.at.elapsed() >= gap)
             })
             .collect();
         // Each at once, none waited on past a short while: a slow machine
@@ -429,12 +450,9 @@ impl CrewHub {
         });
         for (machine, listed) in futures::future::join_all(read).await {
             match listed {
-                Ok(Ok(v)) => match serde_json::from_value::<Vec<MachineSession>>(v) {
-                    Ok(listed) => self.machine_listed(machine, &listed),
-                    Err(e) => {
-                        tracing::debug!(%machine, error = %e, "a machine's sessions couldn't be read");
-                    }
-                },
+                Ok(Ok(v)) => {
+                    self.machine_listed(machine, v);
+                }
                 Ok(Err(e)) => {
                     tracing::debug!(%machine, error = %e, "a machine's sessions weren't read")
                 }
