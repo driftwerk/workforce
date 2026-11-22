@@ -122,6 +122,9 @@ pub struct KeyRead<'a> {
     /// The conversation's session key.
     pub conversation: &'a str,
     pub connector: &'a str,
+    /// Which of the connection's keys it is (`client_id`), where the agent
+    /// named it; otherwise the next still to read that it is shaped for.
+    pub field: Option<&'a str>,
     /// Where the extension says it read it, read in the same call.
     pub origin: &'a str,
     pub path: &'a str,
@@ -159,6 +162,12 @@ pub trait BrowserHooks: Send + Sync {
         _conversation: &str,
         _connector: &str,
     ) -> Option<super::keys::KeyPage> {
+        None
+    }
+    /// What `connector`'s key `field` (an app's `client_id`) looks like,
+    /// where its keys differ: what the page is searched for when the agent
+    /// names the field, so one value is found. `None`: the page's shape.
+    fn key_shape(&self, _connector: &str, _field: &str) -> Option<String> {
         None
     }
     /// Holds a new key `read` says was read, for the setup [`Self::key_page`]

@@ -362,6 +362,8 @@ pub enum Why {
     Unclear,
     /// It sends to other people.
     SendsToPeople,
+    /// It changes the person's accounts in their bookkeeping service.
+    ChangesTheBooks(Books),
     /// A write to a connector.
     ConnectorWrite,
     /// The tool can't say what it changes.
@@ -387,6 +389,8 @@ impl Why {
             Self::CantBeUndone => "Can't be undone",
             Self::Unclear => "Can't tell what this command runs",
             Self::SendsToPeople => "Sends to other people",
+            Self::ChangesTheBooks(Books::FreeAgent) => "It changes your accounts in FreeAgent",
+            Self::ChangesTheBooks(Books::Xero) => "It changes your accounts in Xero",
             Self::ConnectorWrite => "Changes something in a connected service",
             Self::Unknown => "This tool can't say what it changes",
             Self::OnAPage => "Acts on a web page",
@@ -394,6 +398,25 @@ impl Why {
             Self::TheirChrome => "Uses your own Chrome, signed in as you",
             Self::NewSite => "Opens a new site in your Chrome",
             Self::SignIn => "Waits while you sign in. Desk never sees your password",
+        }
+    }
+}
+
+/// A bookkeeping service whose changes always ask.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Books {
+    FreeAgent,
+    Xero,
+}
+
+impl Books {
+    /// The service a connector tool's prefix names.
+    pub fn of(connector: &str) -> Option<Self> {
+        match connector {
+            "freeagent" => Some(Self::FreeAgent),
+            "xero" => Some(Self::Xero),
+            _ => None,
         }
     }
 }
