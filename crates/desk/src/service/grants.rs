@@ -292,6 +292,7 @@ impl Desk {
         new: crate::model::NewSession,
         boss: &str,
         id: Option<Uuid>,
+        deps: bool,
     ) -> Result<crate::model::SessionView, DeskError> {
         let Some(group) = new.group.clone().filter(|g| grant::plan_of(g).is_some()) else {
             return Err(DeskError::Invalid(
@@ -336,7 +337,7 @@ impl Desk {
             &party.name,
             "The person approved its plan; Desk started its ticket for it.",
         );
-        self.start_session(new, id, Some(&party), Some(by), true)
+        self.start_session(new, id, Some(&party), Some(by), true, deps)
             .await
     }
 
