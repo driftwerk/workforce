@@ -207,7 +207,7 @@ impl CrewHub {
             "workspace" => {
                 let ws = workspace::workspace_of(&v.cwd).await;
                 let r = PrRef::of(&ws);
-                let pr = self.pull_seen(&b.service, r.as_ref()).await;
+                let pr = self.workspace_pull(&b.service, r.as_ref()).await;
                 let head = r.and_then(|r| r.head);
                 let said = Self::with_pull(
                     self.workspace_said(&ws, Sees::Everything),
@@ -285,7 +285,7 @@ impl CrewHub {
         sees: Sees,
     ) -> Glance {
         let mut g = g;
-        let pr = self.pull_seen(service, r.as_ref()).await;
+        let pr = self.workspace_pull(service, r.as_ref()).await;
         if let Some(w) = g.workspace.as_mut() {
             add_pull(w, pr, r.as_ref().and_then(|r| r.head.as_deref()));
         }
@@ -336,7 +336,11 @@ impl CrewHub {
     /// The pull request `r`'s branch is, read as the person through
     /// [`super::github_seen`]; none when there is no repository to look
     /// for one of.
-    async fn pull_seen(&self, service: &Arc<AgentService>, r: Option<&PrRef>) -> Option<PullSeen> {
+    async fn workspace_pull(
+        &self,
+        service: &Arc<AgentService>,
+        r: Option<&PrRef>,
+    ) -> Option<PullSeen> {
         let r = r?;
         let note = |n: &str| {
             Some(PullSeen {
@@ -626,7 +630,7 @@ impl CrewHub {
                 .ok()
                 .flatten();
             let sees = serde_json::from_value(body["sees"].clone()).unwrap_or_default();
-            let pr = self.pull_seen(service, r.as_ref()).await;
+            let pr = self.workspace_pull(service, r.as_ref()).await;
             let head = r.and_then(|r| r.head);
             let said = Self::with_pull(body["workspace"].clone(), pr, head.as_deref(), sees);
             return json!({ "workspace": reported(&said.to_string(), &from) });
