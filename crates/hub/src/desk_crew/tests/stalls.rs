@@ -12,6 +12,7 @@ use super::*;
 use workforce_common::channels::desk::DeliveryKind;
 use workforce_desk::account::{Account, Done};
 use workforce_desk::crew::PartyKind;
+use workforce_desk::model::SessionState;
 use workforce_desk::open_item::{NewItem, OpenItem, OpenKind, OpenState};
 use workforce_desk::update::MentionedUpdate;
 use workforce_desk::update_write::{self as write, Mover, Said};
@@ -732,7 +733,7 @@ async fn a_message_behind_a_sessions_question_still_raises_the_question() {
         )
         .await;
         eventually("it asks", async || {
-            (d.view(s.id).unwrap().state == workforce_desk::model::SessionState::Asking).then_some(())
+            (d.view(s.id).unwrap().state == SessionState::Asking).then_some(())
         })
         .await;
         crew.perform(
@@ -898,6 +899,322 @@ async fn a_message_behind_an_approval_still_raises_the_approval() {
         })
         .await;
         request.abort();
+    })
+    .await;
+}
+
+/// What the `ssh` stand-in says while its build runs on the devbox.
+#[derive(Clone, Copy)]
+pub(super) enum Says {
+    /// rbuild's queue line, once.
+    Queued,
+    /// Nothing at all.
+    Nothing,
+    /// A test's progress, every fifth of a second.
+    Streams,
+}
+
+/// A Claude Code stand-in in `dir`, installed as far as Desk can tell,
+/// whose tool shell runs `ssh devbox ~/bin/rbuild-run w cargo test` (the
+/// night of the overnight stall) with an `ssh` that says `says`; each
+/// `ssh` notes its pid in `dir`'s `ssh.pid` for [`builds_stop`].
+pub(super) fn building_cli(dir: &Path, says: Says) -> PathBuf {
+    let bin = dir.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let pids = dir.join("ssh.pid");
+    let runs = match says {
+        Says::Queued => {
+            "echo 'rbuild: all 3 build slots are busy; waiting for one' >&2\nexec sleep 120"
+        }
+        Says::Nothing => "exec sleep 120",
+        Says::Streams => {
+            "n=0\nwhile [ $n -lt 600 ]; do n=$((n+1)); echo \"test step $n of 600\"; sleep 0.2; done"
+        }
+    };
+    workforce_common::executable::write(
+        bin.join("ssh"),
+        format!("#!/bin/sh\necho $$ >> '{}'\n{runs}\n", pids.display()),
+    )
+    .unwrap();
+    let path = dir.join("building-claude");
+    workforce_common::executable::write(
+        &path,
+        format!(
+            "#!/bin/sh\ncase \"$1\" in --version) echo '2.1.300 (Claude Code)'; exit 0;; auth) exit 1;; esac\n\
+             printf '%s\\n' \"$@\" > \"{dir}/args-$$\"\n\
+             /bin/sh -c 'PATH={bin}:$PATH ssh devbox ~/bin/rbuild-run w cargo test; : /h/.claude/shell-snapshots/snapshot-sh-1.sh' &\n\
+             exec sleep 60\n",
+            dir = dir.display(),
+            bin = bin.display(),
+        ),
+    )
+    .unwrap();
+    path
+}
+
+/// Ends the builds [`building_cli`]'s sessions ran.
+pub(super) fn builds_stop(dir: &Path) {
+    std::fs::read_to_string(dir.join("ssh.pid"))
+        .unwrap_or_default()
+        .lines()
+        .for_each(|pid| {
+            std::process::Command::new("kill").arg(pid).status().ok();
+        });
+}
+
+/// Session `s` at work on the tests: started, prompted, its Bash call open.
+pub(super) async fn at_work(dir: &Path, s: uuid::Uuid) -> String {
+    let url = hook_url(dir, s).await;
+    for body in [
+        json!({"hook_event_name": "SessionStart", "session_id": format!("cc-{s}")}),
+        json!({"hook_event_name": "UserPromptSubmit", "prompt": "Run the tests on the devbox."}),
+        json!({"hook_event_name": "PreToolUse", "tool_name": "Bash",
+            "tool_input": {"command": "~/bin/rbuild /w -- cargo test"}}),
+    ] {
+        hook(&url, body).await;
+    }
+    url
+}
+
+/// Looks inside every session until the boss's model is woken by a line
+/// saying `what`: its newest message, not the history it carries.
+pub(super) async fn looked_until_woken(d: &Desk, llm: &wiremock::MockServer, what: &str) {
+    eventually("the boss woken by what Desk sees", async || {
+        d.sight_pass().await;
+        (woken_by(llm, what).await > 0).then_some(())
+    })
+    .await;
+}
+
+/// How many of the boss's model calls were woken by a line saying `what`.
+pub(super) async fn woken_by(llm: &wiremock::MockServer, what: &str) -> usize {
+    llm.received_requests()
+        .await
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|r| serde_json::from_slice::<Value>(&r.body).ok())
+        .filter(|b| {
+            b["messages"]
+                .as_array()
+                .and_then(|m| m.iter().rev().find(|m| m["role"] == "user"))
+                .is_some_and(|m| m.to_string().contains(what))
+        })
+        .count()
+}
+
+/// The first item about session `s` any update posted says who moves.
+async fn moved_in_updates(overseer: &AgentService, d: &Desk, s: uuid::Uuid) -> Option<Said> {
+    let posted: Vec<String> = overseer
+        .sessions
+        .find(DESK_CHANNEL, PERSON)
+        .unwrap()
+        .map(|s| s.messages)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|m| {
+            m.desk
+                .as_ref()
+                .and_then(|x| x.delivery)
+                .is_some_and(|k| k == DeliveryKind::Update)
+        })
+        .map(|m| m.id)
+        .collect();
+    d.store()
+        .extras(&posted)
+        .await
+        .ok()?
+        .into_values()
+        .filter_map(|e| e.update)
+        .flat_map(|u| u.said)
+        .find(|i| {
+            i.moves.is_some()
+                && i.session
+                    .as_ref()
+                    .is_some_and(|l| l.session_id == s.to_string())
+        })
+}
+
+/// Act, a stall three tenths of a second and quiet as long.
+const SIGHTED: &str = "[oversight]\nenabled = true\nlevel = \"act\"\nact = { nudge = true }\n\
+                       work = { stall_minutes = 3 }\nwake = { quiet_minutes = 3 }\n";
+
+/// Where the overnight session waited: on its terminal, or in the
+/// background once its turn ended.
+#[derive(Clone, Copy)]
+enum Shape {
+    Foreground,
+    Background,
+}
+
+/// The overnight stall of 21 Nov, as `shape`: a session waiting hours on
+/// a devbox build slot is seen waiting on the overview, its boss is told
+/// once to look inside and move it, and its stall in an update is the
+/// queue's, looked at again, never "working on it now".
+async fn a_queued_build_is_seen_said_once_and_looked_at_again(shape: Shape) {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(dir.path()).unwrap();
+        let says = match shape {
+            Shape::Foreground => Says::Queued,
+            Shape::Background => Says::Nothing,
+        };
+        let d = sighted_desk(pool, &base, building_cli(&base, says)).await;
+        let (overseer, crew, d, llm) = overseeing_on(&base, d, "ok", SIGHTED, &[], FAST).await;
+        crew.set_update_writer(Arc::new(Down));
+        crew.look_at_updates().await;
+        let s = new_session(&d, &base, "workforce tests").await;
+        let url = at_work(&base, s.id).await;
+        if let Shape::Background = shape {
+            let cli = format!("cc-{}", s.id);
+            let project = base.join("projects").join("-w");
+            std::fs::create_dir_all(&project).unwrap();
+            let transcript = project.join(format!("{cli}.jsonl"));
+            let lines = [
+                json!({"type": "assistant", "uuid": "a1", "timestamp": chrono::Utc::now(),
+                    "message": {"role": "assistant", "content": [{"type": "tool_use", "id": "t1",
+                    "name": "Bash", "input": {"command": "~/bin/rbuild /w -- cargo test",
+                    "run_in_background": true}}]}}),
+                json!({"type": "user", "uuid": "u1", "timestamp": chrono::Utc::now(),
+                    "message": {"role": "user", "content": [{"type": "tool_result",
+                    "tool_use_id": "t1", "content": "Command running in background with ID: b1"}]}}),
+                json!({"type": "assistant", "uuid": "a2", "timestamp": chrono::Utc::now(),
+                    "message": {"role": "assistant", "content": [{"type": "text",
+                    "text": "The tests run in the background."}]}}),
+            ];
+            std::fs::write(
+                &transcript,
+                lines.iter().map(|l| format!("{l}\n")).collect::<String>(),
+            )
+            .unwrap();
+            let tasks = base.join("tasks").join("-w").join(&cli).join("tasks");
+            std::fs::create_dir_all(&tasks).unwrap();
+            std::fs::write(
+                tasks.join("b1.output"),
+                "rbuild: all 3 build slots are busy; waiting for one\n",
+            )
+            .unwrap();
+            hook(
+                &url,
+                json!({"hook_event_name": "Stop", "transcript_path": transcript,
+                    "last_assistant_message": "The tests run in the background.",
+                    "background_tasks": [{"id": "b1", "type": "shell", "status": "running",
+                        "command": "~/bin/rbuild /w -- cargo test"}]}),
+            )
+            .await;
+            eventually("its turn done, its tests in the background", async || {
+                d.view(s.id)
+                    .ok()
+                    .filter(|v| v.state == SessionState::Done && v.waiting_on() == 1)
+            })
+            .await;
+        }
+        looked_until_woken(&d, &llm, "for a build slot. Look inside (crew.inside)").await;
+        let v = d.view(s.id).unwrap();
+        assert_eq!(v.waits.unwrap().words, "waiting for a build slot");
+        let overview = overseer
+            .tools
+            .get("crew.overview")
+            .unwrap()
+            .execute(json!({}))
+            .await
+            .unwrap()
+            .output
+            .to_string();
+        assert!(
+            overview.contains("waiting for a build slot, "),
+            "{overview}"
+        );
+
+        account(
+            &d,
+            s.id,
+            "Run the workforce tests",
+            &["The test run is blocked, waiting for a build slot on the devbox."],
+            None,
+        )
+        .await;
+        let item = eventually("its stall in an update", async || {
+            moved_in_updates(&overseer, &d, s.id).await
+        })
+        .await;
+        let Some(Mover::Outside { on, .. }) = item.moves.clone() else {
+            panic!("outside: {item:?}");
+        };
+        assert!(on.starts_with("a build slot (waited "), "{on}");
+        assert!(!item.body.contains("working on it now"), "{item:?}");
+
+        for _ in 0..5 {
+            d.sight_pass().await;
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert_eq!(
+            woken_by(&llm, "for a build slot. Look inside (crew.inside)").await,
+            1,
+            "said once"
+        );
+        assert_eq!(woken_by(&llm, "crew.ask_session").await, 0);
+        builds_stop(&base);
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_build_queued_at_its_terminal_is_seen_said_once_and_looked_at_again() {
+    a_queued_build_is_seen_said_once_and_looked_at_again(Shape::Foreground).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_build_queued_in_the_background_is_seen_said_once_and_looked_at_again() {
+    a_queued_build_is_seen_said_once_and_looked_at_again(Shape::Background).await;
+}
+
+/// The same night with nothing printed: nothing moves under it, so the
+/// stall is found from what Desk sees alone, its ssh named.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_silent_build_over_ssh_is_said_still_from_its_evidence_alone() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(dir.path()).unwrap();
+        let d = sighted_desk(pool, &base, building_cli(&base, Says::Nothing)).await;
+        let (_overseer, _crew, d, llm) = overseeing_on(&base, d, "ok", SIGHTED, &[], FAST).await;
+        let s = new_session(&d, &base, "workforce tests").await;
+        at_work(&base, s.id).await;
+        looked_until_woken(&d, &llm, "its ssh command may still run on devbox").await;
+        let woke = prompted(&llm, "its ssh command may still run on devbox").await;
+        assert!(
+            woke.iter()
+                .any(|b| b.contains("nothing has moved for ")
+                    && b.contains("Look inside (crew.inside)")),
+            "{woke:?}"
+        );
+        builds_stop(&base);
+    })
+    .await;
+}
+
+/// A build that keeps printing is never a stall, however long it runs: its
+/// quiet is said with what Desk sees, and nothing more.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_build_that_keeps_printing_is_never_said_stalled() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(dir.path()).unwrap();
+        let d = sighted_desk(pool, &base, building_cli(&base, Says::Streams)).await;
+        let (_overseer, _crew, d, llm) = overseeing_on(&base, d, "ok", SIGHTED, &[], FAST).await;
+        let s = new_session(&d, &base, "workforce tests").await;
+        at_work(&base, s.id).await;
+        looked_until_woken(&d, &llm, "— what Desk sees: ").await;
+        for _ in 0..15 {
+            d.sight_pass().await;
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert_eq!(woken_by(&llm, "Look inside (crew.inside)").await, 0);
+        assert_eq!(
+            woken_by(&llm, "— what Desk sees: ").await,
+            1,
+            "once a quiet spell"
+        );
+        builds_stop(&base);
     })
     .await;
 }

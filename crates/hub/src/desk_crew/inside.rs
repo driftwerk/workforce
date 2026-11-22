@@ -18,7 +18,9 @@ use workforce_common::oversight::Oversight;
 use workforce_desk::grant::{Grant, Sees};
 use workforce_desk::model::{SessionState, SessionView};
 use workforce_desk::sees::{self, Part};
-use workforce_desk::sight::{self, Glance, PullGlance, Thresholds, WorkspaceGlance};
+use workforce_desk::sight::{
+    self, Glance, PullGlance, Stall, StallKind, Thresholds, WorkspaceGlance,
+};
 use workforce_desk::{Processes, TranscriptAsk};
 
 use super::github_seen::{Pull, Seen, Unseen};
@@ -102,6 +104,34 @@ fn asked(input: &Value) -> Result<(&'static str, Option<uuid::Uuid>), String> {
             .map(|id| (facet, Some(id)))
             .map_err(|_| NOT_A_SESSION.to_string()),
     }
+}
+
+/// Whether a stall of `kind` is one something should move now: a wait,
+/// a prompt at its terminal, or nothing moving.
+pub(super) fn moves(kind: StallKind) -> bool {
+    matches!(
+        kind,
+        StallKind::Queued | StallKind::Input | StallKind::Still
+    )
+}
+
+/// What the boss is told of `who`'s stall: what it is, and to look inside
+/// and move it.
+pub(super) fn evidence_line(who: &str, s: &Stall) -> String {
+    format!(
+        "{who} {}. Look inside (crew.inside) and move it: free what it waits on, tell it to \
+         stop waiting, or tell the person.",
+        s.words
+    )
+}
+
+/// The key a stall is said once by, until its evidence changes.
+pub(super) fn evidence_key(id: &str, s: &Stall) -> String {
+    format!(
+        "evidence:{id}:{}:{}",
+        s.kind.as_str(),
+        s.since.timestamp_millis()
+    )
 }
 
 /// Whether `v` works, or waits on its own background work.
@@ -292,6 +322,56 @@ impl CrewHub {
         let mut g = sees::glance(g, sees);
         g.stall = sight::verdict(&g, state, chrono::Utc::now(), self.thresholds(o));
         g
+    }
+
+    /// What Desk sees inside the session `id` (here, or `machine/id` on a
+    /// machine) from what it has already read, and the stall that shows
+    /// under `o`'s thresholds: nothing is read for it. None when nothing is
+    /// known of it.
+    pub(super) fn seen_inside(&self, id: &str, o: &Oversight) -> Option<(Glance, Option<Stall>)> {
+        let (g, state) = match id.parse::<uuid::Uuid>() {
+            Ok(id) => {
+                let v = self.desk.view(id).ok()?;
+                (self.desk.glance(&v), v.state)
+            }
+            Err(_) => self
+                .machine_sight
+                .lock()
+                .glances
+                .get(id)
+                .filter(|(.., at)| at.elapsed() < MACHINE_GLANCE_FOR)
+                .map(|(g, state, _)| (g.clone(), *state))?,
+        };
+        let stall = sight::verdict(&g, state, chrono::Utc::now(), self.thresholds(o));
+        Some((g, stall))
+    }
+
+    /// The stall the evidence of session `id` shows that something should
+    /// move: a wait, its terminal, or nothing moving.
+    pub(super) fn stall_of(&self, id: &str, o: &Oversight) -> Option<(Glance, Stall)> {
+        self.seen_inside(id, o)
+            .and_then(|(g, s)| s.filter(|s| moves(s.kind)).map(|s| (g, s)))
+    }
+
+    /// Asks each machine `boss` reaches under its group's grant for the
+    /// glances of its working sessions there, on its own task, at most once
+    /// every [`MACHINE_GLANCE_EVERY`] each: a plan's are asked as they go
+    /// quiet.
+    pub(super) fn glance_group_machines(&self, boss: &str, o: &Oversight) {
+        let grants: Vec<(String, String)> = self
+            .machine_grants_of(boss, o)
+            .into_iter()
+            .filter(|(_, g)| workforce_desk::grant::plan_of(g).is_none())
+            .collect();
+        let Some(crew) = self.me.upgrade().filter(|_| !grants.is_empty()) else {
+            return;
+        };
+        let boss = boss.to_string();
+        tokio::spawn(async move {
+            for (machine, grant) in grants {
+                crew.glance_machine(&machine, &grant, &boss).await;
+            }
+        });
     }
 
     /// `g` rendered as the boss reads it, fenced.

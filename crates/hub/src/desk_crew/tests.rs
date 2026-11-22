@@ -261,7 +261,48 @@ async fn desk_running(
     claude: PathBuf,
     codex: PathBuf,
 ) -> Desk {
-    desk_as(pool, dir, floor, claude, codex, Default::default()).await
+    desk_as(
+        pool,
+        dir,
+        floor,
+        claude,
+        codex,
+        Default::default(),
+        Default::default(),
+    )
+    .await
+}
+
+/// A desk whose Claude Code is `claude`, looked inside of only when a test
+/// asks (`sight_pass`): what its sessions print read under a redactor, its
+/// tasks' output under `dir`'s `tasks`, and any two looks far enough apart
+/// to tell a still tree.
+pub(crate) async fn sighted_desk(
+    pool: workforce_postgres::PostgresPool,
+    dir: &Path,
+    claude: PathBuf,
+) -> Desk {
+    let floor = workforce_desk::Floor {
+        redactor: Some(Arc::new(inside::Hides)),
+        ..Default::default()
+    };
+    let sight = workforce_desk::SightOptions {
+        task_root: dir.join("tasks"),
+        every: Duration::from_secs(3600),
+        settled: Duration::ZERO,
+        shown_after: Duration::ZERO,
+        ..Default::default()
+    };
+    desk_as(
+        pool,
+        dir,
+        floor,
+        claude,
+        not_installed(dir),
+        Default::default(),
+        sight,
+    )
+    .await
 }
 
 /// A desk on one of the person's machines: its groups are its grants.
@@ -271,7 +312,16 @@ pub(crate) async fn machine_desk(pool: workforce_postgres::PostgresPool, dir: &P
         machine: true,
         ..Default::default()
     };
-    desk_as(pool, dir, Default::default(), cli.clone(), cli, bosses).await
+    desk_as(
+        pool,
+        dir,
+        Default::default(),
+        cli.clone(),
+        cli,
+        bosses,
+        Default::default(),
+    )
+    .await
 }
 
 async fn desk_as(
@@ -281,6 +331,7 @@ async fn desk_as(
     claude: PathBuf,
     codex: PathBuf,
     bosses: workforce_desk::grant::BossOptions,
+    sight: workforce_desk::SightOptions,
 ) -> Desk {
     Desk::start(
         DeskStore::with_pool(pool).await.unwrap(),
@@ -301,7 +352,7 @@ async fn desk_as(
             line_reach: workforce_desk::line::Reach::Group,
             memory: Default::default(),
             bosses,
-            sight: Default::default(),
+            sight,
         },
         floor,
         CancellationToken::new(),
@@ -890,12 +941,24 @@ async fn overseeing_at(
     crew_agents: &[Arc<AgentService>],
     timing: Timing,
 ) -> (Arc<AgentService>, Arc<CrewHub>, Desk, wiremock::MockServer) {
+    let d = desk(pool, dir).await;
+    overseeing_on(dir, d, reply, oversight, crew_agents, timing).await
+}
+
+/// [`overseeing_at`] over the desk `d`.
+async fn overseeing_on(
+    dir: &Path,
+    d: Desk,
+    reply: &str,
+    oversight: &str,
+    crew_agents: &[Arc<AgentService>],
+    timing: Timing,
+) -> (Arc<AgentService>, Arc<CrewHub>, Desk, wiremock::MockServer) {
     let (overseer, llm) = agent(dir, "desk", reply).await;
     write_config(&overseer, oversight);
     let mut all = vec![Arc::clone(&overseer)];
     all.extend(crew_agents.iter().cloned());
     let state = hub(&all);
-    let d = desk(pool, dir).await;
     let crew = CrewHub::start(state, d.clone(), timing, CancellationToken::new());
     let dm = overseer
         .sessions

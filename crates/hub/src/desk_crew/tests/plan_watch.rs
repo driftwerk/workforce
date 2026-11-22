@@ -13,9 +13,13 @@
 //! - A session the person stopped is theirs to resume: asked once; one the
 //!   person runs by hand is left alone; a stall is said once; and the
 //!   board says "in Doing, no session", never that it is being done.
+//! - The overnight stall of 21 Nov: a ticket whose session waits on a
+//!   devbox build slot is stuck however busy it looks, said to the person
+//!   once and to the plan's turn once.
 
 use super::act_fully::repo;
-use super::plans::{hub_with, started, ACTS};
+use super::plans::{hub_on, hub_with, started, ACTS};
+use super::stalls::{at_work, building_cli, builds_stop, looked_until_woken, woken_by, Says};
 use super::*;
 use workforce_desk::account::{Account, Done, Ref, RefKind};
 use workforce_desk::board::TicketState;
@@ -615,6 +619,49 @@ async fn a_stopped_session_is_the_persons_a_hand_run_ticket_is_left_alone_and_a_
         tokio::time::sleep(Duration::from_millis(800)).await;
         assert_eq!(stalls().await.len(), 1, "once");
         assert_eq!(stopped().await.len(), 1, "asked once");
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_ticket_whose_session_waits_on_a_build_slot_is_stuck_said_once_and_its_turn_told_once() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(dir.path()).unwrap();
+        let d = sighted_desk(pool, &base, building_cli(&base, Says::Queued)).await;
+        let (overseer, state, d, llm) = hub_on(&base, &watching(), d).await;
+        let _crew = CrewHub::start(state, d.clone(), FAST, CancellationToken::new());
+        let (_, sessions) = running(&d, &base, 1).await;
+        at_work(&base, sessions[0].id).await;
+        let told = "DES-1's session has waited ";
+        looked_until_woken(&d, &llm, told).await;
+        let stalls = || {
+            overseer
+                .sessions
+                .find(DESK_CHANNEL, PERSON)
+                .unwrap()
+                .map(|s| s.messages)
+                .unwrap_or_default()
+                .iter()
+                .filter(|m| m.content.contains("hasn't moved in"))
+                .map(|m| m.content.clone())
+                .collect::<Vec<_>>()
+        };
+        let said = eventually("the plan's stall said", async || {
+            d.sight_pass().await;
+            let s = stalls();
+            (!s.is_empty()).then_some(s)
+        })
+        .await;
+        assert!(said[0].contains(told), "{said:?}");
+        assert!(said[0].contains("for a build slot"), "{said:?}");
+        for _ in 0..8 {
+            d.sight_pass().await;
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert_eq!(stalls().len(), 1, "said once");
+        assert_eq!(woken_by(&llm, told).await, 1, "its turn told once");
+        builds_stop(&base);
     })
     .await;
 }

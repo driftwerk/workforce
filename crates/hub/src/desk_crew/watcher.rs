@@ -589,11 +589,15 @@ impl CrewHub {
         } else {
             o
         };
+        // What runs on its machines is looked inside of, for the next look
+        // to read.
+        self.glance_group_machines(overseer, o);
         let seen = self.desk.seen_by(&o.scope);
         let Ok(overview) = self.desk.overview_for(self, None, Some(&seen)).await else {
             return Vec::new();
         };
         let now = Utc::now();
+        let tz = self.desk.timezone();
         let minute = chrono::Duration::from_std(self.timing.minute).unwrap_or_default();
         let past = |at: Option<chrono::DateTime<Utc>>, minutes: u32| {
             minutes > 0 && at.is_some_and(|at| now - at >= minute * minutes as i32)
@@ -622,17 +626,29 @@ impl CrewHub {
             if item.kind == ItemKind::Session && item.id.parse().is_ok_and(|s| self.taken_back(s)) {
                 continue;
             }
+            // What Desk sees inside it, from what it already read.
+            let inside = match item.kind {
+                ItemKind::Session => self.seen_inside(&item.id, o),
+                ItemKind::Agent => None,
+            };
+            let evidence = inside.as_ref().and_then(|(_, s)| {
+                s.as_ref()
+                    .filter(|s| super::inside::moves(s.kind))
+                    .map(|s| (super::inside::evidence_key(&item.id, s), s))
+            });
             // Said once a stall, instead of its quiet from then on.
             let waits = waiting.get(&item.id).map(Vec::as_slice).unwrap_or_default();
             if let Some(oldest) = waits.first() {
                 let key = format!("undelivered:{}:{}:{}", item.id, oldest.id, moved_at(item));
                 holding.insert(key.clone());
                 holding.insert(quiet_key(item));
+                holding.extend(evidence.as_ref().map(|(k, _)| k.clone()));
                 if let Some(found) =
                     self.undelivered(overseer, item, &party, waits, now, o.work.stall_minutes)
                 {
                     if noted.insert(key) {
                         noted.insert(quiet_key(item));
+                        noted.extend(evidence.as_ref().map(|(k, _)| k.clone()));
                         out.push(found.trigger);
                     }
                     if !found.behind_person {
@@ -676,8 +692,8 @@ impl CrewHub {
             {
                 continue;
             }
-            let (key, trigger) = match item.state {
-                ItemState::NeedsYou if past(item.since, o.wake.waiting_minutes) => {
+            let (key, trigger) = match (item.state, &evidence) {
+                (ItemState::NeedsYou, _) if past(item.since, o.wake.waiting_minutes) => {
                     let waited = item
                         .since
                         .map(|s| (now - s).num_minutes().max(1))
@@ -719,7 +735,23 @@ impl CrewHub {
                         },
                     )
                 }
-                ItemState::Working | ItemState::Quiet
+                (ItemState::Working | ItemState::Quiet, Some((key, stall))) => {
+                    holding.insert(quiet_key(item));
+                    noted.insert(quiet_key(item));
+                    (
+                        key.clone(),
+                        Trigger {
+                            line: super::inside::evidence_line(&who(&party), stall),
+                            approvals: vec![],
+                            hop: 0,
+                            about: None,
+                            group: item.group_id.clone(),
+                            handed: None,
+                            routine: false,
+                        },
+                    )
+                }
+                (ItemState::Working | ItemState::Quiet, None)
                     if past(item.last_activity, o.wake.quiet_minutes) =>
                 {
                     let quiet = item
@@ -730,12 +762,17 @@ impl CrewHub {
                         quiet_key(item),
                         Trigger {
                             line: format!(
-                                "{} has been quiet for {quiet} min while working on {}{}",
+                                "{} has been quiet for {quiet} min while working on {}{}{}",
                                 who(&party),
                                 item.task.as_deref().unwrap_or("its task"),
                                 item.detail
                                     .as_deref()
                                     .map(|d| format!(" (last: {d})"))
+                                    .unwrap_or_default(),
+                                inside
+                                    .as_ref()
+                                    .filter(|(g, _)| g.as_of.is_some())
+                                    .map(|(g, _)| format!(" — what Desk sees: {}", g.line(tz, now)))
                                     .unwrap_or_default()
                             ),
                             approvals: vec![],

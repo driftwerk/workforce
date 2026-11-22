@@ -9,7 +9,7 @@ use workforce_desk::memory::{Redacted, Redactor};
 const SECRET: &str = "SECRET-abc";
 
 /// Hides [`SECRET`], as the hub's patterns would.
-struct Hides;
+pub(super) struct Hides;
 
 impl Redactor for Hides {
     fn stored<'a>(&self, text: &'a str) -> Redacted<'a> {

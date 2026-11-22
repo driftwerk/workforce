@@ -42,10 +42,24 @@ async fn hub_running(
     Desk,
     wiremock::MockServer,
 ) {
+    let d = desk_running(pool, dir, Default::default(), claude, not_installed(dir)).await;
+    hub_on(dir, oversight, d).await
+}
+
+/// [`hub_with`] over the desk `d`.
+pub(super) async fn hub_on(
+    dir: &Path,
+    oversight: &str,
+    d: Desk,
+) -> (
+    Arc<AgentService>,
+    Arc<GatewayState>,
+    Desk,
+    wiremock::MockServer,
+) {
     let (overseer, llm) = agent(dir, "desk", "ok").await;
     write_config(&overseer, oversight);
     let state = hub(std::slice::from_ref(&overseer));
-    let d = desk_running(pool, dir, Default::default(), claude, not_installed(dir)).await;
     let dm = overseer
         .sessions
         .get_or_create(DESK_CHANNEL, PERSON, "desk")
