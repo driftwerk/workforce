@@ -145,7 +145,10 @@ fn unread(hub: &str, system: workforce_desk::board::System, e: FileRead) -> Resp
     match e {
         FileRead::Remote(RemoteError::Waiting { .. }) => refusal(
             StatusCode::CONFLICT,
-            &format!("Waiting for your approval on {hub} to read it."),
+            &format!(
+                "Waiting for your approval on {} to read it.",
+                workforce_desk::board::in_sentence(hub)
+            ),
         ),
         FileRead::Remote(RemoteError::Missing(_) | RemoteError::NotAllowed(_)) => refusal(
             StatusCode::CONFLICT,

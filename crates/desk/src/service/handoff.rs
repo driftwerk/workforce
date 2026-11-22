@@ -975,7 +975,14 @@ impl Desk {
             group: c.facts.source_group.clone(),
         };
         let started = self
-            .start_session(new, Some(id), None, Some(by.clone()), r.folder_chosen)
+            .start_session(
+                new,
+                Some(id),
+                None,
+                Some(by.clone()),
+                r.folder_chosen,
+                false,
+            )
             .await;
         match started {
             Ok(view) => {

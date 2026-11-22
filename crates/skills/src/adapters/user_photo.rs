@@ -20,7 +20,7 @@ use async_trait::async_trait;
 use tokio::sync::RwLock;
 use tracing::info;
 
-use workforce_agent::llm::image::sniff_media_type;
+use workforce_agent::attachments::photo;
 use workforce_agent::runner::CURRENT_CHANNEL_ID;
 use workforce_agent::tools::image_view::{stage_for_view, VIEWED_IMAGES_KEY};
 use workforce_agent::tools::{Tool, ToolResult};
@@ -39,6 +39,33 @@ fn task_local(key: &'static tokio::task::LocalKey<String>) -> Option<String> {
 /// address carries its size (Slack: `…_192.png`); others as they are.
 pub fn larger_avatar(url: &str) -> String {
     url.replace("_192.", "_512.")
+}
+
+/// The photo at `url` as a model can read it, with its media type: the
+/// download's own label is trusted only when its bytes show no type.
+async fn fetch_photo(http: &reqwest::Client, url: &str) -> Result<(Vec<u8>, String), String> {
+    let resp = http
+        .get(url)
+        .send()
+        .await
+        .map_err(|e| format!("profile photo download failed: {e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!("profile photo download failed ({})", resp.status()));
+    }
+    let label = resp
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .filter(|s| s.starts_with("image/"))
+        .map(str::to_string)
+        .unwrap_or_default();
+    let bytes = resp
+        .bytes()
+        .await
+        .map_err(|e| format!("failed to read profile photo bytes: {e}"))?;
+    photo::ready(bytes.to_vec(), &label)
+        .await
+        .map_err(|e| format!("profile photo cannot be shown: {e}"))
 }
 
 /// Fetches a user's profile photo into the agent's view, for use as a reference
@@ -141,37 +168,10 @@ impl Tool for GetUserPhotoTool {
         };
         let url = larger_avatar(&avatar_url);
 
-        let resp = match self.http.get(&url).send().await {
-            Ok(r) if r.status().is_success() => r,
-            Ok(r) => {
-                return Ok(ToolResult::failure(
-                    format!("profile photo download failed ({})", r.status()),
-                    elapsed(),
-                ))
-            }
-            Err(e) => {
-                return Ok(ToolResult::failure(
-                    format!("profile photo download failed: {e}"),
-                    elapsed(),
-                ))
-            }
+        let (bytes, media_type) = match fetch_photo(&self.http, &url).await {
+            Ok(photo) => photo,
+            Err(msg) => return Ok(ToolResult::failure(msg, elapsed())),
         };
-        let header_mt = resp
-            .headers()
-            .get(reqwest::header::CONTENT_TYPE)
-            .and_then(|v| v.to_str().ok())
-            .filter(|s| s.starts_with("image/"))
-            .map(str::to_string);
-        let bytes = match resp.bytes().await {
-            Ok(b) => b.to_vec(),
-            Err(e) => {
-                return Ok(ToolResult::failure(
-                    format!("failed to read profile photo bytes: {e}"),
-                    elapsed(),
-                ))
-            }
-        };
-        let media_type = header_mt.unwrap_or_else(|| sniff_media_type(&bytes).to_string());
 
         let display = input["name"]
             .as_str()
@@ -210,5 +210,44 @@ impl Tool for GetUserPhotoTool {
             }),
             elapsed(),
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    const HEIC: &[u8] = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../agent-runtime/src/attachments/testdata/gps.heic"
+    ));
+
+    async fn served(body: &[u8], content_type: &str) -> (MockServer, String) {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(body.to_vec(), content_type))
+            .mount(&server)
+            .await;
+        let url = format!("{}/avatar", server.uri());
+        (server, url)
+    }
+
+    #[tokio::test]
+    async fn a_heic_avatar_is_a_jpeg_whatever_the_cdn_calls_it() {
+        let (_server, url) = served(HEIC, "image/png").await;
+        let (bytes, media_type) = fetch_photo(&reqwest::Client::new(), &url).await.unwrap();
+        assert_eq!(media_type, "image/jpeg");
+        assert_eq!(&bytes[..3], [0xFF, 0xD8, 0xFF]);
+    }
+
+    #[tokio::test]
+    async fn an_avatar_in_no_format_a_model_reads_is_refused() {
+        let (_server, url) = served(b"II*\0\x08\0\0\0", "image/tiff").await;
+        let err = fetch_photo(&reqwest::Client::new(), &url)
+            .await
+            .unwrap_err();
+        assert!(err.contains("image/tiff"), "{err}");
     }
 }

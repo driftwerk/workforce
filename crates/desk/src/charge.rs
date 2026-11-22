@@ -39,8 +39,11 @@ text_enum!(How {
 text_enum!(ReleasedBy {
     // The person took it back.
     Person => "person",
-    // Its boss let it go (or Desk did, for a boss gone).
+    // Its boss let it go, or Desk did for a boss gone: no longer the boss's
+    // to close.
     Boss => "boss",
+    // Its boss let it go because its work was done.
+    Done => "done",
 });
 
 /// Who drives a charged session now.
@@ -130,6 +133,17 @@ impl Charge {
     /// Whether a boss runs it now: it hasn't been released.
     pub fn live(&self) -> bool {
         self.released_at.is_none()
+    }
+
+    /// Whether the person took it back from its boss.
+    pub fn taken_back(&self) -> bool {
+        self.released_by == Some(ReleasedBy::Person)
+    }
+
+    /// Whether its boss may still end it: it runs it, or let it go as done.
+    pub fn closable_by_boss(&self) -> bool {
+        matches!(self.how, How::Started | How::Handed)
+            && (self.live() || self.released_by == Some(ReleasedBy::Done))
     }
 }
 

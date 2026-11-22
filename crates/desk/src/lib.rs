@@ -39,6 +39,7 @@ mod crew_store;
 mod cwd;
 pub mod decision;
 pub mod decision_store;
+pub mod deps;
 mod devin;
 mod devin_config;
 pub mod directive;

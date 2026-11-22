@@ -478,3 +478,103 @@ fn states_come_from_status_options_or_open_closed_and_labels() {
         Some("Closed")
     );
 }
+
+#[test]
+fn of_the_other_connections_the_only_one_reaching_is_used_and_several_are_asked() {
+    let names = |n: &[&str]| n.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+    assert_eq!(among(vec![]), None);
+    assert_eq!(among(names(&["b"])), Some(Connection::Use("b".into())));
+    assert_eq!(
+        among(names(&["b", "c"])),
+        Some(Connection::Ask(names(&["b", "c"])))
+    );
+}
+
+#[test]
+fn a_connection_s_reach_is_what_github_said_or_unknown() {
+    let project = "github.project_get";
+    assert_eq!(reach_of(project, &Ok(json!({ "id": "PVT_1" }))), Reach::Yes);
+    assert_eq!(
+        reach_of(
+            project,
+            &Err(RemoteError::Failed("Not found: Not Found".into()))
+        ),
+        Reach::No
+    );
+    assert_eq!(
+        reach_of(
+            project,
+            &Err(RemoteError::Workspace {
+                what: "GitHub connection".into(),
+                asked: Some("x".into()),
+                names: vec![],
+            })
+        ),
+        Reach::No
+    );
+    assert_eq!(
+        reach_of("github.projects_list", &Ok(json!({ "projects": [] }))),
+        Reach::No
+    );
+    for no in [
+        "Forbidden (rate limit or permissions): Resource not accessible by integration",
+        "GitHub GraphQL FORBIDDEN: Resource not accessible",
+        "Authentication failed: Bad credentials",
+        "No project 7 for \"acme\"",
+    ] {
+        assert_eq!(
+            reach_of(project, &Err(RemoteError::Failed(no.into()))),
+            Reach::No,
+            "{no}"
+        );
+    }
+    for unknown in [
+        RemoteError::Failed("GitHub API error (502 Bad Gateway): ".into()),
+        RemoteError::Failed(
+            "Forbidden (rate limit or permissions): API rate limit exceeded".into(),
+        ),
+        RemoteError::Failed("GitHub GraphQL rate limited: limit".into()),
+        RemoteError::Failed("error sending request for url".into()),
+        RemoteError::Failed("tool not found: github.project_get".into()),
+        RemoteError::Failed("Tool github.project_get not found or not enabled".into()),
+        RemoteError::Offline("away".into()),
+        RemoteError::RateLimited {
+            retry_after_secs: None,
+        },
+        RemoteError::Waiting {
+            request_id: "r".into(),
+        },
+    ] {
+        assert_eq!(reach_of(project, &Err(unknown)), Reach::Unknown);
+    }
+}
+
+#[test]
+fn what_a_link_names_is_reached_by_its_own_read() {
+    assert_eq!(
+        reach_probe(Some("acme/projects/7"), Some("other")),
+        Some((
+            "github.project_get",
+            json!({ "owner": "acme", "number": 7 })
+        ))
+    );
+    assert_eq!(
+        reach_probe(Some("acme/web"), None),
+        Some((
+            "github.repo_labels",
+            json!({ "owner": "acme", "repo": "web" })
+        ))
+    );
+    assert_eq!(
+        reach_probe(None, Some("acme")),
+        Some(("github.projects_list", json!({ "owner": "acme" })))
+    );
+    assert_eq!(reach_probe(None, Some("-bad")), None);
+    assert_eq!(reach_probe(None, None), None);
+    assert!(reached("github.project_get", &json!({})));
+    assert!(reached(
+        "github.projects_list",
+        &json!({ "projects": [{ "number": 1 }] })
+    ));
+    assert!(!reached("github.projects_list", &json!({ "projects": [] })));
+}

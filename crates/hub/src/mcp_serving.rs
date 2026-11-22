@@ -289,15 +289,14 @@ impl McpServingAgent {
                 )
                 .with_logins(logins),
             ));
-            for tool in
-                crate::github_local::github_local_tools(crate::github_local::GithubLocalContext {
+            crate::github_local::register(
+                &tools,
+                crate::github_local::GithubLocalContext {
                     vault: Arc::clone(v),
                     global_vault: global_vault.clone(),
                     workspace: workspace.clone(),
-                })
-            {
-                tools.register(tool);
-            }
+                },
+            );
         }
 
         Ok(Self {

@@ -580,8 +580,7 @@ impl Desk {
     /// boss still sees it. One its boss (or Desk, for a boss gone or a
     /// group with a boss of its own) let go is the usual rules', as before.
     pub fn taken_back(&self, id: Uuid) -> bool {
-        self.charge_of(id)
-            .is_some_and(|c| !c.live() && c.released_by == Some(charge::ReleasedBy::Person))
+        self.charge_of(id).as_ref().is_some_and(Charge::taken_back)
     }
 
     /// What Desk shows of the charges: every live one, and every one let
@@ -1604,6 +1603,21 @@ impl Desk {
     /// `id`'s boss lets it go, or the person takes it back (`by`). Its row
     /// stays, so a boss that takes on every session never takes it again.
     pub async fn release(&self, id: Uuid, by: &By) -> Result<ChargeView, DeskError> {
+        self.release_as(id, by, charge::ReleasedBy::Boss).await
+    }
+
+    /// [`Self::release`] by a boss whose session's work is done: it still
+    /// ends it.
+    pub async fn release_done(&self, id: Uuid, by: &By) -> Result<ChargeView, DeskError> {
+        self.release_as(id, by, charge::ReleasedBy::Done).await
+    }
+
+    async fn release_as(
+        &self,
+        id: Uuid,
+        by: &By,
+        why: charge::ReleasedBy,
+    ) -> Result<ChargeView, DeskError> {
         let view = self.view(id)?;
         let Some(mut c) = self.charge_of(id).filter(Charge::live) else {
             return Err(DeskError::Conflict("No boss runs that session.".into()));
@@ -1615,7 +1629,7 @@ impl Desk {
         c.released_at = Some(now);
         c.released_by = Some(match by.party.kind {
             PartyKind::You => charge::ReleasedBy::Person,
-            _ => charge::ReleasedBy::Boss,
+            _ => why,
         });
         c.updated_at = now;
         let boss = Party::manager(&c.boss, &self.boss_name(&c.boss));

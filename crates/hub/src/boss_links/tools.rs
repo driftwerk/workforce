@@ -148,7 +148,7 @@ pub fn describe(name: &str) -> &'static str {
         "crew.resume" => "Resume a stopped session you run (session_id: <engine>/<id>), optionally with a prompt.",
         "crew.restart" => "Stop a session you run and resume it with a new prompt (session_id: <engine>/<id>), e.g. to get it unstuck.",
         "crew.start_session" => "Start a real, visible session on one of the group's engines (on), in one of the group's folders there, with a goal: the person sees it, can type into it and take it over, and you run it from the start. engine says Claude Code or Codex. The engine decides whether you may, and how many you run at once.",
-        "crew.release" => "Let a session you run go (session_id: <engine>/<id>): the person runs it on their own. Say why in reason.",
+        "crew.release" => "Let a session you run go (session_id: <engine>/<id>): the person runs it on their own. Say why in reason. Pass done: true only when its work is finished: that release alone keeps your right to close it; any other leaves closing it to the person.",
         _ => "",
     }
 }

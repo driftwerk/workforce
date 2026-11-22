@@ -407,3 +407,119 @@ async fn asked_to_close_what_is_finished_a_boss_closes_and_removes_its_own_and_n
     })
     .await;
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn asked_to_close_a_boss_ends_what_it_let_go_as_done_and_never_what_it_no_longer_runs_or_the_person_is_in(
+) {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(dir.path()).unwrap();
+        let (overseer, crew, d, _llm) = overseeing(&base, pool, "ok", FULL, &[]).await;
+        d.boss_bounds_with(workforce_desk::charge::Bounds {
+            home: base.clone(),
+            ..Default::default()
+        });
+        let boss = Party::manager("desk", &super::super::name_of(&overseer));
+        let clean = base.join("acme-web");
+        repo(&clean, "git@github.com:acme/acme-web.git");
+        let by_boss = By::manager("desk", &boss.name, "Its work is done.");
+        let release = overseer.tools.get("crew.release").unwrap();
+        let mut done = Vec::new();
+        for (name, how) in [("started", How::Started), ("handed", How::Handed)] {
+            let s = finished(&d, &crew, &base, &clean, name, &boss, how).await;
+            let r = release
+                .execute(json!({ "session_id": s.id.to_string(), "reason": "Finished.", "done": true }))
+                .await
+                .unwrap();
+            assert!(r.success, "{r:?}");
+            done.push(s);
+        }
+        let by_desk = finished(&d, &crew, &base, &clean, "desk", &boss, How::Started).await;
+        let r = release
+            .execute(json!({ "session_id": by_desk.id.to_string(), "reason": "Yours now." }))
+            .await
+            .unwrap();
+        assert!(r.success, "{r:?}");
+        let theirs = finished(&d, &crew, &base, &clean, "theirs", &boss, How::Started).await;
+        d.release(theirs.id, &By::you()).await.unwrap();
+        let typing = finished(&d, &crew, &base, &clean, "typing", &boss, How::Started).await;
+        let url = hook_url(&base, typing.id).await;
+        hook(
+            &url,
+            json!({"hook_event_name": "UserPromptSubmit", "prompt": "one more thing"}),
+        )
+        .await;
+        hook(
+            &url,
+            json!({"hook_event_name": "Stop", "last_assistant_message": "Done that too."}),
+        )
+        .await;
+        let typing = eventually("its turn to end again", async || {
+            d.view(typing.id)
+                .ok()
+                .filter(|v| v.state == SessionState::Done && v.prompts > typing.prompts)
+        })
+        .await;
+        d.release_done(typing.id, &by_boss).await.unwrap();
+        *crew.close_settle.lock() = chrono::Duration::zero();
+        assert!(d.charges().iter().all(|c| c.boss != "desk"), "none live");
+
+        let close = overseer.tools.get(super::super::closing::TOOL).unwrap();
+        let ask = |s: &SessionView| {
+            json!({ "session_id": s.id.to_string(), "reason": "The person asked to close the finished sessions." })
+        };
+        let r = close.execute(ask(&by_desk)).await.unwrap();
+        assert!(r.success && r.output["suggested"].is_string(), "{r:?}");
+        let r = close.execute(ask(&theirs)).await.unwrap();
+        assert!(!r.success, "{r:?}");
+        assert!(
+            r.error.as_deref().is_some_and(|e| e.contains("took theirs back")),
+            "{r:?}"
+        );
+        for s in [&by_desk, &theirs] {
+            assert_ne!(state(&d, s.id), SessionState::Closed);
+        }
+        let r = close.execute(ask(&typing)).await.unwrap();
+        assert!(!r.success, "{r:?}");
+        assert!(
+            r.error.as_deref().is_some_and(|e| e.contains("in it now")),
+            "{r:?}"
+        );
+        assert_ne!(state(&d, typing.id), SessionState::Closed);
+        for s in &done {
+            let r = close.execute(ask(s)).await.unwrap();
+            assert!(r.success, "{r:?}");
+            eventually("it is closed and removed", async || {
+                d.view(s.id).is_err().then_some(())
+            })
+            .await;
+        }
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_sweep_never_closes_a_session_its_boss_let_go() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(dir.path()).unwrap();
+        let (overseer, crew, d, _llm) = overseeing(&base, pool, "ok", ACT, &[]).await;
+        let boss = Party::manager("desk", &super::super::name_of(&overseer));
+        let plain = base.join("notes");
+        std::fs::create_dir_all(&plain).unwrap();
+        let let_go = finished(&d, &crew, &base, &plain, "let-go", &boss, How::Started).await;
+        let running = finished(&d, &crew, &base, &plain, "running", &boss, How::Started).await;
+        d.release_done(let_go.id, &By::manager("desk", &boss.name, "Done."))
+            .await
+            .unwrap();
+        *crew.close_settle.lock() = chrono::Duration::zero();
+        crew.look_at_finished_sessions().await;
+        eventually("the one it still runs closed", async || {
+            crew.look_at_finished_sessions().await;
+            (state(&d, running.id) == SessionState::Closed).then_some(())
+        })
+        .await;
+        assert_eq!(state(&d, let_go.id), SessionState::Done);
+    })
+    .await;
+}

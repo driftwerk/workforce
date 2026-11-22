@@ -4123,7 +4123,6 @@ async fn the_documents_folder_is_said_only_to_the_hubs_person_and_never_made() {
     use axum::body::Body;
     use axum::http::Request;
     use tower::ServiceExt as _;
-    use workforce_identity::store::IdentityStore as _;
     use workforce_identity::types::{Identity, IdentityRole};
     let h = hub().await;
     let dir = tempfile::tempdir().unwrap();

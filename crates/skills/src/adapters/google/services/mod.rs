@@ -37,6 +37,7 @@ pub fn build_all(ctx: Arc<GoogleApis>) -> Vec<Arc<dyn Tool>> {
         "google.workspaces",
         "The Google accounts you can use, by name, as {workspaces, default}: default is the one a call without `workspace` goes to, or null when you must pass one. Takes no arguments.",
         ctx,
+        None,
     )));
     out
 }

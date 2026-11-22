@@ -402,7 +402,7 @@ impl Cloner {
 
 /// The program `name` on this computer: on its `PATH`, or where it is
 /// usually installed.
-fn program(name: &str, home: &Path, env: &[(String, String)]) -> Option<PathBuf> {
+pub(crate) fn program(name: &str, home: &Path, env: &[(String, String)]) -> Option<PathBuf> {
     let path = env
         .iter()
         .find(|(k, _)| k == "PATH")

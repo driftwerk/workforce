@@ -2223,7 +2223,8 @@ impl Desk {
         };
         if s.me_source == Some(board::MeSource::Typed) {
             return Err(DeskError::Conflict(format!(
-                "You typed your {title} id, so Desk can't vouch it's you: Take it needs {hub} to say who you are."
+                "You typed your {title} id, so Desk can't vouch it's you: Take it needs {} to say who you are.",
+                board::in_sentence(hub)
             )));
         }
         // Only someone the hub vouched for, on this board, is assigned to:

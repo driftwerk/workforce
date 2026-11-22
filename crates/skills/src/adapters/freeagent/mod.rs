@@ -98,6 +98,7 @@ impl FreeAgentSkill {
             WORKSPACES_TOOL_NAME,
             WORKSPACES_DESCRIPTION,
             self.context.clients(),
+            None,
         )));
         tools
     }
