@@ -13,7 +13,7 @@ use super::*;
 use workforce_common::channels::desk::DeliveryKind;
 use workforce_desk::account::{Account, Done};
 use workforce_desk::crew::PartyKind;
-use workforce_desk::model::SessionState;
+use workforce_desk::model::{SessionState, SessionView};
 use workforce_desk::open_item::{NewItem, OpenItem, OpenKind, OpenState};
 use workforce_desk::update::MentionedUpdate;
 use workforce_desk::update_write::{self as write, Mover, Said};
@@ -374,6 +374,36 @@ async fn a_stall_on_red_ci_is_said_from_what_desk_already_knows() {
         })
         .await;
         assert_eq!(woke.len(), 1, "{woke:?}");
+        let kept_red = |v: &SessionView| {
+            crew.stall_kept(v, &o)
+                .filter(|(_, s)| s.kind == workforce_desk::sight::StallKind::CiRed)
+        };
+        assert!(kept_red(&v).is_some(), "red as kept");
+
+        // It pushes a fix and finishes: what was kept of its folder and its
+        // PR is of the head it pushed past, never said as red.
+        std::fs::write(folder.join("fix.txt"), "fixed").unwrap();
+        super::act_fully::git(&folder, &["add", "fix.txt"]);
+        super::act_fully::git(&folder, &["commit", "-q", "-m", "Fix"]);
+        let before = chrono::Utc::now();
+        hook(
+            &url,
+            json!({"hook_event_name": "UserPromptSubmit", "prompt": "Fix the build"}),
+        )
+        .await;
+        hook(
+            &url,
+            json!({"hook_event_name": "Stop", "last_assistant_message": "Pushed the fix."}),
+        )
+        .await;
+        let pushed = eventually("its next turn done", async || {
+            d.view(s.id)
+                .ok()
+                .filter(|v| v.state == SessionState::Done)
+                .filter(|_| d.state_since(s.id).is_some_and(|at| at > before))
+        })
+        .await;
+        assert!(kept_red(&pushed).is_none(), "no stale red after its push");
     })
     .await;
 }

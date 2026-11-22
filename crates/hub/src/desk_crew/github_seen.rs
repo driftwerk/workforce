@@ -478,19 +478,40 @@ fn listed_of(got: &Value) -> Vec<Listed> {
 type Reading = std::pin::Pin<Box<dyn Future<Output = Result<Value, GithubError>> + Send>>;
 
 impl GithubSeen {
-    /// The pull request that is `branch`'s work on `repo` as GitHub last
-    /// said, however long ago: nothing is read for it.
-    pub(crate) fn branch_kept(&self, repo: &str, branch: &str) -> Option<Pull> {
-        let listed = &self
+    /// The pull request that is `branch`'s work on `repo` as GitHub said
+    /// within `within` of `now`, the branch's list and the pull request
+    /// both: nothing is read for it.
+    pub(crate) fn branch_kept(
+        &self,
+        repo: &str,
+        branch: &str,
+        now: Instant,
+        within: Duration,
+    ) -> Option<Pull> {
+        let fresh = |read: Instant| now.saturating_duration_since(read) < within;
+        let listed = self
             .branches
             .kept
-            .get(&(repo.to_string(), branch.to_string()))?
-            .value;
-        let n = its_pull(listed)?;
+            .get(&(repo.to_string(), branch.to_string()))
+            .filter(|k| fresh(k.read))?;
+        let n = its_pull(&listed.value)?;
         self.pulls
             .kept
             .get(&(repo.to_string(), n))
+            .filter(|k| fresh(k.read))
             .map(|k| k.value.clone())
+    }
+
+    /// Forgets what GitHub said of `branch` of `repo` and of its pull
+    /// request: both are read anew when next asked.
+    pub(crate) fn forget_branch(&mut self, repo: &str, branch: &str) {
+        let listed = self
+            .branches
+            .kept
+            .remove(&(repo.to_string(), branch.to_string()));
+        if let Some(n) = listed.and_then(|k| its_pull(&k.value)) {
+            self.pulls.kept.remove(&(repo.to_string(), n));
+        }
     }
 }
 
@@ -553,10 +574,18 @@ impl CrewHub {
         branch_pull(&self.github_seen, &read, repo, branch, Instant::now()).await
     }
 
-    /// The pull request that is `branch`'s work on `repo` as GitHub last
-    /// said: nothing is read for it.
-    pub(super) fn branch_pull_kept(&self, repo: &str, branch: &str) -> Option<Pull> {
-        self.github_seen.lock().branch_kept(repo, branch)
+    /// The pull request that is `branch`'s work on `repo` as GitHub said
+    /// within `within` of `now`: nothing is read for it.
+    pub(super) fn branch_pull_kept(
+        &self,
+        repo: &str,
+        branch: &str,
+        now: Instant,
+        within: Duration,
+    ) -> Option<Pull> {
+        self.github_seen
+            .lock()
+            .branch_kept(repo, branch, now, within)
     }
 
     /// Takes `p` as what GitHub says of pull request `n` of `repo` now.
@@ -596,6 +625,38 @@ mod tests {
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     const MINUTE: Duration = Duration::from_secs(60);
+
+    #[test]
+    fn a_branchs_kept_pull_is_given_within_its_bound_until_forgotten() {
+        let mut seen = GithubSeen::default();
+        let t0 = Instant::now();
+        let (repo, branch) = ("acme/web", "main");
+        let listed = Listed {
+            number: 7,
+            open: true,
+            merged: false,
+        };
+        let branch_key = (repo.to_string(), branch.to_string());
+        keep(&mut seen.branches.kept, branch_key, vec![listed], t0);
+        let p = Pull {
+            number: 7,
+            open: true,
+            ..Default::default()
+        };
+        keep(&mut seen.pulls.kept, (repo.to_string(), 7), p, t0 + MINUTE);
+        let kept = |seen: &GithubSeen, at, within| {
+            seen.branch_kept(repo, branch, at, within).map(|p| p.number)
+        };
+        assert_eq!(kept(&seen, t0 + MINUTE, 2 * MINUTE), Some(7));
+        assert_eq!(
+            kept(&seen, t0 + 2 * MINUTE, 2 * MINUTE),
+            None,
+            "its branch's list read too long ago"
+        );
+        seen.forget_branch(repo, branch);
+        assert_eq!(kept(&seen, t0 + MINUTE, 2 * MINUTE), None);
+        assert!(seen.pulls.kept.is_empty(), "its pull request forgotten too");
+    }
 
     async fn pr_at(server: &MockServer, n: u64, body: Value, times: u64) {
         Mock::given(method("GET"))

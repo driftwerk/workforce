@@ -412,11 +412,21 @@ impl CrewHub {
             .or_else(|| self.red_kept(v, o))
     }
 
-    /// `v`'s PR's red CI, from its folder and its PR as last read.
+    /// `v`'s PR's red CI, from its folder and its PR as last read, both
+    /// since its state last changed and within [`WORKSPACE_KEPT`]: what was
+    /// read before its turn ended may be of a head it has pushed past.
     fn red_kept(&self, v: &SessionView, o: &Oversight) -> Option<(Glance, Stall)> {
-        let ws = self.workspace_kept(&v.cwd, Instant::now(), WORKSPACE_KEPT)?;
+        let now = Instant::now();
+        let within = self.desk.state_since(v.id).map_or(WORKSPACE_KEPT, |at| {
+            (chrono::Utc::now() - at)
+                .to_std()
+                .unwrap_or_default()
+                .min(WORKSPACE_KEPT)
+        });
+        let ws = self.workspace_kept(&v.cwd, now, within)?;
         let r = PrRef::of(&ws)?;
-        let pull = self.branch_pull_kept(r.origin.as_deref()?, r.branch.as_deref()?)?;
+        let pull =
+            self.branch_pull_kept(r.origin.as_deref()?, r.branch.as_deref()?, now, within)?;
         let mut g = self.desk.glance(v);
         g.workspace = workspace_glance(&ws);
         let pr = PullSeen {
@@ -474,16 +484,32 @@ impl CrewHub {
         }
     }
 
-    /// The folder `cwd` as git read it within the last [`WORKSPACE_FOR`].
+    /// The folder `cwd` as git read it within the last [`WORKSPACE_FOR`]. A
+    /// read that finds its head moved forgets what GitHub said of its
+    /// branch's PR.
     async fn workspace_seen(&self, cwd: &str) -> Workspace {
         let now = Instant::now();
         if let Some(w) = self.workspace_kept(cwd, now, WORKSPACE_FOR) {
             return w;
         }
         let w = workspace::workspace_of(cwd).await;
-        let mut kept = self.workspaces.lock();
-        kept.retain(|_, (_, at)| now.saturating_duration_since(*at) < WORKSPACE_KEPT);
-        kept.insert(cwd.to_string(), (w.clone(), now));
+        let was = {
+            let mut kept = self.workspaces.lock();
+            let was = kept.insert(cwd.to_string(), (w.clone(), now));
+            kept.retain(|_, (_, at)| now.saturating_duration_since(*at) < WORKSPACE_KEPT);
+            was
+        };
+        let moved = was
+            .and_then(|(was, _)| PrRef::of(&was))
+            .filter(|was| PrRef::of(&w).is_some_and(|r| r.head != was.head));
+        if let Some(PrRef {
+            origin: Some(origin),
+            branch: Some(branch),
+            ..
+        }) = moved
+        {
+            self.github_seen.lock().forget_branch(&origin, &branch);
+        }
         w
     }
 
