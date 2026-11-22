@@ -143,7 +143,11 @@ impl Asks {
 /// its own (`X=1;`), or `export`, `declare`, `typeset`, `readonly`,
 /// `local`.
 fn sets(simple: &Simple) -> Vec<String> {
-    let name = |w: &Word| w.text.split_once('=').map_or(w.text.clone(), |(n, _)| n.to_string());
+    let name = |w: &Word| {
+        w.text
+            .split_once('=')
+            .map_or(w.text.clone(), |(n, _)| n.to_string())
+    };
     let declares = simple.words.first().is_some_and(|w| {
         matches!(
             w.text.as_str(),
@@ -156,9 +160,7 @@ fn sets(simple: &Simple) -> Vec<String> {
             .filter(|w| !is_option(w))
             .map(name)
             .collect(),
-        false if simple.words.iter().all(is_assignment) => {
-            simple.words.iter().map(name).collect()
-        }
+        false if simple.words.iter().all(is_assignment) => simple.words.iter().map(name).collect(),
         false => Vec::new(),
     }
 }
@@ -316,8 +318,7 @@ impl Place<'_> {
     /// a relative path with no known cwd, or one spelled under the home.
     fn could_be_home(&self, word: &Word) -> bool {
         let text = word.text.as_str();
-        if word.dynamic || word.brace || word.glob || text.starts_with('~') || text.contains("..")
-        {
+        if word.dynamic || word.brace || word.glob || text.starts_with('~') || text.contains("..") {
             return true;
         }
         let path = match (Path::new(text).is_absolute(), self.cwd.as_ref()) {
@@ -380,7 +381,10 @@ impl Place<'_> {
         };
         match self.deletable(&to) {
             true => None,
-            false => Some(self.kept(std::slice::from_ref(&to)).unwrap_or(Asks::ForGood)),
+            false => Some(
+                self.kept(std::slice::from_ref(&to))
+                    .unwrap_or(Asks::ForGood),
+            ),
         }
     }
 
@@ -738,11 +742,35 @@ fn no_long(_: &str) -> Option<bool> {
 /// -P`, `time -o`).
 fn wrapped(name: &str, args: &[&Word]) -> Option<Result<usize, ()>> {
     let (short, long, before): (Short, fn(&str) -> Option<bool>, usize) = match name {
-        "exec" => (Short { flags: "cl", valued: "a" }, no_long, 0),
-        "command" => (Short { flags: "pvV", valued: "" }, no_long, 0),
-        "builtin" | "nohup" => (Short { flags: "", valued: "" }, no_long, 0),
+        "exec" => (
+            Short {
+                flags: "cl",
+                valued: "a",
+            },
+            no_long,
+            0,
+        ),
+        "command" => (
+            Short {
+                flags: "pvV",
+                valued: "",
+            },
+            no_long,
+            0,
+        ),
+        "builtin" | "nohup" => (
+            Short {
+                flags: "",
+                valued: "",
+            },
+            no_long,
+            0,
+        ),
         "time" => (
-            Short { flags: "pvaq", valued: "f" },
+            Short {
+                flags: "pvaq",
+                valued: "f",
+            },
             |n| match n {
                 "portability" | "verbose" | "quiet" | "append" => Some(false),
                 "format" => Some(true),
@@ -750,14 +778,27 @@ fn wrapped(name: &str, args: &[&Word]) -> Option<Result<usize, ()>> {
             },
             0,
         ),
-        "caffeinate" => (Short { flags: "dimsu", valued: "tw" }, no_long, 0),
+        "caffeinate" => (
+            Short {
+                flags: "dimsu",
+                valued: "tw",
+            },
+            no_long,
+            0,
+        ),
         "nice" => (
-            Short { flags: "0123456789", valued: "n" },
+            Short {
+                flags: "0123456789",
+                valued: "n",
+            },
             |n| (n == "adjustment").then_some(true),
             0,
         ),
         "timeout" => (
-            Short { flags: "v", valued: "ks" },
+            Short {
+                flags: "v",
+                valued: "ks",
+            },
             |n| match n {
                 "foreground" | "preserve-status" | "verbose" => Some(false),
                 "kill-after" | "signal" => Some(true),
@@ -766,12 +807,18 @@ fn wrapped(name: &str, args: &[&Word]) -> Option<Result<usize, ()>> {
             1,
         ),
         "stdbuf" => (
-            Short { flags: "", valued: "ioe" },
+            Short {
+                flags: "",
+                valued: "ioe",
+            },
             |n| matches!(n, "input" | "output" | "error").then_some(true),
             0,
         ),
         "env" => (
-            Short { flags: "i0v", valued: "u" },
+            Short {
+                flags: "i0v",
+                valued: "u",
+            },
             |n| match n {
                 "ignore-environment" | "null" | "debug" => Some(false),
                 "unset" => Some(true),
@@ -779,9 +826,19 @@ fn wrapped(name: &str, args: &[&Word]) -> Option<Result<usize, ()>> {
             },
             0,
         ),
-        "ionice" => (Short { flags: "t", valued: "cnpPu" }, no_long, 0),
+        "ionice" => (
+            Short {
+                flags: "t",
+                valued: "cnpPu",
+            },
+            no_long,
+            0,
+        ),
         "setsid" => (
-            Short { flags: "cfw", valued: "" },
+            Short {
+                flags: "cfw",
+                valued: "",
+            },
             |n| matches!(n, "ctty" | "fork" | "wait").then_some(false),
             0,
         ),
@@ -888,9 +945,18 @@ fn plain_setting(value: &Word) -> bool {
         .unwrap_or((text, ""));
     let rest = rest.trim_start_matches(|c: char| c == '=' || c.is_whitespace());
     match key.to_ascii_lowercase().as_str() {
-        "port" | "user" | "identityfile" | "identitiesonly" | "batchmode" | "connecttimeout"
-        | "stricthostkeychecking" | "userknownhostsfile" | "serveraliveinterval"
-        | "serveralivecountmax" | "loglevel" | "compression" => true,
+        "port"
+        | "user"
+        | "identityfile"
+        | "identitiesonly"
+        | "batchmode"
+        | "connecttimeout"
+        | "stricthostkeychecking"
+        | "userknownhostsfile"
+        | "serveraliveinterval"
+        | "serveralivecountmax"
+        | "loglevel"
+        | "compression" => true,
         "forwardagent" => rest.eq_ignore_ascii_case("no"),
         _ => false,
     }
@@ -911,9 +977,7 @@ fn ssh_call<'w>(name: &str, args: &[&'w Word]) -> Option<Vec<&'w Word>> {
     let long = |n: &str| match name {
         "mosh" => match n {
             "no-init" | "no-ssh-pty" | "local" | "predict-overwrite" => Some(false),
-            "family" | "port" | "predict" | "bind-server" | "experimental-remote-ip" => {
-                Some(true)
-            }
+            "family" | "port" | "predict" | "bind-server" | "experimental-remote-ip" => Some(true),
             _ => None,
         },
         _ => None,
@@ -945,13 +1009,11 @@ fn plain_rsh(value: &Word) -> bool {
     let words: Vec<&Word> = one.words.iter().collect();
     one.writes.is_empty()
         && !one.fed
-        && words
-            .split_first()
-            .is_some_and(|(first, rest)| {
-                !first.dynamic
-                    && first.text.rsplit('/').next() == Some("ssh")
-                    && ssh_call("ssh", rest).is_some_and(|ops| ops.is_empty())
-            })
+        && words.split_first().is_some_and(|(first, rest)| {
+            !first.dynamic
+                && first.text.rsplit('/').next() == Some("ssh")
+                && ssh_call("ssh", rest).is_some_and(|ops| ops.is_empty())
+        })
 }
 
 /// `rsync`'s options: short ones as its table gives them, long ones
@@ -1983,8 +2045,8 @@ fn classify_words(
             let long = |n: &str| match n {
                 "null" | "verbose" | "no-run-if-empty" | "interactive" | "exit" | "show-limits"
                 | "open-tty" => Some(false),
-                "arg-file" | "delimiter" | "max-args" | "max-procs" | "max-chars"
-                | "max-lines" | "process-slot-var" => Some(true),
+                "arg-file" | "delimiter" | "max-args" | "max-procs" | "max-chars" | "max-lines"
+                | "process-slot-var" => Some(true),
                 _ => None,
             };
             let Ok((_, ops)) = getopt(args, &short, long, 0) else {
@@ -2136,21 +2198,27 @@ fn classify_words(
         "tar" | "bsdtar" | "gtar" => tar(args, place),
         "unzip" => {
             let extracts = !args.iter().any(|w| {
-                w.text.starts_with('-') && !w.text.starts_with("--") && w.text.contains(['l', 'p', 't', 'v', 'Z'])
+                w.text.starts_with('-')
+                    && !w.text.starts_with("--")
+                    && w.text.contains(['l', 'p', 't', 'v', 'Z'])
             });
-            if args.iter().any(|w| w.text.starts_with('-') && w.text.contains(':')) {
+            if args
+                .iter()
+                .any(|w| w.text.starts_with('-') && w.text.contains(':'))
+            {
                 return Some(Asks::Unclear);
             }
-            let dest = args.iter().enumerate().find_map(|(at, w)| {
-                match w.text.strip_prefix("-d") {
-                    Some("") => args.get(at + 1).map(|d| (*d).clone()),
-                    Some(rest) => Some(Word {
-                        text: rest.to_string(),
-                        ..(*w).clone()
-                    }),
-                    None => None,
-                }
-            });
+            let dest =
+                args.iter()
+                    .enumerate()
+                    .find_map(|(at, w)| match w.text.strip_prefix("-d") {
+                        Some("") => args.get(at + 1).map(|d| (*d).clone()),
+                        Some(rest) => Some(Word {
+                            text: rest.to_string(),
+                            ..(*w).clone()
+                        }),
+                        None => None,
+                    });
             extracts.then(|| place.extracts(dest.as_ref())).flatten()
         }
         "ditto" => {
@@ -2372,8 +2440,9 @@ fn classify_words(
 
 /// The folder `-t`/`--target-directory` names.
 fn target_dir(args: &[&Word]) -> Option<Word> {
-    args.iter().enumerate().find_map(|(at, w)| {
-        match w.text.strip_prefix("--target-directory") {
+    args.iter()
+        .enumerate()
+        .find_map(|(at, w)| match w.text.strip_prefix("--target-directory") {
             Some(rest) if rest.starts_with('=') => Some(Word {
                 text: rest[1..].to_string(),
                 ..(*w).clone()
@@ -2381,8 +2450,7 @@ fn target_dir(args: &[&Word]) -> Option<Word> {
             Some("") => args.get(at + 1).map(|d| (*d).clone()),
             _ if w.text == "-t" => args.get(at + 1).map(|d| (*d).clone()),
             _ => None,
-        }
-    })
+        })
 }
 
 /// What a shell runs: the script given with `-c`, read as commands once
@@ -2479,7 +2547,9 @@ fn tar(args: &[&Word], place: &Place<'_>) -> Option<Asks> {
     for (at, w) in args.iter().enumerate() {
         let t = w.text.as_str();
         let long = t.split_once('=').map_or(t, |(n, _)| n);
-        if RUNS.contains(&long) || (cluster(w) && t.contains(['P', 'I', 'F'])) || w.dynamic && t.starts_with('-')
+        if RUNS.contains(&long)
+            || (cluster(w) && t.contains(['P', 'I', 'F']))
+            || w.dynamic && t.starts_with('-')
         {
             return Some(Asks::Unclear);
         }
@@ -2649,13 +2719,31 @@ fn runs_through(setting: &Word) -> bool {
             | "init.templatedir"
             | "include.path"
             | "uploadpack.packobjectshook"
-    ) || ["alias.", "includeif.", "pager.", "filter.", "difftool.", "mergetool.", "url.", "protocol."]
-        .iter()
-        .any(|p| key.starts_with(p))
+    ) || [
+        "alias.",
+        "includeif.",
+        "pager.",
+        "filter.",
+        "difftool.",
+        "mergetool.",
+        "url.",
+        "protocol.",
+    ]
+    .iter()
+    .any(|p| key.starts_with(p))
         || matches!(
             last,
-            "command" | "cmd" | "textconv" | "driver" | "program" | "helper" | "tool"
-                | "receivepack" | "uploadpack" | "proxy" | "sshcommand"
+            "command"
+                | "cmd"
+                | "textconv"
+                | "driver"
+                | "program"
+                | "helper"
+                | "tool"
+                | "receivepack"
+                | "uploadpack"
+                | "proxy"
+                | "sshcommand"
         )
 }
 
@@ -2701,7 +2789,10 @@ fn git(args: &[&Word], assigns: &[&Word], place: &Place<'_>) -> Option<Asks> {
         .filter_map(|w| w.text.split_once('=').map(|(n, _)| n))
         .chain(place.set.iter().map(String::as_str))
         .collect();
-    if set.iter().any(|n| GIT_RUNS.contains(n) || n.starts_with("GIT_CONFIG")) {
+    if set
+        .iter()
+        .any(|n| GIT_RUNS.contains(n) || n.starts_with("GIT_CONFIG"))
+    {
         return Some(Asks::Unclear);
     }
     let elsewhere = set

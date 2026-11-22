@@ -173,13 +173,13 @@ pub fn decide_unattended(
                 if why.never_unattended() && !gate.is_some_and(|g| g.acts_fully()) =>
             {
                 Verdict::Refuse {
-                refusal: workforce_core::computer::Refusal {
-                    rule: workforce_core::computer::Refused::OutsideLevel,
-                    sentence: format!(
+                    refusal: workforce_core::computer::Refusal {
+                        rule: workforce_core::computer::Refused::OutsideLevel,
+                        sentence: format!(
                         "{tool_name} wasn't run with nobody there to ask: {}. Ask for it in Desk.",
                         why.sentence()
                     ),
-                },
+                    },
                 }
             }
             _ => Verdict::Run {
@@ -625,9 +625,13 @@ mod tests {
                 decided.verdict
             );
         }
-        let decided =
-            decide_unattended(Some(&Asking(Why::CantBeUndone, false)), &tools, "exec.run", &input)
-                .unwrap();
+        let decided = decide_unattended(
+            Some(&Asking(Why::CantBeUndone, false)),
+            &tools,
+            "exec.run",
+            &input,
+        )
+        .unwrap();
         assert_eq!(decided.verdict, Verdict::Run { by: By::Unattended });
         for why in [Why::Unclear, Why::ForGood, Why::System] {
             let decided =
