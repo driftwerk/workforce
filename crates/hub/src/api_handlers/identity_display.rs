@@ -139,12 +139,10 @@ pub fn hydrate_identity_rows(
         .collect()
 }
 
-/// Resolve an agent's display name from config. Returns the id itself
-/// when no `name` is set or the agent isn't registered.
+/// Resolve an agent's display name, a rename's at once. Returns the id
+/// itself when no `name` is set or the agent isn't registered.
 pub fn resolve_agent_display(registry: &AgentRegistry, id: &str) -> AgentRef {
-    let display = registry
-        .get(id)
-        .and_then(|svc| svc.config.agent_by_id(id).and_then(|a| a.name.clone()));
+    let display = registry.get(id).and_then(|svc| svc.display_name());
     AgentRef {
         id: id.to_string(),
         display_name: display.unwrap_or_else(|| id.to_string()),

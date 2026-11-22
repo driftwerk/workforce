@@ -422,6 +422,61 @@ pub fn workspaces_answer<V>(clients: &HashMap<String, V>, default: &str) -> Valu
     })
 }
 
+/// `<connector>.workspaces`: the caller's instances of a connector by name
+/// (never a key), and the one a call naming none goes to, so a program
+/// (Desk's board link) with several picks one.
+pub struct WorkspacesTool<C> {
+    name: &'static str,
+    description: &'static str,
+    instances: Arc<LiveInstances<C>>,
+    fixed_default: Option<String>,
+}
+
+impl<C> WorkspacesTool<C> {
+    /// `fixed_default`: the default a fixed set's tools were built with;
+    /// `None` takes the set's own.
+    pub fn new(
+        name: &'static str,
+        description: &'static str,
+        instances: Arc<LiveInstances<C>>,
+        fixed_default: Option<String>,
+    ) -> Self {
+        Self {
+            name,
+            description,
+            instances,
+            fixed_default,
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl<C: Send + Sync + 'static> workforce_agent::tools::Tool for WorkspacesTool<C> {
+    fn name(&self) -> &str {
+        self.name
+    }
+
+    fn description(&self) -> &str {
+        self.description
+    }
+
+    fn input_schema(&self) -> Value {
+        json!({ "type": "object", "properties": {}, "required": [] })
+    }
+
+    async fn execute(&self, _input: Value) -> eyre::Result<workforce_agent::tools::ToolResult> {
+        let start = std::time::Instant::now();
+        let (clients, default) = match &self.fixed_default {
+            Some(fixed) => self.instances.for_caller_or(fixed),
+            None => self.instances.for_caller(),
+        };
+        Ok(workforce_agent::tools::ToolResult::success(
+            workspaces_answer(&clients, &default),
+            start.elapsed().as_millis() as u64,
+        ))
+    }
+}
+
 /// The `Available: …. Default: ….` tail of an instance parameter's
 /// description; the default reads `none — pass <param>` when no instance
 /// carries that name.

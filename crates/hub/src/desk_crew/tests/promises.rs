@@ -5,6 +5,7 @@
 //! or nothing changes for 3 days.
 
 use super::super::actions::{Action, Target, STATUS_QUESTION};
+use super::updates::begun;
 use super::*;
 use workforce_desk::open_item::{ClosedBy, NewItem, OpenKind, OpenState};
 
@@ -498,8 +499,7 @@ async fn orders_that_simply_ended_say_nothing_and_the_same_order_twice_is_one() 
     with_test_pool(workforce_desk::store::build_pool, |pool| async move {
         let dir = tempfile::tempdir().unwrap();
         let (overseer, crew, d, _llm) = overseeing(dir.path(), pool, "ok", ACT, &[]).await;
-        crew.look_at_updates().await;
-        tokio::time::sleep(Duration::from_millis(20)).await;
+        begun(&crew).await;
         let s = new_session(&d, dir.path(), "cufflink").await;
         let other = new_session(&d, dir.path(), "cufflink-docs").await;
         let order = |text: &str, sessions: Vec<uuid::Uuid>| {

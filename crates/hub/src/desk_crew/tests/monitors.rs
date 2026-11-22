@@ -223,18 +223,24 @@ async fn away_from_the_dm_what_monitors_saw_gathers_into_one_message_for_their_r
             back.content
         );
         assert!(back.content.contains("Second invoice") && back.content.contains("Third invoice"));
+        let forgotten = async || {
+            d.store()
+                .monitor_held_for("scout")
+                .await
+                .unwrap()
+                .is_empty()
+        };
+        eventually("what was told forgotten", async || {
+            forgotten().await.then_some(())
+        })
+        .await;
         tokio::time::sleep(Duration::from_millis(300)).await;
         assert_eq!(
             told(&scout, DeliveryKind::Monitor).len(),
             2,
             "one message for both"
         );
-        assert!(d
-            .store()
-            .monitor_held_for("scout")
-            .await
-            .unwrap()
-            .is_empty());
+        assert!(forgotten().await);
     })
     .await;
 }

@@ -22,6 +22,7 @@ use super::journal::{self, BulkAction, BulkJob, MarkFlag, Origin};
 use super::mailbox::{decoded, Mailbox, Role};
 use super::schemas;
 use super::session::{MailSession, Timed};
+use super::tools::refused_write;
 use super::uids::UidSet;
 use super::unsubscribe::{self, Method};
 
@@ -435,6 +436,9 @@ impl Tool for EmailBulkTool {
 
     async fn execute(&self, input: Value) -> Result<ToolResult> {
         let start = Instant::now();
+        if let Some(refused) = refused_write(&self.connector, &input, start).await {
+            return Ok(refused);
+        }
         Ok(ToolResult::timed(
             bulk_call(&self.connector, &input, self.intent).await,
             start,
@@ -493,6 +497,9 @@ impl Tool for EmailUndoTool {
 
     async fn execute(&self, input: Value) -> Result<ToolResult> {
         let start = Instant::now();
+        if let Some(refused) = refused_write(&self.connector, &input, start).await {
+            return Ok(refused);
+        }
         Ok(ToolResult::timed(
             undo_call(&self.connector, &input).await,
             start,
@@ -607,6 +614,9 @@ impl Tool for EmailFolderTool {
 
     async fn execute(&self, input: Value) -> Result<ToolResult> {
         let start = Instant::now();
+        if let Some(refused) = refused_write(&self.connector, &input, start).await {
+            return Ok(refused);
+        }
         let outcome: Result<Value, String> = async {
             let account = account_of(&input)?;
             let mut connector = self.connector.lock().await;
@@ -847,6 +857,11 @@ impl Tool for EmailUnsubscribeTool {
 
     async fn execute(&self, input: Value) -> Result<ToolResult> {
         let start = Instant::now();
+        if self.step == UnsubscribeStep::Leave {
+            if let Some(refused) = refused_write(&self.connector, &input, start).await {
+                return Ok(refused);
+            }
+        }
         Ok(ToolResult::timed(
             unsubscribe_call(&self.connector, self.step, &input).await,
             start,

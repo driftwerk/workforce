@@ -2263,6 +2263,12 @@ pub(crate) async fn build_enhanced_prompt_with_context(
     if let Some(line) = works_in_line(&service.workspace) {
         meta_lines.push(line);
     }
+    #[cfg(feature = "postgres")]
+    if let Some(line) = crate::desk_driver::desk()
+        .and_then(|_| crate::desk_driver::documents_line(&service.workspace))
+    {
+        meta_lines.push(line);
+    }
     // An overseer asked in its Desk DM acts within its switches from the
     // first request, not after a suggestion comes back.
     #[cfg(feature = "postgres")]
@@ -2995,6 +3001,7 @@ pub(crate) fn spawn_turn_extraction(
         None
     };
     let pm_agent_id = service.agent_id.clone();
+    let pm_assistant = crate::passive_memory::Assistant::of(service);
     let pm_channel = session.channel.clone();
     let pm_session_id = session.id.clone();
     let pm_user_msg = effective_message.to_string();
@@ -3010,7 +3017,7 @@ pub(crate) fn spawn_turn_extraction(
             if let Err(e) = crate::passive_memory::extract_and_store(
                 pm_llm,
                 store,
-                pm_agent_id.clone(),
+                pm_assistant,
                 &pm_channel,
                 Some(pm_session_id.clone()),
                 turn_message_ids,

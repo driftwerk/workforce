@@ -232,7 +232,7 @@ fn fake_cli(dir: &Path) -> PathBuf {
     workforce_common::executable::write(
         &path,
         format!(
-            "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"{}/args-$$\"\nexec sleep 60\n",
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"{}/args-$$\"\nexec sleep 600\n",
             dir.display()
         ),
     )
@@ -2033,6 +2033,8 @@ mod relay;
 mod relayed_decide;
 mod shared_budget;
 
+mod renamed;
+
 /// A boss still among the hub's agents whose config fails to read for a
 /// moment keeps the sessions it runs; one that stays no overseer lets them
 /// go once that has lasted.
@@ -3590,7 +3592,10 @@ async fn taking_on_is_offered_unless_every_session_is_and_letting_go_always_runs
         let s = new_session(&d, dir.path(), "acme-web").await;
         let (_, mut o) = crew.overseer_service().unwrap();
         let take = Action::TakeOn { session: s.id };
-        let release = Action::Release { session: s.id };
+        let release = Action::Release {
+            session: s.id,
+            done: false,
+        };
         assert!(
             matches!(crew.gate(&take, &o), Gate::Suggest(_)),
             "handed only"
@@ -4551,7 +4556,7 @@ fn installed_cli(dir: &Path) -> PathBuf {
     workforce_common::executable::write(
         &path,
         format!(
-            "#!/bin/sh\ncase \"$1\" in --version) echo '2.1.300 (Claude Code)'; exit 0;; auth) exit 1;; esac\nprintf '%s\\n' \"$@\" > \"{}/args-$$\"\nexec sleep 60\n",
+            "#!/bin/sh\ncase \"$1\" in --version) echo '2.1.300 (Claude Code)'; exit 0;; auth) exit 1;; esac\nprintf '%s\\n' \"$@\" > \"{}/args-$$\"\nexec sleep 600\n",
             dir.display()
         ),
     )

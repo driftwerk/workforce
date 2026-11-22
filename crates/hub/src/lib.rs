@@ -123,6 +123,8 @@ pub(crate) mod desk_delete;
 pub mod desk_driver;
 pub mod desk_folder;
 #[cfg(feature = "postgres")]
+pub(crate) mod desk_issues;
+#[cfg(feature = "postgres")]
 pub(crate) mod desk_key_check;
 pub mod desk_key_copies;
 #[cfg(feature = "postgres")]
@@ -135,6 +137,8 @@ pub(crate) mod desk_line_mcp;
 pub mod desk_memory;
 #[cfg(feature = "postgres")]
 pub mod desk_memory_index;
+#[cfg(feature = "postgres")]
+pub(crate) mod desk_pickup;
 #[cfg(feature = "postgres")]
 pub(crate) mod desk_pool;
 pub(crate) mod desk_reads;
@@ -240,6 +244,7 @@ pub use hub_core::profile;
 pub mod projects;
 pub mod rate_limit;
 pub mod reaction_tool;
+pub(crate) mod recent;
 pub use hub_core::recipients;
 pub mod boss_links;
 pub mod redact;

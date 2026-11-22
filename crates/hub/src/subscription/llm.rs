@@ -828,6 +828,43 @@ mod tests {
             .expect("a new sign-in in the slot is served again");
     }
 
+    /// A photo the backend cannot decode fails the turn once: the same
+    /// request would be refused again by the same model, retried or not.
+    #[tokio::test]
+    async fn a_refused_image_is_one_request_and_a_client_error() {
+        let hub = Harness::new(true).await;
+        let failed = serde_json::json!({"type": "response.failed", "response": {"error": {
+            "code": "invalid_image_format",
+            "message": "The image data you provided could not be decoded."}}});
+        Mock::given(method("POST"))
+            .and(path("/responses"))
+            .respond_with(recorded(&format!(
+                "HTTP 200\ncontent-type: text/event-stream\n\ndata: {failed}\n\n"
+            )))
+            .mount(&hub.server)
+            .await;
+        let chain = FailoverProvider::new(
+            Arc::clone(&hub.provider) as Arc<dyn LlmProvider>,
+            FailoverConfig {
+                retry: workforce_agent::llm::failover::RetryConfig {
+                    max_retries: 4,
+                    initial_backoff_ms: 1,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+
+        let err = chain
+            .create_message(None, &[LlmMessage::user("hi")], &[], None, None, false)
+            .await
+            .unwrap_err();
+
+        assert!(err.to_string().contains("invalid_image_format"), "{err}");
+        assert_eq!(classify_error(&err.to_string()), ErrorKind::ClientError);
+        assert_eq!(hub.requests("/responses").await.len(), 1, "never retried");
+    }
+
     #[tokio::test]
     async fn cooling_login_short_circuits_without_request() {
         let hub = Harness::new(true).await;

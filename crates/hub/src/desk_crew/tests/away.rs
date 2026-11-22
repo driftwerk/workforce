@@ -4,6 +4,7 @@
 //! away; away is judged from the DM's read point, with or without
 //! presence pings; one catch-up per return.
 
+use super::updates::begun;
 use super::*;
 use workforce_common::channels::desk::DeliveryKind;
 use workforce_desk::account::{Account, Done, Ref, RefKind};
@@ -53,11 +54,6 @@ async fn did(d: &Desk, s: uuid::Uuid, done: &str) {
     d.store().session_account_put(&a).await.unwrap();
 }
 
-async fn begun(crew: &Arc<CrewHub>) {
-    crew.look_at_updates().await;
-    tokio::time::sleep(Duration::from_millis(20)).await;
-}
-
 /// Updates after a minute's gather (100 ms here), away after 5 (500 ms).
 const ACT: &str = "[oversight]\nenabled = true\nlevel = \"act\"\nact = { nudge = true }\n\
                    updates = { every_minutes = 1, max_wait_minutes = 1, away_after_minutes = 5 }\n";
@@ -71,9 +67,10 @@ const SECOND_MINUTES: Timing = Timing {
 
 /// Pings typing in the boss's DM every 20 ms for `for_ms`.
 fn type_for(crew: &Arc<CrewHub>, for_ms: u64) -> tokio::task::JoinHandle<()> {
+    let until = std::time::Instant::now() + Duration::from_millis(for_ms);
+    assert!(crew.typing_in("desk"));
     let crew = Arc::clone(crew);
     tokio::spawn(async move {
-        let until = std::time::Instant::now() + Duration::from_millis(for_ms);
         while std::time::Instant::now() < until {
             assert!(crew.typing_in("desk"));
             tokio::time::sleep(Duration::from_millis(20)).await;
@@ -194,7 +191,6 @@ async fn a_needs_you_waits_only_for_typing_and_the_cap() {
         let started = std::time::Instant::now();
         let began = chrono::Utc::now();
         let typing = type_for(&crew, 5000);
-        tokio::time::sleep(Duration::from_millis(30)).await;
         let r = ask(&crew, "Which key should staging use?").await;
         assert!(r.success, "{:?}", r.error);
         assert!(
@@ -228,7 +224,6 @@ async fn a_held_needs_you_goes_only_while_open_and_survives_a_restart() {
         let dir = tempfile::tempdir().unwrap();
         let (overseer, crew, d, _llm) = overseeing(dir.path(), pool, "ok", ACT, &[]).await;
         let typing = type_for(&crew, 150);
-        tokio::time::sleep(Duration::from_millis(30)).await;
         let r = ask(&crew, "Which key should staging use?").await;
         assert!(r.success, "{:?}", r.error);
         let store = d.store();
@@ -489,15 +484,22 @@ async fn away_while_busy_elsewhere_and_one_catch_up_on_return() {
         crew.test_reads
             .lock()
             .insert("desk".into(), chrono::Utc::now());
+        let settled = async || {
+            let state = d
+                .store()
+                .update_state("desk", chrono::Utc::now())
+                .await
+                .unwrap();
+            state.away_since.is_none() && state.pending.is_none()
+        };
+        eventually("back, and its catch-up told", async || {
+            settled().await.then_some(())
+        })
+        .await;
         tokio::time::sleep(Duration::from_millis(800)).await;
         assert_eq!(delivered(&overseer, DeliveryKind::Away).len(), 1, "once");
         assert_eq!(delivered(&overseer, DeliveryKind::Update).len(), 1);
-        let state = d
-            .store()
-            .update_state("desk", chrono::Utc::now())
-            .await
-            .unwrap();
-        assert!(state.away_since.is_none() && state.pending.is_none());
+        assert!(settled().await);
     })
     .await;
 }

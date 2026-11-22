@@ -24,8 +24,20 @@ fn charge(row: &Row) -> Result<Charge> {
         updated_at: row.try_get("updated_at")?,
         released_by: row
             .try_get::<_, Option<&str>>("released_by")?
-            .map(ReleasedBy::parse)
-            .transpose()?,
+            .map(released_by),
+    })
+}
+
+/// Who let a charge go, as stored; a reason this Desk doesn't know (written
+/// by a newer one) is read as the boss's own, which keeps the session the
+/// person's to close.
+pub(crate) fn released_by(text: &str) -> ReleasedBy {
+    ReleasedBy::parse(text).unwrap_or_else(|_| {
+        tracing::warn!(
+            released_by = text,
+            "a charge was released for a reason this Desk doesn't know; read as the boss's"
+        );
+        ReleasedBy::Boss
     })
 }
 

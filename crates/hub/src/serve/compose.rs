@@ -2784,15 +2784,14 @@ fn register_github_tools(setup: &Setup, credentials: &Credentials, toolbox: &Too
     let Toolbox { tools, .. } = toolbox;
     // Register GitHub local repo tools (vault-authenticated clone & list)
     if let Some(ref vault) = vault {
-        for tool in
-            crate::github_local::github_local_tools(crate::github_local::GithubLocalContext {
+        crate::github_local::register(
+            tools,
+            crate::github_local::GithubLocalContext {
                 vault: Arc::clone(vault),
                 global_vault: global_vault.clone(),
                 workspace: workspace.clone(),
-            })
-        {
-            tools.register(tool);
-        }
+            },
+        );
     }
 }
 

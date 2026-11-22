@@ -618,3 +618,51 @@ async fn a_stopped_session_is_the_persons_a_hand_run_ticket_is_left_alone_and_a_
     })
     .await;
 }
+
+/// What closing a session would leave, as the person reads it before a
+/// close from the sidebar: its folder, its open ticket, its open pull
+/// request and its uncommitted work, read as its boss's own close reads
+/// them.
+#[tokio::test(flavor = "multi_thread")]
+async fn what_closing_a_session_leaves_is_read_for_the_person_as_its_boss_reads_it() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(dir.path()).unwrap();
+        let folder = base.join("vellev");
+        repo(&folder, "git@github.com:acme/vellev.git");
+        let (_overseer, state, d, _llm) = hub_with(&base, pool, &watching()).await;
+        let crew = CrewHub::start(state, d.clone(), FAST, CancellationToken::new());
+        let (id, sessions) = running(&d, &folder, 1).await;
+        let s = &sessions[0];
+        let key = d.plan(id).await.unwrap().tickets[0]
+            .ticket
+            .key
+            .clone()
+            .unwrap();
+        let c = d.closing(s.id).await.unwrap();
+        assert_eq!(
+            (c.folder.as_str(), c.tickets.clone()),
+            (s.cwd.as_str(), vec![key])
+        );
+        assert_eq!(
+            (c.pulls.clone(), c.changes.clone()),
+            (vec![], None),
+            "nothing left behind"
+        );
+
+        names_pr(&d, s.id, 175).await;
+        crew.pull_seen(
+            REPO,
+            175,
+            Pull {
+                open: true,
+                ..Default::default()
+            },
+        );
+        std::fs::write(folder.join("half-done.rs"), "fn main() {}").unwrap();
+        let c = d.closing(s.id).await.unwrap();
+        assert_eq!(c.pulls, [175]);
+        assert_eq!(c.changes.as_deref(), Some("1 uncommitted file"));
+    })
+    .await;
+}

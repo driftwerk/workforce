@@ -510,7 +510,7 @@ impl Desk {
                     }
                     item => vec![(item.key(), self.item_facts(item, &ctx).await)],
                 };
-                let from_boss = (from != "desk").then(|| from.clone());
+                let from_boss = from.clone();
                 // The old boss is asked to write it unless it only watches.
                 let asks = from_boss.as_deref().is_some_and(|b| self.boss_acts(b));
                 for (key, facts) in about {
@@ -579,7 +579,7 @@ impl Desk {
         })
     }
 
-    fn crew(&self) -> Option<std::sync::Arc<dyn crew::Crew>> {
+    pub(super) fn crew(&self) -> Option<std::sync::Arc<dyn crew::Crew>> {
         self.0
             .line_crew
             .lock()

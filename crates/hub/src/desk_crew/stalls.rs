@@ -547,13 +547,6 @@ impl CrewHub {
         })
     }
 
-    /// What the person calls boss `boss`.
-    pub(super) fn boss_name_of(&self, boss: &str) -> String {
-        self.overseer_named(boss)
-            .map(|(s, _)| super::name_of(&s))
-            .unwrap_or_else(|| "Desk".into())
-    }
-
     /// Whether session `s`'s line has the ball in `boss`'s court: its newest
     /// word waits on the boss's answer ([`super::waiting::waiting_in`]).
     async fn waits_on_boss_line(&self, boss: &str, s: Uuid) -> bool {

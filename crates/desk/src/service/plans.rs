@@ -61,6 +61,9 @@ pub struct PlanSummary {
     /// breaker does: its own budget, its group's or Desk's. The person
     /// says Continue on the Floor.
     pub held: Option<String>,
+    /// How many sessions it runs at once: its own limit within its boss's,
+    /// as its runner counts them; none while no boss of it oversees.
+    pub limit: Option<usize>,
 }
 
 /// A plan's ticket as its card shows it.
@@ -90,6 +93,10 @@ pub struct PlanTicketView {
     /// Why it waits in To do for someone to start it ([`Runs::held_back`]).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub held_back: Option<String>,
+    /// The session it is assigned to was closed or removed, so it holds no
+    /// slot of its plan ([`Runs::session_closed`]).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub session_closed: bool,
 }
 
 /// A plan in full: its tickets, its waves, and every revision.
@@ -394,8 +401,14 @@ impl Desk {
             progress: plan::progress(&tickets),
             budget,
             held: self.plan_held(&p),
+            limit: self.plan_limit(&p),
             plan: p,
         })
+    }
+
+    /// How many sessions `p` runs at once ([`PlanSummary::limit`]).
+    fn plan_limit(&self, p: &Plan) -> Option<usize> {
+        self.crew()?.boss_limit(p).map(|l| p.limit(l))
     }
 
     /// What holds `p`'s new starts now, while it is open.
@@ -454,6 +467,7 @@ impl Desk {
                     repo: r.repo,
                     adopted: r.adopted,
                     held_back: r.held_back,
+                    session_closed: r.session_closed,
                     ticket: v,
                 }
             })
@@ -495,6 +509,7 @@ impl Desk {
                 progress: plan::progress(&rows),
                 budget: applied.budget.clone(),
                 held: self.plan_held(&p),
+                limit: self.plan_limit(&p),
                 plan: p,
             },
             tickets: shown,
@@ -810,6 +825,7 @@ impl Desk {
                 repo: t.repo.clone(),
                 adopted: t.adopted,
                 held_back: None,
+                session_closed: false,
             };
             if t.adopted {
                 // Only the needs it doesn't have already.
@@ -1483,6 +1499,7 @@ impl Desk {
                 repo: t.repo.clone(),
                 adopted: true,
                 held_back: None,
+                session_closed: false,
             };
             if let Err(e) = self.0.store.adopt_ticket(t.id, &runs).await {
                 self.unclaim(p, &claimed).await;
@@ -1526,6 +1543,7 @@ impl Desk {
                     repo: t.repo.clone(),
                     adopted: t.adopted,
                     held_back: None,
+                    session_closed: false,
                 },
                 was.is_none_or(|w| w.folder.trim().is_empty()),
             )
@@ -2934,6 +2952,7 @@ impl Desk {
         if worktree {
             body["worktree"] = branch_for(&key).into();
         }
+        body["deps"] = true.into();
         if let Some(model) = &runs.model {
             body["model"] = model.clone().into();
         }
@@ -3148,6 +3167,12 @@ fn plan_ticket(
         model: r.model,
         repo: r.repo,
         assigned: v.ticket.assignee.is_some(),
+        session: v
+            .ticket
+            .assignee
+            .as_ref()
+            .filter(|a| a.kind == PartyKind::Session && !r.session_closed)
+            .map(|a| a.id.clone()),
         starting,
         held_back: r.held_back,
     }
@@ -3198,6 +3223,7 @@ fn plan_why(s: &Snapshot, parallel: Option<i16>) -> String {
             model: t.model.clone(),
             repo: t.repo.clone(),
             assigned: false,
+            session: None,
             starting: false,
             held_back: None,
         })

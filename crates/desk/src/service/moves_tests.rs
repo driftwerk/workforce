@@ -703,6 +703,41 @@ async fn a_move_is_made_only_as_previewed_with_each_note_as_sent_and_no_secret()
 }
 
 #[tokio::test]
+async fn the_main_boss_is_asked_for_its_note_and_named_by_its_name() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (d, hub) = desk_with_hub(pool, dir.path()).await;
+        let s = new_session(&d, dir.path()).await;
+        d.set_bosses(vec![
+            boss("desk", "Kat", Scope::Ungrouped, "act"),
+            boss("mia", "Mia", atlas(), "act"),
+        ]);
+        let p = d
+            .preview_move(to("atlas", Item::Session(s.id)))
+            .await
+            .unwrap();
+        let note = p.handover.clone().expect("a note for Mia");
+        assert!(note.drafting, "the main boss is asked to write it");
+        assert_eq!(note.handover.from_boss.as_deref(), Some("desk"));
+        assert!(
+            p.effects
+                .iter()
+                .any(|e| e.text == "Mia receives only the note below from Kat."),
+            "{:?}",
+            p.effects
+        );
+        for _ in 0..100 {
+            if !hub.asked.lock().is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(hub.asked.lock().len(), 1);
+    })
+    .await;
+}
+
+#[tokio::test]
 async fn a_boss_that_only_watches_isnt_asked_and_desks_facts_note_stands() {
     with_test_pool(build_pool, |pool| async move {
         let dir = tempfile::tempdir().unwrap();

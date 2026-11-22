@@ -359,7 +359,7 @@ impl CrewHub {
         let Action::Nudge { message, .. } = action else {
             return Ok(None);
         };
-        if workforce_desk::line::holds(&current.text)
+        if workforce_desk::line::holds(&current.text, &self.boss_name_of(boss))
             && workforce_desk::open_item::normalised(message)
                 != workforce_desk::open_item::normalised(&current.text)
         {

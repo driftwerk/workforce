@@ -56,16 +56,22 @@ pub struct RemoteMcpState {
     pending_calls: Arc<PendingCalls>,
     routed: mpsc::Sender<RoutedApproval>,
     /// When each `(agent, person)` last had its offered adapters loaded
-    /// ([`load_offered_adapters`]): looked at again only after
-    /// [`ADAPTERS_RECHECK`].
-    adapters_checked:
-        parking_lot::Mutex<std::collections::HashMap<(String, String), std::time::Instant>>,
+    /// ([`load_offered_adapters`]).
+    adapters_checked: AdapterChecks,
 }
 
 /// How long a person's offered adapters, once looked at, are left before
 /// they are looked at again: so a key they add is picked up within it, and
 /// one that can't load is tried (and logged) once in it, not every request.
-const ADAPTERS_RECHECK: std::time::Duration = std::time::Duration::from_secs(60);
+pub(crate) const ADAPTERS_RECHECK: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// When each `(agent, person)` last had its adapters looked at.
+pub(crate) type AdapterChecks = crate::recent::Recent<(String, String), ()>;
+
+/// A fresh [`AdapterChecks`], each kept [`ADAPTERS_RECHECK`].
+pub(crate) fn adapter_checks() -> AdapterChecks {
+    crate::recent::Recent::new(ADAPTERS_RECHECK)
+}
 
 impl RemoteMcpState {
     pub fn new(gateway: Arc<GatewayState>) -> Arc<Self> {
@@ -91,23 +97,15 @@ impl RemoteMcpState {
             bridge,
             pending_calls,
             routed,
-            adapters_checked: Default::default(),
+            adapters_checked: adapter_checks(),
         })
     }
 
     /// Whether `person`'s offered adapters on `agent` are due a look, and
     /// if so marks them looked at now, so concurrent requests load once.
     fn adapters_due(&self, agent: &str, person: &str) -> bool {
-        let now = std::time::Instant::now();
-        let mut checked = self.adapters_checked.lock();
-        checked.retain(|_, at| now.duration_since(*at) < ADAPTERS_RECHECK);
-        match checked.entry((agent.to_string(), person.to_string())) {
-            std::collections::hash_map::Entry::Occupied(_) => false,
-            std::collections::hash_map::Entry::Vacant(v) => {
-                v.insert(now);
-                true
-            }
-        }
+        self.adapters_checked
+            .due((agent.to_string(), person.to_string()), ())
     }
 
     /// The tools one agent exposes remotely: its registry plus the `agent.*`
@@ -1733,11 +1731,7 @@ mod tests {
         assert!(!remote.adapters_due("lattice", "sam"));
         assert!(remote.adapters_due("lattice", "kim"));
         assert!(remote.adapters_due("koi", "sam"));
-        remote
-            .adapters_checked
-            .lock()
-            .values_mut()
-            .for_each(|at| *at -= ADAPTERS_RECHECK);
+        remote.adapters_checked.age(ADAPTERS_RECHECK);
         assert!(
             remote.adapters_due("lattice", "sam"),
             "due again a minute on"

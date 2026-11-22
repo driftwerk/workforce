@@ -1,7 +1,8 @@
 //! FreeAgent agent-callable tools.
 //!
 //! Every tool accepts an optional `workspace` selecting which connected
-//! FreeAgent company to target (default `default`). Read tools default to
+//! FreeAgent business to target (the caller's default when omitted, never
+//! one they have none of). Read tools default to
 //! `allow`; mutating tools to `require_approval` so the agent proposes and a
 //! human confirms before anything touches the ledger. All response bodies are
 //! routed through `wrap_external_content` to neutralise prompt injection in
@@ -20,7 +21,7 @@ use workforce_agent::security::external_content::wrap_external_content;
 use workforce_agent::tools::{Tool, ToolResult};
 
 use super::client::{clamp_page, clamp_per_page, FreeAgentClient, FreeAgentContext};
-use crate::adapters::utils::coerce_to_u64;
+use crate::adapters::utils::{coerce_to_u64, LIVE_INSTANCE_DESCRIPTION};
 
 type Handler =
     Box<dyn Fn(Arc<FreeAgentClient>, Value) -> BoxFuture<'static, Result<Value>> + Send + Sync>;
@@ -31,9 +32,8 @@ struct Ctx {
 }
 
 impl Ctx {
-    fn client(&self, input: &Value) -> Arc<FreeAgentClient> {
-        let workspace = input["workspace"].as_str().unwrap_or("default");
-        self.context.client(workspace)
+    fn client(&self, input: &Value) -> Result<Arc<FreeAgentClient>> {
+        self.context.client(input["workspace"].as_str())
     }
 }
 
@@ -43,8 +43,11 @@ where
     Fut: std::future::Future<Output = Result<Value>>,
 {
     let start = std::time::Instant::now();
-    let client = ctx.client(&input);
-    match f(client, input).await {
+    let result = match ctx.client(&input) {
+        Ok(client) => f(client, input).await,
+        Err(e) => Err(e),
+    };
+    match result {
         Ok(output) => Ok(ToolResult::success(output, elapsed(start))),
         Err(e) => {
             warn!(error = %e, "FreeAgent tool failed");
@@ -66,10 +69,7 @@ fn wrap_payload(value: Value, source: &str) -> Value {
 }
 
 fn workspace_prop() -> Value {
-    json!({
-        "type": "string",
-        "description": "Connected FreeAgent company (default: 'default'). Use a per-company name when more than one is connected."
-    })
+    json!({ "type": "string", "description": LIVE_INSTANCE_DESCRIPTION })
 }
 
 /// Insert the `workspace` property into a schema's `properties` block.
@@ -389,7 +389,9 @@ fn specs() -> Vec<ToolSpec> {
         ),
         ToolSpec::read(
             "freeagent.bank_accounts_list",
-            "List bank accounts and their balances.",
+            "List the business's bank accounts with their balances: the balances of its bank \
+             feeds (e.g. HSBC, Revolut Business). Each account's `url` is what \
+             freeagent.bank_transactions_list takes.",
             obj(paged_props(json!({
                 "view": view_prop("standard_bank_accounts, credit_card_accounts, paypal_accounts, …"),
             }))),
@@ -406,7 +408,8 @@ fn specs() -> Vec<ToolSpec> {
         ),
         ToolSpec::read(
             "freeagent.bank_transactions_list",
-            "List bank transactions for a bank account, paged.",
+            "List the transactions of one of the business's bank feeds (e.g. HSBC, Revolut \
+             Business), by `bank_account` and date, paged.",
             obj_required(
                 paged_props(json!({
                     "bank_account": url_prop("The bank account to list transactions for"),
@@ -684,9 +687,8 @@ mod tests {
     use wiremock::matchers::{header, method, path, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
     use workforce_common::settings::SecretStore;
-    use workforce_oauth_client::OAuthClientCreds;
 
-    use crate::adapters::test_support::InMem;
+    use crate::adapters::test_support::People;
 
     /// A context whose data calls hit the wiremock server, with a pre-seeded
     /// far-future access token so the token endpoint is never contacted.
@@ -697,29 +699,27 @@ mod tests {
             .as_secs()
             + 100_000)
             .to_string();
-        let store = InMem::from(&[
+        let store = People::new(&[
+            ("skills/freeagent/oauth_client/client_id", "cid"),
+            ("skills/freeagent/oauth_client/client_secret", "secret"),
             ("skills/freeagent/workspaces/default/refresh_token", "rt"),
             (
                 "skills/freeagent/workspaces/default/access_token",
                 "at-test",
             ),
-        ]);
-        store
-            .set(
+            (
                 "skills/freeagent/workspaces/default/expires_at",
                 &far_future,
-            )
-            .unwrap();
-
-        let creds = OAuthClientCreds {
-            client_id: "cid".into(),
-            client_secret: Some("secret".into()),
-            redirect_uri: None,
-        };
+            ),
+        ]);
+        store.own(
+            "sarah",
+            "skills/freeagent/workspaces/lumen/refresh_token",
+            "rt",
+        );
         let context = FreeAgentContext::with_base_for_test(
             store as Arc<dyn SecretStore>,
             super::super::client::build_http_client().unwrap(),
-            creds,
             server.uri(),
         );
         Ctx {
@@ -780,17 +780,33 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unknown_workspace_falls_back_to_its_own_client() {
-        // A never-connected workspace simply has no token; the call surfaces a
-        // clear auth error rather than panicking.
+    async fn an_unknown_workspace_is_refused_naming_the_callers_own() {
         let server = MockServer::start().await;
         let ctx = ctx_for(&server);
-        let res = tool("freeagent.company", &ctx)
-            .execute(json!({ "workspace": "ghost" }))
+        let company = tool("freeagent.company", &ctx);
+        let refused = |res: ToolResult| {
+            assert!(!res.success);
+            res.error.unwrap()
+        };
+        let ghost = workforce_agent::runner::CURRENT_USER_ID
+            .scope(
+                "sarah".to_string(),
+                company.execute(json!({ "workspace": "ghost" })),
+            )
             .await
             .unwrap();
-        assert!(!res.success);
-        assert!(res.error.unwrap().contains("refresh token"));
+        let said = refused(ghost);
+        assert!(said.contains("FreeAgent business"), "{said}");
+        assert!(said.contains("ghost"), "{said}");
+        assert!(said.contains("default") && said.contains("lumen"), "{said}");
+        // Sarah's own is no one else's.
+        let said = refused(
+            company
+                .execute(json!({ "workspace": "lumen" }))
+                .await
+                .unwrap(),
+        );
+        assert!(said.contains(r#"Available: ["default"]"#), "{said}");
     }
 
     #[test]
