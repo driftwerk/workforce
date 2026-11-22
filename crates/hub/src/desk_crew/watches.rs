@@ -422,7 +422,7 @@ impl CrewHub {
             .await;
         let got = match read {
             Ok(v) => v,
-            Err(e) if e == super::github::NOT_CONNECTED => {
+            Err(super::github::GithubError::NotConnected) => {
                 return Some(("GitHub isn't connected for the person, so it can't be watched: tell them \"Connect GitHub to let me check.\"".into(), None));
             }
             Err(e) => {
@@ -430,7 +430,7 @@ impl CrewHub {
                     return Some((
                         format!(
                             "GitHub couldn't be read for it {MAX_FAILED_READS} times in a row, so it stopped waiting (check the repository and number): {}",
-                            workforce_desk::crew::one_line(&e, 300)
+                            workforce_desk::crew::one_line(&e.to_string(), 300)
                         ),
                         None,
                     ));

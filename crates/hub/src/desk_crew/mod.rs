@@ -42,6 +42,7 @@ mod directives;
 mod extras;
 mod find;
 mod github;
+mod github_seen;
 mod handover;
 mod held;
 mod idle;
@@ -77,6 +78,7 @@ mod updates;
 mod urgent;
 mod waiting;
 mod watches;
+mod workspace;
 pub(crate) use updates::HubWriter;
 mod watcher;
 mod work;
@@ -267,6 +269,9 @@ pub struct CrewHub {
     /// What the closer of finished sessions keeps between looks
     /// ([`closing`]).
     closing: Mutex<closing::Closing>,
+    /// What is known of the sessions' pull requests on GitHub
+    /// ([`github_seen`]).
+    github_seen: Mutex<github_seen::GithubSeen>,
     /// How long a finished session rests before it is closed
     /// ([`closing::SETTLE`]; a test's own).
     close_settle: Mutex<chrono::Duration>,
@@ -778,6 +783,7 @@ impl CrewHub {
             updating: Mutex::default(),
             quiet_made: Mutex::default(),
             closing: Mutex::default(),
+            github_seen: Mutex::default(),
             close_settle: Mutex::new(closing::SETTLE),
             closing_now: tokio::sync::Mutex::new(()),
             dm_typing: Mutex::default(),
