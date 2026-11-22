@@ -492,7 +492,7 @@ mod tests {
         pr_at(
             &server,
             7,
-            json!({"number": 7, "state": "open", "draft": true, "head_sha": "abc"}),
+            json!({"number": 7, "state": "open", "draft": true, "head": {"sha": "abc"}}),
             2,
         )
         .await;
@@ -531,7 +531,7 @@ mod tests {
             .and(path_regex(r"^/repos/acme/web/pulls/\d+$"))
             .respond_with(
                 ResponseTemplate::new(200)
-                    .set_body_json(json!({"state": "open", "head_sha": "abc"})),
+                    .set_body_json(json!({"state": "open", "head": {"sha": "abc"}})),
             )
             .expect(32)
             .mount(&server)
@@ -669,7 +669,7 @@ mod tests {
         pr_at(
             &server,
             12,
-            json!({"number": 12, "state": "open", "head_sha": "abc",
+            json!({"number": 12, "state": "open", "head": {"sha": "abc"},
                    "html_url": "https://github.com/acme/web/pull/12"}),
             2,
         )
