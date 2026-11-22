@@ -8,7 +8,7 @@ use eyre::Result;
 use serde_json::{json, Map, Value};
 use workforce_agent::tools::Tool;
 
-use crate::adapters::google::api::{GoogleApi, GoogleApiContext};
+use crate::adapters::google::api::{GoogleApi, GoogleApis};
 
 use crate::adapters::google::tool_helpers::{
     handler, object_schema, optional_str, optional_u64, props, required_str, tool, urlencode,
@@ -16,7 +16,7 @@ use crate::adapters::google::tool_helpers::{
 
 const BASE: &str = "https://tasks.googleapis.com/tasks/v1";
 
-pub fn tools(ctx: Arc<GoogleApiContext>) -> Vec<Arc<dyn Tool>> {
+pub fn tools(ctx: Arc<GoogleApis>) -> Vec<Arc<dyn Tool>> {
     let mut out: Vec<Arc<dyn Tool>> = Vec::new();
 
     // ── task lists ───────────────────────────────────────────────────────────

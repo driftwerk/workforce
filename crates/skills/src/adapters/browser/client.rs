@@ -635,8 +635,12 @@ impl BrowserClient {
         &self,
         selector: Option<&str>,
         connector: &str,
+        field: Option<&str>,
     ) -> Result<Value> {
-        self.cell().await.capture_key(selector, connector).await
+        self.cell()
+            .await
+            .capture_key(selector, connector, field)
+            .await
     }
 
     /// Uploads a staged artifact to a file field on the page: the bytes go

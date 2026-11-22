@@ -390,6 +390,12 @@ impl BrowserHooks for DeskHooks {
         setups.browser_page(&caller, connector)
     }
 
+    fn key_shape(&self, connector: &str, field: &str) -> Option<String> {
+        crate::desk_connections::app::of(connector)
+            .and_then(|app| app.find_shape(field))
+            .map(str::to_string)
+    }
+
     fn keep_key(&self, read: browser::KeyRead<'_>) -> Result<String, String> {
         let setups = crate::desk_connections::setup::installed()
             .ok_or("Connections aren't running on this hub, so no key was kept.")?;
@@ -399,7 +405,7 @@ impl BrowserHooks for DeskHooks {
         let kept = setups.keep_key(
             &caller,
             read.connector,
-            None,
+            read.field,
             read.origin,
             read.path,
             workforce_common::secret::Secret::new(read.key.to_string()),
@@ -868,8 +874,14 @@ fn prune_shots(shots: &Path) {
     }
 }
 
-/// Gives `service` the browser, if it hasn't it: an overseer reaches for it.
+/// Gives `service` the browser, if it hasn't it: every local agent reaches
+/// for it.
 pub fn equip(service: &crate::serve::AgentService) {
+    // A machine's hub has no person's Chrome, nor their documents, beside it.
+    if crate::desk_driver::machine(&service.config) {
+        return;
+    }
+    crate::desk_driver::documents(&service.workspace);
     if crate::skill_loader::skill_tools_registered("browser", &service.tools) {
         return;
     }
@@ -885,7 +897,7 @@ pub fn equip(service: &crate::serve::AgentService) {
         &service.skill_state,
         "desk",
     ) {
-        warn!(agent = %service.agent_id, error = %format!("{e:#}"), "giving the overseer the browser failed");
+        warn!(agent = %service.agent_id, error = %format!("{e:#}"), "giving the agent the browser failed");
     }
 }
 

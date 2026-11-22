@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 
 use uuid::Uuid;
 use workforce_core::computer::{
-    Ability, Access, ActionKind, Always, Asking, By, Choice, ComputerAccess, Effect, Level,
+    Ability, Access, ActionKind, Always, Asking, Books, By, Choice, ComputerAccess, Effect, Level,
     Refused, Scope, Verdict, Why,
 };
 
@@ -611,6 +611,97 @@ fn rule_5_an_agent_that_asks_never_skips_the_list_and_nothing_else() {
 }
 
 #[test]
+fn a_freeagent_write_asks_as_changing_the_books_even_at_full_access() {
+    let books = Why::ChangesTheBooks(Books::FreeAgent);
+    for policy in [full(), autonomous()] {
+        for tool in [
+            "freeagent.invoice_create",
+            "freeagent.contact_update",
+            "freeagent.expense_create",
+        ] {
+            assert_eq!(
+                verdict(
+                    &policy,
+                    false,
+                    &[connector_grant("freeagent")],
+                    &connector(tool, "freeagent", true)
+                ),
+                once(books),
+                "{tool}"
+            );
+        }
+    }
+    assert_eq!(
+        verdict(
+            &full(),
+            false,
+            &[],
+            &connector("xero.invoice_create", "xero", true)
+        ),
+        once(Why::ChangesTheBooks(Books::Xero))
+    );
+    assert_eq!(books.sentence(), "It changes your accounts in FreeAgent");
+}
+
+#[test]
+fn xero_is_in_no_binding_so_a_bound_agent_reaches_it_as_any_other() {
+    let mut bound = full();
+    bound.connectors = Some(Connectors {
+        enabled: vec!["github".into()],
+        read_only: vec!["freeagent".into()],
+    });
+    assert_eq!(
+        verdict(
+            &bound,
+            false,
+            &[],
+            &connector("xero.invoices_list", "xero", false)
+        ),
+        run()
+    );
+    assert_eq!(
+        verdict(
+            &bound,
+            false,
+            &[],
+            &connector("xero.invoice_create", "xero", true)
+        ),
+        once(Why::ChangesTheBooks(Books::Xero))
+    );
+}
+
+#[test]
+fn asks_never_lets_it_run() {
+    let mut never = full();
+    never.access.asks = Asking::Never;
+    assert_eq!(
+        verdict(
+            &never,
+            false,
+            &[],
+            &connector("freeagent.invoice_create", "freeagent", true)
+        ),
+        run()
+    );
+}
+
+#[test]
+fn a_freeagent_read_runs() {
+    for tool in [
+        "freeagent.bank_transactions_list",
+        "freeagent.company",
+        "freeagent.profit_and_loss_summary",
+    ] {
+        assert!(always_asks(tool).is_none(), "{tool}");
+        assert_eq!(
+            verdict(&full(), false, &[], &connector(tool, "freeagent", false)),
+            run(),
+            "{tool}"
+        );
+    }
+}
+
+#[test]
 fn rule_5_a_delete_inside_the_own_folder_is_not_on_the_list() {
     let v = verdict(
         &full(),
@@ -977,11 +1068,14 @@ fn namespaces_classify_tools_by_prefix() {
     ] {
         assert_eq!(namespace(tool), None, "{tool}");
     }
-    assert!(sends_to_people("slack.post_message"));
-    assert!(sends_to_people("email.forward"));
-    assert!(sends_to_people("postmark.email_send_batch"));
-    assert!(!sends_to_people("slack.channels_list"));
-    assert!(!sends_to_people("email.draft"));
+    assert_eq!(always_asks("slack.post_message"), Some(Why::SendsToPeople));
+    assert_eq!(always_asks("email.forward"), Some(Why::SendsToPeople));
+    assert_eq!(
+        always_asks("postmark.email_send_batch"),
+        Some(Why::SendsToPeople)
+    );
+    assert!(always_asks("slack.channels_list").is_none());
+    assert!(always_asks("email.draft").is_none());
     // Every tool Desk's connectors send to people with.
     for send in [
         "slack.send",
@@ -994,7 +1088,11 @@ fn namespaces_classify_tools_by_prefix() {
         "google.chat.dm_send",
         "sendgrid.email_send",
     ] {
-        assert!(sends_to_people(send), "{send} sends to people");
+        assert_eq!(
+            always_asks(send),
+            Some(Why::SendsToPeople),
+            "{send} sends to people"
+        );
     }
     for not in [
         "slack.read",
@@ -1002,7 +1100,7 @@ fn namespaces_classify_tools_by_prefix() {
         "google.gmail.search",
         "google.gmail.draft_create",
     ] {
-        assert!(!sends_to_people(not), "{not} sends to nobody");
+        assert!(always_asks(not).is_none(), "{not} sends to nobody");
     }
 }
 

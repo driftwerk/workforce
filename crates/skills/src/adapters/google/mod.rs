@@ -140,9 +140,16 @@ pub fn tool_names() -> Vec<&'static str> {
         "google.slides.update_notes",
         "google.slides.batch_update",
         "google.slides.export",
+        "google.workspaces",
         // Setup
         "google.setup",
     ]
+}
+
+/// Where Google's connections live in the vault: each one's refresh token,
+/// and no flat key.
+pub fn instance_paths() -> crate::adapters::utils::InstancePaths {
+    crate::adapters::utils::InstancePaths::new("skills/google/workspaces/", "refresh_token", "")
 }
 
 /// Curated Google read-only tools offered to read-only worker sub-agents:

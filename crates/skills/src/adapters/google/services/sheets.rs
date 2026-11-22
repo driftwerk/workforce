@@ -11,7 +11,7 @@ use workforce_agent::artifacts::{global_store, resolve_rows_input, ArtifactStore
 use workforce_agent::runner::CURRENT_AGENT_ID;
 use workforce_agent::tools::Tool;
 
-use crate::adapters::google::api::{GoogleApi, GoogleApiContext};
+use crate::adapters::google::api::{GoogleApi, GoogleApis};
 
 use crate::adapters::google::tool_helpers::{
     handler, object_schema, optional_array, optional_str, required_array, required_str, urlencode,
@@ -99,7 +99,7 @@ fn value_input_option_schema() -> Value {
     })
 }
 
-pub fn tools(ctx: Arc<GoogleApiContext>) -> Vec<Arc<dyn Tool>> {
+pub fn tools(ctx: Arc<GoogleApis>) -> Vec<Arc<dyn Tool>> {
     let mut out: Vec<Arc<dyn Tool>> = Vec::new();
 
     // ─── get values ──────────────────────────────────────────────────────────
