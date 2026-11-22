@@ -660,7 +660,8 @@ async fn a_ticket_whose_session_waits_on_a_build_slot_is_stuck_said_once_and_its
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
         assert_eq!(stalls().len(), 1, "said once");
-        assert_eq!(woken_by(&llm, told).await, 1, "its turn told once");
+        let woke = woken_by(&llm, told).await;
+        assert_eq!(woke.len(), 1, "its turn told once: {woke:?}");
         builds_stop(&base);
     })
     .await;

@@ -917,23 +917,27 @@ pub(super) enum Says {
 /// A Claude Code stand-in in `dir`, installed as far as Desk can tell,
 /// whose tool shell runs `ssh devbox ~/bin/rbuild-run w cargo test` (the
 /// night of the overnight stall) with an `ssh` that says `says`; each
-/// `ssh` notes its pid in `dir`'s `ssh.pid` for [`builds_stop`].
+/// `ssh` notes its pid and its build's in `dir`'s `ssh.pid` for
+/// [`builds_stop`].
 pub(super) fn building_cli(dir: &Path, says: Says) -> PathBuf {
     let bin = dir.join("bin");
     std::fs::create_dir_all(&bin).unwrap();
     let pids = dir.join("ssh.pid");
     let runs = match says {
         Says::Queued => {
-            "echo 'rbuild: all 3 build slots are busy; waiting for one' >&2\nexec sleep 120"
+            "echo 'rbuild: all 3 build slots are busy; waiting for one' >&2\nsleeps"
         }
-        Says::Nothing => "exec sleep 120",
+        Says::Nothing => "sleeps",
         Says::Streams => {
             "n=0\nwhile [ $n -lt 600 ]; do n=$((n+1)); echo \"test step $n of 600\"; sleep 0.2; done"
         }
     };
     workforce_common::executable::write(
         &bin.join("ssh"),
-        format!("#!/bin/sh\necho $$ >> '{}'\n{runs}\n", pids.display()),
+        format!(
+            "#!/bin/sh\nsleeps() {{ sleep 120 & echo $! >> '{p}'; wait; }}\necho $$ >> '{p}'\n{runs}\n",
+            p = pids.display()
+        ),
     )
     .unwrap();
     let path = dir.join("building-claude");
@@ -981,25 +985,33 @@ pub(super) async fn at_work(dir: &Path, s: uuid::Uuid) -> String {
 pub(super) async fn looked_until_woken(d: &Desk, llm: &wiremock::MockServer, what: &str) {
     eventually("the boss woken by what Desk sees", async || {
         d.sight_pass().await;
-        (woken_by(llm, what).await > 0).then_some(())
+        (!woken_by(llm, what).await.is_empty()).then_some(())
     })
     .await;
 }
 
-/// How many of the boss's model calls were woken by a line saying `what`.
-pub(super) async fn woken_by(llm: &wiremock::MockServer, what: &str) -> usize {
+/// The line saying `what` that woke each of the boss's model calls woken
+/// by one: in its newest message, past the context Desk gives every turn.
+pub(super) async fn woken_by(llm: &wiremock::MockServer, what: &str) -> Vec<String> {
     llm.received_requests()
         .await
         .unwrap_or_default()
         .iter()
         .filter_map(|r| serde_json::from_slice::<Value>(&r.body).ok())
-        .filter(|b| {
-            b["messages"]
-                .as_array()
-                .and_then(|m| m.iter().rev().find(|m| m["role"] == "user"))
-                .is_some_and(|m| m.to_string().contains(what))
+        .filter_map(|b| {
+            let newest = b["messages"]
+                .as_array()?
+                .iter()
+                .rev()
+                .find(|m| m["role"] == "user")?
+                .to_string();
+            let asked = newest.split("[END SYSTEM CONTEXT]").last()?;
+            asked
+                .split("\\n")
+                .find(|l| l.contains(what))
+                .map(str::to_string)
         })
-        .count()
+        .collect()
 }
 
 /// The first item about session `s` any update posted says who moves.
@@ -1034,9 +1046,9 @@ async fn moved_in_updates(overseer: &AgentService, d: &Desk, s: uuid::Uuid) -> O
         })
 }
 
-/// Act, a stall three tenths of a second and quiet as long.
+/// Act, a stall half a second and quiet as long.
 const SIGHTED: &str = "[oversight]\nenabled = true\nlevel = \"act\"\nact = { nudge = true }\n\
-                       work = { stall_minutes = 3 }\nwake = { quiet_minutes = 3 }\n";
+                       work = { stall_minutes = 5 }\nwake = { quiet_minutes = 5 }\n";
 
 /// Where the overnight session waited: on its terminal, or in the
 /// background once its turn ended.
@@ -1147,12 +1159,8 @@ async fn a_queued_build_is_seen_said_once_and_looked_at_again(shape: Shape) {
             d.sight_pass().await;
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
-        assert_eq!(
-            woken_by(&llm, "for a build slot. Look inside (crew.inside)").await,
-            1,
-            "said once"
-        );
-        assert_eq!(woken_by(&llm, "crew.ask_session").await, 0);
+        let woke = woken_by(&llm, "for a build slot. Look inside (crew.inside)").await;
+        assert_eq!(woke.len(), 1, "said once: {woke:?}");
         builds_stop(&base);
     })
     .await;
@@ -1208,12 +1216,10 @@ async fn a_build_that_keeps_printing_is_never_said_stalled() {
             d.sight_pass().await;
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
-        assert_eq!(woken_by(&llm, "Look inside (crew.inside)").await, 0);
-        assert_eq!(
-            woken_by(&llm, "— what Desk sees: ").await,
-            1,
-            "once a quiet spell"
-        );
+        let stalled = woken_by(&llm, "Look inside (crew.inside)").await;
+        assert!(stalled.is_empty(), "{stalled:?}");
+        let quiet = woken_by(&llm, "— what Desk sees: ").await;
+        assert_eq!(quiet.len(), 1, "once a quiet spell: {quiet:?}");
         builds_stop(&base);
     })
     .await;

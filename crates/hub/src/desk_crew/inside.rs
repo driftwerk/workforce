@@ -125,13 +125,16 @@ pub(super) fn evidence_line(who: &str, s: &Stall) -> String {
     )
 }
 
-/// The key a stall is said once by, until its evidence changes.
-pub(super) fn evidence_key(id: &str, s: &Stall) -> String {
-    format!(
-        "evidence:{id}:{}:{}",
-        s.kind.as_str(),
-        s.since.timestamp_millis()
-    )
+/// The key stall `s` in glance `g` of `id` is said once by, until its
+/// evidence changes: a wait by the process it waits in, where Desk knows
+/// it (a process's start is read to the second, so when its wait began can
+/// read earlier as it is looked at again), else by when it began.
+pub(super) fn evidence_key(id: &str, g: &Glance, s: &Stall) -> String {
+    let which = match (s.kind, g.reading.pid) {
+        (StallKind::Queued | StallKind::Input, Some(pid)) => format!("pid-{pid}"),
+        _ => s.since.timestamp_millis().to_string(),
+    };
+    format!("evidence:{id}:{}:{which}", s.kind.as_str())
 }
 
 /// Whether `v` works, or waits on its own background work.

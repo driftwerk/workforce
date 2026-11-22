@@ -631,10 +631,10 @@ impl CrewHub {
                 ItemKind::Session => self.seen_inside(&item.id, o),
                 ItemKind::Agent => None,
             };
-            let evidence = inside.as_ref().and_then(|(_, s)| {
+            let evidence = inside.as_ref().and_then(|(g, s)| {
                 s.as_ref()
                     .filter(|s| super::inside::moves(s.kind))
-                    .map(|s| (super::inside::evidence_key(&item.id, s), s))
+                    .map(|s| (super::inside::evidence_key(&item.id, g, s), s))
             });
             // Said once a stall, instead of its quiet from then on.
             let waits = waiting.get(&item.id).map(Vec::as_slice).unwrap_or_default();

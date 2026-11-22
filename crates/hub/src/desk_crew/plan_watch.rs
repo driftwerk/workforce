@@ -251,7 +251,7 @@ impl CrewHub {
                     .filter(|a| ticket.state == TicketState::Doing && a.kind == PartyKind::Session)
                     .and_then(|a| self.stall_of(&a.id, o));
                 match stalled {
-                    Some((_, s)) => self.stuck_on(p, ticket.id, &key, &s, &mut stuck),
+                    Some(seen) => self.stuck_on(p, ticket.id, &key, &seen, &mut stuck),
                     None => busy |= t.starting || ticket.state == TicketState::Doing,
                 }
                 continue;
@@ -292,10 +292,9 @@ impl CrewHub {
             let stalled = view
                 .as_ref()
                 .filter(|_| ticket.state == TicketState::Doing)
-                .and_then(|v| self.stall_of(&v.id.to_string(), o))
-                .map(|(_, s)| s);
-            if let Some(s) = &stalled {
-                self.stuck_on(p, ticket.id, &key, s, &mut stuck);
+                .and_then(|v| self.stall_of(&v.id.to_string(), o));
+            if let Some(seen) = &stalled {
+                self.stuck_on(p, ticket.id, &key, seen, &mut stuck);
             }
             // At work, whoever runs it: the plan moves.
             if stalled.is_none()
@@ -350,20 +349,20 @@ impl CrewHub {
         self.say_stall(boss, o, p, busy, &stuck, now).await;
     }
 
-    /// Ticket `key`'s session is stuck by what Desk sees inside it
-    /// (`stall`): said with the plan's stall, and its boss's plan turn told
-    /// once until the evidence changes.
+    /// Ticket `key`'s session is stuck by what Desk sees inside it (`seen`:
+    /// its glance and stall): said with the plan's stall, and its boss's
+    /// plan turn told once until the evidence changes.
     fn stuck_on(
         &self,
         p: &PlanDetail,
         ticket: Uuid,
         key: &str,
-        stall: &workforce_desk::sight::Stall,
+        (glance, stall): &(workforce_desk::sight::Glance, workforce_desk::sight::Stall),
         stuck: &mut Vec<String>,
     ) {
         let who = format!("{key}'s session");
         stuck.push(format!("{who} {}", stall.words));
-        let once = super::inside::evidence_key(&ticket.to_string(), stall);
+        let once = super::inside::evidence_key(&ticket.to_string(), glance, stall);
         if self.plan_watch.lock().done.insert(once) {
             self.wake_plan(p.summary.plan.id, super::inside::evidence_line(&who, stall));
         }
