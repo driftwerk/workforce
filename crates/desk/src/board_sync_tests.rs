@@ -1679,6 +1679,15 @@ fn an_unknown_workspace_is_said_plainly_never_as_default() {
         &["acme", "client"],
     ));
     assert_eq!(jira.to_string(), "Pick which Jira site: acme or client");
+    let github = failed(&workforce_core::instances::unknown_instance_text(
+        "GitHub workspace",
+        "default",
+        &["driftwerk", "mantis"],
+    ));
+    assert_eq!(
+        github.to_string(),
+        "Pick which GitHub connection: driftwerk or mantis"
+    );
     let gone = failed(&workforce_core::instances::unknown_instance_text(
         "Jira workspace",
         "client",

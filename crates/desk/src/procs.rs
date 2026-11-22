@@ -107,6 +107,121 @@ pub async fn table() -> Option<Vec<Proc>> {
         .then(|| parse(&String::from_utf8_lossy(&out.stdout)))
 }
 
+/// The processes in process group `group`, as `ps` lists them now.
+pub async fn in_group(group: u32) -> Vec<u32> {
+    let out = tokio::process::Command::new("ps")
+        .args(["-A", "-o", "pid=,pgid="])
+        .kill_on_drop(true)
+        .output()
+        .await;
+    out.ok()
+        .filter(|o| o.status.success())
+        .map(|o| {
+            String::from_utf8_lossy(&o.stdout)
+                .lines()
+                .filter_map(|l| {
+                    let mut f = l.split_whitespace().map(|w| w.parse::<u32>().ok());
+                    match (f.next().flatten(), f.next().flatten()) {
+                        (Some(pid), Some(g)) if g == group => Some(pid),
+                        _ => None,
+                    }
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Whether process `pid`'s environment holds `entry` (`NAME=value`)
+/// exactly, as the system keeps it apart from its arguments.
+pub async fn carries(pid: u32, entry: &str) -> bool {
+    let entry = entry.as_bytes().to_vec();
+    tokio::task::spawn_blocking(move || environ(pid).is_some_and(|env| env.contains(&entry)))
+        .await
+        .unwrap_or(false)
+}
+
+/// Process `pid`'s environment, an entry each, from `/proc`.
+#[cfg(target_os = "linux")]
+fn environ(pid: u32) -> Option<Vec<Vec<u8>>> {
+    let env = std::fs::read(format!("/proc/{pid}/environ")).ok()?;
+    Some(
+        env.split(|b| *b == 0)
+            .filter(|e| !e.is_empty())
+            .map(<[u8]>::to_vec)
+            .collect(),
+    )
+}
+
+/// Process `pid`'s environment, an entry each, from the kernel's
+/// `KERN_PROCARGS2` (the person's own processes alone).
+#[cfg(target_os = "macos")]
+fn environ(pid: u32) -> Option<Vec<Vec<u8>>> {
+    let pid = i32::try_from(pid).ok()?;
+    let mut most: libc::c_int = 0;
+    let mut size = std::mem::size_of::<libc::c_int>();
+    let mut mib = [libc::CTL_KERN, libc::KERN_ARGMAX];
+    // SAFETY: sysctl writes at most `size` bytes into `most`, an int.
+    let read = unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            2,
+            std::ptr::from_mut(&mut most).cast(),
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if read != 0 {
+        return None;
+    }
+    let mut buf = vec![0u8; usize::try_from(most).ok()?];
+    let mut size = buf.len();
+    let mut mib = [libc::CTL_KERN, libc::KERN_PROCARGS2, pid];
+    // SAFETY: sysctl writes at most `size` bytes into `buf`, that long.
+    let read = unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            3,
+            buf.as_mut_ptr().cast(),
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if read != 0 {
+        return None;
+    }
+    buf.truncate(size);
+    procargs_env(&buf)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn environ(_pid: u32) -> Option<Vec<Vec<u8>>> {
+    None
+}
+
+/// The environment in a `KERN_PROCARGS2` reading: past its argument count,
+/// its program's path (and the NULs after it) and that many arguments,
+/// each entry up to the first empty one.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn procargs_env(buf: &[u8]) -> Option<Vec<Vec<u8>>> {
+    let argc = usize::try_from(i32::from_ne_bytes(buf.get(..4)?.try_into().ok()?)).ok()?;
+    let rest = buf.get(4..)?;
+    let path = rest.iter().position(|b| *b == 0)?;
+    let rest = &rest[path..];
+    let start = rest.iter().position(|b| *b != 0)?;
+    let mut words = rest[start..].split(|b| *b == 0);
+    for _ in 0..argc {
+        words.next()?;
+    }
+    Some(
+        words
+            .take_while(|e| !e.is_empty())
+            .map(<[u8]>::to_vec)
+            .collect(),
+    )
+}
+
 /// How long `ps` is waited on for one process's start.
 #[cfg(not(target_os = "linux"))]
 const PS_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
@@ -170,6 +285,41 @@ fn start_of(stat: &str, boot: &str, ticks: u64) -> Option<chrono::DateTime<chron
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_processs_environment_is_read_past_its_arguments() {
+        let mut buf = 2i32.to_ne_bytes().to_vec();
+        buf.extend_from_slice(
+            b"/bin/sh\0\0\0sh\0DESK_DEPS_RUN=args\0HOME=/h\0DESK_DEPS_RUN=env\0\0junk\0",
+        );
+        assert_eq!(
+            procargs_env(&buf),
+            Some(vec![b"HOME=/h".to_vec(), b"DESK_DEPS_RUN=env".to_vec()])
+        );
+        assert_eq!(procargs_env(&buf[..3]), None);
+        let mut short = 5i32.to_ne_bytes().to_vec();
+        short.extend_from_slice(b"/bin/sh\0sh\0");
+        assert_eq!(procargs_env(&short), None);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn a_token_in_a_processs_arguments_alone_isnt_in_its_environment() {
+        let entry = "DESK_DEPS_RUN=run-1";
+        let mut argued = tokio::process::Command::new("sh")
+            .args(["-c", "sleep 60; :", entry])
+            .spawn()
+            .unwrap();
+        let mut carried = tokio::process::Command::new("sh")
+            .args(["-c", "sleep 60; :"])
+            .env("DESK_DEPS_RUN", "run-1")
+            .spawn()
+            .unwrap();
+        assert!(!carries(argued.id().unwrap(), entry).await);
+        assert!(carries(carried.id().unwrap(), entry).await);
+        argued.kill().await.unwrap();
+        carried.kill().await.unwrap();
+    }
 
     #[test]
     fn a_processs_start_is_read_from_its_stat_whatever_its_name() {
