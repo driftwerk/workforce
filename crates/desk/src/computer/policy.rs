@@ -338,6 +338,8 @@ impl AgentPolicy {
     fn connector(&self, id: &str) -> (bool, bool) {
         match &self.connectors {
             None => (true, false),
+            // Xero isn't bound by connection: no `[skills]` turns it off.
+            Some(_) if Books::of(id) == Some(Books::Xero) => (true, false),
             Some(c) => (
                 c.enabled.iter().any(|e| e == id),
                 c.read_only.iter().any(|e| e == id),

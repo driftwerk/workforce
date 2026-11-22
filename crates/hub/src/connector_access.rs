@@ -150,6 +150,7 @@ mod tests {
         "github.project_items",
         "github.issues_changed",
         "github.repo_labels",
+        "github.workspaces",
         "google.calendar.calendars",
         "google.calendar.events",
         "google.calendar.event_get",

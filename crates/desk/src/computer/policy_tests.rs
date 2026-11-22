@@ -641,6 +641,33 @@ fn a_freeagent_write_asks_as_changing_the_books_even_at_full_access() {
 }
 
 #[test]
+fn xero_is_in_no_binding_so_a_bound_agent_reaches_it_as_any_other() {
+    let mut bound = full();
+    bound.connectors = Some(Connectors {
+        enabled: vec!["github".into()],
+        read_only: vec!["freeagent".into()],
+    });
+    assert_eq!(
+        verdict(
+            &bound,
+            false,
+            &[],
+            &connector("xero.invoices_list", "xero", false)
+        ),
+        run()
+    );
+    assert_eq!(
+        verdict(
+            &bound,
+            false,
+            &[],
+            &connector("xero.invoice_create", "xero", true)
+        ),
+        once(Why::ChangesTheBooks(Books::Xero))
+    );
+}
+
+#[test]
 fn asks_never_lets_it_run() {
     let mut never = full();
     never.access.asks = Asking::Never;
