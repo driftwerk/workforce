@@ -256,7 +256,7 @@ impl Desk {
             .and_then(std::sync::Weak::upgrade);
         self.running_boss(me.id)
             .filter(|b| {
-                crate::grant::is_served(b) && crew.as_ref().is_some_and(|c| c.answers_for(b))
+                crate::grant::is_served(b) && crew.as_ref().is_some_and(|c| c.answers_for(b, me.id))
             })
             .map(|b| Party::manager(&b, &self.boss_name(&b)))
             .or_else(|| self.line_overseer(me.group.as_ref().map(|g| g.id.as_str())))

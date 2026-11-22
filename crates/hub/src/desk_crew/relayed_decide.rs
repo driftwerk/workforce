@@ -765,8 +765,10 @@ struct Pump {
     /// The machine may keep notices for the person not yet said taken:
     /// its last take handed some, or none reached it yet.
     notes_waiting: bool,
-    /// The takes in a row that didn't reach the machine.
+    /// The takes in a row that didn't reach the machine, and when the last
+    /// of them began.
     failed: u32,
+    unreached: Option<Instant>,
 }
 
 /// How long after a take a machine is taken from again while Act fully
@@ -847,6 +849,16 @@ impl Pump {
             || (left && self.failed < GIVEN_UP_AFTER);
         !self.busy && (lapsed || (wanted && now >= self.next))
     }
+
+    /// The machine answered a call `at`, a take or any other: one that
+    /// couldn't be reached since is taken from again now, given up on or not.
+    fn reached(&mut self, at: Instant, now: Instant) {
+        if self.unreached.is_some_and(|u| at > u) {
+            self.failed = 0;
+            self.unreached = None;
+            self.next = self.next.min(now);
+        }
+    }
 }
 
 impl Default for Pump {
@@ -862,6 +874,7 @@ impl Default for Pump {
             notes_taken: Vec::new(),
             notes_waiting: true,
             failed: 0,
+            unreached: None,
         }
     }
 }
@@ -925,9 +938,13 @@ pub(crate) async fn pump_loop(crew: Arc<CrewHub>, cancel: CancellationToken) {
             for k in grants {
                 seen.insert(k.clone());
                 {
+                    let now = Instant::now();
                     let mut p = pumps.lock();
                     let p = p.entry(k.clone()).or_default();
-                    if !p.due(in_force, Instant::now()) {
+                    if let Some(at) = crew.machine_reached(&k.0) {
+                        p.reached(at, now);
+                    }
+                    if !p.due(in_force, now) {
                         continue;
                     }
                     p.busy = true;
@@ -1044,9 +1061,13 @@ async fn take(
         match &got {
             Ok(a) => {
                 p.failed = 0;
+                p.unreached = None;
                 p.notes_waiting = a.status == ServedStatus::Ok && !notes.is_empty();
             }
-            Err(_) => p.failed = p.failed.saturating_add(1),
+            Err(_) => {
+                p.failed = p.failed.saturating_add(1);
+                p.unreached = Some(started);
+            }
         }
         if let Some((f, _)) = reported {
             p.counts = Some((f, Instant::now()));
@@ -1258,6 +1279,28 @@ mod tests {
         p.failed = GIVEN_UP_AFTER;
         assert!(!p.due(false, now + NOTED_FOR), "not reached: given up");
         assert!(p.due(true, now + NOTED_FOR));
+    }
+
+    #[test]
+    fn a_machine_given_up_on_is_taken_from_again_once_it_is_reached() {
+        let now = Instant::now();
+        let later = now + MOST_IDLE;
+        let mut p = Pump {
+            failed: GIVEN_UP_AFTER,
+            unreached: Some(now),
+            next: later + MOST_IDLE,
+            ..Pump::default()
+        };
+        assert!(!p.due(false, later), "given up, its notes waiting");
+        // What reached it before the last take that didn't counts for nothing.
+        p.reached(now - TAKE_EVERY, later);
+        assert!(!p.due(false, later));
+        // Reached since, by any call: its notes are taken at once.
+        p.reached(now + TAKE_EVERY, later);
+        assert!(p.due(false, later), "taken for the notes it keeps");
+        assert_eq!((p.failed, p.unreached), (0, None));
+        p.notes_waiting = false;
+        assert!(!p.due(false, later), "and no more once none waits");
     }
 
     #[test]

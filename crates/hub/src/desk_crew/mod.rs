@@ -331,7 +331,11 @@ pub struct CrewHub {
     /// listed them, and when: what the sidebar shows of it
     /// ([`machine_grants`]).
     machine_known: Mutex<HashMap<String, machine_grants::Listed>>,
+    /// The machines said to stay unread, while they do.
+    unread_said: Mutex<HashSet<String>>,
     machine_read: Mutex<HashMap<String, std::time::Instant>>,
+    /// When each machine last answered a call, of any kind.
+    machine_reached: Mutex<HashMap<String, std::time::Instant>>,
     /// Each machine's plan reads that failed in a row.
     machine_down: Mutex<HashMap<String, u32>>,
     /// Sessions a start's work was given to, held from other starts until
@@ -814,7 +818,9 @@ impl CrewHub {
             plans_watched: std::sync::atomic::AtomicBool::new(false),
             ungrouped_asked: Mutex::default(),
             machine_known: Mutex::default(),
+            unread_said: Mutex::default(),
             machine_read: Mutex::default(),
+            machine_reached: Mutex::default(),
             machine_down: Mutex::default(),
             reuse_claims: Mutex::default(),
             relay: relay::relays(),
@@ -1767,8 +1773,8 @@ impl Crew for CrewHub {
         !self.overseers().is_empty()
     }
 
-    fn answers_for(&self, boss: &str) -> bool {
-        self.home_reads(boss)
+    fn answers_for(&self, boss: &str, session: uuid::Uuid) -> bool {
+        self.home_reads(boss, Some(session))
     }
 
     fn answers_itself(&self, view: &workforce_desk::model::SessionView) -> bool {

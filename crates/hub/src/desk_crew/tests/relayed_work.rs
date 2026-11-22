@@ -362,7 +362,7 @@ async fn a_question_to_the_homes_boss_is_the_persons_once_desk_lets_the_boss_go(
         .await;
         assert_eq!(code, StatusCode::OK);
         // Its home took just now: it isn't for not reading that it is given.
-        assert!(crew.home_reads(HOME_DESK));
+        assert!(crew.home_reads(HOME_DESK, Some(vel9.id)));
         let q = eventually("its question given to the person", async || {
             d.store()
                 .line_message(ask)
@@ -461,6 +461,58 @@ async fn a_question_to_the_homes_boss_is_the_persons_once_the_boss_lets_its_sess
             q.escalation
                 .as_ref()
                 .is_some_and(|e| e.why.contains("Its boss let this session go")),
+            "{q:?}"
+        );
+    })
+    .await;
+}
+
+/// On devbox: the home goes on taking under its Acme grant there but no
+/// longer under Ungrouped, as a Mac that can't read devbox's sessions does:
+/// what VEL-9, in Ungrouped, asked its boss is the person's.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_question_is_the_persons_once_its_home_takes_only_under_another_grant() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (crew, d, [vel9, _, _, notes]) = devbox(dir.path(), pool).await;
+        let app = super::super::relay::routes(Arc::clone(&crew.state), Arc::clone(&crew));
+        let token = crew.state.auth_token.clone();
+        let mut acme = ungrouped(1, &[notes.id], true);
+        acme["name"] = json!("Acme");
+        let (code, out) = native(&d, "PUT", "/api/desk/grants/acme", acme).await;
+        assert_eq!(code, StatusCode::OK, "{out}");
+        let out = post(&app, &token, take_on(vel9.id, true)).await;
+        assert_eq!(out["status"], "ok", "{out}");
+        take(&app, &token, json!({})).await;
+        let asked = d
+            .line_call(
+                vel9.id,
+                "ask",
+                &json!({"to": "desk", "text": "Ship VEL-9 now?", "wait_seconds": 60}),
+                Some(Duration::from_millis(10)),
+            )
+            .await
+            .unwrap();
+        let ask: uuid::Uuid = serde_json::from_value(asked["id"].clone()).unwrap();
+
+        crew.homes_gone();
+        let mut under_acme = relayed(WORK_TAKE, json!({}), true);
+        under_acme["group"] = json!("acme");
+        let q = eventually("its question given to the person", async || {
+            let out = post(&app, &token, under_acme.clone()).await;
+            assert_eq!(out["status"], "ok", "{out}");
+            d.store()
+                .line_message(ask)
+                .await
+                .unwrap()
+                .filter(|q| q.asked == Some(Asked::Escalated))
+        })
+        .await;
+        assert!(crew.home_reads(HOME_DESK, Some(notes.id)), "Acme's taken");
+        assert!(
+            q.escalation
+                .as_ref()
+                .is_some_and(|e| e.why.contains("doesn't reach this session")),
             "{q:?}"
         );
     })

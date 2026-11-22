@@ -270,17 +270,6 @@ pub struct SessionView {
     /// with it, and what it gives the person comes as its own card.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub boss_has: Option<String>,
-    /// Whether its Act fully boss answers what it asks itself, here: said
-    /// only in Desk's list of the sessions ([`crate::Desk::listed`]), for
-    /// the hub of a boss that runs it from another computer.
-    #[serde(default)]
-    pub boss_answers: bool,
-    /// The grant here that holds it (its group's key), if any: said only in
-    /// Desk's list of the sessions, so the Mac never asks for it in another.
-    /// Always said, none as null: a list that says it is a Desk's that
-    /// knows its grants.
-    #[serde(default)]
-    pub grant: Option<String>,
     /// How its process last ended on its own, until it starts again.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub exited: Option<Exited>,
@@ -289,6 +278,22 @@ pub struct SessionView {
     pub deps: Option<crate::deps::Deps>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+}
+
+/// A session as Desk's list of them says it ([`crate::Desk::listed`]), for
+/// the hub of a boss that runs it from another computer: its view, and what
+/// only that list says of it.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ListedSession {
+    #[serde(flatten)]
+    pub view: SessionView,
+    /// Whether its Act fully boss answers what it asks itself, here.
+    pub boss_answers: bool,
+    /// The grant here that holds it (its group's key), null when none does:
+    /// the Mac never asks for it in another. Always said, so a list that
+    /// says it is a Desk's that knows its grants.
+    pub grant: Option<String>,
 }
 
 impl SessionView {
@@ -446,8 +451,6 @@ impl SessionView {
             mode: None,
             waits_on_you: None,
             boss_has: None,
-            boss_answers: false,
-            grant: None,
             failure: None,
             exited: None,
             deps: None,

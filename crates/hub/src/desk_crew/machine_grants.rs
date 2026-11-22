@@ -113,6 +113,9 @@ pub struct MachineGrants {
     /// Whether its plans' grants are said: false until its plans' machine
     /// sessions have been read, or for a Desk that doesn't carry them.
     pub plans_known: bool,
+    /// Whether every machine's Ungrouped grant is said, listed here or not:
+    /// with no main overseer, none should hold one.
+    pub ungrouped_known: bool,
     pub machines: BTreeMap<String, MachineWanted>,
 }
 
@@ -239,6 +242,10 @@ impl Listed {
 /// How long one machine's sessions are waited for, as the Ungrouped grants
 /// are read.
 const MACHINE_READ_WITHIN: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// How long a machine Desk reaches may stay unread, Desk carrying its
+/// Ungrouped grant, before it is said: well past a few reads.
+const UNREAD_SAID_AFTER: std::time::Duration = std::time::Duration::from_secs(120);
 
 impl CrewHub {
     /// What `service`'s grants say of it, as the module says; none for an
@@ -421,7 +428,7 @@ impl CrewHub {
             .map(|(s, _)| s.agent_id.as_str().to_string());
         // What was read is kept while Desk doesn't ask: it counts again only
         // as read after Desk asks again.
-        let Some(boss) = main.filter(|_| self.ungrouped_carried()) else {
+        let Some((boss, since)) = main.zip(self.ungrouped_since()) else {
             return;
         };
         let gap = self.machine_gap();
@@ -458,16 +465,16 @@ impl CrewHub {
             .filter(|m| m["reached"].as_bool() == Some(true))
             .filter_map(|m| m["name"].as_str())
             .filter(|m| had.contains(*m))
-            .filter(|m| {
-                self.machine_known
-                    .lock()
-                    .get(*m)
-                    .is_none_or(|l| l.at.elapsed() >= gap)
-            })
             .collect();
         // Each at once, none waited on past a short while: a slow machine
         // keeps what was last read of it.
-        let read = reached.into_iter().map(|machine| {
+        let due = reached.iter().copied().filter(|m| {
+            self.machine_known
+                .lock()
+                .get(*m)
+                .is_none_or(|l| l.at.elapsed() >= gap)
+        });
+        let read = due.map(|machine| {
             let boss = &boss;
             async move {
                 let listed = tokio::time::timeout(
@@ -489,6 +496,55 @@ impl CrewHub {
                 Err(_) => tracing::debug!(%machine, "a machine's sessions weren't read in time"),
             }
         }
+        self.say_unread(&reached, since);
+    }
+
+    /// Says once, in the log and on the Floor, each machine Desk reaches
+    /// whose sessions stay unread past [`UNREAD_SAID_AFTER`] of carrying its
+    /// Ungrouped grant: the main overseer runs none of its sessions in no
+    /// group, so their questions are the person's.
+    fn say_unread(&self, reached: &[&str], since: std::time::Instant) {
+        let unread: BTreeSet<String> = {
+            let known = self.machine_known.lock();
+            reached
+                .iter()
+                .filter(|m| !known.get(**m).is_some_and(|l| l.read_since(since)))
+                .map(|m| m.to_string())
+                .collect()
+        };
+        let said: Vec<String> = {
+            let mut said = self.unread_said.lock();
+            said.retain(|m| unread.contains(m));
+            match since.elapsed() >= UNREAD_SAID_AFTER {
+                true => unread
+                    .into_iter()
+                    .filter(|m| said.insert(m.clone()))
+                    .collect(),
+                false => Vec::new(),
+            }
+        };
+        for machine in said {
+            tracing::warn!(%machine, "a machine's sessions stay unread: its Ungrouped grant isn't said");
+            self.desk.note(workforce_desk::crew::Event::new(
+                workforce_desk::crew::Kind::OnMachine,
+                workforce_desk::crew::Party::desk(),
+                None,
+                format!(
+                    "Desk can't read the sessions on {machine}, so the main boss doesn't run those \
+                     in no group there and their questions come to you. Updating Desk on {machine} \
+                     may fix it."
+                ),
+            ));
+        }
+    }
+
+    /// As if Desk began carrying machines' Ungrouped grants long ago.
+    #[cfg(test)]
+    pub(crate) fn ungrouped_carried_long(&self) {
+        if let Some(a) = self.ungrouped_asked.lock().as_mut() {
+            a.since -= UNREAD_SAID_AFTER;
+        }
+        self.machine_read.lock().clear();
     }
 
     /// Whether Desk on this computer carries machines' Ungrouped grants:
@@ -607,6 +663,7 @@ impl CrewHub {
         let mut out = MachineGrants {
             grant_version: GRANT_VERSION,
             plans_known: plans,
+            ungrouped_known: false,
             machines: BTreeMap::new(),
         };
         let all = layout
@@ -698,11 +755,11 @@ impl CrewHub {
             }
         }
         // Each machine read since Desk began asking: what it should hold in
-        // Ungrouped is said, none included. With no main overseer, none
-        // should hold one.
+        // Ungrouped is said, none included. With no main overseer, every
+        // machine's is: none.
         if plans && ungrouped {
-            let main = overseers.iter().any(|(_, o)| o.scope == Scope::Ungrouped);
-            let since = self.ungrouped_since();
+            out.ungrouped_known = !overseers.iter().any(|(_, o)| o.scope == Scope::Ungrouped);
+            let since = self.ungrouped_since().filter(|_| !out.ungrouped_known);
             let known: Vec<String> = self
                 .machine_known
                 .lock()
@@ -710,14 +767,8 @@ impl CrewHub {
                 .filter(|(_, l)| since.is_some_and(|s| l.read_since(s)))
                 .map(|(m, _)| m.clone())
                 .collect();
-            match main {
-                true => known.into_iter().for_each(|m| {
-                    out.machines.entry(m).or_default().ungrouped_known = true;
-                }),
-                false => out
-                    .machines
-                    .values_mut()
-                    .for_each(|m| m.ungrouped_known = true),
+            for m in known {
+                out.machines.entry(m).or_default().ungrouped_known = true;
             }
         }
         Some(out)

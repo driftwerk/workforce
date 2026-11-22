@@ -62,6 +62,8 @@ const LINES_KEPT: Duration = Duration::from_secs(3_600);
 const SWEEP_EVERY: Duration = Duration::from_secs(5);
 
 const UNREAD: &str = "Its boss on the Mac can't be reached, so its question comes to you.";
+const NOT_TAKEN: &str =
+    "Its boss on the Mac doesn't reach this session just now, so its question comes to you.";
 
 /// A session the boss runs on a machine, as its take says.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -208,8 +210,14 @@ impl Default for Homes {
 }
 
 impl Homes {
-    fn reads(&self, party: &str) -> bool {
-        let mut took = self.took.iter().filter(|((p, _), _)| p == party).peekable();
+    /// Whether `party`'s home took lately: under `group`'s grant, else
+    /// under any. One it never took under here may be taken yet, at first.
+    fn reads(&self, party: &str, group: Option<&str>) -> bool {
+        let mut took = self
+            .took
+            .iter()
+            .filter(|((p, g), _)| p == party && group.is_none_or(|w| g == w))
+            .peekable();
         match took.peek() {
             None => Instant::now() < self.grace,
             Some(_) => took.any(|(_, at)| at.elapsed() < WORK_FRESH),
@@ -282,10 +290,17 @@ fn work_frame(base: Option<Value>, e: &Event, run: &ChargeView) -> Option<Frame>
 // ── The machine's side ──────────────────────────────────────────────────
 
 impl CrewHub {
-    /// Whether the boss `party` relayed from the home reads what the
-    /// sessions it runs here say on Desk's line: its home took lately.
-    pub(crate) fn home_reads(&self, party: &str) -> bool {
-        super::relayed_decide::relayed_party(party) && self.work_homes.lock().reads(party)
+    /// Whether the boss `party` relayed from the home reads what `session`
+    /// says on Desk's line here: its home took lately under the grant that
+    /// holds it (none holding it, never). Of no session, under any grant.
+    pub(crate) fn home_reads(&self, party: &str, session: Option<Uuid>) -> bool {
+        let homes = || self.work_homes.lock();
+        super::relayed_decide::relayed_party(party)
+            && match session.map(|s| self.desk.grant_group_of(s)) {
+                None => homes().reads(party, None),
+                Some(None) => false,
+                Some(Some(g)) => homes().reads(party, Some(&g)),
+            }
     }
 
     /// The boss relayed from the home that runs `session` here, while it
@@ -295,7 +310,7 @@ impl CrewHub {
             .charge_of(session)
             .filter(workforce_desk::charge::Charge::live)
             .map(|c| c.boss)
-            .filter(|b| self.home_reads(b))
+            .filter(|b| self.home_reads(b, Some(session)))
     }
 
     /// Keeps what `messages` report to `boss` waiting for its home's take;
@@ -344,9 +359,14 @@ impl CrewHub {
                 return;
             }
         };
-        for (ask, _) in asks.iter().filter(|(_, to)| !self.home_reads(to)) {
+        for (ask, to, asker) in asks.iter().filter(|(_, to, a)| !self.home_reads(to, *a)) {
+            // Its home takes, but not under the asking session's grant.
+            let why = match asker.is_some() && self.home_reads(to, None) {
+                true => NOT_TAKEN,
+                false => UNREAD,
+            };
             if let Err(e) = self
-                .escalate(*ask, &By::desk(UNREAD), UNREAD, Vec::new(), None)
+                .escalate(*ask, &By::desk(why), why, Vec::new(), None)
                 .await
             {
                 tracing::info!(error = %e, "a question wasn't given to the person");
@@ -1403,17 +1423,26 @@ mod tests {
     #[test]
     fn a_home_reads_while_it_takes_and_one_never_heard_only_at_first() {
         let mut h = Homes::default();
-        assert!(h.reads("home/desk"), "just started: its home may take yet");
+        assert!(
+            h.reads("home/desk", None),
+            "just started: its home may take yet"
+        );
+        assert!(h.reads("home/desk", Some("g")));
         h.grace = Instant::now();
-        assert!(!h.reads("home/desk"));
+        assert!(!h.reads("home/desk", None));
         h.took
             .insert(("home/desk".into(), "g".into()), Instant::now());
-        assert!(h.reads("home/desk"));
+        assert!(h.reads("home/desk", None));
+        assert!(h.reads("home/desk", Some("g")));
+        assert!(
+            !h.reads("home/desk", Some("ungrouped")),
+            "taking under another grant alone"
+        );
         h.took.insert(
             ("home/desk".into(), "g".into()),
             Instant::now() - WORK_FRESH,
         );
-        assert!(!h.reads("home/desk"), "its home stopped taking");
+        assert!(!h.reads("home/desk", None), "its home stopped taking");
     }
 
     #[test]

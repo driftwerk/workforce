@@ -1675,6 +1675,13 @@ async fn works_a_machine_session(
     };
     assert_eq!(grant_of(vel20.id), Some(json!("g-globex")));
     assert_eq!(grant_of(vel9.id), Some(Value::Null), "{listed}");
+    // Said in that list alone: a session's view anywhere else never says
+    // none for a grant it may be in.
+    let view = serde_json::to_value(there.view(vel20.id).unwrap()).unwrap();
+    assert!(
+        view.get("grant").is_none() && view.get("bossAnswers").is_none(),
+        "{view}"
+    );
     let machine_id = format!("devbox/{}", vel9.id);
     // VEL-9 was never placed in the sidebar: it is in no group, as the
     // sidebar shows it. VEL-15 is in a group with no boss of its own.
@@ -1719,7 +1726,8 @@ async fn works_a_machine_session(
     assert!(none(crew.machine_grants(true, false).unwrap()));
     // Asked for the first time: devbox isn't read since, so what it holds
     // in Ungrouped isn't said either way.
-    assert!(!known(&crew.machine_grants(true, true).unwrap()));
+    let cold = crew.machine_grants(true, true).unwrap();
+    assert!(!known(&cold) && !cold.ungrouped_known, "{cold:?}");
     assert!(none(crew.machine_grants(false, true).unwrap()));
     let w = eventually("devbox's sessions read", async || {
         crew.machine_grants(true, true).filter(|w| {
@@ -1729,6 +1737,10 @@ async fn works_a_machine_session(
         })
     })
     .await;
+    assert!(
+        crew.machine_reached("devbox").is_some(),
+        "its listing counts as reaching it, for the takes given up on"
+    );
     let grants = &w.machines["devbox"].grants;
     assert_eq!(grants.len(), 1, "{grants:?}");
     assert_eq!(grants[0].group, workforce_desk::UNGROUPED);
@@ -1839,6 +1851,16 @@ async fn works_a_machine_session(
     })
     .await;
     assert!(there.charge_of(vel9.id).is_some_and(|c| c.live()));
+
+    // The main overseer is gone: no machine should hold an Ungrouped grant,
+    // each one listed or not, so Desk lets go of devbox's.
+    write_config(&main, "[oversight]\nenabled = false\n");
+    let w = eventually("no main overseer", async || {
+        crew.machine_grants(true, true)
+            .filter(|w| w.ungrouped_known)
+    })
+    .await;
+    assert!(none(w), "nothing is wanted in its place");
     poller.abort();
 }
 
@@ -1854,7 +1876,7 @@ async fn a_machine_whose_listing_doesnt_say_its_grants_is_never_written_ungroupe
             |devbox_pool| async move {
                 let (mac_dir, devbox_dir) =
                     (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
-                let (main, crew, _d, _llm) =
+                let (main, crew, d, _llm) =
                     overseeing(mac_dir.path(), mac_pool, "ok", MAIN_ALL, &[]).await;
                 let (_any, there_crew, there, _there_llm) = overseeing(
                     devbox_dir.path(),
@@ -1913,6 +1935,26 @@ async fn a_machine_whose_listing_doesnt_say_its_grants_is_never_written_ungroupe
                 .await;
                 assert!(!r.success, "{r:?}");
                 assert!(carried.lock().iter().all(|c| c.tool != "crew.take_on"));
+
+                // Unread a good while: said once, on the Floor.
+                crew.ungrouped_carried_long();
+                let unread = async || {
+                    d.activity(workforce_desk::crew::Filter::All, None, 50)
+                        .await
+                        .unwrap()
+                        .events
+                        .into_iter()
+                        .filter(|e| e.text.contains("can't read the sessions on devbox"))
+                        .count()
+                };
+                eventually("devbox said unread", async || {
+                    crew.machine_grants(true, true);
+                    (unread().await > 0).then_some(())
+                })
+                .await;
+                // Read again many times over, its gap a tick.
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                assert_eq!(unread().await, 1, "said once while it lasts");
                 poller.abort();
             },
         )

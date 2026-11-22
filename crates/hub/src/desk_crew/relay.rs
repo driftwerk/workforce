@@ -258,7 +258,12 @@ impl CrewHub {
             )));
         }
         match self.relay.send(call, wait).await {
-            Ok(answer) => Ok(answer),
+            Ok(answer) => {
+                self.machine_reached
+                    .lock()
+                    .insert(machine.to_string(), std::time::Instant::now());
+                Ok(answer)
+            }
             // Desk took it: it may have been done there. Not to be sent
             // again as new.
             Err(Unsent::Taken) if tool == "desk.run" => Err(MachineRefused::Unknown(format!(
@@ -269,6 +274,11 @@ impl CrewHub {
             ))),
             Err(Unsent::NotPolling | Unsent::Full | Unsent::NotTaken) => Err(unreached()),
         }
+    }
+
+    /// When `machine` last answered a call, of any kind.
+    pub(crate) fn machine_reached(&self, machine: &str) -> Option<std::time::Instant> {
+        self.machine_reached.lock().get(machine).copied()
     }
 
     /// Whether Desk's native side relays now: it asked for calls lately.

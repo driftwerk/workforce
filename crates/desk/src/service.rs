@@ -25,8 +25,8 @@ use crate::first_run;
 use crate::floor::{Outcome, Scope, Subject, SubjectKey, Turn, TurnLog, TurnOp};
 use crate::holder::{Held, Holder};
 use crate::model::{
-    Approvals, Decision, DeskEvent, Engine, Exited, NewSession, Origin, PendingApproval,
-    SessionPatch, SessionRecord, SessionState, SessionView,
+    Approvals, Decision, DeskEvent, Engine, Exited, ListedSession, NewSession, Origin,
+    PendingApproval, SessionPatch, SessionRecord, SessionState, SessionView,
 };
 use crate::procs;
 use crate::pty::{Exit, Pty};
@@ -3380,16 +3380,16 @@ impl Desk {
     }
 
     /// [`Self::list`], each saying whether its boss answers what it asks
-    /// itself ([`SessionView::boss_answers`]) and which grant holds it
-    /// ([`SessionView::grant`]): what Desk's list of the sessions shows.
-    pub fn listed(&self) -> Vec<SessionView> {
+    /// itself and which grant holds it: what Desk's list of the sessions
+    /// shows.
+    pub fn listed(&self) -> Vec<ListedSession> {
         let crew = self.crew();
         self.list()
             .into_iter()
-            .map(|mut v| {
-                v.boss_answers = crew.as_ref().is_some_and(|c| c.answers_itself(&v));
-                v.grant = self.grant_group_of(v.id);
-                v
+            .map(|view| ListedSession {
+                boss_answers: crew.as_ref().is_some_and(|c| c.answers_itself(&view)),
+                grant: self.grant_group_of(view.id),
+                view,
             })
             .collect()
     }

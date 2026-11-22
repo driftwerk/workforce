@@ -980,10 +980,10 @@ pub trait Crew: Send + Sync {
     fn answers_lines(&self) -> bool {
         false
     }
-    /// Whether `boss`, a boss served from a grant that runs a session
-    /// here, takes what that session says on Desk's line now: one relayed
-    /// from the home, while its home reads it.
-    fn answers_for(&self, _boss: &str) -> bool {
+    /// Whether `boss`, a boss served from a grant that runs `session` here,
+    /// takes what that session says on Desk's line now: one relayed from
+    /// the home, while its home reads it under that grant.
+    fn answers_for(&self, _boss: &str, _session: uuid::Uuid) -> bool {
         false
     }
     /// Whether `view`'s boss answers what it asks itself, here.
