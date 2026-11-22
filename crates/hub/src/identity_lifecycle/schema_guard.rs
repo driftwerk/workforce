@@ -155,7 +155,7 @@ const CLAIMS: &[(&str, &str, &str, Claim)] = &[
         "desk",
         "access_activity",
         "decided_by",
-        NotPersonal("how a call was decided: rule, grant, session, person or classifier"),
+        NotPersonal("how a call was decided: rule, grant, session, person, classifier or on its own"),
     ),
     ("desk", "access_activity", "person", By(C::DeskActivity)),
     (
@@ -169,6 +169,12 @@ const CLAIMS: &[(&str, &str, &str, Claim)] = &[
         "access_grants",
         "person",
         NotPersonal("`you`, the one person of the Desk whose own hub this is"),
+    ),
+    (
+        "desk",
+        "access_on_its_own",
+        "scope",
+        NotPersonal("what an agent's level covers: a whole kind of action, or one folder, host or site"),
     ),
     (
         "desk",

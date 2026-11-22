@@ -82,18 +82,28 @@ impl SqlitePendingApprovalStore {
             ",
         )
         .wrap_err("Failed to initialise pending-approval schema")?;
-        // Added after the table first shipped: an older DB gets it, unset.
-        let has_chat = conn
-            .prepare("SELECT 1 FROM pragma_table_info('pending_approvals') WHERE name = 'chat'")?
-            .exists([])?;
-        if !has_chat {
+        // Added after the table first shipped: an older DB gets them, unset.
+        for (column, ddl) in [
+            (
+                "chat",
+                "ALTER TABLE pending_approvals ADD COLUMN chat INTEGER NOT NULL DEFAULT 0;",
+            ),
+            (
+                "origin",
+                "ALTER TABLE pending_approvals ADD COLUMN origin TEXT;",
+            ),
+        ] {
+            let has = conn
+                .prepare("SELECT 1 FROM pragma_table_info('pending_approvals') WHERE name = ?1")?
+                .exists([column])?;
             // Another process opening the DB at the same moment may add it
             // first: then it is there, as wanted.
-            if let Err(e) = conn.execute_batch(
-                "ALTER TABLE pending_approvals ADD COLUMN chat INTEGER NOT NULL DEFAULT 0;",
-            ) {
-                if !e.to_string().contains("duplicate column name") {
-                    return Err(e).wrap_err("Failed to add pending_approvals.chat");
+            if !has {
+                if let Err(e) = conn.execute_batch(ddl) {
+                    if !e.to_string().contains("duplicate column name") {
+                        return Err(e)
+                            .wrap_err(format!("Failed to add pending_approvals.{column}"));
+                    }
                 }
             }
         }
@@ -138,6 +148,7 @@ fn parse_approval(row: &Row<'_>) -> rusqlite::Result<PendingApproval> {
         created_at: parse_ts(&created_at),
         expires_at: parse_ts(&expires_at),
         chat: chat != 0,
+        origin: row.get("origin")?,
     })
 }
 
@@ -153,7 +164,7 @@ fn parse_target(row: &Row<'_>) -> rusqlite::Result<Target> {
 
 const SELECT_COLS: &str = "request_id, agent_id, session_key, workspace_id, channel_id, thread_ts,
      requester_id, tool_name, tool_input, reason, allow_self_approval, status,
-     resolved_by, channel_notice, channel_notice_ts, created_at, expires_at, chat";
+     resolved_by, channel_notice, channel_notice_ts, created_at, expires_at, chat, origin";
 
 impl PendingApprovalStore for SqlitePendingApprovalStore {
     fn insert_core(
@@ -169,8 +180,8 @@ impl PendingApprovalStore for SqlitePendingApprovalStore {
             "INSERT INTO pending_approvals (
                 request_id, agent_id, session_key, workspace_id, channel_id, thread_ts,
                 requester_id, tool_name, tool_input, reason, allow_self_approval, status,
-                created_at, expires_at, chat
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 'pending', ?12, ?13, ?14)
+                created_at, expires_at, chat, origin
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 'pending', ?12, ?13, ?14, ?15)
              ON CONFLICT (request_id) DO NOTHING",
             params![
                 core.request_id,
@@ -187,6 +198,7 @@ impl PendingApprovalStore for SqlitePendingApprovalStore {
                 Utc::now().to_rfc3339(),
                 expires_at.to_rfc3339(),
                 core.chat as i64,
+                core.origin,
             ],
         )
         .wrap_err("insert_core failed")?;
@@ -418,6 +430,7 @@ mod tests {
             approver_user_ids: vec!["bob".to_string()],
             ttl: std::time::Duration::from_secs(3600),
             chat: false,
+            origin: None,
         }
     }
 

@@ -87,11 +87,11 @@ pub async fn launch_resume(
     // Mirror the scheduler: scope the delivery channel so the resumed
     // turn loads the right per-user visibility, then (for approve) scope
     // the exact tool the human authorised so the runner pre-executes it.
+    // It carries the origin the turn that asked carried, not the one of
+    // whoever answered.
     let origin = match boss {
         true => crate::boss_links::wake::ORIGIN.to_string(),
-        false => workforce_agent::runner::CURRENT_AUTOMATED_ORIGIN
-            .try_with(|o| o.clone())
-            .unwrap_or_default(),
+        false => row.origin.clone().unwrap_or_default(),
     };
     let result = workforce_agent::runner::CURRENT_AUTOMATED_ORIGIN
         .scope(origin, async {
