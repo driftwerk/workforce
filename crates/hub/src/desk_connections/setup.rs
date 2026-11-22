@@ -538,8 +538,8 @@ fn app_steps(service: &str, app: super::app::AppState, whose: &str) -> Vec<Step>
             recipe(service).map_or("Save the app's keys", |r| r.key_label),
             None,
             &match service {
-                "freeagent" => "On the app's page, read the OAuth identifier and the OAuth secret with browser.capture_key {connector: \"freeagent\"} and no selector: Desk finds them, and they never come back to you.".to_string(),
-                _ => "On the dialog that shows the new client, read the Client ID and the Client secret with browser.capture_key {connector: \"google\"} and no selector: Desk finds them, and they never come back to you.".to_string(),
+                "freeagent" => "On the app's page, read the OAuth identifier with browser.capture_key {connector: \"freeagent\", field: \"client_id\"}, then the OAuth secret with field: \"client_secret\", each with no selector: Desk finds them, and they never come back to you. They look alike, so name each.".to_string(),
+                _ => "On the dialog that shows the new client, read the Client ID with browser.capture_key {connector: \"google\", field: \"client_id\"}, then the Client secret with field: \"client_secret\", each with no selector: Desk finds them, and they never come back to you.".to_string(),
             },
         )
     };
@@ -2479,6 +2479,18 @@ impl Setups {
         }
         let length = value.expose_secret().chars().count();
         let all = self.with(caller, &id, move |s| {
+            // An app's id and secret may be shaped alike: the same value
+            // read for both is neither.
+            if c.sign_in == catalog::SignIn::App
+                && s.secrets
+                    .iter()
+                    .any(|(k, v)| k != field && v.expose_secret() == value.expose_secret())
+            {
+                return Err(format!(
+                    "That's the value already kept as the app's {}, so nothing was kept. Read the {field} with browser.capture_key and field: \"{field}\".",
+                    APP_FIELDS.iter().find(|f| **f != field).unwrap_or(&field)
+                ));
+            }
             s.secrets.insert(field.to_string(), value);
             s.read_at = Some(page.origin.clone());
             let all = secret_fields(c).iter().all(|f| s.secrets.contains_key(*f));

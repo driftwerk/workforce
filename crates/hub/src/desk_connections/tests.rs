@@ -199,7 +199,12 @@ fn bearer(h: &HeaderMap) -> Option<String> {
 
 async fn google_userinfo(h: HeaderMap) -> Response {
     match bearer(&h) {
-        Some(who) => Json(json!({ "email": format!("{who}@acme.example") })).into_response(),
+        Some(who) => Json(json!({
+            // `work2` is `work` signed in once more.
+            "sub": format!("1{}", who.trim_end_matches('2').len() * 1000 + who.as_bytes()[0] as usize),
+            "email": format!("{who}@acme.example"),
+        }))
+        .into_response(),
         None => StatusCode::UNAUTHORIZED.into_response(),
     }
 }
@@ -3118,6 +3123,126 @@ mod setups {
         );
     }
 
+    /// FreeAgent's identifier and secret look alike: each is read by name,
+    /// and the same value read for both is neither.
+    #[tokio::test]
+    async fn freeagent_keys_are_read_by_name_and_one_value_is_never_both() {
+        let (_h, s) = setups().await;
+        let allan = caller("allan");
+        let started = s
+            .start(&allan, "freeagent", Some("Harbor"), None, false)
+            .await
+            .unwrap();
+        for step in started
+            .steps
+            .iter()
+            .map(|x| x.id)
+            .take_while(|x| *x != "key")
+        {
+            s.step(&allan, &started.id, step, StepState::Done, None)
+                .unwrap();
+        }
+        let read = |field: &str, value: &str| {
+            s.keep_key(
+                &allan,
+                "freeagent",
+                Some(field),
+                "https://dev.freeagent.com",
+                "/apps/1",
+                Secret::new(value.to_string()),
+            )
+        };
+        assert!(s.next(&started).contains("field: \"client_secret\""));
+        assert!(!read("client_id", FA_ID).unwrap().ready);
+        let twice = read("client_secret", FA_ID).unwrap_err();
+        assert!(
+            twice.contains("already kept as the app's client_id"),
+            "{twice}"
+        );
+        assert!(read("client_secret", FA_SECRET).unwrap().ready);
+    }
+
+    /// Walks a FreeAgent setup with no app yet to its keys, and reads both.
+    async fn freeagent_app_kept(s: &Arc<Setups>, allan: &Caller) -> String {
+        let started = s
+            .start(allan, "freeagent", Some("Harbor"), None, false)
+            .await
+            .unwrap();
+        for step in started
+            .steps
+            .iter()
+            .map(|x| x.id)
+            .take_while(|x| *x != "key")
+        {
+            s.step(allan, &started.id, step, StepState::Done, None)
+                .unwrap();
+        }
+        for (field, value) in [("client_id", FA_ID), ("client_secret", FA_SECRET)] {
+            s.keep_key(
+                allan,
+                "freeagent",
+                Some(field),
+                "https://dev.freeagent.com",
+                "/apps/1",
+                Secret::new(value.to_string()),
+            )
+            .unwrap();
+        }
+        s.finish(allan, &started.id).await;
+        started.id
+    }
+
+    /// The keys read off the app's page are the person's app, hub-wide:
+    /// no connection holds them, and none is made before they approve.
+    #[tokio::test]
+    async fn an_app_key_is_kept_as_the_app_not_the_connection() {
+        let (h, s) = setups().await;
+        let allan = caller("allan");
+        let id = freeagent_app_kept(&s, &allan).await;
+        card_shows(&s, &id, NowKind::Approve).await;
+        assert_eq!(
+            h.global
+                .get("skills/freeagent/oauth_client/client_id")
+                .as_deref(),
+            Some(FA_ID)
+        );
+        assert!(keys(&h.allan).is_empty(), "{:?}", keys(&h.allan));
+        assert!(
+            !keys(&h.global).iter().any(|k| k.contains("/workspaces/")),
+            "{:?}",
+            keys(&h.global)
+        );
+    }
+
+    /// A FreeAgent connection set up for an agent is turned on for it read
+    /// only: its books change only once the person allows it.
+    #[tokio::test]
+    async fn a_freeagent_connection_is_turned_on_read_only() {
+        let (h, s) = setups().await;
+        let allan = caller("allan");
+        let id = freeagent_app_kept(&s, &allan).await;
+        let approving = card_shows(&s, &id, NowKind::Approve).await;
+        let pending =
+            h.c.take_pending(&state_of(&approving.now.url.unwrap()))
+                .unwrap();
+        h.c.complete(pending, "harbor").await.unwrap();
+        card_shows(&s, &id, NowKind::Connected).await;
+        let on = s
+            .use_it(&allan, Some(&id), None, None, None, false, true)
+            .await
+            .unwrap();
+        assert!(on.contains("read only"), "{on}");
+        let config = h
+            .crew
+            .configs
+            .lock()
+            .unwrap()
+            .get("allan")
+            .cloned()
+            .unwrap_or_default();
+        assert!(!config.contains("writable"), "{config}");
+    }
+
     #[tokio::test]
     async fn freeagent_second_business_starts_at_approve() {
         let (h, s) = setups().await;
@@ -3559,6 +3684,133 @@ mod apps {
         );
     }
 
+    /// Two sign-ins in flight: the one finishing second never writes over
+    /// the first's connection, whatever key it started on.
+    #[tokio::test]
+    async fn two_sign_ins_in_flight_keep_two_connections() {
+        let h = hub().await;
+        h.c.keep_app(SARAH, "google", &GOOGLE_ID, &GOOGLE_SECRET)
+            .await
+            .unwrap();
+        let first = h.c.start(SARAH, "google", None, "all", None).await.unwrap();
+        let second = h.c.start(SARAH, "google", None, "all", None).await.unwrap();
+        signs_in(&h, &second, "home").await.unwrap();
+        signs_in(&h, &first, "work").await.unwrap();
+        let list = h.c.list(SARAH).await;
+        assert_eq!(connector(&list, "google").connections.len(), 2);
+        let tokens: Vec<String> = keys(&h.global)
+            .into_iter()
+            .filter(|k| k.ends_with("/refresh_token"))
+            .filter_map(|k| h.global.get(&k))
+            .collect();
+        assert!(tokens.contains(&"rt-home".to_string()), "{tokens:?}");
+        assert!(tokens.contains(&"rt-work".to_string()), "{tokens:?}");
+    }
+
+    /// A connection that kept no account takes the one approving it again
+    /// only when no other connection is that account.
+    #[tokio::test]
+    async fn approving_again_a_connection_with_no_account_kept() {
+        let h = hub().await;
+        h.c.keep_app(SARAH, "google", &GOOGLE_ID, &GOOGLE_SECRET)
+            .await
+            .unwrap();
+        let work =
+            h.c.start(SARAH, "google", Some("Work"), "all", None)
+                .await
+                .unwrap();
+        signs_in(&h, &work, "work").await.unwrap();
+        let home =
+            h.c.start(SARAH, "google", Some("Home"), "all", None)
+                .await
+                .unwrap();
+        signs_in(&h, &home, "home").await.unwrap();
+        let list = h.c.list(SARAH).await;
+        let home_id = connector(&list, "google")
+            .connections
+            .iter()
+            .find(|c| c.name == "Home")
+            .unwrap()
+            .id
+            .clone();
+        let blank: Vec<String> = keys(&h.global)
+            .into_iter()
+            .filter(|k| {
+                k.contains("/home/") && (k.ends_with("/account_id") || k.ends_with("/email"))
+            })
+            .collect();
+        assert_eq!(blank.len(), 2, "{blank:?}");
+        for k in &blank {
+            h.global.delete(k).unwrap();
+        }
+        // `work` is Work already: never Home as well.
+        let again = h.c.approve_again(SARAH, "google", &home_id).await.unwrap();
+        let said = signs_in(&h, &again, "work").await.unwrap_err();
+        assert!(said.contains("connected already as 'Work'"), "{said}");
+        // An account no connection is: Home takes it.
+        let again = h.c.approve_again(SARAH, "google", &home_id).await.unwrap();
+        signs_in(&h, &again, "other").await.unwrap();
+        assert!(blank.iter().any(|k| h.global.get(k).is_some()));
+    }
+
+    /// A Google connection kept by email alone, before its account id was,
+    /// is matched by email once and keeps the id from then on.
+    #[tokio::test]
+    async fn a_connection_kept_by_email_keeps_its_account_id_on_the_next_sign_in() {
+        let h = hub().await;
+        h.c.keep_app(SARAH, "google", &GOOGLE_ID, &GOOGLE_SECRET)
+            .await
+            .unwrap();
+        let started =
+            h.c.start(SARAH, "google", Some("Work"), "all", None)
+                .await
+                .unwrap();
+        signs_in(&h, &started, "work").await.unwrap();
+        let id_at = mine("skills/google/workspaces/default/account_id");
+        assert!(h.global.get(&id_at).is_some());
+        h.global.delete(&id_at).unwrap();
+        let started = h.c.start(SARAH, "google", None, "all", None).await.unwrap();
+        let said = signs_in(&h, &started, "work").await.unwrap();
+        assert!(said.contains("connected already as 'Work'"), "{said}");
+        assert!(h.global.get(&id_at).is_some());
+        assert_eq!(
+            connector(&h.c.list(SARAH).await, "google")
+                .connections
+                .len(),
+            1
+        );
+    }
+
+    /// Kat's setup for every agent never signs in again, or takes over,
+    /// another agent's own connection of the same account.
+    #[tokio::test]
+    async fn a_sign_in_for_every_agent_never_reaches_another_agents_own() {
+        let h = hub().await;
+        h.c.keep_app(SARAH, "google", &GOOGLE_ID, &GOOGLE_SECRET)
+            .await
+            .unwrap();
+        let bens =
+            h.c.start(SARAH, "google", Some("Ben's"), "agent", Some("ben"))
+                .await
+                .unwrap();
+        signs_in(&h, &bens, "work").await.unwrap();
+        let ben_token = || {
+            keys(&h.ben)
+                .into_iter()
+                .find(|k| k.ends_with("/refresh_token"))
+                .and_then(|k| h.ben.get(&k))
+        };
+        assert_eq!(ben_token().as_deref(), Some("rt-work"));
+        let all = h.c.start(SARAH, "google", None, "all", None).await.unwrap();
+        let said = signs_in(&h, &all, "work2").await.unwrap();
+        assert!(!said.contains("connected already"), "{said}");
+        assert_eq!(ben_token().as_deref(), Some("rt-work"));
+        assert!(keys(&h.global)
+            .into_iter()
+            .filter(|k| k.ends_with("/refresh_token"))
+            .any(|k| h.global.get(&k).as_deref() == Some("rt-work2")));
+    }
+
     /// Approving Harbor again signed in as Lumen keeps nothing: Lumen's
     /// books never go under Harbor's name.
     #[tokio::test]
@@ -3678,11 +3930,16 @@ mod apps {
         let fa = connector(&list, "freeagent");
         assert_eq!(fa.app, Some(app::AppState::Moved));
         assert!(!fa.sign_in_ready);
+        // The same app saved again isn't the address added: still moved.
+        h.c.keep_app(SARAH, "freeagent", FA_ID, FA_SECRET)
+            .await
+            .unwrap();
+        let c = catalog::find("freeagent").unwrap();
+        assert_eq!(h.c.app_state(c), Some(app::AppState::Moved));
         match h.c.start(SARAH, "freeagent", None, "all", None).await {
             Err(Refusal::Invalid(said)) => assert!(said.contains("address changed"), "{said}"),
             other => panic!("{other:?}"),
         }
-        let c = catalog::find("freeagent").unwrap();
         h.c.keep_app_address(SARAH, c).unwrap();
         assert_eq!(h.c.app_state(c), Some(app::AppState::Ready));
     }
@@ -3779,4 +4036,97 @@ mod apps {
             .unwrap()
             .contains("earlier Google app"));
     }
+}
+
+/// Every local agent has Desk's browser it sets connections up in, and a
+/// documents folder its context names.
+#[tokio::test]
+async fn every_local_agent_has_the_browser() {
+    let dir = tempfile::tempdir().unwrap();
+    let (service, _llm) = crate::serve::testing::service_on_mock_llm_with(dir.path(), |c| {
+        c.desk.enabled = true;
+        c.desk.machine = Some(false);
+    })
+    .await;
+    setup::register(&service);
+    assert!(service.tools.has("browser.navigate"));
+    assert!(service.tools.has("browser.capture_key"));
+    assert!(service.tools.has("connections.setup"));
+}
+
+/// A machine's hub has no person's Chrome beside it: its agents get no
+/// browser.
+#[tokio::test]
+async fn a_machine_hub_equips_none() {
+    let dir = tempfile::tempdir().unwrap();
+    let (service, _llm) = crate::serve::testing::service_on_mock_llm_with(dir.path(), |c| {
+        c.desk.enabled = true;
+        c.desk.machine = Some(true);
+    })
+    .await;
+    setup::register(&service);
+    crate::desk_browser::equip(&service);
+    assert!(!service.tools.has("browser.navigate"));
+}
+
+/// The documents folder is made once, when the agent is, and the context
+/// names it; a `documents` that is a link is never used.
+#[tokio::test]
+async fn documents_folder_is_made_and_named_in_the_hint() {
+    let dir = tempfile::tempdir().unwrap();
+    let (service, _llm) = crate::serve::testing::service_on_mock_llm_with(dir.path(), |c| {
+        c.desk.enabled = true;
+        c.desk.machine = Some(false);
+    })
+    .await;
+    let documents = service.workspace.join("documents");
+    let _ = std::fs::remove_dir_all(&documents);
+    assert_eq!(crate::desk_driver::documents_line(&service.workspace), None);
+    assert!(!documents.exists(), "naming it never makes it");
+    setup::register(&service);
+    assert!(documents.is_dir());
+    let line = crate::desk_driver::documents_line(&service.workspace).unwrap();
+    assert!(line.contains(&documents.display().to_string()), "{line}");
+
+    #[cfg(unix)]
+    {
+        let elsewhere = tempfile::tempdir().unwrap();
+        std::fs::remove_dir_all(&documents).unwrap();
+        std::os::unix::fs::symlink(elsewhere.path(), &documents).unwrap();
+        assert_eq!(crate::desk_driver::documents(&service.workspace), None);
+        assert_eq!(crate::desk_driver::documents_line(&service.workspace), None);
+    }
+}
+
+/// An agent's documents folder is only for those who may reach the
+/// agent: to anyone else it is no agent at all.
+#[tokio::test]
+async fn the_documents_folder_is_refused_for_someone_elses_agent() {
+    use axum::body::Body;
+    use axum::http::Request;
+    use tower::ServiceExt as _;
+    let h = hub().await;
+    let dir = tempfile::tempdir().unwrap();
+    let (service, _llm) = crate::desk_attachments::tests::agent(
+        dir.path(),
+        "scout",
+        "done",
+        std::time::Duration::ZERO,
+    )
+    .await;
+    // Alice and Bob are members; the agent is neither's.
+    let (state, [(_, alice), _]) = crate::desk_attachments::tests::gateway(&service);
+    let app = router(state, Arc::clone(&h.c));
+    let res = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/desk/agents/scout/documents")
+                .header("authorization", format!("Bearer {alice}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::NOT_FOUND);
+    assert!(!service.workspace.join("documents").exists());
 }

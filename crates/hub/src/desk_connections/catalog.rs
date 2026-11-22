@@ -134,6 +134,7 @@ const GOOGLE_HELD: &[&str] = &[
     "skills/google/workspaces/default/expires_at",
     "skills/google/workspaces/default/scopes",
     "skills/google/workspaces/default/email",
+    "skills/google/workspaces/default/account_id",
     "skills/google/workspaces/default/client_id",
 ];
 
@@ -292,6 +293,7 @@ pub const CATALOG: &[Connector] = &[
             "expires_at",
             "scopes",
             "email",
+            "account_id",
             "client_id",
         ],
         primary_sub: "refresh_token",

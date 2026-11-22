@@ -363,10 +363,6 @@ pub fn choose(
         read_only.push(service.to_string());
     } else if read_only_each {
         read_only.extend(reading.iter().map(|k| format!("{service}:{k}")));
-    } else if !reading.is_empty() {
-        return Err(format!(
-            "{service}'s connections take writes all together or not at all"
-        ));
     }
     for (key, list) in [("read_only", &read_only), ("writable", &writable)] {
         match list.is_empty() {
@@ -509,12 +505,12 @@ mod tests {
     }
 
     #[test]
-    fn email_takes_writes_all_together() {
-        assert!(
-            chosen("", "email", &[("work", true), ("home", false)], None)
-                .unwrap_err()
-                .contains("all together")
-        );
+    fn email_takes_writes_per_account() {
+        let one = chosen("", "email", &[("work", true), ("home", false)], None).unwrap();
+        let b = binding(&one);
+        assert!(!b.reads_only("email"));
+        assert!(!b.reads_only_instance("email", "work"));
+        assert!(b.reads_only_instance("email", "home"));
         let all = chosen("", "email", &[("work", false), ("home", false)], None).unwrap();
         assert!(binding(&all).reads_only("email"));
     }

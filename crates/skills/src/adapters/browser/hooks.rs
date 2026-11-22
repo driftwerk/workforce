@@ -122,6 +122,9 @@ pub struct KeyRead<'a> {
     /// The conversation's session key.
     pub conversation: &'a str,
     pub connector: &'a str,
+    /// Which of the connection's keys it is (`client_id`), where the agent
+    /// named it; otherwise the next still to read that it is shaped for.
+    pub field: Option<&'a str>,
     /// Where the extension says it read it, read in the same call.
     pub origin: &'a str,
     pub path: &'a str,

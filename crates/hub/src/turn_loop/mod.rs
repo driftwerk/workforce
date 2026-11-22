@@ -2264,13 +2264,10 @@ pub(crate) async fn build_enhanced_prompt_with_context(
         meta_lines.push(line);
     }
     #[cfg(feature = "postgres")]
-    if let Some(dir) =
-        crate::desk_driver::desk().and_then(|_| crate::desk_driver::documents(&service.workspace))
+    if let Some(line) = crate::desk_driver::desk()
+        .and_then(|_| crate::desk_driver::documents_line(&service.workspace))
     {
-        meta_lines.push(format!(
-            "- Your documents folder is {}. Keep invoices, statements and files you make or download for the person there.",
-            dir.display()
-        ));
+        meta_lines.push(line);
     }
     // An overseer asked in its Desk DM acts within its switches from the
     // first request, not after a suggestion comes back.

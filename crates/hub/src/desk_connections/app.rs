@@ -56,6 +56,9 @@ pub struct App {
     extra: &'static [(&'static str, &'static str)],
     /// The sub that tells one account from another.
     identity: &'static str,
+    /// The sub a sign-in kept before `identity` was: matched once, then
+    /// `identity` is kept beside it.
+    legacy: Option<&'static str>,
     /// What an app's id and secret look like, whole.
     id_shape: &'static str,
     secret_shape: &'static str,
@@ -77,7 +80,8 @@ pub const APPS: [App; 2] = [
         pkce: true,
         auth: ClientAuth::RequestBody,
         extra: &[("access_type", "offline"), ("prompt", "consent")],
-        identity: "email",
+        identity: "account_id",
+        legacy: Some("email"),
         id_shape: r"^[0-9]{6,20}-[0-9a-z]{32}\.apps\.googleusercontent\.com$",
         secret_shape: r"^GOCSPX-[A-Za-z0-9_-]{20,40}$",
     },
@@ -91,6 +95,7 @@ pub const APPS: [App; 2] = [
         auth: ClientAuth::Basic,
         extra: &[],
         identity: "company_id",
+        legacy: None,
         id_shape: r"^[A-Za-z0-9_-]{16,64}$",
         secret_shape: r"^[A-Za-z0-9_-]{16,64}$",
     },
@@ -145,7 +150,36 @@ pub struct Pending {
 struct Account {
     name: String,
     identity: String,
+    /// What an older sign-in kept as its identity, in [`App::legacy`].
+    legacy: Option<String>,
     subs: Vec<(&'static str, String)>,
+}
+
+/// Why the service didn't say whose a token is: it turned the token down,
+/// or something else (unreachable, a limit, its own trouble).
+enum NotAccount {
+    Rejected(String),
+    Other(String),
+}
+
+impl NotAccount {
+    fn said(self) -> String {
+        match self {
+            Self::Rejected(said) | Self::Other(said) => said,
+        }
+    }
+}
+
+impl From<String> for NotAccount {
+    fn from(said: String) -> Self {
+        Self::Other(said)
+    }
+}
+
+impl From<&str> for NotAccount {
+    fn from(said: &str) -> Self {
+        Self::Other(said.to_string())
+    }
 }
 
 /// A service's endpoints, as [`Services`] reaches them.
@@ -253,11 +287,15 @@ impl App {
 
     /// Whether `id` and `secret` look like this app's.
     pub fn shaped(&self, id: &str, secret: &str) -> bool {
-        self.field_shaped("client_id", id) && self.field_shaped("client_secret", secret)
+        // FreeAgent's id and secret are shaped alike: one read twice is
+        // neither.
+        id != secret
+            && self.field_shaped("client_id", id)
+            && self.field_shaped("client_secret", secret)
     }
 
     /// Who an access token signs in as.
-    async fn account(&self, s: &Services, token: &str) -> Result<Account, String> {
+    async fn account(&self, s: &Services, token: &str) -> Result<Account, NotAccount> {
         let name = self.service().name;
         let url = match self.kind {
             Kind::Google => s.google_userinfo.clone(),
@@ -270,9 +308,16 @@ impl App {
             .header("Accept", "application/json")
             .send()
             .await
-            .map_err(|_| format!("{name} couldn't be reached"))?;
-        if !answer.status().is_success() {
-            return Err(format!("{name} didn't say whose account this is"));
+            .map_err(|_| NotAccount::Other(format!("{name} couldn't be reached")))?;
+        let status = answer.status();
+        if !status.is_success() {
+            let said = format!("{name} didn't say whose account this is");
+            // Only a token it turned down is one to refresh; a limit or
+            // its own trouble isn't.
+            return Err(match status.as_u16() {
+                401 | 403 => NotAccount::Rejected(said),
+                _ => NotAccount::Other(said),
+            });
         }
         let v: Value = answer.json().await.unwrap_or_default();
         let text = |v: &Value| {
@@ -283,23 +328,31 @@ impl App {
         };
         match self.kind {
             Kind::Google => {
+                // Its openid `sub` names the account for good; an email can
+                // change hands or be renamed.
                 let email = text(&v["email"]).ok_or_else(|| format!("{name} gave no email"))?;
+                let sub = text(&v["sub"]).ok_or_else(|| format!("{name} gave no account id"))?;
                 Ok(Account {
                     name: email.clone(),
-                    identity: email.to_lowercase(),
-                    subs: vec![("email", email)],
+                    identity: sub.clone(),
+                    legacy: Some(email.to_lowercase()),
+                    subs: vec![("email", email), ("account_id", sub)],
                 })
             }
             Kind::FreeAgent => {
                 let company = &v["company"];
-                // Its `url` is the same for every business: its `id` isn't.
-                let id =
-                    text(&company["id"]).or_else(|| company["id"].as_u64().map(|n| n.to_string()));
+                // Its `url` is the same for every business: its `id` isn't
+                // (`/v2/company` documents it), and its subdomain is the
+                // business's too.
+                let id = text(&company["id"])
+                    .or_else(|| company["id"].as_u64().map(|n| n.to_string()))
+                    .or_else(|| text(&company["subdomain"]));
                 let (Some(name), Some(id)) = (text(&company["name"]), id) else {
                     return Err("FreeAgent didn't say which business this is".into());
                 };
                 Ok(Account {
                     identity: id.clone(),
+                    legacy: None,
                     subs: vec![("company", name.clone()), ("company_id", id)],
                     name,
                 })
@@ -329,6 +382,14 @@ impl App {
                 if missing.len() == 1 { "it" } else { "them" }
             )
         })
+    }
+
+    /// The words for approving connection `name` again as an account that
+    /// is connection `other` already.
+    fn elsewhere(&self, account: &str, other: &str, name: &str) -> String {
+        format!(
+            "That's {account}, which is connected already as '{other}', not '{name}'. Sign in as the account '{name}' was, then approve."
+        )
     }
 
     /// The words for approving connection `name` again as another account.
@@ -437,7 +498,11 @@ impl Connections {
                 value: client_secret,
             },
         ];
-        if app.kind == Kind::FreeAgent {
+        // A new app is made with this address; the same app saved again
+        // keeps the address it was made with until the person adds this
+        // one (`keep_app_address`) or a sign-in through it works.
+        let same_app = self.app_creds(app).is_some_and(|kept| kept.id == client_id);
+        if app.kind == Kind::FreeAgent && !same_app {
             ops.push(VaultOp::Set {
                 path: &redirect_path,
                 value: &redirect,
@@ -547,21 +612,25 @@ impl Connections {
         (p.until > Instant::now()).then_some(p)
     }
 
-    /// The person's connection of `c` that is `identity`'s: where it is
-    /// and its name.
+    /// The person's connection of `c` that is `account`'s, within `reach`
+    /// (every agent's, and `reach`'s own when it is one agent's): where it
+    /// is and its name. Another agent's own connection is never matched.
     fn same_account(
         &self,
         c: &Connector,
         app: &App,
         person: &str,
-        identity: &str,
+        account: &Account,
+        reach: &Level,
     ) -> Option<(Conn, String)> {
-        self.levels().into_iter().find_map(|level| {
+        let levels = std::iter::once(Level::All)
+            .chain(matches!(reach, Level::Agent(_)).then(|| reach.clone()));
+        levels.into_iter().find_map(|level| {
             self.instances(c, &level, person)
                 .into_iter()
                 .find_map(|(key, tier)| {
-                    self.identity_at(c, app, &level, &key, tier, person)
-                        .filter(|kept| kept.eq_ignore_ascii_case(identity))?;
+                    self.is_account(c, app, &level, &key, tier, person, account)
+                        .filter(|is| *is)?;
                     let (name, _) = self.named_at(c, &level, &key, tier, person);
                     Some((
                         Conn {
@@ -574,8 +643,11 @@ impl Connections {
         })
     }
 
-    /// The account connection `key` at `level` was signed in as.
-    fn identity_at(
+    /// Whether connection `key` at `level` was signed in as `account`: by
+    /// the identity it keeps, or else the one an older sign-in kept. None
+    /// when it keeps neither.
+    #[allow(clippy::too_many_arguments)]
+    fn is_account(
         &self,
         c: &Connector,
         app: &App,
@@ -583,10 +655,15 @@ impl Connections {
         key: &str,
         tier: VaultSource,
         person: &str,
-    ) -> Option<String> {
-        self.vault_at(tier, level)
-            .ok()?
-            .get(&key_at(tier, person, &c.at(key, app.identity)))
+        account: &Account,
+    ) -> Option<bool> {
+        let vault = self.vault_at(tier, level).ok()?;
+        let kept = |sub: &str| vault.get(&key_at(tier, person, &c.at(key, sub)));
+        if let Some(kept) = kept(app.identity) {
+            return Some(kept.eq_ignore_ascii_case(&account.identity));
+        }
+        let (sub, legacy) = (app.legacy?, account.legacy.as_deref()?);
+        kept(sub).map(|kept| kept.eq_ignore_ascii_case(legacy))
     }
 
     /// Completes sign-in `p` with the service's `code`: the exchange on the
@@ -619,13 +696,19 @@ impl Connections {
             Ok(tokens) => tokens,
             Err(e) => {
                 let secrets = BTreeMap::from([("secret".to_string(), p.creds.secret.clone())]);
-                error!(connector = c.id, error = %scrub(&e.to_string(), &secrets), "a sign-in failed at the exchange");
-                return fail(format!("{} didn't finish the sign-in.", c.name));
+                let said = e.to_string();
+                error!(connector = c.id, error = %scrub(&said, &secrets), "a sign-in failed at the exchange");
+                return fail(match (app.kind, said.contains("refresh_token")) {
+                    // Google kept an earlier approval and sent no lasting
+                    // sign-in: it sends one once Desk's access is removed.
+                    (Kind::Google, true) => "Google sent no lasting sign-in, because it remembers an earlier approval of this app. Remove Desk's access at https://myaccount.google.com/permissions, then sign in again.".to_string(),
+                    _ => format!("{} didn't finish the sign-in.", c.name),
+                });
             }
         };
         let account = match app.account(&self.services, &tokens.access_token).await {
             Ok(account) => account,
-            Err(said) => return fail(format!("{said}.")),
+            Err(said) => return fail(format!("{}.", said.said())),
         };
         if self.waiting_flow(&p.flow).is_none() {
             return Err(gone());
@@ -633,13 +716,27 @@ impl Connections {
         let (conn, again) = match (f.again, f.key.clone()) {
             (true, Some(key)) => {
                 let held = self.held_at(c, &f.level, &key, &f.person);
-                let kept =
-                    held.and_then(|tier| self.identity_at(c, app, &f.level, &key, tier, &f.person));
-                if kept.is_some_and(|kept| !kept.eq_ignore_ascii_case(&account.identity)) {
-                    let name = held
-                        .and_then(|tier| self.named_at(c, &f.level, &key, tier, &f.person).0)
-                        .unwrap_or_else(|| key.clone());
-                    return fail(app.not_this(&account.name, &name));
+                let name = || {
+                    held.and_then(|tier| self.named_at(c, &f.level, &key, tier, &f.person).0)
+                        .unwrap_or_else(|| key.clone())
+                };
+                let is = held.and_then(|tier| {
+                    self.is_account(c, app, &f.level, &key, tier, &f.person, &account)
+                });
+                match is {
+                    Some(false) => return fail(app.not_this(&account.name, &name())),
+                    // It kept no account: it takes this one only when no
+                    // other connection is this account.
+                    None => {
+                        if let Some((other, other_name)) =
+                            self.same_account(c, app, &f.person, &account, &f.level)
+                        {
+                            if other.level != f.level || other.key != key {
+                                return fail(app.elsewhere(&account.name, &other_name, &name()));
+                            }
+                        }
+                    }
+                    Some(true) => {}
                 }
                 (
                     Conn {
@@ -649,15 +746,23 @@ impl Connections {
                     true,
                 )
             }
-            (_, key) => match self.same_account(c, app, &f.person, &account.identity) {
+            (_, key) => match self.same_account(c, app, &f.person, &account, &f.level) {
                 Some((conn, _)) => (conn, true),
                 None => {
+                    // Another sign-in may have kept its key meanwhile: this
+                    // one is then a connection of its own, never over it.
+                    let kept: std::collections::BTreeSet<String> = self
+                        .levels()
+                        .iter()
+                        .flat_map(|level| self.instances(c, level, &f.person))
+                        .map(|(key, _)| key)
+                        .collect();
                     let key = match key {
-                        Some(key) => key,
+                        Some(key) if !kept.contains(&key) => key,
                         None if self.keys_in_use(c, &f.person).is_empty() => {
                             DEFAULT_INSTANCE.to_string()
                         }
-                        None => self.new_key(c, &f.person, &account.name),
+                        _ => self.new_key(c, &f.person, &account.name),
                     };
                     (
                         Conn {
@@ -702,6 +807,18 @@ impl Connections {
         if let Err(e) = vault.apply(&ops, VaultActor::User(&f.person)) {
             error!(connector = c.id, error = %format!("{e:#}"), "keeping a sign-in failed");
             return fail("Desk couldn't keep the sign-in.".into());
+        }
+        // A sign-in through this address worked: the app has it.
+        if app.kind == Kind::FreeAgent {
+            let kept = self
+                .vault_at(VaultSource::Global, &Level::All)
+                .and_then(|v| {
+                    v.set(&app.client_path("redirect_uri"), &p.redirect)
+                        .map_err(Refusal::Internal)
+                });
+            if let Err(e) = kept {
+                warn!(connector = c.id, error = ?e, "the app's address couldn't be kept after a sign-in");
+            }
         }
         let note = app.lacking(&account.name, &tokens.scopes);
         let found = Found::Works {
@@ -792,11 +909,11 @@ impl Connections {
         // A token kept fresh may still have been revoked: signed in again
         // once before it is said to fail.
         let account = match app.account(&self.services, &token).await {
-            Ok(account) => Ok(account),
-            Err(_) => match tokens.force_refresh().await {
+            Err(NotAccount::Rejected(_)) => match tokens.force_refresh().await {
                 Ok(token) => app.account(&self.services, &token).await,
                 Err(e) => return (refused(e), None),
             },
+            answered => answered,
         };
         match account {
             Ok(account) => {
@@ -809,7 +926,7 @@ impl Connections {
                     note,
                 )
             }
-            Err(said) => (Found::Failed(said), None),
+            Err(said) => (Found::Failed(said.said()), None),
         }
     }
 }

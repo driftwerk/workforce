@@ -586,6 +586,12 @@ path.",
                     addable: false,
                 },
                 WorkspaceCredentialMeta {
+                    key: "account_id",
+                    description: "Connected Google account's id (auto-managed)",
+                    required: false,
+                    addable: false,
+                },
+                WorkspaceCredentialMeta {
                     key: "client_id",
                     description: "The app the connection was approved on (auto-managed)",
                     required: false,

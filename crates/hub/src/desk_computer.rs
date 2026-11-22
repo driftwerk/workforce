@@ -690,6 +690,15 @@ pub fn prune_daily(computer: Computer, cancel: tokio_util::sync::CancellationTok
     });
 }
 
+/// The connector `tool` is of, as Desk decides it: a bound connector's,
+/// or a books service's (Xero's isn't bound, but its writes still ask).
+fn books_connector(tool: &str) -> Option<&str> {
+    workforce_common::connector_binding::connector_of(tool).or_else(|| {
+        let (prefix, _) = tool.split_once('.')?;
+        workforce_core::computer::Books::of(prefix).map(|_| prefix)
+    })
+}
+
 impl ComputerGate for HubComputerGate {
     fn decides(&self, tool: &str) -> bool {
         match namespace(tool) {
@@ -697,7 +706,7 @@ impl ComputerGate for HubComputerGate {
             Some(Namespace::Connector) => {
                 tool.starts_with("browser.")
                     || tool.starts_with("connections.")
-                    || workforce_common::connector_binding::connector_of(tool).is_some()
+                    || books_connector(tool).is_some()
             }
             // Its own `[skills]`: a change that widens what it reaches.
             None => tool == "system.config",
@@ -718,10 +727,7 @@ impl ComputerGate for HubComputerGate {
                 write: changes_a_page(tool),
             };
         }
-        match (
-            effect,
-            workforce_common::connector_binding::connector_of(tool),
-        ) {
+        match (effect, books_connector(tool)) {
             (Effect::Unknown, Some(connector)) => Effect::Connector {
                 connector: connector.to_string(),
                 write: !workforce_common::connector_binding::is_read(tool),
@@ -1399,6 +1405,8 @@ mod tests {
                 "browser.navigate",
                 "freeagent.invoices_list",
                 "freeagent.invoice_create",
+                "xero.invoices_list",
+                "xero.invoice_create",
             ] {
                 tools.register(Arc::new(Elsewhere(name)));
             }
@@ -1437,6 +1445,10 @@ mod tests {
             assert_eq!(decide_with(harbor, "freeagent.invoice_create").0, "asks once");
             let never = format!("[computer]\nasks = \"never\"\n\n{harbor}");
             assert_eq!(decide_with(&never, "freeagent.invoice_create").0, "run");
+            // Xero isn't bound by connection, but its writes still ask in
+            // Desk's words, and its reads run.
+            assert_eq!(decide_with("", "xero.invoices_list").0, "run");
+            assert_eq!(decide_with("", "xero.invoice_create").0, "asks once");
         })
         .await;
     }

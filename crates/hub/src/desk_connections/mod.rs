@@ -2559,8 +2559,17 @@ async fn documents(
     Path(agent): Path<String>,
 ) -> Response {
     let _person = person!(r, h, q);
-    let Some(service) = r.state.registry.get(&agent) else {
-        return refusal(StatusCode::NOT_FOUND, "There's no such agent");
+    // Only an agent the caller may reach: another's is no agent at all.
+    let service = match crate::gateway::authorise_agent_reader(
+        &r.state,
+        &h,
+        q.token.as_deref(),
+        &agent,
+    )
+    .await
+    {
+        Ok((service, _)) => service,
+        Err(refused) => return refused.into_response(),
     };
     match crate::desk_driver::documents(&service.workspace) {
         Some(path) => Json(json!({ "path": path })).into_response(),

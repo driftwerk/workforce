@@ -836,6 +836,7 @@ impl ExtensionCell {
         &self,
         selector: Option<&str>,
         connector: &str,
+        field: Option<&str>,
     ) -> Result<Value> {
         let Some(hooks) = hooks::hooks() else {
             return Err(eyre!(NO_BROWSER));
@@ -887,6 +888,7 @@ impl ExtensionCell {
                     agent: &self.agent,
                     conversation: &conversation,
                     connector,
+                    field,
                     origin: read["origin"].as_str().unwrap_or_default(),
                     path: read["path"].as_str().unwrap_or_default(),
                     key: &value,

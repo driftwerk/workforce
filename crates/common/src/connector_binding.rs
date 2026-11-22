@@ -61,10 +61,11 @@ pub const INSTANCE_PREFIXES: &[(&str, &str)] = &[
 
 /// The connectors whose tools resolve one instance per call
 /// (`environment::resolve_instance`), so one connection of theirs can be
-/// read only while another takes writes. Email's read only whole.
+/// read only while another takes writes.
 pub const READ_ONLY_EACH: &[&str] = &[
     "github",
     "google",
+    "email",
     "jira",
     "linear",
     "datadog",
@@ -610,10 +611,12 @@ mod tests {
             widened(&ro, &all),
             ["jira: may now change things through `globex`"]
         );
-        // A connector that can't hold one connection back only reads, whole.
+        // Email holds each account back on its own: `work` reads only,
+        // `home` still takes writes.
         let email = parse("[skills]\nread_only = [\"email:work\"]\n").unwrap();
-        assert!(email.reads_only("email"));
-        assert!(!email.reads_only("jira"));
+        assert!(!email.reads_only("email"));
+        assert!(email.reads_only_instance("email", "work"));
+        assert!(!email.reads_only_instance("email", "home"));
         // An empty instance segment is no pick's, never the listing.
         assert_eq!(
             instance_of("jira", "skills/jira/workspaces//globex/x"),

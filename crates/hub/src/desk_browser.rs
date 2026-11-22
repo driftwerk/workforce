@@ -393,7 +393,7 @@ impl BrowserHooks for DeskHooks {
         let kept = setups.keep_key(
             &caller,
             read.connector,
-            None,
+            read.field,
             read.origin,
             read.path,
             workforce_common::secret::Secret::new(read.key.to_string()),
@@ -865,7 +865,10 @@ fn prune_shots(shots: &Path) {
 /// Gives `service` the browser, if it hasn't it: every local agent reaches
 /// for it.
 pub fn equip(service: &crate::serve::AgentService) {
-    if crate::skill_loader::skill_tools_registered("browser", &service.tools) {
+    // A machine's hub has no person's Chrome beside it.
+    if crate::desk_driver::machine(&service.config)
+        || crate::skill_loader::skill_tools_registered("browser", &service.tools)
+    {
         return;
     }
     let Some(vault) = service.vault.as_ref() else {
