@@ -4652,13 +4652,23 @@ fn skill_tool_prefix(skill_name: &str) -> String {
         .to_string()
 }
 
+/// `registry`'s tools that are `skill_name`'s: under its prefix, and not
+/// the hub's own (`github.clone` is no GitHub adapter's).
+fn skill_tools(skill_name: &str, registry: &ToolRegistry) -> Vec<String> {
+    let prefix = format!("{}.", skill_tool_prefix(skill_name));
+    registry
+        .names()
+        .into_iter()
+        .filter(|n| n.starts_with(&prefix) && !registry.is_builtin(n))
+        .collect()
+}
+
 /// Whether any of `skill_name`'s tools is registered. The registry, not
 /// `SkillStateTracker`, decides: the tracker is bookkeeping written after a
 /// registration, so an entry without registered tools must never count as
 /// loaded.
 pub fn skill_tools_registered(skill_name: &str, registry: &ToolRegistry) -> bool {
-    let prefix = format!("{}.", skill_tool_prefix(skill_name));
-    registry.names().iter().any(|n| n.starts_with(&prefix))
+    !skill_tools(skill_name, registry).is_empty()
 }
 
 /// Load `skill_name` from the vault into `registry` and record it in
@@ -4683,12 +4693,7 @@ pub fn load_and_track(
 }
 
 pub fn unload_skill(skill_name: &str, registry: &ToolRegistry) -> Vec<String> {
-    let all_names = registry.names();
-    let dot_prefix = format!("{}.", skill_tool_prefix(skill_name));
-    let to_remove: Vec<String> = all_names
-        .into_iter()
-        .filter(|n| n.starts_with(&dot_prefix))
-        .collect();
+    let to_remove = skill_tools(skill_name, registry);
 
     for name in &to_remove {
         registry.unregister(name);
@@ -6350,6 +6355,35 @@ mod tests {
 
         registry.register(Arc::new(NamedTool("record-keeper.apply_change".into())));
         assert!(skill_tools_registered("record-keeper", &registry));
+    }
+
+    /// `github.clone` and `github.repos` are the hub's own: with only them
+    /// registered the GitHub adapter isn't loaded, so a person's own key
+    /// still loads it; unloading the adapter leaves them.
+    #[test]
+    fn the_hubs_own_github_tools_never_read_as_the_adapters() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = ToolRegistry::new();
+        crate::github_local::register(
+            &registry,
+            crate::github_local::GithubLocalContext {
+                vault: Arc::new(Vault::open(&dir.path().join("vault"), "k").unwrap()),
+                global_vault: None,
+                workspace: dir.path().to_path_buf(),
+            },
+        );
+        let own = |r: &ToolRegistry| r.has("github.clone") && r.has("github.repos");
+        assert!(own(&registry));
+        assert!(!skill_tools_registered("github", &registry));
+
+        registry.register(Arc::new(NamedTool("github.project_get".into())));
+        assert!(skill_tools_registered("github", &registry));
+        assert_eq!(
+            unload_skill("github", &registry),
+            vec!["github.project_get".to_string()]
+        );
+        assert!(own(&registry));
+        assert!(!skill_tools_registered("github", &registry));
     }
 
     #[test]

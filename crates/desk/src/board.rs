@@ -94,6 +94,17 @@ pub enum Via {
     ThisHub,
 }
 
+/// What a board says [`Via::ThisHub`] is, as a name.
+pub const THIS_COMPUTER: &str = "This computer";
+
+/// A hub's name as it reads mid-sentence: "on this computer", "on Atlas".
+pub fn in_sentence(hub: &str) -> &str {
+    match hub {
+        THIS_COMPUTER => "this computer",
+        named => named,
+    }
+}
+
 /// Which of the target's issues a board imports and keeps in sync.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "value", rename_all = "camelCase")]
@@ -268,6 +279,7 @@ pub enum Paused {
 impl Paused {
     /// As the board says it.
     pub fn say(&self, hub: &str) -> String {
+        let mid = in_sentence(hub);
         match self {
             Self::ByYou => "Paused by you; changes go out when you resume it.".into(),
             Self::HubOffline { since } => format!(
@@ -277,9 +289,9 @@ impl Paused {
             Self::HubUnpaired => format!(
                 "Paused: {hub} isn't linked any more. Link through another hub, or keep the board here, unsynced."
             ),
-            Self::NoToken => format!("Paused: paste a new token for {hub}."),
+            Self::NoToken => format!("Paused: paste a new token for {mid}."),
             Self::Missing { tools } => format!(
-                "Paused: no agent on {hub} you can reach has {} switched on any more.",
+                "Paused: no agent on {mid} you can reach has {} switched on any more.",
                 system_of_tools(tools)
             ),
             Self::Refused { reason } => format!("Paused: {hub} refused: {reason}"),
@@ -292,7 +304,7 @@ impl Paused {
                         "Paused: {hub} has no {what} {asked} of yours any more; yours there are {names}."
                     ),
                     (None, false) => format!(
-                        "Paused: you have more than one {what} on {hub} ({names}), and this link doesn't say which."
+                        "Paused: you have more than one {what} on {mid} ({names}), and this link doesn't say which."
                     ),
                 }
             }
@@ -1720,6 +1732,28 @@ pub fn search_query(q: &str) -> Option<String> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn this_computer_is_said_in_lower_case_mid_sentence() {
+        let missing = Paused::Missing {
+            tools: vec!["github.project_get".into()],
+        };
+        assert_eq!(
+            missing.say(THIS_COMPUTER),
+            "Paused: no agent on this computer you can reach has GitHub switched on any more."
+        );
+        assert_eq!(
+            missing.say("Atlas"),
+            "Paused: no agent on Atlas you can reach has GitHub switched on any more."
+        );
+        assert_eq!(
+            Paused::HubOffline { since: Utc::now() }
+                .say(THIS_COMPUTER)
+                .split(" is offline")
+                .next(),
+            Some("Paused: This computer")
+        );
+    }
 
     fn ticket(state: TicketState, needs: Vec<Uuid>) -> Ticket {
         let now = Utc::now();

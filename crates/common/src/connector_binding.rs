@@ -423,6 +423,9 @@ const READS: &[&str] = &[
 /// `github.ci_status` but sets a board column in `github.project_item_status`.
 const NAMED: &[(&str, bool)] = &[
     ("github.viewer", true),
+    ("github.workspaces", true),
+    ("jira.workspaces", true),
+    ("linear.workspaces", true),
     ("github.issues_changed", true),
     ("github.repo_labels", true),
     ("github.project_item_status", false),
@@ -500,6 +503,9 @@ mod tests {
             "github.pr_diff",
             "github.workflow_run_logs",
             "github.viewer",
+            "github.workspaces",
+            "jira.workspaces",
+            "linear.workspaces",
             "github.projects_list",
             "github.project_get",
             "github.project_items",

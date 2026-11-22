@@ -577,3 +577,70 @@ async fn a_room_turn_by_id_or_slug_reaches_a_boss_only_inside_the_rooms_group() 
     })
     .await;
 }
+
+/// The main boss is asked for the note on what it ran, unless it only watches.
+async fn main_boss_handover(level: &str, drafts: bool) {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (desk_boss, l1) = agent(dir.path(), "desk", "ok").await;
+        let (mia, l2) = agent(dir.path(), "mia", "ok").await;
+        let d = desk(pool, dir.path()).await;
+        d.change_layout(|l| l.create("atlas", "Atlas", &[], None))
+            .await
+            .unwrap();
+        let s = new_session(&d, dir.path(), "acme-api").await;
+        write_config(
+            &desk_boss,
+            &format!("[oversight]\nenabled = true\nlevel = \"{level}\"\n"),
+        );
+        write_config(
+            &mia,
+            &format!("[oversight]\nenabled = true\ngroup = \"atlas\"\n{ACTS}"),
+        );
+        let state = hub(&[Arc::clone(&desk_boss), Arc::clone(&mia)]);
+        let _crew = CrewHub::start(state, d.clone(), FAST, CancellationToken::new());
+        eventually("two bosses", async || (d.bosses().len() == 2).then_some(())).await;
+        let dm = desk_boss
+            .sessions
+            .get_or_create(DESK_CHANNEL, PERSON, "desk")
+            .unwrap();
+        desk_boss.sessions.save(&dm).unwrap();
+        let p = d
+            .preview_move(MoveAsk {
+                item: Item::Session(s.id),
+                to: Some("atlas".into()),
+                choices: Choices::default(),
+            })
+            .await
+            .unwrap();
+        let h = p.handover.expect("a note");
+        assert_eq!(h.handover.from_boss.as_deref(), Some("desk"));
+        let channel = super::super::handover_channel(h.handover.id);
+        let asked = || {
+            desk_boss
+                .sessions
+                .list(Some(&channel), 1)
+                .ok()
+                .filter(|l| !l.is_empty())
+                .map(drop)
+        };
+        if h.drafting {
+            eventually("the main boss's handover turn", async || asked()).await;
+        } else {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+        }
+        assert_eq!((h.drafting, asked().is_some()), (drafts, drafts));
+        drop((l1, l2));
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_main_boss_is_asked_for_the_note_on_what_it_ran() {
+    main_boss_handover("act", true).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_main_boss_that_only_watches_leaves_desks_note_standing() {
+    main_boss_handover("watch", false).await;
+}

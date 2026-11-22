@@ -150,9 +150,11 @@ pub(crate) enum Action {
     TakeOn {
         session: Uuid,
     },
-    /// Let a session it runs go: the person runs it on their own.
+    /// Let a session it runs go: the person runs it on their own. `done`:
+    /// its work is finished, so the boss may still close it.
     Release {
         session: Uuid,
+        done: bool,
     },
     /// Continue a session's work in a session of another engine, with a
     /// brief of it: only ever suggested, as the brief goes to that
@@ -237,6 +239,8 @@ struct Input {
     reply_to: Option<String>,
     message_id: Option<String>,
     reason: Option<String>,
+    /// `crew.release`: the session's work is finished.
+    done: Option<bool>,
     #[serde(default)]
     options: Vec<String>,
     draft: Option<String>,
@@ -472,6 +476,7 @@ impl Action {
             },
             "crew.release" => Self::Release {
                 session: session()?,
+                done: i.done.unwrap_or(false),
             },
             "crew.handoff" => Self::Handoff {
                 session: session()?,
@@ -656,6 +661,10 @@ fn charge_plain(e: workforce_desk::DeskError) -> String {
     }
 }
 
+/// What a boss may not close, as the refusal says it.
+const NOT_ITS: &str =
+    "a session you didn't start or weren't handed, or that is no longer yours to run";
+
 /// How long a boss's resume or restart is waited for: its turn goes on
 /// past it, never held for the whole of a tool call's time.
 const STARTS_WITHIN: std::time::Duration = std::time::Duration::from_secs(60);
@@ -783,9 +792,9 @@ impl CrewHub {
         self.gate_as(action, o, boss.as_deref(), false)
     }
 
-    /// Closing a session `boss` neither started nor was handed: only the
-    /// person closes it (Desk refuses anyone else), so it is theirs to
-    /// approve, never run.
+    /// Closing a session `boss` neither started nor was handed, or the
+    /// person took back from it: only the person closes it (Desk refuses
+    /// anyone else), so it is theirs to approve, never run.
     fn close_not_its(&self, action: &Action, o: &Oversight, boss: Option<&str>) -> Option<Gate> {
         let Action::Close { session } = action else {
             return None;
@@ -797,8 +806,7 @@ impl CrewHub {
         Some(match o.level {
             Level::Watch => Gate::Refuse,
             _ => Gate::Suggest(
-                "only the person closes a session you didn't start and weren't handed: they close it with one click"
-                    .into(),
+                format!("only the person closes {NOT_ITS}: they close it with one click").into(),
             ),
         })
     }
@@ -1427,7 +1435,7 @@ impl CrewHub {
             | Action::Resume { session: s, .. }
             | Action::Restart { session: s, .. }
             | Action::TakeOn { session: s }
-            | Action::Release { session: s }
+            | Action::Release { session: s, .. }
             | Action::Handoff { session: s, .. }
             | Action::SetMode { session: s, .. }
             | Action::SwitchLogin { session: s, .. } => {
@@ -1543,7 +1551,7 @@ impl CrewHub {
             Action::TakeOn { session } => {
                 format!("Run {} for you", self.session_name(*session))
             }
-            Action::Release { session } => {
+            Action::Release { session, .. } => {
                 format!("Let {} go: you run it", self.session_name(*session))
             }
             Action::Handoff {
@@ -2222,10 +2230,7 @@ impl CrewHub {
                 // now and has nothing to lose.
                 if by.party.kind == crew::PartyKind::Manager {
                     if !d.may_end(*session, Some(&by)) {
-                        return Err(
-                            "Only the person closes a session you didn't start and weren't handed."
-                                .into(),
-                        );
+                        return Err(format!("Only the person closes {NOT_ITS}."));
                     }
                     if let Some(why) = self.close_held(&was, &by.party.id).await {
                         return Err(why);
@@ -2355,8 +2360,13 @@ impl CrewHub {
                     .map_err(charge_plain)?;
                 Ok(format!("took on {}", self.session_name(c.session)))
             }
-            Action::Release { session } => {
-                let c = d.release(*session, &by).await.map_err(charge_plain)?;
+            Action::Release { session, done } => {
+                let c = if *done {
+                    d.release_done(*session, &by).await
+                } else {
+                    d.release(*session, &by).await
+                }
+                .map_err(charge_plain)?;
                 Ok(format!("let {} go", self.session_name(c.session)))
             }
             Action::Handoff {

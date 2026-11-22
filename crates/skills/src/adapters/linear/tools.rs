@@ -1969,49 +1969,6 @@ impl Tool for LinearTeamsListTool {
     }
 }
 
-// ── linear.workspaces ──────────────────────────────────────────────────
-
-/// The caller's Linear workspaces by name (never a key), and the one a call
-/// naming none goes to: what a program (Desk's board link) asks before it
-/// lists teams, so a person with several picks one.
-pub struct LinearWorkspacesTool {
-    clients: Arc<LiveInstances<LinearClient>>,
-    default_workspace: String,
-}
-
-impl LinearWorkspacesTool {
-    pub fn new(clients: Arc<LiveInstances<LinearClient>>, default_workspace: String) -> Self {
-        Self {
-            clients,
-            default_workspace,
-        }
-    }
-}
-
-#[async_trait]
-impl Tool for LinearWorkspacesTool {
-    fn name(&self) -> &str {
-        "linear.workspaces"
-    }
-
-    fn description(&self) -> &str {
-        "The Linear workspaces you can use, by name, as {workspaces, default}: default is the one a call without `workspace` goes to, or null when you must pass one. Takes no arguments."
-    }
-
-    fn input_schema(&self) -> Value {
-        serde_json::json!({ "type": "object", "properties": {}, "required": [] })
-    }
-
-    async fn execute(&self, _input: Value) -> Result<ToolResult> {
-        let start = std::time::Instant::now();
-        let (clients, default) = self.clients.for_caller_or(&self.default_workspace);
-        Ok(ToolResult::success(
-            crate::adapters::utils::workspaces_answer(&clients, &default),
-            start.elapsed().as_millis() as u64,
-        ))
-    }
-}
-
 // ── linear.project_list ────────────────────────────────────────────────
 
 pub struct LinearProjectListTool {

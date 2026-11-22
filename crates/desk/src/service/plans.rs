@@ -2934,6 +2934,7 @@ impl Desk {
         if worktree {
             body["worktree"] = branch_for(&key).into();
         }
+        body["deps"] = true.into();
         if let Some(model) = &runs.model {
             body["model"] = model.clone().into();
         }

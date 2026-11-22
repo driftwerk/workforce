@@ -40,13 +40,6 @@ pub struct InputImage {
     pub media_type: String,
 }
 
-/// Sniff an image media type from magic bytes, defaulting to PNG. Used when a
-/// reference-image input omits its media type — artifacts are stored as opaque
-/// bytes, so the original mime isn't recoverable from the store.
-pub fn sniff_media_type(bytes: &[u8]) -> &'static str {
-    detect_image_media_type(bytes).unwrap_or("image/png")
-}
-
 /// The image media type `bytes` carry, judged by magic bytes; `None` when they
 /// are not a PNG, JPEG, GIF or WebP.
 pub fn detect_image_media_type(bytes: &[u8]) -> Option<&'static str> {

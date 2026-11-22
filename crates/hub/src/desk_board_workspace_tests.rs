@@ -395,3 +395,378 @@ async fn several_jira_sites_are_picked_from_too() {
     })
     .await;
 }
+
+const CONNECTIONS: [&str; 3] = ["driftwerk", "mantis", "patchwork"];
+
+/// A fake GitHub of three connections, `mantis` the default, as a person's
+/// own keys make one: only the connections in `reach` reach acme's
+/// project 7.
+struct FakeGithub {
+    name: &'static str,
+    reach: &'static [&'static str],
+    calls: Calls,
+}
+
+#[async_trait::async_trait]
+impl Tool for FakeGithub {
+    fn name(&self) -> &str {
+        self.name
+    }
+    fn description(&self) -> &str {
+        "a fake GitHub tool of three connections"
+    }
+    fn input_schema(&self) -> Value {
+        json!({ "type": "object" })
+    }
+    async fn execute(&self, input: Value) -> eyre::Result<ToolResult> {
+        self.calls
+            .lock()
+            .unwrap()
+            .push((self.name.to_string(), input.clone()));
+        if self.name == "github.workspaces" {
+            return Ok(ToolResult::success(
+                json!({ "workspaces": CONNECTIONS, "default": "mantis" }),
+                0,
+            ));
+        }
+        let through = input["workspace"].as_str().unwrap_or("mantis");
+        if !self.reach.contains(&through) {
+            return Ok(ToolResult::failure("Not found: Not Found".to_string(), 0));
+        }
+        Ok(ToolResult::success(
+            match self.name {
+                "github.project_get" => json!({
+                    "id": "PVT_acme7", "title": "Acme", "number": 7,
+                    "status": { "options": [{ "name": "Todo" }, { "name": "In Progress" }, { "name": "Done" }] },
+                }),
+                _ => json!({ "items": [], "issues": [] }),
+            },
+            0,
+        ))
+    }
+}
+
+/// A hub whose GitHub is the fake's.
+async fn hub_of_connections(
+    dir: &std::path::Path,
+    reach: &'static [&'static str],
+) -> (RemoteHub, Calls) {
+    let fx = fixture(true);
+    with_agents(&fx, dir, &["default"]).await;
+    let calls: Calls = Arc::default();
+    let service = fx.state.registry.default_agent().unwrap();
+    for name in workforce_desk::github_sync::TOOLS
+        .iter()
+        .chain(&["github.workspaces", "github.viewer"])
+    {
+        service.tools.register(Arc::new(FakeGithub {
+            name,
+            reach,
+            calls: Arc::clone(&calls),
+        }));
+    }
+    let remote = super::tests::serve_remote(fx, &["github.*"], Arc::default(), None).await;
+    (remote, calls)
+}
+
+fn project(workspace: Option<&str>, link: bool) -> Value {
+    let mut b = json!({
+        "system": "github", "target": "acme/projects/7",
+        "via": { "kind": "hub", "hub": "atlas" },
+    });
+    if link {
+        b["filter"] = json!({ "kind": "all", "value": { "includeDone": false } });
+        b["states"] = json!({});
+    }
+    if let Some(w) = workspace {
+        b["workspace"] = json!(w);
+    }
+    b
+}
+
+/// Of several GitHub connections, a link goes through the one that reaches
+/// its project, though the default doesn't: the check says which, the link
+/// keeps it, and every call of the sync names it.
+#[tokio::test]
+async fn a_github_link_goes_through_the_connection_that_reaches_its_project() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let desk = crate::desk_crew::tests::desk(pool, dir.path()).await;
+        let (remote, calls) = hub_of_connections(&dir.path().join("remote"), &["driftwerk"]).await;
+        let local = local_hub(desk.clone(), dir.path());
+        local.link_atlas(&remote).await;
+
+        let (status, found) = local
+            .send("POST", "/api/desk/boards/link/check", project(None, false))
+            .await;
+        assert_eq!(status, StatusCode::OK, "{found}");
+        assert_eq!(found["workspaces"], json!(CONNECTIONS));
+        assert_eq!(found["workspace"], "driftwerk", "{found}");
+        assert_eq!(found["targetId"], "PVT_acme7");
+
+        let b = board(&desk, "Acme").await;
+        let (status, linked) = local
+            .send(
+                "PUT",
+                &format!("/api/desk/boards/{}/link", b.id),
+                project(None, true),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{linked}");
+        assert_eq!(linked["sync"]["workspace"], "driftwerk");
+        let before = calls.lock().unwrap().len();
+        local.sync.pass_board(b.id, true).await.unwrap();
+        let after: Vec<(String, Value)> = calls.lock().unwrap()[before..].to_vec();
+        assert!(!after.is_empty(), "the pass called GitHub");
+        for (tool, args) in after.iter().filter(|(t, _)| t != "github.workspaces") {
+            assert_eq!(args["workspace"], "driftwerk", "{tool} {args}");
+        }
+    })
+    .await;
+}
+
+/// Two connections reach the project and the default doesn't: the person
+/// picks, and the one picked is kept.
+#[tokio::test]
+async fn two_github_connections_reaching_a_project_are_picked_from() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let desk = crate::desk_crew::tests::desk(pool, dir.path()).await;
+        let (remote, _) =
+            hub_of_connections(&dir.path().join("remote"), &["driftwerk", "patchwork"]).await;
+        let local = local_hub(desk.clone(), dir.path());
+        local.link_atlas(&remote).await;
+        let why = "Pick which GitHub connection: driftwerk or patchwork";
+
+        let (status, found) = local
+            .send("POST", "/api/desk/boards/link/check", project(None, false))
+            .await;
+        assert_eq!(status, StatusCode::OK, "{found}");
+        assert_eq!(found["workspaceWhy"], why);
+        assert_eq!(found["workspaces"], json!(["driftwerk", "patchwork"]));
+        assert!(found.get("states").is_none(), "{found}");
+
+        let b = board(&desk, "Acme").await;
+        let uri = format!("/api/desk/boards/{}/link", b.id);
+        let (status, said) = local.send("PUT", &uri, project(None, true)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{said}");
+        assert_eq!(said["error"], why);
+
+        let (status, linked) = local
+            .send("PUT", &uri, project(Some("patchwork"), true))
+            .await;
+        assert_eq!(status, StatusCode::OK, "{linked}");
+        assert_eq!(linked["sync"]["workspace"], "patchwork");
+    })
+    .await;
+}
+
+/// A connection picked is kept while it reaches the project, though the
+/// default reaches it too; one GitHub turns away is refused by name, and
+/// the dialog may pick another.
+#[tokio::test]
+async fn a_github_connection_picked_is_kept_unless_it_can_t_reach() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let desk = crate::desk_crew::tests::desk(pool, dir.path()).await;
+        let (remote, _) =
+            hub_of_connections(&dir.path().join("remote"), &["driftwerk", "mantis"]).await;
+        let local = local_hub(desk.clone(), dir.path());
+        local.link_atlas(&remote).await;
+
+        let (status, found) = local
+            .send(
+                "POST",
+                "/api/desk/boards/link/check",
+                project(Some("driftwerk"), false),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{found}");
+        assert_eq!(found["workspace"], "driftwerk");
+
+        let why = "Your GitHub connection patchwork can't reach acme/projects/7: pick another.";
+        let (status, found) = local
+            .send(
+                "POST",
+                "/api/desk/boards/link/check",
+                project(Some("patchwork"), false),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{found}");
+        assert_eq!(found["workspaceWhy"], why);
+        assert_eq!(found["workspaces"], json!(CONNECTIONS));
+
+        let b = board(&desk, "Acme").await;
+        let (status, said) = local
+            .send(
+                "PUT",
+                &format!("/api/desk/boards/{}/link", b.id),
+                project(Some("patchwork"), true),
+            )
+            .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{said}");
+        assert_eq!(said["error"], why);
+    })
+    .await;
+}
+
+/// Whether a connection reaches a target is the real adapter's read: a
+/// project GitHub can't resolve for its key, or a repository it answers
+/// 404 for, isn't reached; the same reads with a key that can are; and
+/// GitHub down or rate limited says neither.
+#[tokio::test]
+async fn a_connection_github_turns_away_doesn_t_reach_the_target() {
+    use wiremock::matchers::{header, method, path, path_regex};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+    use workforce_desk::board::{System, Via};
+    use workforce_desk::github_sync::Reach;
+    use workforce_skills::adapters::github::config::{GithubSkillConfig, GithubWorkspaceConfig};
+    use workforce_skills::adapters::github::GithubSkill;
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let github = MockServer::start().await;
+        let by = |token: &str| header("authorization", format!("Bearer ghp_{token}").as_str());
+        let project = json!({
+            "id": "PVT_acme7", "number": 7, "title": "Acme",
+            "url": "https://github.invalid/orgs/acme/projects/7",
+            "closed": false, "fields": { "nodes": [] },
+        });
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .and(by("open"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(
+                    json!({ "data": { "repositoryOwner": { "projectV2": project } } }),
+                ),
+            )
+            .mount(&github)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .and(by("shut"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": { "repositoryOwner": null },
+                "errors": [{
+                    "type": "NOT_FOUND",
+                    "message": "Could not resolve to a ProjectV2 with the number 7.",
+                }],
+            })))
+            .mount(&github)
+            .await;
+        Mock::given(method("GET"))
+            .and(path_regex("^/repos/acme/web/(labels|milestones)$"))
+            .and(by("open"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+            .mount(&github)
+            .await;
+        Mock::given(method("GET"))
+            .and(path_regex("^/repos/acme/web/"))
+            .and(by("shut"))
+            .respond_with(
+                ResponseTemplate::new(404).set_body_json(json!({ "message": "Not Found" })),
+            )
+            .mount(&github)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .and(by("busy"))
+            .respond_with(ResponseTemplate::new(502))
+            .mount(&github)
+            .await;
+        Mock::given(method("GET"))
+            .and(path_regex("^/repos/acme/web/"))
+            .and(by("busy"))
+            .respond_with(
+                ResponseTemplate::new(403)
+                    .insert_header("x-ratelimit-remaining", "0")
+                    .set_body_json(json!({ "message": "API rate limit exceeded" })),
+            )
+            .mount(&github)
+            .await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let desk = crate::desk_crew::tests::desk(pool, dir.path()).await;
+        let local = local_hub(desk, dir.path());
+        let connection = |name: &str| {
+            (
+                name.to_string(),
+                GithubWorkspaceConfig {
+                    token: format!("ghp_{name}"),
+                    base_url: github.uri(),
+                    default_owner: None,
+                },
+            )
+        };
+        let skill = GithubSkill::new(GithubSkillConfig {
+            token: None,
+            base_url: github.uri(),
+            default_owner: None,
+            workspaces: std::collections::HashMap::from([
+                connection("open"),
+                connection("shut"),
+                connection("busy"),
+            ]),
+            default_workspace: Some("open".into()),
+        })
+        .unwrap();
+        let service = crate::serve::testing::plain_service(&dir.path().join("agent")).await;
+        skill
+            .tools()
+            .into_iter()
+            .for_each(|t| service.tools.register(t));
+        local.fx.state.registry.insert("default", service);
+        let person = local.person.id.to_string();
+        let remote = local
+            .sync
+            .remote(System::Github, &Via::ThisHub, &person, None, None)
+            .await
+            .unwrap();
+        let reads = [
+            (
+                "github.project_get",
+                json!({ "owner": "acme", "number": 7 }),
+            ),
+            (
+                "github.repo_labels",
+                json!({ "owner": "acme", "repo": "web" }),
+            ),
+        ];
+        for (tool, args) in &reads {
+            let said = [
+                ("open", Reach::Yes),
+                ("shut", Reach::No),
+                ("busy", Reach::Unknown),
+            ];
+            for (name, reach) in said {
+                let got = local.sync.reaches(&remote, tool, name, tool, args).await;
+                assert_eq!(got, reach, "{name} {tool}");
+            }
+        }
+
+        // A default GitHub can't answer for is kept, not swapped for
+        // another that reaches.
+        let names = ["busy", "open", "shut"].map(String::from);
+        let reached = super::Reached {
+            remote,
+            agent: Some("default".into()),
+        };
+        let chosen = |default: &'static str| super::Wanted {
+            system: System::Github,
+            names: &names,
+            default: Some(default),
+            asked: None,
+            target: Some("acme/web"),
+            owner: None,
+        };
+        for (default, kept) in [("busy", "busy"), ("shut", "open")] {
+            let got = local
+                .sync
+                .github_connection(&Via::ThisHub, &person, &reached, chosen(default))
+                .await
+                .ok()
+                .flatten();
+            assert_eq!(got.as_deref(), Some(kept), "default {default}");
+        }
+    })
+    .await;
+}
