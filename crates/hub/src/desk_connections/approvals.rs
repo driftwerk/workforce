@@ -10,8 +10,11 @@ use workforce_common::delivery::DeliveryTarget;
 
 use crate::hub_core::schedules::{HubJob, JobPayload, Schedule, NOTHING_TO_SAY};
 
-/// The job's name, as the person's job list shows it.
+/// The job's name, as the person's job list shows it at first.
 pub const JOB: &str = "Bank approvals";
+
+/// What the hub knows the job by, whatever the person renames it.
+pub const KEY: &str = "bank-approvals";
 
 /// The only tools its turn is offered: reads of the bank alone.
 pub const TOOLS: [&str; 2] = ["bank.workspaces", "bank.accounts"];
@@ -19,6 +22,7 @@ pub const TOOLS: [&str; 2] = ["bank.workspaces", "bank.accounts"];
 /// The job that watches the person's bank approvals.
 pub fn job() -> HubJob {
     HubJob {
+        name: JOB.into(),
         description: "Reminds you in Desk before a bank's approval lapses.".into(),
         schedule: Schedule::Cron {
             expr: "0 9 * * *".into(),

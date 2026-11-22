@@ -36,9 +36,6 @@ const DEFAULT_LIMIT: usize = 10;
 const OVERFETCH_FACTOR: usize = 4;
 const OVERFETCH_MAX: usize = 200;
 
-/// A bank read, asked whether the turn may read the person's bank at all.
-const PERSONAL_PROBE: &str = "bank.accounts";
-
 pub struct SessionsTool {
     sessions: Arc<dyn SessionStore>,
 }
@@ -69,11 +66,11 @@ enum Scope {
     Visible {
         personal: bool,
     },
-    /// An eval's turns are never a source: one question's answer must not be
-    /// found by the next, nor by the person's own chats. Nor is a
-    /// conversation that read the person's bank, where the bank can't be
-    /// read either.
-    Eval,
+    /// Never a source: an eval's turns (one question's answer must not be
+    /// found by the next, nor by the person's own chats), a conversation
+    /// left behind, and one that read the person's bank where the bank
+    /// can't be read either.
+    Hidden,
     OtherUser,
     Missing,
 }
@@ -198,7 +195,7 @@ impl SessionsTool {
                     true
                 }
                 Scope::Visible { personal: false } => true,
-                Scope::Eval => false,
+                Scope::Hidden => false,
                 Scope::OtherUser => {
                     suppressed_other_user += 1;
                     false
@@ -272,7 +269,7 @@ impl SessionsTool {
                     .map(|entry| entry.filter(|e| !e.is_failure())),
                 personal,
             ),
-            Scope::Eval | Scope::OtherUser | Scope::Missing => (Ok(None), false),
+            Scope::Hidden | Scope::OtherUser | Scope::Missing => (Ok(None), false),
         };
         let elapsed = start.elapsed().as_millis() as u64;
         match entry {
@@ -291,14 +288,11 @@ impl SessionsTool {
     /// may not be read.
     fn scope(&self, session_id: &str, identity_id: &str) -> Scope {
         match self.sessions.get(session_id) {
-            Ok(Some(s)) if crate::turn_extraction::is_eval_channel(&s.channel) => Scope::Eval,
+            Ok(Some(s)) if crate::turn_extraction::is_eval_channel(&s.channel) => Scope::Hidden,
             // Had while a boss in a scope it has left: that scope's.
-            Ok(Some(s)) if crate::memory_fence::left_behind(&s) => Scope::Eval,
-            Ok(Some(s))
-                if s.read_personal()
-                    && crate::personal_access::refusal(PERSONAL_PROBE).is_some() =>
-            {
-                Scope::Eval
+            Ok(Some(s)) if crate::memory_fence::left_behind(&s) => Scope::Hidden,
+            Ok(Some(s)) if s.read_personal() && !crate::personal_access::may_read() => {
+                Scope::Hidden
             }
             Ok(Some(s)) if s.owner == identity_id => Scope::Visible {
                 personal: s.read_personal(),

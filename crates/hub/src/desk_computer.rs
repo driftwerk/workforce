@@ -176,8 +176,8 @@ fn uses_their_chrome(tool: &str, effect: &Effect) -> bool {
         || matches!(effect, Effect::Connector { connector, .. } if is_browser_key(connector))
 }
 
-/// Why a browser call on BankSync's site may not be made in this run: its
-/// pages show the person's banks, accounts and transactions, so they are
+/// Why a browser call on BankSync's site, in the person's Chrome or Desk's
+/// own headless browser, may not be made in this run: its pages show the person's banks, accounts and transactions, so they are
 /// opened only where the bank may be read (the person's own Desk, watched).
 fn banksync_refusal(effect: &Effect) -> Option<&'static str> {
     let Effect::Connector { connector, .. } = effect else {
@@ -185,9 +185,10 @@ fn banksync_refusal(effect: &Effect) -> Option<&'static str> {
     };
     let origin = connector
         .strip_prefix("chrome-visit:")
-        .or_else(|| connector.strip_prefix("chrome:"))?;
+        .or_else(|| connector.strip_prefix("chrome:"))
+        .or_else(|| connector.strip_prefix("browser:"))?;
     (origin == crate::desk_connections::catalog::BANKSYNC_APP)
-        .then(|| crate::personal_access::refusal("bank.accounts"))
+        .then(crate::personal_access::read_refusal)
         .flatten()
 }
 
@@ -1106,6 +1107,11 @@ mod tests {
         );
         assert!(super::banksync_refusal(&at(bank, false)).is_some());
         assert!(super::banksync_refusal(&at("https://linear.app", true)).is_none());
+        let headless = Effect::Connector {
+            connector: format!("browser:{bank}"),
+            write: false,
+        };
+        assert!(super::banksync_refusal(&headless).is_some(), "headless too");
         let desk = |place: DeskPlace, attended: bool| DeskScope {
             target: DeskTarget::of_turn(&place, "desk", None, false),
             owner: "ann".into(),

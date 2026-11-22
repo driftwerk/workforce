@@ -3353,7 +3353,14 @@ async fn one_agent_watches_the_person_s_bank_approvals_while_a_bank_is_kept() {
     assert_eq!(watching(), ["ben"], "ben reaches the shared one too");
     h.c.disconnect(SARAH, "bank", &own.id).await.unwrap();
     assert_eq!(watching(), ["allan"], "the first by name it reaches");
+
+    // Allan is removed, and its jobs with it: the watch is ben's now.
+    h.crew.agents.lock().unwrap().retain(|a| a.id != "allan");
+    h.crew.watches.lock().unwrap().remove("allan");
+    h.c.rewatch(SARAH).await;
+    assert_eq!(watching(), ["ben"], "the next it reaches takes it on");
+
     h.c.disconnect(SARAH, "bank", &all.id).await.unwrap();
     assert!(watching().is_empty(), "gone with the last bank");
-    assert_eq!(h.crew.watches.lock().unwrap().len(), 2);
+    assert_eq!(h.crew.watches.lock().unwrap().len(), 1);
 }

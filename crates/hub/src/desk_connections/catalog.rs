@@ -132,6 +132,8 @@ pub struct Connector {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Renewal {
+    /// Who holds the approval, as the person knows them: "BankSync".
+    pub service: &'static str,
     /// What the approval is called: "Bank approval".
     pub label: &'static str,
     /// Where it is renewed.
@@ -490,6 +492,7 @@ pub const CATALOG: &[Connector] = &[
         name_hint: "NatWest",
         extras: &[("skills/bank/consented_at", CONSENTED_AT)],
         renewal: Some(Renewal {
+            service: "BankSync",
             label: "Bank approval",
             page: BANKSYNC_APP,
             open: "Open BankSync",

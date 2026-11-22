@@ -7036,6 +7036,10 @@ async fn delete_agent(
         }
     }
 
+    #[cfg(feature = "postgres")]
+    if gone {
+        crate::desk_connections::agent_removed(&state).await;
+    }
     info!(agent_id = %id, gone, "Agent removed via API (overlay)");
 
     Ok(Json(serde_json::json!({

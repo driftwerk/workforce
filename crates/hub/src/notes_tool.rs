@@ -531,6 +531,17 @@ impl Tool for NotesTool {
             _ => MemoryManager::new(&self.workspace),
         };
 
+        if matches!(
+            input.action.as_str(),
+            "write_daily" | "append_memory" | "write_profile"
+        ) && workforce_agent::personal::read()
+        {
+            return Ok(ToolResult::failure(
+                crate::memory_tool::PERSONAL_KEPT_NOTHING,
+                start.elapsed().as_millis() as u64,
+            ));
+        }
+
         match input.action.as_str() {
             "write_daily" => {
                 let content = match input.content {
@@ -1487,6 +1498,54 @@ mod tests {
             .await
             .unwrap();
         assert!(!result.output["has_task"].as_bool().unwrap());
+    }
+
+    /// A turn that has read the person's bank writes no note, daily, memory
+    /// or profile; reading them still works.
+    #[tokio::test]
+    async fn a_turn_that_read_the_bank_writes_no_note() {
+        let dir = tempfile::tempdir().unwrap();
+        let tool = NotesTool::new(dir.path().to_path_buf());
+        let refused = workforce_agent::personal::scoped(false, async {
+            workforce_agent::personal::calling("bank.balances");
+            let mut refused = Vec::new();
+            for (action, extra) in [
+                (
+                    "write_daily",
+                    serde_json::json!({ "content": "£12 at Tesco" }),
+                ),
+                (
+                    "append_memory",
+                    serde_json::json!({ "content": "£12 at Tesco" }),
+                ),
+                (
+                    "write_profile",
+                    serde_json::json!({ "content": "banks with NatWest" }),
+                ),
+            ] {
+                let mut input = extra;
+                input["action"] = action.into();
+                let got = tool.execute(input).await.unwrap();
+                refused.push(
+                    !got.success
+                        && got.error.as_deref() == Some(crate::memory_tool::PERSONAL_KEPT_NOTHING),
+                );
+            }
+            let read = tool
+                .execute(serde_json::json!({ "action": "read_daily" }))
+                .await
+                .unwrap();
+            refused.push(read.success);
+            refused
+        })
+        .await;
+        assert_eq!(refused, [true, true, true, true]);
+        assert!(
+            walk(dir.path()).iter().all(|f| !std::fs::read_to_string(f)
+                .unwrap_or_default()
+                .contains("Tesco")),
+            "nothing written"
+        );
     }
 
     #[tokio::test]

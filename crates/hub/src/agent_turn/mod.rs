@@ -642,7 +642,13 @@ impl TurnChain {
             let resolved = service.resolved.snapshot();
             (resolved.effort_level(), resolved.fast)
         };
-        let routes = Box::pin(self.run_routes(service, turn));
+        // A conversation that read the person's bank keeps nothing of any
+        // turn of it ([`workforce_agent::personal`]), from its first call.
+        let read_personal = turn.session.read_personal();
+        let routes = Box::pin(workforce_agent::personal::scoped(
+            read_personal,
+            self.run_routes(service, turn),
+        ));
         // A person's own route alone: what the turn finds missing or tells
         // them to connect is their own login, never a shared one.
         let routes: std::pin::Pin<

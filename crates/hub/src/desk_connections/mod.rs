@@ -1687,6 +1687,14 @@ impl Connections {
             self.agents.reload(&agent, c.id, person).await;
         }
         if c.renewal.is_some() {
+            self.rewatch(person).await;
+        }
+    }
+
+    /// Moves `person`'s watch of every approval that lapses to the agents
+    /// that watch it now: after an agent is removed, its watch is another's.
+    pub async fn rewatch(&self, person: &str) {
+        for c in catalog::CATALOG.iter().filter(|c| c.renewal.is_some()) {
             let watching = self.watchers(c, person);
             for agent in self.agents.all() {
                 self.agents
@@ -2246,7 +2254,7 @@ impl Agents for Registry {
             return;
         };
         scheduler
-            .keep_for(person, approvals::JOB, on.then(approvals::job))
+            .keep_for(person, approvals::KEY, on.then(approvals::job))
             .await;
     }
 
@@ -2391,6 +2399,26 @@ pub fn reload_skill(
 fn google_redirect(listen: &str) -> String {
     let port = listen.rsplit_once(':').map_or("8080", |(_, port)| port);
     format!("http://127.0.0.1:{port}/api/auth/google/callback")
+}
+
+/// Once an agent is removed, the approvals it watched for the people who
+/// hold this hub are watched by another of their agents.
+pub async fn agent_removed(state: &GatewayState) {
+    use workforce_identity::store::IdentityStore as _;
+    let Some(connections) = INSTALLED.get() else {
+        return;
+    };
+    let Some(identities) = state.identity_store.as_ref() else {
+        return;
+    };
+    let holders = identities
+        .list(&workforce_identity::store::IdentityFilter::default())
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|i| crate::authz::is_effective_admin(i.role, i.status));
+    for holder in holders {
+        connections.rewatch(&holder.id.to_string()).await;
+    }
 }
 
 /// Connections for this `[desk]` hub, kept for the Google callback, and

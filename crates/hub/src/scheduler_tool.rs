@@ -520,7 +520,7 @@ impl SchedulerTool {
 
         let answers_at = crate::desk_surface::origin()
             .filter(|_| resolved_channel_id.as_deref().is_none_or(str::is_empty));
-        if let Some(why) = personal_refusal(
+        if let Some(why) = crate::personal_access::job_refusal(
             input.tools.as_deref().unwrap_or_default(),
             answers_at
                 .as_ref()
@@ -757,7 +757,7 @@ impl SchedulerTool {
             JobPayload::AgentTurn { tools, .. } => tools.as_deref(),
             _ => None,
         };
-        if let Some(why) = personal_refusal(
+        if let Some(why) = crate::personal_access::job_refusal(
             input.tools.as_deref().or(kept_tools).unwrap_or_default(),
             crate::scheduler::desk_target(&job),
         ) {
@@ -973,43 +973,6 @@ impl SchedulerTool {
         ))
     }
 }
-
-/// Whether `entry` of a job's `tools` names the person's bank, a tool of it
-/// or all of it.
-fn names_personal(entry: &str) -> bool {
-    workforce_common::connector_binding::is_personal(entry)
-        || workforce_common::connector_binding::PERSONAL.contains(&entry)
-}
-
-/// Why a job given `tools`, answering at `desk`, may not read the person's
-/// bank; `None` when it may, or doesn't. It answers in their own Desk
-/// conversation (never a room, nor a channel it names), and names nothing
-/// beside the bank but reads: nothing it could send the bank on with.
-fn personal_refusal(
-    tools: &[String],
-    desk: Option<&workforce_common::channels::desk::DeskTarget>,
-) -> Option<&'static str> {
-    if !tools.iter().any(|t| names_personal(t)) {
-        return None;
-    }
-    if !desk.is_some_and(|t| crate::personal_access::is_private(&t.place)) {
-        return Some(PERSONAL_OFF_DESK);
-    }
-    tools
-        .iter()
-        .any(|t| !names_personal(t) && !workforce_common::connector_binding::is_read(t))
-        .then_some(PERSONAL_ONLY_READS)
-}
-
-/// What a job that reads the person's bank is told when it wouldn't answer
-/// in their own Desk conversation.
-const PERSONAL_OFF_DESK: &str =
-    "A job that reads the person's bank answers only in their own Desk conversation with you, never a room or a channel: make it from there.";
-
-/// What a job that reads the person's bank is told when it names more than
-/// reads beside it.
-const PERSONAL_ONLY_READS: &str =
-    "A job that reads the person's bank names nothing beside it but reads: nothing that writes or sends, and no whole namespace.";
 
 #[cfg(test)]
 mod tests {
@@ -1788,16 +1751,6 @@ mod tests {
     }
 
     #[test]
-    fn a_job_names_the_bank_by_its_namespace_or_any_of_its_tools() {
-        for named in ["bank", "bank.accounts", "bank.transactions"] {
-            assert!(super::names_personal(named), "{named}");
-        }
-        for other in ["banking", "linear", "linear.issue_get", "bankbook.read"] {
-            assert!(!super::names_personal(other), "{other}");
-        }
-    }
-
-    #[test]
     fn a_bank_job_answers_in_the_person_s_own_desk_and_names_only_reads_beside_it() {
         use workforce_common::channels::desk::{DeskPlace, DeskTarget};
         let at = |place: DeskPlace| DeskTarget::of_turn(&place, "desk", None, false);
@@ -1809,28 +1762,34 @@ mod tests {
         });
         let tools = |t: &[&str]| t.iter().map(|s| s.to_string()).collect::<Vec<_>>();
 
-        assert_eq!(personal_refusal(&tools(&["linear"]), None), None);
+        assert_eq!(
+            crate::personal_access::job_refusal(&tools(&["linear"]), None),
+            None
+        );
         for named in [
             &["bank"][..],
             &["bank.accounts"],
             &["bank.balances", "linear.issue_list"],
         ] {
             assert_eq!(
-                personal_refusal(&tools(named), Some(&dm)),
+                crate::personal_access::job_refusal(&tools(named), Some(&dm)),
                 None,
                 "{named:?}"
             );
             assert_eq!(
-                personal_refusal(&tools(named), None),
-                Some(PERSONAL_OFF_DESK)
+                crate::personal_access::job_refusal(&tools(named), None),
+                Some(crate::personal_access::JOB_OFF_DESK)
             );
             assert_eq!(
-                personal_refusal(&tools(named), Some(&room)),
-                Some(PERSONAL_OFF_DESK)
+                crate::personal_access::job_refusal(&tools(named), Some(&room)),
+                Some(crate::personal_access::JOB_OFF_DESK)
             );
         }
         assert_eq!(
-            personal_refusal(&tools(&["bank.accounts"]), Some(&at(DeskPlace::Call))),
+            crate::personal_access::job_refusal(
+                &tools(&["bank.accounts"]),
+                Some(&at(DeskPlace::Call))
+            ),
             None
         );
         for beside in [
@@ -1840,8 +1799,8 @@ mod tests {
             "linear.issue_create",
         ] {
             assert_eq!(
-                personal_refusal(&tools(&["bank.accounts", beside]), Some(&dm)),
-                Some(PERSONAL_ONLY_READS),
+                crate::personal_access::job_refusal(&tools(&["bank.accounts", beside]), Some(&dm)),
+                Some(crate::personal_access::ONLY_READS),
                 "{beside}"
             );
         }

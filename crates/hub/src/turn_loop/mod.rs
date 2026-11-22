@@ -6001,22 +6001,22 @@ pub(crate) async fn stream_admitted(
                 .await;
 
                 if !session.read_personal() {
-                crate::lessons::run_post_turn(
-                    crate::lessons::LessonPipelineConfig {
-                        extract_enabled: ls_extract_enabled,
-                        llm: &ls_llm,
-                        store: ls_store.as_ref(),
-                        agent_id: &ls_agent_id,
-                        extract_model: ls_extract_model,
-                        extract_prompt: ls_extract_prompt,
-                        cost_tracker: &ls_cost_tracker,
-                        sessions: &ls_sessions,
-                    },
-                    &mut session,
-                    archive_base_for_task,
-                    &effective_message,
-                    &result.response,
-                );
+                    crate::lessons::run_post_turn(
+                        crate::lessons::LessonPipelineConfig {
+                            extract_enabled: ls_extract_enabled,
+                            llm: &ls_llm,
+                            store: ls_store.as_ref(),
+                            agent_id: &ls_agent_id,
+                            extract_model: ls_extract_model,
+                            extract_prompt: ls_extract_prompt,
+                            cost_tracker: &ls_cost_tracker,
+                            sessions: &ls_sessions,
+                        },
+                        &mut session,
+                        archive_base_for_task,
+                        &effective_message,
+                        &result.response,
+                    );
                 }
 
                 // Spawn background compaction if it was deferred earlier

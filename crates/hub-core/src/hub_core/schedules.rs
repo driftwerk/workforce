@@ -310,6 +310,8 @@ pub enum SessionMode {
 /// says, and never capped, as it lasts while what it watches does.
 #[derive(Debug, Clone)]
 pub struct HubJob {
+    /// What the person's job list calls it; they may rename it.
+    pub name: String,
     pub description: String,
     pub schedule: Schedule,
     pub payload: JobPayload,

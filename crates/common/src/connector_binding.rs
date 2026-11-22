@@ -66,6 +66,12 @@ pub fn is_personal(tool: &str) -> bool {
     connector_of(tool).is_some_and(|c| PERSONAL.contains(&c))
 }
 
+/// Whether `entry` of a run's or a job's `tools` names a [`PERSONAL`]
+/// connector: all of it (`bank`) or one of its tools (`bank.accounts`).
+pub fn names_personal(entry: &str) -> bool {
+    is_personal(entry) || PERSONAL.contains(&entry)
+}
+
 /// Whether vault `path` holds a [`PERSONAL`] connector's key (its flat one,
 /// or one of its instances'), at any tier, however it is spelled: never
 /// shown to an agent or put into a request, whatever the vault's redaction.
@@ -472,6 +478,16 @@ mod tests {
         assert!(is_personal("bank.workspaces"));
         for other in ["linear.issue_get", "bank", "banking.list", "memory.recall"] {
             assert!(!is_personal(other), "{other}");
+        }
+    }
+
+    #[test]
+    fn the_bank_is_named_by_its_namespace_or_any_of_its_tools() {
+        for named in ["bank", "bank.accounts", "bank.transactions"] {
+            assert!(names_personal(named), "{named}");
+        }
+        for other in ["banking", "linear", "linear.issue_get", "bankbook.read"] {
+            assert!(!names_personal(other), "{other}");
         }
     }
 

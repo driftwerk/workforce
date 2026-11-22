@@ -302,14 +302,20 @@ struct TraceEnvelope<'a, T: Serialize> {
     data: &'a T,
 }
 
-/// Writes trace data as JSONL files to the local filesystem. A run that
-/// read a person's private connector (their bank) leaves no trace: its
-/// file goes, and nothing more of it is written.
+/// Writes trace data as JSONL files to the local filesystem: one file for
+/// the agent, which every run of it writes to.
+///
+/// A run that read a person's private connector (their bank: its session
+/// had, it called one, or it read back a conversation that had) leaves no
+/// line in it ([`workforce_agent::personal`]). So that none of such a run
+/// is kept, a run's lines are held until it ends and written together
+/// then; a run that ends without a footer (a crash) leaves none. Other
+/// runs, and lines written outside any run, are untouched.
 pub struct JsonlTraceWriter {
     /// The opened file handle, protected by a mutex for thread safety.
     file: Mutex<std::io::BufWriter<fs::File>>,
-    path: PathBuf,
-    personal: std::sync::atomic::AtomicBool,
+    /// Each running run's lines, by [`workforce_agent::personal::run_key`].
+    held: Mutex<std::collections::HashMap<usize, Vec<String>>>,
 }
 
 impl JsonlTraceWriter {
@@ -342,40 +348,55 @@ impl JsonlTraceWriter {
 
         Ok(Self {
             file: Mutex::new(writer),
-            path: file_path,
-            personal: std::sync::atomic::AtomicBool::new(false),
+            held: Mutex::default(),
         })
     }
 
-    /// Whether the run read a personal connector, by `round` or before it:
-    /// once it has, its file is removed.
-    fn forgets(&self, round: Option<&TraceRound>) -> bool {
-        use std::sync::atomic::Ordering;
-        let read = round.is_some_and(|r| {
-            r.tool_results
-                .iter()
-                .any(|t| workforce_common::connector_binding::is_personal(&t.tool_name))
-        });
-        if read && !self.personal.swap(true, Ordering::SeqCst) {
-            if let Err(e) = fs::remove_file(&self.path) {
-                tracing::warn!(error = %e, "a trace that read the person's bank wasn't removed");
-            }
-        }
-        self.personal.load(Ordering::SeqCst)
-    }
-
-    /// Write a single JSON line with a type discriminator.
-    fn write_line<T: Serialize>(&self, type_name: &str, data: &T) -> Result<()> {
-        let envelope = TraceEnvelope {
+    /// One line, as written.
+    fn line<T: Serialize>(type_name: &str, data: &T) -> Result<String> {
+        Ok(serde_json::to_string(&TraceEnvelope {
             r#type: type_name,
             data,
+        })?)
+    }
+
+    /// Takes a line of the run in hand: held until it ends, dropped with
+    /// the rest of it once it has read the bank. `start` begins the run's
+    /// lines afresh; `end` writes them out.
+    fn take(&self, line: String, start: bool, end: bool) -> Result<()> {
+        let Some(run) = workforce_agent::personal::run_key() else {
+            return self.write_lines(&[line]);
         };
-        let json = serde_json::to_string(&envelope)?;
+        let mut held = self
+            .held
+            .lock()
+            .map_err(|e| eyre::eyre!("Trace hold mutex poisoned: {}", e))?;
+        if workforce_agent::personal::read() {
+            held.remove(&run);
+            return Ok(());
+        }
+        if start {
+            held.remove(&run);
+        }
+        let lines = held.entry(run).or_default();
+        lines.push(line);
+        if !end {
+            return Ok(());
+        }
+        let lines = held.remove(&run).unwrap_or_default();
+        drop(held);
+        self.write_lines(&lines)
+    }
+
+    /// Writes `lines` together, so no other run's come between them.
+    fn write_lines(&self, lines: &[String]) -> Result<()> {
         let mut file = self
             .file
             .lock()
             .map_err(|e| eyre::eyre!("Trace file mutex poisoned: {}", e))?;
-        writeln!(file, "{}", json)?;
+        for line in lines {
+            writeln!(file, "{}", line)?;
+        }
         file.flush()?;
         Ok(())
     }
@@ -383,21 +404,15 @@ impl JsonlTraceWriter {
 
 impl TraceWriter for JsonlTraceWriter {
     fn write_header(&self, header: &TraceHeader) -> Result<()> {
-        self.write_line("header", header)
+        self.take(Self::line("header", header)?, true, false)
     }
 
     fn write_round(&self, round: &TraceRound) -> Result<()> {
-        match self.forgets(Some(round)) {
-            true => Ok(()),
-            false => self.write_line("round", round),
-        }
+        self.take(Self::line("round", round)?, false, false)
     }
 
     fn write_footer(&self, footer: &TraceFooter) -> Result<()> {
-        match self.forgets(None) {
-            true => Ok(()),
-            false => self.write_line("footer", footer),
-        }
+        self.take(Self::line("footer", footer)?, false, true)
     }
 }
 
@@ -456,35 +471,119 @@ mod tests {
         assert_eq!(other_bits(&trace.path()), 0);
     }
 
-    #[test]
-    fn a_run_that_reads_the_person_s_bank_leaves_no_trace() {
-        use workforce_agent::trace::ToolResultTrace;
-        let base = tempfile::tempdir().unwrap();
-        let writer = JsonlTraceWriter::new(base.path(), "kat").unwrap();
-        let round = |tool: &str| {
-            let mut r: TraceRound = serde_json::from_value(serde_json::json!({
-                "round": 1, "input": [], "response": [], "tool_results": [],
-                "model": "m", "stop_reason": "tool_use", "input_tokens": 0,
-                "output_tokens": 0, "cache_read_tokens": 0, "cache_creation_tokens": 0
-            }))
-            .unwrap();
-            r.tool_results.push(ToolResultTrace {
+    fn round(tool: &str, output: serde_json::Value) -> TraceRound {
+        let mut r: TraceRound = serde_json::from_value(serde_json::json!({
+            "round": 1, "input": [], "response": [], "tool_results": [],
+            "model": "m", "stop_reason": "tool_use", "input_tokens": 0,
+            "output_tokens": 0, "cache_read_tokens": 0, "cache_creation_tokens": 0
+        }))
+        .unwrap();
+        r.tool_results
+            .push(workforce_agent::trace::ToolResultTrace {
                 tool_use_id: "t".into(),
                 tool_name: tool.into(),
                 input: serde_json::json!({}),
-                output: serde_json::json!("£12.30 at Tesco"),
+                output,
                 success: true,
                 duration_ms: 1,
             });
-            r
-        };
-        writer.write_round(&round("linear.issue_get")).unwrap();
-        assert!(writer.path.exists());
-        writer.write_round(&round("bank.transactions")).unwrap();
-        writer.write_round(&round("linear.issue_get")).unwrap();
-        assert!(!writer.path.exists());
-        let left: Vec<_> = walk(base.path());
-        assert!(left.is_empty(), "{left:?}");
+        r
+    }
+
+    fn header(session: &str) -> TraceHeader {
+        serde_json::from_value(serde_json::json!({
+            "trace_id": session, "agent_id": "kat", "session_id": session,
+            "workflow_id": null, "step_id": null, "task_type": null,
+            "model": "m", "system_prompt": "", "tools": [],
+            "started_at": "2026-11-22T09:00:00Z"
+        }))
+        .unwrap()
+    }
+
+    fn footer() -> TraceFooter {
+        TraceFooter {
+            outcome: workforce_agent::trace::TraceOutcome::Success,
+            completed_at: chrono::Utc::now(),
+            total_rounds: 1,
+            total_input_tokens: 0,
+            total_output_tokens: 0,
+            total_duration_ms: 1,
+        }
+    }
+
+    /// A run of `session`'s, as the runner makes one: its tools run as
+    /// calls are made, then its round is traced.
+    async fn run(
+        writer: &JsonlTraceWriter,
+        session: &str,
+        read: bool,
+        calls: &[(&str, serde_json::Value)],
+    ) {
+        workforce_agent::personal::scoped(read, async {
+            writer.write_header(&header(session)).unwrap();
+            for (tool, output) in calls {
+                workforce_agent::personal::calling(tool);
+                workforce_agent::personal::answered(output);
+                tokio::task::yield_now().await;
+                writer.write_round(&round(tool, output.clone())).unwrap();
+            }
+            writer.write_footer(&footer()).unwrap();
+        })
+        .await;
+    }
+
+    fn traced(base: &std::path::Path) -> Vec<String> {
+        walk(base)
+            .iter()
+            .flat_map(|f| {
+                fs::read_to_string(f)
+                    .unwrap()
+                    .lines()
+                    .map(str::to_string)
+                    .collect::<Vec<_>>()
+            })
+            .filter(|l| l.contains("\"header\""))
+            .map(|l| {
+                serde_json::from_str::<serde_json::Value>(&l).unwrap()["session_id"]
+                    .as_str()
+                    .unwrap()
+                    .to_string()
+            })
+            .collect()
+    }
+
+    /// The agent's one file is shared by every run: a run that read the
+    /// bank leaves none of its lines, and everyone else's stay, whole.
+    #[tokio::test]
+    async fn only_a_run_that_read_the_person_s_bank_goes_untraced() {
+        let base = tempfile::tempdir().unwrap();
+        let writer = JsonlTraceWriter::new(base.path(), "kat").unwrap();
+        let linear = || ("linear.issue_get", serde_json::json!("DW-1"));
+        let bank = || ("bank.transactions", serde_json::json!("£12.30 at Tesco"));
+        tokio::join!(
+            run(&writer, "ann-banks", false, &[linear(), bank(), linear()]),
+            run(&writer, "bob", false, &[linear(), linear()]),
+        );
+        run(&writer, "ann-later", true, &[linear()]).await;
+        run(
+            &writer,
+            "ann-reads-back",
+            false,
+            &[(
+                "sessions.read",
+                serde_json::json!({"personal_read": true, "messages": []}),
+            )],
+        )
+        .await;
+        run(&writer, "carl", false, &[linear()]).await;
+
+        assert_eq!(traced(base.path()), ["bob", "carl"]);
+        let all: String = walk(base.path())
+            .iter()
+            .map(|f| fs::read_to_string(f).unwrap())
+            .collect();
+        assert!(!all.contains("Tesco"));
+        assert_eq!(all.lines().count(), 4 + 3, "bob's run whole, and carl's");
     }
 
     fn walk(dir: &std::path::Path) -> Vec<PathBuf> {
