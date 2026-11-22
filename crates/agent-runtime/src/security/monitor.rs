@@ -625,13 +625,41 @@ pub struct ContentScope {
 }
 
 impl ContentScope {
-    /// The scope of an ordinary turn delivering to `channel`.
+    /// The scope of an ordinary turn delivering to `channel`, on the
+    /// platform the turn is on ([`turn_platform`]): the same channel id on
+    /// another platform is somewhere else.
     pub fn delivering_to(channel: Option<&str>) -> Self {
+        let platform = turn_platform();
         Self {
-            expected: channel.into_iter().map(Place::any).collect(),
+            expected: channel
+                .into_iter()
+                .map(|target| Place {
+                    platform: platform.clone(),
+                    target: target.to_string(),
+                })
+                .collect(),
             ..Self::default()
         }
     }
+}
+
+/// The platforms a turn's session can be on, as its key starts.
+const SESSION_PLATFORMS: &[&str] = &["slack", "teams"];
+
+/// The platform the current turn is on: Desk for a run that answers to a
+/// Desk conversation, else the one its session is keyed on. `None` when
+/// neither says, and its places are then on any platform.
+pub fn turn_platform() -> Option<String> {
+    if crate::runner::current_desk().is_some() {
+        return Some(workforce_common::channels::desk::DESK_PLATFORM.to_string());
+    }
+    let key = crate::runner::CURRENT_SESSION_KEY
+        .try_with(Clone::clone)
+        .ok()?;
+    let platform = key.split(':').next()?;
+    SESSION_PLATFORMS
+        .contains(&platform)
+        .then(|| platform.to_string())
 }
 
 /// A call the guard weighs.
@@ -1940,6 +1968,56 @@ mod tests {
                 Some(&writes("slack", "C2"))
             )
             .is_some());
+    }
+
+    /// A turn's place is on the platform it is on: in a Slack turn, a post
+    /// the model sends to another platform's "here" (Desk, no channel) is
+    /// held, while one to its own conversation runs; a Desk turn's own
+    /// conversation is Desk's.
+    #[test]
+    fn a_turns_own_place_is_on_its_own_platform() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let slack = rt.block_on(
+            crate::runner::CURRENT_SESSION_KEY.scope("slack:T1:C1:1.5".to_string(), async {
+                armed(ContentScope::delivering_to(Some("C1")))
+            }),
+        );
+        assert_eq!(
+            slack.scope.expected,
+            vec![Place::on("slack", "C1")],
+            "the Slack turn's channel"
+        );
+        let to_desk = writes("desk", "");
+        let to_slack = writes("slack", "");
+        let post = |effect| Call {
+            here: Some("C1"),
+            ..Call::new("messaging.send", &Value::Null, Some(effect))
+        };
+        assert!(
+            slack.check_call(&post(&to_desk)).is_some(),
+            "another platform's here is somewhere else"
+        );
+        assert_eq!(slack.check_call(&post(&to_slack)), None);
+        let desk = rt.block_on(crate::runner::with_desk(
+            Some(workforce_common::channels::desk::DeskScope {
+                target: workforce_common::channels::desk::DeskTarget::of_turn(
+                    &workforce_common::channels::desk::DeskPlace::Dm { thread: None },
+                    "desk",
+                    None,
+                    false,
+                ),
+                owner: "person-1".into(),
+                attended: true,
+                relayed: false,
+            }),
+            async { armed(ContentScope::delivering_to(Some("C1"))) },
+        ));
+        assert_eq!(desk.check_call(&post(&to_desk)), None);
+        assert!(desk.check_call(&post(&to_slack)).is_some());
+        let unknown = armed(ContentScope::delivering_to(Some("C1")));
+        assert_eq!(unknown.scope.expected, vec![Place::any("C1")]);
     }
 
     #[test]
