@@ -143,7 +143,7 @@ impl CrewHub {
             }),
             "workspace" => {
                 let ws = workspace::workspace_of(&v.cwd).await;
-                let pr = self.pull_seen(&b.service, &ws).await;
+                let pr = self.workspace_pull(&b.service, &ws).await;
                 Ok(
                     json!({ "workspace": reported(&self.workspace_said(&ws, &pr).to_string(), "the session's workspace") }),
                 )
@@ -198,7 +198,7 @@ impl CrewHub {
         let now = chrono::Utc::now();
         let mut g = self.desk.glance(v);
         let ws = self.workspace_seen(&v.cwd).await;
-        let pr = self.pull_seen(service, &ws).await;
+        let pr = self.workspace_pull(service, &ws).await;
         g.workspace = workspace_glance(&ws, &pr);
         g.stall = sight::verdict(&g, v.state, now, self.stall_thresholds(o));
         g
@@ -246,7 +246,11 @@ impl CrewHub {
     /// The pull request `ws`'s branch is, read as the person through
     /// [`super::github_seen`]; none when there is no branch on GitHub to
     /// look for.
-    async fn pull_seen(&self, service: &Arc<AgentService>, ws: &Workspace) -> Option<PullSeen> {
+    async fn workspace_pull(
+        &self,
+        service: &Arc<AgentService>,
+        ws: &Workspace,
+    ) -> Option<PullSeen> {
         let Workspace::Repo(repo) = ws else {
             return None;
         };
