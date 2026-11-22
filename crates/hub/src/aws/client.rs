@@ -562,6 +562,7 @@ mod tests {
             served: None,
             desk: None,
             work: None,
+            personal: None,
         }
     }
 

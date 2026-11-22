@@ -66,6 +66,7 @@ pub fn digest_source_eligible(
         && !predecessor_ids.contains(&s.id) // already in the target's carry-over
         && !successor_prevs.contains(&s.id) // its successor candidate holds the carry-over
         && !crate::memory_fence::left_behind(s) // a scope a boss left keeps its talk
+        && !s.read_personal() // what the person's bank said stays where it was read
 }
 
 /// Channel-type label — never raw ids ("where" attribution).
@@ -368,6 +369,15 @@ mod tests {
         assert!(!eligible(&asked, &target, default_cutoff()));
         let chatted = source("rest", "alice", "how many orders?", minutes(5));
         assert!(eligible(&chatted, &target, default_cutoff()));
+    }
+
+    #[test]
+    fn a_conversation_that_read_the_person_s_bank_is_never_a_digest_source() {
+        let target = dm_session("web", "alice");
+        let mut banked = source("desk", "alice", "what did I spend?", minutes(5));
+        assert!(eligible(&banked, &target, default_cutoff()));
+        banked.mark_read_personal();
+        assert!(!eligible(&banked, &target, default_cutoff()));
     }
 
     // ── Target gate ──────────────────────────────────────────────────────

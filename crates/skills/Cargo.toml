@@ -62,6 +62,7 @@ google = ["tokio", "reqwest", "axum", "url", "sha2", "rand", "open", "lettre", "
 linear = ["reqwest", "tokio", "url", "sha2"]
 jira = ["reqwest", "reqwest/multipart", "tokio", "pulldown-cmark", "url", "sha2"]
 datadog = ["reqwest", "tokio"]
+bank = ["reqwest", "tokio", "sha2"]
 metabase = ["reqwest", "tokio"]
 hubspot = ["reqwest", "tokio"]
 notion = ["reqwest", "tokio"]

@@ -518,6 +518,17 @@ impl SchedulerTool {
             ));
         }
 
+        let answers_at = crate::desk_surface::origin()
+            .filter(|_| resolved_channel_id.as_deref().is_none_or(str::is_empty));
+        if let Some(why) = crate::personal_access::job_refusal(
+            input.tools.as_deref().unwrap_or_default(),
+            answers_at
+                .as_ref()
+                .and_then(workforce_common::delivery::DeliveryTarget::desk_target),
+        ) {
+            return Ok(ToolResult::failure(why, start.elapsed().as_millis() as u64));
+        }
+
         let service = self.scheduler.service();
         let budget = &service.config.budget;
         let tz = service.config.user_timezone();
@@ -741,6 +752,16 @@ impl SchedulerTool {
                 }),
                 elapsed(),
             ));
+        }
+        let kept_tools = match &job.payload {
+            JobPayload::AgentTurn { tools, .. } => tools.as_deref(),
+            _ => None,
+        };
+        if let Some(why) = crate::personal_access::job_refusal(
+            input.tools.as_deref().or(kept_tools).unwrap_or_default(),
+            crate::scheduler::desk_target(&job),
+        ) {
+            return Ok(ToolResult::failure(why, elapsed()));
         }
         let rescheduled = schedule.is_some();
         let edit = JobEdit {
@@ -1727,5 +1748,63 @@ mod tests {
             }
         });
         assert!(schema["properties"]["action"].is_object());
+    }
+
+    #[test]
+    fn a_bank_job_answers_in_the_person_s_own_desk_and_names_only_the_bank() {
+        use workforce_common::channels::desk::{DeskPlace, DeskTarget};
+        let at = |place: DeskPlace| DeskTarget::of_turn(&place, "desk", None, false);
+        let dm = at(DeskPlace::Dm { thread: None });
+        let room = at(DeskPlace::Room {
+            room: uuid::Uuid::nil(),
+            name: "family".into(),
+            thread: None,
+        });
+        let tools = |t: &[&str]| t.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+
+        assert_eq!(
+            crate::personal_access::job_refusal(&tools(&["linear"]), None),
+            None
+        );
+        for named in [
+            &["bank"][..],
+            &["bank.accounts"],
+            &["bank.balances", "bank.transactions"],
+        ] {
+            assert_eq!(
+                crate::personal_access::job_refusal(&tools(named), Some(&dm)),
+                None,
+                "{named:?}"
+            );
+            assert_eq!(
+                crate::personal_access::job_refusal(&tools(named), None),
+                Some(crate::personal_access::JOB_OFF_DESK)
+            );
+            assert_eq!(
+                crate::personal_access::job_refusal(&tools(named), Some(&room)),
+                Some(crate::personal_access::JOB_OFF_DESK)
+            );
+        }
+        assert_eq!(
+            crate::personal_access::job_refusal(
+                &tools(&["bank.accounts"]),
+                Some(&at(DeskPlace::Call))
+            ),
+            None
+        );
+        for beside in [
+            "messaging.send",
+            "http.request",
+            "linear",
+            "linear.issue_create",
+            "linear.issue_list",
+            "datadog.logs_search",
+        ] {
+            assert_eq!(
+                crate::personal_access::job_refusal(&tools(&["bank.accounts", beside]), Some(&dm)),
+                Some(crate::personal_access::ONLY_BANK),
+                "{beside}"
+            );
+        }
     }
 }

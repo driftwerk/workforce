@@ -68,6 +68,10 @@ struct MessageInput {
     limit: Option<usize>,
 }
 
+/// What a send is told in a turn that read the person's bank.
+pub(crate) const PERSONAL_SENDS_NOTHING: &str =
+    "A conversation that read the person's bank sends nothing on to another agent.";
+
 #[async_trait]
 impl Tool for AgentMessageTool {
     fn name(&self) -> &str {
@@ -115,6 +119,15 @@ impl Tool for AgentMessageTool {
     async fn execute(&self, input: serde_json::Value) -> Result<ToolResult> {
         let start = Instant::now();
         let input: MessageInput = serde_json::from_value(input)?;
+
+        // A turn that read the person's bank sends nothing of it on to
+        // another agent.
+        if input.action == "send" && workforce_agent::personal::read() {
+            return Ok(ToolResult::failure(
+                PERSONAL_SENDS_NOTHING,
+                start.elapsed().as_millis() as u64,
+            ));
+        }
 
         let result = match input.action.as_str() {
             "list_agents" => {
@@ -363,6 +376,34 @@ mod tests {
         fn routed_delivery(self: Arc<Self>) -> tokio::sync::mpsc::Sender<RoutedApproval> {
             tokio::sync::mpsc::channel(1).0
         }
+    }
+
+    /// A turn that read the person's bank sends nothing on to another agent;
+    /// it may still see who there is.
+    #[tokio::test]
+    async fn a_turn_that_read_the_bank_sends_no_agent_message() {
+        let tool = AgentMessageTool::new(
+            Arc::new(NoAgents),
+            Arc::new(AgentInbox::new()),
+            "agent-a".to_string(),
+        );
+        let (sent, listed) = workforce_agent::personal::scoped(true, async {
+            let sent = tool
+                .execute(serde_json::json!({
+                    "action": "send", "to_agent": "agent-b", "content": "£12.30 at Tesco"
+                }))
+                .await
+                .unwrap();
+            let listed = tool
+                .execute(serde_json::json!({ "action": "list_agents" }))
+                .await
+                .unwrap();
+            (sent, listed)
+        })
+        .await;
+        assert!(!sent.success);
+        assert_eq!(sent.error.as_deref(), Some(PERSONAL_SENDS_NOTHING));
+        assert!(listed.success);
     }
 
     #[tokio::test]

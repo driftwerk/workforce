@@ -896,6 +896,15 @@ impl WorkflowTool {
             Ok(r) => r,
             Err(e) => return Ok(ToolResult::failure(e, elapsed())),
         };
+        // What a turn that read the person's bank saves stays theirs, for
+        // good: never team or global, and only where a store keeps the mark.
+        let banked = workforce_agent::personal::read();
+        if banked && visibility != workforce_core::access::Visibility::Private {
+            return Ok(ToolResult::failure(PERSONAL_STAYS_PRIVATE, elapsed()));
+        }
+        if banked && self.runtime.def_store().is_none() {
+            return Ok(ToolResult::failure(PERSONAL_KEPT_NOWHERE, elapsed()));
+        }
         match self
             .runtime
             .save_definition_source(
@@ -907,7 +916,8 @@ impl WorkflowTool {
                 workforce_orchestrator::workflow_store::EditContext::new(
                     "agent_tool",
                     grant.actor.as_deref(),
-                ),
+                )
+                .read_personal(banked),
             )
             .await
         {
@@ -1914,6 +1924,13 @@ only with `pause`, since a human is then the one choosing the outcome.
 10. Use `workflow { action: "get", workflow_id: "..." }` to retrieve and modify existing workflows
 "#;
 
+/// What a shared save is told in a turn that read the person's bank.
+pub(crate) const PERSONAL_STAYS_PRIVATE: &str = "A conversation that read the person's bank saves a workflow only for them: save it with `visibility: \"private\"`.";
+
+/// What a save is told in a turn that read the person's bank, on a hub with
+/// no definition store to keep it private for good.
+pub(crate) const PERSONAL_KEPT_NOWHERE: &str = "A conversation that read the person's bank saves no workflow on this hub: it has nowhere to keep it private to them for good.";
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -2795,6 +2812,99 @@ mod write_auth_tests {
             .as_deref()
             .unwrap_or_default()
             .contains("workflow_id"));
+    }
+
+    /// A workflow saved in a turn that read the bank is the person's for
+    /// good: a team or global save there is refused, a private one is
+    /// marked in its save, and no later save, share, grant or transfer
+    /// makes it anyone else's. With no store, nothing is saved there.
+    #[tokio::test]
+    async fn a_workflow_saved_in_a_bank_turn_is_never_shared_after() {
+        let (bare, dir) = fs_runtime().await;
+        let private = serde_json::json!({
+            "action": "save", "workflow_id": "demo",
+            "toml_content": DEMO, "visibility": "private",
+        });
+        let storeless = workforce_agent::personal::scoped(
+            true,
+            as_user("alice", tool(&bare, true).execute(private)),
+        )
+        .await
+        .unwrap();
+        assert_eq!(storeless.error.as_deref(), Some(PERSONAL_KEPT_NOWHERE));
+        assert!(!demo_file(&dir).exists());
+
+        workforce_postgres::test_support::with_test_pool(
+            WorkflowStore::build_pool,
+            |pool| async move {
+                let store = WorkflowStore::new(pool).await.expect("store");
+                let (runtime, _dir) = fs_runtime().await;
+                runtime.set_store(Arc::clone(&store));
+                let member = tool(&runtime, false);
+                let at = |visibility: &str| {
+                    serde_json::json!({
+                        "action": "save", "workflow_id": "demo",
+                        "toml_content": DEMO, "visibility": visibility,
+                    })
+                };
+                let member = &member;
+                let banked = move |input: serde_json::Value| {
+                    workforce_agent::personal::scoped(true, as_user("alice", member.execute(input)))
+                };
+                for visibility in ["team", "global"] {
+                    let refused = banked(at(visibility)).await.unwrap();
+                    assert_eq!(refused.error.as_deref(), Some(PERSONAL_STAYS_PRIVATE));
+                }
+                assert!(store
+                    .get("demo", "workflow", Some("alice"))
+                    .await
+                    .unwrap()
+                    .is_none());
+
+                let saved = banked(save(DEMO)).await.unwrap();
+                assert!(saved.success, "{saved:?}");
+                assert!(store
+                    .read_personal("workflow", "demo", Some("alice"))
+                    .await
+                    .unwrap());
+
+                let stays = workforce_orchestrator::workflow_store::READ_PERSONAL_STAYS_PRIVATE;
+                let later = as_user("alice", member.execute(at("team"))).await.unwrap();
+                assert!(
+                    later.error.as_deref().unwrap_or_default().contains(stays),
+                    "{later:?}"
+                );
+                let shared = store
+                    .set_visibility("workflow", "demo", "alice", Visibility::Global)
+                    .await
+                    .unwrap_err();
+                assert!(shared.to_string().contains(stays));
+                let granted = store
+                    .set_shares(
+                        "workflow",
+                        "demo",
+                        "alice",
+                        &[Grant::user("bob", GrantLevel::Run)],
+                        "alice",
+                    )
+                    .await
+                    .unwrap_err();
+                assert!(granted.to_string().contains(stays));
+                let handed = store
+                    .transfer(
+                        "workflow",
+                        "demo",
+                        "alice",
+                        "bob",
+                        workforce_core::access::OutgoingAccess::Nothing,
+                        "alice",
+                    )
+                    .await
+                    .expect_err("never handed on");
+                assert_eq!(handed.to_string(), stays);
+            },
+        )
+        .await;
     }
 
     /// With a store, a member deletes their own copy and the shared row

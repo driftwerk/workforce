@@ -69,6 +69,7 @@ pub const NAMESPACES: &[(&str, Namespace)] = &[
     ("linear", Namespace::Connector),
     ("jira", Namespace::Connector),
     ("datadog", Namespace::Connector),
+    ("bank", Namespace::Connector),
     ("metabase", Namespace::Connector),
     ("xero", Namespace::Connector),
     ("spotify", Namespace::Connector),

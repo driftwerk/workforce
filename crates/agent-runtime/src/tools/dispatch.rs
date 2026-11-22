@@ -846,8 +846,12 @@ pub async fn execute_gated(
         return ToolExecution::failed(tool_not_found_message(tool_name, tools));
     };
     let call_input = exec_input.unwrap_or_else(|| input.clone());
+    crate::personal::calling(tool_name);
     match execute_with_deadline(&tool, call_input).await {
         Ok(result) => {
+            if result.success {
+                crate::personal::answered(&result.output);
+            }
             let (output_text, is_error) = if result.success {
                 (
                     serde_json::to_string(&result.output).unwrap_or_else(|_| "{}".to_string()),

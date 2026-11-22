@@ -2277,3 +2277,119 @@ fn an_advisor_step_keeps_its_question_and_answer_with_secrets_hidden() {
     assert_eq!(last.question, format!("round {}", many.len() - 1));
     assert!(steps.iter().all(|s| s.advice_fits()));
 }
+
+#[test]
+fn a_turn_that_read_the_person_s_bank_is_never_remembered() {
+    use workforce_common::session::SessionMessage;
+    let read = |tool: &str| {
+        SessionMessage::tool(
+            tool,
+            &serde_json::json!({}),
+            &serde_json::json!({"data": "£12.30 at Tesco"}),
+            true,
+            1,
+            None,
+        )
+    };
+    assert!(super::extraction::read_personal(&[
+        read("linear.issue_get"),
+        read("bank.transactions")
+    ]));
+    assert!(!super::extraction::read_personal(&[read(
+        "linear.issue_get"
+    )]));
+    assert!(!super::extraction::read_personal(&[]));
+}
+
+/// A turn whose own flag says it read the bank (a call through a CLI
+/// engine's gate leaves no invocation) marks its session, asked in the turn.
+#[tokio::test]
+async fn a_turn_flagged_as_having_read_the_bank_marks_its_session() {
+    use std::sync::Arc;
+    use workforce_common::session::{InMemorySessionStore, SessionStore};
+    let store: Arc<dyn SessionStore> = Arc::new(InMemorySessionStore::new());
+    let mut session = Session::new("desk", "ann", "kat");
+    store.save(&session).unwrap();
+    workforce_agent::personal::scoped(false, async {
+        super::extraction::note_personal_read(&store, &mut session, &[]);
+        assert!(!session.read_personal());
+        workforce_agent::personal::scoped(false, async {
+            workforce_agent::personal::calling("bank.transactions");
+        })
+        .await;
+        super::extraction::note_personal_read(&store, &mut session, &[]);
+    })
+    .await;
+    assert!(session.read_personal());
+    assert!(store.get(&session.id).unwrap().unwrap().read_personal());
+}
+
+#[test]
+fn a_session_stays_marked_once_a_turn_read_the_bank_even_after_compaction() {
+    use std::sync::Arc;
+    use workforce_agent::runner::ToolInvocation;
+    use workforce_common::session::{InMemorySessionStore, SessionStore};
+    let call = |tool: &str, success: bool, output: serde_json::Value| ToolInvocation {
+        tool_name: tool.into(),
+        input: serde_json::json!({}),
+        output,
+        success,
+        policy_decision: "allow".into(),
+        duration_ms: 1,
+        denial_reason: None,
+        error: None,
+    };
+    let store: Arc<dyn SessionStore> = Arc::new(InMemorySessionStore::new());
+    let mut session = Session::new("desk", "ann", "kat");
+    store.save(&session).unwrap();
+
+    super::extraction::note_personal_read(
+        &store,
+        &mut session,
+        &[
+            call("linear.issue_get", true, serde_json::json!({})),
+            call("bank.accounts", false, serde_json::Value::Null),
+        ],
+    );
+    assert!(!session.read_personal(), "a refused bank call read nothing");
+    assert!(super::learns_from(&session));
+
+    super::extraction::note_personal_read(
+        &store,
+        &mut session,
+        &[call(
+            "bank.balances",
+            true,
+            serde_json::json!({"data": "£1"}),
+        )],
+    );
+    assert!(session.read_personal());
+    let mut compacted = store.get(&session.id).unwrap().unwrap();
+    assert!(compacted.read_personal(), "kept by its own patch");
+    compacted.messages.clear();
+    super::extraction::note_personal_read(&store, &mut compacted, &[]);
+    assert!(compacted.read_personal());
+    assert!(!super::extraction::digest_turn_admits(
+        &compacted, "ann", None
+    ));
+    assert!(
+        !super::learns_from(&compacted),
+        "know-how and turn extraction learn nothing of it"
+    );
+
+    let mut other = Session::new("desk", "ann", "kat");
+    store.save(&other).unwrap();
+    super::extraction::note_personal_read(
+        &store,
+        &mut other,
+        &[call(
+            "sessions",
+            true,
+            serde_json::json!({ workforce_common::session::PERSONAL_READ_KEY: true }),
+        )],
+    );
+    assert!(
+        other.read_personal(),
+        "reading a banked conversation back marks this one"
+    );
+}
