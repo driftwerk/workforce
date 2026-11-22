@@ -747,14 +747,15 @@ impl Desk {
     /// requests, as its boss's own close reads them.
     pub async fn closing(&self, id: Uuid) -> Result<Closing, DeskError> {
         let v = self.view(id)?;
+        let waits = v.pending.is_some()
+            || v.asked.is_some()
+            || matches!(v.state, SessionState::Asking | SessionState::Blocked);
         let work = match v.state {
-            _ if v.pending.is_some() || v.asked.is_some() => Some("it's waiting on you"),
-            SessionState::Asking | SessionState::Blocked => Some("it's waiting on you"),
+            _ if waits => Some("it's waiting on you"),
             SessionState::Starting | SessionState::Working => Some("it's working"),
             _ => None,
         };
-        let mut tickets = Vec::new();
-        for t in self
+        let open: Vec<_> = self
             .0
             .store
             .session_tickets(id)
@@ -762,9 +763,8 @@ impl Desk {
             .map_err(|e| DeskError::Internal(e.wrap_err("reading a session's tickets")))?
             .into_iter()
             .filter(|t| !matches!(t.state, TicketState::Done | TicketState::Dropped))
-        {
-            tickets.push(self.key_of(&t).await?);
-        }
+            .collect();
+        let tickets = futures::future::try_join_all(open.iter().map(|t| self.key_of(t))).await?;
         let known = Closing {
             folder: v.cwd.clone(),
             work: work.map(str::to_string),
@@ -775,6 +775,28 @@ impl Desk {
             Some(crew) => crew.closing(&v, known).await,
             None => known,
         })
+    }
+
+    /// Which of the sessions `ids` were closed or removed here: not one
+    /// open, and closed or no longer known to the store.
+    pub async fn closed_among(&self, ids: &[Uuid]) -> Result<Vec<Uuid>, DeskError> {
+        let mut closed = Vec::new();
+        for &id in ids {
+            let state = match self.view(id) {
+                Ok(v) => Some(v.state),
+                Err(_) => self
+                    .0
+                    .store
+                    .get(id)
+                    .await
+                    .map_err(|e| DeskError::Internal(e.wrap_err("reading a session")))?
+                    .map(|r| r.state),
+            };
+            if state.is_none_or(|s| s == SessionState::Closed) {
+                closed.push(id);
+            }
+        }
+        Ok(closed)
     }
 
     /// Ends a session: stops it if it runs here and closes it, so it leaves

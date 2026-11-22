@@ -251,6 +251,8 @@ impl DeskStore {
                  state_at = $11, updated_at = $12, external = $13, upstream_rank = $14, \
                  held_back = CASE WHEN $15::text IS NOT NULL THEN $15 \
                  WHEN $5 = 'todo' AND $7::jsonb IS NULL THEN held_back END, \
+                 session_closed_at = CASE WHEN assignee ->> 'id' = $7::jsonb ->> 'id' \
+                 THEN session_closed_at END, \
                  version = version + 1 \
                  WHERE id = $1 AND version = $2 RETURNING version",
                 &[
@@ -411,6 +413,22 @@ impl DeskStore {
     }
 
     /// The tickets assigned to the session `id`.
+    /// Says the session `session` (`machine/id` for one on a machine) was
+    /// closed or removed, or runs again when not `closed`, on the tickets
+    /// assigned to it: a closed one's hold no slot of their plan.
+    pub async fn close_session_tickets(&self, session: &str, closed: bool) -> Result<u64> {
+        let client = self.pool().get().await?;
+        Ok(client
+            .execute(
+                "UPDATE tickets SET session_closed_at = CASE WHEN $2 \
+                 THEN coalesce(session_closed_at, now()) END \
+                 WHERE assignee ->> 'kind' = 'session' AND assignee ->> 'id' = $1 \
+                 AND (session_closed_at IS NULL) = $2",
+                &[&session, &closed],
+            )
+            .await?)
+    }
+
     pub async fn session_tickets(&self, id: Uuid) -> Result<Vec<Ticket>> {
         self.tickets_where(
             "assignee ->> 'kind' = 'session' AND assignee ->> 'id' = $1",

@@ -172,7 +172,7 @@ fn progress_reads_and_writes_the_shape_desk_reads() {
     let p = progress(&[ticket(1, TicketState::Todo, &[])]);
     let v = serde_json::to_value(&p).unwrap();
     for field in [
-        "done", "doing", "review", "ready", "blocked", "waiting", "total", "next",
+        "done", "doing", "review", "ready", "blocked", "waiting", "total", "next", "holding",
     ] {
         assert!(v.get(field).is_some(), "{field} in {v}");
     }
@@ -1112,7 +1112,7 @@ fn over_the_limit_nothing_starts_until_it_drains() {
 
 /// The Mantis plan of 21 Nov: four at once, every ticket on devbox. Each
 /// session it holds keeps its slot whatever it is doing, or whatever was
-/// last seen of it, until it is seen closed.
+/// last seen of it, until it is closed or removed.
 fn on_devbox(n: u128, state: TicketState) -> PlanTicket {
     let mut t = ticket(n, state, &[]);
     t.machine = Some("devbox".into());
@@ -1137,19 +1137,28 @@ fn mantis() -> (Plan, Vec<PlanTicket>) {
 
 #[test]
 fn eighteen_sessions_on_a_machine_hold_eighteen_slots_whatever_was_seen_of_them() {
-    let (p, tickets) = mantis();
+    let (p, mut tickets) = mantis();
     // Nothing seen of them yet (a restart, devbox not answering), or each
     // seen working, idle or asking, or killed and so interrupted or
     // stopped: none is closed, and their tickets are still in Doing.
-    let held_now = held(&tickets, |_| false);
-    assert_eq!(held_now, 18);
-    assert!(next_starts(&p, &tickets, room(&p, held_now, 0, 12), None).is_empty());
+    assert_eq!(held(&tickets), 18);
+    assert!(next_starts(&p, &tickets, room(&p, 18, 0, 12), None).is_empty());
+    let line = full(&progress(&tickets), 4).unwrap();
+    assert!(line.starts_with("holds 18 of 4 sessions: ACM-1, ACM-2,"), "{line}");
     // Fifteen closed: one slot of four is free.
-    let closed: HashSet<String> = (1..=15).map(|n| format!("devbox/{}", u(100 + n))).collect();
-    let held_now = held(&tickets, |s| closed.contains(s));
-    assert_eq!(held_now, 3);
-    let starts = next_starts(&p, &tickets, room(&p, held_now, 0, 12), None);
+    for t in &mut tickets[..15] {
+        t.session = None;
+    }
+    assert_eq!(held(&tickets), 3);
+    let starts = next_starts(&p, &tickets, room(&p, 3, 0, 12), None);
     assert_eq!(starts.iter().map(|s| s.ticket).collect::<Vec<_>>(), [u(19)]);
+    assert_eq!(full(&progress(&tickets), 4), None);
+    // All eighteen closed: it starts four again.
+    for t in &mut tickets {
+        t.session = None;
+    }
+    assert_eq!(held(&tickets), 0);
+    assert_eq!(next_starts(&p, &tickets, room(&p, 0, 0, 12), None).len(), 4);
 }
 
 #[test]
@@ -1171,10 +1180,12 @@ fn a_plan_holds_its_review_sessions_and_unknown_starts_once_each_and_not_its_don
     let mut done = on_devbox(34, TicketState::Done);
     done.session = Some("devbox/done".into());
     tickets.extend([review, unsure, linked, twice, done]);
-    assert_eq!(held(&tickets, |_| false), 5);
-    // A linked start holds its slot even once its session is seen closed.
-    assert_eq!(held(&tickets, |s| s == "devbox/linked"), 5);
-    assert_eq!(held(&tickets, |s| s == "devbox/review"), 4);
+    let names: Vec<String> = holding(&tickets).iter().map(|t| t.name()).collect();
+    assert_eq!(names, ["ACM-1", "ACM-2", "ACM-30", "ACM-31", "ACM-32"]);
+    // A closed session's ticket holds nothing; a linked start still does.
+    tickets[2].session = None;
+    tickets[4].session = None;
+    assert_eq!(held(&tickets), 4);
 }
 
 #[test]

@@ -90,6 +90,10 @@ pub struct PlanTicketView {
     /// Why it waits in To do for someone to start it ([`Runs::held_back`]).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub held_back: Option<String>,
+    /// The session it is assigned to was closed or removed, so it holds no
+    /// slot of its plan ([`Runs::session_closed`]).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub session_closed: bool,
 }
 
 /// A plan in full: its tickets, its waves, and every revision.
@@ -454,6 +458,7 @@ impl Desk {
                     repo: r.repo,
                     adopted: r.adopted,
                     held_back: r.held_back,
+                    session_closed: r.session_closed,
                     ticket: v,
                 }
             })
@@ -810,6 +815,7 @@ impl Desk {
                 repo: t.repo.clone(),
                 adopted: t.adopted,
                 held_back: None,
+                session_closed: false,
             };
             if t.adopted {
                 // Only the needs it doesn't have already.
@@ -1483,6 +1489,7 @@ impl Desk {
                 repo: t.repo.clone(),
                 adopted: true,
                 held_back: None,
+                session_closed: false,
             };
             if let Err(e) = self.0.store.adopt_ticket(t.id, &runs).await {
                 self.unclaim(p, &claimed).await;
@@ -1526,6 +1533,7 @@ impl Desk {
                     repo: t.repo.clone(),
                     adopted: t.adopted,
                     held_back: None,
+                    session_closed: false,
                 },
                 was.is_none_or(|w| w.folder.trim().is_empty()),
             )
@@ -3152,7 +3160,7 @@ fn plan_ticket(
             .ticket
             .assignee
             .as_ref()
-            .filter(|a| a.kind == PartyKind::Session)
+            .filter(|a| a.kind == PartyKind::Session && !r.session_closed)
             .map(|a| a.id.clone()),
         starting,
         held_back: r.held_back,

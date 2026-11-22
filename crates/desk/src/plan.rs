@@ -1206,24 +1206,29 @@ pub struct Start {
     pub repo: Option<String>,
 }
 
-/// How many sessions `plan` holds: each one its tickets in Doing or Review
-/// are on until `closed` says it was, and each start of one under
-/// way or whose outcome isn't known yet, every session once.
-pub fn held(tickets: &[PlanTicket], closed: impl Fn(&str) -> bool) -> usize {
+/// The tickets of the sessions a plan holds, one each in order: every
+/// session its tickets in Doing or Review are on until it is closed or
+/// removed, and every start of one under way or whose outcome isn't known
+/// yet.
+pub fn holding(tickets: &[PlanTicket]) -> Vec<&PlanTicket> {
+    let mut seen = HashSet::new();
     tickets
         .iter()
-        .filter_map(|t| {
-            let on = t.session.as_deref().filter(|s| {
-                t.starting
-                    || (matches!(t.state, TicketState::Doing | TicketState::Review) && !closed(s))
+        .filter(|t| {
+            let on = t.session.as_deref().filter(|_| {
+                t.starting || matches!(t.state, TicketState::Doing | TicketState::Review)
             });
             match on {
-                Some(s) => Some(s.to_string()),
-                None => t.starting.then(|| t.id.to_string()),
+                Some(s) => seen.insert(s.to_string()),
+                None => t.starting && seen.insert(t.id.to_string()),
             }
         })
-        .collect::<HashSet<_>>()
-        .len()
+        .collect()
+}
+
+/// How many sessions a plan holds ([`holding`]).
+pub fn held(tickets: &[PlanTicket]) -> usize {
+    holding(tickets).len()
 }
 
 /// How many more sessions `plan` may start now: fewer than its own limit
@@ -1317,6 +1322,9 @@ pub struct Progress {
     pub total: usize,
     /// The tickets that start next as slots free, by key, in order.
     pub next: Vec<String>,
+    /// The tickets of the sessions it holds, one each ([`holding`]), by key.
+    #[serde(default)]
+    pub holding: Vec<String>,
 }
 
 /// Where `tickets`, a plan's, stand.
@@ -1350,7 +1358,19 @@ pub fn progress(tickets: &[PlanTicket]) -> Progress {
     }
     next.sort_by(|a, b| a.rank.total_cmp(&b.rank));
     p.next = next.iter().map(|t| t.name()).collect();
+    p.holding = holding(tickets).iter().map(|t| t.name()).collect();
     p
+}
+
+/// "holds 4 of 4 sessions: DES-1, DES-2, DES-3, DES-4", while `plan` holds
+/// as many sessions as it may run at once (`cap`): it starts no more until
+/// one of them is closed or its ticket moves on.
+pub fn full(p: &Progress, cap: usize) -> Option<String> {
+    let n = p.holding.len();
+    (cap > 0 && n >= cap).then(|| {
+        let sessions = if cap == 1 { "session" } else { "sessions" };
+        format!("holds {n} of {cap} {sessions}: {}", p.holding.join(", "))
+    })
 }
 
 /// Whether every one of a plan's tickets is Done or Dropped: its boss

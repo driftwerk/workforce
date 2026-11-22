@@ -1519,7 +1519,6 @@ impl Crew for CrewHub {
         self.move_boss_to(agent, to, replace).await
     }
 
-    /// The main overseer: over everything ungrouped.
     async fn closing(
         &self,
         v: &workforce_desk::model::SessionView,
@@ -1528,6 +1527,7 @@ impl Crew for CrewHub {
         self.what_closing_leaves(v, known).await
     }
 
+    /// The main overseer: over everything ungrouped.
     fn overseer(&self) -> Option<Overseer> {
         let (service, o) = self.overseer_for(&Scope::Ungrouped)?;
         Some(Overseer {

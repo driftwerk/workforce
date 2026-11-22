@@ -1598,24 +1598,13 @@ impl CrewHub {
             .count()
     }
 
-    /// Whether the session `assignee` (`machine/id` for one on a machine)
-    /// was closed, here or as its machine was last read: only that lets its
-    /// plan's slot go. One that ended on its own, was let go, is gone from
-    /// its machine or not read yet still holds it, until its ticket is
-    /// moved on or returned to the plan.
-    pub(super) fn closed(&self, assignee: &str) -> bool {
-        if super::relay::machine_session(assignee).is_some() {
-            return self
-                .machine_seen
-                .lock()
-                .get(assignee)
-                .is_some_and(|s| s.state == "closed");
+    /// Says on the tickets of `item`, a session on a machine, that it was
+    /// closed or removed there, or runs again when not `closed`: a closed
+    /// one's hold no slot of their plan.
+    async fn session_closed(&self, item: &str, closed: bool) {
+        if let Err(e) = self.desk.store().close_session_tickets(item, closed).await {
+            tracing::warn!(session = %item, error = format!("{e:#}"), "a machine session's close wasn't kept on its tickets");
         }
-        assignee
-            .parse::<Uuid>()
-            .ok()
-            .and_then(|id| self.desk.view(id).ok())
-            .is_some_and(|v| v.state == SessionState::Closed)
     }
 
     /// Reads each machine that open plans' tickets work on, at most once a
@@ -1737,13 +1726,23 @@ impl CrewHub {
                 read.insert(machine.clone(), Instant::now());
             }
             let (_, first, group, _) = &sessions[0];
+            // Those read there before: one no longer listed may have been
+            // closed or removed, which it says of them.
+            let ids: Vec<&str> = {
+                let seen = self.machine_seen.lock();
+                sessions
+                    .iter()
+                    .filter(|(item, ..)| seen.get(item).is_some_and(|s| s.state != "starting"))
+                    .filter_map(|(item, ..)| item.rsplit('/').next())
+                    .collect()
+            };
             let listed = self
                 .machine_call(
                     &machine,
                     group.as_deref(),
                     &first.boss,
                     "desk.sessions",
-                    json!({}),
+                    json!({ "ids": ids }),
                 )
                 .await;
             let listed: Vec<MachineSession> = match listed {
@@ -1822,6 +1821,12 @@ impl CrewHub {
                     ),
                     (None, Some(line)) => self.plan_failures.lock().push((fresh.plan, line)),
                     (None, None) => {}
+                }
+                if let Some(now) = now {
+                    let closed = now.state == "closed";
+                    if was.as_ref().map_or(closed, |w| (w.state == "closed") != closed) {
+                        self.session_closed(&item, closed).await;
+                    }
                 }
                 let mut next = was.unwrap_or(fresh);
                 match now {
@@ -1965,7 +1970,7 @@ impl CrewHub {
                 let busy = self.desk.charges_busy(&boss.id)
                     + self.desk.starts_under_way(&boss.id).await
                     + self.machine_busy(&boss.id);
-                let held = plan::held(&tickets, |s| self.closed(s));
+                let held = plan::held(&tickets);
                 let room = plan::room(&p, held, busy, limit);
                 for s in plan::next_starts(&p, &rows, room, standing) {
                     match self.desk.plan_start(&p, &s, &boss, &by).await {
@@ -2208,28 +2213,37 @@ impl CrewHub {
             .map(|t| (t.ticket.ticket.id, t.ticket.ticket.updated_at.to_rfc3339()))
             .collect();
         let revision = p.approved_revision.unwrap_or(p.revision);
-        let suggested: HashSet<String> = made
+        let ticket_of = |s: &crew::Suggestion| s.action["input"]["ticket_id"].as_str().map(str::to_string);
+        // An open suggestion is as good as starting; one taken or dismissed
+        // for this revision of the ticket isn't suggested again, but holds
+        // no slot.
+        let (open, settled): (Vec<_>, Vec<_>) = made
             .iter()
+            .partition(|s| s.state == crew::SuggestionState::Open);
+        let open: HashSet<String> = open.into_iter().filter_map(ticket_of).collect();
+        let settled: HashSet<String> = settled
+            .into_iter()
             .filter(|s| {
                 let i = &s.action["input"];
-                s.state == crew::SuggestionState::Open
-                    || (i["plan_id"].as_str() == Some(&p.id.to_string())
-                        && i["plan_revision"].as_i64() == Some(i64::from(revision))
-                        && i["ticket_id"]
-                            .as_str()
-                            .and_then(|t| t.parse::<Uuid>().ok())
-                            .and_then(|t| at.get(&t))
-                            .is_some_and(|now| i["ticket_at"].as_str() == Some(now.as_str())))
+                i["plan_id"].as_str() == Some(&p.id.to_string())
+                    && i["plan_revision"].as_i64() == Some(i64::from(revision))
+                    && i["ticket_id"]
+                        .as_str()
+                        .and_then(|t| t.parse::<Uuid>().ok())
+                        .and_then(|t| at.get(&t))
+                        .is_some_and(|now| i["ticket_at"].as_str() == Some(now.as_str()))
             })
-            .filter_map(|s| s.action["input"]["ticket_id"].as_str().map(str::to_string))
+            .filter_map(ticket_of)
             .collect();
-        let mut rows = tickets.to_vec();
-        // A ticket already suggested is as good as starting.
-        for t in &mut rows {
-            if suggested.contains(&t.id.to_string()) {
+        let mark = |rows: &mut [PlanTicket], these: &HashSet<String>| {
+            for t in rows.iter_mut().filter(|t| these.contains(&t.id.to_string())) {
                 t.starting = true;
             }
-        }
+        };
+        let mut rows = tickets.to_vec();
+        mark(&mut rows, &open);
+        let held = plan::held(&rows);
+        mark(&mut rows, &settled);
         let opened = self
             .desk
             .store()
@@ -2237,7 +2251,6 @@ impl CrewHub {
             .await
             .map_or(0, |n| usize::try_from(n).unwrap_or(usize::MAX));
         let busy = self.desk.charges_busy(boss) + opened;
-        let held = plan::held(&rows, |s| self.closed(s));
         let room = plan::room(p, held, busy, o.work.parallel as usize);
         let by = self.by_boss(
             service,
@@ -2530,7 +2543,7 @@ impl CrewHub {
         let said: Vec<String> = lines.iter().map(|l| format!("- {l}")).collect();
         let progress = &detail.summary.progress;
         let stands = format!(
-            "{} of {} done · {} doing · {} in review · {} ready{}",
+            "{} of {} done · {} doing · {} in review · {} ready{}{}",
             progress.done,
             progress.total,
             progress.doing,
@@ -2539,7 +2552,10 @@ impl CrewHub {
             match progress.next.is_empty() {
                 true => String::new(),
                 false => format!(" · next {}", progress.next.join(", ")),
-            }
+            },
+            plan::full(progress, p.limit(o.work.parallel as usize))
+                .map(|f| format!(" · {f}: it starts no more until one is closed or its ticket moves on"))
+                .unwrap_or_default()
         );
         let then = match closing {
             true => "Every ticket is done or dropped. Write the person a short closing summary: what was done, what was dropped and why, and anything left for them. Your reply is posted in your DM.".to_string(),

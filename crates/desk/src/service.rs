@@ -1056,6 +1056,9 @@ enum Persist {
     Terminal(Box<TerminalRecord>),
     DeleteTerminal(Uuid),
     Put(Box<SessionRecord>),
+    /// A session was closed, or runs again when not: its tickets say so
+    /// ([`DeskStore::close_session_tickets`]).
+    Closed(Uuid, bool),
     Attention(Uuid, DateTime<Utc>),
     /// Sessions forgotten with all Activity says of them and how far they
     /// were read, and the CLI sessions of those removed hidden, in one
@@ -2604,6 +2607,10 @@ impl Desk {
             });
         }
         let _ = self.0.persist.send(Persist::Put(Box::new(r)));
+        let closed = view.state == SessionState::Closed;
+        if closed != before.as_ref().is_some_and(|b| b.state == SessionState::Closed) {
+            let _ = self.0.persist.send(Persist::Closed(id, closed));
+        }
         if noticed {
             let _ = self.0.persist.send(Persist::Attention(id, view.updated_at));
         }
@@ -8579,6 +8586,10 @@ async fn persist_loop(
                 }
                 put
             }
+            Persist::Closed(id, closed) => store
+                .close_session_tickets(&id.to_string(), closed)
+                .await
+                .map(drop),
             Persist::Attention(id, at) => store.set_attention(id, at).await,
             Persist::Forget {
                 ids,

@@ -2535,3 +2535,65 @@ async fn a_ticket_of_a_repository_here_may_name_a_folder_desk_clones_into_but_ne
     })
     .await;
 }
+
+/// A plan's ticket holds its slot until its session is closed or removed,
+/// and its close is kept on the ticket: a restart, which doesn't load
+/// closed sessions, frees it no less; one reopened holds it again.
+#[tokio::test]
+async fn a_closed_or_removed_session_frees_its_plans_slot_and_a_restart_keeps_it_free() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(pool.clone(), dir.path()).await;
+        let p = d
+            .propose_plan(
+                new_plan(dir.path(), &[("a", &[]), ("b", &[])]),
+                &sarah(),
+                &by_sarah(),
+            )
+            .await
+            .unwrap();
+        let id = p.summary.plan.id;
+        let p = d.approve_plan(id, 1, &By::you()).await.unwrap();
+        let plan = p.summary.plan.clone();
+        let mut sessions = Vec::new();
+        for t in &p.tickets {
+            let start = Start {
+                repo: None,
+                ticket: t.ticket.ticket.id,
+                engine: Engine::Claude,
+                folder: dir.path().to_string_lossy().into_owned(),
+                view: None,
+                worktree: false,
+            };
+            sessions.push(d.plan_start(&plan, &start, &sarah(), &by_sarah()).await.unwrap().id);
+        }
+        let held = async |d: &crate::Desk| crate::plan::held(&d.plan_tickets(id).await.unwrap());
+        assert_eq!(held(&d).await, 2);
+        d.end(sessions[0], Some(By::you())).await.unwrap();
+        d.persisted().await;
+        assert_eq!(held(&d).await, 1, "closed");
+        let again = desk(pool.clone(), dir.path()).await;
+        assert_eq!(held(&again).await, 1, "still closed after a restart");
+        // Reopened: its ticket holds its slot again.
+        let r = again.0.store.get(sessions[0]).await.unwrap().unwrap();
+        again.save(crate::model::SessionRecord {
+            state: SessionState::Stopped,
+            ..r
+        });
+        again.persisted().await;
+        assert_eq!(held(&again).await, 2, "running again");
+        // Closed and removed: its ticket is no one's.
+        again.end(sessions[1], Some(By::you())).await.unwrap();
+        again.remove_closed(sessions[1]).await.unwrap();
+        again.persisted().await;
+        assert_eq!(held(&again).await, 1, "removed");
+        let gone = sessions[1].to_string();
+        assert!(again
+            .plan_tickets(id)
+            .await
+            .unwrap()
+            .iter()
+            .all(|t| t.session.as_deref() != Some(gone.as_str())));
+    })
+    .await;
+}
