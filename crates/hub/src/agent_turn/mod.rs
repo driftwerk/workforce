@@ -674,11 +674,17 @@ impl TurnChain {
             }),
         )
         .await;
-        let routes = Box::pin(workforce_agent::runner::with_guard_keeper(
-            Some(keeps),
-            workforce_agent::runner::with_content_guard(
-                Some(Arc::clone(&guard)),
-                self.run_routes(service, turn),
+        // A conversation that read the person's bank keeps nothing of any
+        // turn of it ([`workforce_agent::personal`]), from its first call.
+        let read_personal = turn.session.read_personal();
+        let routes = Box::pin(workforce_agent::personal::scoped(
+            read_personal,
+            workforce_agent::runner::with_guard_keeper(
+                Some(keeps),
+                workforce_agent::runner::with_content_guard(
+                    Some(Arc::clone(&guard)),
+                    self.run_routes(service, turn),
+                ),
             ),
         ));
         // A person's own route alone: what the turn finds missing or tells

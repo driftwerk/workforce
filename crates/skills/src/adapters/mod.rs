@@ -13,6 +13,9 @@ pub mod jira;
 #[cfg(feature = "datadog")]
 pub mod datadog;
 
+#[cfg(feature = "bank")]
+pub mod bank;
+
 #[cfg(feature = "metabase")]
 pub mod metabase;
 

@@ -22,6 +22,59 @@ pub(crate) fn digest_turn_admits(
     personalizes_prompt(user)
         && !is_automated_source(user)
         && prompt_visibility(session, channel_id).is_private()
+        && !session.read_personal()
+}
+
+/// Mark `session`, for good, once a turn of it read a personal connector
+/// (the person's bank): a call of `invocations` did, or a tool message it
+/// still holds did (a turn that ended before it settled), or the turn's own
+/// flag says so (a call through a CLI engine's gate, a session it read
+/// back), asked inside the turn's scope. Kept by a patch,
+/// so no other writer's save of the session drops it.
+pub(crate) fn note_personal_read(
+    sessions: &std::sync::Arc<dyn workforce_common::session::SessionStore>,
+    session: &mut workforce_common::session::Session,
+    invocations: &[workforce_agent::runner::ToolInvocation],
+) {
+    let read = workforce_agent::personal::read()
+        || invocations.iter().any(reads_personal)
+        || read_personal(&session.messages);
+    if session.read_personal() || !read {
+        return;
+    }
+    session.mark_read_personal();
+    let patch = serde_json::Map::from_iter([(
+        workforce_common::session::PERSONAL_READ_KEY.to_string(),
+        serde_json::Value::Bool(true),
+    )]);
+    if let Err(e) = sessions.merge_metadata(&session.id, patch, &[]) {
+        tracing::warn!(error = %e, session_id = %session.id, "a session that read the person's bank wasn't marked");
+    }
+}
+
+/// Whether `call` brought a personal connector's data into the turn: one of
+/// its tools that answered, or `sessions` reading back a conversation that
+/// had.
+fn reads_personal(call: &workforce_agent::runner::ToolInvocation) -> bool {
+    call.success
+        && (workforce_common::connector_binding::is_personal(&call.tool_name)
+            || call
+                .output
+                .get(workforce_common::session::PERSONAL_READ_KEY)
+                .is_some_and(|v| v == true))
+}
+
+/// Whether `messages` hold what a personal connector (the person's bank)
+/// read: nothing of them is remembered or digested.
+pub(crate) fn read_personal(messages: &[workforce_common::session::SessionMessage]) -> bool {
+    messages.iter().any(|m| {
+        matches!(m.role, workforce_common::session::MessageRole::Tool)
+            && m.tool_data
+                .as_ref()
+                .and_then(|d| d.get("name"))
+                .and_then(|n| n.as_str())
+                .is_some_and(workforce_common::connector_binding::is_personal)
+    })
 }
 
 /// Decide whether a completed turn should run passive-memory extraction and/or

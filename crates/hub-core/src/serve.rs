@@ -159,8 +159,9 @@ pub fn select_visible_other_sessions<'a>(
         .filter(|s| s.owner == current_owner)
         .filter(|s| s.message_count() > 0)
         .filter(|s| s.updated_at > cutoff)
-        // A boss's talk in a group it has left stays with that group.
-        .filter(|s| !s.kept_apart())
+        // A boss's talk in a group it has left stays with that group, and
+        // what the person's bank said stays where it was read.
+        .filter(|s| !s.kept_apart() && !s.read_personal())
         .collect()
 }
 
@@ -4752,6 +4753,16 @@ pub mod tests {
             visible.iter().map(|s| s.id.clone()).collect::<Vec<_>>(),
             [kept.id]
         );
+    }
+
+    #[test]
+    fn a_session_that_read_the_person_s_bank_is_never_another_sessions_context() {
+        let cutoff = chrono::Utc::now() - chrono::Duration::hours(1);
+        let mut banked = Session::new("desk", "kings", "kat");
+        banked.add_user_message("balances", None);
+        banked.mark_read_personal();
+        let pool = vec![banked];
+        assert!(select_visible_other_sessions(&pool, "none", "kings", cutoff).is_empty());
     }
 
     fn make_session(owner: &str, age_minutes: i64, message_count: usize) -> Session {
