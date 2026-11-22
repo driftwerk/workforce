@@ -172,6 +172,12 @@ const CLAIMS: &[(&str, &str, &str, Claim)] = &[
     ),
     (
         "desk",
+        "access_on_its_own",
+        "scope",
+        NotPersonal("what an agent's level covers: a whole kind of action, or one folder, host or site"),
+    ),
+    (
+        "desk",
         "boss_grants",
         "members",
         NotPersonal("this engine's sessions in a bossed group, by session id, never a person's"),
