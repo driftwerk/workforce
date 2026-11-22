@@ -239,14 +239,18 @@ async fn a_prompt_only_the_terminal_answers_is_cleared_and_asked_again_in_desk()
             "{}",
             message.text
         );
-        let interrupted = d
-            .activity(workforce_desk::crew::Filter::All, None, 100)
-            .await
-            .unwrap()
-            .events
-            .into_iter()
-            .any(|e| e.kind == workforce_desk::crew::Kind::Interrupted);
-        assert!(interrupted, "Esc was pressed, as a decision of the boss");
+        // Esc was pressed, as a decision of the boss: recorded as it is
+        // sent, not before the session is told.
+        eventually("the Esc to be recorded", async || {
+            d.activity(workforce_desk::crew::Filter::All, None, 100)
+                .await
+                .unwrap()
+                .events
+                .into_iter()
+                .any(|e| e.kind == workforce_desk::crew::Kind::Interrupted)
+                .then_some(())
+        })
+        .await;
         assert_eq!(said(&overseer, &["answer it there"]), 0);
         assert_eq!(
             said(&overseer, &["waiting on you"]),
