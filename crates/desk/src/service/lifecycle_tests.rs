@@ -1,8 +1,11 @@
 //! Tests of a session's life after its work: ending, removing, clearing,
 //! and the CLI sessions removed from Desk that adoption leaves alone.
 
-use super::tests::{desk, fake_cli, found, kept_until, logged_desk, logs, new_session, Logged};
+use super::tests::{
+    desk, fake_cli, found, kept_until, logged_desk, logs, new_session, post, Logged,
+};
 use super::*;
+use crate::board::TicketState;
 use crate::store::{build_pool, tests::record_fixture};
 use workforce_postgres::test_support::with_test_pool;
 
@@ -430,6 +433,91 @@ async fn a_boss_never_ends_a_session_it_didnt_start_and_wasnt_handed() {
         assert!(!d.may_end(s.id, Some(&boss)));
         assert!(!d.may_end(s.id, None));
         assert!(d.may_end(s.id, Some(&By::you())));
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn what_closing_leaves_says_its_folder_its_turn_and_its_open_tickets() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(pool, dir.path()).await;
+        let s = new_session(&d, dir.path()).await;
+        let b = d
+            .create_board(super::NewBoard {
+                name: "Auth".into(),
+                group: None,
+                prefix: Some("AUT".into()),
+            })
+            .await
+            .unwrap();
+        let mut keys = Vec::new();
+        for (title, state) in [
+            ("Fix the token refresh", TicketState::Doing),
+            ("Ship it", TicketState::Done),
+        ] {
+            let t = d
+                .create_ticket(
+                    super::NewTicket {
+                        board: b.id,
+                        title: title.into(),
+                        body: String::new(),
+                        state: None,
+                        needs: vec![],
+                    },
+                    &By::you(),
+                )
+                .await
+                .unwrap();
+            d.assign_ticket(
+                t.ticket.id,
+                Some(super::AssignTo::Session(s.id)),
+                &By::you(),
+            )
+            .await
+            .unwrap();
+            d.move_ticket(
+                t.ticket.id,
+                super::Move {
+                    state,
+                    before: None,
+                    after: None,
+                },
+                &By::you(),
+            )
+            .await
+            .unwrap();
+            keys.push(t.key.unwrap());
+        }
+        post(
+            &d,
+            s.id,
+            serde_json::json!({"hook_event_name": "SessionStart", "session_id": "cc-1"}),
+        )
+        .await;
+        let c = d.closing(s.id).await.unwrap();
+        assert_eq!(c.folder, s.cwd);
+        assert_eq!(c.tickets, [keys[0].clone()], "only the open one");
+        assert_eq!(c.work, None, "at rest");
+        assert_eq!(
+            (c.changes, c.pulls),
+            (None, vec![]),
+            "no hub crew reads them here"
+        );
+        post(
+            &d,
+            s.id,
+            serde_json::json!({"hook_event_name": "UserPromptSubmit", "prompt": "run the tests"}),
+        )
+        .await;
+        assert_eq!(
+            d.closing(s.id).await.unwrap().work.as_deref(),
+            Some("it's working")
+        );
+        assert!(matches!(
+            d.closing(Uuid::new_v4()).await,
+            Err(DeskError::NotFound)
+        ));
     })
     .await;
 }
