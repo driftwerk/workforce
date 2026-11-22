@@ -139,6 +139,30 @@ impl Asks {
     }
 }
 
+/// The names a command sets for the commands after it: an assignment on
+/// its own (`X=1;`), or `export`, `declare`, `typeset`, `readonly`,
+/// `local`.
+fn sets(simple: &Simple) -> Vec<String> {
+    let name = |w: &Word| w.text.split_once('=').map_or(w.text.clone(), |(n, _)| n.to_string());
+    let declares = simple.words.first().is_some_and(|w| {
+        matches!(
+            w.text.as_str(),
+            "export" | "declare" | "typeset" | "readonly" | "local"
+        )
+    });
+    match declares {
+        true => simple.words[1..]
+            .iter()
+            .filter(|w| !is_option(w))
+            .map(name)
+            .collect(),
+        false if simple.words.iter().all(is_assignment) => {
+            simple.words.iter().map(name).collect()
+        }
+        false => Vec::new(),
+    }
+}
+
 /// Where a command's paths are read from, and what counts as its own folder.
 pub struct Place<'a> {
     pub cwd: Option<PathBuf>,
@@ -151,6 +175,8 @@ pub struct Place<'a> {
     /// know): what isn't there yet may be one by the time a later command
     /// runs.
     later: bool,
+    /// What an earlier command of the line set in the environment.
+    set: Vec<String>,
 }
 
 /// `path` as the disk spells it: the folders holding it canonicalized (the
@@ -195,6 +221,7 @@ impl<'a> Place<'a> {
             scratch,
             home,
             later: false,
+            set: Vec::new(),
         }
     }
 }
@@ -284,10 +311,112 @@ impl Place<'_> {
         }
     }
 
+    /// Whether `word`, which can't be resolved, could name a path in the
+    /// person's home: anything expanded or matched as it runs, `~`, `..`,
+    /// a relative path with no known cwd, or one spelled under the home.
+    fn could_be_home(&self, word: &Word) -> bool {
+        let text = word.text.as_str();
+        if word.dynamic || word.brace || word.glob || text.starts_with('~') || text.contains("..")
+        {
+            return true;
+        }
+        let path = match (Path::new(text).is_absolute(), self.cwd.as_ref()) {
+            (true, _) => PathBuf::from(text),
+            (false, Some(cwd)) => cwd.join(text),
+            (false, None) => return true,
+        };
+        let folded = |p: &Path| p.to_string_lossy().to_lowercase();
+        folded(&path).starts_with(&folded(self.home))
+    }
+
+    /// The `targets` that can't be told until the command runs.
+    fn unresolved<'w>(&self, targets: &[&'w Word]) -> Vec<&'w Word> {
+        targets
+            .iter()
+            .copied()
+            .filter(|t| self.made_later(t) || self.resolve(t).is_none())
+            .collect()
+    }
+
+    /// What writing to `targets` that can't be told until it runs asks: the
+    /// computer's own when one could be in the person's home, else that it
+    /// can't be told.
+    fn lost(&self, targets: &[&Word]) -> Asks {
+        match targets.iter().any(|t| self.could_be_home(t)) {
+            true => Asks::System,
+            false => Asks::ForGood,
+        }
+    }
+
+    /// What deleting what isn't wanted under `folder` asks (`rsync
+    /// --delete`, `find -delete`): what goes can't be told until it runs,
+    /// so outside the own folder and scratch it is for good.
+    fn clears(&self, folder: &Word) -> Option<Asks> {
+        if self.made_later(folder) {
+            return Some(self.lost(&[folder]));
+        }
+        match self.resolve(folder) {
+            Some(p) if self.deletable(&p) => None,
+            Some(p) => Some(self.kept(std::slice::from_ref(&p)).unwrap_or(Asks::ForGood)),
+            None => Some(self.lost(&[folder])),
+        }
+    }
+
+    /// What unpacking into `dest` (the cwd when `None`) asks: what an
+    /// archive holds can't be told, so into the home itself or what the
+    /// person keeps there it is the computer's own, and anywhere else
+    /// outside the own folder and scratch it is for good.
+    fn extracts(&self, dest: Option<&Word>) -> Option<Asks> {
+        let to = match dest {
+            Some(d) if self.made_later(d) => return Some(self.lost(&[d])),
+            Some(d) => match self.resolve(d) {
+                Some(p) => p,
+                None => return Some(self.lost(&[d])),
+            },
+            None => match self.cwd.clone() {
+                Some(cwd) => cwd,
+                None => return Some(Asks::System),
+            },
+        };
+        match self.deletable(&to) {
+            true => None,
+            false => Some(self.kept(std::slice::from_ref(&to)).unwrap_or(Asks::ForGood)),
+        }
+    }
+
+    /// What linking at `dest` (or, into a folder, at each source's name in
+    /// it) asks when nothing is written over: only that one is kept in the
+    /// home, or can't be told.
+    fn links_onto(&self, dest: &Word, sources: &[&Word]) -> Option<Asks> {
+        if !self.unresolved(&[dest]).is_empty() {
+            return Some(self.lost(&[dest]));
+        }
+        let to = self.resolve(dest)?;
+        let at: Vec<PathBuf> = match to.is_dir() {
+            true => std::iter::once(to.clone())
+                .chain(
+                    sources
+                        .iter()
+                        .filter_map(|s| Path::new(s.text.trim_end_matches('/')).file_name())
+                        .map(|n| to.join(n)),
+                )
+                .collect(),
+            false => vec![to],
+        };
+        self.kept(&at)
+    }
+
     /// What writing over `targets` asks: as a delete, but a new file
     /// outside the folder (none there yet) is made, not lost.
     fn overwrites(&self, targets: &[&Word], unknown: bool) -> Option<Asks> {
-        match self.outside(targets, unknown, Self::resolve) {
+        if unknown {
+            return Some(Asks::ForGood);
+        }
+        let lost = self.unresolved(targets);
+        if !lost.is_empty() {
+            return Some(self.lost(&lost));
+        }
+        match self.outside(targets, false, Self::resolve) {
             None => Some(Asks::ForGood),
             Some(outside) => self.kept(&outside).or_else(|| {
                 let over: Vec<PathBuf> = outside
@@ -299,8 +428,13 @@ impl Place<'_> {
         }
     }
 
-    /// What adding to `targets` asks: only that one is kept in the home.
+    /// What adding to `targets` asks: only that one is kept in the home,
+    /// or can't be told until it runs.
     fn appends(&self, targets: &[&Word]) -> Option<Asks> {
+        let lost = self.unresolved(targets);
+        if !lost.is_empty() {
+            return Some(self.lost(&lost));
+        }
         let found: Vec<PathBuf> = targets.iter().filter_map(|t| self.resolve(t)).collect();
         self.kept(&found)
     }
@@ -308,13 +442,14 @@ impl Place<'_> {
     /// What copying `sources` onto `dest` writes over: the file there, or,
     /// into a folder, the file of each source's name in it.
     fn copies_onto(&self, dest: &Word, sources: &[&Word], unknown: bool) -> Option<Asks> {
-        if unknown || self.made_later(dest) {
+        if unknown {
             return Some(Asks::ForGood);
         }
-        let Some(to) = self.resolve(dest) else {
-            return Some(Asks::ForGood);
-        };
-        if let Some(system) = self.kept(std::slice::from_ref(&to)) {
+        if !self.unresolved(&[dest]).is_empty() {
+            return Some(self.lost(&[dest]));
+        }
+        let to = self.resolve(dest)?;
+        if let Some(system) = self.links_onto(dest, sources) {
             return Some(system);
         }
         if self.deletable(&to) {
@@ -432,7 +567,11 @@ pub fn always_asks(command: &str, place: &Place<'_>) -> Option<Asks> {
         Err(()) => return Some(Asks::Unclear),
     };
     // Each command's paths are read where the `cd`s before it left it.
-    let mut here = Place::new(place.cwd.clone(), place.own, place.scratch, place.home);
+    let mut here = Place {
+        cwd: place.cwd.clone(),
+        set: place.set.clone(),
+        ..*place
+    };
     let mut moved = false;
     let mut found: Option<Asks> = None;
     let mut add = |asks: Asks| {
@@ -494,42 +633,169 @@ pub fn always_asks(command: &str, place: &Place<'_>) -> Option<Asks> {
             add(asks);
         }
         here.later |= makes_links(simple);
+        here.set.extend(sets(simple));
     }
     found
 }
 
-/// Where the command a wrapper (`nohup`, `env X=1`, `timeout 10`, `nice
-/// -n 5`, …) runs starts in its `args`; `None` when `name` wraps nothing
-/// or names no command after its own options.
-fn wrapped(name: &str, args: &[&Word]) -> Option<usize> {
-    match name {
-        "exec" | "command" | "builtin" | "nohup" | "time" | "caffeinate" => {
-            Some(args.iter().take_while(|w| is_option(w)).count())
+/// A program's short options: the letters taken alone, and those taking a
+/// value (joined, `-p22`, or the next word).
+struct Short {
+    flags: &'static str,
+    valued: &'static str,
+}
+
+/// Options read from a call, each named as given (`-o`, `--rsh`) with its
+/// value, and the operands.
+type Read<'w> = (Vec<(String, Option<Word>)>, Vec<&'w Word>);
+
+/// `args` read as getopt reads them with `short`'s letters: clusters
+/// (`-4o`) letter by letter, a value joined (`-oX`) or the next word's.
+/// `long` says whether a `--name` takes a value, `None` for one it doesn't
+/// know. Options may still come after `mixed` operands (`0` stops at the
+/// first, as POSIX does; `usize::MAX` mixes them, as GNU and popt do), and
+/// end at `--`. `Err` for an option it doesn't know, a value missing, or a
+/// word expanded at run time where an option may stand.
+fn getopt<'w>(
+    args: &[&'w Word],
+    short: &Short,
+    long: impl Fn(&str) -> Option<bool>,
+    mixed: usize,
+) -> Result<Read<'w>, ()> {
+    let mut given = Vec::new();
+    let mut operands = Vec::new();
+    let mut ended = false;
+    let mut i = 0;
+    while let Some(w) = args.get(i) {
+        i += 1;
+        let t = w.text.as_str();
+        let open = !ended && operands.len() <= mixed;
+        if open && w.dynamic {
+            return Err(());
         }
-        "nice" | "timeout" | "stdbuf" | "env" => {
-            let mut j = 0;
-            while let Some(w) = args.get(j) {
-                let t = w.text.as_str();
-                if is_assignment(w) && name == "env" {
-                    j += 1;
-                } else if is_option(w) {
-                    let takes = matches!(
-                        (name, t),
-                        ("nice", "-n") | ("env", "-u" | "-C" | "-S") | ("timeout", "-s" | "-k")
-                    ) || (name == "stdbuf" && t.len() == 2);
-                    j += if takes { 2 } else { 1 };
-                } else if name == "timeout" && j == args.iter().take_while(|w| is_option(w)).count()
-                {
-                    j += 1;
-                    break;
-                } else {
-                    break;
-                }
+        if !open || !t.starts_with('-') || t == "-" {
+            operands.push(*w);
+            continue;
+        }
+        if t == "--" {
+            ended = true;
+            continue;
+        }
+        let mut next = || {
+            let value = args.get(i).copied().cloned().ok_or(());
+            i += 1;
+            value
+        };
+        if let Some(name) = t.strip_prefix("--") {
+            let (name, joined) = match name.split_once('=') {
+                Some((n, v)) => (n, Some(v)),
+                None => (name, None),
+            };
+            let value = match (long(name).ok_or(())?, joined) {
+                (true, Some(v)) => Some(Word {
+                    text: v.to_string(),
+                    ..(*w).clone()
+                }),
+                (true, None) => Some(next()?),
+                (false, Some(_)) => return Err(()),
+                (false, None) => None,
+            };
+            given.push((format!("--{name}"), value));
+            continue;
+        }
+        let letters: Vec<char> = t[1..].chars().collect();
+        for (at, c) in letters.iter().enumerate() {
+            if short.valued.contains(*c) {
+                let rest: String = letters[at + 1..].iter().collect();
+                let value = match rest.is_empty() {
+                    true => next()?,
+                    false => Word {
+                        text: rest,
+                        ..(*w).clone()
+                    },
+                };
+                given.push((format!("-{c}"), Some(value)));
+                break;
             }
-            args.get(j).map(|_| j)
+            if !short.flags.contains(*c) {
+                return Err(());
+            }
+            given.push((format!("-{c}"), None));
         }
-        _ => None,
     }
+    Ok((given, operands))
+}
+
+/// No long options.
+fn no_long(_: &str) -> Option<bool> {
+    None
+}
+
+/// Where the command a wrapper (`nohup`, `env X=1`, `timeout 10`, `nice
+/// -n 5`, …) runs starts in its `args`, read with the wrapper's own
+/// options; `None` when `name` wraps nothing, `Some(Err)` for an option it
+/// doesn't know or one that runs the command elsewhere (`env -C`, `env
+/// -P`, `time -o`).
+fn wrapped(name: &str, args: &[&Word]) -> Option<Result<usize, ()>> {
+    let (short, long, before): (Short, fn(&str) -> Option<bool>, usize) = match name {
+        "exec" => (Short { flags: "cl", valued: "a" }, no_long, 0),
+        "command" => (Short { flags: "pvV", valued: "" }, no_long, 0),
+        "builtin" | "nohup" => (Short { flags: "", valued: "" }, no_long, 0),
+        "time" => (
+            Short { flags: "pvaq", valued: "f" },
+            |n| match n {
+                "portability" | "verbose" | "quiet" | "append" => Some(false),
+                "format" => Some(true),
+                _ => None,
+            },
+            0,
+        ),
+        "caffeinate" => (Short { flags: "dimsu", valued: "tw" }, no_long, 0),
+        "nice" => (
+            Short { flags: "0123456789", valued: "n" },
+            |n| (n == "adjustment").then_some(true),
+            0,
+        ),
+        "timeout" => (
+            Short { flags: "v", valued: "ks" },
+            |n| match n {
+                "foreground" | "preserve-status" | "verbose" => Some(false),
+                "kill-after" | "signal" => Some(true),
+                _ => None,
+            },
+            1,
+        ),
+        "stdbuf" => (
+            Short { flags: "", valued: "ioe" },
+            |n| matches!(n, "input" | "output" | "error").then_some(true),
+            0,
+        ),
+        "env" => (
+            Short { flags: "i0v", valued: "u" },
+            |n| match n {
+                "ignore-environment" | "null" | "debug" => Some(false),
+                "unset" => Some(true),
+                _ => None,
+            },
+            0,
+        ),
+        "ionice" => (Short { flags: "t", valued: "cnpPu" }, no_long, 0),
+        "setsid" => (
+            Short { flags: "cfw", valued: "" },
+            |n| matches!(n, "ctty" | "fork" | "wait").then_some(false),
+            0,
+        ),
+        _ => return None,
+    };
+    Some(getopt(args, &short, long, 0).map(|(_, operands)| {
+        let at = args.len() - operands.len();
+        // `env -` starts the command with nothing set, as `-i` does.
+        let at = match (name, operands.first()) {
+            ("env", Some(w)) if w.text == "-" => at + 1,
+            _ => at,
+        };
+        (at + before).min(args.len())
+    }))
 }
 
 /// The command `env -S` (`--split-string`) runs: its string split as a
@@ -590,76 +856,214 @@ pub enum Host {
     Unread,
 }
 
-/// The options of `ssh`, `sftp`, `mosh` and `scp` that take a value; for
-/// `scp`, `-B` takes none and `-X` one (for `ssh` it forwards X11).
-const SSH_VALUED: &[&str] = &[
-    "-B", "-b", "-c", "-D", "-E", "-e", "-F", "-I", "-i", "-J", "-L", "-l", "-m", "-O", "-o", "-p",
-    "-P", "-Q", "-R", "-S", "-W", "-w",
-];
+/// The options of `ssh`, `scp`, `sftp` and `mosh`, as their own tables
+/// give them.
+const SSH: Short = Short {
+    flags: "46AaCfGgKkMNnqsTtVvXxYy",
+    valued: "BbcDEeFIiJLlmOopQRSWw",
+};
+const SCP: Short = Short {
+    flags: "346ABCOpqRrsTv",
+    valued: "cDFiJlPoSX",
+};
+const SFTP: Short = Short {
+    flags: "46AaCfNpqrv",
+    valued: "BbcDFiJloPRSsX",
+};
+const MOSH: Short = Short {
+    flags: "an46",
+    valued: "p",
+};
 
-/// The `ssh`-family call's operands, its options and their values left
-/// out.
-fn ssh_operands<'w>(name: &str, args: &[&'w Word]) -> Vec<&'w Word> {
-    let mut out = vec![];
-    let mut skip = false;
-    let mut rest = false;
-    for w in args {
-        let t = w.text.as_str();
-        if skip {
-            skip = false;
-        } else if rest || !is_option(w) {
-            rest |= !out.is_empty() && name != "scp";
-            out.push(*w);
-        } else if t == "--" {
-            rest = true;
-        } else if match name {
-            "scp" => t == "-X" || (t != "-B" && SSH_VALUED.contains(&t)),
-            _ => SSH_VALUED.contains(&t),
-        } {
-            skip = true;
-        }
+/// The `-o` settings an `ssh`-family call may be given and still be read:
+/// none that runs a program, reads another config, names another machine
+/// or forwards the person's agent.
+fn plain_setting(value: &Word) -> bool {
+    if value.dynamic {
+        return false;
     }
-    out
+    let text = value.text.trim();
+    let (key, rest) = text
+        .split_once(|c: char| c == '=' || c.is_whitespace())
+        .unwrap_or((text, ""));
+    let rest = rest.trim_start_matches(|c: char| c == '=' || c.is_whitespace());
+    match key.to_ascii_lowercase().as_str() {
+        "port" | "user" | "identityfile" | "identitiesonly" | "batchmode" | "connecttimeout"
+        | "stricthostkeychecking" | "userknownhostsfile" | "serveraliveinterval"
+        | "serveralivecountmax" | "loglevel" | "compression" => true,
+        "forwardagent" => rest.eq_ignore_ascii_case("no"),
+        _ => false,
+    }
 }
 
-/// Whether an `ssh`-family call runs something of its own here: a proxy
-/// or local command, a config file that may name one, another program in
-/// place of `ssh`, a batch of `sftp` commands.
-fn runs_here(name: &str, args: &[&Word]) -> bool {
-    const LOCAL: &[&str] = &[
-        "proxycommand",
-        "localcommand",
-        "permitlocalcommand",
-        "knownhostscommand",
-        "remotecommand",
-        "include",
+/// An `ssh`-family call's operands, read with its own options; `None` when
+/// it can't be read, or runs something here or through another machine:
+/// a config file, a proxy or local command, a jump host, another program
+/// in place of `ssh`, a batch of `sftp` commands, a log or control file.
+fn ssh_call<'w>(name: &str, args: &[&'w Word]) -> Option<Vec<&'w Word>> {
+    let (short, held, mixed): (&Short, &str, usize) = match name {
+        // Options may come after the host, up to the command it runs.
+        "ssh" => (&SSH, "EFIJS", 1),
+        "scp" => (&SCP, "DFJS", usize::MAX),
+        "sftp" => (&SFTP, "bDFJS", usize::MAX),
+        _ => (&MOSH, "", usize::MAX),
+    };
+    let long = |n: &str| match name {
+        "mosh" => match n {
+            "no-init" | "no-ssh-pty" | "local" | "predict-overwrite" => Some(false),
+            "family" | "port" | "predict" | "bind-server" | "experimental-remote-ip" => {
+                Some(true)
+            }
+            _ => None,
+        },
+        _ => None,
+    };
+    let (given, operands) = getopt(args, short, long, mixed).ok()?;
+    given
+        .iter()
+        .all(|(option, value)| match option.as_str() {
+            "-o" => value.as_ref().is_some_and(plain_setting),
+            o => !o
+                .strip_prefix('-')
+                .is_some_and(|l| l.len() == 1 && held.contains(l)),
+        })
+        .then_some(operands)
+}
+
+/// Whether `rsync -e` names `ssh` itself, read as [`ssh_call`] reads it,
+/// with nothing of its own to run.
+fn plain_rsh(value: &Word) -> bool {
+    if value.dynamic {
+        return false;
+    }
+    let Ok(commands) = split(&value.text) else {
+        return false;
+    };
+    let [one] = commands.as_slice() else {
+        return false;
+    };
+    let words: Vec<&Word> = one.words.iter().collect();
+    one.writes.is_empty()
+        && !one.fed
+        && words
+            .split_first()
+            .is_some_and(|(first, rest)| {
+                !first.dynamic
+                    && first.text.rsplit('/').next() == Some("ssh")
+                    && ssh_call("ssh", rest).is_some_and(|ops| ops.is_empty())
+            })
+}
+
+/// `rsync`'s options: short ones as its table gives them, long ones
+/// known by name (`Some(true)` taking a value); any other can't be read.
+const RSYNC: Short = Short {
+    flags: "vqcarRbudlLkKHpEAXUNOJogDtSnWxCFyhiPz8m0s46IV",
+    valued: "TBefM@",
+};
+
+fn rsync_long(name: &str) -> Option<bool> {
+    const FLAGS: &[&str] = &[
+        "archive",
+        "verbose",
+        "quiet",
+        "compress",
+        "recursive",
+        "relative",
+        "backup",
+        "update",
+        "links",
+        "copy-links",
+        "copy-dirlinks",
+        "keep-dirlinks",
+        "hard-links",
+        "perms",
+        "executability",
+        "acls",
+        "xattrs",
+        "owner",
+        "group",
+        "devices",
+        "specials",
+        "times",
+        "atimes",
+        "crtimes",
+        "omit-dir-times",
+        "omit-link-times",
+        "sparse",
+        "dry-run",
+        "whole-file",
+        "one-file-system",
+        "cvs-exclude",
+        "fuzzy",
+        "human-readable",
+        "itemize-changes",
+        "partial",
+        "progress",
+        "stats",
+        "checksum",
+        "dirs",
+        "mkpath",
+        "prune-empty-dirs",
+        "from0",
+        "protect-args",
+        "secluded-args",
+        "ignore-times",
+        "size-only",
+        "ignore-existing",
+        "existing",
+        "inplace",
+        "append",
+        "append-verify",
+        "force",
+        "ignore-errors",
+        "numeric-ids",
+        "safe-links",
+        "copy-unsafe-links",
+        "no-motd",
+        "list-only",
+        "8-bit-output",
+        "no-implied-dirs",
+        "remove-source-files",
+        "del",
+        "delete",
+        "delete-before",
+        "delete-during",
+        "delete-delay",
+        "delete-after",
+        "delete-excluded",
+        "delete-missing-args",
     ];
-    let option = |v: &Word| {
-        let key = v
-            .text
-            .split(['=', ' ', '\t'])
-            .next()
-            .unwrap_or_default()
-            .to_ascii_lowercase();
-        v.dynamic || LOCAL.contains(&key.as_str())
-    };
-    let program: &[&str] = match name {
-        "scp" => &["-S", "-F"],
-        "sftp" => &["-S", "-F", "-D", "-b"],
-        _ => &["-F"],
-    };
-    args.iter().enumerate().any(|(i, w)| {
-        let t = w.text.as_str();
-        match t {
-            "-o" => args.get(i + 1).is_none_or(|v| option(v)),
-            _ if program.contains(&t) => true,
-            _ if t.starts_with("-o") && !t.starts_with("--") => option(&Word {
-                text: t[2..].to_string(),
-                ..(*w).clone()
-            }),
-            _ => false,
-        }
-    })
+    const VALUED: &[&str] = &[
+        "exclude",
+        "include",
+        "exclude-from",
+        "include-from",
+        "filter",
+        "info",
+        "debug",
+        "timeout",
+        "contimeout",
+        "port",
+        "bwlimit",
+        "chmod",
+        "max-size",
+        "min-size",
+        "max-delete",
+        "modify-window",
+        "out-format",
+        "block-size",
+        "compress-level",
+        "compress-choice",
+        "checksum-choice",
+        "iconv",
+        "rsh",
+    ];
+    let flag = |n: &str| FLAGS.contains(&n);
+    match name {
+        _ if flag(name) || name.strip_prefix("no-").is_some_and(flag) => Some(false),
+        _ if VALUED.contains(&name) => Some(true),
+        _ => None,
+    }
 }
 
 /// What a call to another machine asks: nothing when what it runs there
@@ -694,6 +1098,20 @@ fn host_word(word: &Word, whole: bool) -> Option<Host> {
     let address = ["ssh://", "scp://", "sftp://", "rsync://"]
         .iter()
         .find_map(|scheme| text.strip_prefix(scheme));
+    // An IPv6 address is written in brackets: `[::1]:path`, `user@[::1]`.
+    if let Some((user, rest)) = text.split_once('[').filter(|_| address.is_none()) {
+        let (v6, after) = rest.split_once(']')?;
+        let shaped = (user.is_empty() || (user.ends_with('@') && !user.contains('/')))
+            && match whole {
+                true => after.is_empty(),
+                false => after.starts_with(':'),
+            };
+        return match (shaped, word.dynamic) {
+            (false, _) => None,
+            (true, true) => Some(Host::Unread),
+            (true, false) => Some(Host::Named(v6.to_ascii_lowercase())),
+        };
+    }
     let at = match address {
         Some(rest) => rest.split('/').next().unwrap_or(rest),
         None if whole => text,
@@ -716,7 +1134,7 @@ fn host_word(word: &Word, whole: bool) -> Option<Host> {
         None if address.is_some() => host.split(':').next().unwrap_or(host),
         None => host,
     };
-    (!host.is_empty()).then(|| Host::Named(host.to_string()))
+    (!host.is_empty()).then(|| Host::Named(host.to_ascii_lowercase()))
 }
 
 /// Whether `simple` could make a link for what follows it on the line:
@@ -1111,21 +1529,37 @@ impl Splitter {
             Some('(') => {
                 self.at += 1;
                 if self.peek(0) == Some('(') {
-                    // Arithmetic: runs nothing.
-                    self.substitution()?;
-                    return Ok(());
+                    // Arithmetic runs nothing, unless it holds a command.
+                    let inner = self.substitution()?;
+                    return match inner.contains("$(") || inner.contains('`') {
+                        true => Err(()),
+                        false => Ok(()),
+                    };
                 }
                 let inner = self.substitution()?;
                 let commands = split(&inner)?;
                 self.out.extend(commands);
             }
+            // `${…}` runs nothing, unless it holds a command (`${X:-$(…)}`),
+            // which can't be read.
             Some('{') => {
+                let mut depth = 0;
                 while let Some(c) = self.peek(0) {
                     self.at += 1;
-                    if c == '}' {
-                        break;
+                    match c {
+                        '`' => return Err(()),
+                        '$' if self.peek(0) == Some('(') => return Err(()),
+                        '{' => depth += 1,
+                        '}' => {
+                            depth -= 1;
+                            if depth == 0 {
+                                return Ok(());
+                            }
+                        }
+                        _ => {}
                     }
                 }
+                return Err(());
             }
             _ => {
                 while let Some(c) = self.peek(0) {
@@ -1525,48 +1959,41 @@ fn classify_words(
     let args = &words[i + 1..];
     match name {
         "for" | "select" => None,
-        "case" | "function" | "eval" | "coproc" => Some(Asks::Unclear),
+        // What makes a later word mean another command.
+        "case" | "function" | "eval" | "coproc" | "alias" | "unalias" | "enable" => {
+            Some(Asks::Unclear)
+        }
+        "hash" if has_flag(args, 'p', &[]) => Some(Asks::Unclear),
         "env" if split_string(args).is_some() => match split_string(args)? {
             Some(script) => always_asks(&script, place),
             None => Some(Asks::Unclear),
         },
-        _ if wrapped(name, args).is_some() => {
-            let at = wrapped(name, args)?;
-            classify_words(&args[at..], simple, place, unknown)
-        }
+        _ if wrapped(name, args).is_some() => match wrapped(name, args)? {
+            Ok(at) => {
+                let rest: Vec<&Word> = words[..i].iter().chain(&args[at..]).copied().collect();
+                classify_words(&rest, simple, place, unknown)
+            }
+            Err(()) => Some(Asks::Unclear),
+        },
         "xargs" => {
-            let mut j = 0;
-            while let Some(w) = args.get(j) {
-                if !is_option(w) {
-                    break;
-                }
-                let takes = matches!(
-                    w.text.as_str(),
-                    "-I" | "-n" | "-P" | "-L" | "-d" | "-E" | "-s" | "-a"
-                );
-                j += if takes { 2 } else { 1 };
-            }
-            unknown = true;
-            args.get(j)?;
-            classify_words(&args[j..], simple, place, unknown)
-        }
-        _ if SHELLS.contains(&name) => {
-            let script_flag = |w: &&&Word| {
-                !w.text.starts_with("--") && w.text.starts_with('-') && w.text.contains('c')
+            let short = Short {
+                flags: "0oprtxeil",
+                valued: "EILnPsad",
             };
-            if let Some(at) = args.iter().position(|w| script_flag(&w)) {
-                return match args.get(at + 1) {
-                    Some(script) if !script.dynamic => always_asks(&script.text, place),
-                    _ => Some(Asks::Unclear),
-                };
-            }
-            let script = args.iter().any(|w| !is_option(w));
-            if !script || simple.piped_in || simple.fed {
-                Some(Asks::Unclear)
-            } else {
-                None
-            }
+            let long = |n: &str| match n {
+                "null" | "verbose" | "no-run-if-empty" | "interactive" | "exit" | "show-limits"
+                | "open-tty" => Some(false),
+                "arg-file" | "delimiter" | "max-args" | "max-procs" | "max-chars"
+                | "max-lines" | "process-slot-var" => Some(true),
+                _ => None,
+            };
+            let Ok((_, ops)) = getopt(args, &short, long, 0) else {
+                return Some(Asks::Unclear);
+            };
+            ops.first()?;
+            classify_words(&args[args.len() - ops.len()..], simple, place, true)
         }
+        _ if SHELLS.contains(&name) => shell(args, simple, place, unknown),
         _ if SYSTEM.contains(&name) || name.starts_with("mkfs") || name.starts_with("newfs") => {
             Some(Asks::System)
         }
@@ -1617,78 +2044,137 @@ fn classify_words(
             })
         }
         "rsync" => {
-            if has_flag(args, 'e', &["rsh"])
-                || words[..i].iter().any(|w| {
-                    w.text.starts_with("RSYNC_RSH=") || w.text.starts_with("RSYNC_CONNECT_PROG=")
-                })
-            {
+            const RUNS: &[&str] = &["RSYNC_RSH", "RSYNC_CONNECT_PROG"];
+            let held = words[..i]
+                .iter()
+                .filter_map(|w| w.text.split_once('=').map(|(n, _)| n))
+                .chain(place.set.iter().map(String::as_str))
+                .any(|n| RUNS.contains(&n));
+            let Ok((given, ops)) = getopt(args, &RSYNC, rsync_long, usize::MAX) else {
+                return Some(Asks::Unclear);
+            };
+            let readable = given.iter().all(|(o, v)| match o.as_str() {
+                "-e" | "--rsh" => v.as_ref().is_some_and(plain_rsh),
+                "-M" => false,
+                _ => true,
+            });
+            if held || !readable {
                 return Some(Asks::Unclear);
             }
-            let deletes = args.iter().any(|w| w.text.starts_with("--delete"));
-            let ops = operands(args);
+            let named = |o: &str| given.iter().any(|(g, _)| g == o);
+            let deletes = given
+                .iter()
+                .any(|(o, _)| o == "--del" || o.starts_with("--delete"));
             let Some((dest, sources)) = ops.split_last() else {
                 return deletes.then_some(Asks::ForGood);
             };
-            let here: Vec<&Word> = sources.iter().copied().filter(|w| !w.remote()).collect();
             let onto = match (deletes, host_word(dest, false)) {
                 (true, Some(host)) => Some(Asks::Remote(vec![host])),
-                (true, None) => place.deletes(&[*dest], unknown),
+                (true, None) => place.clears(dest),
                 (false, Some(_)) => None,
                 (false, None) if sources.is_empty() => None,
                 (false, None) => place.copies_onto(dest, sources, unknown),
             };
-            let taken = args
-                .iter()
-                .any(|w| w.text == "--remove-source-files")
-                .then(|| place.deletes(&here, unknown))
+            let taken = named("--remove-source-files")
+                .then(|| {
+                    sources
+                        .iter()
+                        .filter(|w| !w.remote())
+                        .filter_map(|w| place.clears(w))
+                        .reduce(Asks::worst)
+                })
                 .flatten();
             match (onto, taken) {
                 (Some(a), Some(b)) => Some(a.worst(b)),
                 (a, b) => a.or(b),
             }
         }
-        "scp" if runs_here(name, args) => Some(Asks::Unclear),
-        "scp" => {
-            let ops = ssh_operands(name, args);
-            match ops.split_last() {
-                Some((dest, sources)) if !sources.is_empty() && !dest.remote() => {
-                    place.copies_onto(dest, sources, unknown)
+        "ssh" | "scp" | "sftp" | "mosh" => {
+            let Some(ops) = ssh_call(name, args) else {
+                return Some(Asks::Unclear);
+            };
+            match name {
+                "scp" => match ops.split_last() {
+                    Some((dest, sources)) if !sources.is_empty() && !dest.remote() => {
+                        place.copies_onto(dest, sources, unknown)
+                    }
+                    _ => None,
+                },
+                "sftp" => None,
+                _ => {
+                    let (host, remote) = ops.split_first()?;
+                    on_host(
+                        host_word(host, true),
+                        remote,
+                        simple.piped_in || simple.fed,
+                        place.home,
+                    )
                 }
+            }
+        }
+        "ln" => {
+            let into = target_dir(args);
+            let ops = operands(args);
+            let force = has_flag(args, 'f', &["force"]);
+            let here = Word {
+                text: ".".into(),
+                dynamic: false,
+                glob: false,
+                brace: false,
+            };
+            let (dest, sources): (&Word, &[&Word]) = match (into.as_ref(), ops.split_last()) {
+                (Some(dir), _) => (dir, &ops),
+                (None, Some((dest, sources))) if !sources.is_empty() => (dest, sources),
+                (None, Some(_)) => (&here, &ops),
+                (None, None) => return None,
+            };
+            match force {
+                true => place.copies_onto(dest, sources, unknown),
+                false => place.links_onto(dest, sources),
+            }
+        }
+        "tar" | "bsdtar" | "gtar" => tar(args, place),
+        "unzip" => {
+            let extracts = !args.iter().any(|w| {
+                w.text.starts_with('-') && !w.text.starts_with("--") && w.text.contains(['l', 'p', 't', 'v', 'Z'])
+            });
+            if args.iter().any(|w| w.text.starts_with('-') && w.text.contains(':')) {
+                return Some(Asks::Unclear);
+            }
+            let dest = args.iter().enumerate().find_map(|(at, w)| {
+                match w.text.strip_prefix("-d") {
+                    Some("") => args.get(at + 1).map(|d| (*d).clone()),
+                    Some(rest) => Some(Word {
+                        text: rest.to_string(),
+                        ..(*w).clone()
+                    }),
+                    None => None,
+                }
+            });
+            extracts.then(|| place.extracts(dest.as_ref())).flatten()
+        }
+        "ditto" => {
+            let mut ops = Vec::new();
+            let mut skip = false;
+            for w in args {
+                if skip {
+                    skip = false;
+                } else if matches!(w.text.as_str(), "--arch" | "--bom") {
+                    skip = true;
+                } else if !is_option(w) {
+                    ops.push(*w);
+                }
+            }
+            match ops.split_last() {
+                Some((dest, sources)) if !sources.is_empty() => place.extracts(Some(dest)),
                 _ => None,
             }
         }
-        "ssh" | "sftp" | "mosh"
-            if runs_here(name, args)
-                || (name == "mosh"
-                    && args.iter().any(|w| {
-                        w.text.starts_with("--ssh") || w.text.starts_with("--client")
-                    })) =>
-        {
-            Some(Asks::Unclear)
-        }
-        "ssh" | "mosh" => {
-            let ops = ssh_operands(name, args);
-            let (host, remote) = match ops.split_first() {
-                Some((host, remote)) => (host_word(host, true), remote),
-                None => return None,
-            };
-            on_host(host, remote, simple.piped_in || simple.fed, place.home)
-        }
-        "sftp" => None,
-        // What a copy, an install or a forced link writes over.
-        "cp" | "install" | "ln" => {
-            if name == "ln" && !has_flag(args, 'f', &["force"]) {
-                return None;
-            }
-            let into = args
-                .iter()
-                .position(|w| w.text == "-t" || w.text.starts_with("--target-directory"))
-                .and_then(|i| match args[i].text.split_once('=') {
-                    Some((_, _)) => Some(args[i]),
-                    None => args.get(i + 1).copied(),
-                });
+        // What a copy or an install writes over.
+        "cp" | "install" => {
+            let into = target_dir(args);
             let ops = operands(args);
-            match (into, ops.split_last()) {
+            match (into.as_ref(), ops.split_last()) {
                 (Some(dir), _) => place.copies_onto(dir, &ops, unknown),
                 (None, Some((dest, sources))) if !sources.is_empty() => {
                     place.copies_onto(dest, sources, unknown)
@@ -1859,7 +2345,10 @@ fn classify_words(
                     .flatten(),
             })
         }
-        "git" => git(args, &words[..i], place),
+        "git" => {
+            let assigns: Vec<&Word> = words[..i].iter().copied().collect();
+            git(args, &assigns, place)
+        }
         "xattr" => {
             let clears = args.iter().any(|w| {
                 !w.text.starts_with("--") && w.text.starts_with('-') && w.text.contains('c')
@@ -1881,6 +2370,143 @@ fn classify_words(
     }
 }
 
+/// The folder `-t`/`--target-directory` names.
+fn target_dir(args: &[&Word]) -> Option<Word> {
+    args.iter().enumerate().find_map(|(at, w)| {
+        match w.text.strip_prefix("--target-directory") {
+            Some(rest) if rest.starts_with('=') => Some(Word {
+                text: rest[1..].to_string(),
+                ..(*w).clone()
+            }),
+            Some("") => args.get(at + 1).map(|d| (*d).clone()),
+            _ if w.text == "-t" => args.get(at + 1).map(|d| (*d).clone()),
+            _ => None,
+        }
+    })
+}
+
+/// What a shell runs: the script given with `-c`, read as commands once
+/// its options (`-e`, `-o pipefail`, `--`) are past. A script that isn't
+/// written out, one run for what `xargs` or `find` feeds, a shell reading
+/// its commands from a pipe, and an option it doesn't know can't be read.
+fn shell(args: &[&Word], simple: &Simple, place: &Place<'_>, unknown: bool) -> Option<Asks> {
+    const FLAGS: &str = "abcefhiklmnprstuvxBCEHPT";
+    const LONG: &[&str] = &[
+        "norc",
+        "noprofile",
+        "login",
+        "posix",
+        "noediting",
+        "restricted",
+        "verbose",
+        "version",
+        "help",
+    ];
+    let mut command = false;
+    let mut stdin = false;
+    let mut i = 0;
+    while let Some(w) = args.get(i) {
+        let t = w.text.as_str();
+        if w.dynamic {
+            return Some(Asks::Unclear);
+        }
+        if t == "--" || t == "-" {
+            i += 1;
+            break;
+        }
+        let Some(letters) = t
+            .strip_prefix('-')
+            .or_else(|| t.strip_prefix('+'))
+            .filter(|l| !l.is_empty())
+        else {
+            break;
+        };
+        i += 1;
+        if let Some(long) = letters.strip_prefix('-') {
+            if !LONG.contains(&long) {
+                return Some(Asks::Unclear);
+            }
+            continue;
+        }
+        for c in letters.chars() {
+            match c {
+                'o' | 'O' => {
+                    i += 1;
+                    break;
+                }
+                'c' => command = true,
+                's' => stdin = true,
+                _ if FLAGS.contains(c) => {}
+                _ => return Some(Asks::Unclear),
+            }
+        }
+    }
+    let script = args.get(i);
+    match (command, script) {
+        _ if unknown => Some(Asks::Unclear),
+        (true, Some(s)) if !s.dynamic => always_asks(&s.text, place),
+        (true, _) => Some(Asks::Unclear),
+        (false, Some(_)) if !stdin && !simple.piped_in && !simple.fed => None,
+        (false, _) => Some(Asks::Unclear),
+    }
+}
+
+/// `tar`: unpacking ([`Place::extracts`]) where its `-C` says, or the cwd.
+/// Names kept whole (`-P`), a program run for it, and a `-C` it can't
+/// place can't be read.
+fn tar(args: &[&Word], place: &Place<'_>) -> Option<Asks> {
+    let bundled = args.first().filter(|w| !w.text.starts_with('-'));
+    let cluster = |w: &&Word| w.text.starts_with('-') && !w.text.starts_with("--");
+    let extracts = bundled.is_some_and(|w| w.text.contains('x'))
+        || args.iter().filter(cluster).any(|w| w.text.contains('x'))
+        || args
+            .iter()
+            .any(|w| matches!(w.text.as_str(), "--extract" | "--get"));
+    if !extracts {
+        return None;
+    }
+    const RUNS: &[&str] = &[
+        "--absolute-names",
+        "--to-command",
+        "--use-compress-program",
+        "--info-script",
+        "--new-volume-script",
+        "--checkpoint-action",
+        "--rsh-command",
+    ];
+    let mut dest: Option<Word> = None;
+    let mut dests = 0;
+    for (at, w) in args.iter().enumerate() {
+        let t = w.text.as_str();
+        let long = t.split_once('=').map_or(t, |(n, _)| n);
+        if RUNS.contains(&long) || (cluster(w) && t.contains(['P', 'I', 'F'])) || w.dynamic && t.starts_with('-')
+        {
+            return Some(Asks::Unclear);
+        }
+        let given = match t {
+            "-C" | "--directory" => args.get(at + 1).map(|d| (*d).clone()),
+            _ if t.starts_with("--directory=") => Some(Word {
+                text: t["--directory=".len()..].to_string(),
+                ..(*w).clone()
+            }),
+            _ if t.starts_with("-C") => Some(Word {
+                text: t[2..].to_string(),
+                ..(*w).clone()
+            }),
+            _ if cluster(w) && t.contains('C') => return Some(Asks::Unclear),
+            _ => None,
+        };
+        if let Some(d) = given {
+            dests += 1;
+            dest = Some(d);
+        }
+    }
+    if bundled.is_some_and(|w| w.text.contains(['C', 'P', 'I', 'F'])) || dests > 1 {
+        return Some(Asks::Unclear);
+    }
+    place.extracts(dest.as_ref())
+}
+
 /// `find`: `-delete` deletes under its start paths; `-exec` runs a command
 /// on what it finds.
 fn find(args: &[&Word], simple: &Simple, place: &Place<'_>) -> Option<Asks> {
@@ -1890,14 +2516,18 @@ fn find(args: &[&Word], simple: &Simple, place: &Place<'_>) -> Option<Asks> {
         .copied()
         .collect();
     if args.iter().any(|w| w.text == "-delete") {
-        let asks = if starts.is_empty() {
-            match place.cwd.as_ref() {
-                Some(cwd) if place.deletable(cwd) => None,
-                Some(cwd) => Some(Asks::Deletes(vec![cwd.clone()])),
-                None => Some(Asks::ForGood),
-            }
-        } else {
-            place.deletes(&starts, false)
+        let here = Word {
+            text: ".".into(),
+            dynamic: false,
+            glob: false,
+            brace: false,
+        };
+        let asks = match starts.is_empty() {
+            true => place.clears(&here),
+            false => starts
+                .iter()
+                .filter_map(|s| place.clears(s))
+                .reduce(Asks::worst),
         };
         if asks.is_some() {
             return asks;
@@ -1971,6 +2601,64 @@ fn evaluates(name: &str, args: &[&Word]) -> bool {
     }
 }
 
+/// What in git's environment names a program it runs: an ssh, a pager, an
+/// editor, a diff, a prompt for a password, a proxy.
+const GIT_RUNS: &[&str] = &[
+    "GIT_SSH_COMMAND",
+    "GIT_SSH",
+    "GIT_EXTERNAL_DIFF",
+    "GIT_PAGER",
+    "GIT_ASKPASS",
+    "GIT_EDITOR",
+    "GIT_SEQUENCE_EDITOR",
+    "GIT_PROXY_COMMAND",
+    "GIT_EXEC_PATH",
+    "GIT_TEMPLATE_DIR",
+    "SSH_ASKPASS",
+    "PAGER",
+    "EDITOR",
+    "VISUAL",
+];
+
+/// Whether a `git -c key=value` setting runs a program, reads more
+/// settings, or changes where git works or reaches: one with a value made
+/// as it runs can't be read either.
+fn runs_through(setting: &Word) -> bool {
+    if setting.dynamic {
+        return true;
+    }
+    let key = setting
+        .text
+        .split_once('=')
+        .map_or(setting.text.as_str(), |(k, _)| k)
+        .to_ascii_lowercase();
+    let last = key.rsplit('.').next().unwrap_or(&key);
+    matches!(
+        key.as_str(),
+        "core.sshcommand"
+            | "core.pager"
+            | "core.fsmonitor"
+            | "core.hookspath"
+            | "core.editor"
+            | "core.askpass"
+            | "core.gitproxy"
+            | "core.worktree"
+            | "core.alternaterefscommand"
+            | "sequence.editor"
+            | "diff.external"
+            | "init.templatedir"
+            | "include.path"
+            | "uploadpack.packobjectshook"
+    ) || ["alias.", "includeif.", "pager.", "filter.", "difftool.", "mergetool.", "url.", "protocol."]
+        .iter()
+        .any(|p| key.starts_with(p))
+        || matches!(
+            last,
+            "command" | "cmd" | "textconv" | "driver" | "program" | "helper" | "tool"
+                | "receivepack" | "uploadpack" | "proxy" | "sshcommand"
+        )
+}
+
 /// `git`: what can't be undone, acting where its `-C`, `--git-dir` and
 /// `--work-tree` (or theirs in the environment, `assigns`) say.
 fn git(args: &[&Word], assigns: &[&Word], place: &Place<'_>) -> Option<Asks> {
@@ -1996,6 +2684,8 @@ fn git(args: &[&Word], assigns: &[&Word], place: &Place<'_>) -> Option<Asks> {
             (false, None) => None,
         };
         match option {
+            "-c" if given.as_ref().is_none_or(runs_through) => return Some(Asks::Unclear),
+            "--config-env" | "--exec-path" => return Some(Asks::Unclear),
             "-C" => here.cwd = given.as_ref().and_then(|g| here.resolve(g)),
             "--git-dir" | "--work-tree" => at.push(given.as_ref().and_then(|g| here.resolve(g))),
             t if !t.starts_with('-') => break,
@@ -2006,9 +2696,17 @@ fn git(args: &[&Word], assigns: &[&Word], place: &Place<'_>) -> Option<Asks> {
             _ => 1,
         };
     }
-    let elsewhere = assigns
+    let set: Vec<&str> = assigns
         .iter()
-        .any(|w| w.text.starts_with("GIT_DIR=") || w.text.starts_with("GIT_WORK_TREE="));
+        .filter_map(|w| w.text.split_once('=').map(|(n, _)| n))
+        .chain(place.set.iter().map(String::as_str))
+        .collect();
+    if set.iter().any(|n| GIT_RUNS.contains(n) || n.starts_with("GIT_CONFIG")) {
+        return Some(Asks::Unclear);
+    }
+    let elsewhere = set
+        .iter()
+        .any(|n| matches!(*n, "GIT_DIR" | "GIT_WORK_TREE"));
     at.push(here.cwd.clone().filter(|_| !elsewhere));
     let place = &here;
     let sub = args.get(i)?;
@@ -2597,7 +3295,7 @@ mod tests {
                 "ssh -p 2222 -i ~/.ssh/k dev@devbox 'cargo build && rm -rf target'",
                 on("devbox"),
             ),
-            ("ssh -J root@gw root@10.0.1.20 'rm -rf x'", on("10.0.1.20")),
+            ("ssh -l root 10.0.1.20 'rm -rf x'", on("10.0.1.20")),
             ("ssh ssh://dev@devbox:2222 rm -rf x", on("devbox")),
             ("ssh -B en0 devbox 'git push -f'", on("devbox")),
             ("ssh -t devbox sudo reboot", on("devbox")),
@@ -2607,10 +3305,6 @@ mod tests {
             ("cd x && bash -c \"ssh devbox 'rm -rf y'\"", on("devbox")),
             ("rsync -az --delete ./ devbox:src/x/", on("devbox")),
             ("rsync -a --delete host::module/ x@host:/y", on("host")),
-            (
-                "ssh \"$H\" 'rm -rf x'",
-                Some(Asks::Remote(vec![Host::Unread])),
-            ),
             ("ssh devbox uptime", None),
             ("ssh devbox", None),
             ("ssh -o StrictHostKeyChecking=no prod.example ls", None),
@@ -2618,6 +3312,7 @@ mod tests {
             ("scp -P 22 dev@a:/x dev@b:/y", None),
             ("scp -B -X x a devbox:/tmp/", None),
             ("rsync -az ./ devbox:src/x/", None),
+            ("rsync -aze ssh a devbox:b", None),
             ("sftp dev@devbox", None),
             ("mosh devbox", None),
         ] {
@@ -2642,7 +3337,8 @@ mod tests {
             "scp -S ./evil a devbox:/x",
             "sftp -b batch devbox",
             "rsync -e 'sh -c \"$X\"' a devbox:b",
-            "rsync -aze ssh a devbox:b",
+            "ssh -J root@gw root@10.0.1.20 'rm -rf x'",
+            "ssh \"$H\" 'rm -rf x'",
             "rsync --rsh=x ./ devbox:/x",
             "RSYNC_RSH=x rsync ./ devbox:x",
             "mosh --ssh='x' devbox",
@@ -2671,13 +3367,212 @@ mod tests {
             "git clean -fdx",
             "git -C /Users/sarah/dev/other clean -fdx",
             "git reset --hard HEAD~3",
-            "rsync -a --delete ./ \"$D\"",
             "rsync --delete",
-            "echo x > \"$F\"",
-            "cp a \"$F\"",
+            "ls | xargs tee",
             "cd - && rm -rf build",
+            "rsync -a --delete ./ /Users/sarah/dev/acme-web/",
+            "find /Users/sarah/dev/acme-web -name '*.o' -delete",
+            "tar -xzf a.tgz -C /Users/sarah/dev/acme-web",
         ] {
             assert_eq!(asks(command), Some(G), "{command:?}");
+        }
+    }
+
+    /// `ssh`, `scp`, `sftp`, `rsync` and `mosh` are read as getopt reads
+    /// them, letter by letter with each one's own table: an option it
+    /// doesn't know, a setting that could run something or reach another
+    /// machine, or a word made as it runs can't be read.
+    #[test]
+    fn an_ssh_family_call_is_read_option_by_option() {
+        for command in [
+            "ssh -4o 'ProxyCommand=sh -c x' devbox true",
+            "ssh -4oProxyCommand=x devbox true",
+            "ssh -qF ./cfg devbox",
+            "scp -qS ./evil a devbox:/x",
+            "ssh devbox -oProxyCommand=x true",
+            "ssh -o HostName=prod devbox ls",
+            "ssh -o CanonicalizeHostname=yes devbox ls",
+            "ssh -o PKCS11Provider=/x.so devbox ls",
+            "ssh -o ForwardAgent=yes devbox ls",
+            "ssh -Z devbox ls",
+            "ssh --proxy devbox",
+            "ssh -E /Users/sarah/.zprofile devbox",
+            "ssh -I /x.so devbox",
+            "ssh $OPTS devbox ls",
+            "scp -o ProxyJump=gw a devbox:/x",
+            "scp -D /bin/sh a devbox:/x",
+            "sftp -oProxyCommand=x devbox",
+            "rsync -e 'ssh -oProxyCommand=x' a devbox:b",
+            "rsync -e 'ssh -F cfg' a devbox:b",
+            "rsync -e ssh2 a devbox:b",
+            "rsync -e 'ssh devbox' a devbox:b",
+            "rsync --rsync-path='sudo rsync' a devbox:b",
+            "rsync -M--log-file=x a devbox:b",
+            "rsync --log-file=/Users/sarah/.zprofile a devbox:b",
+            "rsync -Z a devbox:b",
+            "mosh --client=x devbox",
+        ] {
+            assert_eq!(asks(command), Some(U), "{command:?}");
+        }
+        let on = |h: &str| Some(Asks::Remote(vec![Host::Named(h.to_string())]));
+        for command in [
+            "ssh -tl root devbox 'rm -rf /'",
+            "ssh -tlroot devbox 'rm -rf /'",
+            "ssh devbox -t 'rm -rf /'",
+            "ssh DevBox 'rm -rf /'",
+        ] {
+            assert_eq!(asks(command), on("devbox"), "{command:?}");
+        }
+        assert_eq!(asks("ssh dev@[FE80::1] 'rm -rf x'"), on("fe80::1"));
+        assert_eq!(asks("rsync -a --delete ./ [::1]:x/"), on("::1"));
+        for command in [
+            "ssh -4 -o Port=2222 -o 'User dev' -o IdentitiesOnly=yes devbox ls",
+            "ssh -o ForwardAgent=no devbox ls",
+            "ssh -t devbox ls -la",
+            "rsync -e 'ssh -p 2222 -o BatchMode=yes' -az ./ devbox:x/",
+            "rsync -avz --exclude=target --exclude .git ./ devbox:src/x/",
+            "scp -o Port=22 -P 22 a devbox:/tmp/",
+        ] {
+            assert_eq!(asks(command), None, "{command:?}");
+        }
+    }
+
+    /// A write Desk can't place that could be in the person's home is
+    /// theirs: added to, written over, linked or synced onto.
+    #[test]
+    fn a_write_desk_cant_place_that_could_be_in_the_home_is_the_persons() {
+        for command in [
+            "echo key >> \"$HOME/.ssh/authorized_keys\"",
+            "echo x | tee -a \"$HOME/.zprofile\"",
+            "echo x >> ~$USER/.zshrc",
+            "echo x >> /Users/sarah/*/rc",
+            "echo x > \"$F\"",
+            "cp a \"$F\"",
+            "rsync -a --delete ./ \"$D\"",
+            "ln -s /x \"$HOME/.zshrc\"",
+        ] {
+            assert_eq!(asks(command), Some(Asks::System), "{command:?}");
+        }
+        assert_eq!(asks("echo x >> work.log"), None);
+    }
+
+    /// What hides a command inside another (a substitution in `${…}` or
+    /// arithmetic, a shell reading options before its script, a wrapper's
+    /// options, aliases and definitions) is read through, or can't be.
+    #[test]
+    fn what_hides_a_command_inside_another_is_read_through_or_cant_be() {
+        for command in [
+            "echo ${X:-$(rm -rf ~)}",
+            "echo \"${X:-`rm -rf ~`}\"",
+            "echo $(( $(rm -rf ~) + 1 ))",
+            "bash -c -- \"$S\"",
+            "ls | xargs sh -c 'rm -rf \"$1\"' _",
+            "xargs -I{} sh -c x",
+            "find . -exec sh -c 'rm -rf \"$1\"' _ {} \\;",
+            "bash --rcfile x -c ls",
+            "env -C / rm -rf x",
+            "env -P /evil rm x",
+            "time -o /Users/sarah/.zprofile ls",
+            "timeout --bogus 10 ls",
+            "nohup -x rm -rf ~",
+            "alias ls='rm -rf ~'; ls",
+            "unalias ls",
+            "enable -n echo",
+            "hash -p /bin/rm ls",
+            "function f { ls; }",
+        ] {
+            assert_eq!(asks(command), Some(U), "{command:?}");
+        }
+        let home = asks("rm -rf ~");
+        assert_eq!(home, Some(Asks::System));
+        for command in [
+            "bash -c -e 'rm -rf ~'",
+            "bash -o pipefail -c 'rm -rf ~'",
+            "sh -ec 'rm -rf ~'",
+            "timeout -k 5 10 rm -rf ~",
+            "timeout -s KILL 10 rm -rf ~",
+            "env -u X rm -rf ~",
+            "env - rm -rf ~",
+            "exec -a name rm -rf ~",
+            "nice -n 5 rm -rf ~",
+            "nice -5 rm -rf ~",
+            "ionice -c 3 rm -rf ~",
+            "caffeinate -t 60 rm -rf ~",
+            "setsid -f rm -rf ~",
+        ] {
+            assert_eq!(asks(command), home, "{command:?}");
+        }
+        assert_eq!(asks("echo ${X:-default} $((1 + 2))"), None);
+    }
+
+    /// git reached through a setting or its environment that runs another
+    /// program can't be read; other settings change nothing.
+    #[test]
+    fn git_running_a_program_of_its_own_cant_be_read() {
+        for command in [
+            "git -c core.sshCommand='sh -c x' push",
+            "git -c core.pager=x log",
+            "git -c 'alias.st=!rm -rf ~' st",
+            "git -c credential.helper='!x' fetch",
+            "git -c diff.x.textconv=x diff",
+            "git -c core.fsmonitor=x status",
+            "git -c core.hooksPath=/x commit -m x",
+            "git -c merge.tool=x mergetool",
+            "git -c \"$K\" log",
+            "git --config-env=core.pager=X log",
+            "GIT_SSH_COMMAND=x git fetch",
+            "GIT_SSH=x git fetch",
+            "GIT_PAGER=x git log",
+            "GIT_EXTERNAL_DIFF=x git diff",
+            "GIT_ASKPASS=x git push",
+            "GIT_EDITOR=x git commit",
+            "env GIT_EDITOR=x git commit",
+            "export GIT_SSH_COMMAND=x; git fetch",
+            "GIT_CONFIG_COUNT=1 git log",
+        ] {
+            assert_eq!(asks(command), Some(U), "{command:?}");
+        }
+        assert_eq!(asks("git -c user.name=x commit -m y"), None);
+        assert_eq!(asks("git -c color.ui=always log"), None);
+        assert_eq!(asks("GIT_AUTHOR_NAME=x git commit -m y"), None);
+    }
+
+    /// Linking, unpacking or copying into the person's home itself or what
+    /// they keep there is theirs; into the own folder it runs.
+    #[test]
+    fn what_lands_in_the_home_or_its_kept_paths_is_the_persons() {
+        for command in [
+            "ln -s /x ~/.zshrc",
+            "ln -s /x /Users/sarah/.ssh/authorized_keys",
+            "ln -s x ~/Library/LaunchAgents/a.plist",
+            "tar -xzf a.tgz -C ~",
+            "tar xzf a.tgz -C ~/.config",
+            "tar -x -f a.tar --directory=/Users/sarah",
+            "unzip a.zip -d ~",
+            "ditto a ~",
+            "cp -r dots/. ~",
+            "cp -r cfg ~/.config/",
+            "mv x ~/.ssh/",
+            "cd ~ && tar -xf a.tar",
+        ] {
+            assert_eq!(asks(command), Some(Asks::System), "{command:?}");
+        }
+        for command in [
+            "tar -xPf a.tar",
+            "tar -xf a.tar --to-command=sh",
+            "tar -xf a.tar -I zstd",
+            "unzip -: a.zip",
+        ] {
+            assert_eq!(asks(command), Some(U), "{command:?}");
+        }
+        for command in [
+            "tar -xzf a.tgz",
+            "tar -czf a.tgz src",
+            "unzip -l a.zip",
+            "unzip a.zip -d out",
+            "ln -s src lib",
+        ] {
+            assert_eq!(asks(command), None, "{command:?}");
         }
     }
 

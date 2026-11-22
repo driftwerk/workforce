@@ -158,6 +158,12 @@ fn checked(mut settings: Settings) -> Result<Settings, String> {
 /// turn is one the person whose Desk this is started and is in: no job,
 /// schedule or other person's turn.
 fn unbound_now(state: &Arc<GatewayState>, agent: &str) -> bool {
+    acts_fully(state, agent) && attended_by_holder(state)
+}
+
+/// Whether `agent`'s settings make it unbound (Act fully anywhere, every
+/// switch on) and its grant holds it so (its budget not spent), in any turn.
+fn acts_fully(state: &Arc<GatewayState>, agent: &str) -> bool {
     let Some(service) = state.registry.get(agent) else {
         return false;
     };
@@ -174,7 +180,7 @@ fn unbound_now(state: &Arc<GatewayState>, agent: &str) -> bool {
     let Some(crew) = crate::desk_crew::for_service(&service) else {
         return false;
     };
-    crew.unbound_given(service.agent_id.as_str(), &o) && attended_by_holder(state)
+    crew.unbound_given(service.agent_id.as_str(), &o)
 }
 
 /// Whether this turn may be unbound in the browser: the Desk holder's
@@ -920,6 +926,12 @@ pub fn install(
     {
         let state = Arc::clone(state);
         crate::desk_computer::judge_unbound_with(Box::new(move |agent| unbound_now(&state, agent)));
+    }
+    {
+        let state = Arc::clone(state);
+        crate::desk_computer::judge_acts_fully_with(Box::new(move |agent| {
+            acts_fully(&state, agent)
+        }));
     }
     {
         // Only the person whose Desk this is uses their Chrome, and its

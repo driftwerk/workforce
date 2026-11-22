@@ -131,6 +131,14 @@ fn unbound_now(agent: &str) -> bool {
     JUDGE.get().is_some_and(|judge| judge(agent))
 }
 
+static ACTS_FULLY: std::sync::OnceLock<UnboundJudge> = std::sync::OnceLock::new();
+
+/// Installs who judges whether an agent's Act fully is in force by its
+/// settings and grant, whoever's turn it is: once, with Desk's browser.
+pub fn judge_acts_fully_with(judge: UnboundJudge) -> bool {
+    ACTS_FULLY.set(judge).is_ok()
+}
+
 /// Whether an identity is the person whose Desk this is: the only one whose
 /// turns may use their own Chrome, signed in as them.
 pub type HolderJudge = Box<dyn Fn(Option<&str>) -> bool + Send + Sync>;
@@ -947,6 +955,13 @@ impl ComputerGate for HubComputerGate {
 
     fn unbound(&self) -> bool {
         self.policy.browser.browsing == Browsing::Unbound && unbound_now(&self.policy.agent)
+    }
+
+    fn acts_fully(&self) -> bool {
+        self.policy.browser.browsing == Browsing::Unbound
+            && ACTS_FULLY
+                .get()
+                .is_some_and(|judge| judge(&self.policy.agent))
     }
 
     fn asks_unattended(&self, tool: &str) -> bool {
@@ -2476,6 +2491,45 @@ mod tests {
                     exec.deny_reason.as_deref(),
                     Some(workforce_agent::tools::computer::CHANGED_SINCE_ALLOWED),
                     "{tool}"
+                );
+            }
+        })
+        .await;
+    }
+
+    /// Act fully in force has no restraints: a job runs what the person
+    /// would be asked about, a program given as text included; at Act it is
+    /// refused with nobody there to ask.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn act_fully_runs_in_a_job_what_an_act_level_agent_is_refused() {
+        with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+            let store = Arc::new(DeskStore::with_pool(pool).await.unwrap());
+            let hub = hub();
+            let tools = tools(&hub.subject.workspace);
+            judge_acts_fully_with(Box::new(|_| true));
+            let input = json!({"command": "python3 -c 'print(1)'"});
+            let act = UNBOUND.replace("level = \"full\"", "level = \"act\"");
+            for (body, runs) in [(UNBOUND, true), (act.as_str(), false)] {
+                std::fs::write(hub.subject.workspace.join("config.toml"), body).unwrap();
+                let gate = HubComputerGate::for_agent(
+                    Computer::new(Arc::clone(&store)),
+                    &hub.config,
+                    &hub.subject,
+                );
+                let decided = as_sarah(|| {
+                    workforce_agent::tools::computer::decide_unattended(
+                        Some(&gate),
+                        &tools,
+                        "exec.run",
+                        &input,
+                    )
+                })
+                .unwrap();
+                assert_eq!(
+                    matches!(decided.verdict, Verdict::Run { .. }),
+                    runs,
+                    "{body}: {:?}",
+                    decided.verdict
                 );
             }
         })

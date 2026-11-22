@@ -130,6 +130,12 @@ pub trait ComputerGate: Send + Sync {
     fn unbound(&self) -> bool {
         false
     }
+    /// Whether the agent's standing is Act fully, in force by its settings
+    /// and grant, in any turn: nothing it does is held back for the person,
+    /// jobs included.
+    fn acts_fully(&self) -> bool {
+        false
+    }
     /// Keeps a session or lasting answer as Desk's grant, or as what the
     /// agent does on its own.
     fn keep(
@@ -163,7 +169,10 @@ pub fn decide_unattended(
     let asks = matches!(decision.verdict, Verdict::Ask { .. } | Verdict::Review);
     if asks && gate.is_some_and(|g| g.unattended_runs() && !g.asks_unattended(tool_name)) {
         decision.verdict = match &decision.verdict {
-            Verdict::Ask { why, .. } if why.never_unattended() => Verdict::Refuse {
+            Verdict::Ask { why, .. }
+                if why.never_unattended() && !gate.is_some_and(|g| g.acts_fully()) =>
+            {
+                Verdict::Refuse {
                 refusal: workforce_core::computer::Refusal {
                     rule: workforce_core::computer::Refused::OutsideLevel,
                     sentence: format!(
@@ -171,7 +180,8 @@ pub fn decide_unattended(
                         why.sentence()
                     ),
                 },
-            },
+                }
+            }
             _ => Verdict::Run {
                 by: workforce_core::computer::By::Unattended,
             },
@@ -575,8 +585,9 @@ mod tests {
         ));
     }
 
-    /// A gate at Full access running what would ask in a job.
-    struct Asking(Why);
+    /// A gate at Full access running what would ask in a job, acting
+    /// fully or not.
+    struct Asking(Why, bool);
 
     impl ComputerGate for Asking {
         fn decides(&self, _tool: &str) -> bool {
@@ -592,6 +603,9 @@ mod tests {
         fn unattended_runs(&self) -> bool {
             true
         }
+        fn acts_fully(&self) -> bool {
+            self.1
+        }
     }
 
     #[test]
@@ -600,7 +614,7 @@ mod tests {
         let input = serde_json::json!({});
         for why in [Why::Unclear, Why::ForGood, Why::System] {
             let decided =
-                decide_unattended(Some(&Asking(why)), &tools, "exec.run", &input).unwrap();
+                decide_unattended(Some(&Asking(why, false)), &tools, "exec.run", &input).unwrap();
             assert!(
                 matches!(
                     &decided.verdict,
@@ -612,9 +626,18 @@ mod tests {
             );
         }
         let decided =
-            decide_unattended(Some(&Asking(Why::CantBeUndone)), &tools, "exec.run", &input)
+            decide_unattended(Some(&Asking(Why::CantBeUndone, false)), &tools, "exec.run", &input)
                 .unwrap();
         assert_eq!(decided.verdict, Verdict::Run { by: By::Unattended });
+        for why in [Why::Unclear, Why::ForGood, Why::System] {
+            let decided =
+                decide_unattended(Some(&Asking(why, true)), &tools, "exec.run", &input).unwrap();
+            assert_eq!(
+                decided.verdict,
+                Verdict::Run { by: By::Unattended },
+                "acting fully: {why:?}"
+            );
+        }
     }
 
     #[test]

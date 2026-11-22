@@ -2211,6 +2211,17 @@ fn other_machines_run_on_their_own_by_host_or_anywhere() {
         "X=1 ssh devbox ls; eval \"$X\"",
         "bash -c 'ssh devbox ls; eval \"$X\"'",
         "eval \"$X\"; sudo ls; ssh devbox true",
+        "ssh -4o 'ProxyCommand=sh -c x' devbox true",
+        "ssh -4oProxyCommand=x devbox true",
+        "ssh -qF ./cfg devbox",
+        "scp -qS ./evil a devbox:/x",
+        "ssh -o HostName=prod devbox ls",
+        "ssh devbox -oProxyCommand=x true",
+        "echo key >> \"$HOME/.ssh/authorized_keys\"; ssh devbox true",
+        "echo x | tee -a \"$HOME/.zprofile\"; ssh devbox true",
+        "echo ${X:-$(rm -rf ~)}; ssh devbox true",
+        "GIT_SSH_COMMAND=x git push; ssh devbox true",
+        "alias ssh='rm -rf ~'; ssh devbox true",
     ] {
         let c = own(in_folder(exec(probe, ACME), ACME));
         for pol in [&devbox, &anywhere] {

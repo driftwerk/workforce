@@ -348,8 +348,8 @@ impl DeskStore {
     }
 
     /// Sets what `agent` does on its own for `kind` in `scope`: `None` asks
-    /// each time again. Refused, in the person's words, where the level
-    /// doesn't fit ([`level_refusal`]). Whether there was a row to change:
+    /// each time again, never refused. Refused, in the person's words,
+    /// where a level doesn't fit ([`level_refusal`]). Whether there was a row to change:
     /// `false` only for asking again where it already asked.
     pub async fn set_on_its_own(
         &self,
@@ -359,7 +359,7 @@ impl DeskStore {
         scope: &Scope,
         level: Option<Level>,
     ) -> Result<bool> {
-        if let Some(why) = level_refusal(kind, scope, level) {
+        if let Some(why) = level.and_then(|_| level_refusal(kind, scope, level)) {
             eyre::bail!("{why}");
         }
         let client = self.pool().get().await?;

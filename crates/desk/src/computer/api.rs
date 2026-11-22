@@ -384,23 +384,21 @@ const MAX_HOST: usize = 253;
 /// that an agent may work in, as the disk spells it with its links
 /// followed.
 fn kept_scope(scope: Scope, home: &Path) -> Result<Scope, String> {
-    match scope {
+    match spelled(scope, home) {
         Scope::Whole => Ok(Scope::Whole),
         Scope::Host(host) => {
-            let host = host.trim();
-            let host = host.rsplit('@').next().unwrap_or(host).to_ascii_lowercase();
             let plain = !host.is_empty()
                 && host.len() <= MAX_HOST
-                && host
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'));
+                && (host.parse::<std::net::Ipv6Addr>().is_ok()
+                    || host
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_')));
             match plain {
                 true => Ok(Scope::Host(host)),
                 false => Err(format!("{host} isn't a host name or address.")),
             }
         }
         Scope::Site(site) => {
-            let site = site.trim().trim_end_matches('/').to_ascii_lowercase();
             let bare = site
                 .split_once("://")
                 .filter(|(scheme, _)| matches!(*scheme, "http" | "https"))
@@ -418,10 +416,6 @@ fn kept_scope(scope: Scope, home: &Path) -> Result<Scope, String> {
             }
         }
         Scope::Folder(folder) => {
-            let folder = match folder.strip_prefix("~") {
-                Ok(rest) => home.join(rest),
-                Err(_) => folder,
-            };
             let plain = folder.is_absolute()
                 && folder.components().all(|c| {
                     matches!(
@@ -444,6 +438,33 @@ fn kept_scope(scope: Scope, home: &Path) -> Result<Scope, String> {
     }
 }
 
+/// `scope` as it is kept, whatever is set there: a host lower-cased with
+/// any `user@` and IPv6 brackets dropped, a site lower-cased with no
+/// trailing `/`, a folder with `~` expanded and its links followed where
+/// it still leads somewhere.
+fn spelled(scope: Scope, home: &Path) -> Scope {
+    match scope {
+        Scope::Host(host) => {
+            let host = host.trim();
+            let host = host.rsplit('@').next().unwrap_or(host);
+            let host = host
+                .strip_prefix('[')
+                .and_then(|h| h.strip_suffix(']'))
+                .unwrap_or(host);
+            Scope::Host(host.to_ascii_lowercase())
+        }
+        Scope::Site(site) => Scope::Site(site.trim().trim_end_matches('/').to_ascii_lowercase()),
+        Scope::Folder(folder) => {
+            let folder = match folder.strip_prefix("~") {
+                Ok(rest) => home.join(rest),
+                Err(_) => folder,
+            };
+            Scope::Folder(super::boss::resolve_real(&folder).unwrap_or(folder))
+        }
+        Scope::Whole => Scope::Whole,
+    }
+}
+
 async fn put_on_its_own(
     State(s): S,
     h: HeaderMap,
@@ -456,11 +477,19 @@ async fn put_on_its_own(
     let Some(Json(body)) = body else {
         return bad("the body is {\"agent\", \"kind\", \"scope\", \"level\"}");
     };
-    let scope = match kept_scope(body.scope, &home()) {
-        Ok(scope) => scope,
-        Err(why) => return bad(why),
+    // Asking again where it was set is never refused: what is kept is
+    // removed as it was kept, however it would be judged now.
+    let scope = match body.level {
+        None => spelled(body.scope, &home()),
+        Some(_) => match kept_scope(body.scope, &home()) {
+            Ok(scope) => scope,
+            Err(why) => return bad(why),
+        },
     };
-    if let Some(why) = level_refusal(body.kind, &scope, body.level) {
+    if let Some(why) = body
+        .level
+        .and_then(|_| level_refusal(body.kind, &scope, body.level))
+    {
         return bad(why);
     }
     match s
@@ -766,6 +795,20 @@ mod tests {
             let (status, missing) = put(removed).await;
             assert_eq!(status, 404);
             assert_eq!(missing["error"], "It already asks each time there.");
+            // Asking again is never refused for how the scope is written:
+            // one no level could be set for is simply not there.
+            for odd in [
+                json!({"agent": "kat", "kind": "network", "scope": {"kind": "host", "value": "dev box"}, "level": null}),
+                json!({"agent": "kat", "kind": "commands", "scope": {"kind": "host", "value": "devbox"}, "level": null}),
+                json!({"agent": "kat", "kind": "files", "scope": {"kind": "folder", "value": "~/.ssh"}, "level": null}),
+            ] {
+                assert_eq!(put(odd.clone()).await.0, 404, "{odd}");
+            }
+            // An IPv6 address, brackets dropped, as the card reads it.
+            let v6 = json!({"agent": "kat", "kind": "network", "scope": {"kind": "host", "value": "[FE80::1]"}, "level": "anywhere"});
+            assert_eq!(put(v6).await.0, 204);
+            let gone = json!({"agent": "kat", "kind": "network", "scope": {"kind": "host", "value": "fe80::1"}, "level": null});
+            assert_eq!(put(gone).await.0, 204);
 
             for decided_by in ["on_its_own", "person"] {
                 desk.store()
