@@ -355,6 +355,7 @@ pub use workforce_hub_core::user_config;
 pub mod user_discovery;
 pub use hub_core::vault_audit;
 pub use workforce_hub_core::vault;
+pub mod personal_access;
 pub mod reconfigure;
 pub mod vault_copy;
 pub mod vault_policy;

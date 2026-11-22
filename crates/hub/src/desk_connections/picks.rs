@@ -48,6 +48,10 @@ pub struct ServicePicks {
     /// Each connection takes writes or not on its own; otherwise the
     /// service does, all together.
     pub read_only_each: bool,
+    /// It is only ever read (a bank): there are no writes to allow.
+    pub reads_only: bool,
+    /// Its approval lapses at the service and is renewed there (a bank's).
+    pub renewable: bool,
     /// The agent's connections of it are chosen one by one, rather than
     /// following the levels it reads from.
     pub chosen: bool,
@@ -179,6 +183,8 @@ impl Connections {
                     name: c.name,
                     several: c.named(),
                     read_only_each: READ_ONLY_EACH.contains(&c.id),
+                    reads_only: c.reads_only,
+                    renewable: c.renewal.is_some(),
                     chosen: a.binding.picks(c.id).is_some(),
                     connections,
                 }

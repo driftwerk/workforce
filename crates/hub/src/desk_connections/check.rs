@@ -29,6 +29,10 @@ pub struct Services {
     pub slack_api: String,
     /// `None`: `https://api.{site}`.
     pub datadog_api: Option<String>,
+    pub bank_api: String,
+    /// BankSync's per-person limit, which a check spends: the process's one
+    /// outside tests.
+    pub bank_limiter: std::sync::Arc<workforce_skills::adapters::bank::banksync::Limiter>,
     pub google_auth: String,
     pub google_token: String,
     pub google_userinfo: String,
@@ -57,6 +61,8 @@ impl Services {
             linear_api: "https://api.linear.app".into(),
             slack_api: "https://slack.com/api".into(),
             datadog_api: None,
+            bank_api: workforce_skills::adapters::bank::banksync::API.into(),
+            bank_limiter: workforce_skills::adapters::bank::banksync::Limiter::shared(),
             google_auth: workforce_skills::adapters::google::oauth::AUTH_URL.into(),
             google_token: workforce_skills::adapters::google::oauth::TOKEN_URL.into(),
             google_userinfo: workforce_skills::adapters::google::oauth::USERINFO_URL.into(),
@@ -177,13 +183,13 @@ fn account(value: &Value, keys: &[&str]) -> Option<String> {
 
 impl Services {
     /// Tests `fields` against `connector`'s service.
-    pub async fn check(&self, connector: &str, fields: &Fields) -> Found {
-        match self.check_inner(connector, fields).await {
+    pub async fn check(&self, connector: &str, person: &str, fields: &Fields) -> Found {
+        match self.check_inner(connector, person, fields).await {
             Ok(found) | Err(found) => found,
         }
     }
 
-    async fn check_inner(&self, connector: &str, f: &Fields) -> Result<Found, Found> {
+    async fn check_inner(&self, connector: &str, person: &str, f: &Fields) -> Result<Found, Found> {
         let http = &self.http;
         Ok(match connector {
             "github" => self.github_user(field(f, "token")).await?,
@@ -302,8 +308,40 @@ impl Services {
                 }
             }
             "email" => check_mailbox(f).await,
+            "bank" => self.bank(person, f).await,
             other => Found::Failed(format!("{other} can't be tested")),
         })
+    }
+
+    /// Whether a BankSync key only reads, and the bank it names is connected
+    /// with its approval standing: the bank's name. It spends `person`'s limit
+    /// at BankSync, never another's.
+    async fn bank(&self, person: &str, f: &Fields) -> Found {
+        use workforce_skills::adapters::bank::model::BankError;
+        match workforce_skills::adapters::bank::banksync::check(
+            field(f, "api_key"),
+            field(f, "bank"),
+            &self.bank_api,
+            person,
+            std::sync::Arc::clone(&self.bank_limiter),
+        )
+        .await
+        {
+            Ok(c) if c.connected => Found::Works { account: c.bank },
+            Ok(c) => Found::Refused(format!(
+                "{}'s approval has lapsed in BankSync: the person renews it there, then presses Reconnect",
+                c.bank
+            )),
+            Err(
+                e @ (BankError::Revoked
+                | BankError::ScopeMissing
+                | BankError::NotReadOnly
+                | BankError::NeedsReconnect
+                | BankError::Invalid(_)
+                | BankError::NotConfigured(_)),
+            ) => Found::Refused(e.to_string()),
+            Err(e) => Found::Failed(e.to_string()),
+        }
     }
 
     /// GitHub's `GET /user` with `token`.

@@ -99,6 +99,7 @@ fn is_member_writable(path: &str) -> bool {
 /// One representative key per skill — the flat path the adapter falls back
 /// to when no workspace is configured. Drives [`get_integrations`].
 const SCOPE_PROBES: &[(&str, &str)] = &[
+    ("bank", "skills/bank/api_key"),
     ("datadog", "skills/datadog/api_key"),
     ("email", "skills/email/accounts/default/username"),
     (

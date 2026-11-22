@@ -325,7 +325,9 @@ impl PlaybookRuntime {
                     owner,
                     visibility,
                     RunAsWrite::Unchanged,
-                    edit,
+                    // A save in a turn that read the bank marks the row, in
+                    // the same write.
+                    edit.read_personal(workforce_agent::personal::read()),
                 )
                 .await?;
         } else if owner.is_some() {

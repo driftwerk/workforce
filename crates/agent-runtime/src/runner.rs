@@ -805,6 +805,9 @@ pub struct SessionContext {
     /// a tool, a subagent) is held and counted as that work, never as the
     /// person's own.
     pub work: Option<workforce_common::work_use::Work>,
+    /// The run's [`crate::personal`] flag, carried so a bank call in the
+    /// spawned task marks its run, and what keeps things there sees it.
+    pub personal: Option<Arc<crate::personal::RunPersonal>>,
 }
 
 /// [`CURRENT_CHAT_ORIGIN`], false where unset.
@@ -862,6 +865,7 @@ impl SessionContext {
             served: CURRENT_SERVED.try_with(ServedLog::clone).ok(),
             desk: current_desk(),
             work: workforce_common::work_use::current(),
+            personal: crate::personal::current(),
         }
     }
 
@@ -889,6 +893,7 @@ impl SessionContext {
         let served = self.served;
         let desk = self.desk;
         let work = self.work;
+        let personal = self.personal;
         let layers: [(&'static tokio::task::LocalKey<String>, Option<String>, bool); 14] = [
             (&CURRENT_ARTIFACT_SCOPE, self.artifact_scope, false),
             (&CURRENT_MEMORY_FENCE, self.memory_fence, false),
@@ -949,7 +954,7 @@ impl SessionContext {
                 None => inner.await,
             }
         };
-        let inner = with_desk(desk, inner);
+        let inner = with_desk(desk, crate::personal::within(personal, inner));
         // Boxed, as the layers above: each nests the whole future once more.
         let inner: std::pin::Pin<Box<dyn std::future::Future<Output = T> + Send + '_>> =
             Box::pin(workforce_common::work_use::within_opt(work, inner));
@@ -993,6 +998,7 @@ impl SessionContext {
         let served = self.served;
         let desk = self.desk;
         let work = self.work;
+        let personal = self.personal;
         let layers: [(&'static tokio::task::LocalKey<String>, Option<String>); 11] = [
             (&CURRENT_MEMORY_FENCE, self.memory_fence),
             (&CURRENT_AGENT_ID, self.agent_id),
@@ -1026,6 +1032,7 @@ impl SessionContext {
             Some(log) => CURRENT_SERVED.sync_scope(log, outer),
             None => outer(),
         };
+        let outer = move || crate::personal::sync_within(personal, outer);
         let outer = move || CURRENT_DESK.sync_scope(desk, outer);
         let outer = move || workforce_common::work_use::sync_within_opt(work, outer);
         let outer = move || match artifact_store {
@@ -3736,8 +3743,15 @@ impl AgentRunner {
         let _turn = TurnGuard::begin();
         let mut tel = crate::turn_event::TurnTelemetry::start(&self.config);
         tel.set_task(&content);
-        let result =
-            Box::pin(self.run_with_history_content_inner(content, prior_messages, &mut tel)).await;
+        let started = std::time::Instant::now();
+        let result = crate::personal::scoped(false, async {
+            let result =
+                Box::pin(self.run_with_history_content_inner(content, prior_messages, &mut tel))
+                    .await;
+            self.trace_failed(&result, started);
+            result
+        })
+        .await;
         tel.emit(&result);
         result
     }
@@ -5005,17 +5019,42 @@ impl AgentRunner {
         let _turn = TurnGuard::begin();
         let mut tel = crate::turn_event::TurnTelemetry::start(&self.config);
         tel.set_task(&task_content);
-        let result = Box::pin(self.run_with_progress_and_history_inner(
-            task_content,
-            prior_messages,
-            progress_tx,
-            cancel_token,
-            inject_rx,
-            &mut tel,
-        ))
+        let started = std::time::Instant::now();
+        let result = crate::personal::scoped(false, async {
+            let result = Box::pin(self.run_with_progress_and_history_inner(
+                task_content,
+                prior_messages,
+                progress_tx,
+                cancel_token,
+                inject_rx,
+                &mut tel,
+            ))
+            .await;
+            self.trace_failed(&result, started);
+            result
+        })
         .await;
         tel.emit(&result);
         result
+    }
+
+    /// A run that failed is closed with an `Error` footer, so it is traced
+    /// as one; a run that closed itself already (cancelled) has nothing
+    /// left to close, and the writer drops the extra footer.
+    fn trace_failed(&self, result: &Result<RunResult>, started: std::time::Instant) {
+        let (Err(e), Some(tw)) = (result, self.config.trace_writer.as_ref()) else {
+            return;
+        };
+        if let Err(e) = tw.write_footer(&crate::trace::TraceFooter {
+            outcome: crate::trace::TraceOutcome::Error(e.to_string()),
+            completed_at: chrono::Utc::now(),
+            total_rounds: 0,
+            total_input_tokens: 0,
+            total_output_tokens: 0,
+            total_duration_ms: started.elapsed().as_millis() as u64,
+        }) {
+            warn!(error = %e, "Failed to write trace footer");
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -8579,6 +8618,8 @@ mod tests {
                 "j1",
                 "email check",
             )),
+            // A bank call in the spawned task marks the run it is part of.
+            personal: Some(Arc::default()),
         };
         let captured = Arc::new(std::sync::Mutex::new(SessionContext::default()));
         let c = Arc::clone(&captured);
@@ -8595,6 +8636,10 @@ mod tests {
         );
         assert_eq!(after.artifact_scope, original.artifact_scope);
         assert_eq!(after.key, original.key);
+        assert!(Arc::ptr_eq(
+            after.personal.as_ref().unwrap(),
+            original.personal.as_ref().unwrap()
+        ));
         assert_eq!(after.memory_fence, original.memory_fence);
         assert_eq!(after.id, original.id);
         assert_eq!(after.user_id, original.user_id);

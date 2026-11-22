@@ -2842,6 +2842,13 @@ pub(crate) async fn know_how_block(
     }
 }
 
+/// Whether the turn's session is one know-how and turn extraction learn
+/// from: never an eval's, nor one that read the person's bank (which
+/// lessons skip too).
+pub(crate) fn learns_from(session: &workforce_common::session::Session) -> bool {
+    !crate::turn_extraction::is_eval_channel(&session.channel) && !session.read_personal()
+}
+
 /// Learn from a finished turn in the background (see [`crate::know_how`]).
 pub(crate) async fn spawn_know_how(
     service: &AgentService,
@@ -2856,7 +2863,7 @@ pub(crate) async fn spawn_know_how(
     let Some(person) = know_how_person(service, session, principal) else {
         return;
     };
-    if crate::turn_extraction::is_eval_channel(&session.channel) {
+    if !learns_from(session) {
         return;
     }
     let kh = crate::know_how::KnowHow::shared(&service.config).await;
@@ -2954,7 +2961,7 @@ pub(crate) fn spawn_turn_extraction(
     response: &str,
     principal: &str,
 ) {
-    if crate::turn_extraction::is_eval_channel(&session.channel) {
+    if !learns_from(session) {
         return;
     }
     let mem = service.effective_memory();
@@ -3338,7 +3345,9 @@ pub(crate) async fn process_turn(
         chat: crate::serve::in_chat_turn(),
         ..SessionContext::capture()
     }
-    .scope(Box::pin(process_admitted(
+    // The turn's own bank flag: its runs mark it, and what keeps the turn
+    // after them asks it.
+    .scope(Box::pin(workforce_agent::personal::scoped(false, process_admitted(
         service,
         AdmittedTurn {
             channel,
@@ -3356,7 +3365,7 @@ pub(crate) async fn process_turn(
             trust_level,
             author,
         },
-    )))
+    ))))
     .await
 }
 
@@ -3972,6 +3981,7 @@ pub(crate) async fn process_admitted(
     }
 
     record_round_cap_continuation(&mut session, &result);
+    extraction::note_personal_read(&service.sessions, &mut session, &result.tool_invocations);
     service.sessions.save(&session)?;
     turn_journal.clear();
     persist_turn_owned_metadata(&service.sessions, &session);
@@ -4004,29 +4014,32 @@ pub(crate) async fn process_admitted(
 
     // Fire-and-forget lesson extraction + reinforcement. Both are
     // bounded — extraction LLM-calls only on detector-positive turns,
-    // reinforcement is a no-op when nothing was injected this turn.
-    crate::lessons::run_post_turn(
-        crate::lessons::LessonPipelineConfig {
-            // A shared session belongs to no single user; distilling its turns
-            // into the agent's recallable lessons would widen the room's
-            // content. Reinforcement self-gates (nothing is injected in a
-            // shared room, so it no-ops).
-            extract_enabled: service.effective_memory().lesson_extract
-                && !session.is_shared_conversation()
-                && !session.kept_apart(),
-            llm: &service.llm,
-            store: service.memory_store.as_ref(),
-            agent_id: &service.agent_id,
-            extract_model: lesson_extract_model(service),
-            extract_prompt: service.effective_memory().lesson_extract_prompt.clone(),
-            cost_tracker: &service.cost_tracker,
-            sessions: &service.sessions,
-        },
-        &mut session,
-        archive_base,
-        &effective_message,
-        &result.response,
-    );
+    // reinforcement is a no-op when nothing was injected this turn. A
+    // conversation that read the person's bank teaches none.
+    if !session.read_personal() {
+        crate::lessons::run_post_turn(
+            crate::lessons::LessonPipelineConfig {
+                // A shared session belongs to no single user; distilling its turns
+                // into the agent's recallable lessons would widen the room's
+                // content. Reinforcement self-gates (nothing is injected in a
+                // shared room, so it no-ops).
+                extract_enabled: service.effective_memory().lesson_extract
+                    && !session.is_shared_conversation()
+                    && !session.kept_apart(),
+                llm: &service.llm,
+                store: service.memory_store.as_ref(),
+                agent_id: &service.agent_id,
+                extract_model: lesson_extract_model(service),
+                extract_prompt: service.effective_memory().lesson_extract_prompt.clone(),
+                cost_tracker: &service.cost_tracker,
+                sessions: &service.sessions,
+            },
+            &mut session,
+            archive_base,
+            &effective_message,
+            &result.response,
+        );
+    }
 
     // Fire-and-forget background compaction if deferred
     if needs_compaction && !needs_urgent {
@@ -5593,7 +5606,9 @@ pub(crate) async fn stream_admitted(
     let in_flight_for_task = crate::memory_fence::TurnInFlight::begin(&service.workspace);
     // Whether a person's message started it, for what its runner asks.
     let chat_for_task = workforce_agent::runner::chat_origin();
-    let handle = tokio::spawn(workforce_agent::runner::CURRENT_CHAT_ORIGIN.scope(chat_for_task, workforce_agent::runner::CURRENT_MEMORY_FENCE.scope(memory_fence_for_task, workforce_agent::runner::with_desk(desk_scope_for_task, CURRENT_BILLING_IDENTITY.scope(
+    // The turn's own bank flag: its runs mark it, and what keeps the turn
+    // after them asks it.
+    let handle = tokio::spawn(workforce_agent::personal::scoped(false, workforce_agent::runner::CURRENT_CHAT_ORIGIN.scope(chat_for_task, workforce_agent::runner::CURRENT_MEMORY_FENCE.scope(memory_fence_for_task, workforce_agent::runner::with_desk(desk_scope_for_task, CURRENT_BILLING_IDENTITY.scope(
         billing_identity_for_task.unwrap_or_default(),
         CURRENT_VOICE_CHANNEL.scope(
         voice_channel_for_task,
@@ -5973,6 +5988,11 @@ pub(crate) async fn stream_admitted(
                     "Agent run complete"
                 );
 
+                extraction::note_personal_read(
+                    &me.sessions,
+                    &mut session,
+                    &result.tool_invocations,
+                );
                 // Fire-and-forget post-turn extraction (passive memory +
                 // DM-only relationship capture), shared with
                 // `process_message` via `spawn_turn_extraction`.
@@ -5991,22 +6011,24 @@ pub(crate) async fn stream_admitted(
                 )
                 .await;
 
-                crate::lessons::run_post_turn(
-                    crate::lessons::LessonPipelineConfig {
-                        extract_enabled: ls_extract_enabled,
-                        llm: &ls_llm,
-                        store: ls_store.as_ref(),
-                        agent_id: &ls_agent_id,
-                        extract_model: ls_extract_model,
-                        extract_prompt: ls_extract_prompt,
-                        cost_tracker: &ls_cost_tracker,
-                        sessions: &ls_sessions,
-                    },
-                    &mut session,
-                    archive_base_for_task,
-                    &effective_message,
-                    &result.response,
-                );
+                if !session.read_personal() {
+                    crate::lessons::run_post_turn(
+                        crate::lessons::LessonPipelineConfig {
+                            extract_enabled: ls_extract_enabled,
+                            llm: &ls_llm,
+                            store: ls_store.as_ref(),
+                            agent_id: &ls_agent_id,
+                            extract_model: ls_extract_model,
+                            extract_prompt: ls_extract_prompt,
+                            cost_tracker: &ls_cost_tracker,
+                            sessions: &ls_sessions,
+                        },
+                        &mut session,
+                        archive_base_for_task,
+                        &effective_message,
+                        &result.response,
+                    );
+                }
 
                 // Spawn background compaction if it was deferred earlier
                 if deferred_compaction {
@@ -6113,7 +6135,7 @@ pub(crate) async fn stream_admitted(
     ),
     ),
     ),
-    )))));
+    ))))));
 
     // Everything downstream reads the reply without voice directions; they
     // travel beside it.

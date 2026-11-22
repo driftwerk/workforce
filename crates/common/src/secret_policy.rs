@@ -157,6 +157,10 @@ fn resolve_one(
         warn!(target: "sentinel.audit", "secret refused: a Desk link is never a workflow secret");
         return Err(eyre!("{SECRET_REFUSED}"));
     }
+    if crate::connector_binding::is_personal_secret(&marker.key) {
+        warn!(target: "sentinel.audit", "secret refused: a personal connector's key is never a workflow secret");
+        return Err(eyre!("{SECRET_REFUSED}"));
+    }
 
     let resolved = if is_per_user_scope(marker.scope) {
         // Resolve the owner's per-user secret by its explicit physical path at
@@ -403,6 +407,51 @@ mod tests {
         };
         with_policy(deny, async move {
             assert!(resolve_secret_markers("[[vault:agent_user:k]]", &store, None).is_err());
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn a_bank_key_is_never_a_workflow_secret_even_declared_by_its_owner() {
+        let linear = "skills/linear/workspaces/acme/api_key";
+        let banks = [
+            "skills/bank/api_key",
+            "skills/bank/workspaces/natwest/api_key",
+        ];
+        let entries: Vec<(String, VaultSource, &str)> = banks
+            .iter()
+            .chain([&linear])
+            .map(|k| (format!("users/alice/{k}"), VaultSource::AgentSpecific, "k"))
+            .collect();
+        let store = TierStore::with(
+            &entries
+                .iter()
+                .map(|(p, t, v)| (p.as_str(), *t, *v))
+                .collect::<Vec<_>>(),
+        );
+        let policy = SecretPolicy {
+            per_user_identity: Some("alice".to_string()),
+            declared: declared(
+                &banks
+                    .iter()
+                    .chain([&linear])
+                    .map(|k| ("agent_user", *k, &[] as &[&str]))
+                    .collect::<Vec<_>>(),
+            ),
+            ..Default::default()
+        };
+        with_policy(policy, async move {
+            let marker = |key: &str| format!("[[vault:agent_user:{key}]]");
+            assert_eq!(
+                resolve_secret_markers(&marker(linear), &store, None).unwrap(),
+                "k"
+            );
+            for key in banks {
+                assert!(
+                    resolve_secret_markers(&marker(key), &store, None).is_err(),
+                    "{key}"
+                );
+            }
         })
         .await;
     }

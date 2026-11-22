@@ -176,6 +176,22 @@ fn uses_their_chrome(tool: &str, effect: &Effect) -> bool {
         || matches!(effect, Effect::Connector { connector, .. } if is_browser_key(connector))
 }
 
+/// Why a browser call on BankSync's site, in the person's Chrome or Desk's
+/// own headless browser, may not be made in this run: its pages show the person's banks, accounts and transactions, so they are
+/// opened only where the bank may be read (the person's own Desk, watched).
+fn banksync_refusal(effect: &Effect) -> Option<&'static str> {
+    let Effect::Connector { connector, .. } = effect else {
+        return None;
+    };
+    let origin = connector
+        .strip_prefix("chrome-visit:")
+        .or_else(|| connector.strip_prefix("chrome:"))
+        .or_else(|| connector.strip_prefix("browser:"))?;
+    (origin == crate::desk_connections::catalog::BANKSYNC_APP)
+        .then(crate::personal_access::read_refusal)
+        .flatten()
+}
+
 /// Where the person's home is.
 fn home() -> PathBuf {
     std::env::var_os("HOME")
@@ -947,6 +963,16 @@ impl ComputerGate for HubComputerGate {
                 },
             };
         }
+        // BankSync's pages show the person's banks and their transactions:
+        // the browser opens them only where the bank itself may be read.
+        if let Some(why) = banksync_refusal(effect) {
+            return Verdict::Refuse {
+                refusal: Refusal {
+                    rule: Refused::OutsideLevel,
+                    sentence: why.to_string(),
+                },
+            };
+        }
         // "Sign in for me" is for the person in Desk on this computer, who
         // can see Desk's browser: never a turn in Slack or another client.
         if (tool == SIGN_IN || tool == SIGNED_IN)
@@ -1074,6 +1100,48 @@ pub fn install(computer: Computer, config: Arc<WorkforceConfig>) {
 mod tests {
     use std::path::Path;
     use std::time::Duration;
+
+    /// BankSync's site is opened in the browser only where the bank itself
+    /// may be read: never off Desk, in a room, or unwatched; another site is
+    /// left to the gate.
+    #[tokio::test]
+    async fn banksync_s_pages_are_opened_only_where_the_bank_is_read() {
+        use workforce_common::channels::desk::{DeskPlace, DeskScope, DeskTarget};
+        let at = |site: &str, visit: bool| Effect::Connector {
+            connector: workforce_skills::adapters::browser::site_key(visit, Some(site)),
+            write: false,
+        };
+        let bank = crate::desk_connections::catalog::BANKSYNC_APP;
+        assert!(
+            super::banksync_refusal(&at(bank, true)).is_some(),
+            "off Desk"
+        );
+        assert!(super::banksync_refusal(&at(bank, false)).is_some());
+        assert!(super::banksync_refusal(&at("https://linear.app", true)).is_none());
+        let headless = Effect::Connector {
+            connector: format!("browser:{bank}"),
+            write: false,
+        };
+        assert!(super::banksync_refusal(&headless).is_some(), "headless too");
+        let desk = |place: DeskPlace, attended: bool| DeskScope {
+            target: DeskTarget::of_turn(&place, "desk", None, false),
+            owner: "ann".into(),
+            attended,
+            relayed: false,
+        };
+        let in_dm = workforce_agent::runner::with_desk(
+            Some(desk(DeskPlace::Dm { thread: None }, true)),
+            async { super::banksync_refusal(&at(bank, true)) },
+        )
+        .await;
+        assert_eq!(in_dm, None);
+        let unwatched = workforce_agent::runner::with_desk(
+            Some(desk(DeskPlace::Dm { thread: None }, false)),
+            async { super::banksync_refusal(&at(bank, false)) },
+        )
+        .await;
+        assert!(unwatched.is_some());
+    }
 
     use async_trait::async_trait;
     use serde_json::{json, Value};
