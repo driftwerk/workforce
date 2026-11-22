@@ -1336,30 +1336,25 @@ pub fn publishes_on(command: &str, branch: Option<&str>) -> bool {
     })
 }
 
-/// Whether a line starts a shell or an interpreter that runs what it reads
-/// from stdin (`bash -s`, `sh`, `python3 -`), or can't be read.
-fn runs_stdin(script: &str) -> bool {
+/// Whether a command run with something on its stdin surely doesn't run
+/// it: one simple command, written out, among a few that read stdin as
+/// data at most. Anything else (a shell, `sudo`, `env sh`, `. /dev/stdin`)
+/// may run what it is fed.
+fn reads_no_script(script: &str) -> bool {
+    const DATA: &[&str] = &[
+        "cat", "ls", "echo", "true", "false", "pwd", "uptime", "df", "uname", "hostname", "whoami",
+        "date", "wc", "sort", "head", "tail", "grep",
+    ];
     let Ok(commands) = split(script) else {
-        return true;
+        return false;
     };
-    commands.iter().any(|c| {
-        let words: Vec<&Word> = c.words.iter().filter(|w| !is_assignment(w)).collect();
-        let Some((first, args)) = words.split_first() else {
-            return false;
-        };
-        let name = first.text.rsplit('/').next().unwrap_or(&first.text);
-        if first.dynamic {
-            return true;
-        }
-        if SHELLS.contains(&name) || other_shell(name) {
-            return match shell_options(args) {
-                Ok((true, _, _)) => false,
-                Ok((false, stdin, at)) => stdin || args.get(at).is_none_or(|w| from_stdin(w)),
-                Err(()) => true,
-            };
-        }
-        interpreter(name) && operands(args).first().is_none_or(|w| from_stdin(w))
-    })
+    let [only] = commands.as_slice() else {
+        return false;
+    };
+    only.words
+        .first()
+        .is_some_and(|w| !w.dynamic && DATA.contains(&w.text.as_str()))
+        && only.words.iter().all(|w| !w.dynamic)
 }
 
 /// The words a line that can't be read is told to publish by.
@@ -1439,8 +1434,7 @@ fn publishes_words(
                     let fed = simple.fed || simple.piped_in || simple.reads_file;
                     let script = remote_script(remote);
                     remote.iter().any(|w| w.dynamic)
-                        || (remote.is_empty() && fed)
-                        || runs_stdin(&script)
+                        || (fed && !reads_no_script(&script))
                         || publishes_on(&script, Some(DEFAULT_BRANCHES[0]))
                 }
                 None => false,
@@ -1565,6 +1559,11 @@ struct Splitter {
     redirect: bool,
     /// That target is a file written: whether it is appended to.
     redirect_to: Option<bool>,
+    /// That target is what stdin reads (`< f`, `<> f`, `<&3`).
+    redirect_in: bool,
+    /// The `$` being read is inside double quotes: a `"` after it closes
+    /// them.
+    in_quotes: bool,
     /// The next word is a heredoc's delimiter.
     delimiter: Option<bool>,
     /// That delimiter has a quote or a backslash in it: the body is text.
@@ -1626,6 +1625,8 @@ fn split_as(command: &str, void: bool) -> Result<(Vec<Simple>, bool), ()> {
         heredocs: vec![],
         redirect: false,
         redirect_to: None,
+        redirect_in: false,
+        in_quotes: false,
         delimiter: None,
         quoted: false,
         closed: false,
@@ -1687,6 +1688,12 @@ impl Splitter {
             self.heredocs.push((word.text, strip, quoted));
         } else if self.redirect {
             self.redirect = false;
+            // `/dev/null`, or `<&-` closing it, feeds nothing.
+            if std::mem::take(&mut self.redirect_in)
+                && (word.dynamic || !matches!(word.text.as_str(), "/dev/null" | "-"))
+            {
+                self.current.reads_file = true;
+            }
             if let Some(append) = self.redirect_to.take() {
                 self.current.writes.push((word, append));
             }
@@ -2027,11 +2034,13 @@ impl Splitter {
                 }
                 // A `$` before nothing it expands stays a `$`; one before
                 // anything else (`$[x]`, arithmetic, or zsh's `$~x`, `$=x`)
-                // can't be read. `$'…'` and `$"…"` are quotes, read next.
+                // can't be read. `$'…'` is a quote, read next; `$"…"` is
+                // translated, and a translation may hold `$(…)`.
+                let quotes = self.in_quotes;
                 if self.at == start
-                    && !self
-                        .peek(0)
-                        .is_none_or(|c| c.is_whitespace() || "'\"/.:,;|&)<>}%".contains(c))
+                    && !self.peek(0).is_none_or(|c| {
+                        c.is_whitespace() || "'/.:,;|&)<>}%".contains(c) || (c == '"' && quotes)
+                    })
                 {
                     return Err(());
                 }
@@ -2102,7 +2111,12 @@ impl Splitter {
                                     self.at += 1;
                                 }
                             }
-                            Some('$') => self.dollar()?,
+                            Some('$') => {
+                                self.in_quotes = true;
+                                let read = self.dollar();
+                                self.in_quotes = false;
+                                read?
+                            }
                             Some('`') => return Err(()),
                             Some(n) => {
                                 self.push_char(n);
@@ -2322,9 +2336,7 @@ impl Splitter {
         if self.peek(0) == Some('&') {
             self.at += 1;
         }
-        if c == '<' && !both && !dup {
-            self.current.reads_file = true;
-        }
+        self.redirect_in = c == '<';
         self.redirect = true;
         self.redirect_to = ((c == '>' || both) && !dup).then_some(append);
         Ok(())
@@ -5468,6 +5480,9 @@ mod tests {
             "echo ${(P)x}",
             "echo ${(e)x}",
             "echo $~x $=x",
+            // A translated string may hold `$(…)`.
+            "echo $\"hello\"",
+            "echo $\"a $(rm -rf ~)\"",
         ] {
             assert_eq!(asks(command), Some(U), "{command:?}");
         }
@@ -5535,6 +5550,18 @@ mod tests {
             "ssh prod 'bash -s' <<< 'kubectl apply -f x'",
             "ssh prod < cmds.txt",
             "ssh prod 'cd repo && git push'",
+            // Fed, to anything not known to read its stdin as data only.
+            "echo 'npm publish' | ssh prod 'bash -c \"cat | sh\"'",
+            "ssh prod 'sh -c sh' < f",
+            "echo 'npm publish' | ssh prod sudo bash",
+            "echo 'npm publish' | ssh prod env sh",
+            "echo 'npm publish' | ssh prod nohup bash",
+            "echo 'npm publish' | ssh prod timeout 60 sh",
+            "echo 'npm publish' | ssh prod exec bash",
+            "echo 'npm publish' | ssh prod sudo -s",
+            "echo 'npm publish' | ssh prod '. /dev/stdin'",
+            "ssh prod <> f",
+            "exec 3< f; ssh prod 0<&3",
         ] {
             assert!(publishes_on(command, Some("main")), "{command:?}");
         }
@@ -5551,6 +5578,10 @@ mod tests {
             "bash -c -- 'npm test'",
             "ssh devbox 'cd repo && cargo test'",
             "ssh prod ls < /dev/null",
+            "ssh prod < /dev/null",
+            "ssh prod 0<&-",
+            "echo x | ssh prod cat",
+            "ssh prod wc -l < f",
             "ssh devbox 'git push origin feat/x'",
         ] {
             assert!(!publishes_on(command, Some("main")), "{command:?}");
