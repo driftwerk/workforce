@@ -2565,7 +2565,12 @@ async fn a_closed_or_removed_session_frees_its_plans_slot_and_a_restart_keeps_it
                 view: None,
                 worktree: false,
             };
-            sessions.push(d.plan_start(&plan, &start, &sarah(), &by_sarah()).await.unwrap().id);
+            sessions.push(
+                d.plan_start(&plan, &start, &sarah(), &by_sarah())
+                    .await
+                    .unwrap()
+                    .id,
+            );
         }
         let held = async |d: &crate::Desk| crate::plan::held(&d.plan_tickets(id).await.unwrap());
         assert_eq!(held(&d).await, 2);

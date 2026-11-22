@@ -412,7 +412,6 @@ impl DeskStore {
         self.tickets_where("plan = $1", &[&id]).await
     }
 
-    /// The tickets assigned to the session `id`.
     /// Says the session `session` (`machine/id` for one on a machine) was
     /// closed or removed, or runs again when not `closed`, on the tickets
     /// assigned to it: a closed one's hold no slot of their plan.
@@ -429,6 +428,7 @@ impl DeskStore {
             .await?)
     }
 
+    /// The tickets assigned to the session `id`.
     pub async fn session_tickets(&self, id: Uuid) -> Result<Vec<Ticket>> {
         self.tickets_where(
             "assignee ->> 'kind' = 'session' AND assignee ->> 'id' = $1",

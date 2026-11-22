@@ -778,10 +778,19 @@ impl Desk {
     }
 
     /// Which of the sessions `ids` were closed or removed here: not one
-    /// open, and closed or no longer known to the store.
-    pub async fn closed_among(&self, ids: &[Uuid]) -> Result<Vec<Uuid>, DeskError> {
+    /// open, and closed or no longer known to the store. Only those in a
+    /// group `sees` lets the asker see are said: a removed one is in none.
+    pub async fn closed_among(
+        &self,
+        ids: &[Uuid],
+        sees: impl Fn(Option<&str>) -> bool,
+    ) -> Result<Vec<Uuid>, DeskError> {
+        let layout = self.layout();
         let mut closed = Vec::new();
-        for &id in ids {
+        for &id in ids
+            .iter()
+            .filter(|&&id| sees(crate::scope::group_of(&super::session_item(id), &layout)))
+        {
             let state = match self.view(id) {
                 Ok(v) => Some(v.state),
                 Err(_) => self

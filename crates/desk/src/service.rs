@@ -2608,7 +2608,11 @@ impl Desk {
         }
         let _ = self.0.persist.send(Persist::Put(Box::new(r)));
         let closed = view.state == SessionState::Closed;
-        if closed != before.as_ref().is_some_and(|b| b.state == SessionState::Closed) {
+        if closed
+            != before
+                .as_ref()
+                .is_some_and(|b| b.state == SessionState::Closed)
+        {
             let _ = self.0.persist.send(Persist::Closed(id, closed));
         }
         if noticed {

@@ -236,10 +236,14 @@ impl DeskTool {
                     .flatten()
                     .filter_map(|i| i.as_str()?.parse().ok())
                     .collect();
-                let closed = d.closed_among(&named).await?;
+                let closed = d.closed_among(&named, |g| seen.sees(g)).await?;
                 let mut all = out(mine)?;
                 if let Some(all) = all.as_array_mut() {
-                    all.extend(closed.iter().map(|id| json!({ "id": id, "state": "closed" })));
+                    all.extend(
+                        closed
+                            .iter()
+                            .map(|id| json!({ "id": id, "state": "closed" })),
+                    );
                 }
                 Ok(all)
             }

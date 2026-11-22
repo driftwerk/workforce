@@ -288,7 +288,8 @@ async fn a_plans_session_on_a_machine_holds_its_slot_until_the_machine_says_it_w
         let there: Arc<parking_lot::Mutex<Vec<Value>>> = Arc::default();
         let closed: Arc<parking_lot::Mutex<Vec<String>>> = Arc::default();
         let poller = {
-            let (crew, there, closed) = (Arc::clone(&crew), Arc::clone(&there), Arc::clone(&closed));
+            let (crew, there, closed) =
+                (Arc::clone(&crew), Arc::clone(&there), Arc::clone(&closed));
             tokio::spawn(async move {
                 loop {
                     for c in crew.relay_take(Duration::from_millis(100)).await {
@@ -373,7 +374,9 @@ async fn a_plans_session_on_a_machine_holds_its_slot_until_the_machine_says_it_w
         assert_ne!(there.lock()[0]["id"], json!(first));
         let was = format!("devbox/{first}");
         let tickets = d.plan_tickets(id).await.unwrap();
-        assert!(tickets.iter().all(|t| t.session.as_deref() != Some(was.as_str())));
+        assert!(tickets
+            .iter()
+            .all(|t| t.session.as_deref() != Some(was.as_str())));
         assert_eq!(held_now(&d, id).await, 1);
         poller.abort();
     })
@@ -1278,7 +1281,10 @@ async fn a_dismissed_start_holds_no_slot_and_the_next_is_suggested() {
                 .await
                 .unwrap()
         };
-        let mut first = eventually("the first start suggested", async || suggested().await.pop()).await;
+        let mut first = eventually("the first start suggested", async || {
+            suggested().await.pop()
+        })
+        .await;
         tokio::time::sleep(Duration::from_millis(600)).await;
         assert_eq!(suggested().await.len(), 1, "one at a time");
         first.state = workforce_desk::crew::SuggestionState::Dismissed;
@@ -2925,9 +2931,12 @@ async fn desk_sessions_says_which_of_the_ids_asked_about_were_closed_or_removed_
             .unwrap();
         let out = workforce_agent::runner::CURRENT_AGENT_ID
             .scope("desk".to_string(), async move {
-                workforce_agent::tools::Tool::execute(&tool, json!({ "ids": [open, shut, removed] }))
-                    .await
-                    .unwrap()
+                workforce_agent::tools::Tool::execute(
+                    &tool,
+                    json!({ "ids": [open, shut, removed] }),
+                )
+                .await
+                .unwrap()
             })
             .await
             .output;

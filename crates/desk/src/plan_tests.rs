@@ -1144,7 +1144,10 @@ fn eighteen_sessions_on_a_machine_hold_eighteen_slots_whatever_was_seen_of_them(
     assert_eq!(held(&tickets), 18);
     assert!(next_starts(&p, &tickets, room(&p, 18, 0, 12), None).is_empty());
     let line = full(&progress(&tickets), 4).unwrap();
-    assert!(line.starts_with("holds 18 of 4 sessions: ACM-1, ACM-2,"), "{line}");
+    assert!(
+        line.starts_with("holds 18 of 4 sessions: ACM-1, ACM-2,"),
+        "{line}"
+    );
     // Fifteen closed: one slot of four is free.
     for t in &mut tickets[..15] {
         t.session = None;

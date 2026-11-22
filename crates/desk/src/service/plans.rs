@@ -61,6 +61,9 @@ pub struct PlanSummary {
     /// breaker does: its own budget, its group's or Desk's. The person
     /// says Continue on the Floor.
     pub held: Option<String>,
+    /// How many sessions it runs at once: its own limit within its boss's,
+    /// as its runner counts them; none while no boss of it oversees.
+    pub limit: Option<usize>,
 }
 
 /// A plan's ticket as its card shows it.
@@ -398,8 +401,14 @@ impl Desk {
             progress: plan::progress(&tickets),
             budget,
             held: self.plan_held(&p),
+            limit: self.plan_limit(&p),
             plan: p,
         })
+    }
+
+    /// How many sessions `p` runs at once ([`PlanSummary::limit`]).
+    fn plan_limit(&self, p: &Plan) -> Option<usize> {
+        self.crew()?.boss_limit(&p.boss).map(|l| p.limit(l))
     }
 
     /// What holds `p`'s new starts now, while it is open.
@@ -500,6 +509,7 @@ impl Desk {
                 progress: plan::progress(&rows),
                 budget: applied.budget.clone(),
                 held: self.plan_held(&p),
+                limit: self.plan_limit(&p),
                 plan: p,
             },
             tickets: shown,
