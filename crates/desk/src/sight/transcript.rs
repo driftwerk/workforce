@@ -33,16 +33,16 @@ pub const STEP_MAX: usize = 12_000;
 
 /// A record's bytes, read by range.
 pub trait Ranges {
-    fn len(&self) -> u64;
-    fn read(&self, at: u64, len: u64) -> io::Result<Vec<u8>>;
+    fn size(&self) -> u64;
+    fn read_at(&self, at: u64, len: u64) -> io::Result<Vec<u8>>;
 }
 
 impl Ranges for [u8] {
-    fn len(&self) -> u64 {
+    fn size(&self) -> u64 {
         self.len() as u64
     }
 
-    fn read(&self, at: u64, len: u64) -> io::Result<Vec<u8>> {
+    fn read_at(&self, at: u64, len: u64) -> io::Result<Vec<u8>> {
         let start = usize::try_from(at).unwrap_or(usize::MAX).min(self.len());
         let end = usize::try_from(at.saturating_add(len))
             .unwrap_or(usize::MAX)
@@ -92,7 +92,7 @@ impl<'a, R: Ranges + ?Sized> Spans<'a, R> {
         Self {
             r,
             engine,
-            pos: end.min(r.len()),
+            pos: end.min(r.size()),
             carry: Vec::new(),
             lines: VecDeque::new(),
             parts: VecDeque::new(),
@@ -117,7 +117,7 @@ impl<'a, R: Ranges + ?Sized> Spans<'a, R> {
                 return Ok(None);
             }
             let start = self.pos.saturating_sub(CHUNK);
-            let mut buf = self.r.read(start, self.pos - start)?;
+            let mut buf = self.r.read_at(start, self.pos - start)?;
             self.read += self.pos - start;
             buf.append(&mut self.carry);
             let mut pieces = buf.split(|b| *b == b'\n');
@@ -682,14 +682,15 @@ mod tests {
 
     #[test]
     fn a_codex_rollout_pages_through_its_own_reader() {
-        let line = |v: Value| v.to_string();
+        let said = |n: u32, role: &str, kind: &str, text: &str| {
+            json!({"timestamp": ts(n), "type": "response_item", "payload": {"type": "message",
+                "role": role, "content": [{"type": kind, "text": text}]}})
+            .to_string()
+        };
         let r = record(&[
-            line(json!({"timestamp": ts(0), "type": "event_msg",
-                "payload": {"type": "user_message", "message": "fix the build"}})),
-            line(json!({"timestamp": ts(1), "type": "event_msg",
-                "payload": {"type": "agent_message", "message": "fixed"}})),
-            line(json!({"timestamp": ts(2), "type": "event_msg",
-                "payload": {"type": "user_message", "message": "now test it"}})),
+            said(0, "user", "input_text", "fix the build"),
+            said(1, "assistant", "output_text", "fixed"),
+            said(2, "user", "input_text", "now test it"),
         ]);
         let p = page(r.as_slice(), Engine::Codex, r.len() as u64, &Hides).unwrap();
         assert_eq!(asks(&p), ["now test it", "fix the build"]);

@@ -700,11 +700,11 @@ struct FileRanges {
 }
 
 impl Ranges for FileRanges {
-    fn len(&self) -> u64 {
+    fn size(&self) -> u64 {
         self.len
     }
 
-    fn read(&self, at: u64, len: u64) -> std::io::Result<Vec<u8>> {
+    fn read_at(&self, at: u64, len: u64) -> std::io::Result<Vec<u8>> {
         use std::io::{Read, Seek, SeekFrom};
         let mut file = self.file.borrow_mut();
         file.seek(SeekFrom::Start(at))?;
