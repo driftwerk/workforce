@@ -70,10 +70,11 @@ pub enum IsolatedRoute {
 
 /// Metadata a turn computes for itself and nothing else writes: the observed
 /// prompt size and the calibration ratio derived from it (which drive the
-/// context estimate compaction keys on), the round-cap record, and the CLI
-/// transcript its turns continue.
-const TURN_OWNED_METADATA: [&str; 5] = [
+/// context estimate compaction keys on), the round-cap record, the CLI
+/// transcript its turns continue, and its guard while it is unfinished.
+const TURN_OWNED_METADATA: [&str; 6] = [
     "observed_input_tokens",
+    workforce_common::session::TURN_CONTENT_SCOPE,
     "estimate_calibration",
     "round_cap_continuation",
     crate::hub_core::subscriptions::CliKind::ClaudeCode.slot_key(),
@@ -3210,6 +3211,7 @@ pub fn reply_only(response: String) -> RunResult {
         hit_round_cap: false,
         injected_user_messages: Vec::new(),
         gate_notice: None,
+        guard: None,
     }
 }
 
@@ -3773,6 +3775,7 @@ pub mod tests {
             hit_round_cap: budget_capped,
             injected_user_messages: Vec::new(),
             gate_notice: None,
+            guard: None,
         }
     }
 

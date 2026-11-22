@@ -561,6 +561,10 @@ pub const LEFT_SCOPE_KEY: &str = "desk_scope_left";
 /// code writes it, and it follows the conversation's rollovers.
 pub const DESK_BOSS_KEY: &str = "desk_boss";
 
+/// The metadata key a turn's guard is kept under while the turn is
+/// unfinished ([`Session::turn_content_scope`]).
+pub const TURN_CONTENT_SCOPE: &str = "turn_content_scope";
+
 /// A conversation session between a user and an agent.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Session {
@@ -1213,6 +1217,28 @@ impl Session {
     pub fn set_content_scope(&mut self, scope: serde_json::Value) {
         self.metadata_object_mut()
             .insert("content_scope".into(), scope);
+    }
+
+    /// The guard of the turn on this session that has not finished, as it
+    /// was when the turn stopped: kept while a call waits on someone's
+    /// answer or after a restart cut the turn off, and gone once a turn
+    /// finishes.
+    pub fn turn_content_scope(&self) -> Option<&serde_json::Value> {
+        self.metadata.get(TURN_CONTENT_SCOPE)
+    }
+
+    pub fn set_turn_content_scope(&mut self, scope: Option<serde_json::Value>) {
+        match scope {
+            Some(scope) => {
+                self.metadata_object_mut()
+                    .insert(TURN_CONTENT_SCOPE.into(), scope);
+            }
+            None => {
+                if let Some(metadata) = self.metadata.as_object_mut() {
+                    metadata.remove(TURN_CONTENT_SCOPE);
+                }
+            }
+        }
     }
 
     /// True between a rollover's sync seal+mint and its async carry-over

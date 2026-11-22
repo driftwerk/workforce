@@ -282,6 +282,16 @@ pub trait Tool: Send + Sync {
         false
     }
 
+    /// Whether the person's standing choice already decides a call of this
+    /// tool for the agent it is registered for, as an overseer's crew tools
+    /// are decided by its oversight level and act switches. A turn steered
+    /// by outside content takes it as named for the turn
+    /// ([`Call::standing`](crate::security::monitor::Call::standing)).
+    /// `false`, the default.
+    fn standing_choice(&self) -> bool {
+        false
+    }
+
     /// What THIS call does to this computer: reads, writes or deletes which
     /// paths, runs which command where, starts a session where. A hub with
     /// `[desk]` decides a call in a namespace that touches this computer by
@@ -319,89 +329,37 @@ pub trait Tool: Send + Sync {
     }
 }
 
-/// A tool saying what it returns is outside content
-/// ([`Tool::reads_outside_content`]); in every other way, the tool it wraps.
-pub struct ReadsOutside(std::sync::Arc<dyn Tool>);
+/// The methods a tool wrapping another answers as the tool it wraps,
+/// saying what a call does: where it writes, whether what it returns is
+/// outside content, whether the person's standing choice decides it, and
+/// what it does to this computer. Every wrapper says them through this, so
+/// one added here is never silently dropped by a wrapper that forgot it.
+/// `$inner` is the wrapped tool's field.
+#[doc(hidden)]
+pub use workforce_core::computer::Effect as CallEffect;
 
-impl ReadsOutside {
-    /// `tools`, each one `reads` names saying what it returns is outside
-    /// content.
-    pub fn marking(
-        tools: Vec<std::sync::Arc<dyn Tool>>,
-        reads: impl Fn(&str) -> bool,
-    ) -> Vec<std::sync::Arc<dyn Tool>> {
-        tools
-            .into_iter()
-            .map(|tool| match reads(tool.name()) {
-                true => std::sync::Arc::new(Self(tool)) as std::sync::Arc<dyn Tool>,
-                false => tool,
-            })
-            .collect()
-    }
-}
+#[macro_export]
+macro_rules! delegate_call_facts {
+    ($($inner:tt)+) => {
+        fn surface_effect(
+            &self,
+            input: &serde_json::Value,
+        ) -> Option<$crate::tools::SurfaceEffect> {
+            self.$($inner)+.surface_effect(input)
+        }
 
-#[async_trait]
-impl Tool for ReadsOutside {
-    fn name(&self) -> &str {
-        self.0.name()
-    }
+        fn reads_outside_content(&self) -> bool {
+            self.$($inner)+.reads_outside_content()
+        }
 
-    fn description(&self) -> &str {
-        self.0.description()
-    }
+        fn standing_choice(&self) -> bool {
+            self.$($inner)+.standing_choice()
+        }
 
-    fn input_schema(&self) -> serde_json::Value {
-        self.0.input_schema()
-    }
-
-    async fn execute(&self, input: serde_json::Value) -> Result<ToolResult> {
-        self.0.execute(input).await
-    }
-
-    fn soft_deadline(&self) -> Option<std::time::Duration> {
-        self.0.soft_deadline()
-    }
-
-    fn approval_summary(&self, input: &serde_json::Value) -> Option<String> {
-        self.0.approval_summary(input)
-    }
-
-    fn approval_requirement(&self) -> Option<String> {
-        self.0.approval_requirement()
-    }
-
-    fn approval_notice(&self) -> Option<String> {
-        self.0.approval_notice()
-    }
-
-    fn surface_effect(&self, input: &serde_json::Value) -> Option<SurfaceEffect> {
-        self.0.surface_effect(input)
-    }
-
-    fn reads_outside_content(&self) -> bool {
-        true
-    }
-
-    fn effect(&self, input: &serde_json::Value) -> workforce_core::computer::Effect {
-        self.0.effect(input)
-    }
-
-    async fn collect(
-        &self,
-        input: serde_json::Value,
-        plan: serde_json::Value,
-        checkpoint: Option<String>,
-    ) -> Result<ToolResult> {
-        self.0.collect(input, plan, checkpoint).await
-    }
-
-    async fn abandon(&self, plan: serde_json::Value, checkpoint: Option<String>) {
-        self.0.abandon(plan, checkpoint).await
-    }
-
-    fn definition(&self) -> ToolDefinition {
-        self.0.definition()
-    }
+        fn effect(&self, input: &serde_json::Value) -> $crate::tools::CallEffect {
+            self.$($inner)+.effect(input)
+        }
+    };
 }
 
 impl ToolResult {

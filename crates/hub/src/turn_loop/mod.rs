@@ -2947,12 +2947,11 @@ pub(crate) fn spawn_turn_extraction(
     effective_message: &str,
     response: &str,
     principal: &str,
+    armed: bool,
 ) {
     // What a turn handling outside content said is that content's, never a
-    // memory of the person's.
-    let reads_outside = session.channel.starts_with("monitor:")
-        || workforce_agent::runner::caller_content_guard()
-            .is_some_and(|guard| guard.armed().is_some());
+    // memory of the person's: one its guard armed on, whoever started it.
+    let reads_outside = session.channel.starts_with("monitor:") || armed;
     if crate::turn_extraction::is_eval_channel(&session.channel) || reads_outside {
         return;
     }
@@ -3970,6 +3969,7 @@ pub(crate) async fn process_admitted(
     }
 
     record_round_cap_continuation(&mut session, &result);
+    crate::monitor::scope::keep_turn(&mut session, &result);
     service.sessions.save(&session)?;
     turn_journal.clear();
     persist_turn_owned_metadata(&service.sessions, &session);
@@ -3990,15 +3990,19 @@ pub(crate) async fn process_admitted(
         &effective_message,
         &result.response,
         principal,
+        result.guard.is_some(),
     );
-    spawn_know_how(
-        service,
-        &session,
-        principal,
-        message,
-        &result.tool_invocations,
-    )
-    .await;
+    // Nor is what such a turn did a way of working to learn from.
+    if result.guard.is_none() {
+        spawn_know_how(
+            service,
+            &session,
+            principal,
+            message,
+            &result.tool_invocations,
+        )
+        .await;
+    }
 
     // Fire-and-forget lesson extraction + reinforcement. Both are
     // bounded — extraction LLM-calls only on detector-positive turns,
@@ -4011,7 +4015,8 @@ pub(crate) async fn process_admitted(
             // shared room, so it no-ops).
             extract_enabled: service.effective_memory().lesson_extract
                 && !session.is_shared_conversation()
-                && !session.kept_apart(),
+                && !session.kept_apart()
+                && result.guard.is_none(),
             llm: &service.llm,
             store: service.memory_store.as_ref(),
             agent_id: &service.agent_id,
@@ -5593,7 +5598,9 @@ pub(crate) async fn stream_admitted(
     let chat_for_task = workforce_agent::runner::chat_origin();
     // The caller's guard (a workflow step's, a monitor's) crosses the spawn.
     let guard_for_task = workforce_agent::runner::caller_content_guard();
-    let handle = tokio::spawn(workforce_agent::runner::with_content_guard(guard_for_task, workforce_agent::runner::CURRENT_CHAT_ORIGIN.scope(chat_for_task, workforce_agent::runner::CURRENT_MEMORY_FENCE.scope(memory_fence_for_task, workforce_agent::runner::with_desk(desk_scope_for_task, CURRENT_BILLING_IDENTITY.scope(
+    // And whatever keeps that guard's state.
+    let keepers_for_task = workforce_agent::runner::guard_keepers();
+    let handle = tokio::spawn(workforce_agent::runner::with_guard_keepers(keepers_for_task, workforce_agent::runner::with_content_guard(guard_for_task, workforce_agent::runner::CURRENT_CHAT_ORIGIN.scope(chat_for_task, workforce_agent::runner::CURRENT_MEMORY_FENCE.scope(memory_fence_for_task, workforce_agent::runner::with_desk(desk_scope_for_task, CURRENT_BILLING_IDENTITY.scope(
         billing_identity_for_task.unwrap_or_default(),
         CURRENT_VOICE_CHANNEL.scope(
         voice_channel_for_task,
@@ -5881,6 +5888,7 @@ pub(crate) async fn stream_admitted(
                     session.attribute_messages_from(archive_base_for_task, &user_id_for_attr);
                 }
                 record_round_cap_continuation(&mut session, &result);
+                crate::monitor::scope::keep_turn(&mut session, &result);
                 sessions.save_refreshing(&mut session)?;
                 turn_journal.clear();
                 // The save above may have lost CAS, which discards the
@@ -5982,18 +5990,21 @@ pub(crate) async fn stream_admitted(
                     &effective_message,
                     &result.response,
                     &rel_principal_for_task,
+                    result.guard.is_some(),
                 );
-                spawn_know_how(&me,
-                    &session,
-                    &rel_principal_for_task,
-                    &kh_question,
-                    &result.tool_invocations,
-                )
-                .await;
+                if result.guard.is_none() {
+                    spawn_know_how(&me,
+                        &session,
+                        &rel_principal_for_task,
+                        &kh_question,
+                        &result.tool_invocations,
+                    )
+                    .await;
+                }
 
                 crate::lessons::run_post_turn(
                     crate::lessons::LessonPipelineConfig {
-                        extract_enabled: ls_extract_enabled,
+                        extract_enabled: ls_extract_enabled && result.guard.is_none(),
                         llm: &ls_llm,
                         store: ls_store.as_ref(),
                         agent_id: &ls_agent_id,
@@ -6113,7 +6124,7 @@ pub(crate) async fn stream_admitted(
     ),
     ),
     ),
-    ))))));
+    )))))));
 
     // Everything downstream reads the reply without voice directions; they
     // travel beside it.

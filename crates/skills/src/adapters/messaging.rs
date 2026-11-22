@@ -21,6 +21,17 @@ use crate::adapters::messaging_routing::{
 };
 use crate::adapters::utils::{coerce_to_u64, decode_upload_content};
 
+/// The messaging tools that only look.
+pub const READS: &[&str] = &[
+    "messaging.read",
+    "messaging.read_thread",
+    "messaging.channel_info",
+    "messaging.member_info",
+    "messaging.whoami",
+    "messaging.list_pins",
+    "messaging.emoji_list",
+];
+
 const DEDUP_WINDOW: Duration = Duration::from_secs(10);
 
 async fn resolve_for_channel(
@@ -79,12 +90,17 @@ async fn resolve_for_workspace(
         .ok_or_else(|| eyre::eyre!("no {platform} surface registered for this agent"))
 }
 
+/// A message read from a channel, its words fenced as outside content:
+/// whoever wrote them, they are not the person's instruction.
 fn channel_message_to_json(m: &ChannelMessage) -> serde_json::Value {
     serde_json::json!({
         "user": m.user,
         "user_name": m.user_name,
         "channel_name": m.channel_name,
-        "text": m.text,
+        "text": crate::adapters::utils::wrap_field(
+            Some(&serde_json::Value::String(m.text.clone())),
+            "a channel message",
+        ),
         "timestamp": m.timestamp,
         "message_id": m.message_id,
         "thread_id": m.thread_id,
@@ -2320,8 +2336,12 @@ mod tests {
         assert_eq!(result.output["thread_id"], "100.001");
         assert_eq!(result.output["count"], 2);
         let messages = result.output["messages"].as_array().unwrap();
-        assert_eq!(messages[0]["text"], "parent message");
-        assert_eq!(messages[1]["text"], "reply");
+        // What each says is fenced as outside content.
+        for (message, said) in messages.iter().zip(["parent message", "reply"]) {
+            let text = message["text"].as_str().unwrap();
+            assert!(text.starts_with(workforce_agent::security::monitor::FENCE_MARK));
+            assert!(text.contains(said), "{text}");
+        }
     }
 
     #[tokio::test]

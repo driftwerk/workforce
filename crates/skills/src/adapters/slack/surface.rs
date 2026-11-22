@@ -82,19 +82,26 @@ fn validate_blocks(blocks: &[serde_json::Value]) -> Result<()> {
     Ok(())
 }
 
-/// Stamp `thread_ts` / `username` / `icon_url` from the outbound message
-/// onto an already-built `chat.postMessage` body. Pulled out so the
-/// three send paths (Block Kit, rich_text, mrkdwn-chunked) share one
-/// definition of the optional-field contract.
 /// The message-metadata event a post carrying outside content is marked
 /// with, so reading it back knows it for what it is.
 const OUTSIDE_EVENT: &str = "workforce_outside_content";
 
+/// Mark a `chat.postMessage` or `chat.update` body as carrying outside
+/// content: no previews of its links, and the metadata that says so.
+fn mark_outside(body: &mut serde_json::Value) {
+    body["unfurl_links"] = serde_json::json!(false);
+    body["unfurl_media"] = serde_json::json!(false);
+    body["metadata"] = serde_json::json!({ "event_type": OUTSIDE_EVENT, "event_payload": {} });
+}
+
+/// Stamp `thread_ts` / `username` / `icon_url` from the outbound message
+/// onto an already-built `chat.postMessage` body, and mark it when it
+/// carries outside content. Pulled out so the three send paths (Block Kit,
+/// rich_text, mrkdwn-chunked) share one definition of the optional-field
+/// contract.
 fn apply_outbound_extras(body: &mut serde_json::Value, message: &OutboundMessage) {
     if message.outside {
-        body["unfurl_links"] = serde_json::json!(false);
-        body["unfurl_media"] = serde_json::json!(false);
-        body["metadata"] = serde_json::json!({ "event_type": OUTSIDE_EVENT, "event_payload": {} });
+        mark_outside(body);
     }
     if let Some(ref thread_id) = message.thread_id {
         body["thread_ts"] = serde_json::json!(thread_id);
@@ -688,6 +695,63 @@ pub struct SlackSurface {
 }
 
 impl SlackSurface {
+    /// Edit `message_id` to `text`, marked as carrying outside content when
+    /// `outside` is.
+    async fn edit_marked(
+        &self,
+        channel: &str,
+        message_id: &str,
+        text: &str,
+        outside: bool,
+    ) -> Result<()> {
+        let rewritten = self.rewrite_outbound_text(channel, text).await;
+        let text = rewritten.as_str();
+        let groups = super::rich_text::build_messages(text, self.paragraph_spacing);
+        let body = match groups.as_slice() {
+            // `chat.update` only mutates one message. If the edit grows beyond
+            // a single Slack payload we'd need to post follow-ups, which would
+            // change the original semantics — surface a clear error so the
+            // caller can pre-split instead.
+            [only] => {
+                validate_blocks(only)?;
+                serde_json::json!({
+                    "channel": channel,
+                    "ts": message_id,
+                    "text": super::rich_text::notification_fallback(text),
+                    "blocks": only,
+                })
+            }
+            // Empty render: update to plaintext (preserves blank-message edits).
+            [] => serde_json::json!({
+                "channel": channel,
+                "ts": message_id,
+                "text": text,
+            }),
+            _ => {
+                return Err(eyre::eyre!(
+                    "edit_message: rendered edit exceeds one Slack message ({} groups); split before calling",
+                    groups.len()
+                ))
+            }
+        };
+
+        let mut body = body;
+        if outside {
+            mark_outside(&mut body);
+        }
+        let resp = self.slack_api_post(&self.url("chat.update"), &body).await?;
+
+        if !resp["ok"].as_bool().unwrap_or(false) {
+            let err = resp["error"].as_str().unwrap_or("unknown");
+            return Err(eyre::eyre!(
+                "{}",
+                slack_error_hint("chat.update", err, Some(channel))
+            ));
+        }
+
+        Ok(())
+    }
+
     pub fn new(bot_token: &str) -> Self {
         Self::build(bot_token, None, None, DEFAULT_SLACK_BASE_URL.into())
     }
@@ -1648,10 +1712,13 @@ impl SlackSurface {
         cursor: Option<&str>,
     ) -> Result<RepliesPage> {
         let limit_s = clamp_limit(limit).to_string();
+        // With each message's metadata, so a post the hub marked as outside
+        // content reads back as such.
         let mut query: Vec<(&str, &str)> = vec![
             ("channel", channel),
             ("ts", ts),
             ("limit", limit_s.as_str()),
+            ("include_all_metadata", "true"),
         ];
         if let Some(c) = cursor {
             query.push(("cursor", c));
@@ -2414,48 +2481,11 @@ impl ChannelSurface for SlackSurface {
     }
 
     async fn edit_message(&self, channel: &str, message_id: &str, text: &str) -> Result<()> {
-        let rewritten = self.rewrite_outbound_text(channel, text).await;
-        let text = rewritten.as_str();
-        let groups = super::rich_text::build_messages(text, self.paragraph_spacing);
-        let body = match groups.as_slice() {
-            // `chat.update` only mutates one message. If the edit grows beyond
-            // a single Slack payload we'd need to post follow-ups, which would
-            // change the original semantics — surface a clear error so the
-            // caller can pre-split instead.
-            [only] => {
-                validate_blocks(only)?;
-                serde_json::json!({
-                    "channel": channel,
-                    "ts": message_id,
-                    "text": super::rich_text::notification_fallback(text),
-                    "blocks": only,
-                })
-            }
-            // Empty render: update to plaintext (preserves blank-message edits).
-            [] => serde_json::json!({
-                "channel": channel,
-                "ts": message_id,
-                "text": text,
-            }),
-            _ => {
-                return Err(eyre::eyre!(
-                    "edit_message: rendered edit exceeds one Slack message ({} groups); split before calling",
-                    groups.len()
-                ))
-            }
-        };
+        self.edit_marked(channel, message_id, text, false).await
+    }
 
-        let resp = self.slack_api_post(&self.url("chat.update"), &body).await?;
-
-        if !resp["ok"].as_bool().unwrap_or(false) {
-            let err = resp["error"].as_str().unwrap_or("unknown");
-            return Err(eyre::eyre!(
-                "{}",
-                slack_error_hint("chat.update", err, Some(channel))
-            ));
-        }
-
-        Ok(())
+    async fn edit_outside(&self, channel: &str, message_id: &str, text: &str) -> Result<()> {
+        self.edit_marked(channel, message_id, text, true).await
     }
 
     async fn delete_message(&self, channel: &str, message_id: &str) -> Result<()> {

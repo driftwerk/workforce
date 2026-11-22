@@ -188,14 +188,7 @@ impl LinearSkill {
     }
 
     /// Return all agent-callable tools.
-    /// Its reads say what they return is outside content.
     pub fn tools(&self) -> Vec<Arc<dyn Tool>> {
-        workforce_agent::tools::ReadsOutside::marking(self.every_tool(), |name| {
-            READ_TOOLS.contains(&name)
-        })
-    }
-
-    fn every_tool(&self) -> Vec<Arc<dyn Tool>> {
         let pm = &self.prefix_map;
         vec![
             Arc::new(tools::LinearIssueListTool::new(
@@ -969,27 +962,6 @@ mod tests {
             registered, declared,
             "LinearSkill::tool_names() drifted from tools()"
         );
-    }
-
-    #[test]
-    fn its_reads_say_they_return_outside_content_and_its_writes_do_not() {
-        let skill = LinearSkill::new(LinearSkillConfig {
-            api_key: Some("k".to_string()),
-            base_url: "https://api.linear.app/graphql".to_string(),
-            default_team_id: None,
-            workspaces: std::collections::HashMap::new(),
-            default_workspace: None,
-            prefix_map: std::collections::HashMap::new(),
-        })
-        .unwrap();
-        for tool in skill.tools() {
-            assert_eq!(
-                tool.reads_outside_content(),
-                READ_TOOLS.contains(&tool.name()),
-                "{}",
-                tool.name()
-            );
-        }
     }
 
     #[test]

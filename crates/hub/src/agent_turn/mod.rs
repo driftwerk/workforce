@@ -643,7 +643,14 @@ impl TurnChain {
             (resolved.effort_level(), resolved.fast)
         };
         let kept = crate::monitor::scope::kept_guard(turn.session);
-        let routes = Box::pin(self.run_routes(service, turn));
+        let keeper = crate::monitor::scope::turn_keeper(
+            Arc::clone(&service.sessions),
+            turn.session.id.clone(),
+        );
+        let routes = Box::pin(workforce_agent::runner::with_guard_keeper(
+            Some(keeper),
+            self.run_routes(service, turn),
+        ));
         // A person's own route alone: what the turn finds missing or tells
         // them to connect is their own login, never a shared one.
         let routes: std::pin::Pin<

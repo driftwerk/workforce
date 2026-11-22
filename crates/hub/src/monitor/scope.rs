@@ -3,24 +3,15 @@
 use std::sync::Arc;
 
 use workforce_agent::runner::{with_content_guard, with_tool_whitelist, ToolWhitelist};
-use workforce_agent::security::monitor::{AnomalySignal, ContentGuard, ContentScope, Place};
+use workforce_agent::security::monitor::{
+    AnomalySignal, ContentGuard, ContentScope, Knowledge, Place,
+};
 use workforce_orchestrator::monitor::MonitorMeta;
 
 use crate::serve::AgentService;
 
 /// The tool a turn posts its own result with.
 const DELIVERY_TOOL: &str = "messaging.send";
-
-/// The messaging tools that only look.
-const MESSAGING_READS: &[&str] = &[
-    "messaging.read",
-    "messaging.read_thread",
-    "messaging.channel_info",
-    "messaging.member_info",
-    "messaging.whoami",
-    "messaging.list_pins",
-    "messaging.emoji_list",
-];
 
 /// Reads a monitor's turn is not given unless it names them: a fetch can
 /// carry what the turn read out in its URL, and the agent's own files are
@@ -43,18 +34,35 @@ pub(crate) enum Delivery<'a> {
 }
 
 /// The tools the hub knows only read: the curation set, every adapter's
-/// reads, mail's, Google's outside reads and the messaging reads.
+/// reads, what other people wrote in a connected system, mail's, Google's
+/// outside reads and the messaging reads.
 pub(crate) fn reads() -> Vec<String> {
     crate::turn_loop::worker::curation_tool_patterns()
         .into_iter()
+        .chain(workforce_skills::adapters::outside_reads())
         .chain(
             workforce_skills::adapters::email::READ_TOOLS
                 .iter()
                 .chain(workforce_skills::adapters::google::tool_helpers::OUTSIDE_READS)
-                .chain(MESSAGING_READS)
+                .chain(workforce_skills::adapters::messaging::READS)
                 .map(|tool| tool.to_string()),
         )
         .collect()
+}
+
+/// What every guard in the hub knows of its tools: what only reads, what
+/// returns other people's words, and the authorisation's command-running
+/// class. Installed at boot, and by a test that needs it, always the same.
+pub(crate) fn knowledge() -> Knowledge {
+    Knowledge {
+        reads: reads().into_iter().collect(),
+        outside_reads: workforce_skills::adapters::outside_reads()
+            .into_iter()
+            .collect(),
+        runs_commands: Some(|tool, input| {
+            crate::authz::tool_capability(tool, input) == Some(crate::authz::Capability::ShellExec)
+        }),
+    }
 }
 
 /// The tools a monitor's turn is given: the reads it is offered, its own
@@ -96,7 +104,7 @@ impl MonitorTurn {
                 named: named.to_vec(),
                 armed: Some(format!("what monitor '{}' was given", monitor.name)),
                 refuses: true,
-                stops: Vec::new(),
+                ..ContentScope::default()
             })),
             tools: turn_tools(delivery, named),
         }
@@ -152,15 +160,20 @@ pub(crate) fn keep(session: &mut workforce_common::session::Session) {
     }
 }
 
-/// The guard kept on `session` for a turn its caller set none for. A kept
-/// scope that can't be read is kept as strictly as any: armed, refusing.
+/// The guard kept on `session` for a turn its caller set none for: the
+/// unfinished turn's as it stopped ([`keep_turn`], [`turn_keeper`]), else
+/// the one a monitor's run set. A kept scope that can't be read is kept as
+/// strictly as any: armed, refusing.
 pub(crate) fn kept_guard(
     session: &workforce_common::session::Session,
 ) -> Option<Arc<ContentGuard>> {
     if workforce_agent::runner::caller_content_guard().is_some() {
         return None;
     }
-    let scope = serde_json::from_value(session.content_scope()?.clone()).unwrap_or_else(|e| {
+    let kept = session
+        .turn_content_scope()
+        .or_else(|| session.content_scope())?;
+    let scope = serde_json::from_value(kept.clone()).unwrap_or_else(|e| {
         tracing::warn!(session = %session.id, error = %e, "A kept content scope could not be read; the turn refuses");
         ContentScope {
             armed: Some("a turn kept before it was resumed".to_string()),
@@ -169,6 +182,48 @@ pub(crate) fn kept_guard(
         }
     });
     Some(Arc::new(ContentGuard::new(scope)))
+}
+
+/// Keep on `session` the guard of the turn that just stopped while a call
+/// of it waits on someone's answer, so the turn resumed when they answer is
+/// guarded as it was; a turn that finished keeps nothing.
+pub(crate) fn keep_turn(
+    session: &mut workforce_common::session::Session,
+    result: &workforce_agent::runner::RunResult,
+) {
+    let waiting = result
+        .tool_invocations
+        .iter()
+        .any(|call| call.policy_decision == "require_approval");
+    session.set_turn_content_scope(
+        result
+            .guard
+            .as_ref()
+            .filter(|_| waiting)
+            .and_then(|scope| serde_json::to_value(scope).ok()),
+    );
+}
+
+/// What keeps the guard of a turn on `session_id` as it arms and refuses,
+/// so a turn a restart cut off resumes guarded as it was. A turn that
+/// finishes replaces it ([`keep_turn`]).
+pub(crate) fn turn_keeper(
+    sessions: Arc<dyn workforce_common::session::SessionStore>,
+    session_id: String,
+) -> workforce_agent::security::monitor::Keeper {
+    Arc::new(move |scope: &ContentScope| {
+        let Ok(kept) = serde_json::to_value(scope) else {
+            return;
+        };
+        let mut patch = serde_json::Map::new();
+        patch.insert(
+            workforce_common::session::TURN_CONTENT_SCOPE.to_string(),
+            kept,
+        );
+        if let Err(e) = sessions.merge_metadata(&session_id, patch, &[]) {
+            tracing::warn!(session = %session_id, error = %e, "The turn's guard could not be kept");
+        }
+    })
 }
 
 fn stopped_notice(monitor: &MonitorMeta, stops: &[AnomalySignal]) -> Option<String> {
@@ -258,20 +313,57 @@ mod tests {
 
     #[test]
     fn every_tool_a_turn_is_offered_passes_the_guard() {
-        workforce_agent::security::monitor::know_reads(reads());
+        workforce_agent::security::monitor::know(knowledge());
         let scope = ContentScope::default();
+        let input = serde_json::json!({});
         for tool in turn_tools(&Delivery::Told, &[]) {
             assert_eq!(
                 workforce_agent::security::monitor::assess(
-                    &tool,
-                    &serde_json::json!({}),
-                    None,
-                    &scope
+                    &workforce_agent::security::monitor::Call::new(&tool, &input, None),
+                    &scope,
+                    &Default::default(),
                 ),
                 None,
                 "{tool}"
             );
         }
+    }
+
+    #[test]
+    fn the_hub_knows_its_command_runners_and_connector_reads() {
+        workforce_agent::security::monitor::know(knowledge());
+        let guard = ContentGuard::new(ContentScope {
+            armed: Some("a webhook".into()),
+            ..ContentScope::default()
+        });
+        let input = serde_json::json!({});
+        for runs in [
+            "code.build",
+            "code.cargo",
+            "wasm_skill.build",
+            "desk.prompt",
+            "crew.nudge",
+        ] {
+            assert!(
+                matches!(
+                    guard.check(runs, &input, None).map(|held| held.signal),
+                    Some(AnomalySignal::CommandExecution { .. })
+                ),
+                "{runs}"
+            );
+        }
+        let refactor = serde_json::json!({ "action": "rename_symbol" });
+        assert!(guard.check("code.refactor", &refactor, None).is_some());
+        for read in ["linear.issue_get", "github.list_issues", "notion.page_get"] {
+            assert!(
+                workforce_agent::security::monitor::reads_outside(read),
+                "{read}"
+            );
+            assert_eq!(guard.check(read, &input, None), None, "{read}");
+        }
+        assert!(!workforce_agent::security::monitor::reads_outside(
+            "linear.issue_create"
+        ));
     }
 
     #[tokio::test]

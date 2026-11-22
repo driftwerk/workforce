@@ -276,7 +276,13 @@ pub(super) async fn start_one(
         "MCP server initialised"
     );
 
-    super::tool::mark_external(id, cfg.external);
+    // A preset's server is a vendor's, returning what other people wrote:
+    // outside content, whether its record says so or predates saying it.
+    super::tool::mark_external(
+        agent_id,
+        id,
+        cfg.external || super::presets::lookup(id).is_some(),
+    );
     let tool_count = register_tools(id, agent_id, &client, &tools, &upstream_tools, &cost);
     // Record (or clear) this server's MCP-workspace membership so the tool
     // filter + call guard know whether it's gated. A server with `workspace`

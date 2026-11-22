@@ -3554,6 +3554,8 @@ pub(crate) async fn forward_local_progress(
                 "compact_start",
                 String::new(),
             )),
+            // Desk shows no previews of links: nothing to mark.
+            ProgressEvent::OutsideContent { .. } => None,
             ProgressEvent::CompactEnd => Some(BroadcastMessage::new(
                 sid.clone(),
                 "compact_end",
@@ -5823,14 +5825,7 @@ fn is_conversational_channel(channel: &str) -> bool {
 
 /// Identity files that can be read/written via the API. HEARTBEAT.md is the
 /// agent's check-in list, which Desk edits beside the others.
-const ALLOWED_IDENTITY_FILES: &[&str] = &[
-    "SOUL.md",
-    "AGENTS.md",
-    "TOOLS.md",
-    "IDENTITY.md",
-    "WELCOME.md",
-    "HEARTBEAT.md",
-];
+const ALLOWED_IDENTITY_FILES: &[&str] = workforce_agent::security::monitor::IDENTITY_FILES;
 
 /// Helper: resolve an agent service by ID, returning an appropriate error.
 pub(crate) fn resolve_agent(

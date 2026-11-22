@@ -2222,6 +2222,10 @@ impl Scheduler {
                         ),
                     ),
                 );
+                // Whether the run read outside content: what it answers is
+                // then posted marked so.
+                let armed = workforce_agent::security::monitor::Armed::new();
+                let turn = workforce_agent::runner::with_guard_keeper(Some(armed.keeper()), turn);
                 let process_result = match run_capped(turn, run_minutes).await {
                     Some(result) => result,
                     // Cut off, as a skip: a long run is not a failing job.
@@ -2382,7 +2386,7 @@ impl Scheduler {
                                             icon_url: None,
 
                                             blocks: None,
-                                            outside: false,
+                                            outside: armed.is_armed(),
                                         })
                                         .await
                                     {

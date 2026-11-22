@@ -451,6 +451,42 @@ pub fn content_guard() -> Arc<crate::security::monitor::ContentGuard> {
     })
 }
 
+tokio::task_local! {
+    /// What keeps the state of the guard of the turn running here as it
+    /// changes ([`ContentGuard::kept_by`](crate::security::monitor::ContentGuard::kept_by)).
+    static GUARD_KEEPERS: Vec<crate::security::monitor::Keeper>;
+}
+
+/// Run `fut` with `keeper` keeping the state of the guard each of its turns
+/// runs under, beside any keeper set around it; unchanged when there is
+/// none.
+pub async fn with_guard_keeper<F: std::future::Future>(
+    keeper: Option<crate::security::monitor::Keeper>,
+    fut: F,
+) -> F::Output {
+    match keeper {
+        Some(keeper) => {
+            let mut keepers = guard_keepers();
+            keepers.push(keeper);
+            GUARD_KEEPERS.scope(keepers, fut).await
+        }
+        None => fut.await,
+    }
+}
+
+/// Every keeper set around the current task, to carry across a spawn.
+pub fn guard_keepers() -> Vec<crate::security::monitor::Keeper> {
+    GUARD_KEEPERS.try_with(Clone::clone).unwrap_or_default()
+}
+
+/// Run `fut` with `keepers` (from [`guard_keepers`]) set around it.
+pub async fn with_guard_keepers<F: std::future::Future>(
+    keepers: Vec<crate::security::monitor::Keeper>,
+    fut: F,
+) -> F::Output {
+    GUARD_KEEPERS.scope(keepers, fut).await
+}
+
 /// The guard the current turn's caller set, if one did.
 pub fn caller_content_guard() -> Option<Arc<crate::security::monitor::ContentGuard>> {
     CONTENT_GUARD.try_with(Arc::clone).ok()
@@ -1378,6 +1414,11 @@ pub struct RunResult {
     /// What the compile gate appended to `response` (a failing or unverified
     /// build): the reader's to see, but not the agent's words.
     pub gate_notice: Option<String>,
+    /// The turn's content guard as it ended, when outside content armed it:
+    /// what guards a turn resumed from here (after an approval, a restart),
+    /// and what tells whoever posts the answer that it carries what that
+    /// content said.
+    pub guard: Option<crate::security::monitor::ContentScope>,
 }
 
 impl RunResult {
@@ -1480,6 +1521,10 @@ pub enum ProgressEvent {
         cache_read_tokens: u32,
         tool_count: usize,
     },
+    /// The turn's guard armed on outside content (`from`): what the turn
+    /// says from here may carry it, so whoever posts it marks it as outside
+    /// content and shows no previews of its links.
+    OutsideContent { from: String },
     /// Session compaction is starting.
     CompactStart,
     /// Session compaction finished.
@@ -1830,10 +1875,20 @@ async fn conclude(
 }
 
 /// The guard a turn sending `messages` runs under, armed when this turn's
-/// part of them (from the message that started it on) carries a fence of
-/// outside content. What an earlier turn read armed that turn.
-fn guard_for_turn(messages: &[LlmMessage]) -> Arc<crate::security::monitor::ContentGuard> {
+/// part of them (from the message that started it on) carries outside
+/// content: a fence, or the result of a call of a tool that returns outside
+/// content as it is. The URLs its prompt gives and its outside content
+/// carries are ones it may open. What an earlier turn read armed that turn;
+/// a turn resumed after it was held carries its guard as it was
+/// (`ContentScope` kept with the turn).
+fn guard_for_turn(
+    messages: &[LlmMessage],
+    tools: &ToolRegistry,
+) -> Arc<crate::security::monitor::ContentGuard> {
     let guard = content_guard();
+    for keeper in guard_keepers() {
+        guard.kept_by(keeper);
+    }
     let started = messages
         .iter()
         .rposition(|message| {
@@ -1844,21 +1899,62 @@ fn guard_for_turn(messages: &[LlmMessage]) -> Arc<crate::security::monitor::Cont
                     .any(|block| matches!(block, ContentBlock::Text { .. }))
         })
         .unwrap_or(0);
-    messages[started..]
+    let turn = &messages[started..];
+    let called: std::collections::HashMap<&str, &str> = turn
         .iter()
         .flat_map(|message| &message.content)
         .filter_map(|block| match block {
-            ContentBlock::Text { text } | ContentBlock::ToolResult { content: text, .. } => {
-                Some(text)
-            }
+            ContentBlock::ToolUse { id, name, .. } => Some((id.as_str(), name.as_str())),
             _ => None,
         })
-        .for_each(|text| guard.arm_if_fenced(text, "the conversation"));
+        .collect();
+    for message in turn {
+        for block in &message.content {
+            match block {
+                ContentBlock::Text { text } => {
+                    if message.role == Role::User {
+                        guard.saw(text);
+                    }
+                    guard.arm_if_fenced(text, "the conversation");
+                }
+                ContentBlock::ToolResult {
+                    tool_use_id,
+                    content,
+                    is_error,
+                    ..
+                } => {
+                    let tool = called.get(tool_use_id.as_str()).copied();
+                    arm_on_result(
+                        &guard,
+                        tools,
+                        tool.unwrap_or("the conversation"),
+                        tool.is_some() && *is_error != Some(true),
+                        content,
+                    );
+                }
+                _ => {}
+            }
+        }
+    }
     guard
 }
 
+/// A call the content guard held was refused where nobody could be asked:
+/// the turn's owner is told, as a refusing scope's owner is.
+fn tell_guard_refused(
+    gates: &ToolGates,
+    tools: &ToolRegistry,
+    tool: &str,
+    input: &serde_json::Value,
+) {
+    if let Some((guard, held)) = crate::tools::dispatch::guard_hold(gates, tools, tool, input) {
+        guard.refused(&held.signal);
+    }
+}
+
 /// Arm `guard` when `tool`'s result is outside content: a fence in it, or a
-/// successful call of a tool that returns outside content as it is.
+/// successful call of a tool that returns outside content as it is. The
+/// URLs it carries are then ones the turn may open.
 pub(crate) fn arm_on_result(
     guard: &crate::security::monitor::ContentGuard,
     tools: &ToolRegistry,
@@ -1866,8 +1962,10 @@ pub(crate) fn arm_on_result(
     success: bool,
     output: &str,
 ) {
-    if success && tools.get(tool).is_some_and(|t| t.reads_outside_content()) {
-        guard.on_untrusted_content(tool);
+    let outside = tools.get(tool).is_some_and(|t| t.reads_outside_content())
+        || crate::security::monitor::reads_outside(tool);
+    if success && outside {
+        guard.read_outside(output, tool);
     } else {
         guard.arm_if_fenced(output, tool);
     }
@@ -4117,7 +4215,7 @@ impl AgentRunner {
         self.seed_calls(&mut messages, &mut tool_invocations, None, None)
             .await;
         let mut compile_gate = self.gate_turn(&tool_invocations);
-        let content_guard = guard_for_turn(&messages);
+        let content_guard = guard_for_turn(&messages, &self.tools);
         let mut rounds = 0;
         let mut model_switches: Vec<ModelSwitchRecord> = Vec::new();
         let start_time = std::time::Instant::now();
@@ -4289,6 +4387,7 @@ impl AgentRunner {
                             hit_round_cap: true,
                             injected_user_messages: Vec::new(),
                             gate_notice: notice,
+                            guard: content_guard.armed().map(|_| content_guard.kept_scope()),
                         });
                     }
                     Err(e) => {
@@ -4325,6 +4424,7 @@ impl AgentRunner {
                             hit_round_cap: true,
                             injected_user_messages: Vec::new(),
                             gate_notice: notice,
+                            guard: content_guard.armed().map(|_| content_guard.kept_scope()),
                         });
                     }
                 }
@@ -4584,6 +4684,7 @@ impl AgentRunner {
                     hit_round_cap: rounds >= self.config.max_rounds,
                     injected_user_messages: Vec::new(),
                     gate_notice,
+                    guard: content_guard.armed().map(|_| content_guard.kept_scope()),
                 });
             }
 
@@ -4617,6 +4718,7 @@ impl AgentRunner {
                     hit_round_cap: false,
                     injected_user_messages: Vec::new(),
                     gate_notice: None,
+                    guard: content_guard.armed().map(|_| content_guard.kept_scope()),
                 });
             }
 
@@ -4829,6 +4931,7 @@ impl AgentRunner {
                                 });
                             }
                             RouteResolution::DenyUnreachable => {
+                                tell_guard_refused(&gates, &self.tools, &tn, &input);
                                 crate::tools::computer::settle(
                                     self.config.computer_gate.as_deref(),
                                     &tn,
@@ -4858,6 +4961,7 @@ impl AgentRunner {
                             // no human is watching a non-progress turn, so the
                             // instant error stands.
                             RouteResolution::SelfServe => {
+                                tell_guard_refused(&gates, &self.tools, &tn, &input);
                                 crate::tools::computer::settle(
                                     self.config.computer_gate.as_deref(),
                                     &tn,
@@ -5165,7 +5269,8 @@ impl AgentRunner {
         )
         .await;
         let mut compile_gate = self.gate_turn(&tool_invocations);
-        let content_guard = guard_for_turn(&messages);
+        let content_guard = guard_for_turn(&messages, &self.tools);
+        let mut told_outside = false;
         let mut rounds = 0;
         let model_switches: Vec<ModelSwitchRecord> = Vec::new();
         let start_time = std::time::Instant::now();
@@ -5392,6 +5497,7 @@ impl AgentRunner {
                     hit_round_cap: true,
                     injected_user_messages: std::mem::take(&mut absorbed_followups),
                     gate_notice: notice,
+                    guard: content_guard.armed().map(|_| content_guard.kept_scope()),
                 });
             }
 
@@ -5479,6 +5585,14 @@ impl AgentRunner {
                     (degraded, false)
                 }
                 Ok(()) => {
+                    // What it says from here may carry the outside content
+                    // it read: whoever posts it is told, once.
+                    if let Some(from) = content_guard.armed().filter(|_| !told_outside) {
+                        told_outside = true;
+                        let _ = progress_tx
+                            .send(ProgressEvent::OutsideContent { from })
+                            .await;
+                    }
                     let _ = progress_tx
                         .send(ProgressEvent::LlmCall { round: rounds })
                         .await;
@@ -5850,6 +5964,7 @@ impl AgentRunner {
                     hit_round_cap: rounds >= self.config.max_rounds,
                     injected_user_messages: std::mem::take(&mut absorbed_followups),
                     gate_notice,
+                    guard: content_guard.armed().map(|_| content_guard.kept_scope()),
                 });
             }
 
@@ -5895,6 +6010,7 @@ impl AgentRunner {
                     hit_round_cap: false,
                     injected_user_messages: std::mem::take(&mut absorbed_followups),
                     gate_notice: None,
+                    guard: content_guard.armed().map(|_| content_guard.kept_scope()),
                 });
             }
 
@@ -6202,6 +6318,7 @@ impl AgentRunner {
                                 });
                             }
                             RouteResolution::DenyUnreachable => {
+                                tell_guard_refused(&gates, &self.tools, &tool_name, &input);
                                 crate::tools::computer::settle(
                                     self.config.computer_gate.as_deref(),
                                     &tool_name,
@@ -6229,6 +6346,7 @@ impl AgentRunner {
                                     });
                                 match opened {
                                     Err(refusal) => {
+                                        tell_guard_refused(&gates, &self.tools, &tool_name, &input);
                                         crate::tools::computer::settle(
                                             self.config.computer_gate.as_deref(),
                                             &tool_name,
@@ -10945,6 +11063,7 @@ mod tests {
                 ProgressEvent::ConnectRequired { .. } => "connect_required",
                 ProgressEvent::Snapshot(_) => "snapshot",
                 ProgressEvent::File(_) => "file",
+                ProgressEvent::OutsideContent { .. } => "outside_content",
             })
             .collect();
 

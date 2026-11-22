@@ -218,6 +218,7 @@ impl CliServed {
             hit_round_cap: self.capped,
             injected_user_messages: self.injected,
             gate_notice: None,
+            guard: None,
         }
     }
 }

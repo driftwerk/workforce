@@ -111,15 +111,7 @@ impl HubspotSkill {
     }
 
     /// All agent-callable tools.
-    /// Its reads say what they return is outside content.
     pub fn tools(&self) -> Vec<Arc<dyn Tool>> {
-        workforce_agent::tools::ReadsOutside::marking(
-            self.every_tool(),
-            workforce_common::connector_binding::is_read,
-        )
-    }
-
-    fn every_tool(&self) -> Vec<Arc<dyn Tool>> {
         let c = &self.clients;
         let d = &self.default_portal;
         vec![

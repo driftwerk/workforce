@@ -146,7 +146,8 @@ impl Preset {
             workspace: None,
             env: None,
             default: false,
-            external: false,
+            // A vendor's server returns what other people wrote.
+            external: true,
         }
     }
 

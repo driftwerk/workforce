@@ -491,6 +491,13 @@ pub trait ChannelSurface: Send + Sync {
         ))
     }
 
+    /// Edit a previously sent message whose text now carries outside
+    /// content: marked so, with no previews of its links, where the surface
+    /// can say it; a plain edit everywhere else.
+    async fn edit_outside(&self, channel: &str, message_id: &str, text: &str) -> Result<()> {
+        self.edit_message(channel, message_id, text).await
+    }
+
     /// Edit a previously sent message with a full rich payload (text + optional blocks).
     /// Default implementation falls back to the text-only `edit_message`; Slack overrides
     /// this so Block Kit payloads survive the update.

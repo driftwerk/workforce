@@ -98,13 +98,7 @@ impl Tool for ConnectionWrite {
         self.inner.approval_requirement()
     }
 
-    fn surface_effect(&self, input: &serde_json::Value) -> Option<super::SurfaceEffect> {
-        self.inner.surface_effect(input)
-    }
-
-    fn effect(&self, input: &serde_json::Value) -> workforce_core::computer::Effect {
-        self.inner.effect(input)
-    }
+    crate::delegate_call_facts!(inner);
 
     async fn collect(
         &self,

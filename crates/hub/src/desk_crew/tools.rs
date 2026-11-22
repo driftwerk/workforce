@@ -1353,6 +1353,13 @@ impl Tool for CrewTool {
         describe(self.name)
     }
 
+    /// The person's standing choice decides it: the overseer's level is
+    /// what offered it, and Desk's act switches decide each action it takes
+    /// as they decide every action.
+    fn standing_choice(&self) -> bool {
+        true
+    }
+
     fn input_schema(&self) -> Value {
         schema(self.name, || {
             self.crew

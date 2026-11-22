@@ -49,7 +49,7 @@ use std::time::Instant;
 
 use async_trait::async_trait;
 use eyre::Result;
-use workforce_agent::tools::{SurfaceEffect, Tool, ToolDefinition, ToolResult};
+use workforce_agent::tools::{Tool, ToolDefinition, ToolResult};
 use workforce_common::oversight::{Level, Oversight, WorkStyle};
 use workforce_core::computer::Effect;
 
@@ -429,13 +429,7 @@ impl Tool for SessionsOnly {
         self.inner.approval_notice()
     }
 
-    fn surface_effect(&self, input: &serde_json::Value) -> Option<SurfaceEffect> {
-        self.inner.surface_effect(input)
-    }
-
-    fn effect(&self, input: &serde_json::Value) -> Effect {
-        self.inner.effect(input)
-    }
+    workforce_agent::delegate_call_facts!(inner);
 
     async fn collect(
         &self,

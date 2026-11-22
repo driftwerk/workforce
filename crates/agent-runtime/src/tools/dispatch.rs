@@ -163,6 +163,7 @@ fn gate_with(
     let response = apply_cascade_gate(gates, response, tool_name);
     let response = apply_tool_requirement(tools, response, tool_name);
     let effect = surface_effect_of(tools, tool_name, input);
+    let guard_effect = guarded_effect(tools, tool_name, input);
     let to = effect.as_ref().and_then(SurfaceEffect::destination);
     let mut held = None;
     let asks_nothing = gates
@@ -209,7 +210,7 @@ fn gate_with(
     }
     let guarded = gates.content_guard.as_deref().and_then(|guard| {
         guard
-            .check(tool_name, input, effect.as_ref())
+            .check_call(&guarded_call(tools, tool_name, input, &guard_effect))
             .map(|held| (guard, held))
     });
     let missing = || {
@@ -586,6 +587,72 @@ pub fn surface_effect_of(
                     destination: input["channel"].as_str().unwrap_or_default().to_string(),
                 })
         })
+}
+
+/// The leaves of a chat surface's tools that post where they name: what the
+/// guard takes as a write to that channel when the tool says nothing of
+/// itself. Every other call of the namespace (a kick, an unarchive, a
+/// reaction) is weighed as itself, not as a post to the turn's channel.
+const POSTS: &[&str] = &[
+    "send",
+    "message",
+    "mention",
+    "reply",
+    "post",
+    "send_message",
+    "upload_file",
+    "update_message",
+];
+
+/// What a call does to a surface, as the content guard weighs it: what the
+/// tool says, else a post where it names for a chat surface's posting tools.
+fn guarded_effect(tools: &ToolRegistry, tool_name: &str, input: &Value) -> Option<SurfaceEffect> {
+    let said = tools
+        .get(tool_name)
+        .and_then(|tool| tool.surface_effect(input));
+    let posts = tool_name
+        .rsplit_once('.')
+        .is_some_and(|(_, leaf)| POSTS.contains(&leaf));
+    match said {
+        Some(effect) => Some(effect),
+        None if posts => surface_effect_of(tools, tool_name, input),
+        None => None,
+    }
+}
+
+/// A call of `tool_name` as the content guard weighs it.
+fn guarded_call<'a>(
+    tools: &ToolRegistry,
+    tool_name: &'a str,
+    input: &'a Value,
+    effect: &'a Option<SurfaceEffect>,
+) -> crate::security::monitor::Call<'a> {
+    crate::security::monitor::Call {
+        standing: tools
+            .get(tool_name)
+            .is_some_and(|tool| tool.standing_choice()),
+        ..crate::security::monitor::Call::new(tool_name, input, effect.as_ref())
+    }
+}
+
+/// The content guard's hold on a call, where the gate would ask about it:
+/// `None` at Full access or Act fully, where nothing is asked. A path where
+/// nobody can be asked refuses such a call, and tells the guard so
+/// ([`ContentGuard::refused`]), as a refusing scope does.
+pub fn guard_hold(
+    gates: &ToolGates,
+    tools: &ToolRegistry,
+    tool_name: &str,
+    input: &Value,
+) -> Option<(Arc<ContentGuard>, crate::security::monitor::Held)> {
+    let unbound = gates
+        .computer_gate
+        .as_deref()
+        .is_some_and(|g| g.asks_nothing() || g.unbound());
+    let guard = gates.content_guard.as_ref().filter(|_| !unbound)?;
+    let effect = guarded_effect(tools, tool_name, input);
+    let held = guard.check_call(&guarded_call(tools, tool_name, input, &effect))?;
+    Some((Arc::clone(guard), held))
 }
 
 /// The longest stretch of what a held write would say that its prompt shows.
