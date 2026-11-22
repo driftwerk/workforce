@@ -47,6 +47,83 @@ fn approve(s: uuid::Uuid, a: uuid::Uuid) -> Value {
     json!({"session_id": s.to_string(), "approval_id": a.to_string(), "reason": "Keep it moving."})
 }
 
+/// Moving between Act and Act fully gives the overseer its tools for the
+/// new level over the old ones: a turn running meanwhile never finds them
+/// gone. Down to Watch it keeps only what it reads and its own settings'
+/// card; overseeing nothing, it has no crew tools at all.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_level_change_never_leaves_the_overseer_without_its_tools() {
+    use super::super::tools::{ACT, READ};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use workforce_common::oversight::Level;
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(dir.path()).unwrap();
+        let (overseer, crew, _d, _llm) = overseeing(&base, pool, "ok", UNBOUND, &[]).await;
+        let at = |level: Level| {
+            UNBOUND.replace(
+                "level = \"full\"",
+                &format!("level = \"{}\"", level.as_str()),
+            )
+        };
+        let settle = async |config: &str, level: Option<Level>| {
+            write_config(&overseer, config);
+            super::super::config_saved(&overseer);
+            crew.sync().await;
+            eventually("the level in force", async || {
+                (crew.overseer_service().map(|(_, o)| o.level) == level).then_some(())
+            })
+            .await;
+        };
+        let has = |names: &[&str]| names.iter().filter(|n| overseer.tools.has(n)).count();
+        settle(UNBOUND, Some(Level::Full)).await;
+        // Each time the tools change, every one of them is there.
+        let done = Arc::new(AtomicBool::new(false));
+        let watching = {
+            let (overseer, done) = (Arc::clone(&overseer), Arc::clone(&done));
+            std::thread::spawn(move || {
+                let (mut seen, mut gone) = (overseer.tools.generation(), 0);
+                while !done.load(Ordering::Relaxed) {
+                    let now = overseer.tools.generation();
+                    if now != seen {
+                        seen = now;
+                        gone += READ
+                            .iter()
+                            .chain(ACT.iter())
+                            .filter(|n| !overseer.tools.has(n))
+                            .count();
+                    }
+                    std::thread::yield_now();
+                }
+                gone
+            })
+        };
+        for level in [Level::Act, Level::Full].into_iter().cycle().take(20) {
+            settle(&at(level), Some(level)).await;
+        }
+        done.store(true, Ordering::Relaxed);
+        assert_eq!(
+            watching.join().unwrap(),
+            0,
+            "the overseer's tools went missing"
+        );
+        // Watching, it keeps what it reads and the card to ask for more.
+        settle(&at(Level::Watch), Some(Level::Watch)).await;
+        assert_eq!(has(&READ), READ.len());
+        assert_eq!(
+            ACT.iter()
+                .copied()
+                .filter(|n| overseer.tools.has(n))
+                .collect::<Vec<_>>(),
+            vec![super::super::own_settings::NAME]
+        );
+        // Overseeing nothing, it has none.
+        settle(&UNBOUND.replace("enabled = true", "enabled = false"), None).await;
+        assert_eq!(has(&READ) + has(&ACT), 0);
+    })
+    .await;
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn unbound_allows_what_it_is_asked_but_its_own_settings_and_says_so() {
     with_test_pool(workforce_desk::store::build_pool, |pool| async move {
@@ -753,21 +830,37 @@ async fn a_running_session_goes_back_to_its_own_mode_when_unbound_ends() {
                 message: "Run the deploy".into(),
                 reply_to: None,
             };
-            // Taken back by the person, it is left alone altogether.
-            let why = eventually("the boss held", async || {
+            // An unbound boss that runs it again (Desk passes a session on
+            // to its scope's overseer when the boss that took it oversees
+            // nothing here) drives it in auto mode as before.
+            let desks = || {
+                matches!(ends, Ends::AnotherBoss)
+                    && d.charge_of(s.id)
+                        .is_some_and(|c| c.live() && c.boss == "desk")
+            };
+            // Taken back by the person, it is left alone altogether. Handed
+            // to another boss, it may be passed on to this one before the
+            // hold is ever seen, and then nothing holds it: who runs it then
+            // is kept as it was seen.
+            let held = eventually("the boss held", async || {
                 let (_, o) = crew.overseer_service()?;
                 match (crew.gate(&deploy, &o), ends) {
-                    (Gate::No(why), Ends::Released) => Some(why.into_owned()),
+                    (Gate::No(why), Ends::Released) => Some(Ok(why.into_owned())),
                     (Gate::Suggest(why), _) if why.contains("still runs in auto mode") => {
-                        Some(why.into_owned())
+                        Some(Ok(why.into_owned()))
                     }
+                    (Gate::Run, Ends::AnotherBoss) => d
+                        .charge_of(s.id)
+                        .filter(|c| c.live())
+                        .map(|c| Err(c.boss.clone())),
                     _ => None,
                 }
             })
             .await;
-            match ends {
-                Ends::Released => assert!(why.contains("leave it alone"), "{why}"),
-                _ => assert!(
+            match (ends, held) {
+                (_, Err(runs)) => assert_eq!(runs, "desk", "never held, yet not passed on"),
+                (Ends::Released, Ok(why)) => assert!(why.contains("leave it alone"), "{why}"),
+                (_, Ok(why)) => assert!(
                     why.contains("put back in its own mode") || why.contains("puts it back"),
                     "{why}"
                 ),
@@ -801,14 +894,6 @@ async fn a_running_session_goes_back_to_its_own_mode_when_unbound_ends() {
             };
             // The queued deploy never goes in while it runs in auto mode:
             // it starts again in its own mode first.
-            // An unbound boss that runs it again (Desk passes a session on
-            // to its scope's overseer when the boss that took it oversees
-            // nothing here) drives it in auto mode as before.
-            let desks = || {
-                matches!(ends, Ends::AnotherBoss)
-                    && d.charge_of(s.id)
-                        .is_some_and(|c| c.live() && c.boss == "desk")
-            };
             let args = loop {
                 let m = d.store().line_message(queued).await.unwrap().unwrap();
                 let mode = d.view(s.id).unwrap().mode;
