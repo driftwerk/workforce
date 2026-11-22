@@ -1977,7 +1977,7 @@ impl Setups {
                     true => self.connections.new_key(c, &person, &name),
                     false => key,
                 };
-                let account = match self.connections.check(c, &fields).await {
+                let account = match self.connections.check(c, &person, &fields).await {
                     Found::Works { account } => account,
                     found @ (Found::Refused(_) | Found::Failed(_)) => {
                         // The service's own words go on the person's card,

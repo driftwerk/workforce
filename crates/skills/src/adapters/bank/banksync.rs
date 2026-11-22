@@ -87,6 +87,8 @@ enum Keys {
     Fixed {
         api_key: Secret<String>,
         bank: String,
+        /// Whose limit it spends, where no call is made as them.
+        owner: Option<String>,
     },
     Store {
         store: Arc<dyn SecretStore>,
@@ -108,12 +110,20 @@ pub struct BankSync {
 
 impl BankSync {
     /// A connection on `api_key` reading `bank`, at `base` (BankSync's
-    /// [`API`] outside tests).
-    pub fn fixed(api_key: &str, bank: &str, base: &str, limiter: Arc<Limiter>) -> Self {
+    /// [`API`] outside tests). `owner` is the person it is of, whose limit it
+    /// spends; none is the caller of the running call.
+    pub fn fixed(
+        api_key: &str,
+        bank: &str,
+        base: &str,
+        limiter: Arc<Limiter>,
+        owner: Option<&str>,
+    ) -> Self {
         Self::new(
             Keys::Fixed {
                 api_key: Secret::new(api_key.to_string()),
                 bank: bank.to_string(),
+                owner: owner.map(str::to_string),
             },
             base,
             limiter,
@@ -157,7 +167,7 @@ impl BankSync {
 
     fn field(&self, field: &str) -> Option<String> {
         match &self.keys {
-            Keys::Fixed { api_key, bank } => match field {
+            Keys::Fixed { api_key, bank, .. } => match field {
                 "api_key" => Some(api_key.expose_secret().clone()),
                 "bank" => Some(bank.clone()),
                 _ => None,
@@ -185,9 +195,14 @@ impl BankSync {
         path: &str,
         query: &[(&str, String)],
     ) -> Result<Value, BankError> {
-        let who = workforce_agent::runner::CURRENT_USER_ID
-            .try_with(String::clone)
-            .unwrap_or_default();
+        let who = match &self.keys {
+            Keys::Fixed {
+                owner: Some(owner), ..
+            } => owner.clone(),
+            _ => workforce_agent::runner::CURRENT_USER_ID
+                .try_with(String::clone)
+                .unwrap_or_default(),
+        };
         let bucket = format!("{who}\u{0}{workspace}");
         let mut waited = false;
         loop {
@@ -499,9 +514,15 @@ impl BankProvider for BankSync {
 }
 
 /// What a key and bank test as, for Connections: the bank's name when the
-/// key only reads and the bank's approval stands.
-pub async fn check(api_key: &str, bank: &str, base: &str) -> Result<Connection, BankError> {
-    BankSync::fixed(api_key, bank, base, Limiter::shared())
+/// key only reads and the bank's approval stands. It spends `owner`'s limit,
+/// the person whose connection it is.
+pub async fn check(
+    api_key: &str,
+    bank: &str,
+    base: &str,
+    owner: &str,
+) -> Result<Connection, BankError> {
+    BankSync::fixed(api_key, bank, base, Limiter::shared(), Some(owner))
         .connection()
         .await
 }

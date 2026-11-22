@@ -67,7 +67,7 @@ async fn serve(scopes: &[&str]) -> MockServer {
 }
 
 fn natwest(server: &MockServer) -> BankSync {
-    BankSync::fixed(KEY, "natwest", &server.uri(), Arc::default())
+    BankSync::fixed(KEY, "natwest", &server.uri(), Arc::default(), None)
 }
 
 fn window() -> Window {
@@ -358,14 +358,22 @@ async fn a_person_s_connections_on_one_workspace_share_its_limit() {
             .await;
     }
     let limiter = Arc::new(Limiter::default());
-    let natwest = BankSync::fixed(KEY, "natwest", &server.uri(), Arc::clone(&limiter));
-    let revolut = BankSync::fixed(KEY, "revolut", &server.uri(), Arc::clone(&limiter));
-    workforce_agent::runner::CURRENT_USER_ID
-        .scope("ann".into(), async {
-            natwest.connection().await.unwrap();
-            revolut.connection().await.unwrap();
-        })
-        .await;
+    let natwest = BankSync::fixed(
+        KEY,
+        "natwest",
+        &server.uri(),
+        Arc::clone(&limiter),
+        Some("ann"),
+    );
+    let revolut = BankSync::fixed(
+        KEY,
+        "revolut",
+        &server.uri(),
+        Arc::clone(&limiter),
+        Some("ann"),
+    );
+    natwest.connection().await.unwrap();
+    revolut.connection().await.unwrap();
     let counts = limiter.0.lock().unwrap();
     assert_eq!(counts["ann\u{0}ws_1"].len(), 4, "two banks, two reads each");
     assert!(Arc::ptr_eq(&Limiter::shared(), &Limiter::shared()));

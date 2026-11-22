@@ -1289,8 +1289,8 @@ impl Connections {
     }
 
     /// Runs `c`'s Test on `fields`, its words scrubbed of them.
-    async fn check(&self, c: &Connector, fields: &BTreeMap<String, String>) -> Found {
-        match self.services.check(c.id, fields).await {
+    async fn check(&self, c: &Connector, person: &str, fields: &BTreeMap<String, String>) -> Found {
+        match self.services.check(c.id, person, fields).await {
             Found::Works { account } => Found::Works { account },
             Found::Refused(e) => Found::Refused(scrub(&e, fields)),
             Found::Failed(e) => Found::Failed(scrub(&e, fields)),
@@ -1337,7 +1337,7 @@ impl Connections {
         self.vault_at(Self::tiers(c, &level)[0], &level)?;
         // A flat connection still kept would be hidden by a named one.
         self.migrate(person).await;
-        let account = match self.check(c, &fields).await {
+        let account = match self.check(c, person, &fields).await {
             Found::Works { account } => account,
             other => return Err(Self::failed(other)),
         };
@@ -1379,7 +1379,7 @@ impl Connections {
                 Refusal::NotFound(format!("That {} connection isn't there any more", c.name))
             })?;
         let fields = Self::fields(c, given)?;
-        let found = self.check(c, &fields).await;
+        let found = self.check(c, person, &fields).await;
         let Found::Works { .. } = &found else {
             return Err(Self::failed(found));
         };
@@ -1483,7 +1483,7 @@ impl Connections {
                 Refusal::NotFound(format!("That {} connection isn't there any more", c.name))
             })?;
         let found = self
-            .check(c, &self.kept(c, &conn.level, &conn.key, tier, person))
+            .check(c, person, &self.kept(c, &conn.level, &conn.key, tier, person))
             .await;
         if let Found::Works { .. } = &found {
             let path = key_at(tier, person, &at);
@@ -1529,7 +1529,7 @@ impl Connections {
             SignIn::Google => self.test_google(conn, tier, person).await,
             _ => {
                 let fields = self.kept(c, &conn.level, &conn.key, tier, person);
-                self.check(c, &fields).await
+                self.check(c, person, &fields).await
             }
         };
         self.record(c, conn, person, &found, false).await;

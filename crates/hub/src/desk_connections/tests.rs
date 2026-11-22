@@ -3216,6 +3216,8 @@ fn bank(key: &str, bank: &str) -> BTreeMap<String, String> {
     ])
 }
 
+/// BankSync allows a person ten requests a minute and a check makes three, so
+/// each test below holds to ten of them for Sarah.
 #[tokio::test]
 async fn a_bank_connects_only_on_a_key_that_reads_and_says_when_its_approval_lapses() {
     let h = hub().await;
@@ -3230,29 +3232,8 @@ async fn a_bank_connects_only_on_a_key_that_reads_and_says_when_its_approval_lap
         )
         .await;
     assert!(refused.is_err(), "a key that can write is refused");
-    let lapsed =
-        h.c.connect(
-            SARAH,
-            "bank",
-            Some("Revolut"),
-            "agent",
-            Some("allan"),
-            bank(BS_GOOD, "Revolut"),
-        )
-        .await;
-    assert!(lapsed.is_err(), "a bank whose approval lapsed is refused");
 
-    // BankSync allows ten requests a minute, and a check makes three; each
-    // step from here is counted as a different caller's, as it is by the
-    // process's limiter, which the test would otherwise spend in one go.
-    fn apart<F: std::future::Future>(
-        who: &str,
-        step: F,
-    ) -> impl std::future::Future<Output = F::Output> {
-        workforce_agent::runner::CURRENT_USER_ID.scope(who.to_string(), step)
-    }
-    let natwest = apart(
-        "first",
+    let natwest =
         h.c.connect(
             SARAH,
             "bank",
@@ -3260,10 +3241,9 @@ async fn a_bank_connects_only_on_a_key_that_reads_and_says_when_its_approval_lap
             "agent",
             Some("allan"),
             bank(BS_GOOD, "natwest"),
-        ),
-    )
-    .await
-    .unwrap();
+        )
+        .await
+        .unwrap();
     assert_eq!(natwest.account.as_deref(), Some("NatWest"));
     let approval = natwest.approval.expect("an approval date");
     assert!(approval.estimated && !approval.due);
@@ -3293,18 +3273,13 @@ async fn a_bank_connects_only_on_a_key_that_reads_and_says_when_its_approval_lap
         )
         .unwrap();
 
-    let tested = apart("second", h.c.test(SARAH, "bank", &natwest.id))
-        .await
-        .unwrap();
+    let tested = h.c.test(SARAH, "bank", &natwest.id).await.unwrap();
     assert_eq!(stamp(), long_ago, "a Test moves nothing");
     let lapsed = tested.approval.unwrap();
     assert!(lapsed.due && lapsed.days_left < 0);
-    apart(
-        "third",
-        h.c.reconnect(SARAH, "bank", &natwest.id, bank(BS_GOOD, "natwest")),
-    )
-    .await
-    .unwrap();
+    h.c.reconnect(SARAH, "bank", &natwest.id, bank(BS_GOOD, "natwest"))
+        .await
+        .unwrap();
     assert_eq!(stamp(), long_ago, "nor does a new key");
     let key = natwest.id.rsplit('~').next().unwrap().to_string();
     h.c.keep(
@@ -3321,15 +3296,86 @@ async fn a_bank_connects_only_on_a_key_that_reads_and_says_when_its_approval_lap
         long_ago,
         "nor a setup run again, which keeps it the same way"
     );
+}
 
-    let renewed = apart("fourth", h.c.renew(SARAH, "bank", &natwest.id))
+#[tokio::test]
+async fn a_lapsed_bank_is_refused_and_only_the_persons_renewal_moves_its_approval() {
+    let h = hub().await;
+    let lapsed =
+        h.c.connect(
+            SARAH,
+            "bank",
+            Some("Revolut"),
+            "agent",
+            Some("allan"),
+            bank(BS_GOOD, "Revolut"),
+        )
+        .await;
+    assert!(lapsed.is_err(), "a bank whose approval lapsed is refused");
+
+    let natwest =
+        h.c.connect(
+            SARAH,
+            "bank",
+            Some("NatWest"),
+            "agent",
+            Some("allan"),
+            bank(BS_GOOD, "natwest"),
+        )
         .await
         .unwrap();
-    assert_ne!(stamp(), long_ago, "the person's renewal does");
+    let path = key_at(
+        VaultSource::AgentPerUser,
+        SARAH,
+        &format!(
+            "skills/bank/workspaces/{}/consented_at",
+            natwest.id.rsplit('~').next().unwrap()
+        ),
+    );
+    let long_ago = (Utc::now() - chrono::Duration::days(100)).to_rfc3339();
+    h.allan
+        .apply(
+            &[VaultOp::Set {
+                path: &path,
+                value: &long_ago,
+            }],
+            VaultActor::User(SARAH),
+        )
+        .unwrap();
+    let renewed = h.c.renew(SARAH, "bank", &natwest.id).await.unwrap();
+    assert_ne!(
+        h.allan.get(&path).unwrap(),
+        long_ago,
+        "the person's renewal does"
+    );
     assert_eq!(renewed.approval.unwrap().days_left, 90);
 
     h.c.disconnect(SARAH, "bank", &natwest.id).await.unwrap();
     assert!(h.allan.get(&path).is_none(), "its stamp goes with it");
+}
+
+/// One person's checks never spend another's limit: Sarah's requests are
+/// gone, and a second person's check still goes through.
+#[tokio::test]
+async fn one_persons_bank_checks_do_not_spend_anothers_limit() {
+    let h = hub().await;
+    let keys = || bank(BS_GOOD, "natwest");
+    for _ in 0..3 {
+        assert!(matches!(
+            h.c.services.check("bank", SARAH, &keys()).await,
+            Found::Works { .. }
+        ));
+    }
+    // Sarah has spent nine requests; a fourth check's second one is her
+    // eleventh, and waits too long to be sent.
+    assert!(matches!(
+        h.c.services.check("bank", SARAH, &keys()).await,
+        Found::Failed(ref why) if why.contains("10 requests a minute")
+    ));
+    assert!(matches!(
+        h.c.services.check("bank", "ben", &keys()).await,
+        Found::Works { .. }
+    ));
 }
 
 #[tokio::test]

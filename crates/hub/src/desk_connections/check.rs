@@ -173,13 +173,13 @@ fn account(value: &Value, keys: &[&str]) -> Option<String> {
 
 impl Services {
     /// Tests `fields` against `connector`'s service.
-    pub async fn check(&self, connector: &str, fields: &Fields) -> Found {
-        match self.check_inner(connector, fields).await {
+    pub async fn check(&self, connector: &str, person: &str, fields: &Fields) -> Found {
+        match self.check_inner(connector, person, fields).await {
             Ok(found) | Err(found) => found,
         }
     }
 
-    async fn check_inner(&self, connector: &str, f: &Fields) -> Result<Found, Found> {
+    async fn check_inner(&self, connector: &str, person: &str, f: &Fields) -> Result<Found, Found> {
         let http = &self.http;
         Ok(match connector {
             "github" => self.github_user(field(f, "token")).await?,
@@ -298,19 +298,21 @@ impl Services {
                 }
             }
             "email" => check_mailbox(f).await,
-            "bank" => self.bank(f).await,
+            "bank" => self.bank(person, f).await,
             other => Found::Failed(format!("{other} can't be tested")),
         })
     }
 
     /// Whether a BankSync key only reads, and the bank it names is connected
-    /// with its approval standing: the bank's name.
-    async fn bank(&self, f: &Fields) -> Found {
+    /// with its approval standing: the bank's name. It spends `person`'s limit
+    /// at BankSync, never another's.
+    async fn bank(&self, person: &str, f: &Fields) -> Found {
         use workforce_skills::adapters::bank::model::BankError;
         match workforce_skills::adapters::bank::banksync::check(
             field(f, "api_key"),
             field(f, "bank"),
             &self.bank_api,
+            person,
         )
         .await
         {
