@@ -812,6 +812,10 @@ impl WorkflowStore {
         run_as: RunAsWrite,
         edit: EditContext<'_>,
     ) -> Result<()> {
+        // A row marked in this very save is never shared by it either.
+        if edit.read_personal && visibility != Visibility::Private {
+            return Err(eyre::eyre!(READ_PERSONAL_STAYS_PRIVATE));
+        }
         let now = Utc::now();
         let (set_run_as, run_as_value) = run_as.column_write();
         let mut conn = self.pool.get().await?;
@@ -2735,6 +2739,61 @@ mod tests {
             Some(&shared),
             &AliceTeam
         ));
+    }
+
+    /// The store holds the rule itself: a save marked as made after reading
+    /// the person's bank is never a team or global one, new row or old, and
+    /// a private one marks the row for good.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_save_made_after_reading_the_bank_is_private_or_nothing() {
+        with_store(|s| async move {
+            let marked = || edit("agent_tool", Some("alice")).read_personal(true);
+            let save = |visibility: Visibility, edit: EditContext<'static>| {
+                let s = Arc::clone(&s);
+                async move {
+                    s.save(
+                        "triage",
+                        "workflow",
+                        "x",
+                        None,
+                        Some("alice"),
+                        visibility,
+                        RunAsWrite::Unchanged,
+                        edit,
+                    )
+                    .await
+                }
+            };
+            for visibility in [Visibility::Team, Visibility::Global] {
+                let refused = save(visibility, marked()).await.unwrap_err();
+                assert_eq!(refused.to_string(), READ_PERSONAL_STAYS_PRIVATE);
+            }
+            assert!(s
+                .get("triage", "workflow", Some("alice"))
+                .await
+                .unwrap()
+                .is_none());
+
+            save(Visibility::Private, marked()).await.unwrap();
+            assert!(s
+                .read_personal("workflow", "triage", Some("alice"))
+                .await
+                .unwrap());
+            let later = save(Visibility::Team, edit("web", Some("alice")))
+                .await
+                .unwrap_err();
+            assert_eq!(later.to_string(), READ_PERSONAL_STAYS_PRIVATE);
+            save(Visibility::Private, edit("web", Some("alice")))
+                .await
+                .unwrap();
+            assert!(
+                s.read_personal("workflow", "triage", Some("alice"))
+                    .await
+                    .unwrap(),
+                "never cleared"
+            );
+        })
+        .await;
     }
 
     #[tokio::test(flavor = "multi_thread")]
