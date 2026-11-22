@@ -277,7 +277,9 @@ pub struct SessionView {
     pub boss_answers: bool,
     /// The grant here that holds it (its group's key), if any: said only in
     /// Desk's list of the sessions, so the Mac never asks for it in another.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Always said, none as null: a list that says it is a Desk's that
+    /// knows its grants.
+    #[serde(default)]
     pub grant: Option<String>,
     /// How its process last ended on its own, until it starts again.
     #[serde(skip_serializing_if = "Option::is_none")]

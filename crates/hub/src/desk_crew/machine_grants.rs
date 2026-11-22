@@ -91,6 +91,18 @@ pub struct MachineWanted {
     pub grants: Vec<Wanted>,
     /// Every one of its sessions the sidebar lists, in any group or none.
     pub listed: BTreeSet<Uuid>,
+    /// Whether its Ungrouped grant is said: false until its sessions have
+    /// been read since Desk began carrying Ungrouped grants, and until then
+    /// Desk leaves the one it holds as it is.
+    pub ungrouped_known: bool,
+}
+
+/// Desk's asks for machines' Ungrouped grants.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Asked {
+    /// The first of the asks it makes now, none lapsing between.
+    since: std::time::Instant,
+    last: std::time::Instant,
 }
 
 /// The grants every machine should hold, by machine.
@@ -216,6 +228,14 @@ pub(crate) struct Listed {
     open: BTreeSet<Uuid>,
 }
 
+impl Listed {
+    /// Whether it says what Ungrouped can hold there, as read at or after
+    /// `since`.
+    fn read_since(&self, since: std::time::Instant) -> bool {
+        self.grants_said && self.at >= since
+    }
+}
+
 /// How long one machine's sessions are waited for, as the Ungrouped grants
 /// are read.
 const MACHINE_READ_WITHIN: std::time::Duration = std::time::Duration::from_secs(5);
@@ -310,7 +330,10 @@ impl CrewHub {
     /// read yet, or whose listing doesn't say which grant holds each, and
     /// none while Desk doesn't carry machines' Ungrouped grants.
     pub(crate) fn ungrouped_sessions(&self, o: &Oversight) -> MachineSessions {
-        if o.scope != Scope::Ungrouped || !self.ungrouped_carried() {
+        let Some(since) = self.ungrouped_since() else {
+            return MachineSessions::new();
+        };
+        if o.scope != Scope::Ungrouped {
             return MachineSessions::new();
         }
         // Every plan's session there, whatever its engine or state: a plan's
@@ -326,7 +349,7 @@ impl CrewHub {
         self.machine_known
             .lock()
             .iter()
-            .filter(|(_, l)| l.grants_said)
+            .filter(|(_, l)| l.read_since(since))
             .flat_map(|(m, l)| l.open.iter().map(move |id| (m.clone(), *id)))
             .filter(|k| !grouped.contains(k) && !planned.contains(k))
             .fold(MachineSessions::new(), |mut out, (m, id)| {
@@ -396,8 +419,9 @@ impl CrewHub {
             .into_iter()
             .find(|(_, o)| o.scope == Scope::Ungrouped)
             .map(|(s, _)| s.agent_id.as_str().to_string());
+        // What was read is kept while Desk doesn't ask: it counts again only
+        // as read after Desk asks again.
         let Some(boss) = main.filter(|_| self.ungrouped_carried()) else {
-            self.machine_known.lock().clear();
             return;
         };
         let gap = self.machine_gap();
@@ -470,9 +494,24 @@ impl CrewHub {
     /// Whether Desk on this computer carries machines' Ungrouped grants:
     /// it asked for them lately.
     pub(crate) fn ungrouped_carried(&self) -> bool {
+        self.ungrouped_since().is_some()
+    }
+
+    /// As if Desk last asked for machines' Ungrouped grants long ago.
+    #[cfg(test)]
+    pub(crate) fn ungrouped_lapsed(&self) {
+        if let Some(a) = self.ungrouped_asked.lock().as_mut() {
+            a.last -= UNGROUPED_ASKED_FOR;
+        }
+    }
+
+    /// Since when Desk has carried machines' Ungrouped grants, while it
+    /// does.
+    fn ungrouped_since(&self) -> Option<std::time::Instant> {
         self.ungrouped_asked
             .lock()
-            .is_some_and(|at| at.elapsed() < UNGROUPED_ASKED_FOR)
+            .filter(|a| a.last.elapsed() < UNGROUPED_ASKED_FOR)
+            .map(|a| a.since)
     }
 
     /// The grant the main overseer's (`o`'s) call on session `id` of
@@ -553,7 +592,9 @@ impl CrewHub {
     /// are, and the groups' go on.
     pub(crate) fn machine_grants(&self, plans: bool, ungrouped: bool) -> Option<MachineGrants> {
         if ungrouped {
-            *self.ungrouped_asked.lock() = Some(std::time::Instant::now());
+            let now = std::time::Instant::now();
+            let since = self.ungrouped_since().unwrap_or(now);
+            *self.ungrouped_asked.lock() = Some(Asked { since, last: now });
         }
         if self.services().is_empty() || !self.desk.charges_loaded() {
             return None;
@@ -654,6 +695,29 @@ impl CrewHub {
                     &m,
                     granted.wanted(UNGROUPED.to_string(), "Ungrouped".into(), members, None),
                 );
+            }
+        }
+        // Each machine read since Desk began asking: what it should hold in
+        // Ungrouped is said, none included. With no main overseer, none
+        // should hold one.
+        if plans && ungrouped {
+            let main = overseers.iter().any(|(_, o)| o.scope == Scope::Ungrouped);
+            let since = self.ungrouped_since();
+            let known: Vec<String> = self
+                .machine_known
+                .lock()
+                .iter()
+                .filter(|(_, l)| since.is_some_and(|s| l.read_since(s)))
+                .map(|(m, _)| m.clone())
+                .collect();
+            match main {
+                true => known.into_iter().for_each(|m| {
+                    out.machines.entry(m).or_default().ungrouped_known = true;
+                }),
+                false => out
+                    .machines
+                    .values_mut()
+                    .for_each(|m| m.ungrouped_known = true),
             }
         }
         Some(out)

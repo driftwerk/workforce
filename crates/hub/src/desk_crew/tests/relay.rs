@@ -956,11 +956,8 @@ fn carrying(
                         let (code, mut listed) =
                             native(&there, "GET", "/api/desk/sessions", Value::Null).await;
                         for s in listed.as_array_mut().into_iter().flatten() {
-                            let Some(s) = s.as_object_mut() else { continue };
-                            if older {
+                            if let Some(s) = s.as_object_mut().filter(|_| older) {
                                 s.remove("grant");
-                            } else {
-                                s.entry("grant").or_insert(Value::Null);
                             }
                         }
                         (code, listed)
@@ -1668,6 +1665,16 @@ async fn works_a_machine_session(
     let (code, out) =
         super::served::native(&there, "PUT", "/api/desk/grants/g-globex", theirs).await;
     assert_eq!(code, StatusCode::OK, "{out}");
+    // devbox's list says which grant holds each of its sessions, none too.
+    let (_, listed) = super::served::native(&there, "GET", "/api/desk/sessions", Value::Null).await;
+    let grant_of = |id: uuid::Uuid| {
+        listed
+            .as_array()
+            .and_then(|l| l.iter().find(|s| s["id"] == json!(id)))
+            .and_then(|s| s.get("grant").cloned())
+    };
+    assert_eq!(grant_of(vel20.id), Some(json!("g-globex")));
+    assert_eq!(grant_of(vel9.id), Some(Value::Null), "{listed}");
     let machine_id = format!("devbox/{}", vel9.id);
     // VEL-9 was never placed in the sidebar: it is in no group, as the
     // sidebar shows it. VEL-15 is in a group with no boss of its own.
@@ -1706,7 +1713,13 @@ async fn works_a_machine_session(
     let none = |w: super::super::machine_grants::MachineGrants| {
         w.machines.values().all(|m| m.grants.is_empty())
     };
+    let known = |w: &super::super::machine_grants::MachineGrants| {
+        w.machines.get("devbox").is_some_and(|m| m.ungrouped_known)
+    };
     assert!(none(crew.machine_grants(true, false).unwrap()));
+    // Asked for the first time: devbox isn't read since, so what it holds
+    // in Ungrouped isn't said either way.
+    assert!(!known(&crew.machine_grants(true, true).unwrap()));
     assert!(none(crew.machine_grants(false, true).unwrap()));
     let w = eventually("devbox's sessions read", async || {
         crew.machine_grants(true, true).filter(|w| {
@@ -1814,6 +1827,18 @@ async fn works_a_machine_session(
             == 1,
         "its turn ran on the machine session's own line"
     );
+
+    // Desk stopped asking a while and asks again: devbox counts as unread
+    // until it is read again, so its Ungrouped grant isn't said gone.
+    crew.ungrouped_lapsed();
+    let again = crew.machine_grants(true, true).unwrap();
+    assert!(!known(&again));
+    assert!(again.machines["devbox"].grants.is_empty(), "{again:?}");
+    eventually("devbox read again", async || {
+        crew.machine_grants(true, true).filter(known).map(drop)
+    })
+    .await;
+    assert!(there.charge_of(vel9.id).is_some_and(|c| c.live()));
     poller.abort();
 }
 

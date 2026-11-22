@@ -324,8 +324,9 @@ pub struct CrewHub {
     /// Whether the plans' machine sessions were read since the hub started:
     /// until then no plan grant is said ([`machine_grants`]).
     plans_watched: std::sync::atomic::AtomicBool,
-    /// When Desk last asked for machines' Ungrouped grants: it carries them.
-    ungrouped_asked: Mutex<Option<std::time::Instant>>,
+    /// Since when Desk has asked for machines' Ungrouped grants, and when
+    /// it last did: it carries them.
+    ungrouped_asked: Mutex<Option<machine_grants::Asked>>,
     /// Each of the person's machines' open sessions, as Desk there last
     /// listed them, and when: what the sidebar shows of it
     /// ([`machine_grants`]).
