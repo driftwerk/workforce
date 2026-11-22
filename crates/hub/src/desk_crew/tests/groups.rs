@@ -1792,6 +1792,15 @@ async fn a_groups_boss_hears_its_plans_session_was_removed_by_the_person() {
             })
             .await
             .output;
+        for gone in [mine, theirs, loose] {
+            let said: Vec<&Value> = out
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|s| s["id"] == json!(gone))
+                .collect();
+            assert_eq!(said, [&json!({ "id": gone, "state": "closed" })]);
+        }
         let listed: Vec<workforce_desk::crew::MachineSession> =
             serde_json::from_value(out).unwrap();
         let closed: Vec<uuid::Uuid> = listed
