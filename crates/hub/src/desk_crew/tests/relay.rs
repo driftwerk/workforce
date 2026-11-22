@@ -371,7 +371,21 @@ async fn a_local_boss_reaches_its_groups_machine_sessions_through_desk() {
         // Taken but never answered: said, in time.
         *crew.relay_wait.lock() = Duration::from_millis(300);
         let (taker, crew2) = (Arc::clone(&crew), Arc::clone(&crew));
-        let took = tokio::spawn(async move { taker.relay_take(Duration::from_secs(5)).await });
+        // Desk takes the interrupt; the Mac's own takes, queued meanwhile,
+        // aren't what it waits for.
+        let took = tokio::spawn(async move {
+            loop {
+                let got: Vec<RelayCall> = taker
+                    .relay_take(Duration::from_secs(5))
+                    .await
+                    .into_iter()
+                    .filter(|c| c.tool == "crew.interrupt")
+                    .collect();
+                if !got.is_empty() {
+                    return got;
+                }
+            }
+        });
         let r = tool("crew.interrupt")
             .execute(interrupt(format!("devbox/{remote}")))
             .await
