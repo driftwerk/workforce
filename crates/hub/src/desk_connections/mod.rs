@@ -1483,7 +1483,11 @@ impl Connections {
                 Refusal::NotFound(format!("That {} connection isn't there any more", c.name))
             })?;
         let found = self
-            .check(c, person, &self.kept(c, &conn.level, &conn.key, tier, person))
+            .check(
+                c,
+                person,
+                &self.kept(c, &conn.level, &conn.key, tier, person),
+            )
             .await;
         if let Found::Works { .. } = &found {
             let path = key_at(tier, person, &at);
