@@ -320,7 +320,7 @@ impl CrewHub {
             add_pull(w, pr, r.as_ref().and_then(|r| r.head.as_deref()));
         }
         let mut g = sees::glance(g, sees);
-        g.stall = sight::verdict(&g, state, chrono::Utc::now(), self.thresholds(o));
+        g.stall = sight::verdict(&g, state, chrono::Utc::now(), self.stall_thresholds(o));
         g
     }
 
@@ -383,7 +383,7 @@ impl CrewHub {
     }
 
     /// `o`'s quiet and stall minutes, in this hub's minutes.
-    fn thresholds(&self, o: &Oversight) -> Thresholds {
+    fn stall_thresholds(&self, o: &Oversight) -> Thresholds {
         let minutes = |n: u32| {
             chrono::Duration::from_std(self.timing.minute.saturating_mul(n))
                 .unwrap_or(chrono::Duration::MAX)
