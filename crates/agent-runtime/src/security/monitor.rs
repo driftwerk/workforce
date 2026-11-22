@@ -644,6 +644,10 @@ pub struct Call<'a> {
     /// overseer's crew tools, within its oversight level and act switches):
     /// named for the turn, and its commands are the person's to allow.
     pub standing: bool,
+    /// The conversation the turn is in (`C1`, `C1 › thread 1.5`), where a
+    /// message that names no destination goes. `None` reads it from the
+    /// turn's channel and thread ([`here`]).
+    pub here: Option<&'a str>,
 }
 
 impl<'a> Call<'a> {
@@ -653,8 +657,30 @@ impl<'a> Call<'a> {
             input,
             effect,
             standing: false,
+            here: None,
         }
     }
+}
+
+/// The conversation this turn is in, as a write's destination names it:
+/// its channel, in its thread when it is in one. `None` outside one.
+pub fn here() -> Option<String> {
+    let current = |key: &'static tokio::task::LocalKey<String>| {
+        key.try_with(|value| value.trim().to_string())
+            .ok()
+            .filter(|value| !value.is_empty())
+    };
+    let channel = current(&crate::runner::CURRENT_CHANNEL_ID)?;
+    Some(match current(&crate::runner::CURRENT_THREAD_ID) {
+        Some(thread) => format!("{channel} › thread {thread}"),
+        None => channel,
+    })
+}
+
+/// Whether `tool`, given no destination, posts to the conversation the
+/// turn is in: a message (`messaging.send`, an upload) does.
+fn posts_here(tool: &str) -> bool {
+    tool.split('.').next() == Some("messaging")
 }
 
 /// A call the guard holds.
@@ -848,6 +874,11 @@ impl ContentGuard {
     /// Whether `call` is held.
     pub fn check_call(&self, call: &Call<'_>) -> Option<Held> {
         let armed = self.armed()?;
+        let current = call.here.is_none().then(here).flatten();
+        let call = &Call {
+            here: call.here.or(current.as_deref()),
+            ..*call
+        };
         let signal = {
             let seen = self.seen.lock().unwrap_or_else(|e| e.into_inner());
             assess(call, &self.scope, &seen)?
@@ -890,6 +921,7 @@ pub fn assess(
         input,
         effect,
         standing,
+        here,
     } = *call;
     let owned = || tool.to_string();
     let action = input["action"]
@@ -931,11 +963,28 @@ pub fn assess(
             host_of(url).unwrap_or("a web address").to_string(),
         ));
     }
-    // A write that says where it goes runs only there; one that doesn't
-    // say is judged as any other call.
-    if let Some(to) = effect.and_then(SurfaceEffect::destination) {
+    // A write that says where it goes runs only there. A message that
+    // names nowhere goes to the conversation the turn is in, and is judged
+    // as going there; with no conversation to go to, it is held. Any other
+    // write that doesn't say is judged as any other call.
+    let to = effect.and_then(|effect| {
+        effect.destination().or_else(|| match effect {
+            SurfaceEffect::Writes { platform, .. } if posts_here(tool) => {
+                here.and_then(|here| Destination::of(platform, here))
+            }
+            _ => None,
+        })
+    });
+    if let Some(to) = to {
         return (!scope.expected.iter().any(|place| place.receives(&to)))
             .then(|| exfiltration(format!("{} {}", to.platform, to.target)));
+    }
+    if let Some(SurfaceEffect::Writes { platform, .. }) = effect {
+        if posts_here(tool) {
+            return Some(exfiltration(format!(
+                "{platform}, with no conversation to post to"
+            )));
+        }
     }
     if crate::runner::is_outbound_delivery_tool(tool)
         || (tool == "email.confirm" && action != "cancel")
@@ -1195,11 +1244,31 @@ mod tests {
         );
         assert!(!held.refused);
         assert!(held.reason.contains("email from x@evil.example"));
-        // A post that names nowhere is not a confirmed post to the turn's
-        // own place: it is weighed as any call, and a send is a way out.
-        assert!(guard
-            .check("messaging.send", &json!({}), Some(&writes("slack", "")))
-            .is_some());
+        // A post that names nowhere goes to the conversation the turn is
+        // in: run when that is where it delivers, held when it is not or
+        // when there is none.
+        let unnamed = writes("slack", "");
+        let posted_in = |here: Option<&str>| {
+            guard.check_call(&Call {
+                here,
+                ..Call::new("messaging.send", &Value::Null, Some(&unnamed))
+            })
+        };
+        assert_eq!(posted_in(Some("C1")), None);
+        assert_eq!(posted_in(Some("C1 › thread 1.5")), None);
+        assert_eq!(
+            posted_in(Some("C9")).map(|held| held.signal),
+            Some(AnomalySignal::Exfiltration {
+                tool: "messaging.send".into(),
+                to: "slack c9".into()
+            })
+        );
+        assert!(
+            guard
+                .check("messaging.send", &json!({}), Some(&unnamed))
+                .is_some(),
+            "no conversation to post to"
+        );
         for own in ["C1", "#c1", "C1 › thread 1.5", "C1 in T1"] {
             assert_eq!(
                 guard.check("messaging.send", &json!({}), Some(&writes("slack", own))),
@@ -1823,6 +1892,41 @@ mod tests {
     fn a_write_that_names_no_destination_is_judged_as_any_call() {
         let guard = armed(delivering("C1"));
         let nowhere = writes("slack", "");
+        // A message with no destination is the current conversation's: the
+        // turn's own (its origin, or a monitor's destination) runs, and one
+        // it can't place is held.
+        let send = |here: Option<&str>| Call {
+            here,
+            ..Call::new("messaging.send", &Value::Null, Some(&nowhere))
+        };
+        assert_eq!(guard.check_call(&send(Some("C1"))), None);
+        let monitor = armed(ContentScope {
+            expected: vec![Place::on("slack", "C7")],
+            refuses: true,
+            ..ContentScope::default()
+        });
+        assert_eq!(monitor.check_call(&send(Some("C7"))), None);
+        assert!(monitor.check_call(&send(Some("C1"))).is_some());
+        let unplaced = guard.check_call(&send(None)).expect("nowhere to post");
+        assert_eq!(
+            unplaced.signal,
+            AnomalySignal::Exfiltration {
+                tool: "messaging.send".into(),
+                to: "slack, with no conversation to post to".into()
+            }
+        );
+        // The turn's conversation, as a turn on it is scoped.
+        let in_thread = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(crate::runner::CURRENT_CHANNEL_ID.scope(
+                "C1".to_string(),
+                crate::runner::CURRENT_THREAD_ID.scope("1.5".to_string(), async {
+                    (here(), guard.check_call(&send(None)))
+                }),
+            ));
+        assert_eq!(in_thread, (Some("C1 › thread 1.5".to_string()), None));
+        // Any other write that names nowhere is weighed as any call.
         assert!(guard
             .check("acme.ticket_update", &json!({}), Some(&nowhere))
             .is_some());
