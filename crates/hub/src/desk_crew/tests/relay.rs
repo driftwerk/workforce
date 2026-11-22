@@ -1661,3 +1661,97 @@ async fn a_machine_sessions_inside_is_read_there_judged_here_and_an_older_desk_i
     })
     .await;
 }
+
+/// A plan's ticket at work on a machine keeps its plan moving while what
+/// Desk sees of its session there is unknown, past the plan's stall; once
+/// its glance there shows it waiting hours on a build slot, the ticket is
+/// stuck and the person is told the plan's stall once, naming the wait.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_machine_ticket_is_busy_while_its_evidence_is_unknown_and_stuck_once_it_shows_a_wait() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (main, _llm) = agent(dir.path(), "desk", "ok").await;
+        write_config(
+            &main,
+            &format!(
+                "{MAIN}[oversight.work]\nstall_minutes = 5\n[oversight.wake]\nquiet_minutes = 40\n"
+            ),
+        );
+        let state = hub(std::slice::from_ref(&main));
+        let d = desk_running(
+            pool,
+            dir.path(),
+            Default::default(),
+            installed_cli(dir.path()),
+            not_installed(dir.path()),
+        )
+        .await;
+        let dm = main
+            .sessions
+            .get_or_create(DESK_CHANNEL, PERSON, "desk")
+            .unwrap();
+        main.sessions.save(&dm).unwrap();
+        let crew = CrewHub::start(state, d.clone(), FAST, CancellationToken::new());
+        // devbox: its sessions, each start made, and their glances there.
+        let listed: Arc<parking_lot::Mutex<Vec<Value>>> = Arc::default();
+        let since = chrono::Utc::now() - chrono::Duration::hours(3);
+        let _poller = {
+            let (crew, listed) = (Arc::clone(&crew), Arc::clone(&listed));
+            tokio::spawn(async move {
+                loop {
+                    for c in crew.relay_take(Duration::from_millis(200)).await {
+                        let body = match c.tool.as_str() {
+                            "desk.sessions" => Value::Array(listed.lock().clone()),
+                            "desk.session_start" => {
+                                let s = json!({"id": uuid::Uuid::new_v4(), "name": c.input["name"],
+                                               "cwd": c.input["cwd"], "state": "working"});
+                                listed.lock().push(s.clone());
+                                s
+                            }
+                            _ if c.tool == super::super::inside::NAME => {
+                                let glances: Vec<Value> = listed
+                                    .lock()
+                                    .iter()
+                                    .filter_map(|s| s["id"].as_str()?.parse().ok())
+                                    .map(|id| machine_glance(id, since))
+                                    .collect();
+                                json!({ "glances": glances })
+                            }
+                            _ => json!({"done": "read"}),
+                        };
+                        let status = ServedStatus::Ok;
+                        crew.relay_answer(c.id, RelayAnswer { status, body });
+                    }
+                }
+            })
+        };
+        planned_on_devbox(&main, &d, "Speed up recall", "/home/dev/vellev").await;
+        let stalls = || {
+            main.sessions
+                .find(DESK_CHANNEL, PERSON)
+                .unwrap()
+                .map(|s| s.messages)
+                .unwrap_or_default()
+                .iter()
+                .filter(|m| m.content.contains("hasn't moved in"))
+                .map(|m| m.content.clone())
+                .collect::<Vec<_>>()
+        };
+        // Past the plan's stall and short of its session's quiet: nothing
+        // is known of it there, so it is at work.
+        tokio::time::sleep(Duration::from_millis(2000)).await;
+        assert!(stalls().is_empty(), "{:?}", stalls());
+        let said = eventually("the plan's stall said", async || {
+            let s = stalls();
+            (!s.is_empty()).then_some(s)
+        })
+        .await;
+        assert!(
+            said[0].contains("has waited 3 h for a build slot"),
+            "{said:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(800)).await;
+        assert_eq!(stalls().len(), 1, "once");
+    })
+    .await;
+}
