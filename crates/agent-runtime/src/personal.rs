@@ -240,7 +240,7 @@ mod tests {
         let told = Arc::new(std::sync::Mutex::new(Vec::new()));
         let tell = |name: &'static str| {
             let told = Arc::clone(&told);
-            move |read| told.lock().unwrap().push((name, read))
+            move |read: bool| told.lock().unwrap().push((name, read))
         };
         on_end(tell("outside"));
         let held = scoped(false, async {
