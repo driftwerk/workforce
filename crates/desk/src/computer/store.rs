@@ -1,4 +1,4 @@
-//! The kill switch, grants, what each agent does on its own (V090) and
+//! The kill switch, grants, what each agent does on its own (V091) and
 //! activity in Postgres (`desk` schema, V020).
 //!
 //! `arguments` reach here already tokenised by the caller
