@@ -275,6 +275,10 @@ pub struct SessionView {
     /// the hub of a boss that runs it from another computer.
     #[serde(default)]
     pub boss_answers: bool,
+    /// The grant here that holds it (its group's key), if any: said only in
+    /// Desk's list of the sessions, so the Mac never asks for it in another.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grant: Option<String>,
     /// How its process last ended on its own, until it starts again.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub exited: Option<Exited>,
@@ -438,6 +442,7 @@ impl SessionView {
             waits_on_you: None,
             boss_has: None,
             boss_answers: false,
+            grant: None,
             failure: None,
             exited: None,
             created_at: r.created_at,

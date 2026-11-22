@@ -776,6 +776,10 @@ pub struct MachineSession {
     /// from a Desk that doesn't say.
     #[serde(default)]
     pub boss_answers: Option<bool>,
+    /// The grant there that holds it, by its group's key; none while none
+    /// does, or from a Desk that doesn't say.
+    #[serde(default)]
+    pub grant: Option<String>,
     /// How its process last ended on its own; none from a Desk that
     /// doesn't say, or says it in a way this one can't read.
     #[serde(default, deserialize_with = "exited_or_none")]

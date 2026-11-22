@@ -1615,6 +1615,13 @@ async fn works_a_machine_session(
     let started = super::relayed_work::person_started;
     let vel9 = started(&there, devbox_dir.path(), "VEL-9").await;
     let vel15 = started(&there, devbox_dir.path(), "VEL-15").await;
+    // VEL-20 is held there by another home's grant: never asked for in
+    // this one's, which devbox would refuse whole.
+    let vel20 = started(&there, devbox_dir.path(), "VEL-20").await;
+    let theirs = super::served::grant(&[vel20.id], devbox_dir.path(), "act", "status");
+    let (code, out) =
+        super::served::native(&there, "PUT", "/api/desk/grants/g-globex", theirs).await;
+    assert_eq!(code, StatusCode::OK, "{out}");
     let machine_id = format!("devbox/{}", vel9.id);
     // VEL-9 was never placed in the sidebar: it is in no group, as the
     // sidebar shows it. VEL-15 is in a group with no boss of its own.

@@ -206,6 +206,10 @@ const UNGROUPED_ASKED_FOR: std::time::Duration = std::time::Duration::from_secs(
 /// the plan's goal: none yet where its tickets are still to start.
 pub(crate) type PlanSessions = BTreeMap<(String, Uuid), (String, BTreeSet<Uuid>)>;
 
+/// How long one machine's sessions are waited for, as the Ungrouped grants
+/// are read.
+const MACHINE_READ_WITHIN: std::time::Duration = std::time::Duration::from_secs(5);
+
 impl CrewHub {
     /// What `service`'s grants say of it, as the module says; none for an
     /// id a grant can't name.
@@ -289,19 +293,23 @@ impl CrewHub {
     }
 
     /// Each machine's sessions the sidebar has in Ungrouped that the main
-    /// overseer `agent` reaches by its machine's Ungrouped grant: none for
+    /// overseer `o` reaches by its machine's Ungrouped grant: none for
     /// a group's boss, and none of its plans' (a machine holds a session in
     /// one grant only). As the sidebar resolves it: each machine's open
     /// sessions, as last read there, in no group; the ones it lists in
     /// Ungrouped for a machine not read yet.
-    pub(crate) fn ungrouped_sessions(&self, agent: &str, o: &Oversight) -> MachineSessions {
+    pub(crate) fn ungrouped_sessions(&self, o: &Oversight) -> MachineSessions {
         if o.scope != Scope::Ungrouped {
             return MachineSessions::new();
         }
+        // Every plan's session there, whatever its engine or state: a plan's
+        // grant has it, never this one.
         let planned: BTreeSet<(String, Uuid)> = self
-            .plan_sessions(agent, o)
-            .into_iter()
-            .flat_map(|((m, _), (_, ids))| ids.into_iter().map(move |id| (m.clone(), id)))
+            .machine_seen
+            .lock()
+            .keys()
+            .filter_map(|item| machine_session(item))
+            .map(|(m, id)| (m.to_string(), id))
             .collect();
         let layout = self.desk.layout();
         let grouped: BTreeSet<(String, Uuid)> = layout
@@ -337,9 +345,12 @@ impl CrewHub {
     /// Keeps `listed`, `machine`'s sessions as Desk there just listed them,
     /// but those closed.
     pub(super) fn machine_listed(&self, machine: &str, listed: &[MachineSession]) {
+        // One another grant there holds (another home's, or a group's) is
+        // never asked for: the machine would refuse the whole grant.
         let open = listed
             .iter()
             .filter(|s| s.state != "closed")
+            .filter(|s| s.grant.as_deref().is_none_or(|g| g == UNGROUPED))
             .map(|s| s.id)
             .collect();
         self.machine_known
@@ -389,35 +400,45 @@ impl CrewHub {
             .map(str::to_string)
             .collect();
         self.machine_known.lock().retain(|m, _| had.contains(m));
-        let reached = machines["machines"]
+        let reached: Vec<&str> = machines["machines"]
             .as_array()
             .into_iter()
             .flatten()
             .filter(|m| m["reached"].as_bool() == Some(true))
             .filter_map(|m| m["name"].as_str())
-            .filter(|m| had.contains(*m));
-        for machine in reached {
-            let fresh = self
-                .machine_known
-                .lock()
-                .get(machine)
-                .is_some_and(|(at, _)| at.elapsed() < gap);
-            if fresh {
-                continue;
+            .filter(|m| had.contains(*m))
+            .filter(|m| {
+                self.machine_known
+                    .lock()
+                    .get(*m)
+                    .is_none_or(|(at, _)| at.elapsed() >= gap)
+            })
+            .collect();
+        // Each at once, none waited on past a short while: a slow machine
+        // keeps what was last read of it.
+        let read = reached.into_iter().map(|machine| {
+            let boss = &boss;
+            async move {
+                let listed = tokio::time::timeout(
+                    MACHINE_READ_WITHIN,
+                    self.machine_call(machine, None, boss, "desk.sessions", json!({})),
+                )
+                .await;
+                (machine, listed)
             }
-            match self
-                .machine_call(machine, None, &boss, "desk.sessions", json!({}))
-                .await
-            {
-                Ok(v) => match serde_json::from_value::<Vec<MachineSession>>(v) {
+        });
+        for (machine, listed) in futures::future::join_all(read).await {
+            match listed {
+                Ok(Ok(v)) => match serde_json::from_value::<Vec<MachineSession>>(v) {
                     Ok(listed) => self.machine_listed(machine, &listed),
                     Err(e) => {
                         tracing::debug!(%machine, error = %e, "a machine's sessions couldn't be read");
                     }
                 },
-                Err(e) => {
+                Ok(Err(e)) => {
                     tracing::debug!(%machine, error = %e, "a machine's sessions weren't read")
                 }
+                Err(_) => tracing::debug!(%machine, "a machine's sessions weren't read in time"),
             }
         }
     }
@@ -430,18 +451,17 @@ impl CrewHub {
             .is_some_and(|at| at.elapsed() < UNGROUPED_ASKED_FOR)
     }
 
-    /// The grant `agent`'s call on session `id` of `machine` goes under
-    /// when it is one of that machine's sessions in Ungrouped, or why it
-    /// can't be reached.
+    /// The grant the main overseer's (`o`'s) call on session `id` of
+    /// `machine` goes under when it is one of that machine's sessions in
+    /// Ungrouped, or why it can't be reached.
     pub(crate) fn ungrouped_grant_of(
         &self,
-        agent: &str,
         o: &Oversight,
         machine: &str,
         id: Uuid,
     ) -> Result<String, String> {
         let ours = self
-            .ungrouped_sessions(agent, o)
+            .ungrouped_sessions(o)
             .get(machine)
             .is_some_and(|ids| ids.contains(&id));
         match (ours, self.ungrouped_carried()) {
@@ -471,7 +491,7 @@ impl CrewHub {
                 .into_keys()
                 .map(|(m, plan)| (m, plan_key(plan)))
                 .chain(
-                    self.ungrouped_sessions(agent, o)
+                    self.ungrouped_sessions(o)
                         .into_keys()
                         .filter(|_| self.ungrouped_carried())
                         .map(|m| (m, UNGROUPED.to_string())),
@@ -593,7 +613,7 @@ impl CrewHub {
         // Said only once the plans' sessions are known, so none of theirs is
         // taken into it.
         for (service, o) in overseers.iter().filter(|_| plans && ungrouped) {
-            let machines = self.ungrouped_sessions(service.agent_id.as_str(), o);
+            let machines = self.ungrouped_sessions(o);
             let Some(granted) = (!machines.is_empty())
                 .then(|| self.granted(service, o))
                 .flatten()

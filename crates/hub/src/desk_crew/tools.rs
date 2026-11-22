@@ -952,10 +952,7 @@ impl CrewTool {
             None => {
                 let agent = b.service.agent_id.as_str();
                 crew.plan_grant_of(agent, &b.oversight, machine, id)
-                    .map_or_else(
-                        || crew.ungrouped_grant_of(agent, &b.oversight, machine, id),
-                        Ok,
-                    )
+                    .map_or_else(|| crew.ungrouped_grant_of(&b.oversight, machine, id), Ok)
             }
         }
     }

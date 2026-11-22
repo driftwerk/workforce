@@ -3354,14 +3354,15 @@ impl Desk {
     }
 
     /// [`Self::list`], each saying whether its boss answers what it asks
-    /// itself ([`SessionView::boss_answers`]): what Desk's list of the
-    /// sessions shows.
+    /// itself ([`SessionView::boss_answers`]) and which grant holds it
+    /// ([`SessionView::grant`]): what Desk's list of the sessions shows.
     pub fn listed(&self) -> Vec<SessionView> {
         let crew = self.crew();
         self.list()
             .into_iter()
             .map(|mut v| {
                 v.boss_answers = crew.as_ref().is_some_and(|c| c.answers_itself(&v));
+                v.grant = self.grant_group_of(v.id);
                 v
             })
             .collect()

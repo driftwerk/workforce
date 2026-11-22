@@ -1573,9 +1573,12 @@ impl CrewHub {
         if !self.desk.charges_loaded() {
             return;
         }
-        self.watch_machines().await;
-        self.watch_ungrouped().await;
-        self.retry_machine_starts().await;
+        // What the machines' Ungrouped grants are made of is read beside
+        // the plans' own work, never in its way.
+        tokio::join!(self.watch_ungrouped(), async {
+            self.watch_machines().await;
+            self.retry_machine_starts().await;
+        });
         match self.desk.plans(Some(PlanState::Paused), None).await {
             Ok(paused) => {
                 for s in paused {
@@ -2886,6 +2889,7 @@ mod tests {
             created_at: None,
             boss_has: None,
             boss_answers: None,
+            grant: None,
             exited: None,
         };
         // Nothing new: nothing said.
