@@ -30,9 +30,13 @@ use crate::runner::SessionContext;
 /// Resolve one image-input object into an [`InputImage`]: either
 /// `{ "artifact_id": "art_…" }` (a prior generation or a
 /// `view_attachment`/`get_user_photo` result, read back from the store) or
-/// `{ "data_base64": "…" }` (inline). `media_type` is honoured when given, else
-/// sniffed from the bytes. `label` prefixes errors (e.g. `"images[0]"`).
-fn resolve_image_input(entry: &Value, agent_id: &str, label: &str) -> Result<InputImage, String> {
+/// `{ "data_base64": "…" }` (inline). What the bytes show decides the media type, and `media_type` only
+/// when they show nothing; a HEIC is converted to JPEG. `label` prefixes errors (e.g. `"images[0]"`).
+async fn resolve_image_input(
+    entry: &Value,
+    agent_id: &str,
+    label: &str,
+) -> Result<InputImage, String> {
     let bytes = if let Some(id_str) = entry.get("artifact_id").and_then(Value::as_str) {
         let id = ArtifactId::parse(id_str)
             .map_err(|e| format!("{label}: invalid artifact_id '{id_str}': {e}"))?;
@@ -60,31 +64,27 @@ fn resolve_image_input(entry: &Value, agent_id: &str, label: &str) -> Result<Inp
     } else {
         return Err(format!("{label}: needs an 'artifact_id' or 'data_base64'"));
     };
-    let media_type = entry
+    let declared = entry
         .get("media_type")
         .and_then(Value::as_str)
-        .filter(|s| !s.is_empty())
-        .map(str::to_string)
-        .unwrap_or_else(|| crate::llm::image::sniff_media_type(&bytes).to_string());
-    Ok(InputImage {
-        data: bytes,
-        media_type,
-    })
+        .unwrap_or_default();
+    let (data, media_type) = crate::attachments::photo::ready(bytes, declared)
+        .await
+        .map_err(|e| format!("{label}: {e}"))?;
+    Ok(InputImage { data, media_type })
 }
 
 /// Resolve the `images` input array into reference images, preserving order.
 /// Shared with `generate_video`'s input images.
-pub(crate) fn resolve_reference_images(
+pub(crate) async fn resolve_reference_images(
     images: &Value,
     agent_id: &str,
 ) -> Result<Vec<InputImage>, String> {
-    let Some(arr) = images.as_array() else {
-        return Ok(Vec::new());
-    };
-    arr.iter()
-        .enumerate()
-        .map(|(i, entry)| resolve_image_input(entry, agent_id, &format!("images[{i}]")))
-        .collect()
+    let mut resolved = Vec::new();
+    for (i, entry) in images.as_array().into_iter().flatten().enumerate() {
+        resolved.push(resolve_image_input(entry, agent_id, &format!("images[{i}]")).await?);
+    }
+    Ok(resolved)
 }
 
 /// Registry name of the image-generation tool. Used for (un)registration on
@@ -329,10 +329,11 @@ impl Tool for ImageGenerationTool {
             .map(|v| v.clamp(1, 4) as u8)
             .unwrap_or(self.default_n);
 
-        let reference_images = match resolve_reference_images(&input["images"], &self.agent_id) {
-            Ok(imgs) => imgs,
-            Err(msg) => return Ok(ToolResult::failure(msg, elapsed(started))),
-        };
+        let reference_images =
+            match resolve_reference_images(&input["images"], &self.agent_id).await {
+                Ok(imgs) => imgs,
+                Err(msg) => return Ok(ToolResult::failure(msg, elapsed(started))),
+            };
 
         let req = ImageRequest {
             prompt: full_prompt,
@@ -531,6 +532,30 @@ pub fn reinstall_image_tool(
 mod tests {
     use super::*;
     use crate::artifacts::types::ArtifactId;
+
+    #[tokio::test]
+    async fn a_heic_reference_image_is_sent_as_a_jpeg_and_an_unknown_one_is_refused() {
+        use base64::Engine as _;
+        let encode = |bytes: &[u8]| base64::engine::general_purpose::STANDARD.encode(bytes);
+        let heic = include_bytes!("../attachments/testdata/gps.heic");
+        let images = serde_json::json!([
+            { "data_base64": encode(heic), "media_type": "image/png" },
+            { "data_base64": encode(heic) },
+        ]);
+        let resolved = resolve_reference_images(&images, "agent").await.unwrap();
+        for image in &resolved {
+            assert_eq!(image.media_type, "image/jpeg");
+            assert_eq!(&image.data[..3], [0xFF, 0xD8, 0xFF]);
+        }
+        let unknown = serde_json::json!([{ "data_base64": encode(b"II*\0\x08\0\0\0") }]);
+        let err = resolve_reference_images(&unknown, "agent")
+            .await
+            .unwrap_err();
+        assert!(
+            err.starts_with("images[0]: this file is not an image format"),
+            "{err}"
+        );
+    }
 
     /// Pins the producer↔consumer contract: the JSON the tool emits under
     /// `GENERATED_IMAGES_KEY` must be exactly what `parse_generated_images`

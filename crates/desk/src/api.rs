@@ -768,7 +768,8 @@ async fn switch_account(
 /// A start as New session asks it, or as a plan's ticket on this machine
 /// for its plan's boss (`boss`, `local:<agent>`), run by it from launch,
 /// under the session id its plan gave it (`id`), so a start sent again is
-/// the same one ([`Desk::create_held`]).
+/// the same one ([`Desk::create_held`]). A plan's ticket has its folder's
+/// dependencies installed as it starts (`deps`).
 #[derive(Deserialize)]
 struct Start {
     #[serde(flatten)]
@@ -777,13 +778,15 @@ struct Start {
     boss: Option<String>,
     #[serde(default)]
     id: Option<Uuid>,
+    #[serde(default)]
+    deps: bool,
 }
 
 async fn create(State(s): S, h: HeaderMap, Query(q): Q, Json(start): Json<Start>) -> Response {
     guarded!(s, h, q);
     match (start.boss, start.id) {
-        (Some(boss), id) => s.desk.create_held(start.new, &boss, id).await,
-        (None, None) => s.desk.create_chosen(start.new).await,
+        (Some(boss), id) => s.desk.create_held(start.new, &boss, id, start.deps).await,
+        (None, None) => s.desk.create_chosen(start.new, start.deps).await,
         (None, Some(_)) => Err(DeskError::Invalid(
             "Only a plan's ticket started for its boss names its session.".into(),
         )),
@@ -3113,6 +3116,20 @@ mod tests {
             assert!(
                 refused.to_string().contains("in its desk view"),
                 "{refused}"
+            );
+            // A plan's ticket asks for its folder's dependencies.
+            std::fs::write(dir.path().join("package.json"), "{}").unwrap();
+            let (status, started) = call(
+                &app,
+                "POST",
+                "/api/desk/sessions",
+                Some(json!({ "engine": "claude", "name": "atlas", "cwd": cwd, "prompt": "Go.", "deps": true })),
+            )
+            .await;
+            assert_eq!(status, 200, "{started}");
+            assert_eq!(
+                started["deps"],
+                json!({ "state": "left", "why": "it has no lockfile" })
             );
         })
         .await;

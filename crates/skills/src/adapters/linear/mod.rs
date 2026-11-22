@@ -259,9 +259,11 @@ impl LinearSkill {
                 self.default_workspace.clone(),
                 Arc::clone(pm),
             )),
-            Arc::new(tools::LinearWorkspacesTool::new(
+            Arc::new(crate::adapters::utils::WorkspacesTool::new(
+                "linear.workspaces",
+                "The Linear workspaces you can use, by name, as {workspaces, default}: default is the one a call without `workspace` goes to, or null when you must pass one. Takes no arguments.",
                 Arc::clone(&self.clients),
-                self.default_workspace.clone(),
+                Some(self.default_workspace.clone()),
             )),
             Arc::new(tools::LinearProjectListTool::new(
                 Arc::clone(&self.clients),

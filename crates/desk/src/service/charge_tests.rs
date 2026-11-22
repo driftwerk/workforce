@@ -1321,3 +1321,121 @@ fn a_command_is_read_for_settings_where_it_runs() {
         home
     ));
 }
+
+#[tokio::test]
+async fn a_boss_ends_what_it_started_or_was_handed_only_while_it_runs_it_or_let_it_go_as_done() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(pool, dir.path()).await;
+        let boss = By::manager("sarah", "Sarah", "its work is done");
+        let mia = Party::manager("mia", "Mia");
+        let charged = |how| {
+            let d = d.clone();
+            let dir = dir.path().to_path_buf();
+            async move {
+                let s = new_session(&d, &dir).await;
+                d.take_on(s.id, &sarah(), how, &Default::default(), &By::you())
+                    .await
+                    .unwrap();
+                s.id
+            }
+        };
+        let mut ends = Vec::new();
+        for how in [How::Started, How::Handed] {
+            let done = charged(how).await;
+            d.release_done(done, &boss).await.unwrap();
+            let by_desk = charged(how).await;
+            d.release(
+                by_desk,
+                &By::manager("sarah", "Sarah", "its group has a boss"),
+            )
+            .await
+            .unwrap();
+            let by_person = charged(how).await;
+            d.release(by_person, &By::you()).await.unwrap();
+            let passed_on = charged(how).await;
+            d.take_on(passed_on, &mia, how, &Default::default(), &By::you())
+                .await
+                .unwrap();
+            let running = charged(how).await;
+            ends.extend([
+                (done, true),
+                (by_desk, false),
+                (by_person, false),
+                (passed_on, false),
+                (running, true),
+            ]);
+        }
+        let taken = charged(How::Taken).await;
+        d.release_done(taken, &boss).await.unwrap();
+        ends.push((taken, false));
+        let legacy = charged(How::Started).await;
+        d.release(legacy, &boss).await.unwrap();
+        let mut row = d.store().charge(legacy).await.unwrap().unwrap();
+        row.released_by = None;
+        d.store().put_charge(&row).await.unwrap();
+        ends.push((legacy, false));
+        assert!(d.charge_load().await, "read again, as after a restart");
+        for (id, ok) in &ends {
+            assert_eq!(d.may_end(*id, Some(&boss)), *ok, "{id}");
+        }
+        let (done, _) = ends[0];
+        d.end(done, Some(boss.clone())).await.unwrap();
+        assert_eq!(d.view(done).unwrap().state, SessionState::Closed);
+        let (by_desk, _) = ends[1];
+        assert!(matches!(
+            d.end(by_desk, Some(boss)).await,
+            Err(DeskError::Conflict(_))
+        ));
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn an_unknown_release_reason_is_the_bosss_and_an_unreadable_charge_fails_the_load() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(pool, dir.path()).await;
+        let boss = By::manager("sarah", "Sarah", "its work is done");
+        let mut ids = Vec::new();
+        for _ in 0..3 {
+            let s = new_session(&d, dir.path()).await;
+            d.take_on(
+                s.id,
+                &sarah(),
+                How::Started,
+                &Default::default(),
+                &By::you(),
+            )
+            .await
+            .unwrap();
+            d.release_done(s.id, &boss).await.unwrap();
+            ids.push(s.id);
+        }
+        let client = d.store().pool().get().await.unwrap();
+        client
+            .execute(
+                "UPDATE charges SET released_by = 'from-a-newer-desk' WHERE session = $1",
+                &[&ids[0]],
+            )
+            .await
+            .unwrap();
+        let read = d.store().charges().await.unwrap();
+        let unknown = read.iter().find(|c| c.session == ids[0]).unwrap();
+        assert_eq!(unknown.released_by, Some(crate::charge::ReleasedBy::Boss));
+        assert!(d.charge_load().await, "the load goes on");
+        assert!(!d.may_end(ids[0], Some(&boss)), "unknown reason: refused");
+        assert!(d.may_end(ids[2], Some(&boss)), "the row it can read stands");
+        client
+            .execute(
+                "UPDATE charges SET how = 'garbled' WHERE session = $1",
+                &[&ids[1]],
+            )
+            .await
+            .unwrap();
+        drop(client);
+        assert!(d.store().charges().await.is_err(), "no row is skipped");
+        assert!(!d.charge_load().await, "the load fails, as it would unread");
+    })
+    .await;
+}
