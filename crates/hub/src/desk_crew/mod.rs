@@ -327,12 +327,16 @@ pub struct CrewHub {
     /// Since when Desk has asked for machines' Ungrouped grants, and when
     /// it last did: it carries them.
     ungrouped_asked: Mutex<Option<machine_grants::Asked>>,
+    /// Since when, and over how many of Desk's asks, there has been no
+    /// main overseer here.
+    main_missing: Mutex<Option<machine_grants::MainMissing>>,
     /// Each of the person's machines' open sessions, as Desk there last
     /// listed them, and when: what the sidebar shows of it
     /// ([`machine_grants`]).
     machine_known: Mutex<HashMap<String, machine_grants::Listed>>,
-    /// The machines said to stay unread, while they do.
-    unread_said: Mutex<HashSet<String>>,
+    /// The machines reached but unread, while they are: since when, and
+    /// whether that was said.
+    unread_since: Mutex<HashMap<String, (std::time::Instant, bool)>>,
     machine_read: Mutex<HashMap<String, std::time::Instant>>,
     /// When each machine last answered a call, of any kind.
     machine_reached: Mutex<HashMap<String, std::time::Instant>>,
@@ -817,8 +821,9 @@ impl CrewHub {
             machine_plans: Mutex::default(),
             plans_watched: std::sync::atomic::AtomicBool::new(false),
             ungrouped_asked: Mutex::default(),
+            main_missing: Mutex::default(),
             machine_known: Mutex::default(),
-            unread_said: Mutex::default(),
+            unread_since: Mutex::default(),
             machine_read: Mutex::default(),
             machine_reached: Mutex::default(),
             machine_down: Mutex::default(),

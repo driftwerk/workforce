@@ -369,13 +369,19 @@ impl Desk {
     /// The group whose grant names `id` (as a member or born), when one
     /// does.
     pub fn grant_group_of(&self, id: Uuid) -> Option<String> {
+        self.grant_held_of(id).map(|(group, _)| group)
+    }
+
+    /// The group whose grant names `id` (as a member or born), and when
+    /// that grant was last issued, when one does.
+    pub fn grant_held_of(&self, id: Uuid) -> Option<(String, DateTime<Utc>)> {
         self.0
             .grants
             .lock()
             .grants
             .values()
             .find(|g| g.members.contains(&id) || g.born.contains(&id))
-            .map(|g| g.group.clone())
+            .map(|g| (g.group.clone(), g.issued_at))
     }
 
     fn grant_view_of(run: &GrantsRun, g: &Grant, now: DateTime<Utc>) -> GrantView {

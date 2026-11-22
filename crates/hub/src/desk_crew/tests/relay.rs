@@ -1852,14 +1852,32 @@ async fn works_a_machine_session(
     .await;
     assert!(there.charge_of(vel9.id).is_some_and(|c| c.live()));
 
-    // The main overseer is gone: no machine should hold an Ungrouped grant,
-    // each one listed or not, so Desk lets go of devbox's.
+    // The main overseer is gone a moment, then back: devbox's Ungrouped
+    // grant isn't said either way meanwhile, so nothing is taken away.
     write_config(&main, "[oversight]\nenabled = false\n");
     let w = eventually("no main overseer", async || {
         crew.machine_grants(true, true)
-            .filter(|w| w.ungrouped_known)
+            .filter(|_| crew.overseer_named("desk").is_none())
     })
     .await;
+    assert!(!w.ungrouped_known && !known(&w), "{w:?}");
+    write_config(&main, MAIN_ALL);
+    eventually("the main overseer back", async || {
+        crew.machine_grants(true, true).filter(known).map(drop)
+    })
+    .await;
+    // Gone a while, over two asks: no machine should hold an Ungrouped
+    // grant, each one listed or not, so Desk lets go of devbox's.
+    write_config(&main, "[oversight]\nenabled = false\n");
+    let w = eventually("no main overseer again", async || {
+        crew.machine_grants(true, true)
+            .filter(|_| crew.overseer_named("desk").is_none())
+    })
+    .await;
+    assert!(!w.ungrouped_known, "not at once: {w:?}");
+    crew.main_gone_long();
+    let w = crew.machine_grants(true, true).unwrap();
+    assert!(w.ungrouped_known, "{w:?}");
     assert!(none(w), "nothing is wanted in its place");
     poller.abort();
 }
@@ -1936,8 +1954,6 @@ async fn a_machine_whose_listing_doesnt_say_its_grants_is_never_written_ungroupe
                 assert!(!r.success, "{r:?}");
                 assert!(carried.lock().iter().all(|c| c.tool != "crew.take_on"));
 
-                // Unread a good while: said once, on the Floor.
-                crew.ungrouped_carried_long();
                 let unread = async || {
                     d.activity(workforce_desk::crew::Filter::All, None, 50)
                         .await
@@ -1947,6 +1963,14 @@ async fn a_machine_whose_listing_doesnt_say_its_grants_is_never_written_ungroupe
                         .filter(|e| e.text.contains("can't read the sessions on devbox"))
                         .count()
                 };
+                // Desk has asked a good while, but devbox was first reached
+                // unread only lately: not said yet, read after read.
+                crew.ungrouped_carried_long();
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                crew.machine_grants(true, true);
+                assert_eq!(unread().await, 0);
+                // Unread a good while itself: said once, on the Floor.
+                crew.unread_long();
                 eventually("devbox said unread", async || {
                     crew.machine_grants(true, true);
                     (unread().await > 0).then_some(())

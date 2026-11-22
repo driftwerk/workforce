@@ -210,16 +210,23 @@ impl Default for Homes {
 }
 
 impl Homes {
-    /// Whether `party`'s home took lately: under `group`'s grant, else
-    /// under any. One it never took under here may be taken yet, at first.
-    fn reads(&self, party: &str, group: Option<&str>) -> bool {
+    /// Whether `party`'s home took lately: under `grant`'s (its group, and
+    /// when it was issued), else under any. One it never took under here
+    /// may be taken under yet: at first, and while the grant is new.
+    fn reads(&self, party: &str, grant: Option<(&str, DateTime<Utc>)>) -> bool {
         let mut took = self
             .took
             .iter()
-            .filter(|((p, g), _)| p == party && group.is_none_or(|w| g == w))
+            .filter(|((p, g), _)| p == party && grant.is_none_or(|(w, _)| g == w))
             .peekable();
+        let new = |issued: DateTime<Utc>| {
+            (Utc::now() - issued)
+                .to_std()
+                .ok()
+                .is_none_or(|age| age < WORK_FRESH)
+        };
         match took.peek() {
-            None => Instant::now() < self.grace,
+            None => Instant::now() < self.grace || grant.is_some_and(|(_, at)| new(at)),
             Some(_) => took.any(|(_, at)| at.elapsed() < WORK_FRESH),
         }
     }
@@ -296,10 +303,10 @@ impl CrewHub {
     pub(crate) fn home_reads(&self, party: &str, session: Option<Uuid>) -> bool {
         let homes = || self.work_homes.lock();
         super::relayed_decide::relayed_party(party)
-            && match session.map(|s| self.desk.grant_group_of(s)) {
+            && match session.map(|s| self.desk.grant_held_of(s)) {
                 None => homes().reads(party, None),
                 Some(None) => false,
-                Some(Some(g)) => homes().reads(party, Some(&g)),
+                Some(Some((g, issued))) => homes().reads(party, Some((&g, issued))),
             }
     }
 
@@ -1423,19 +1430,26 @@ mod tests {
     #[test]
     fn a_home_reads_while_it_takes_and_one_never_heard_only_at_first() {
         let mut h = Homes::default();
+        let long_ago = Utc::now() - chrono::TimeDelta::hours(1);
         assert!(
             h.reads("home/desk", None),
             "just started: its home may take yet"
         );
-        assert!(h.reads("home/desk", Some("g")));
+        assert!(h.reads("home/desk", Some(("g", long_ago))));
         h.grace = Instant::now();
         assert!(!h.reads("home/desk", None));
+        assert!(!h.reads("home/desk", Some(("g", long_ago))));
+        // A grant just written, none taken under it yet: its home may take
+        // under it yet, until it is no longer new.
+        assert!(h.reads("home/desk", Some(("acme", Utc::now()))));
+        let aged = Utc::now() - chrono::TimeDelta::from_std(WORK_FRESH).unwrap();
+        assert!(!h.reads("home/desk", Some(("acme", aged))));
         h.took
             .insert(("home/desk".into(), "g".into()), Instant::now());
         assert!(h.reads("home/desk", None));
-        assert!(h.reads("home/desk", Some("g")));
+        assert!(h.reads("home/desk", Some(("g", long_ago))));
         assert!(
-            !h.reads("home/desk", Some("ungrouped")),
+            !h.reads("home/desk", Some(("ungrouped", long_ago))),
             "taking under another grant alone"
         );
         h.took.insert(
@@ -1443,6 +1457,10 @@ mod tests {
             Instant::now() - WORK_FRESH,
         );
         assert!(!h.reads("home/desk", None), "its home stopped taking");
+        assert!(
+            !h.reads("home/desk", Some(("g", Utc::now()))),
+            "a grant taken under once is new no more"
+        );
     }
 
     #[test]

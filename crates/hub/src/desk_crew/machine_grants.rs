@@ -97,6 +97,14 @@ pub struct MachineWanted {
     pub ungrouped_known: bool,
 }
 
+/// Desk's asks for machines' Ungrouped grants with no main overseer here:
+/// from when, and how many in a row.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct MainMissing {
+    since: std::time::Instant,
+    asks: u32,
+}
+
 /// Desk's asks for machines' Ungrouped grants.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Asked {
@@ -243,8 +251,15 @@ impl Listed {
 /// are read.
 const MACHINE_READ_WITHIN: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// How long a machine Desk reaches may stay unread, Desk carrying its
-/// Ungrouped grant, before it is said: well past a few reads.
+/// How long, and over how many of Desk's asks in a row, there is no main
+/// overseer before no machine should hold an Ungrouped grant: one missing
+/// for a moment (agents coming up one by one, a config read as it is
+/// written) takes nothing away.
+const MAIN_GONE_FOR: std::time::Duration = std::time::Duration::from_secs(60);
+const MAIN_GONE_ASKS: u32 = 2;
+
+/// How long a machine Desk reaches may stay unread, from when it was first
+/// reached unread, before it is said: well past a few reads.
 const UNREAD_SAID_AFTER: std::time::Duration = std::time::Duration::from_secs(120);
 
 impl CrewHub {
@@ -500,9 +515,9 @@ impl CrewHub {
     }
 
     /// Says once, in the log and on the Floor, each machine Desk reaches
-    /// whose sessions stay unread past [`UNREAD_SAID_AFTER`] of carrying its
-    /// Ungrouped grant: the main overseer runs none of its sessions in no
-    /// group, so their questions are the person's.
+    /// whose sessions stay unread [`UNREAD_SAID_AFTER`] from when it was
+    /// first reached unread: the main overseer runs none of its sessions in
+    /// no group, so their questions are the person's.
     fn say_unread(&self, reached: &[&str], since: std::time::Instant) {
         let unread: BTreeSet<String> = {
             let known = self.machine_known.lock();
@@ -512,16 +527,19 @@ impl CrewHub {
                 .map(|m| m.to_string())
                 .collect()
         };
+        let now = std::time::Instant::now();
         let said: Vec<String> = {
-            let mut said = self.unread_said.lock();
-            said.retain(|m| unread.contains(m));
-            match since.elapsed() >= UNREAD_SAID_AFTER {
-                true => unread
-                    .into_iter()
-                    .filter(|m| said.insert(m.clone()))
-                    .collect(),
-                false => Vec::new(),
-            }
+            let mut first = self.unread_since.lock();
+            first.retain(|m, _| unread.contains(m));
+            unread
+                .into_iter()
+                .filter(|m| {
+                    let (at, said) = first.entry(m.clone()).or_insert((now, false));
+                    let say = !*said && now.duration_since(*at) >= UNREAD_SAID_AFTER;
+                    *said |= say;
+                    say
+                })
+                .collect()
         };
         for machine in said {
             tracing::warn!(%machine, "a machine's sessions stay unread: its Ungrouped grant isn't said");
@@ -538,11 +556,41 @@ impl CrewHub {
         }
     }
 
+    /// Counts one of Desk's asks with a main overseer here or not, and says
+    /// whether there has been none for [`MAIN_GONE_FOR`] and
+    /// [`MAIN_GONE_ASKS`] asks in a row.
+    fn main_gone(&self, main: bool) -> bool {
+        let mut missing = self.main_missing.lock();
+        let was = *missing;
+        *missing = (!main).then(|| MainMissing {
+            since: was.map_or_else(std::time::Instant::now, |m| m.since),
+            asks: was.map_or(0, |m| m.asks) + 1,
+        });
+        missing.is_some_and(|m| m.asks >= MAIN_GONE_ASKS && m.since.elapsed() >= MAIN_GONE_FOR)
+    }
+
+    /// As if the main overseer went [`MAIN_GONE_FOR`] earlier than it did.
+    #[cfg(test)]
+    pub(crate) fn main_gone_long(&self) {
+        if let Some(m) = self.main_missing.lock().as_mut() {
+            m.since -= MAIN_GONE_FOR;
+        }
+    }
+
     /// As if Desk began carrying machines' Ungrouped grants long ago.
     #[cfg(test)]
     pub(crate) fn ungrouped_carried_long(&self) {
         if let Some(a) = self.ungrouped_asked.lock().as_mut() {
             a.since -= UNREAD_SAID_AFTER;
+        }
+        self.machine_read.lock().clear();
+    }
+
+    /// As if each machine unread now was first reached unread long ago.
+    #[cfg(test)]
+    pub(crate) fn unread_long(&self) {
+        for (at, _) in self.unread_since.lock().values_mut() {
+            *at -= UNREAD_SAID_AFTER;
         }
         self.machine_read.lock().clear();
     }
@@ -755,11 +803,12 @@ impl CrewHub {
             }
         }
         // Each machine read since Desk began asking: what it should hold in
-        // Ungrouped is said, none included. With no main overseer, every
-        // machine's is: none.
+        // Ungrouped is said, none included. With no main overseer a while,
+        // every machine's is: none; for a moment, none is said.
         if plans && ungrouped {
-            out.ungrouped_known = !overseers.iter().any(|(_, o)| o.scope == Scope::Ungrouped);
-            let since = self.ungrouped_since().filter(|_| !out.ungrouped_known);
+            let main = overseers.iter().any(|(_, o)| o.scope == Scope::Ungrouped);
+            out.ungrouped_known = self.main_gone(main);
+            let since = self.ungrouped_since().filter(|_| main);
             let known: Vec<String> = self
                 .machine_known
                 .lock()
