@@ -45,7 +45,7 @@ use workforce_desk::plan::PlanState;
 use workforce_desk::{DeskError, PlanDetail, PlanTicketView};
 
 use super::actions::{Action, Gate, Target};
-use super::closing::Pull;
+use super::github_seen::Pull;
 use super::{AgentService, CrewHub};
 
 /// What a session started again is told first.

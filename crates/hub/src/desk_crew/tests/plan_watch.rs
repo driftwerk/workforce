@@ -25,7 +25,7 @@ use workforce_desk::open_item::OpenKind;
 use workforce_desk::plan::{Draft, DraftTicket};
 use workforce_desk::{AssignTo, Move, NewPlan};
 
-use super::super::closing::Pull;
+use super::super::github_seen::Pull;
 
 /// Act, the grace a tenth of a second and a stall half a second.
 fn watching() -> String {

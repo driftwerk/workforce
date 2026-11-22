@@ -537,17 +537,16 @@ impl CrewTool {
             super::directives::NAME => crew.directives_tool(b, input).await,
             super::cadence_tool::NAME => crew.cadence_tool(b, input).await,
             // The person's GitHub, as them: no scope of Desk's to keep to.
-            super::github::PR | super::github::BRANCH | super::github::CI => {
-                super::github::read(
-                    b.service.vault.clone(),
-                    b.service.global_vault.clone(),
-                    &b.service.config,
-                    &b.service.tools,
-                    self.name,
-                    input,
-                )
-                .await
-            }
+            super::github::PR | super::github::BRANCH | super::github::CI => super::github::read(
+                b.service.vault.clone(),
+                b.service.global_vault.clone(),
+                &b.service.config,
+                &b.service.tools,
+                self.name,
+                input,
+            )
+            .await
+            .map_err(|e| e.to_string()),
             super::watches::WATCH | super::watches::WATCHES => {
                 crew.watch_tool(self.name, b, input).await
             }
