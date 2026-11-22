@@ -1961,10 +1961,13 @@ mod tests {
         // A message with no destination is the current conversation's: the
         // turn's own (its origin, or a monitor's destination) runs, and one
         // it can't place is held.
-        let send = |here: Option<&str>| Call {
-            here,
-            ..Call::new("messaging.send", &Value::Null, Some(&nowhere))
-        };
+        fn sent<'a>(here: Option<&'a str>, to: &'a SurfaceEffect) -> Call<'a> {
+            Call {
+                here,
+                ..Call::new("messaging.send", &Value::Null, Some(to))
+            }
+        }
+        let send = |here| sent(here, &nowhere);
         assert_eq!(guard.check_call(&send(Some("C1"))), None);
         let monitor = armed(ContentScope {
             expected: vec![Place::on("slack", "C7")],
