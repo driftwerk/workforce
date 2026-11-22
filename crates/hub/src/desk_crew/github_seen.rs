@@ -477,6 +477,23 @@ fn listed_of(got: &Value) -> Vec<Listed> {
 /// One of GitHub's reads being made.
 type Reading = std::pin::Pin<Box<dyn Future<Output = Result<Value, GithubError>> + Send>>;
 
+impl GithubSeen {
+    /// The pull request that is `branch`'s work on `repo` as GitHub last
+    /// said, however long ago: nothing is read for it.
+    pub(crate) fn branch_kept(&self, repo: &str, branch: &str) -> Option<Pull> {
+        let listed = &self
+            .branches
+            .kept
+            .get(&(repo.to_string(), branch.to_string()))?
+            .value;
+        let n = its_pull(listed)?;
+        self.pulls
+            .kept
+            .get(&(repo.to_string(), n))
+            .map(|k| k.value.clone())
+    }
+}
+
 impl CrewHub {
     /// How `service`'s GitHub reads are made: as the person; none without
     /// one, so nothing is read or learnt of GitHub for anyone.
@@ -534,6 +551,12 @@ impl CrewHub {
     ) -> Result<Seen<Option<Pull>>, Unseen> {
         let read = self.github_reader(service).ok_or(Unseen::NotConnected)?;
         branch_pull(&self.github_seen, &read, repo, branch, Instant::now()).await
+    }
+
+    /// The pull request that is `branch`'s work on `repo` as GitHub last
+    /// said: nothing is read for it.
+    pub(super) fn branch_pull_kept(&self, repo: &str, branch: &str) -> Option<Pull> {
+        self.github_seen.lock().branch_kept(repo, branch)
     }
 
     /// Takes `p` as what GitHub says of pull request `n` of `repo` now.
@@ -863,7 +886,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_branchs_work_is_its_newest_open_pull_request_its_list_kept_five_minutes() {
+    async fn a_branchs_work_is_its_newest_open_pull_request_its_list_kept_five_minutes_and_known_without_a_read(
+    ) {
         let server = MockServer::start().await;
         no_writes(&server).await;
         Mock::given(method("GET"))
@@ -898,12 +922,14 @@ mod tests {
         let h = hub(&server);
         let read = |name, input| h.fetch("ann", name, input);
         let seen = Mutex::new(GithubSeen::default());
+        assert_eq!(seen.lock().branch_kept("acme/web", "fix"), None);
         let t0 = Instant::now();
         let got = branch_pull(&seen, &read, "acme/web", "fix", t0)
             .await
             .unwrap();
         let p = got.value.unwrap();
         assert_eq!(p.number, 12);
+        assert_eq!(seen.lock().branch_kept("acme/web", "fix"), Some(p.clone()));
         assert_eq!(p.checks.as_deref(), Some("failure"));
         assert_eq!(
             (p.failed, p.failed_names),

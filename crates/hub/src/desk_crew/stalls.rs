@@ -386,7 +386,7 @@ impl CrewHub {
         let sid = view.id;
         // What Desk sees inside it: what a wait waits on is what it waits
         // on, and red CI or a session that is still is the boss's to move.
-        let seen = self.inside_stall(boss, o, view).await;
+        let seen = self.stall_kept(view, o);
         let queued = seen
             .as_ref()
             .filter(|(_, s)| s.kind == StallKind::Queued)
@@ -563,23 +563,6 @@ impl CrewHub {
                 "I've been looking at what unblocks it since",
             ),
         })
-    }
-
-    /// What Desk sees inside `view` for `boss`, its folder and PR read as
-    /// the person, when that shows a stall someone should move.
-    async fn inside_stall(
-        &self,
-        boss: &str,
-        o: &Oversight,
-        view: &workforce_desk::model::SessionView,
-    ) -> Option<(workforce_desk::sight::Glance, workforce_desk::sight::Stall)> {
-        let (service, _) = self.overseer_named(boss)?;
-        let g = self.glance_of(&service, view, o).await;
-        let s = g
-            .stall
-            .clone()
-            .filter(|s| super::inside::moves(s.kind) || s.kind == StallKind::CiRed)?;
-        Some((g, s))
     }
 
     /// What the boss says it is doing about a stall it handed its full

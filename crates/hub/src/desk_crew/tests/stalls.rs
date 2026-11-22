@@ -910,8 +910,6 @@ pub(super) enum Says {
     Queued,
     /// Nothing at all.
     Nothing,
-    /// A test's progress, every fifth of a second.
-    Streams,
 }
 
 /// A Claude Code stand-in in `dir`, installed as far as Desk can tell,
@@ -924,13 +922,8 @@ pub(super) fn building_cli(dir: &Path, says: Says) -> PathBuf {
     std::fs::create_dir_all(&bin).unwrap();
     let pids = dir.join("ssh.pid");
     let runs = match says {
-        Says::Queued => {
-            "echo 'rbuild: all 3 build slots are busy; waiting for one' >&2\nsleeps"
-        }
+        Says::Queued => "echo 'rbuild: all 3 build slots are busy; waiting for one' >&2\nsleeps",
         Says::Nothing => "sleeps",
-        Says::Streams => {
-            "n=0\nwhile [ $n -lt 600 ]; do n=$((n+1)); echo \"test step $n of 600\"; sleep 0.2; done"
-        }
     };
     workforce_common::executable::write(
         &bin.join("ssh"),
@@ -966,11 +959,17 @@ pub(super) fn builds_stop(dir: &Path) {
         });
 }
 
-/// Session `s` at work on the tests: started, prompted, its Bash call open.
+/// Session `s` at work on the tests: started, prompted, its Bash call open
+/// in its transcript under `dir`'s `projects`.
 pub(super) async fn at_work(dir: &Path, s: uuid::Uuid) -> String {
     let url = hook_url(dir, s).await;
+    let transcript = transcript_of(dir, s);
+    std::fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+    let since = chrono::Utc::now() - chrono::Duration::minutes(1);
+    std::fs::write(&transcript, format!("{}\n", test_call(since, false))).unwrap();
     for body in [
-        json!({"hook_event_name": "SessionStart", "session_id": format!("cc-{s}")}),
+        json!({"hook_event_name": "SessionStart", "session_id": format!("cc-{s}"),
+            "transcript_path": transcript}),
         json!({"hook_event_name": "UserPromptSubmit", "prompt": "Run the tests on the devbox."}),
         json!({"hook_event_name": "PreToolUse", "tool_name": "Bash",
             "tool_input": {"command": "~/bin/rbuild /w -- cargo test"}}),
@@ -978,6 +977,42 @@ pub(super) async fn at_work(dir: &Path, s: uuid::Uuid) -> String {
         hook(&url, body).await;
     }
     url
+}
+
+/// Where session `s`'s transcript is under `dir`.
+fn transcript_of(dir: &Path, s: uuid::Uuid) -> std::path::PathBuf {
+    dir.join("projects")
+        .join("-w")
+        .join(format!("cc-{s}.jsonl"))
+}
+
+/// Where session `s`'s calls write their output under `dir`.
+fn tasks_of(dir: &Path, s: uuid::Uuid) -> std::path::PathBuf {
+    dir.join("tasks")
+        .join("-w")
+        .join(format!("cc-{s}"))
+        .join("tasks")
+}
+
+/// The transcript record of the Bash call `t1` running the tests, made at
+/// `at`, in the `background` or not.
+fn test_call(at: chrono::DateTime<chrono::Utc>, background: bool) -> Value {
+    json!({"type": "assistant", "uuid": "a1", "timestamp": at,
+        "message": {"role": "assistant", "stop_reason": "tool_use", "content": [{
+            "type": "tool_use", "id": "t1", "name": "Bash",
+            "input": {"command": "~/bin/rbuild /w -- cargo test",
+                "run_in_background": background}}]}})
+}
+
+/// Appends `text` to the file at `path`.
+fn append(path: &Path, text: &str) {
+    use std::io::Write as _;
+    std::fs::File::options()
+        .create(true)
+        .append(true)
+        .open(path)
+        .and_then(|mut f| f.write_all(text.as_bytes()))
+        .unwrap();
 }
 
 /// Looks inside every session until the boss's model is woken by a line
@@ -1081,15 +1116,31 @@ pub(super) async fn looks_inside_when_told(llm: &wiremock::MockServer, s: uuid::
     .await;
 }
 
-/// What Desk saw was enough: the boss looked inside session `s` as it was
-/// told, never asked it, and nothing put Desk's status question on its
-/// line.
+/// What Desk saw was enough: the boss, scripted to look inside session `s`
+/// when told ([`looks_inside_when_told`]), was handed what Desk sees
+/// inside it, fenced, never asked it, and nothing put Desk's status
+/// question on its line.
 pub(super) async fn looked_inside_never_asked(llm: &wiremock::MockServer, d: &Desk, s: uuid::Uuid) {
-    let called = eventually("the boss looking inside", async || {
-        let called = boss_called(llm).await;
-        called.contains("crew_inside").then_some(called)
+    eventually("what Desk sees inside it handed to the boss", async || {
+        let requests = llm.received_requests().await.unwrap_or_default();
+        requests
+            .iter()
+            .filter_map(|r| serde_json::from_slice::<Value>(&r.body).ok())
+            .any(|b| {
+                b["messages"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter(|m| m["role"] == "tool")
+                    .filter_map(|m| m["content"].as_str())
+                    .any(|c| {
+                        c.contains("what Desk sees inside the session") && c.contains("Reads as: ")
+                    })
+            })
+            .then_some(())
     })
     .await;
+    let called = boss_called(llm).await;
     assert!(!called.contains("crew_ask_session"), "{called:?}");
     let asked: Vec<String> = sent(d, s)
         .await
@@ -1100,8 +1151,9 @@ pub(super) async fn looked_inside_never_asked(llm: &wiremock::MockServer, d: &De
 }
 
 /// Where the overnight session waited: on its terminal with rbuild's queue
-/// line on its screen, in the background once its turn ended with the
-/// line in its task's output, or on its terminal with nothing printed.
+/// line in its call's output and on its screen, in the background once its
+/// turn ended with the line in its shell's output, or on its terminal with
+/// nothing printed.
 #[derive(Clone, Copy)]
 pub(super) enum Shape {
     AtItsTerminal,
@@ -1127,56 +1179,56 @@ impl Shape {
     }
 }
 
-/// Session `s` at work on the tests ([`at_work`]) as `shape` has it: in
-/// the background, its turn ended on starting them, their output in its
-/// task's file under `base`'s `tasks`.
+/// Session `s` at work on the tests ([`at_work`]) as `shape` has it: its
+/// call printing rbuild's queue line once Desk has looked at it, or in the
+/// background, its turn ended on starting them, the line printed in its
+/// shell's output; silent, nothing printed.
 pub(super) async fn at_work_as(d: &Desk, base: &Path, s: uuid::Uuid, shape: Shape) {
     let url = at_work(base, s).await;
-    if !matches!(shape, Shape::InTheBackground) {
-        return;
-    }
-    let cli = format!("cc-{s}");
-    let project = base.join("projects").join("-w");
-    std::fs::create_dir_all(&project).unwrap();
-    let transcript = project.join(format!("{cli}.jsonl"));
-    let lines = [
-        json!({"type": "assistant", "uuid": "a1", "timestamp": chrono::Utc::now(),
-            "message": {"role": "assistant", "content": [{"type": "tool_use", "id": "t1",
-            "name": "Bash", "input": {"command": "~/bin/rbuild /w -- cargo test",
-            "run_in_background": true}}]}}),
-        json!({"type": "user", "uuid": "u1", "timestamp": chrono::Utc::now(),
-            "message": {"role": "user", "content": [{"type": "tool_result",
-            "tool_use_id": "t1", "content": "Command running in background with ID: b1"}]}}),
-        json!({"type": "assistant", "uuid": "a2", "timestamp": chrono::Utc::now(),
-            "message": {"role": "assistant", "content": [{"type": "text",
-            "text": "The tests run in the background."}]}}),
-    ];
-    std::fs::write(
-        &transcript,
-        lines.iter().map(|l| format!("{l}\n")).collect::<String>(),
-    )
-    .unwrap();
-    let tasks = base.join("tasks").join("-w").join(&cli).join("tasks");
+    let tasks = tasks_of(base, s);
     std::fs::create_dir_all(&tasks).unwrap();
-    std::fs::write(
-        tasks.join("b1.output"),
+    let output = match shape {
+        Shape::Silent => return,
+        Shape::AtItsTerminal => tasks.join("c1.output"),
+        Shape::InTheBackground => {
+            let transcript = transcript_of(base, s);
+            let lines = [
+                test_call(chrono::Utc::now(), true),
+                json!({"type": "user", "uuid": "u1", "timestamp": chrono::Utc::now(),
+                    "message": {"role": "user", "content": [{"type": "tool_result",
+                    "tool_use_id": "t1", "content": "Command running in background with ID: b1"}]}}),
+                json!({"type": "assistant", "uuid": "a2", "timestamp": chrono::Utc::now(),
+                    "message": {"role": "assistant", "content": [{"type": "text",
+                    "text": "The tests run in the background."}]}}),
+            ];
+            std::fs::write(
+                &transcript,
+                lines.iter().map(|l| format!("{l}\n")).collect::<String>(),
+            )
+            .unwrap();
+            hook(
+                &url,
+                json!({"hook_event_name": "Stop", "transcript_path": transcript,
+                    "last_assistant_message": "The tests run in the background.",
+                    "background_tasks": [{"id": "b1", "type": "shell", "status": "running",
+                        "command": "~/bin/rbuild /w -- cargo test"}]}),
+            )
+            .await;
+            eventually("its turn done, its tests in the background", async || {
+                d.view(s)
+                    .ok()
+                    .filter(|v| v.state == SessionState::Done && v.waiting_on() == 1)
+            })
+            .await;
+            tasks.join("b1.output")
+        }
+    };
+    append(&output, "   Compiling workforce-hub v0.1.0\n");
+    d.sight_pass().await;
+    append(
+        &output,
         "rbuild: all 3 build slots are busy; waiting for one\n",
-    )
-    .unwrap();
-    hook(
-        &url,
-        json!({"hook_event_name": "Stop", "transcript_path": transcript,
-            "last_assistant_message": "The tests run in the background.",
-            "background_tasks": [{"id": "b1", "type": "shell", "status": "running",
-                "command": "~/bin/rbuild /w -- cargo test"}]}),
-    )
-    .await;
-    eventually("its turn done, its tests in the background", async || {
-        d.view(s)
-            .ok()
-            .filter(|v| v.state == SessionState::Done && v.waiting_on() == 1)
-    })
-    .await;
+    );
 }
 
 /// The overnight stall of 21 Nov, as `shape`: a session waiting hours on
@@ -1251,17 +1303,67 @@ async fn a_build_queued_in_the_background_is_seen_said_once_and_looked_at_again(
     a_queued_build_is_seen_said_once_and_looked_at_again(Shape::InTheBackground).await;
 }
 
-/// A build that keeps printing is never a stall, however long it runs: its
-/// quiet is said with what Desk sees, and nothing more.
+/// The overnight session gone silent: nothing moves under its ssh build,
+/// so its boss is told once that nothing has moved and to look whether it
+/// still works on the devbox, never to move it.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_build_that_keeps_printing_is_never_said_stalled() {
+async fn a_silent_ssh_build_is_said_once_as_nothing_moving_and_only_looked_at() {
     with_test_pool(workforce_desk::store::build_pool, |pool| async move {
         let dir = tempfile::tempdir().unwrap();
         let base = std::fs::canonicalize(dir.path()).unwrap();
-        let d = sighted_desk(pool, &base, building_cli(&base, Says::Streams)).await;
+        let d = sighted_desk(pool, &base, building_cli(&base, Shape::Silent.says())).await;
+        let (_overseer, _crew, d, llm) = overseeing_on(&base, d, "ok", SIGHTED, &[], FAST).await;
+        let s = new_session(&d, &base, "workforce tests").await;
+        looks_inside_when_told(&llm, s.id).await;
+        at_work_as(&d, &base, s.id, Shape::Silent).await;
+        let look = format!(
+            "{}. Look inside (crew.inside) to see whether it still works there.",
+            Shape::Silent.stall()
+        );
+        looked_until_woken(&d, &llm, &look).await;
+        for _ in 0..5 {
+            d.sight_pass().await;
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        let woke = woken_by(&llm, &look).await;
+        assert_eq!(woke.len(), 1, "said once: {woke:?}");
+        assert!(woke[0].contains("nothing has moved for "), "{woke:?}");
+        let moved = woken_by(&llm, "free what it waits on").await;
+        assert!(moved.is_empty(), "{moved:?}");
+        looked_inside_never_asked(&llm, &d, s.id).await;
+        builds_stop(&base);
+    })
+    .await;
+}
+
+/// A build that keeps printing is never a stall, however long it runs and
+/// whatever else says it waits: rbuild's queue line on its screen and a
+/// sub-agent's output waiting on a reviewer. Its quiet is said with what
+/// Desk sees, and nothing more.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_build_that_keeps_printing_is_never_said_stalled_whatever_else_says_it_waits() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(dir.path()).unwrap();
+        let d = sighted_desk(pool, &base, building_cli(&base, Says::Queued)).await;
         let (_overseer, _crew, d, llm) = overseeing_on(&base, d, "ok", SIGHTED, &[], FAST).await;
         let s = new_session(&d, &base, "workforce tests").await;
         at_work(&base, s.id).await;
+        let tasks = tasks_of(&base, s.id);
+        std::fs::create_dir_all(&tasks).unwrap();
+        let reviewer = base.join("agent-review.output");
+        append(&reviewer, "started\n");
+        std::os::unix::fs::symlink(&reviewer, tasks.join("a1.output")).unwrap();
+        let output = tasks.join("c1.output");
+        append(&output, "   Compiling workforce-hub v0.1.0\n");
+        d.sight_pass().await;
+        append(&reviewer, "waiting for the reviewer's approval\n");
+        let printing = tokio::spawn(async move {
+            for n in 1.. {
+                append(&output, &format!("test step {n} ... ok\n"));
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+        });
         looked_until_woken(&d, &llm, "— what Desk sees: ").await;
         for _ in 0..15 {
             d.sight_pass().await;
@@ -1271,6 +1373,7 @@ async fn a_build_that_keeps_printing_is_never_said_stalled() {
         assert!(stalled.is_empty(), "{stalled:?}");
         let quiet = woken_by(&llm, "— what Desk sees: ").await;
         assert_eq!(quiet.len(), 1, "once a quiet spell: {quiet:?}");
+        printing.abort();
         builds_stop(&base);
     })
     .await;

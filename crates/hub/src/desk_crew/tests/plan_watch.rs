@@ -628,7 +628,7 @@ async fn a_stopped_session_is_the_persons_a_hand_run_ticket_is_left_alone_and_a_
 }
 
 /// The overnight stall of 21 Nov on a plan, as `shape`: its ticket's
-/// session is stuck however busy it looks, the person is told the plan's
+/// session waits, so is stuck however busy it looks, the person is told the plan's
 /// stall once naming it, its plan's turn is told once, the watcher says it
 /// to the boss once, and what Desk saw was enough: nothing asked the
 /// session.
@@ -694,7 +694,54 @@ async fn a_ticket_waiting_on_a_build_slot_in_the_background_is_stuck_said_once_a
     a_ticket_stuck_on_its_build_is_said_once_and_its_turn_told_once(Shape::InTheBackground).await;
 }
 
+/// The overnight session gone silent on a plan: an ssh build that prints
+/// nothing and moves nothing under it may still run on the other computer,
+/// so its plan's turn is told once to look and the watcher says so once,
+/// but its ticket isn't stuck: the person is never told, and nothing says
+/// to free what it waits on.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_ticket_whose_silent_ssh_build_moves_nothing_is_stuck_said_once_and_told_once() {
-    a_ticket_stuck_on_its_build_is_said_once_and_its_turn_told_once(Shape::Silent).await;
+async fn a_ticket_whose_silent_ssh_build_moves_nothing_is_only_looked_at() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(dir.path()).unwrap();
+        let d = sighted_desk(pool, &base, building_cli(&base, Shape::Silent.says())).await;
+        let oversight = format!("{}[oversight.wake]\nquiet_minutes = 5\n", watching());
+        let (overseer, state, d, llm) = hub_on(&base, &oversight, d).await;
+        let _crew = CrewHub::start(state, d.clone(), FAST, CancellationToken::new());
+        let (_, sessions) = running(&d, &base, 1).await;
+        let s = sessions[0].id;
+        looks_inside_when_told(&llm, s).await;
+        at_work_as(&d, &base, s, Shape::Silent).await;
+        let look = format!(
+            "{}. Look inside (crew.inside) to see whether it still works there.",
+            Shape::Silent.stall()
+        );
+        looked_until_woken(&d, &llm, &look).await;
+        for _ in 0..15 {
+            d.sight_pass().await;
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        let told: Vec<String> = overseer
+            .sessions
+            .find(DESK_CHANNEL, PERSON)
+            .unwrap()
+            .map(|s| s.messages)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|m| m.content.contains("hasn't moved in"))
+            .map(|m| m.content)
+            .collect();
+        assert!(told.is_empty(), "never the person's: {told:?}");
+        let (plan, watcher): (Vec<String>, Vec<String>) = woken_by(&llm, &look)
+            .await
+            .into_iter()
+            .partition(|l| l.contains("DES-1's session "));
+        assert_eq!(plan.len(), 1, "its turn told once: {plan:?}");
+        assert_eq!(watcher.len(), 1, "the watcher's line once: {watcher:?}");
+        let moved = woken_by(&llm, "free what it waits on").await;
+        assert!(moved.is_empty(), "{moved:?}");
+        looked_inside_never_asked(&llm, &d, s).await;
+        builds_stop(&base);
+    })
+    .await;
 }

@@ -1667,7 +1667,8 @@ async fn a_machine_sessions_inside_is_read_there_judged_here_and_an_older_desk_i
 /// A plan's ticket at work on a machine keeps its plan moving while what
 /// Desk sees of its session there is unknown, past the plan's stall; once
 /// its glance there shows it waiting hours on a build slot, the ticket is
-/// stuck and the person is told the plan's stall once, naming the wait.
+/// stuck and the person is told the plan's stall once, naming the wait;
+/// once it finishes there, that glance no longer stands.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_machine_ticket_is_busy_while_its_evidence_is_unknown_and_stuck_once_it_shows_a_wait() {
     with_test_pool(workforce_desk::store::build_pool, |pool| async move {
@@ -1696,12 +1697,18 @@ async fn a_machine_ticket_is_busy_while_its_evidence_is_unknown_and_stuck_once_i
         let crew = CrewHub::start(state, d.clone(), FAST, CancellationToken::new());
         // devbox: its sessions, each start made, and their glances there.
         let listed: Arc<parking_lot::Mutex<Vec<Value>>> = Arc::default();
+        let answered = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let since = chrono::Utc::now() - chrono::Duration::hours(3);
         let _poller = {
-            let (crew, listed) = (Arc::clone(&crew), Arc::clone(&listed));
+            let (crew, listed, answered) = (
+                Arc::clone(&crew),
+                Arc::clone(&listed),
+                Arc::clone(&answered),
+            );
             tokio::spawn(async move {
                 loop {
                     for c in crew.relay_take(Duration::from_millis(200)).await {
+                        answered.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                         let body = match c.tool.as_str() {
                             "desk.sessions" => Value::Array(listed.lock().clone()),
                             "desk.session_start" => {
@@ -1739,10 +1746,9 @@ async fn a_machine_ticket_is_busy_while_its_evidence_is_unknown_and_stuck_once_i
                 .map(|m| m.content.clone())
                 .collect::<Vec<_>>()
         };
-        // Past the plan's stall and short of its session's quiet: nothing
-        // is known of it there, so it is at work.
-        tokio::time::sleep(Duration::from_millis(2000)).await;
-        assert!(stalls().is_empty(), "{:?}", stalls());
+        // Past the plan's stall and short of its session's quiet nothing
+        // is known of it there, so it is at work: the first stall said is
+        // its wait's.
         let said = eventually("the plan's stall said", async || {
             let s = stalls();
             (!s.is_empty()).then_some(s)
@@ -1752,8 +1758,54 @@ async fn a_machine_ticket_is_busy_while_its_evidence_is_unknown_and_stuck_once_i
             said[0].contains("has waited 3 h for a build slot"),
             "{said:?}"
         );
-        tokio::time::sleep(Duration::from_millis(800)).await;
+        let after = answered.load(std::sync::atomic::Ordering::SeqCst);
+        eventually("the plan looked at again", async || {
+            (answered.load(std::sync::atomic::Ordering::SeqCst) >= after + 10).then_some(())
+        })
+        .await;
         assert_eq!(stalls().len(), 1, "once");
+
+        // Its session there finishes: what was seen inside it as it worked
+        // no longer says what it does.
+        let item = format!("devbox/{}", listed.lock()[0]["id"].as_str().unwrap());
+        let (_, o) = crew.overseer_named("desk").unwrap();
+        assert!(crew.seen_inside(&item, &o).is_some());
+        {
+            let mut l = listed.lock();
+            l[0]["state"] = json!("idle");
+            l[0]["last_reply"] = json!("The tests ran.");
+        }
+        eventually("its glance there let go", async || {
+            crew.seen_inside(&item, &o).is_none().then_some(())
+        })
+        .await;
     })
     .await;
+}
+
+/// A dev server under a session reads as the same process however often
+/// the session waits: each wait is told apart by its own call, so a later
+/// one is said again, and the same one, its start read a second off, never.
+#[test]
+fn a_wait_is_keyed_by_its_own_call_not_a_process_that_outlives_it() {
+    use workforce_desk::sight::{Glance, Stall, StallKind};
+    let since = chrono::Utc::now() - chrono::Duration::hours(1);
+    let g: Glance =
+        serde_json::from_value(machine_glance(uuid::Uuid::new_v4(), since)["glance"].clone())
+            .unwrap();
+    let s = Stall {
+        kind: StallKind::Queued,
+        since,
+        words: "has waited 1 h for a build slot".into(),
+    };
+    let key = |g: &Glance, s: &Stall| super::super::inside::evidence_key("devbox/s1", g, s);
+    let mut later = g.clone();
+    later.reading.call = Some("toolu_2".into());
+    assert_eq!(later.reading.pid, g.reading.pid);
+    assert_ne!(key(&g, &s), key(&later, &s));
+    let read_again = Stall {
+        since: since - chrono::Duration::seconds(1),
+        ..s.clone()
+    };
+    assert_eq!(key(&g, &s), key(&g, &read_again));
 }

@@ -20,7 +20,7 @@ use workforce_desk::grant::{Grant, Sees};
 use workforce_desk::model::{SessionState, SessionView};
 use workforce_desk::sees::{self, Part};
 use workforce_desk::sight::{
-    self, Glance, PullGlance, Stall, StallKind, Thresholds, WorkspaceGlance,
+    self, Glance, Kind, PullGlance, Stall, StallKind, Thresholds, WorkspaceGlance,
 };
 use workforce_desk::{Processes, TranscriptAsk};
 
@@ -121,23 +121,35 @@ pub(super) fn moves(kind: StallKind) -> bool {
     )
 }
 
-/// What the boss is told of `who`'s stall: what it is, and to look inside
-/// and move it.
-pub(super) fn evidence_line(who: &str, s: &Stall) -> String {
-    format!(
-        "{who} {}. Look inside (crew.inside) and move it: free what it waits on, tell it to \
-         stop waiting, or tell the person.",
-        s.words
-    )
+/// Whether stall `s` in glance `g` only asks the boss to look: nothing
+/// moves under it while its ssh command may still run on another computer,
+/// which alone says nothing is stuck.
+pub(super) fn only_looks(g: &Glance, s: &Stall) -> bool {
+    s.kind == StallKind::Still && g.reading.kind == Kind::Remote
+}
+
+/// What the boss is told of `who`'s stall `s` in glance `g`: what it is,
+/// and to look inside, and move it where it is stuck.
+pub(super) fn evidence_line(who: &str, g: &Glance, s: &Stall) -> String {
+    let then = if only_looks(g, s) {
+        "Look inside (crew.inside) to see whether it still works there."
+    } else {
+        "Look inside (crew.inside) and move it: free what it waits on, tell it to stop \
+         waiting, or tell the person."
+    };
+    format!("{who} {}. {then}", s.words)
 }
 
 /// The key stall `s` in glance `g` of `id` is said once by, until its
-/// evidence changes: a wait by the process it waits in, where Desk knows
-/// it (a process's start is read to the second, so when its wait began can
-/// read earlier as it is looked at again), else by when it began.
+/// evidence changes: a wait by the call, else the process, it waits in,
+/// where Desk knows them (a process's start is read to the second, so when
+/// its wait began can read earlier as it is looked at again), else by when
+/// it began.
 pub(super) fn evidence_key(id: &str, g: &Glance, s: &Stall) -> String {
-    let which = match (s.kind, g.reading.pid) {
-        (StallKind::Queued | StallKind::Input, Some(pid)) => format!("pid-{pid}"),
+    let r = &g.reading;
+    let which = match (s.kind, r.call.as_deref(), r.pid) {
+        (StallKind::Queued | StallKind::Input, Some(call), _) => format!("call-{call}"),
+        (StallKind::Queued | StallKind::Input, None, Some(pid)) => format!("pid-{pid}"),
         _ => s.since.timestamp_millis().to_string(),
     };
     format!("evidence:{id}:{}:{which}", s.kind.as_str())
@@ -334,10 +346,24 @@ impl CrewHub {
         o: &Oversight,
         sees: Sees,
     ) -> Glance {
-        let mut g = g;
         let pr = self.workspace_pull(service, r.as_ref()).await;
+        self.judge(g, pr, r.as_ref(), state, o, sees)
+    }
+
+    /// `g`, what is seen of a session in `state` at `sees`, with `pr`, its
+    /// PR as looked for at `r`, and the stall it shows under `o`'s
+    /// thresholds.
+    fn judge(
+        &self,
+        mut g: Glance,
+        pr: Option<PullSeen>,
+        r: Option<&PrRef>,
+        state: SessionState,
+        o: &Oversight,
+        sees: Sees,
+    ) -> Glance {
         if let Some(w) = g.workspace.as_mut() {
-            add_pull(w, pr, r.as_ref().and_then(|r| r.head.as_deref()));
+            add_pull(w, pr, r.and_then(|r| r.head.as_deref()));
         }
         let mut g = sees::glance(g, sees);
         g.stall = sight::verdict(&g, state, chrono::Utc::now(), self.stall_thresholds(o));
@@ -371,6 +397,31 @@ impl CrewHub {
     pub(super) fn stall_of(&self, id: &str, o: &Oversight) -> Option<(Glance, Stall)> {
         self.seen_inside(id, o)
             .and_then(|(g, s)| s.filter(|s| moves(s.kind)).map(|s| (g, s)))
+    }
+
+    /// The stall someone should move inside `v`, from what Desk has already
+    /// read: a wait, its terminal or nothing moving, else its PR's red CI
+    /// as GitHub last said. Nothing is read for it.
+    pub(super) fn stall_kept(&self, v: &SessionView, o: &Oversight) -> Option<(Glance, Stall)> {
+        self.stall_of(&v.id.to_string(), o)
+            .filter(|(g, s)| !only_looks(g, s))
+            .or_else(|| self.red_kept(v, o))
+    }
+
+    /// `v`'s PR's red CI, from its folder and its PR as last read.
+    fn red_kept(&self, v: &SessionView, o: &Oversight) -> Option<(Glance, Stall)> {
+        let ws = self.workspace_kept(&v.cwd, Instant::now())?;
+        let r = PrRef::of(&ws)?;
+        let pull = self.branch_pull_kept(r.origin.as_deref()?, r.branch.as_deref()?)?;
+        let mut g = self.desk.glance(v);
+        g.workspace = workspace_glance(&ws);
+        let pr = PullSeen {
+            pull: Some(pull),
+            note: None,
+        };
+        let g = self.judge(g, Some(pr), Some(&r), v.state, o, Sees::Everything);
+        let s = g.stall.clone().filter(|s| s.kind == StallKind::CiRed)?;
+        Some((g, s))
     }
 
     /// Asks each machine `boss` reaches under its group's grant for the
@@ -422,13 +473,7 @@ impl CrewHub {
     /// The folder `cwd` as git read it within the last [`WORKSPACE_FOR`].
     async fn workspace_seen(&self, cwd: &str) -> Workspace {
         let now = Instant::now();
-        let kept = self
-            .workspaces
-            .lock()
-            .get(cwd)
-            .filter(|(_, at)| now.saturating_duration_since(*at) < WORKSPACE_FOR)
-            .map(|(w, _)| w.clone());
-        if let Some(w) = kept {
+        if let Some(w) = self.workspace_kept(cwd, now) {
             return w;
         }
         let w = workspace::workspace_of(cwd).await;
@@ -436,6 +481,15 @@ impl CrewHub {
         kept.retain(|_, (_, at)| now.saturating_duration_since(*at) < WORKSPACE_FOR);
         kept.insert(cwd.to_string(), (w.clone(), now));
         w
+    }
+
+    /// The folder `cwd` as last read, within [`WORKSPACE_FOR`] of `now`.
+    fn workspace_kept(&self, cwd: &str, now: Instant) -> Option<Workspace> {
+        self.workspaces
+            .lock()
+            .get(cwd)
+            .filter(|(_, at)| now.saturating_duration_since(*at) < WORKSPACE_FOR)
+            .map(|(w, _)| w.clone())
     }
 
     /// The pull request `r`'s branch is, read as the person through

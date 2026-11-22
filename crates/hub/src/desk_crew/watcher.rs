@@ -634,7 +634,12 @@ impl CrewHub {
             let evidence = inside.as_ref().and_then(|(g, s)| {
                 s.as_ref()
                     .filter(|s| super::inside::moves(s.kind))
-                    .map(|s| (super::inside::evidence_key(&item.id, g, s), s))
+                    .map(|s| {
+                        (
+                            super::inside::evidence_key(&item.id, g, s),
+                            super::inside::evidence_line(&who(&party), g, s),
+                        )
+                    })
             });
             // Said once a stall, instead of its quiet from then on.
             let waits = waiting.get(&item.id).map(Vec::as_slice).unwrap_or_default();
@@ -735,13 +740,13 @@ impl CrewHub {
                         },
                     )
                 }
-                (ItemState::Working | ItemState::Quiet, Some((key, stall))) => {
+                (ItemState::Working | ItemState::Quiet, Some((key, line))) => {
                     holding.insert(quiet_key(item));
                     noted.insert(quiet_key(item));
                     (
                         key.clone(),
                         Trigger {
-                            line: super::inside::evidence_line(&who(&party), stall),
+                            line: line.clone(),
                             approvals: vec![],
                             hop: 0,
                             about: None,

@@ -249,11 +249,9 @@ impl CrewHub {
                     .assignee
                     .as_ref()
                     .filter(|a| ticket.state == TicketState::Doing && a.kind == PartyKind::Session)
-                    .and_then(|a| self.stall_of(&a.id, o));
-                match stalled {
-                    Some(seen) => self.stuck_on(p, ticket.id, &key, &seen, &mut stuck),
-                    None => busy |= t.starting || ticket.state == TicketState::Doing,
-                }
+                    .and_then(|a| self.stall_of(&a.id, o))
+                    .is_some_and(|seen| self.stuck_on(p, ticket.id, &key, &seen, &mut stuck));
+                busy |= !stalled && (t.starting || ticket.state == TicketState::Doing);
                 continue;
             }
             if ticket.state == TicketState::Todo && t.ticket.ready {
@@ -292,12 +290,10 @@ impl CrewHub {
             let stalled = view
                 .as_ref()
                 .filter(|_| ticket.state == TicketState::Doing)
-                .and_then(|v| self.stall_of(&v.id.to_string(), o));
-            if let Some(seen) = &stalled {
-                self.stuck_on(p, ticket.id, &key, seen, &mut stuck);
-            }
+                .and_then(|v| self.stall_of(&v.id.to_string(), o))
+                .is_some_and(|seen| self.stuck_on(p, ticket.id, &key, &seen, &mut stuck));
             // At work, whoever runs it: the plan moves.
-            if stalled.is_none()
+            if !stalled
                 && view.as_ref().is_some_and(|v| {
                     matches!(
                         v.state,
@@ -312,7 +308,7 @@ impl CrewHub {
                 .as_ref()
                 .is_some_and(|v| v.live && v.state != SessionState::Closed);
             match stands(ticket.state, session, view.as_ref(), ours, rested) {
-                Stands::Busy => busy |= stalled.is_none(),
+                Stands::Busy => busy |= !stalled,
                 Stands::Fine if ticket.state == TicketState::Doing && !runs => {
                     stuck.push(format!("{key} is in Doing with no session"));
                 }
@@ -349,9 +345,10 @@ impl CrewHub {
         self.say_stall(boss, o, p, busy, &stuck, now).await;
     }
 
-    /// Ticket `key`'s session is stuck by what Desk sees inside it (`seen`:
-    /// its glance and stall): said with the plan's stall, and its boss's
-    /// plan turn told once until the evidence changes.
+    /// What Desk sees inside ticket `key`'s session (`seen`: its glance and
+    /// stall), its boss's plan turn told once until the evidence changes:
+    /// whether it is stuck, then said with the plan's stall. One only to
+    /// look at isn't.
     fn stuck_on(
         &self,
         p: &PlanDetail,
@@ -359,13 +356,20 @@ impl CrewHub {
         key: &str,
         (glance, stall): &(workforce_desk::sight::Glance, workforce_desk::sight::Stall),
         stuck: &mut Vec<String>,
-    ) {
+    ) -> bool {
         let who = format!("{key}'s session");
-        stuck.push(format!("{who} {}", stall.words));
         let once = super::inside::evidence_key(&ticket.to_string(), glance, stall);
         if self.plan_watch.lock().done.insert(once) {
-            self.wake_plan(p.summary.plan.id, super::inside::evidence_line(&who, stall));
+            self.wake_plan(
+                p.summary.plan.id,
+                super::inside::evidence_line(&who, glance, stall),
+            );
         }
+        let stuck_by = !super::inside::only_looks(glance, stall);
+        if stuck_by {
+            stuck.push(format!("{who} {}", stall.words));
+        }
+        stuck_by
     }
 
     /// Ticket `key` is in Doing with its session gone: its boss puts it
