@@ -66,15 +66,16 @@ The Jira skill provides these tools for interacting with Jira Cloud:
 | `jira.search` | Search issues using JQL with cursor pagination |
 | `jira.get_issue` | Get full issue details including comments and rendered description |
 | `jira.create_issue` | Create a new issue |
-| `jira.update_issue` | Update fields on an existing issue |
+| `jira.update_issue` | Update fields on an existing issue, or move it before or after another issue on its boards (`rank_before_issue` / `rank_after_issue`) |
 | `jira.delete_issue` | Permanently delete an issue (requires permission) |
-| `jira.assign_issue` | Assign an issue to a user by accountId |
+| `jira.assign_issue` | Assign an issue to a user by accountId (pass null to unassign) |
 | `jira.add_comment` | Add a comment to an issue |
 | `jira.list_comments` | List comments on an issue |
 | `jira.list_transitions` | List available workflow transitions |
 | `jira.transition_issue` | Move an issue through a workflow transition |
 | `jira.add_attachment` | Upload a local file as an attachment |
 | `jira.list_projects` | List accessible projects |
+| `jira.myself` | Show who you are on Jira: your accountId, display name and email |
 | `jira.list_fields` | Find the site's story points, sprint, start date and Development fields, and its priority order |
 | `jira.dev_status` | See an issue's pull requests, branches, commit count and builds, as its Development panel shows them |
 | `jira.list_remote_links` | List the web links on an issue (Confluence pages, designs, other trackers) |
