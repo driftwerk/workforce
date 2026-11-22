@@ -7,6 +7,7 @@
 //! item with its answer, reminded until it is answered.
 
 use super::super::actions::{Action, Target};
+use super::super::github_seen::Pull;
 use super::super::updates::UpdateWriter;
 use super::*;
 use workforce_common::channels::desk::DeliveryKind;
@@ -309,6 +310,70 @@ async fn a_stall_only_the_person_can_settle_is_their_item_until_answered() {
                 .any(|m| m.text.contains("Take the 60 minute window tonight")),
             "{thread:?}"
         );
+    })
+    .await;
+}
+
+/// A stall whose session's PR failed CI is the boss's to fix, named from
+/// what Desk already knows of its folder and its PR: who moves it reads
+/// neither again.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stall_on_red_ci_is_said_from_what_desk_already_knows() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(dir.path()).unwrap();
+        let folder = base.join("acme-web");
+        super::act_fully::repo(&folder, "git@github.com:acme/acme-web.git");
+        let head = std::fs::read_to_string(folder.join(".git/refs/heads/main")).unwrap();
+        let (overseer, crew, d, llm) = overseeing(&base, pool, "ok", ACT, &[]).await;
+        crew.set_update_writer(Arc::new(Down));
+        crew.look_at_updates().await;
+        let s = new_session(&d, &folder, "acme-web fix").await;
+        let url = hook_url(&base, s.id).await;
+        hook(
+            &url,
+            json!({"hook_event_name": "Stop", "last_assistant_message": "Pushed the fix."}),
+        )
+        .await;
+        let v = eventually("its turn done", async || {
+            d.view(s.id).ok().filter(|v| v.state == SessionState::Done)
+        })
+        .await;
+        crew.branch_seen("acme/acme-web", "main", 175);
+        crew.pull_seen(
+            "acme/acme-web",
+            175,
+            Pull {
+                number: 175,
+                open: true,
+                head: Some(head.trim().to_string()),
+                checks: Some("failure".into()),
+                failed: 1,
+                failed_names: vec!["Test (1/6)".into()],
+                ..Default::default()
+            },
+        );
+        let (_, o) = crew.overseer_named(overseer.agent_id.as_str()).unwrap();
+        let looked = crew.glance_of(&overseer, &v, &o).await;
+        assert_eq!(
+            looked.stall.map(|s| s.kind),
+            Some(workforce_desk::sight::StallKind::CiRed)
+        );
+        account(
+            &d,
+            s.id,
+            "Fix the acme-web build",
+            &["Blocked: the PR's CI failed."],
+            None,
+        )
+        .await;
+        let red = "acme-web fix's PR #175 failed CI (Test (1/6)) and nothing is fixing it.";
+        let woke = eventually("the boss told of its red CI", async || {
+            let w = woken_by(&llm, red).await;
+            (!w.is_empty()).then_some(w)
+        })
+        .await;
+        assert_eq!(woke.len(), 1, "{woke:?}");
     })
     .await;
 }
@@ -1254,6 +1319,14 @@ async fn a_queued_build_is_seen_said_once_and_looked_at_again(shape: Shape) {
         at_work_as(&d, &base, s.id, shape).await;
         looked_until_woken(&d, &llm, "for a build slot. Look inside (crew.inside)").await;
         let v = d.view(s.id).unwrap();
+        let g = d.glance(&v);
+        assert!(g.settled, "its samples settled");
+        let open = matches!(shape, Shape::AtItsTerminal).then(|| "t1".to_string());
+        assert_eq!(
+            g.open_call.map(|c| c.id),
+            open,
+            "its open call, read from its transcript"
+        );
         assert_eq!(v.waits.unwrap().words, "waiting for a build slot");
         let overview = overseer
             .tools
@@ -1311,14 +1384,17 @@ async fn a_build_queued_in_the_background_is_seen_said_once_and_looked_at_again(
 
 /// The overnight session gone silent: nothing moves under its ssh build,
 /// so its boss is told once that nothing has moved and to look whether it
-/// still works on the devbox, never to move it.
+/// still works on the devbox, never to move it, and its stall in an update
+/// is its session's, at work.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_silent_ssh_build_is_said_once_as_nothing_moving_and_only_looked_at() {
     with_test_pool(workforce_desk::store::build_pool, |pool| async move {
         let dir = tempfile::tempdir().unwrap();
         let base = std::fs::canonicalize(dir.path()).unwrap();
         let d = sighted_desk(pool, &base, building_cli(&base, Shape::Silent.says())).await;
-        let (_overseer, _crew, d, llm) = overseeing_on(&base, d, "ok", SIGHTED, &[], FAST).await;
+        let (overseer, crew, d, llm) = overseeing_on(&base, d, "ok", SIGHTED, &[], FAST).await;
+        crew.set_update_writer(Arc::new(Down));
+        crew.look_at_updates().await;
         let s = new_session(&d, &base, "workforce tests").await;
         looks_inside_when_told(&llm, s.id).await;
         at_work_as(&d, &base, s.id, Shape::Silent).await;
@@ -1337,6 +1413,23 @@ async fn a_silent_ssh_build_is_said_once_as_nothing_moving_and_only_looked_at() 
         let moved = woken_by(&llm, "free what it waits on").await;
         assert!(moved.is_empty(), "{moved:?}");
         looked_inside_never_asked(&llm, &d, s.id).await;
+
+        account(
+            &d,
+            s.id,
+            "Run the workforce tests",
+            &["The test run is blocked on the devbox build."],
+            None,
+        )
+        .await;
+        let item = eventually("its stall in an update", async || {
+            moved_in_updates(&overseer, &d, s.id).await
+        })
+        .await;
+        let Some(Mover::Boss { doing }) = item.moves.clone() else {
+            panic!("the boss's: {item:?}");
+        };
+        assert!(doing.starts_with("I have its session"), "at work: {doing}");
         builds_stop(&base);
     })
     .await;

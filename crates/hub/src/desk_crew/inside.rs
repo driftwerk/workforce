@@ -45,6 +45,9 @@ question, and long before crew.ask_session.";
 const FACETS: [&str; 5] = ["glance", "transcript", "processes", "workspace", "logs"];
 /// How long a folder's read serves a glance.
 const WORKSPACE_FOR: Duration = Duration::from_secs(60);
+/// How long a folder's read is kept for what is judged from what Desk
+/// already knows ([`CrewHub::stall_kept`]).
+const WORKSPACE_KEPT: Duration = Duration::from_secs(15 * 60);
 /// The most sessions one glance at everything working gives.
 const GLANCES_MOST: usize = 20;
 /// How many of those are read at once.
@@ -401,7 +404,8 @@ impl CrewHub {
 
     /// The stall someone should move inside `v`, from what Desk has already
     /// read: a wait, its terminal or nothing moving, else its PR's red CI
-    /// as GitHub last said. Nothing is read for it.
+    /// as GitHub last said of its folder as last read (within
+    /// [`WORKSPACE_KEPT`]). Nothing is read for it.
     pub(super) fn stall_kept(&self, v: &SessionView, o: &Oversight) -> Option<(Glance, Stall)> {
         self.stall_of(&v.id.to_string(), o)
             .filter(|(g, s)| !only_looks(g, s))
@@ -410,7 +414,7 @@ impl CrewHub {
 
     /// `v`'s PR's red CI, from its folder and its PR as last read.
     fn red_kept(&self, v: &SessionView, o: &Oversight) -> Option<(Glance, Stall)> {
-        let ws = self.workspace_kept(&v.cwd, Instant::now())?;
+        let ws = self.workspace_kept(&v.cwd, Instant::now(), WORKSPACE_KEPT)?;
         let r = PrRef::of(&ws)?;
         let pull = self.branch_pull_kept(r.origin.as_deref()?, r.branch.as_deref()?)?;
         let mut g = self.desk.glance(v);
@@ -473,22 +477,22 @@ impl CrewHub {
     /// The folder `cwd` as git read it within the last [`WORKSPACE_FOR`].
     async fn workspace_seen(&self, cwd: &str) -> Workspace {
         let now = Instant::now();
-        if let Some(w) = self.workspace_kept(cwd, now) {
+        if let Some(w) = self.workspace_kept(cwd, now, WORKSPACE_FOR) {
             return w;
         }
         let w = workspace::workspace_of(cwd).await;
         let mut kept = self.workspaces.lock();
-        kept.retain(|_, (_, at)| now.saturating_duration_since(*at) < WORKSPACE_FOR);
+        kept.retain(|_, (_, at)| now.saturating_duration_since(*at) < WORKSPACE_KEPT);
         kept.insert(cwd.to_string(), (w.clone(), now));
         w
     }
 
-    /// The folder `cwd` as last read, within [`WORKSPACE_FOR`] of `now`.
-    fn workspace_kept(&self, cwd: &str, now: Instant) -> Option<Workspace> {
+    /// The folder `cwd` as last read, within `within` of `now`.
+    fn workspace_kept(&self, cwd: &str, now: Instant, within: Duration) -> Option<Workspace> {
         self.workspaces
             .lock()
             .get(cwd)
-            .filter(|(_, at)| now.saturating_duration_since(*at) < WORKSPACE_FOR)
+            .filter(|(_, at)| now.saturating_duration_since(*at) < within)
             .map(|(w, _)| w.clone())
     }
 

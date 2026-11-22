@@ -569,6 +569,23 @@ impl CrewHub {
             Instant::now(),
         );
     }
+
+    /// Takes pull request `n`, open, as the one GitHub lists for `branch`
+    /// of `repo` now.
+    #[cfg(test)]
+    pub(crate) fn branch_seen(&self, repo: &str, branch: &str, n: u64) {
+        let listed = Listed {
+            number: n,
+            open: true,
+            merged: false,
+        };
+        keep(
+            &mut self.github_seen.lock().branches.kept,
+            (repo.to_string(), branch.to_string()),
+            vec![listed],
+            Instant::now(),
+        );
+    }
 }
 
 #[cfg(test)]
