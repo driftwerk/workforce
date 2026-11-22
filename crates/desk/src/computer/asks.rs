@@ -1193,12 +1193,18 @@ fn on_host(host: Option<Host>, remote: &[&Word], fed: bool, home: &Path) -> Opti
     if remote.iter().any(|w| w.dynamic) || (remote.is_empty() && fed) {
         return Some(Asks::Unclear);
     }
-    let script = remote
+    always_asks(&remote_script(remote), &Place::new(None, &[], &[], home))
+        .map(|_| Asks::Remote(vec![host]))
+}
+
+/// The command `ssh` runs on the other machine: its words joined, as the
+/// remote shell is given them.
+fn remote_script(remote: &[&Word]) -> String {
+    remote
         .iter()
         .map(|w| w.text.as_str())
         .collect::<Vec<_>>()
-        .join(" ");
-    always_asks(&script, &Place::new(None, &[], &[], home)).map(|_| Asks::Remote(vec![host]))
+        .join(" ")
 }
 
 impl Word {
@@ -1396,6 +1402,15 @@ fn publishes_words(
                 Err(()) => told(),
             }
         }
+        // What it runs there, on that machine's own branch.
+        "ssh" | "mosh" => match ssh_call(name, args) {
+            Some(ops) => match ops.split_first() {
+                Some((_, remote)) if remote.iter().any(|w| w.dynamic) => true,
+                Some((_, remote)) => publishes_on(&remote_script(remote), None),
+                None => false,
+            },
+            None => told(),
+        },
         "eval" => {
             if args.iter().any(|w| w.dynamic) {
                 return true;
@@ -1879,6 +1894,15 @@ impl Splitter {
         Err(())
     }
 
+    /// Arithmetic that sets a name not known as an integer sets it as an
+    /// assignment does (`$((CDPATH=1))`): a later bare-name `cd` can't be
+    /// placed.
+    fn arithmetic_sets(&mut self, set: &[String]) {
+        if set.iter().any(|n| !self.ints.contains(n)) {
+            self.clean = false;
+        }
+    }
+
     /// `$…`: a substitution is read as its own commands; anything else
     /// marks the word as expanded at run time.
     fn dollar(&mut self) -> Result<(), ()> {
@@ -1893,6 +1917,7 @@ impl Splitter {
                     // a name whose value it evaluates.
                     let inner = self.substitution()?;
                     let set = plain_arithmetic(&inner, &self.ints).ok_or(())?;
+                    self.arithmetic_sets(&set);
                     self.counted.extend(set);
                     self.parts.1 += 1;
                     return Ok(());
@@ -2107,6 +2132,7 @@ impl Splitter {
                     self.at += 1;
                     let inner = self.substitution()?;
                     let set = plain_arithmetic(&inner, &self.ints).ok_or(())?;
+                    self.arithmetic_sets(&set);
                     let for_start = self.compound.is_some()
                         && self.compound == self.out.len().checked_sub(1)
                         && self
@@ -2372,6 +2398,15 @@ fn plain_expansion(inner: &str) -> bool {
     };
     if !plain {
         return false;
+    }
+    // `${x@Q}` and the like quote or transform; `@P` expands a prompt,
+    // running what it holds, and any other is unknown.
+    let operator = match rest.strip_prefix('[') {
+        Some(sub) => sub.split_once(']').map_or("", |(_, after)| after),
+        None => rest,
+    };
+    if let Some(op) = operator.strip_prefix('@') {
+        return op.len() == 1 && "QEaAUuLKk".contains(op);
     }
     // Each `${…}` nested in what follows the name.
     let mut nested = rest;
@@ -5365,6 +5400,12 @@ mod tests {
             "i=0; until false; do echo $((i)); eval x; done",
             "i=0; while :; do echo $((i)); $X; done",
             "i=0; function f { :; }; echo $((i))",
+            // `@P` expands a prompt, running what it holds.
+            "bash -c \"x='\\$(rm -rf ~)'; echo \\\"\\${x@P}\\\"\"",
+            "echo \"${x@P}\"",
+            "echo ${a[0]@P}",
+            "echo ${x@Z}",
+            "echo ${y:-${x@P}}",
         ] {
             assert_eq!(asks(command), Some(U), "{command:?}");
         }
@@ -5382,6 +5423,9 @@ mod tests {
             "ls; cd src && rm -rf build",
             "trap 'CDPATH=/x' DEBUG; cd src && rm -rf build",
             "cd src && rm -rf build; trap x DEBUG",
+            // Arithmetic sets a name as an assignment does.
+            ": $((CDPATH=1)); cd src && rm -rf build",
+            "((CDPATH=1)); cd src && rm -rf build",
         ] {
             if asks(command).is_none() {
                 wrong.push(command);
@@ -5399,6 +5443,7 @@ mod tests {
             "i=0; command echo x; builtin true; echo $((i))",
             "x=a; cd src && rm -rf build",
             "echo x; [ -d src ] && cd src && rm -rf build",
+            "echo ${x@Q} ${x@U} ${a[@]@A} ${x@k}",
         ] {
             assert_eq!(asks(command), None, "{command:?}");
         }
@@ -5417,6 +5462,9 @@ mod tests {
             "$CMD",
             "nice -n 5 npm publish",
             "git -c alias.x='!git push' x",
+            "ssh devbox 'cd repo && git push origin main'",
+            "ssh prod 'npm publish'",
+            "ssh prod 'kubectl apply -f x'",
         ] {
             assert!(publishes_on(command, Some("main")), "{command:?}");
         }
@@ -5431,6 +5479,7 @@ mod tests {
             "timeout 60 git status",
             "eval 'ls'",
             "bash -c -- 'npm test'",
+            "ssh devbox 'cd repo && cargo test'",
         ] {
             assert!(!publishes_on(command, Some("main")), "{command:?}");
         }
