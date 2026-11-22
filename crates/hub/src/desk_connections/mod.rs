@@ -2404,7 +2404,6 @@ fn google_redirect(listen: &str) -> String {
 /// Once an agent is removed, the approvals it watched for the people who
 /// hold this hub are watched by another of their agents.
 pub async fn agent_removed(state: &GatewayState) {
-    use workforce_identity::store::IdentityStore as _;
     let Some(connections) = INSTALLED.get() else {
         return;
     };

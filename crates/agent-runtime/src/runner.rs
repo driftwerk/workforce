@@ -3743,10 +3743,14 @@ impl AgentRunner {
         let _turn = TurnGuard::begin();
         let mut tel = crate::turn_event::TurnTelemetry::start(&self.config);
         tel.set_task(&content);
-        let result = crate::personal::scoped(
-            false,
-            Box::pin(self.run_with_history_content_inner(content, prior_messages, &mut tel)),
-        )
+        let started = std::time::Instant::now();
+        let result = crate::personal::scoped(false, async {
+            let result =
+                Box::pin(self.run_with_history_content_inner(content, prior_messages, &mut tel))
+                    .await;
+            self.trace_failed(&result, started);
+            result
+        })
         .await;
         tel.emit(&result);
         result
@@ -5015,20 +5019,42 @@ impl AgentRunner {
         let _turn = TurnGuard::begin();
         let mut tel = crate::turn_event::TurnTelemetry::start(&self.config);
         tel.set_task(&task_content);
-        let result = crate::personal::scoped(
-            false,
-            Box::pin(self.run_with_progress_and_history_inner(
+        let started = std::time::Instant::now();
+        let result = crate::personal::scoped(false, async {
+            let result = Box::pin(self.run_with_progress_and_history_inner(
                 task_content,
                 prior_messages,
                 progress_tx,
                 cancel_token,
                 inject_rx,
                 &mut tel,
-            )),
-        )
+            ))
+            .await;
+            self.trace_failed(&result, started);
+            result
+        })
         .await;
         tel.emit(&result);
         result
+    }
+
+    /// A run that failed is closed with an `Error` footer, so it is traced
+    /// as one; a run that closed itself already (cancelled) has nothing
+    /// left to close, and the writer drops the extra footer.
+    fn trace_failed(&self, result: &Result<RunResult>, started: std::time::Instant) {
+        let (Err(e), Some(tw)) = (result, self.config.trace_writer.as_ref()) else {
+            return;
+        };
+        if let Err(e) = tw.write_footer(&crate::trace::TraceFooter {
+            outcome: crate::trace::TraceOutcome::Error(e.to_string()),
+            completed_at: chrono::Utc::now(),
+            total_rounds: 0,
+            total_input_tokens: 0,
+            total_output_tokens: 0,
+            total_duration_ms: started.elapsed().as_millis() as u64,
+        }) {
+            warn!(error = %e, "Failed to write trace footer");
+        }
     }
 
     #[allow(clippy::too_many_arguments)]

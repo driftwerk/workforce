@@ -27,14 +27,18 @@ pub(crate) fn digest_turn_admits(
 
 /// Mark `session`, for good, once a turn of it read a personal connector
 /// (the person's bank): a call of `invocations` did, or a tool message it
-/// still holds did (a turn that ended before it settled). Kept by a patch,
+/// still holds did (a turn that ended before it settled), or the turn's own
+/// flag says so (a call through a CLI engine's gate, a session it read
+/// back), asked inside the turn's scope. Kept by a patch,
 /// so no other writer's save of the session drops it.
 pub(crate) fn note_personal_read(
     sessions: &std::sync::Arc<dyn workforce_common::session::SessionStore>,
     session: &mut workforce_common::session::Session,
     invocations: &[workforce_agent::runner::ToolInvocation],
 ) {
-    let read = invocations.iter().any(reads_personal) || read_personal(&session.messages);
+    let read = workforce_agent::personal::read()
+        || invocations.iter().any(reads_personal)
+        || read_personal(&session.messages);
     if session.read_personal() || !read {
         return;
     }

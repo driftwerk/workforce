@@ -8,7 +8,7 @@
 
 use workforce_agent::tools::access::{ToolAccess, ToolAccessSnapshot};
 use workforce_common::channels::desk::{DeskPlace, DeskTarget};
-use workforce_common::connector_binding::{is_read, names_personal, PERSONAL};
+use workforce_common::connector_binding::{connector_of, is_read, names_personal, PERSONAL};
 
 const OFF_DESK: &str =
     "The person's bank is read only in a Desk conversation with them. Ask them there.";
@@ -23,7 +23,7 @@ pub const JOB_OFF_DESK: &str =
 /// What work that reads the person's bank is told when it holds more than
 /// reads beside it.
 pub const ONLY_READS: &str =
-    "Work that reads the person's bank names nothing beside it but reads: nothing that writes or sends, and no whole namespace.";
+    "Work that reads the person's bank names nothing beside it but a built-in connector's reads: nothing that writes or sends, no web, http or MCP tool, and no whole namespace.";
 
 /// Whether `place` is the person's alone: their DM with the agent (or a
 /// thread on it), or a call.
@@ -82,9 +82,22 @@ fn why_not(tool: Option<&str>) -> Option<&'static str> {
     }
 }
 
-/// Whether `tools` holds something beside the bank that isn't a read.
+/// Whether `tools` holds something beside the bank that isn't a known
+/// read: only a built-in connector's own tool whose read the hub knows (as
+/// its computer gate keeps it) may sit beside it. A name alone says
+/// nothing: `web.*`, `http.*` and an MCP server's tools reach out whatever
+/// they are called.
 fn only_reads_beside(tools: &[String]) -> bool {
-    tools.iter().any(|t| !names_personal(t) && !is_read(t))
+    tools.iter().any(|t| !names_personal(t) && !known_read(t))
+}
+
+/// A built-in connector's own tool that only reads.
+fn known_read(tool: &str) -> bool {
+    connector_of(tool).is_some_and(|connector| {
+        crate::skill_loader::static_skill_tool_names(connector)
+            .iter()
+            .any(|t| *t == tool)
+    }) && is_read(tool)
 }
 
 /// Why a job given `tools`, answering at `desk`, may not read the person's
@@ -288,6 +301,13 @@ mod tests {
             heartbeat(holding(&["bank", "linear.issue_get"])).await,
             (None, true)
         );
+        for beside in ["web.search", "acme_mcp.get_x"] {
+            assert_eq!(
+                heartbeat(holding(&["bank", beside])).await,
+                (Some(ONLY_READS), false),
+                "{beside}"
+            );
+        }
         assert_eq!(
             heartbeat(holding(&["linear.issue_get"])).await,
             (Some(UNNAMED), false)
@@ -308,5 +328,25 @@ mod tests {
             job_refusal(&tools(&["bank", "messaging.send"]), Some(&dm)),
             Some(ONLY_READS)
         );
+        assert_eq!(
+            job_refusal(&tools(&["bank", "linear.issue_get"]), Some(&dm)),
+            None
+        );
+        // Beside the bank, only a built-in connector's known reads: a name
+        // that reads like one says nothing of a web, http or MCP tool.
+        for beside in [
+            "web.search",
+            "web.fetch",
+            "http.get",
+            "acme_mcp.get_x",
+            "linear.get_x",
+            "linear",
+        ] {
+            assert_eq!(
+                job_refusal(&tools(&["bank", beside]), Some(&dm)),
+                Some(ONLY_READS),
+                "{beside}"
+            );
+        }
     }
 }

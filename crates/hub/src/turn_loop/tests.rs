@@ -2301,6 +2301,29 @@ fn a_turn_that_read_the_person_s_bank_is_never_remembered() {
     assert!(!super::extraction::read_personal(&[]));
 }
 
+/// A turn whose own flag says it read the bank (a call through a CLI
+/// engine's gate leaves no invocation) marks its session, asked in the turn.
+#[tokio::test]
+async fn a_turn_flagged_as_having_read_the_bank_marks_its_session() {
+    use std::sync::Arc;
+    use workforce_common::session::{InMemorySessionStore, SessionStore};
+    let store: Arc<dyn SessionStore> = Arc::new(InMemorySessionStore::new());
+    let mut session = Session::new("desk", "ann", "kat");
+    store.save(&session).unwrap();
+    workforce_agent::personal::scoped(false, async {
+        super::extraction::note_personal_read(&store, &mut session, &[]);
+        assert!(!session.read_personal());
+        workforce_agent::personal::scoped(false, async {
+            workforce_agent::personal::calling("bank.transactions");
+        })
+        .await;
+        super::extraction::note_personal_read(&store, &mut session, &[]);
+    })
+    .await;
+    assert!(session.read_personal());
+    assert!(store.get(&session.id).unwrap().unwrap().read_personal());
+}
+
 #[test]
 fn a_session_stays_marked_once_a_turn_read_the_bank_even_after_compaction() {
     use std::sync::Arc;

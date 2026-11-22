@@ -16,11 +16,38 @@ use serde_json::Value;
 use workforce_common::connector_binding::is_personal;
 use workforce_common::session::PERSONAL_READ_KEY;
 
+/// What a run's end is told: whether it read the bank.
+type OnEnd = Box<dyn FnOnce(bool) + Send>;
+
 /// One run's flag.
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct RunPersonal {
     read: AtomicBool,
     parent: Option<Arc<RunPersonal>>,
+    /// What is told when the run ends ([`on_end`]), however it ends.
+    ends: std::sync::Mutex<Vec<OnEnd>>,
+}
+
+impl std::fmt::Debug for RunPersonal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RunPersonal")
+            .field("read", &self.read)
+            .field("parent", &self.parent)
+            .finish_non_exhaustive()
+    }
+}
+
+/// A run ends when the last of it lets its flag go: its own scope, and
+/// every task it spawned under it. What it held for its end is told then,
+/// whether it finished, failed or was dropped part way.
+impl Drop for RunPersonal {
+    fn drop(&mut self) {
+        let read = self.read.load(Ordering::SeqCst);
+        let ends = std::mem::take(self.ends.get_mut().unwrap_or_else(|e| e.into_inner()));
+        for end in ends {
+            end(read);
+        }
+    }
 }
 
 impl RunPersonal {
@@ -59,6 +86,7 @@ pub async fn scoped<F: std::future::Future>(read: bool, fut: F) -> F::Output {
                 .is_some_and(|p| p.read.load(Ordering::SeqCst)),
         ),
         parent,
+        ends: Default::default(),
     });
     if read {
         run.mark();
@@ -98,6 +126,20 @@ pub fn mark() {
 /// while it runs.
 pub fn run_key() -> Option<usize> {
     RUN.try_with(|r| Arc::as_ptr(r) as usize).ok()
+}
+
+/// Tells `end` whether the run in hand read the bank once it ends, however
+/// it ends; told at once (unread) outside any run.
+pub fn on_end(end: impl FnOnce(bool) + Send + 'static) {
+    let mut end: Option<OnEnd> = Some(Box::new(end));
+    let _ = RUN.try_with(|r| {
+        if let Ok(mut ends) = r.ends.lock() {
+            ends.extend(end.take());
+        }
+    });
+    if let Some(end) = end {
+        end(false);
+    }
 }
 
 /// Notes a call of `tool` before it runs: a personal connector's marks the
@@ -189,5 +231,34 @@ mod tests {
         })
         .await;
         assert!(marked);
+    }
+
+    /// A run's end is told once the last of it is done, whether it read
+    /// the bank; outside any run, at once.
+    #[tokio::test]
+    async fn a_run_s_end_is_told_whether_it_read_the_bank() {
+        let told = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let tell = |name: &'static str| {
+            let told = Arc::clone(&told);
+            move |read| told.lock().unwrap().push((name, read))
+        };
+        on_end(tell("outside"));
+        let held = scoped(false, async {
+            on_end(tell("plain"));
+            current()
+        })
+        .await;
+        scoped(false, async {
+            on_end(tell("bank"));
+            calling("bank.transactions");
+        })
+        .await;
+        assert_eq!(*told.lock().unwrap(), [("outside", false), ("bank", true)]);
+        drop(held);
+        assert_eq!(
+            told.lock().unwrap()[2],
+            ("plain", false),
+            "told once its last share goes"
+        );
     }
 }

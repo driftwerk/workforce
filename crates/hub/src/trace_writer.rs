@@ -309,9 +309,16 @@ struct TraceEnvelope<'a, T: Serialize> {
 /// had, it called one, or it read back a conversation that had) leaves no
 /// line in it ([`workforce_agent::personal`]). So that none of such a run
 /// is kept, a run's lines are held until it ends and written together
-/// then; a run that ends without a footer (a crash) leaves none. Other
-/// runs, and lines written outside any run, are untouched.
+/// then. A run that ends without a footer (an error, a dropped turn) is
+/// written as far as it got once it is gone, unless it read the bank, so
+/// nothing is held past its run. Other runs, and lines written outside any
+/// run, are untouched.
 pub struct JsonlTraceWriter {
+    lines: Arc<Lines>,
+}
+
+/// The file, and the lines each running run holds for it.
+struct Lines {
     /// The opened file handle, protected by a mutex for thread safety.
     file: Mutex<std::io::BufWriter<fs::File>>,
     /// Each running run's lines, by [`workforce_agent::personal::run_key`].
@@ -347,8 +354,10 @@ impl JsonlTraceWriter {
         );
 
         Ok(Self {
-            file: Mutex::new(writer),
-            held: Mutex::default(),
+            lines: Arc::new(Lines {
+                file: Mutex::new(writer),
+                held: Mutex::default(),
+            }),
         })
     }
 
@@ -365,12 +374,9 @@ impl JsonlTraceWriter {
     /// lines afresh; `end` writes them out.
     fn take(&self, line: String, start: bool, end: bool) -> Result<()> {
         let Some(run) = workforce_agent::personal::run_key() else {
-            return self.write_lines(&[line]);
+            return self.lines.write(&[line]);
         };
-        let mut held = self
-            .held
-            .lock()
-            .map_err(|e| eyre::eyre!("Trace hold mutex poisoned: {}", e))?;
+        let mut held = self.lines.held()?;
         if workforce_agent::personal::read() {
             held.remove(&run);
             return Ok(());
@@ -378,18 +384,66 @@ impl JsonlTraceWriter {
         if start {
             held.remove(&run);
         }
-        let lines = held.entry(run).or_default();
+        let lines = match held.entry(run) {
+            std::collections::hash_map::Entry::Occupied(lines) => lines.into_mut(),
+            // A footer with nothing before it closes nothing.
+            std::collections::hash_map::Entry::Vacant(_) if end => return Ok(()),
+            std::collections::hash_map::Entry::Vacant(lines) => {
+                // However the run ends, what it still holds goes then.
+                let kept = Arc::downgrade(&self.lines);
+                workforce_agent::personal::on_end(move |read| {
+                    if let Some(kept) = kept.upgrade() {
+                        kept.ended(run, read);
+                    }
+                });
+                lines.insert(Vec::new())
+            }
+        };
         lines.push(line);
         if !end {
             return Ok(());
         }
         let lines = held.remove(&run).unwrap_or_default();
         drop(held);
-        self.write_lines(&lines)
+        self.lines.write(&lines)
+    }
+
+    /// How many runs hold lines now.
+    #[cfg(test)]
+    fn holding(&self) -> usize {
+        self.lines.held().map_or(0, |held| held.len())
+    }
+}
+
+impl Lines {
+    fn held(
+        &self,
+    ) -> Result<std::sync::MutexGuard<'_, std::collections::HashMap<usize, Vec<String>>>> {
+        self.held
+            .lock()
+            .map_err(|e| eyre::eyre!("Trace hold mutex poisoned: {}", e))
+    }
+
+    /// `run` is over without a footer: what it held is written, unless it
+    /// read the bank.
+    fn ended(&self, run: usize, read: bool) {
+        let Ok(mut held) = self.held() else {
+            return;
+        };
+        let Some(lines) = held.remove(&run) else {
+            return;
+        };
+        drop(held);
+        if read {
+            return;
+        }
+        if let Err(e) = self.write(&lines) {
+            tracing::warn!(error = %e, "Failed to write an unfinished run's trace");
+        }
     }
 
     /// Writes `lines` together, so no other run's come between them.
-    fn write_lines(&self, lines: &[String]) -> Result<()> {
+    fn write(&self, lines: &[String]) -> Result<()> {
         let mut file = self
             .file
             .lock()
@@ -584,6 +638,55 @@ mod tests {
             .collect();
         assert!(!all.contains("Tesco"));
         assert_eq!(all.lines().count(), 4 + 3, "bob's run whole, and carl's");
+    }
+
+    /// A run that errors before its footer: what it got to is written
+    /// once it is gone, and nothing is held after it; one that read the
+    /// bank leaves nothing, and is held no longer either. A run whose
+    /// failure the runner closes with an `Error` footer is traced whole.
+    #[tokio::test]
+    async fn a_run_that_errors_is_traced_as_far_as_it_got_unless_it_read_the_bank() {
+        let base = tempfile::tempdir().unwrap();
+        let writer = JsonlTraceWriter::new(base.path(), "kat").unwrap();
+        let held = &writer;
+        let errs = move |session: &'static str, tool: &'static str| {
+            let writer = held;
+            workforce_agent::personal::scoped(false, async move {
+                writer.write_header(&header(session)).unwrap();
+                workforce_agent::personal::calling(tool);
+                writer
+                    .write_round(&round(tool, serde_json::json!("£12.30 at Tesco")))
+                    .unwrap();
+                assert_eq!(writer.holding(), usize::from(!tool.starts_with("bank.")));
+            })
+        };
+        errs("ann-errs", "linear.issue_get").await;
+        assert_eq!(writer.holding(), 0, "nothing held past its run");
+        assert_eq!(traced(base.path()), ["ann-errs"]);
+
+        errs("ann-banks-and-errs", "bank.transactions").await;
+        assert_eq!(writer.holding(), 0);
+        assert_eq!(traced(base.path()), ["ann-errs"]);
+
+        workforce_agent::personal::scoped(false, async {
+            writer.write_header(&header("bob-errs")).unwrap();
+            writer
+                .write_footer(&TraceFooter {
+                    outcome: workforce_agent::trace::TraceOutcome::Error("boom".into()),
+                    ..footer()
+                })
+                .unwrap();
+            // A second close (cancelled, then failed) closes nothing.
+            writer.write_footer(&footer()).unwrap();
+        })
+        .await;
+        let all: String = walk(base.path())
+            .iter()
+            .map(|f| fs::read_to_string(f).unwrap())
+            .collect();
+        assert_eq!(traced(base.path()), ["ann-errs", "bob-errs"]);
+        assert_eq!(all.lines().count(), 2 + 2, "ann's two lines, bob's two");
+        assert!(all.contains("boom"));
     }
 
     fn walk(dir: &std::path::Path) -> Vec<PathBuf> {

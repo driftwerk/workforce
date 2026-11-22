@@ -3338,7 +3338,9 @@ pub(crate) async fn process_turn(
         chat: crate::serve::in_chat_turn(),
         ..SessionContext::capture()
     }
-    .scope(Box::pin(process_admitted(
+    // The turn's own bank flag: its runs mark it, and what keeps the turn
+    // after them asks it.
+    .scope(Box::pin(workforce_agent::personal::scoped(false, process_admitted(
         service,
         AdmittedTurn {
             channel,
@@ -3356,7 +3358,7 @@ pub(crate) async fn process_turn(
             trust_level,
             author,
         },
-    )))
+    ))))
     .await
 }
 
@@ -5597,7 +5599,9 @@ pub(crate) async fn stream_admitted(
     let in_flight_for_task = crate::memory_fence::TurnInFlight::begin(&service.workspace);
     // Whether a person's message started it, for what its runner asks.
     let chat_for_task = workforce_agent::runner::chat_origin();
-    let handle = tokio::spawn(workforce_agent::runner::CURRENT_CHAT_ORIGIN.scope(chat_for_task, workforce_agent::runner::CURRENT_MEMORY_FENCE.scope(memory_fence_for_task, workforce_agent::runner::with_desk(desk_scope_for_task, CURRENT_BILLING_IDENTITY.scope(
+    // The turn's own bank flag: its runs mark it, and what keeps the turn
+    // after them asks it.
+    let handle = tokio::spawn(workforce_agent::personal::scoped(false, workforce_agent::runner::CURRENT_CHAT_ORIGIN.scope(chat_for_task, workforce_agent::runner::CURRENT_MEMORY_FENCE.scope(memory_fence_for_task, workforce_agent::runner::with_desk(desk_scope_for_task, CURRENT_BILLING_IDENTITY.scope(
         billing_identity_for_task.unwrap_or_default(),
         CURRENT_VOICE_CHANNEL.scope(
         voice_channel_for_task,
@@ -6124,7 +6128,7 @@ pub(crate) async fn stream_admitted(
     ),
     ),
     ),
-    )))));
+    ))))));
 
     // Everything downstream reads the reply without voice directions; they
     // travel beside it.

@@ -149,6 +149,9 @@ impl Tool for PlaybookTool {
     }
 }
 
+/// What a shared save is told in a turn that read the person's bank.
+pub(crate) const PERSONAL_STAYS_PRIVATE: &str = "A conversation that read the person's bank saves a playbook only for them: save it with `visibility: \"private\"`.";
+
 impl PlaybookTool {
     async fn handle_list(&self, start: Instant) -> ToolResult {
         // Only the playbooks this turn's user can start: global, their own, and
@@ -297,6 +300,13 @@ impl PlaybookTool {
             Ok(v) => v,
             Err(e) => return Ok(ToolResult::failure(e, elapsed())),
         };
+        // What a turn that read the person's bank saves stays theirs: a
+        // playbook others can start would carry it on.
+        if visibility != workforce_core::access::Visibility::Private
+            && workforce_agent::personal::read()
+        {
+            return Ok(ToolResult::failure(PERSONAL_STAYS_PRIVATE, elapsed()));
+        }
         match self
             .runtime
             .save_definition_source(
@@ -658,6 +668,28 @@ mod tests {
 
     fn delete() -> serde_json::Value {
         serde_json::json!({ "action": "delete", "playbook_id": "demo" })
+    }
+
+    /// A turn that read the person's bank never saves a playbook others can
+    /// start: a system one is for everyone, so it is refused, and nothing
+    /// is written.
+    #[tokio::test]
+    async fn a_turn_that_read_the_bank_saves_no_shared_playbook() {
+        let (runtime, dir) = fs_runtime();
+        let tool = fs_tool(&runtime, true);
+        let refused = workforce_agent::personal::scoped(false, async {
+            workforce_agent::personal::calling("bank.transactions");
+            tool.execute(save(GOOD)).await.unwrap()
+        })
+        .await;
+        assert!(!refused.success);
+        assert_eq!(refused.error.as_deref(), Some(PERSONAL_STAYS_PRIVATE));
+        assert!(!dir.join("demo.toml").exists());
+        assert!(
+            tool.execute(save(GOOD)).await.unwrap().success,
+            "elsewhere, as ever"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
