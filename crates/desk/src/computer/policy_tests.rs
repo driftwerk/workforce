@@ -2154,8 +2154,14 @@ fn other_machines_run_on_their_own_by_host_or_anywhere() {
     assert!(asks_with(&verdict(&commands, false, &[], &there("devbox"))).is_some());
     let anywhere = alone(full(), ActionKind::Network, Level::Anywhere);
     assert_eq!(
-        verdict(&anywhere, false, &[], &there("\"$H\"")),
+        verdict(&anywhere, false, &[], &there("devbox")),
         on_its_own()
+    );
+    // A host made as it runs stands where ssh reads its options: it can't
+    // be read, so it is the person's even with every machine allowed.
+    assert_eq!(
+        asks_with(&verdict(&anywhere, false, &[], &there("\"$H\""))).map(|(_, why)| why),
+        Some(Why::Unclear)
     );
     // "In its folders" means nothing for hosts.
     let folders = alone(full(), ActionKind::Network, Level::InFolders);

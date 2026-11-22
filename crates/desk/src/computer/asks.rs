@@ -2413,7 +2413,7 @@ fn classify_words(
             })
         }
         "git" => {
-            let assigns: Vec<&Word> = words[..i].iter().copied().collect();
+            let assigns: Vec<&Word> = words[..i].to_vec();
             git(args, &assigns, place)
         }
         "xattr" => {
@@ -3540,12 +3540,13 @@ mod tests {
             "echo x >> /Users/sarah/*/rc",
             "echo x > \"$F\"",
             "cp a \"$F\"",
-            "rsync -a --delete ./ \"$D\"",
             "ln -s /x \"$HOME/.zshrc\"",
         ] {
             assert_eq!(asks(command), Some(Asks::System), "{command:?}");
         }
         assert_eq!(asks("echo x >> work.log"), None);
+        // Where rsync reads its options, a word made as it runs can't be read.
+        assert_eq!(asks("rsync -a --delete ./ \"$D\""), Some(U));
     }
 
     /// What hides a command inside another (a substitution in `${…}` or
