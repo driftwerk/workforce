@@ -724,8 +724,8 @@ impl Desk {
             self.sight_keep(HashMap::new());
             return;
         }
-        let table = procs::stats().await;
         let listed = Utc::now();
+        let table = procs::stats().await;
         self.0.sight.reads.fetch_add(1, Ordering::Relaxed);
         if let Some(table) = &table {
             self.background_looked(background, table);
@@ -783,8 +783,8 @@ impl Desk {
         changed.into_iter().for_each(|id| self.publish(id));
     }
 
-    /// One session's sample now, from `table` (listed when it says) and its
-    /// files, after `prev`.
+    /// One session's sample now, from `table` (its listing begun when it
+    /// says) and its files, after `prev`.
     async fn sampled(
         &self,
         prev: Option<&Sample>,
