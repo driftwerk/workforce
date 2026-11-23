@@ -93,38 +93,70 @@ pub fn persist_turn_owned_metadata(
     sessions: &Arc<dyn workforce_common::session::SessionStore>,
     session: &workforce_common::session::Session,
 ) {
-    persist_owned(sessions, &session.id, turn_owned(session));
+    let (patch, remove) = turn_owned(session);
+    if let Err(e) = sessions.merge_metadata(&session.id, patch, &remove) {
+        tracing::warn!(error = %e, session_id = %session.id, "Failed to persist turn metadata");
+    }
 }
 
-/// Saves the turn's `session` and refreshes it from what is stored, then
-/// writes its own metadata back over that, in it and in the store: a save
-/// merged into another write takes on the stored metadata, which isn't the
-/// turn's for these keys.
+/// Saves the turn's `session`, its own metadata keys as it has them in the
+/// same write, and refreshes it from what is stored. Its messages in
+/// `archive`, as it held them before the save, as the store holds them now:
+/// what the turn has to archive.
 pub fn save_turn(
     sessions: &Arc<dyn workforce_common::session::SessionStore>,
     session: &mut workforce_common::session::Session,
-) -> eyre::Result<()> {
-    let owned = turn_owned(session);
-    sessions.save_refreshing(session)?;
-    let metadata = session.metadata_object_mut();
-    owned.0.iter().for_each(|(key, value)| {
-        metadata.insert(key.clone(), value.clone());
-    });
-    owned.1.iter().for_each(|key| {
-        metadata.remove(*key);
-    });
-    persist_owned(sessions, &session.id, owned);
-    Ok(())
+    archive: impl std::ops::RangeBounds<usize>,
+) -> eyre::Result<Vec<workforce_common::session::SessionMessage>> {
+    saved_with(session, archive, |session| {
+        sessions.save_refreshing_owning(session, &TURN_OWNED_METADATA)
+    })
 }
 
-type OwnedMetadata = (
-    serde_json::Map<String, serde_json::Value>,
-    Vec<&'static str>,
-);
+/// [`save_turn`] of what isn't a turn's end: no metadata of its own.
+pub fn save_refreshing_archiving(
+    sessions: &Arc<dyn workforce_common::session::SessionStore>,
+    session: &mut workforce_common::session::Session,
+    archive: impl std::ops::RangeBounds<usize>,
+) -> eyre::Result<Vec<workforce_common::session::SessionMessage>> {
+    saved_with(session, archive, |session| {
+        sessions.save_refreshing(session)
+    })
+}
+
+/// `session` saved by `save`, and its messages in `archive` before it as it
+/// holds them after: a save merged into another write puts what was stored
+/// ahead of them, and leaves out any that write took out.
+fn saved_with(
+    session: &mut workforce_common::session::Session,
+    archive: impl std::ops::RangeBounds<usize>,
+    save: impl FnOnce(&mut workforce_common::session::Session) -> eyre::Result<()>,
+) -> eyre::Result<Vec<workforce_common::session::SessionMessage>> {
+    let range = (archive.start_bound().cloned(), archive.end_bound().cloned());
+    let ids: std::collections::HashSet<String> = session
+        .messages
+        .get(range)
+        .unwrap_or_default()
+        .iter()
+        .map(|m| m.id.clone())
+        .collect();
+    save(session)?;
+    Ok(session
+        .messages
+        .iter()
+        .filter(|m| ids.contains(&m.id))
+        .cloned()
+        .collect())
+}
 
 /// The turn's own metadata keys in `session`: those it holds, and those it
 /// doesn't, to remove.
-fn turn_owned(session: &workforce_common::session::Session) -> OwnedMetadata {
+fn turn_owned(
+    session: &workforce_common::session::Session,
+) -> (
+    serde_json::Map<String, serde_json::Value>,
+    Vec<&'static str>,
+) {
     TURN_OWNED_METADATA.into_iter().fold(
         (serde_json::Map::new(), Vec::new()),
         |(mut patch, mut remove), key| {
@@ -137,16 +169,6 @@ fn turn_owned(session: &workforce_common::session::Session) -> OwnedMetadata {
             (patch, remove)
         },
     )
-}
-
-fn persist_owned(
-    sessions: &Arc<dyn workforce_common::session::SessionStore>,
-    session_id: &str,
-    (patch, remove): OwnedMetadata,
-) {
-    if let Err(e) = sessions.merge_metadata(session_id, patch, &remove) {
-        tracing::warn!(error = %e, session_id = %session_id, "Failed to persist turn metadata");
-    }
 }
 
 /// End the session's turn record. Called on every turn teardown EXCEPT
@@ -3838,37 +3860,78 @@ pub mod tests {
         }
     }
 
-    #[test]
-    fn a_turns_save_merged_into_another_write_keeps_its_own_metadata_and_the_others_message() {
-        use workforce_common::session::{JsonlSessionStore, SessionStore};
+    fn file_store() -> (
+        tempfile::TempDir,
+        Arc<dyn workforce_common::session::SessionStore>,
+    ) {
         let dir = tempfile::tempdir().unwrap();
-        let sessions: Arc<dyn SessionStore> = Arc::new(JsonlSessionStore::new(dir.path()).unwrap());
+        let sessions =
+            Arc::new(workforce_common::session::JsonlSessionStore::new(dir.path()).unwrap());
+        (dir, sessions)
+    }
+
+    #[test]
+    fn a_turns_save_merged_into_another_write_keeps_both_metadata_and_archives_its_own() {
+        let (_dir, sessions) = file_store();
         let mut turn = sessions.get_or_create("c", "o", "a").unwrap();
         turn.add_user_message("asked", None);
         sessions.save_refreshing(&mut turn).unwrap();
 
         let mut other = sessions.get(&turn.id).unwrap().unwrap();
         let notice = other.add_assistant_message("the session closed", 2);
+        other
+            .metadata_object_mut()
+            .insert("channel_name".into(), serde_json::json!("DM with Kings"));
         sessions.save(&other).unwrap();
+        let from = turn.messages.len();
+        let answer = turn.add_assistant_message("answered", 2);
         turn.metadata_object_mut()
             .insert("observed_input_tokens".into(), serde_json::json!(4242));
-        save_turn(&sessions, &mut turn).unwrap();
+        let archive = save_turn(&sessions, &mut turn, from..).unwrap();
         assert_eq!(
-            turn.metadata.get("observed_input_tokens"),
-            Some(&serde_json::json!(4242))
+            archive.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+            [answer.as_str()]
         );
-        let answer = turn.add_assistant_message("answered", 2);
-        sessions.save(&turn).unwrap();
 
+        let more = turn.add_assistant_message("and more", 2);
+        sessions.save(&turn).unwrap();
         let stored = sessions.get(&turn.id).unwrap().unwrap();
-        assert_eq!(
-            stored.metadata.get("observed_input_tokens"),
-            Some(&serde_json::json!(4242))
-        );
+        for held in [&turn, &stored] {
+            assert_eq!(
+                held.metadata.get("observed_input_tokens"),
+                Some(&serde_json::json!(4242))
+            );
+            assert_eq!(
+                held.metadata.get("channel_name"),
+                Some(&serde_json::json!("DM with Kings"))
+            );
+        }
         let ids: Vec<&str> = stored.messages.iter().map(|m| m.id.as_str()).collect();
-        assert!(
-            ids.contains(&notice.as_str()) && ids.contains(&answer.as_str()),
-            "{ids:?}"
+        assert_eq!(&ids[1..], [notice.as_str(), answer.as_str(), more.as_str()]);
+    }
+
+    #[test]
+    fn a_turns_answer_is_what_it_archives_after_its_session_was_cut_short() {
+        let (_dir, sessions) = file_store();
+        let mut turn = sessions.get_or_create("c", "o", "a").unwrap();
+        let kept = turn.add_user_message("keep this", None);
+        let cut = turn.add_user_message("retry from here", None);
+        sessions.save_refreshing(&mut turn).unwrap();
+
+        sessions.truncate_from_message(&turn.id, &cut).unwrap();
+        let from = turn.messages.len();
+        let answer = turn.add_assistant_message("answered", 2);
+        let archive = save_refreshing_archiving(&sessions, &mut turn, from..).unwrap();
+        assert_eq!(
+            archive.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+            [answer.as_str()]
+        );
+        assert_eq!(
+            turn.messages
+                .iter()
+                .map(|m| m.id.as_str())
+                .collect::<Vec<_>>(),
+            [kept.as_str(), answer.as_str()]
         );
     }
 

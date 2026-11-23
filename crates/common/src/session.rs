@@ -2965,6 +2965,15 @@ pub trait SessionStore: Send + Sync {
         self.save(session)
     }
 
+    /// [`Self::save_refreshing`], keeping the metadata keys `owned` as
+    /// `session` has them (set, or removed where it lacks them) in the same
+    /// write, even when it merges into another and keeps what is stored
+    /// otherwise. The default is plain `save_refreshing`, which replaces.
+    fn save_refreshing_owning(&self, session: &mut Session, owned: &[&str]) -> eyre::Result<()> {
+        let _ = owned;
+        self.save_refreshing(session)
+    }
+
     /// Claim the fleet-wide right to run a turn for `session_id`, valid for
     /// `ttl_secs`. Re-entrant: the claiming process wins again (renewal passes
     /// the same `claim_id`; a newer local turn passes a fresh one), and a
@@ -4472,11 +4481,42 @@ pub(crate) fn discarded_metadata_keys(
         .collect()
 }
 
+/// `stored` metadata with `incoming`'s keys `owned` as `incoming` has them:
+/// set where it holds one, removed where it doesn't.
+pub(crate) fn owning(
+    mut stored: serde_json::Value,
+    incoming: &serde_json::Value,
+    owned: &[&str],
+) -> serde_json::Value {
+    if !owned.is_empty() {
+        let (patch, remove) = owned.iter().fold(
+            (serde_json::Map::new(), Vec::new()),
+            |(mut patch, mut remove), key| {
+                match incoming.get(*key) {
+                    Some(value) => {
+                        patch.insert((*key).to_string(), value.clone());
+                    }
+                    None => remove.push(*key),
+                }
+                (patch, remove)
+            },
+        );
+        apply_metadata_patch(&mut stored, patch, &remove);
+    }
+    stored
+}
+
 /// `incoming` saved over `stored`, which another write changed since it was
 /// read or which `incoming` holds only a shell of, as the Postgres store
 /// resolves it: [`appended`]; the stored session's sealing, place in its
-/// thread, metadata and compactions; incoming's own name, kind and model.
-fn merged(mut stored: Session, incoming: &Session) -> Session {
+/// thread, metadata (but for incoming's keys `owned`) and compactions;
+/// incoming's own name, kind and model.
+fn merged(mut stored: Session, incoming: &Session, owned: &[&str]) -> Session {
+    stored.metadata = owning(
+        std::mem::take(&mut stored.metadata),
+        &incoming.metadata,
+        owned,
+    );
     let discarded = discarded_metadata_keys(&incoming.metadata, &stored.metadata);
     if !discarded.is_empty() {
         warn!(
@@ -4628,7 +4668,11 @@ impl JsonlSessionStore {
     /// is a shell) [`merged`] into the stored session, so no message either
     /// wrote is lost and none a write took out comes back. The revision it
     /// is stored at, and what was stored when a full session was merged.
-    fn save_returning_revision(&self, session: &Session) -> eyre::Result<(i64, Option<Session>)> {
+    fn save_returning_revision(
+        &self,
+        session: &Session,
+        owned: &[&str],
+    ) -> eyre::Result<(i64, Option<Session>)> {
         self.exclusively(&session.id, || {
             self.hydrate_in_cache(&session.id)?;
             let stored = self.cached(&session.id)?;
@@ -4636,7 +4680,7 @@ impl JsonlSessionStore {
             let shell = session.cached_message_count.is_some();
             let (mut saved, was_merged) = match stored {
                 Some(stored) if shell || session.loaded_revision != stored.loaded_revision => {
-                    (merged(stored, session), !shell)
+                    (merged(stored, session, owned), !shell)
                 }
                 _ => (session.clone(), false),
             };
@@ -5096,11 +5140,15 @@ impl SessionStore for JsonlSessionStore {
     }
 
     fn save(&self, session: &Session) -> eyre::Result<()> {
-        self.save_returning_revision(session).map(drop)
+        self.save_returning_revision(session, &[]).map(drop)
     }
 
     fn save_refreshing(&self, session: &mut Session) -> eyre::Result<()> {
-        let (revision, merged) = self.save_returning_revision(session)?;
+        self.save_refreshing_owning(session, &[])
+    }
+
+    fn save_refreshing_owning(&self, session: &mut Session, owned: &[&str]) -> eyre::Result<()> {
+        let (revision, merged) = self.save_returning_revision(session, owned)?;
         session.refreshed(revision, merged);
         Ok(())
     }
@@ -6871,6 +6919,41 @@ mod tests {
                 second.as_str()
             ]
         );
+    }
+
+    #[test]
+    fn a_merged_save_keeps_the_callers_own_keys_beside_what_was_stored_in_the_file_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = JsonlSessionStore::new(dir.path()).unwrap();
+        let mut turn = s.get_or_create("cli", "u", "agent-a").unwrap();
+        turn.add_user_message("asked", None);
+        s.save_refreshing(&mut turn).unwrap();
+
+        let mut other = s.get(&turn.id).unwrap().unwrap();
+        other
+            .metadata_object_mut()
+            .insert("channel_name".into(), serde_json::json!("DM"));
+        other
+            .metadata_object_mut()
+            .insert("cut".into(), serde_json::json!(1));
+        s.save(&other).unwrap();
+        turn.metadata_object_mut()
+            .insert("observed".into(), serde_json::json!(42));
+        s.save_refreshing_owning(&mut turn, &["observed", "cut"])
+            .unwrap();
+
+        for held in [turn.clone(), s.get(&turn.id).unwrap().unwrap()] {
+            assert_eq!(held.metadata.get("observed"), Some(&serde_json::json!(42)));
+            assert_eq!(
+                held.metadata.get("channel_name"),
+                Some(&serde_json::json!("DM"))
+            );
+            assert_eq!(
+                held.metadata.get("cut"),
+                None,
+                "the turn's own, which it lacks"
+            );
+        }
     }
 
     #[test]

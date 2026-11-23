@@ -501,9 +501,8 @@ pub(crate) async fn keep_heard_left(
         };
         let from = session.messages.len();
         keep_heard(&mut session, left, trust_level, desk.as_ref());
-        sessions.save_refreshing(&mut session)?;
-        for msg in session.messages.get(from..).unwrap_or_default() {
-            sessions.append_to_archive(&session.id, msg)?;
+        for msg in crate::serve::save_refreshing_archiving(&sessions, &mut session, from..)? {
+            sessions.append_to_archive(&session.id, &msg)?;
         }
         Ok(())
     })
@@ -548,19 +547,28 @@ pub(crate) fn keep_failed_turn(
     session: &mut Session,
     turn: FailedTurn<'_>,
 ) {
-    if !turn.heard.is_empty() {
-        keep_heard(session, turn.heard, turn.trust_level, turn.desk);
-        if let Some(asker) = turn.asker {
-            session.attribute_messages_from(turn.archive_base, asker);
+    let unsaved = |session: &Session| {
+        session
+            .messages
+            .get(turn.archived_upto..)
+            .unwrap_or_default()
+            .to_vec()
+    };
+    let unarchived = match turn.heard.is_empty() {
+        true => unsaved(session),
+        false => {
+            keep_heard(session, turn.heard, turn.trust_level, turn.desk);
+            if let Some(asker) = turn.asker {
+                session.attribute_messages_from(turn.archive_base, asker);
+            }
+            crate::serve::save_refreshing_archiving(sessions, session, turn.archived_upto..)
+                .unwrap_or_else(|e| {
+                    tracing::warn!(error = %e, "Failed to save a failed turn's follow-ups");
+                    unsaved(session)
+                })
         }
-        if let Err(e) = sessions.save_refreshing(session) {
-            tracing::warn!(error = %e, "Failed to save a failed turn's follow-ups");
-        }
-    }
-    for msg in session
-        .messages
-        .get(turn.archived_upto..)
-        .unwrap_or_default()
+    };
+    for msg in unarchived
         .iter()
         .filter(|m| m.role == workforce_common::session::MessageRole::User)
     {

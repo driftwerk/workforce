@@ -56,7 +56,7 @@ use crate::postgres::{
 use crate::session::{
     appended, compute_stats, context_usage_for, coordination_score, delete_live_message,
     discarded_metadata_keys, format_excerpt_rows, is_searched, matches_every_term,
-    message_to_transcript_entry, paginate_entries, rank_search_results, reassigned_channel,
+    message_to_transcript_entry, owning, paginate_entries, rank_search_results, reassigned_channel,
     redact_message_secrets, redact_messages_in_place, replies_to, search_terms, tool_calls_for,
     ArchivePage, DeletedMessage, InterruptedTurn, JournalEntry, MessageRole, Reassigned,
     RedactionStats, Session, SessionAttachment, SessionContextType, SessionContextUsage,
@@ -426,11 +426,11 @@ fn parse_uuid(id: &str) -> Result<Uuid> {
 fn warn_discarded_metadata(
     session: &Session,
     incoming: &serde_json::Value,
+    kept: &serde_json::Value,
     stored_row: &tokio_postgres::Row,
     branch: &'static str,
 ) {
-    let stored: serde_json::Value = stored_row.get(7);
-    let discarded = discarded_metadata_keys(incoming, &stored);
+    let discarded = discarded_metadata_keys(incoming, kept);
     if !discarded.is_empty() {
         tracing::warn!(
             session_id = %session.id,
@@ -697,11 +697,15 @@ impl SessionStore for PostgresSessionStore {
     }
 
     fn save(&self, session: &Session) -> Result<()> {
-        self.save_returning_revision(session).map(drop)
+        self.save_returning_revision(session, &[]).map(drop)
     }
 
     fn save_refreshing(&self, session: &mut Session) -> Result<()> {
-        let (revision, merged) = self.save_returning_revision(session)?;
+        self.save_refreshing_owning(session, &[])
+    }
+
+    fn save_refreshing_owning(&self, session: &mut Session, owned: &[&str]) -> Result<()> {
+        let (revision, merged) = self.save_returning_revision(session, owned)?;
         session.refreshed(revision, merged);
         Ok(())
     }
@@ -2546,7 +2550,11 @@ impl PostgresSessionStore {
     /// The shared body of `save`/`save_refreshing`: persist the session and
     /// return the row's post-write revision so callers can refresh their CAS
     /// baseline without a follow-up read.
-    fn save_returning_revision(&self, session: &Session) -> Result<(i64, Option<Session>)> {
+    fn save_returning_revision(
+        &self,
+        session: &Session,
+        owned: &[&str],
+    ) -> Result<(i64, Option<Session>)> {
         let session = session.clone();
         self.block_on(async move {
             let mut conn = self.pool.get().await?;
@@ -2589,6 +2597,9 @@ impl PostgresSessionStore {
                     row.compaction_history.clone(),
                 )
             };
+            // What is stored, but for the caller's own keys.
+            let stored_metadata =
+                |cur: &tokio_postgres::Row| owning(cur.get(7), &row.metadata, owned);
             let mut kept = None;
             let (
                 messages,
@@ -2602,7 +2613,8 @@ impl PostgresSessionStore {
             ) = match existing.as_ref() {
                 None => incoming(),
                 Some(cur) if is_shell => {
-                    warn_discarded_metadata(&session, &row.metadata, cur, "shell save");
+                    let metadata = stored_metadata(cur);
+                    warn_discarded_metadata(&session, &row.metadata, &metadata, cur, "shell save");
                     (
                         cur.get(1),
                         cur.get(2),
@@ -2610,13 +2622,20 @@ impl PostgresSessionStore {
                         cur.get(4),
                         cur.get(5),
                         cur.get(6),
-                        cur.get(7),
+                        metadata,
                         cur.get(8),
                     )
                 }
                 Some(cur) if session.loaded_revision == Some(cur.get::<_, i64>(0)) => incoming(),
                 Some(cur) => {
-                    warn_discarded_metadata(&session, &row.metadata, cur, "stale-baseline save");
+                    let metadata = stored_metadata(cur);
+                    warn_discarded_metadata(
+                        &session,
+                        &row.metadata,
+                        &metadata,
+                        cur,
+                        "stale-baseline save",
+                    );
                     let stored: Vec<SessionMessage> =
                         serde_json::from_value(cur.get(1)).context("decode stored messages")?;
                     // New ids land at the end, so a summary from a
@@ -2628,7 +2647,7 @@ impl PostgresSessionStore {
                     let json = serde_json::to_value(&merged).context("encode merged messages")?;
                     kept = Some(Session {
                         messages: merged,
-                        metadata: cur.get(7),
+                        metadata: metadata.clone(),
                         compaction_history: serde_json::from_value(cur.get(8))
                             .context("decode stored compaction history")?,
                         total_tokens: total as u64,
@@ -2641,7 +2660,7 @@ impl PostgresSessionStore {
                         cur.get(4),
                         cur.get(5),
                         cur.get(6),
-                        cur.get(7),
+                        metadata,
                         cur.get(8),
                     )
                 }
@@ -4046,6 +4065,43 @@ pub(crate) mod tests {
             let second = turn.add_assistant_message("second", 2);
             s.save(&turn).unwrap();
             assert_eq!(ids(&turn.id), [kept.as_str(), &first, &second]);
+        })
+        .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_merged_save_keeps_the_callers_own_keys_beside_what_was_stored() {
+        with_store(|store| async move {
+            let s: Arc<dyn SessionStore> = store;
+            let mut turn = s.get_or_create("cli", "u", "agent-a").unwrap();
+            turn.add_user_message("asked", None);
+            s.save_refreshing(&mut turn).unwrap();
+
+            let mut other = s.get(&turn.id).unwrap().unwrap();
+            other
+                .metadata_object_mut()
+                .insert("channel_name".into(), serde_json::json!("DM"));
+            other
+                .metadata_object_mut()
+                .insert("cut".into(), serde_json::json!(1));
+            s.save(&other).unwrap();
+            turn.metadata_object_mut()
+                .insert("observed".into(), serde_json::json!(42));
+            s.save_refreshing_owning(&mut turn, &["observed", "cut"])
+                .unwrap();
+
+            for held in [turn.clone(), s.get(&turn.id).unwrap().unwrap()] {
+                assert_eq!(held.metadata.get("observed"), Some(&serde_json::json!(42)));
+                assert_eq!(
+                    held.metadata.get("channel_name"),
+                    Some(&serde_json::json!("DM"))
+                );
+                assert_eq!(
+                    held.metadata.get("cut"),
+                    None,
+                    "the turn's own, which it lacks"
+                );
+            }
         })
         .await;
     }

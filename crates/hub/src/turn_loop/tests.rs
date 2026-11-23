@@ -1744,6 +1744,55 @@ async fn a_turn_that_compacts_still_archives_its_question() {
     );
 }
 
+/// A turn answered by a notice archives its own answer once, after another
+/// writer saved and archived its notice while the turn ran.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_notice_turn_archives_its_answer_once_beside_anothers_notice() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut config = workforce_common::settings::WorkforceConfig::default();
+    config.hub.data_dir = tmp.path().to_string_lossy().to_string();
+    config.memory.db_path = tmp.path().join("memory.db").to_string_lossy().into_owned();
+    config.llm.provider = "ollama".into();
+    config.llm.api_key = Some("http://127.0.0.1:9".into());
+    config.llm.default_model = "mock".into();
+    let service = AgentService::from_config(config, None).await.unwrap();
+    let sessions = std::sync::Arc::clone(&service.sessions);
+    let mut turn = sessions
+        .get_or_create("cli", "identity-1", service.agent_id.as_str())
+        .unwrap();
+    let asked = turn.add_user_message("is the deploy done?", None);
+    sessions.save_refreshing(&mut turn).unwrap();
+    sessions
+        .append_to_archive(&turn.id, turn.messages.last().unwrap())
+        .unwrap();
+
+    let mut other = sessions.get(&turn.id).unwrap().unwrap();
+    other.add_assistant_message("the session closed", 2);
+    sessions.save(&other).unwrap();
+    sessions
+        .append_to_archive(&turn.id, other.messages.last().unwrap())
+        .unwrap();
+    let from = turn.messages.len();
+    crate::turn_loop::save_notice_turn(&service, &mut turn, 0, from, "identity-1", "It is.", None)
+        .unwrap();
+
+    let archived: Vec<(String, String)> = sessions
+        .read_archive_page(&turn.id, None, 50)
+        .unwrap()
+        .messages
+        .into_iter()
+        .map(|m| (m.id, m.content))
+        .collect();
+    let ids: std::collections::HashSet<&str> = archived.iter().map(|(id, _)| id.as_str()).collect();
+    assert_eq!(ids.len(), archived.len(), "each once: {archived:?}");
+    assert_eq!(archived.len(), 3, "{archived:?}");
+    assert!(ids.contains(asked.as_str()));
+    assert!(
+        archived.iter().any(|(_, text)| text == "It is."),
+        "{archived:?}"
+    );
+}
+
 /// A follow-up sent now into a turn that is then stopped is still the
 /// person's: kept, as said, once the turn's task is gone.
 #[tokio::test(flavor = "multi_thread")]
