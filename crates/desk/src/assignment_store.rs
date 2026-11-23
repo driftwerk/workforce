@@ -28,8 +28,9 @@ pub const TAKEN_MEANWHILE: &str =
     "it went after it was settled, and another order holds its job now";
 
 /// When the line message carrying it went in, if it did: as the line
-/// row says (taken by the session's hook counts).
-const WENT_IN: &str = "CASE WHEN l.delivery IN ('delivered', 'handed') \
+/// row says. Handed to Desk's plugin is not in yet: it is once the
+/// session's prompt or the plugin says so.
+const WENT_IN: &str = "CASE WHEN l.delivery = 'delivered' \
     THEN COALESCE(l.delivered_at, l.updated_at) END";
 
 fn assignment(r: &Row) -> Result<Assignment> {
@@ -895,11 +896,15 @@ mod tests {
                 .await
                 .unwrap();
             store.assignment_reopen(first.id).await.unwrap();
-            // Gone in: the same order again is refused.
+            // Handed to Desk's plugin is not in yet.
             store
-                .line_take(m.id, crate::line::Delivery::Delivered)
+                .line_take(m.id, crate::line::Delivery::Handed)
                 .await
                 .unwrap();
+            let handed = store.assignment_of_line(m.id).await.unwrap().unwrap();
+            assert_eq!(handed.delivered_at, None);
+            // Gone in: the same order again is refused.
+            store.line_ack(m.id).await.unwrap();
             let third = order("boss", s, "Start Harbor production release 3 now.");
             assert!(matches!(
                 store.assignment_reserve(&third, None).await.unwrap(),

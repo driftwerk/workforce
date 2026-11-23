@@ -1383,7 +1383,7 @@ impl CrewHub {
         // Its own message: delivered, or never.
         if m.from.kind == PartyKind::Manager {
             match m.delivery {
-                Delivery::Delivered | Delivery::Handed => {
+                Delivery::Delivered => {
                     let _ = store
                         .assignment_delivered(m.id, m.delivered_at.unwrap_or(m.updated_at))
                         .await;
