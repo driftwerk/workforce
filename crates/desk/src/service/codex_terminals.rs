@@ -280,6 +280,22 @@ impl Desk {
         };
         let known = self.record(id).ok();
         let before = known.as_ref().map(|r| r.state);
+        // Its rollout shows its prompts: a line message typed in is in once
+        // its marker shows there. A first read's last prompt is from before.
+        self.prompts_seen_from(id);
+        let mark = tail
+            .last_prompt
+            .as_deref()
+            .filter(|p| {
+                !first
+                    && known
+                        .as_ref()
+                        .is_none_or(|r| r.last_prompt.as_deref() != Some(*p))
+            })
+            .and_then(crate::line::is_delivery);
+        if let Some(mark) = mark {
+            self.line_heard(id, &mark).await;
+        }
         // A turn that ended since it was last read: it wasn't done, or its
         // reply is a new one; never one that ended before it was bound (a
         // resumed session's last turn).
@@ -431,40 +447,58 @@ mod tests {
         .unwrap();
     }
 
+    /// A desk whose home holds Codex's rollout `th-1` (a turn started),
+    /// with a terminal open in `dir`: the desk, that home, `dir`, the fake
+    /// `codex`, the terminal and its pty.
+    async fn codex_desk(
+        pool: workforce_postgres::PostgresPool,
+        dir: &std::path::Path,
+    ) -> (
+        Desk,
+        PathBuf,
+        String,
+        PathBuf,
+        super::super::terminals::TerminalView,
+        Arc<Pty>,
+    ) {
+        let home = dir.join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let cwd = dir.to_string_lossy().into_owned();
+        rollout(&home, "th-1", &cwd, &["task_started"]);
+        let bin = fake_codex(dir);
+        let mut opts = crate::testing::options(dir);
+        opts.env = std::collections::BTreeMap::from([
+            ("PATH".into(), "/usr/bin:/bin".into()),
+            ("SHELL".into(), "/bin/sh".into()),
+            ("HOME".into(), home.to_string_lossy().into_owned()),
+        ]);
+        crate::store::DeskStore::migrate(&pool).await.unwrap();
+        let d = Desk::start(
+            crate::store::DeskStore::from_pool(pool),
+            opts,
+            Default::default(),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        let t = d
+            .create_terminal(super::super::terminals::NewTerminal {
+                id: None,
+                name: None,
+                cwd: cwd.clone(),
+                env: Default::default(),
+            })
+            .await
+            .unwrap();
+        let pty = d.attach_terminal(t.id).unwrap();
+        (d, home, cwd, bin, t, pty)
+    }
+
     #[tokio::test]
     async fn a_codex_typed_in_a_terminal_is_a_session_and_a_resume_is_the_same_one() {
         with_test_pool(crate::store::build_pool, |pool| async move {
             let dir = tempfile::tempdir().unwrap();
-            let home = dir.path().join("home");
-            std::fs::create_dir_all(&home).unwrap();
-            let cwd = dir.path().to_string_lossy().into_owned();
-            rollout(&home, "th-1", &cwd, &["task_started"]);
-            let bin = fake_codex(dir.path());
-            let mut opts = crate::testing::options(dir.path());
-            opts.env = std::collections::BTreeMap::from([
-                ("PATH".into(), "/usr/bin:/bin".into()),
-                ("SHELL".into(), "/bin/sh".into()),
-                ("HOME".into(), home.to_string_lossy().into_owned()),
-            ]);
-            crate::store::DeskStore::migrate(&pool).await.unwrap();
-            let d = Desk::start(
-                crate::store::DeskStore::from_pool(pool),
-                opts,
-                Default::default(),
-                CancellationToken::new(),
-            )
-            .await
-            .unwrap();
-            let t = d
-                .create_terminal(super::super::terminals::NewTerminal {
-                    id: None,
-                    name: None,
-                    cwd: cwd.clone(),
-                    env: Default::default(),
-                })
-                .await
-                .unwrap();
-            let pty = d.attach_terminal(t.id).unwrap();
+            let (d, home, cwd, bin, t, pty) = codex_desk(pool, dir.path()).await;
             let sessions = || -> Vec<Row> {
                 d.0.state
                     .lock()
@@ -572,6 +606,77 @@ mod tests {
             }
             let v = d.view(first.0).unwrap();
             assert_eq!((v.state, v.asked), (SessionState::Done, None));
+            pty.write(b"\x03exit\n").unwrap();
+        })
+        .await;
+    }
+
+    /// A boss's message typed into a Codex in a terminal, which no hook
+    /// tells of, is in once its rollout shows the prompt it started: typed
+    /// once, never again, nor given up on.
+    #[tokio::test]
+    async fn a_message_typed_into_a_codex_in_a_terminal_is_in_once_its_rollout_shows_it() {
+        with_test_pool(crate::store::build_pool, |pool| async move {
+            let dir = tempfile::tempdir().unwrap();
+            let (d, home, cwd, bin, _t, pty) = codex_desk(pool, dir.path()).await;
+            let codex = |d: &Desk| {
+                d.0.state
+                    .lock()
+                    .records
+                    .values()
+                    .find(|r| r.engine == Engine::Codex)
+                    .map(|r| (r.id, r.state))
+            };
+            let track_until = async |want: SessionState| {
+                for _ in 0..200 {
+                    d.track_codex_terminals().await;
+                    if let Some((id, state)) = codex(&d).filter(|(_, s)| *s == want) {
+                        return (id, state);
+                    }
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                panic!("never {want:?}");
+            };
+            pty.write(format!("{} resume th-1\n", bin.display()).as_bytes())
+                .unwrap();
+            track_until(SessionState::Working).await;
+            rollout(&home, "th-1", &cwd, &["task_started", "task_complete"]);
+            let (s, _) = track_until(SessionState::Done).await;
+            let m = d
+                .line_send(
+                    super::super::Sender::Overseer(crate::crew::By::manager(
+                        "sarah",
+                        "Sarah",
+                        "It should open the PR.",
+                    )),
+                    crate::line::Send::Tell {
+                        to: crate::line::Target::Session(s),
+                        text: "Open the PR.".into(),
+                        when: crate::line::When::Queue,
+                    },
+                )
+                .await
+                .unwrap();
+            let delivery = async || d.store().line_message(m.id).await.unwrap().unwrap().delivery;
+            d.line_pump(s).await;
+            assert_eq!(delivery().await, crate::line::Delivery::Handed, "typed in, not shown in");
+            {
+                use std::io::Write;
+                let path = home.join(".codex/sessions/2026/11/02/rollout-2026-11-02T10-00-00-th-1.jsonl");
+                let mut f = std::fs::OpenOptions::new().append(true).open(path).unwrap();
+                for e in [
+                    serde_json::json!({"type": "response_item", "payload": {"type": "message", "role": "user",
+                        "content": [{"type": "input_text", "text": format!("{} Sarah tells you: Open the PR.", crate::line::marker(m.id))}]}}),
+                    serde_json::json!({"type": "event_msg", "payload": {"type": "task_started"}}),
+                ] {
+                    writeln!(f, "{e}").unwrap();
+                }
+            }
+            track_until(SessionState::Working).await;
+            assert_eq!(delivery().await, crate::line::Delivery::Delivered);
+            d.line_requeue_stale(Utc::now() + chrono::Duration::hours(1)).await;
+            d.line_pump(s).await;
+            assert_eq!(delivery().await, crate::line::Delivery::Delivered, "typed once");
             pty.write(b"\x03exit\n").unwrap();
         })
         .await;

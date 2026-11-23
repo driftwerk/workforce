@@ -163,7 +163,7 @@ fn bosss(m: &LineMessage, boss: &str, s: Uuid) -> bool {
         && m.to_session() == Some(s)
         && !matches!(
             m.delivery,
-            Delivery::Refused | Delivery::Withdrawn | Delivery::Noted
+            Delivery::Refused | Delivery::Withdrawn | Delivery::Noted | Delivery::Unreceived
         )
 }
 

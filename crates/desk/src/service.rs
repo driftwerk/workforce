@@ -6267,6 +6267,7 @@ impl Desk {
             }
         };
         self.mode_said(id, &hook, body);
+        self.prompts_seen_from(id);
         Some(self.apply_hook(id, hook, claude::agent_of(body)).await)
     }
 
@@ -7828,6 +7829,9 @@ impl Desk {
                 CodexEvent::Prompt(p) => Some(self.person_prompted(id, p)),
                 _ => None,
             };
+            if let CodexEvent::Prompt(_) = &event {
+                self.prompts_seen_from(id);
+            }
             let delivery = match &event {
                 CodexEvent::Prompt(p) => match crate::line::is_delivery(p) {
                     Some(mark) => {
@@ -8849,6 +8853,16 @@ mod tests {
         d.hook(id, &t, body.to_string().as_bytes()).await.unwrap()
     }
 
+    /// `next`, handed to Desk's plugin in `id`, went in: its marker came
+    /// back in the prompt it started, and the plugin said it submitted it.
+    pub(super) async fn went_in(d: &Desk, id: Uuid, next: &Value) {
+        if let Some(mark) = crate::line::is_delivery(next["text"].as_str().unwrap()) {
+            d.line_heard(id, &mark).await;
+        }
+        let m = serde_json::from_value(next["id"].clone()).unwrap();
+        d.line_ack(id, m, true).await.unwrap();
+    }
+
     #[test]
     fn a_codex_turns_background_is_what_its_app_server_started_in_it() {
         let table = procs::parse(
@@ -9169,7 +9183,7 @@ mod tests {
             eventually("queued again, waiting on the question", async || {
                 let m = row(earlier.id).await;
                 (m.delivery == crate::line::Delivery::Queued
-                    && second.line_waits(&m) == Some(crate::line::Wait::Asking))
+                    && second.line_waits(&m).await == Some(crate::line::Wait::Asking))
                 .then_some(())
             })
             .await;
@@ -9180,12 +9194,12 @@ mod tests {
                 .await
                 .unwrap();
             assert_ne!(
-                second.line_waits(&row(after.id).await),
+                second.line_waits(&row(after.id).await).await,
                 Some(crate::line::Wait::Asking),
                 "its running boss answers it"
             );
             assert_eq!(
-                second.line_waits(&row(earlier.id).await),
+                second.line_waits(&row(earlier.id).await).await,
                 Some(crate::line::Wait::Asking)
             );
         })

@@ -27,9 +27,14 @@ const LIVE: &str = "('sending', 'open', 'held')";
 pub const TAKEN_MEANWHILE: &str =
     "it went after it was settled, and another order holds its job now";
 
+/// Why an order whose line message was withdrawn, refused or never shown
+/// to have gone in holds nothing.
+pub const NEVER_WENT_IN: &str = "its message never went in";
+
 /// When the line message carrying it went in, if it did: as the line
-/// row says (taken by the session's hook counts).
-const WENT_IN: &str = "CASE WHEN l.delivery IN ('delivered', 'handed') \
+/// row says. Handed to Desk's plugin is not in yet: it is once the
+/// session's prompt or the plugin says so.
+const WENT_IN: &str = "CASE WHEN l.delivery = 'delivered' \
     THEN COALESCE(l.delivered_at, l.updated_at) END";
 
 fn assignment(r: &Row) -> Result<Assignment> {
@@ -67,10 +72,15 @@ fn assignment(r: &Row) -> Result<Assignment> {
     })
 }
 
-/// A select of assignments with what their line rows say, after `rest`.
+/// Whether an assignment's line message is on its way in: handed to Desk's
+/// plugin, or typed in, and not yet shown to be in.
+const HANDED: &str = "COALESCE(l.delivery = 'handed', false)";
+
+/// A select of assignments with what their line rows say (when theirs
+/// went in, and whether it is on its way, as `handed`), after `rest`.
 fn select(rest: &str) -> String {
     format!(
-        "SELECT {COLUMNS}, {WENT_IN} FROM boss_assignments a \
+        "SELECT {COLUMNS}, {WENT_IN}, {HANDED} AS handed FROM boss_assignments a \
          LEFT JOIN line_messages l ON l.id = a.line_message {rest}"
     )
 }
@@ -79,6 +89,19 @@ fn select(rest: &str) -> String {
 /// machine's session), it was sent there.
 fn went_in(a: &Assignment) -> bool {
     a.delivered_at.is_some() || (a.line_message.is_none() && a.state == AssignmentState::Open)
+}
+
+/// What came of restoring an order whose message reached its session
+/// after all ([`DeskStore::assignment_restore`]).
+#[derive(Debug, Clone)]
+pub enum Restored {
+    /// It stands again, open.
+    Back(Box<Assignment>),
+    /// It doesn't: `holder`, sent since, has its job now.
+    Taken {
+        order: Box<Assignment>,
+        holder: Box<Assignment>,
+    },
 }
 
 /// What came of reserving an assignment.
@@ -113,21 +136,9 @@ impl DeskStore {
             &[&new.boss],
         )
         .await?;
-        let live: Vec<Live> = tx
-            .query(
-                &select(&format!("WHERE a.boss = $1 AND a.state IN {LIVE}")),
-                &[&new.boss],
-            )
-            .await?
-            .iter()
-            .map(assignment)
-            .collect::<Result<Vec<_>>>()?
-            .into_iter()
-            .map(|a| Live {
-                delivered: went_in(&a),
-                a,
-            })
-            .collect();
+        // One on its way in counts as in: superseded, it would reach its
+        // session beside the new one.
+        let live = Self::live_of(&tx, &new.boss).await?;
         let (supersede, follow_up) = match assignment::rule(new, &live, replacing.map(|(id, _)| id))
         {
             Ruling::Refused { rule, holder } => {
@@ -406,6 +417,81 @@ impl DeskStore {
             .transpose()
     }
 
+    /// The order carried by `line_message`, cancelled as it never went in,
+    /// which reached its session after all: open again, in one transaction
+    /// under its boss's lock, unless an order sent since holds its job
+    /// (by [`assignment::rule`], as if it were sent now). `None` when no
+    /// such order was cancelled.
+    pub async fn assignment_restore(&self, line_message: Uuid) -> Result<Option<Restored>> {
+        let mut client = self.pool().get().await?;
+        let tx = client.transaction().await?;
+        let Some(order) = tx
+            .query_opt(
+                &select(
+                    "WHERE a.line_message = $1 AND a.state = 'cancelled' AND a.closed_by = 'desk' \
+                     AND a.closed_why = $2 LIMIT 1",
+                ),
+                &[&line_message, &NEVER_WENT_IN],
+            )
+            .await?
+            .as_ref()
+            .map(assignment)
+            .transpose()?
+        else {
+            return Ok(None);
+        };
+        tx.execute(
+            "SELECT pg_advisory_xact_lock(hashtext('boss_assignments:' || $1))",
+            &[&order.boss],
+        )
+        .await?;
+        let live = Self::live_of(&tx, &order.boss).await?;
+        let holder = match assignment::rule(&order, &live, None) {
+            Ruling::Refused { holder, .. } => Some(holder),
+            Ruling::Send { supersede, .. } => supersede.first().copied(),
+        };
+        if let Some(holder) = holder.and_then(|h| live.into_iter().find(|l| l.a.id == h)) {
+            return Ok(Some(Restored::Taken {
+                order: Box::new(order),
+                holder: Box::new(holder.a),
+            }));
+        }
+        let back = tx
+            .query_opt(
+                &format!(
+                    "UPDATE boss_assignments a SET state = 'open', closed_at = NULL, \
+                     closed_by = NULL, closed_why = NULL WHERE id = $1 AND state = 'cancelled' \
+                     RETURNING {COLUMNS}, NULL::timestamptz"
+                ),
+                &[&order.id],
+            )
+            .await?
+            .as_ref()
+            .map(assignment)
+            .transpose()?;
+        tx.commit().await?;
+        Ok(back.map(|a| Restored::Back(Box::new(a))))
+    }
+
+    /// `boss`'s live assignments, each with whether its message is in or
+    /// on its way: what [`assignment::rule`] judges an order by.
+    async fn live_of(tx: &tokio_postgres::Transaction<'_>, boss: &str) -> Result<Vec<Live>> {
+        tx.query(
+            &select(&format!("WHERE a.boss = $1 AND a.state IN {LIVE}")),
+            &[&boss],
+        )
+        .await?
+        .iter()
+        .map(|r| {
+            let a = assignment(r)?;
+            Ok(Live {
+                delivered: went_in(&a) || r.try_get::<_, bool>("handed")?,
+                a,
+            })
+        })
+        .collect()
+    }
+
     /// The order `id`, which carries no line message here (a ticket, a
     /// resume, a restart, a start, or one relayed to a machine), reached its
     /// session at `at`.
@@ -619,14 +705,14 @@ impl DeskStore {
             .map(|r| r.get(0)))
     }
 
-    /// The live assignments whose line message was withdrawn or refused:
-    /// it never went in, so they hold nothing.
+    /// The live assignments whose line message was withdrawn, refused, or
+    /// never shown to have gone in: they hold nothing.
     pub async fn assignments_never_went_in(&self) -> Result<Vec<Assignment>> {
         let client = self.pool().get().await?;
         client
             .query(
                 &select(
-                    "WHERE a.state IN ('open', 'sending') AND l.delivery IN ('withdrawn', 'refused')",
+                    "WHERE a.state IN ('open', 'sending') AND l.delivery IN ('withdrawn', 'refused', 'unreceived')",
                 ),
                 &[],
             )
@@ -895,19 +981,90 @@ mod tests {
                 .await
                 .unwrap();
             store.assignment_reopen(first.id).await.unwrap();
-            // Gone in: the same order again is refused.
+            // Handed to Desk's plugin is not in yet, but on its way: the
+            // same order again is refused, as once it has gone in.
             store
-                .line_take(m.id, crate::line::Delivery::Delivered)
+                .line_take(m.id, crate::line::Delivery::Handed)
                 .await
                 .unwrap();
-            let third = order("boss", s, "Start Harbor production release 3 now.");
-            assert!(matches!(
-                store.assignment_reserve(&third, None).await.unwrap(),
-                Reserved::Refused {
-                    rule: Rule::SameSession,
-                    ..
+            let handed = store.assignment_of_line(m.id).await.unwrap().unwrap();
+            assert_eq!(handed.delivered_at, None);
+            let refused = async || {
+                let again = order("boss", s, "Start Harbor production release 3 now.");
+                matches!(
+                    store.assignment_reserve(&again, None).await.unwrap(),
+                    Reserved::Refused {
+                        rule: Rule::SameSession,
+                        ..
+                    }
+                )
+            };
+            assert!(refused().await, "on its way in");
+            store.line_ack(m.id).await.unwrap();
+            assert!(refused().await, "gone in");
+        })
+        .await;
+    }
+
+    /// An order cancelled as its message never went in stands again once
+    /// that message arrives after all, unless an order sent since for
+    /// another session holds its job.
+    #[tokio::test]
+    async fn an_order_whose_message_arrived_after_all_stands_again_unless_its_job_is_held() {
+        with_test_pool(crate::store::build_pool, |pool| async move {
+            let store = DeskStore::with_pool(pool).await.unwrap();
+            let sent = async |session: Uuid| {
+                let a = order("boss", session, "Dispatch the real release 3 promote now.");
+                assert!(matches!(
+                    store.assignment_reserve(&a, None).await.unwrap(),
+                    Reserved::Kept { .. }
+                ));
+                let m = crate::line::LineMessage::new(
+                    crate::crew::Party::manager("boss", "Desk"),
+                    crate::crew::Party::you(),
+                    crate::line::LineKind::Tell,
+                    a.text.clone(),
+                    1,
+                );
+                store.put_line(&m).await.unwrap();
+                store.assignment_sent(a.id, Some(m.id), true).await.unwrap();
+                store
+                    .assignment_close(a.id, AssignmentState::Cancelled, "desk", NEVER_WENT_IN)
+                    .await
+                    .unwrap();
+                (a, m)
+            };
+            let (first, m) = sent(Uuid::new_v4()).await;
+            match store.assignment_restore(m.id).await.unwrap() {
+                Some(Restored::Back(a)) => {
+                    assert_eq!((a.id, a.state), (first.id, AssignmentState::Open))
                 }
-            ));
+                other => panic!("{other:?}"),
+            }
+            assert!(
+                store.assignment_restore(m.id).await.unwrap().is_none(),
+                "once"
+            );
+            store
+                .assignment_close(first.id, AssignmentState::Cancelled, "desk", NEVER_WENT_IN)
+                .await
+                .unwrap();
+            let holder = order(
+                "boss",
+                Uuid::new_v4(),
+                "Dispatch the real release 3 promote now.",
+            );
+            store.assignment_reserve(&holder, None).await.unwrap();
+            match store.assignment_restore(m.id).await.unwrap() {
+                Some(Restored::Taken { order, holder: h }) => {
+                    assert_eq!((order.id, h.id), (first.id, holder.id))
+                }
+                other => panic!("{other:?}"),
+            }
+            assert_eq!(
+                store.assignment(first.id).await.unwrap().unwrap().state,
+                AssignmentState::Cancelled
+            );
         })
         .await;
     }
