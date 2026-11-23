@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
 
@@ -10,8 +10,8 @@ use uuid::Uuid;
 use crate::subscription::Payer;
 
 /// The transcript a CLI keeps for an agent's turns in one session: which
-/// one, how many turns it has answered, when it last did, and the last
-/// session message it has seen.
+/// one, how many turns it has answered, when it last did, the last session
+/// message it has seen, how full it is, and what of a turn's input it holds.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EngineSlot {
     pub id: Uuid,
@@ -19,6 +19,17 @@ pub struct EngineSlot {
     pub last_reply_at: Option<DateTime<Utc>>,
     /// The id of the last message of this session the transcript holds.
     pub synced_through: Option<String>,
+    /// When that message was saved: what the transcript holds once a
+    /// compaction has removed it.
+    #[serde(default)]
+    pub synced_at: Option<DateTime<Utc>>,
+    /// The tokens its last model call read, the transcript's size; 0 when
+    /// the CLI doesn't say.
+    #[serde(default)]
+    pub context_tokens: u64,
+    /// The passages of its last turn's input it holds, by their hash.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub holds: BTreeSet<u64>,
 }
 
 impl EngineSlot {
@@ -29,6 +40,9 @@ impl EngineSlot {
             turns: 0,
             last_reply_at: None,
             synced_through: None,
+            synced_at: None,
+            context_tokens: 0,
+            holds: BTreeSet::new(),
         }
     }
 }
