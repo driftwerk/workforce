@@ -57,11 +57,21 @@ impl Ext {
         }
     }
 
-    /// Says hello and signs the challenge; what the hub said next.
+    /// Says hello as an extension that updates itself and signs the
+    /// challenge; what the hub said next.
     async fn handshake(&mut self, sign_right: bool) -> (Value, Value) {
+        self.handshake_at(sign_right, Some(SELF_UPDATING)).await
+    }
+
+    /// [`Self::handshake`] as an extension of `revision` (`None`: one older
+    /// than revisions, whose hello says none).
+    async fn handshake_at(&mut self, sign_right: bool, revision: Option<u64>) -> (Value, Value) {
         let key = self.public();
-        self.say(json!({ "type": "hello", "protocol": 1, "version": "0.1.0", "key": key, "label": "ignored" }))
-            .await;
+        let mut hello = json!({ "type": "hello", "protocol": 1, "version": "0.1.0", "key": key, "label": "ignored" });
+        if let Some(revision) = revision {
+            hello["revision"] = json!(revision);
+        }
+        self.say(hello).await;
         let challenge = self.hear().await;
         let nonce = challenge["nonce"].as_str().unwrap().to_string();
         let message = if sign_right {
@@ -215,6 +225,33 @@ async fn a_chrome_reaches_nothing_until_the_person_confirms_it_and_then_takes_ca
     let again = Chrome::new(dir.path().join("chrome-profiles.json"));
     assert_eq!(again.view().len(), 1);
     assert_eq!(again.view()[0].state, "confirmed");
+}
+
+/// An extension from before it could update itself is never used, so no
+/// answer of its old build is taken: the agent is told how the person
+/// reloads it. Letting its tabs go still reaches it.
+#[tokio::test]
+async fn an_extension_that_cant_update_itself_is_told_to_be_reloaded_and_never_used() {
+    let dir = tempfile::tempdir().unwrap();
+    let chrome = Chrome::new(dir.path().join("p.json"));
+    let port = hub(Arc::clone(&chrome)).await;
+    let mut e = ext(port, new_key()).await;
+    e.handshake_at(true, None).await;
+    assert!(chrome.confirm(&chrome.view()[0].id));
+    assert_eq!(e.hear().await["type"], "ready");
+    let refused = held(chrome.call("click", json!({ "session": "s", "selector": "#x" })))
+        .await
+        .unwrap_err();
+    assert_eq!(refused.to_string(), OUTDATED);
+    let closing = tokio::spawn({
+        let chrome = Arc::clone(&chrome);
+        async move { held(chrome.call("close", json!({ "session": "s" }))).await }
+    });
+    let call = e.hear().await;
+    assert_eq!(call["cmd"], "close");
+    e.say(json!({ "type": "result", "id": call["id"], "ok": true, "value": { "closed": true } }))
+        .await;
+    assert!(closing.await.unwrap().is_ok());
 }
 
 #[tokio::test]

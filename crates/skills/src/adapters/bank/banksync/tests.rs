@@ -191,10 +191,11 @@ async fn a_bank_is_named_by_its_id_or_its_name_alone() {
 #[tokio::test]
 async fn what_banksync_refuses_is_said_as_what_to_do() {
     for (status, expected) in [
-        (503, BankError::NeedsReconnect),
+        (503, BankError::Unavailable(Some(503))),
         (401, BankError::Revoked),
         (403, BankError::ScopeMissing),
         (404, BankError::NotFound("bank or account")),
+        (409, BankError::Unavailable(Some(409))),
         (502, BankError::Unavailable(Some(502))),
     ] {
         let server = serve(&["banks:read"]).await;
@@ -207,6 +208,114 @@ async fn what_banksync_refuses_is_said_as_what_to_do() {
         assert_eq!(got, expected);
         assert!(!got.to_string().contains("12.30"));
     }
+}
+
+/// A lapse is only what BankSync's own answer calls one: its 409
+/// `reauth_required`, or its JSON 503 "consent required". Another 409 (a
+/// paging restart) or a bare 503 is BankSync not answering.
+#[tokio::test]
+async fn only_banksyncs_own_word_is_a_lapse() {
+    for (status, body, expected) in [
+        (
+            409,
+            json!({"success": false, "error": "The bank needs reconnecting", "code": "reauth_required",
+                   "recovery": {"action": "reconnect"}, "reconnectUrl": "https://app.banksync.io/x"}),
+            BankError::NeedsReconnect,
+        ),
+        (
+            409,
+            json!({"success": false, "error": "Start again", "recovery": {"action": "restart_pagination"}}),
+            BankError::Unavailable(Some(409)),
+        ),
+        (
+            503,
+            json!({"success": false, "error": "Bank consent required"}),
+            BankError::NeedsReconnect,
+        ),
+    ] {
+        let server = serve(&["banks:read"]).await;
+        Mock::given(method("GET"))
+            .and(path("/banks/bnk_nw/accounts"))
+            .respond_with(ResponseTemplate::new(status).set_body_json(body))
+            .mount(&server)
+            .await;
+        assert_eq!(natwest(&server).accounts().await.unwrap_err(), expected);
+    }
+}
+
+/// BankSync's detail of a bank may say nothing of its connection, or be
+/// out of date: the bank is connected unless BankSync refuses its accounts
+/// as needing reconnecting.
+#[tokio::test]
+async fn a_bank_is_lapsed_only_when_banksync_says_so() {
+    let silent = json!({
+        "id": "bnk_nw", "name": "NatWest", "source": "saltedge", "type": "bank", "order": 0,
+        "createdAt": "2026-09-01T00:00:00Z", "updatedAt": "2026-09-01T00:00:00Z", "links": {}
+    });
+    for (detail, accounts_answer, connected) in [
+        (
+            silent.clone(),
+            ResponseTemplate::new(200).set_body_json(accounts()),
+            true,
+        ),
+        (
+            json!({"status": "connected", "id": "bnk_nw", "name": "NatWest"}),
+            ResponseTemplate::new(500),
+            true,
+        ),
+        (
+            bank("bnk_nw", "NatWest", false),
+            ResponseTemplate::new(200).set_body_json(accounts()),
+            true,
+        ),
+        (
+            silent,
+            ResponseTemplate::new(409).set_body_json(
+                json!({"success": false, "error": "Reconnect", "code": "reauth_required"}),
+            ),
+            false,
+        ),
+        (
+            bank("bnk_nw", "NatWest", false),
+            ResponseTemplate::new(503).set_body_json(json!({"success": false, "error": "Consent"})),
+            false,
+        ),
+    ] {
+        let server = serve(&["banks:read"]).await;
+        Mock::given(method("GET"))
+            .and(path("/banks/bnk_nw"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!({"success": true, "data": detail})),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/banks/bnk_nw/accounts"))
+            .respond_with(accounts_answer)
+            .mount(&server)
+            .await;
+        let c = natwest(&server).connection().await.unwrap();
+        assert_eq!((c.bank.as_str(), c.connected), ("NatWest", connected));
+    }
+    let server = serve(&["banks:read"]).await;
+    Mock::given(method("GET"))
+        .and(path("/banks/bnk_nw"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({"success": true, "data": bank("bnk_nw", "NatWest", false)})),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/banks/bnk_nw/accounts"))
+        .respond_with(ResponseTemplate::new(502))
+        .mount(&server)
+        .await;
+    assert_eq!(
+        natwest(&server).connection().await,
+        Err(BankError::Unavailable(Some(502))),
+        "BankSync not answering is never read as a lapse"
+    );
 }
 
 #[tokio::test]

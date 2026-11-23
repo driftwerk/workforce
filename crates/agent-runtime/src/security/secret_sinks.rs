@@ -27,8 +27,13 @@
 //! `body` — objects and arbitrary JSON, where the registry substitutes flat
 //! top-level strings only. And it must *know* a credential landed on the
 //! request, because one that did may not follow a redirect; substituting
-//! upstream hands the tool indistinguishable cleartext. A reviewer reading for
-//! "what can turn a marker into cleartext" must read both files.
+//! upstream hands the tool indistinguishable cleartext.
+//!
+//! `connections.keep` resolves a key's marker itself too
+//! (`hub::desk_connections::setup::given_secret`): it must know the key was
+//! handed over by the person, never typed by the model, and never scraped from
+//! a tool's answer. A reviewer reading for "what can turn a marker into
+//! cleartext" must read all three.
 
 use serde_json::Value;
 use workforce_common::secret_marker::{global_cache, parse_markers, ConsumedSecret, MarkerId};

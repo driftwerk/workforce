@@ -527,7 +527,7 @@ pub const CATALOG: &[Connector] = &[
             label: "Bank approval",
             page: BANKSYNC_APP,
             open: "Open BankSync",
-            about: "Renew the approval in BankSync: it takes you to your bank to approve it again. BankSync doesn't tell Desk when an approval lapses, so Desk takes your word that you renewed it and counts about 90 days from then.",
+            about: "Renew the approval in BankSync: it takes you to your bank to approve it again. BankSync doesn't tell Desk when an approval lapses, so Desk takes your word that you renewed it and counts about 180 days from then.",
             done: "I’ve renewed it, check it",
         }),
         reads_only: true,

@@ -837,9 +837,12 @@ Set one up with connections.setup {service: 'bank', name: '<Bank>'}: keep `bank`
 (its name as BankSync shows it) with connections.keep, then in the person's \
 signed-in BankSync tab open Settings > Developers > API keys, make a key named \
 'Desk – <Bank>' with only banks:read and institutions:read, and read it with \
-browser.capture_key, so it never passes through you. Desk tests it and keeps it.\n\
-Never vault.set a bank key yourself, and never make a key with any other scope: \
-a key that can do more than read is refused.\n\
+browser.capture_key, so it never passes through you. If the person has the key \
+already, ask them to send it with `cmd: secret <name> <key>` and keep it with \
+connections.keep {field: 'api_key', value: '[[secret:<name>]]'}. Either way Desk \
+tests it (a key that can do more than read is refused) and keeps it.\n\
+A bank key goes in only through its setup, never with vault.set, and never with \
+any other scope.\n\
 Set skills/bank/default_workspace only when the person names a default.",
             workspace_vault_prefix: "skills/bank/workspaces/",
             workspace_credentials: &[

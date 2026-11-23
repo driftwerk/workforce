@@ -863,7 +863,7 @@ impl ExtensionCell {
                 })?;
             if !keys::matches(&page, url) {
                 return Err(eyre!(
-                    "Desk's tab isn't on {connector}'s key page, so no key was read."
+                    "Desk's tab isn't on {connector}'s key page, so no key was read. Desk reads only its own tab, which closes when a turn ends: open the key page with browser.navigate and make the key there. If the person made it in their own window or has it already, ask them to send it with `cmd: secret <name> <key>` and keep it with connections.keep, its [[secret:<name>]] marker as the value."
                 ));
             }
             // A named field is searched for by its own shape, so an app's

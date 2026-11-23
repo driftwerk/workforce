@@ -110,6 +110,7 @@ static LABELLED_PATTERNS: Lazy<Vec<LabelledPattern>> = Lazy::new(|| {
         ("LINEAR_API_TOKEN", r"lin_api_[a-zA-Z0-9]{20,}"),
         ("ATLASSIAN_API_TOKEN", r"ATATT[a-zA-Z0-9_-]{20,}"),
         ("METABASE_API_KEY", r"mb_[a-zA-Z0-9+/=_-]{20,}"),
+        ("BANKSYNC_API_KEY", r"bsk_[a-zA-Z0-9_-]{20,}"),
         ("NOTION_TOKEN", r"ntn_[a-zA-Z0-9]{30,}"),
         ("NOTION_LEGACY_TOKEN", r"secret_[a-zA-Z0-9]{43}"),
         ("HUBSPOT_PAT", r"pat-(?:na1|eu1)-[a-f0-9-]{36}"),
@@ -1134,6 +1135,7 @@ mod tests {
             ("SLACK_TOKEN", concat!("xoxb-1", "234567890-abcdefghij-klmnopqrstuvwxyz")),
             ("SLACK_APP_TOKEN", concat!("xapp-1", "-A123-1234567890-abcdefghij")),
             ("LINEAR_API_TOKEN", concat!("lin_ap", "i_aBcDeFgHiJkLmNoPqRsT1234567890")),
+            ("BANKSYNC_API_KEY", concat!("bsk_", "a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6")),
             (
                 "ATLASSIAN_API_TOKEN",
                 concat!("ATAT", "T3xFfGF0abcdefghijklmnopqrstuvwxyz"),

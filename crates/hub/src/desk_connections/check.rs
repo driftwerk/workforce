@@ -171,6 +171,12 @@ fn refused_or_failed(name: &str, status: reqwest::StatusCode, body: &str, key: &
     }
 }
 
+/// What a bank whose approval BankSync says lapsed is told: renewed there,
+/// then tried again, first connect or Reconnect alike.
+fn lapsed(bank: &str) -> String {
+    format!("BankSync says {bank}'s approval has lapsed: the person reconnects the bank in BankSync, approving it again at the bank, then tries again here")
+}
+
 fn account(value: &Value, keys: &[&str]) -> Option<String> {
     keys.iter().find_map(|k| {
         k.split('.')
@@ -328,15 +334,12 @@ impl Services {
         .await
         {
             Ok(c) if c.connected => Found::Works { account: c.bank },
-            Ok(c) => Found::Refused(format!(
-                "{}'s approval has lapsed in BankSync: the person renews it there, then presses Reconnect",
-                c.bank
-            )),
+            Ok(c) => Found::Refused(lapsed(&c.bank)),
+            Err(BankError::NeedsReconnect) => Found::Refused(lapsed(field(f, "bank"))),
             Err(
                 e @ (BankError::Revoked
                 | BankError::ScopeMissing
                 | BankError::NotReadOnly
-                | BankError::NeedsReconnect
                 | BankError::Invalid(_)
                 | BankError::NotConfigured(_)),
             ) => Found::Refused(e.to_string()),

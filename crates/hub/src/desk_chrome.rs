@@ -100,6 +100,9 @@ type Answer = oneshot::Sender<std::result::Result<Value, String>>;
 struct Conn {
     out: mpsc::UnboundedSender<String>,
     waiting: Arc<parking_lot::Mutex<HashMap<u64, Answer>>>,
+    /// The extension's revision, as its hello said: 1 for one older than
+    /// revisions.
+    revision: u64,
 }
 
 /// The hub's end of Desk's extension.
@@ -420,6 +423,7 @@ impl Chrome {
         let conn = Arc::new(Conn {
             out,
             waiting: Default::default(),
+            revision: hello["revision"].as_u64().unwrap_or(1),
         });
         self.live.lock().insert(id.clone(), Arc::clone(&conn));
         info!(profile = %id, %version, "Desk's Chrome extension connected");
@@ -557,6 +561,9 @@ impl ExtensionLink for Chrome {
         let conn = self
             .chosen_conn()
             .ok_or_else(|| eyre!(browser::NOT_CONNECTED))?;
+        if conn.revision < SELF_UPDATING && !matches!(cmd, "close" | "stop") {
+            return Err(eyre!(OUTDATED));
+        }
         let id = self.next.fetch_add(1, Ordering::Relaxed);
         let mut call = args.clone();
         let Value::Object(map) = &mut call else {
@@ -588,6 +595,15 @@ impl ExtensionLink for Chrome {
         Chrome::connected(self)
     }
 }
+
+/// The first revision of Desk's extension that brings itself up to date
+/// after a Desk install. One older keeps running the build Chrome first
+/// loaded, whose answers this hub can't trust (a click it never made said as
+/// made), until the person reloads it once.
+pub const SELF_UPDATING: u64 = 2;
+
+/// What a call on an extension older than [`SELF_UPDATING`] is told.
+pub const OUTDATED: &str = "Desk's extension in the person's Chrome is an old build that can't update itself, so Desk didn't use it. Ask them to reload it once: in Chrome open chrome://extensions and press the reload arrow on Desk's card. From then on it keeps itself up to date.";
 
 /// What a call in someone else's turn is told.
 pub const OTHERS_TURN: &str = "The browser is the person's own Chrome, signed in as them: it is used only in a turn of theirs.";

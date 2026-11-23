@@ -5,8 +5,9 @@ use chrono::{DateTime, Duration, NaiveDate, Utc};
 use serde::Serialize;
 use serde_json::Number;
 
-/// How long a bank's approval lasts under UK open banking.
-pub const CONSENT_DAYS: i64 = 90;
+/// How long a bank's approval lasts under UK and EU open banking, as
+/// BankSync says: 180 days.
+pub const CONSENT_DAYS: i64 = 180;
 
 /// The days before an approval lapses on which the person is reminded.
 const REMIND_AT: &[i64] = &[7, 1, 0];
@@ -240,7 +241,7 @@ mod tests {
     #[test]
     fn an_approval_reminds_seven_days_before_the_day_before_and_on_the_day() {
         let consented: DateTime<Utc> = "2026-09-01T10:00:00Z".parse().unwrap();
-        let until = day("2026-11-30");
+        let until = day("2027-02-28");
         let reminded: Vec<i64> = (-2..=10)
             .map(|n| until - Duration::days(n))
             .map(|today| Approval::of(consented, today))
@@ -256,7 +257,10 @@ mod tests {
             .collect();
         assert_eq!(due, (-2..=7).collect::<Vec<_>>());
         let late_utc: DateTime<Utc> = "2026-09-01T23:30:00Z".parse().unwrap();
-        assert_eq!(Approval::of(late_utc, day("2026-09-01")).days_left, 90);
+        assert_eq!(
+            Approval::of(late_utc, day("2026-09-01")).days_left,
+            CONSENT_DAYS
+        );
     }
 
     #[test]
