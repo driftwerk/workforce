@@ -65,6 +65,13 @@ pub struct Reading {
 }
 
 impl Reading {
+    /// Whether it is a wait said in output Desk found no process of the
+    /// session's writing: it may be long over, so it is at most looked at,
+    /// never a stall.
+    pub fn unplaced(&self) -> bool {
+        matches!(self.kind, Kind::Waits(_)) && self.pid.is_none()
+    }
+
     /// Nothing seen running at `now`.
     pub fn quiet(now: DateTime<Utc>) -> Self {
         Self {
@@ -247,7 +254,7 @@ pub fn verdict(
     let sampled = g.as_of.is_some();
     let busy = state == SessionState::Working || (state == SessionState::Done && g.background > 0);
     let waited = match r.kind {
-        Kind::Waits(_) if sampled && past(r.since, t.stall) => {
+        Kind::Waits(_) if !r.unplaced() && sampled && past(r.since, t.stall) => {
             let d = lasted(now - r.since);
             let words = match r.words.strip_prefix("waiting for ") {
                 Some(what) => format!("has waited {d} for {what}"),
@@ -268,7 +275,7 @@ pub fn verdict(
             .into_iter()
             .flatten()
             .fold(cpu, std::cmp::max);
-        let quiet = matches!(r.kind, Kind::Works | Kind::Remote | Kind::Quiet);
+        let quiet = matches!(r.kind, Kind::Works | Kind::Remote | Kind::Quiet) || r.unplaced();
         (quiet && past(moved, t.quiet)).then(|| Stall {
             kind: StallKind::Still,
             since: moved,
@@ -278,6 +285,10 @@ pub fn verdict(
                 match (r.kind, r.on.as_deref()) {
                     (Kind::Remote, Some(host)) =>
                         format!("; its ssh command may still run on {host}"),
+                    (Kind::Waits(_), _) if r.unplaced() => format!(
+                        "; its output said it is {}, in no process Desk can see",
+                        r.words
+                    ),
                     _ => String::new(),
                 }
             ),
@@ -579,7 +590,7 @@ mod tests {
             since: at(since),
             by: None,
             on: None,
-            pid: None,
+            pid: Some(7),
             call: None,
         }
     }
@@ -648,6 +659,31 @@ mod tests {
             ..T
         };
         assert_eq!(kind(&g, SessionState::Working, 600, off), None);
+    }
+
+    #[test]
+    fn a_wait_in_no_process_desk_sees_is_never_a_stall_and_at_most_looked_at() {
+        let unplaced = Reading {
+            pid: None,
+            call: Some("b1".into()),
+            ..reading(Kind::Waits(Wait::Queue), BUILD_SLOT, 0)
+        };
+        assert!(unplaced.unplaced());
+        let moving = glance(unplaced.clone(), 160);
+        assert_eq!(kind(&moving, SessionState::Working, 170, T), None);
+        let bg = Glance {
+            background: 1,
+            ..glance(unplaced, 0)
+        };
+        let s = verdict(&bg, SessionState::Done, at(170), T).unwrap();
+        assert_eq!(s.kind, StallKind::Still, "only nothing moving under it");
+        assert!(
+            s.words.ends_with(
+                "; its output said it is waiting for a build slot, in no process Desk can see"
+            ),
+            "{}",
+            s.words
+        );
     }
 
     #[test]
