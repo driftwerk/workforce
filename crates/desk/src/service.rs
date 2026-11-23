@@ -3115,10 +3115,11 @@ impl Desk {
             let now = Utc::now();
             let looked = {
                 let st = self.0.state.lock();
+                let found = st.sight.get(&id).map(|s| &s.found);
                 st.live
                     .get(&id)
                     .map(|l| {
-                        let after = l.background.clone().looked(running, now, unseen);
+                        let after = l.background.clone().looked(running, found, now, unseen);
                         (after, &l.background)
                     })
                     .filter(|(after, before)| after != *before)
@@ -7034,6 +7035,7 @@ impl Desk {
                 .is_none_or(|s| !crate::limit::says_plan_limit(s));
         let reader = unsure.then(|| self.reader()).flatten();
         let running = self.running_now(id).await;
+        let found = self.0.state.lock().sight.get(&id).map(|s| s.found.clone());
         let unseen = self.shell_unseen();
         // A refusal whose words aren't the plan's, on an account whose
         // readings show a window full: the plan's limit after all.
@@ -7113,7 +7115,7 @@ impl Desk {
                     (true, None) => std::mem::take(&mut l.background),
                     (_, background) => std::mem::take(&mut l.background).reported(background, now),
                 }
-                .looked_if(running, now, unseen);
+                .looked_if(running, found.as_ref(), now, unseen);
             }
         });
         if let (Some(reader), Some(end), Some(reply)) = (reader, read, said_whole) {
@@ -8106,6 +8108,7 @@ impl Desk {
                             l.codex_question = None;
                             l.background = std::mem::take(&mut l.background).looked_if(
                                 running,
+                                None,
                                 Utc::now(),
                                 unseen,
                             );
