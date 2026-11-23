@@ -171,15 +171,20 @@ impl DeskStore {
     /// answered if it is still open: whether this did, so an answer is
     /// applied once.
     pub async fn ask_applied(&self, item: Uuid) -> Result<bool> {
+        self.ask_settled(item, "Answered").await
+    }
+
+    /// [`Self::ask_applied`], closing it, if still open, as `why`.
+    pub async fn ask_settled(&self, item: Uuid, why: &str) -> Result<bool> {
         let client = self.pool().get().await?;
         let n = client
             .execute(
                 "UPDATE boss_open_items SET applied_at = now(), changed_at = now(), \
                  state = 'closed', closed_at = COALESCE(closed_at, now()), \
                  closed_by = COALESCE(closed_by, 'person'), \
-                 closed_why = COALESCE(closed_why, 'Answered') \
+                 closed_why = COALESCE(closed_why, $2) \
                  WHERE id = $1 AND applied_at IS NULL",
-                &[&item],
+                &[&item, &why],
             )
             .await?;
         Ok(n == 1)

@@ -276,13 +276,15 @@ async fn a_goal_the_person_agreed_is_kept_by_desk_until_it_is_met() {
         .await;
         assert!(!r.success);
         assert!(r.error.unwrap().contains("proposed something else"));
-        let r = run(
-            &overseer,
-            "crew.plan_update",
+        // Their answer is their whole reply: a part of it is refused, saying so.
+        let answer = |said: &str| {
             json!({ "plan_id": id.to_string(), "result": green("acme/web", 2),
-                    "person_said": "make it two green runs in a row", "why": "Steadier." }),
-        )
-        .await;
+                    "person_said": said, "why": "Steadier." })
+        };
+        let r = run(&overseer, "crew.plan_update", answer("make it two green runs in a row")).await;
+        assert!(!r.success);
+        assert!(r.error.unwrap().contains("Quote the whole message"));
+        let r = run(&overseer, "crew.plan_update", answer("Yes, make it two green runs in a row")).await;
         assert!(r.success, "{r:?}");
         let p = d.plan(id).await.unwrap();
         assert_eq!(p.summary.plan.result, Some(serde_json::from_value(green("acme/web", 2)).unwrap()));
@@ -695,6 +697,23 @@ async fn a_machines_session_gets_its_goal_on_the_plan_that_runs_it() {
         let key = p.tickets[0].ticket.key.clone().unwrap();
         let remote = uuid::Uuid::new_v4();
         let item = format!("devbox/{remote}");
+        // Its ticket is taken by a session on the devbox, as a plan's start
+        // there leaves it: the plans' loop then knows it as the plan's.
+        eventually("its ticket taken there", async || {
+            let mut row = d.store().ticket(ticket).await.unwrap()?;
+            row.state = TicketState::Doing;
+            row.assignee = Some(workforce_desk::crew::Party {
+                kind: workforce_desk::crew::PartyKind::Session,
+                id: item.clone(),
+                name: "flaky-tests".into(),
+                engine: Some(workforce_desk::model::Engine::Claude),
+                origin: None,
+            });
+            d.store().put_ticket(&mut row).await.ok()
+        })
+        .await;
+        // And Desk on the devbox said it is working there, as its read of
+        // the devbox leaves it: the loop keeps it, its ticket being held.
         crew.machine_seen.lock().insert(
             item.clone(),
             crate::desk_crew::plan::MachineSeen {
@@ -703,12 +722,15 @@ async fn a_machines_session_gets_its_goal_on_the_plan_that_runs_it() {
                 boss: "desk".into(),
                 goal: p.summary.plan.goal.clone(),
                 key: key.clone(),
-                engine: None,
+                engine: Some(workforce_desk::model::Engine::Claude),
                 state: "working".into(),
                 reply: None,
                 misses: 0,
             },
         );
+        // Kept through the plans' loop's passes.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(crew.machine_seen.lock().contains_key(&item));
 
         // A new plan for it is pointed at the one that runs it.
         person_says(&overseer, "Yes, get the flaky tests fixed today");
@@ -804,4 +826,123 @@ async fn a_part_whose_reads_keep_failing_is_repaired_where_it_reads_from() {
         assert!(!p.awaiting(), "a repair needs no approval");
     })
     .await;
+}
+
+/// A question about a plan's goal that the person settles by approving the
+/// plan on its card, as it proposed, closes: it doesn't stay open in their
+/// list, nor apply again. One about another goal stays.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_goal_question_the_person_settles_on_the_plans_card_closes_with_it() {
+    use workforce_desk::open_item::OpenState;
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(dir.path()).unwrap();
+        let gh = github().await;
+        let (_overseer, _crew, d, _llm) = boss_on(&base, pool, ACTS, &gh).await;
+        let p = super::plans::proposed(&d, &base, 1).await;
+        let id = p.summary.plan.id;
+        let store = d.store();
+        let settled = goal_asked(
+            store,
+            id,
+            "Shall the goal be a green suite?",
+            &p.summary.plan.goal.to_uppercase(),
+        )
+        .await;
+        let other = goal_asked(
+            store,
+            id,
+            "Shall the goal be the docs shipped?",
+            "Ship the docs",
+        )
+        .await;
+        d.approve_plan(id, p.summary.plan.revision, &By::you())
+            .await
+            .unwrap();
+        let open: Vec<_> = store
+            .goal_asks(id)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|a| a.item)
+            .collect();
+        assert_eq!(open, [other]);
+        let i = store.open_item(settled).await.unwrap().unwrap();
+        assert_eq!(i.state, OpenState::Closed);
+        assert_eq!(
+            i.closed_why.as_deref(),
+            Some("You approved it on the plan's card.")
+        );
+        assert_eq!(
+            store.open_item(other).await.unwrap().unwrap().state,
+            OpenState::Open
+        );
+    })
+    .await;
+}
+
+/// A short "ok" agrees only to what the boss said last: one written before
+/// the boss's newest DM message answered something else.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_short_agreement_counts_only_after_the_bosss_last_message() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(dir.path()).unwrap();
+        let folder = base.to_string_lossy().to_string();
+        let gh = github().await;
+        let (overseer, _crew, d, _llm) = boss_on(&base, pool, ACTS, &gh).await;
+        let plan = json!({ "goal": "Make the suite green", "start_now": { "person_said": "ok" },
+                           "result": judged(), "tickets": [{ "title": "Fix it", "folder": folder }] });
+        person_says(&overseer, "ok");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        boss_says(&overseer, "Shall I make the suite green? It's 3 flaky tests.");
+        let r = run(&overseer, "crew.plan", plan.clone()).await;
+        assert!(!r.success, "{r:?}");
+        let why = r.error.unwrap();
+        assert!(why.contains("came before your last message"), "{why}");
+        assert!(d.plans(None, None).await.unwrap().is_empty());
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        person_says(&overseer, "ok");
+        let r = run(&overseer, "crew.plan", plan).await;
+        assert!(r.success, "{r:?}");
+    })
+    .await;
+}
+
+/// The boss writes `text` in its DM with the person.
+fn boss_says(boss: &AgentService, text: &str) {
+    let mut dm = boss
+        .sessions
+        .get_or_create(DESK_CHANNEL, PERSON, "desk")
+        .unwrap();
+    dm.add_assistant_message(text, 0);
+    boss.sessions.save(&dm).unwrap();
+    boss.sessions
+        .append_to_archive(&dm.id, dm.messages.last().unwrap())
+        .unwrap();
+}
+
+/// A question of the boss's about plan `plan`'s goal, proposing `goal`.
+async fn goal_asked(
+    store: &workforce_desk::store::DeskStore,
+    plan: uuid::Uuid,
+    text: &str,
+    goal: &str,
+) -> uuid::Uuid {
+    use workforce_desk::open_item::{NewItem, OpenKind};
+    let i = store
+        .item_open(&NewItem::ask("desk", OpenKind::Ask, None, text))
+        .await
+        .unwrap()
+        .item()
+        .clone();
+    let proposal = workforce_desk::goal::Proposal {
+        goal: Some(goal.to_string()),
+        ..Default::default()
+    };
+    store
+        .item_set_goal(i.id, plan, &proposal, chrono::Utc::now())
+        .await
+        .unwrap();
+    i.id
 }

@@ -408,7 +408,7 @@ fn said_by_finds_the_quote_in_one_message_after_since() {
 }
 
 #[test]
-fn a_short_reply_answers_a_question_whole_and_never_as_part_of_another() {
+fn a_reply_answers_a_question_whole_however_short_and_never_in_part() {
     let messages = vec![
         (at(0), "yes".to_string()),
         (at(10), "Yes, do it".to_string()),
@@ -417,16 +417,22 @@ fn a_short_reply_answers_a_question_whole_and_never_as_part_of_another() {
     let answered = |quote: &str, since: i64| said_by(&messages, quote, at(since), Said::Answering);
     assert_eq!(answered("yes", -60), Ok(at(0)));
     assert_eq!(answered("Yes, do it", -60), Ok(at(10)));
-    assert_eq!(answered("yes, do", -60), Ok(at(10)), "two words of a reply");
+    assert_eq!(
+        answered("yes, do", -60),
+        Err(NotSaid::NotWhole),
+        "two words of a reply aren't it"
+    );
+    assert_eq!(
+        answered("I see why", -60),
+        Err(NotSaid::NotWhole),
+        "a part of a no is never a yes"
+    );
     assert_eq!(
         answered("yes", 0),
-        Err(NotSaid::TooShort { words: 2, chars: 6 }),
+        Err(NotSaid::NotWhole),
         "a lone yes inside a longer reply after the question isn't one"
     );
-    assert_eq!(
-        answered("yes", 5),
-        Err(NotSaid::TooShort { words: 2, chars: 6 })
-    );
+    assert_eq!(answered("yes", 5), Err(NotSaid::NotWhole));
     assert_eq!(
         said_by(&messages[..1], "yes", at(5), Said::Answering),
         Err(NotSaid::TooOld(at(0))),
@@ -851,4 +857,36 @@ fn what_a_goal_names_is_said_in_a_steady_order_and_none_takes_any_work() {
         checkpoint_shows(std::slice::from_ref(&e), &[Found::Unplaced], &[]),
         Err(NotShown::Unplaced(e))
     );
+}
+
+#[test]
+fn only_a_message_that_stands_alone_is_more_than_an_answer_to_the_last() {
+    assert!(!stands_alone("ok"));
+    assert!(!stands_alone("yes go ahead"));
+    assert!(stands_alone("Go ahead, start it"));
+}
+
+#[test]
+fn a_plan_approved_holds_what_a_question_proposed_when_it_holds_each_part() {
+    let measured = result(vec![judged()]);
+    let asked = |goal: Option<&str>, result: Option<GoalResult>, met: Option<&str>| Proposal {
+        goal: goal.map(str::to_string),
+        result,
+        met: met.map(str::to_string),
+    };
+    let covers = |p: &Proposal| approved_covers(p, "Make  the suite green", Some(&measured));
+    assert!(covers(&asked(Some("make the suite green"), None, None)));
+    assert!(covers(&asked(None, Some(measured.clone()), None)));
+    assert!(covers(&asked(
+        Some("Make the suite green"),
+        Some(measured.clone()),
+        None
+    )));
+    assert!(!covers(&asked(Some("Ship the docs"), None, None)));
+    assert!(!covers(&asked(None, Some(result(vec![])), None)));
+    assert!(
+        !covers(&asked(None, None, Some("it ran green"))),
+        "met is never approved on a card"
+    );
+    assert!(!covers(&Proposal::default()));
 }
