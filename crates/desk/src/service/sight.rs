@@ -38,7 +38,7 @@ const BORN_KEPT: usize = 64;
 /// The most of a task output file read in one pass.
 const TASK_TAIL: u64 = 64 * 1024;
 /// The tool whose calls write their output to a task output file.
-const SHELL_TOOL: &str = "Bash";
+const SHELL_TOOL: &str = sight_procs::SHELL_TOOL;
 /// The most rows a process tree shows.
 const TREE_ROWS: usize = 40;
 /// The most of a process's arguments shown.
@@ -141,6 +141,9 @@ pub struct Sample {
     /// Its open call; its input left out where the person keeps the
     /// session out of Desk.
     pub open_call: Option<OpenCall>,
+    /// Every open Bash call in its records, a sub-agent's too, by id and
+    /// when it began: each claims its own output file ([`call_file`]).
+    claims: Vec<Claim>,
     folder: Option<Arc<TaskFolder>>,
     call_output: Option<Output>,
     shells: Vec<Output>,
@@ -276,10 +279,14 @@ struct TaskFolder {
     born: Vec<(PathBuf, SystemTime)>,
 }
 
+/// An open Bash call's id and when it began.
+type Claim = (String, DateTime<Utc>);
+
 /// What one session's files said this pass.
 struct Files {
     records: Vec<RecordSeen>,
     open_call: Option<OpenCall>,
+    claims: Vec<Claim>,
     folder: Option<Arc<TaskFolder>>,
     call_output: Option<Output>,
     shells: Vec<Output>,
@@ -293,6 +300,7 @@ impl Files {
         Self {
             records: prev.map(|p| p.records.clone()).unwrap_or_default(),
             open_call: prev.and_then(|p| p.open_call.clone()),
+            claims: prev.map(|p| p.claims.clone()).unwrap_or_default(),
             folder: prev.and_then(|p| p.folder.clone()),
             call_output: prev.and_then(|p| p.call_output.clone()),
             shells: prev.map(|p| p.shells.clone()).unwrap_or_default(),
@@ -486,15 +494,46 @@ fn first_read(folder: &TaskFolder, path: &Path) -> Option<Tracked> {
     Some(Tracked::from(path.to_path_buf(), meta.created().ok(), from))
 }
 
-/// The output file `call` writes to in `folder`: the first made since it
-/// started that is no background shell's.
-fn call_file(call: &OpenCall, folder: &TaskFolder, shells: &[PathBuf]) -> Option<Tracked> {
-    let (path, _) = folder
-        .born
-        .iter()
-        .filter(|(p, made)| to_utc(*made) >= call.since - sight_procs::SKEW && !shells.contains(p))
-        .min_by_key(|(_, made)| *made)?;
-    first_read(folder, path)
+/// The output file `call` writes to in `folder`: of the files made since
+/// each open Bash call (`claims`, by id and when it began) began that are
+/// no background shell's (`shells`), each call has the one made nearest
+/// when it began, the nearest first and none given to two. A sub-agent's
+/// call asked while `call` waits on the person keeps its own file, and
+/// `call` has none until its own is made.
+fn call_file(
+    call: &OpenCall,
+    claims: &[Claim],
+    folder: &TaskFolder,
+    shells: &[PathBuf],
+) -> Option<Tracked> {
+    let calls = std::iter::once((call.id.as_str(), call.since)).chain(
+        claims
+            .iter()
+            .filter(|(id, _)| *id != call.id)
+            .map(|(id, since)| (id.as_str(), *since)),
+    );
+    let mut pairs: Vec<(chrono::Duration, &str, &PathBuf)> = calls
+        .flat_map(|(id, since)| {
+            folder
+                .born
+                .iter()
+                .map(move |(p, made)| (to_utc(*made) - since, id, p))
+                .filter(|(gap, _, p)| *gap >= -sight_procs::SKEW && !shells.contains(p))
+        })
+        .collect();
+    pairs.sort_by_key(|&(gap, id, _)| (gap.abs(), id));
+    let mut taken: (Vec<&str>, Vec<&PathBuf>) = Default::default();
+    for (_, id, path) in pairs {
+        if taken.0.contains(&id) || taken.1.contains(&path) {
+            continue;
+        }
+        if id == call.id {
+            return first_read(folder, path);
+        }
+        taken.0.push(id);
+        taken.1.push(path);
+    }
+    None
 }
 
 /// What a session's files say since `prev`: each record's length and last
@@ -515,13 +554,19 @@ fn read_files(
             Some((p.clone(), meta.len(), meta.modified().ok()?))
         })
         .collect();
-    let open_call = match prev.filter(|s| s.records == seen) {
-        Some(p) => p.open_call.clone(),
-        None => seen
-            .iter()
-            .filter_map(|(p, ..)| open_call_in(p, engine))
-            .max_by_key(|c| c.since)
-            .map(|c| OpenCall {
+    let (open_call, claims) = match prev.filter(|s| s.records == seen) {
+        Some(p) => (p.open_call.clone(), p.claims.clone()),
+        None => {
+            let open: Vec<OpenCall> = seen
+                .iter()
+                .filter_map(|(p, ..)| open_call_in(p, engine))
+                .collect();
+            let claims = open
+                .iter()
+                .filter(|c| c.tool == SHELL_TOOL)
+                .map(|c| (c.id.clone(), c.since))
+                .collect();
+            let newest = open.into_iter().max_by_key(|c| c.since).map(|c| OpenCall {
                 input: redactor
                     .map(|r| {
                         crate::crew::clip(
@@ -531,12 +576,15 @@ fn read_files(
                     })
                     .unwrap_or_default(),
                 ..c
-            }),
+            });
+            (newest, claims)
+        }
     };
     let Some(folder) = tasks.and_then(|t| listed(&t, prev.and_then(|p| p.folder.as_ref()))) else {
         return Files {
             records: seen,
             open_call,
+            claims,
             ..Files::kept(None)
         };
     };
@@ -556,7 +604,7 @@ fn read_files(
         .as_ref()
         .filter(|c| c.tool == SHELL_TOOL)
         .and_then(|c| {
-            let t = held(&c.id).or_else(|| call_file(c, &folder, &shell_paths))?;
+            let t = held(&c.id).or_else(|| call_file(c, &claims, &folder, &shell_paths))?;
             Some((c.id.clone(), t))
         });
     let shells: Vec<Output> = shells
@@ -575,6 +623,7 @@ fn read_files(
     Files {
         records: seen,
         open_call,
+        claims,
         folder: Some(folder),
         call_output,
         shells,
@@ -880,7 +929,8 @@ impl Desk {
             .filter_map(|(id, t)| Some((id.as_str(), t.born?)))
             .collect();
         let listed = table.map_or(now, |(_, at)| at);
-        let placed = sight_procs::placed(&refs, files.open_call.as_ref(), &born, listed);
+        let call_born = files.call_output.as_ref().and_then(|(_, t)| t.born);
+        let placed = sight_procs::placed(&refs, files.open_call.as_ref(), call_born, &born, listed);
         let busy = |id: &str| {
             prev.zip(placed.get(id)).is_some_and(|(p, head)| {
                 sight_procs::active(&p.runs, &sight_procs::subtree(&refs, head))
@@ -964,6 +1014,7 @@ impl Desk {
             records: files.records,
             grew_at,
             open_call,
+            claims: files.claims,
             folder: files.folder,
             call_output: files.call_output,
             shells: files.shells,
@@ -1493,7 +1544,7 @@ mod tests {
             input: String::new(),
             since: to_utc(at(1000)),
         };
-        let made_since = call_file(&call, &folder, std::slice::from_ref(&shell)).unwrap();
+        let made_since = call_file(&call, &[], &folder, std::slice::from_ref(&shell)).unwrap();
         assert_eq!(
             (made_since.path.as_path(), made_since.read_to),
             (own.as_path(), 0)
@@ -1502,13 +1553,59 @@ mod tests {
             first: SystemTime::now() + Duration::from_secs(3600),
             ..folder
         };
-        let old = call_file(&call, &listed_later, &[shell]).unwrap();
+        let old = call_file(&call, &[], &listed_later, &[shell]).unwrap();
         assert_eq!(old.read_to, 15, "a file there before is read from its end");
         let late = OpenCall {
             since: to_utc(at(1100)),
             ..call
         };
-        assert!(call_file(&late, &listed_later, &[]).is_none());
+        assert!(call_file(&late, &[], &listed_later, &[]).is_none());
+    }
+
+    #[test]
+    fn a_call_waiting_on_approval_has_its_own_file_not_a_sub_agents_made_since() {
+        let dir = tempfile::tempdir().unwrap();
+        let at = |s| SystemTime::UNIX_EPOCH + Duration::from_secs(s);
+        let file = |name: &str| {
+            let p = dir.path().join(name);
+            std::fs::write(&p, "").unwrap();
+            p
+        };
+        let (sub, own) = (file("s1.output"), file("f1.output"));
+        let call = OpenCall {
+            id: "toolu_main".into(),
+            tool: "Bash".into(),
+            input: String::new(),
+            since: to_utc(at(1000)),
+        };
+        // The sub-agent's call is asked at T1, its file made with it.
+        let claims = [
+            ("toolu_main".to_string(), call.since),
+            ("toolu_sub".to_string(), to_utc(at(1010))),
+        ];
+        let folder = |born: Vec<(PathBuf, SystemTime)>| TaskFolder {
+            path: dir.path().to_path_buf(),
+            first: at(0),
+            changed: at(0),
+            names: HashSet::new(),
+            born,
+        };
+        let before_its_own = folder(vec![(sub.clone(), at(1010))]);
+        assert!(
+            call_file(&call, &claims, &before_its_own, &[]).is_none(),
+            "none until its own is made"
+        );
+        assert_eq!(
+            call_file(&call, &[], &before_its_own, &[]).map(|t| t.path),
+            Some(sub.clone()),
+            "with no call to claim it, the first made since"
+        );
+        let both = folder(vec![(sub, at(1010)), (own.clone(), at(1030))]);
+        assert_eq!(
+            call_file(&call, &claims, &both, &[]).map(|t| t.path),
+            Some(own),
+            "its own, made at T2"
+        );
     }
 
     #[test]
@@ -1544,6 +1641,7 @@ mod tests {
             grew_at: now,
             record_count: 0,
             open_call: None,
+            claims: vec![],
             folder: None,
             call_output: None,
             shells: vec![],
