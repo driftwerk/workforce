@@ -6,10 +6,11 @@
 use std::collections::HashMap;
 
 use chrono::{DateTime, Utc};
-use eyre::Result;
+use eyre::{Context, Result};
 use tokio_postgres::Row;
 use uuid::Uuid;
 
+use crate::goal::{GoalAsk, Proposal};
 use crate::open_item::{AskLayout, ClosedBy, NewItem, OpenItem, OpenKind, OpenState};
 use crate::store::DeskStore;
 
@@ -100,6 +101,103 @@ impl DeskStore {
             .execute(
                 "UPDATE boss_open_items SET prefer_scope = $2 WHERE id = $1",
                 &[&id, &scope],
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// Keeps item `id` as the boss's question about plan `plan`'s goal,
+    /// proposing `proposal`: proposed `at` when it proposes something
+    /// other than it did.
+    pub async fn item_set_goal(
+        &self,
+        id: Uuid,
+        plan: Uuid,
+        proposal: &Proposal,
+        at: DateTime<Utc>,
+    ) -> Result<()> {
+        let client = self.pool().get().await?;
+        client
+            .execute(
+                "UPDATE boss_open_items SET plan = $2, proposal = $3, \
+                 proposed_at = CASE WHEN proposal IS NOT DISTINCT FROM $3 AND plan = $2 \
+                 THEN proposed_at ELSE $4 END, \
+                 applied_at = CASE WHEN proposal IS NOT DISTINCT FROM $3 AND plan = $2 \
+                 THEN applied_at END WHERE id = $1",
+                &[&id, &plan, &serde_json::to_value(proposal)?, &at],
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// The boss's questions about plan `plan`'s goal whose proposal isn't
+    /// applied yet, open or closed, newest proposed first: the person may
+    /// answer one on its buttons, which closes it, or the boss close it with
+    /// their answer before it applies it.
+    pub async fn goal_asks(&self, plan: Uuid) -> Result<Vec<GoalAsk>> {
+        let client = self.pool().get().await?;
+        client
+            .query(
+                "SELECT id, proposal, proposed_at, closed_at, closed_by, closed_why \
+                 FROM boss_open_items WHERE plan = $1 AND proposal IS NOT NULL \
+                 AND proposed_at IS NOT NULL AND applied_at IS NULL \
+                 ORDER BY proposed_at DESC, id",
+                &[&plan],
+            )
+            .await?
+            .iter()
+            .map(|r| {
+                let by: Option<String> = r.try_get("closed_by")?;
+                let why: Option<String> = r.try_get("closed_why")?;
+                let at: Option<DateTime<Utc>> = r.try_get("closed_at")?;
+                let answered = match (by.as_deref(), why, at) {
+                    (Some("person"), Some(why), Some(at)) => why
+                        .strip_prefix(crate::goal::YOU_ANSWERED)
+                        .map(|a| (at, a.to_string())),
+                    _ => None,
+                };
+                Ok(GoalAsk {
+                    item: r.try_get("id")?,
+                    proposal: serde_json::from_value(r.try_get("proposal")?)
+                        .context("reading what a question proposed")?,
+                    at: r.try_get("proposed_at")?,
+                    answered,
+                })
+            })
+            .collect()
+    }
+
+    /// Notes that question `item`'s proposal was applied, and closes it as
+    /// answered if it is still open: whether this did, so an answer is
+    /// applied once.
+    pub async fn ask_applied(&self, item: Uuid) -> Result<bool> {
+        self.ask_settled(item, "Answered").await
+    }
+
+    /// [`Self::ask_applied`], closing it, if still open, as `why`.
+    pub async fn ask_settled(&self, item: Uuid, why: &str) -> Result<bool> {
+        let client = self.pool().get().await?;
+        let n = client
+            .execute(
+                "UPDATE boss_open_items SET applied_at = now(), changed_at = now(), \
+                 state = 'closed', closed_at = COALESCE(closed_at, now()), \
+                 closed_by = COALESCE(closed_by, 'person'), \
+                 closed_why = COALESCE(closed_why, $2) \
+                 WHERE id = $1 AND applied_at IS NULL",
+                &[&item, &why],
+            )
+            .await?;
+        Ok(n == 1)
+    }
+
+    /// Lets question `item` be answered again: what applying it was to do
+    /// didn't happen.
+    pub async fn ask_unapplied(&self, item: Uuid) -> Result<()> {
+        let client = self.pool().get().await?;
+        client
+            .execute(
+                "UPDATE boss_open_items SET applied_at = NULL WHERE id = $1",
+                &[&item],
             )
             .await?;
         Ok(())

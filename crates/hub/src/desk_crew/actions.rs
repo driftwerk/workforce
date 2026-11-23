@@ -2881,6 +2881,12 @@ impl CrewHub {
                 if let Some(key) = &t.key {
                     ticket.clone_from(key);
                 }
+                // A goal's ticket is Desk's to close, once the goal is met.
+                if boss.is_some() {
+                    if let Some(why) = self.goal_held(t.ticket.id, ticket, *state).await {
+                        return Err(why);
+                    }
+                }
                 *was = Some(t.ticket.state);
                 *off_external = workforce_desk::board::unassigns(*state)
                     && t.ticket
