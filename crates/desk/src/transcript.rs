@@ -2,7 +2,7 @@
 //! for what a session card shows when its terminal isn't attached: the last
 //! prompt, the last reply, and Claude Code's own title for the conversation.
 
-use std::io::{Read, Seek, SeekFrom};
+use std::io::{BufRead, Read, Seek, SeekFrom};
 use std::path::Path;
 
 use serde_json::Value;
@@ -34,6 +34,18 @@ pub struct Tail {
     pub last_login: Option<(String, chrono::DateTime<chrono::Utc>)>,
     /// A `/login` whose outcome is still to come.
     pending_login: Option<(String, chrono::DateTime<chrono::Utc>)>,
+}
+
+/// Whether `needle` is anywhere in the file at `path`, read whole a line at
+/// a time (what a long turn wrote since can be more than its tail).
+pub fn mentions(path: &Path, needle: &str) -> std::io::Result<bool> {
+    let needle = needle.as_bytes();
+    for line in std::io::BufReader::new(std::fs::File::open(path)?).split(b'\n') {
+        if line?.windows(needle.len()).any(|w| w == needle) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// The whole lines of the end of a transcript.

@@ -55,6 +55,7 @@ fn message(row: &Row) -> Result<LineMessage> {
             .map(Urgency::parse)
             .transpose()?,
         actions: Vec::new(),
+        late: false,
     };
     m.shape();
     Ok(m)
@@ -368,24 +369,25 @@ impl DeskStore {
             .transpose()
     }
 
-    /// The row whose marker came back in a prompt its session started: in
-    /// the session, whatever Desk's plugin says of it, whether it was
-    /// still handed, put back in the queue since, or given up on. `None`
-    /// when it had gone already, or never will.
-    pub async fn line_went_in(&self, id: Uuid) -> Result<Option<LineMessage>> {
+    /// The row shown to be in its session (its marker came back in a
+    /// prompt, or is in its transcript), whatever Desk's plugin says of
+    /// it: still handed, put back in the queue since, or given up on. With
+    /// what it was. `None` when it had gone already, or never will.
+    pub async fn line_went_in(&self, id: Uuid) -> Result<Option<(LineMessage, Delivery)>> {
         let client = self.pool().get().await?;
         client
             .query_opt(
                 &format!(
-                    "UPDATE line_messages SET delivery = 'delivered', delivered_at = now(), \
-                     updated_at = now() WHERE id = $1 \
-                     AND delivery IN ('queued', 'handed', 'held', 'unreceived') RETURNING {COLUMNS}"
+                    "WITH was AS (SELECT delivery AS was FROM line_messages WHERE id = $1 FOR UPDATE) \
+                     UPDATE line_messages SET delivery = 'delivered', delivered_at = now(), \
+                     updated_at = now() FROM was WHERE id = $1 \
+                     AND delivery IN ('queued', 'handed', 'held', 'unreceived') \
+                     RETURNING {COLUMNS}, was.was"
                 ),
                 &[&id],
             )
             .await?
-            .as_ref()
-            .map(message)
+            .map(|r| Ok((message(&r)?, Delivery::parse(r.try_get("was")?)?)))
             .transpose()
     }
 
@@ -407,8 +409,9 @@ impl DeskStore {
             .collect()
     }
 
-    /// Gives up on the row handed before `before`: it went in and was never
-    /// shown to have. `None` when it isn't handed from then.
+    /// Gives up on the row handed before `before`, never shown to have gone
+    /// in: an ask it is is withdrawn with it. `None` when it isn't handed
+    /// from then.
     pub async fn line_unreceived(
         &self,
         id: Uuid,
@@ -418,7 +421,9 @@ impl DeskStore {
         client
             .query_opt(
                 &format!(
-                    "UPDATE line_messages SET delivery = 'unreceived', updated_at = now() \
+                    "UPDATE line_messages SET delivery = 'unreceived', updated_at = now(), \
+                     asked = CASE WHEN asked IN ('open', 'escalated', 'lapsed') \
+                     THEN 'withdrawn' ELSE asked END \
                      WHERE id = $1 AND delivery = 'handed' AND handed_at < $2 RETURNING {COLUMNS}"
                 ),
                 &[&id, &before],

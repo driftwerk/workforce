@@ -6268,6 +6268,7 @@ impl Desk {
             }
         };
         self.mode_said(id, &hook, body);
+        self.prompts_seen_from(id);
         Some(self.apply_hook(id, hook, claude::agent_of(body)).await)
     }
 
@@ -7829,6 +7830,9 @@ impl Desk {
                 CodexEvent::Prompt(p) => Some(self.person_prompted(id, p)),
                 _ => None,
             };
+            if let CodexEvent::Prompt(_) = &event {
+                self.prompts_seen_from(id);
+            }
             let delivery = match &event {
                 CodexEvent::Prompt(p) => match crate::line::is_delivery(p) {
                     Some(mark) => {

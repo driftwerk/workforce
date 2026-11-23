@@ -1131,7 +1131,7 @@ impl CrewHub {
         };
         Ok((
             format!(
-                "{did} {name}: queued, not yet delivered; {why}. Don't say it arrived until crew.history with message_id {} says it was delivered.",
+                "{did} {name}: queued, not yet delivered; {why}. Wait for it, and don't send it again; crew.history with message_id {} says once it was delivered.",
                 now.id
             ),
             now.delivery,

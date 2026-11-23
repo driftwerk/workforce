@@ -1392,15 +1392,21 @@ impl CrewHub {
                     let _ = store
                         .assignment_delivered(m.id, m.delivered_at.unwrap_or(m.updated_at))
                         .await;
-                }
-                Delivery::Withdrawn | Delivery::Refused | Delivery::Unreceived => {
-                    if m.delivery == Delivery::Unreceived {
-                        self.unreceived(m);
+                    if m.late {
+                        self.received_late(m);
                     }
+                }
+                Delivery::Withdrawn | Delivery::Refused => {
                     if let Ok(Some(a)) = store.assignment_of_line(m.id).await {
                         self.never_went_in(&a).await;
                     }
                 }
+                // Said once: as its assignment closes, or, carrying none,
+                // as it was given up on.
+                Delivery::Unreceived => match store.assignment_of_line(m.id).await {
+                    Ok(Some(a)) => self.never_went_in(&a).await,
+                    _ => self.unreceived(m),
+                },
                 _ => {}
             }
             return;
@@ -1439,10 +1445,32 @@ impl CrewHub {
         }
     }
 
-    /// `a`'s line message was withdrawn or refused: it holds nothing.
-    /// The boss's `m` went into its session twice and was never shown to
-    /// have: the boss is told, as it isn't put in again.
-    pub(super) fn unreceived(self: &Arc<Self>, m: &LineMessage) {
+    /// The boss's `m` was never shown to have gone into its session: the
+    /// boss is told, as it isn't put in again.
+    fn unreceived(self: &Arc<Self>, m: &LineMessage) {
+        self.said_of_message(
+            m,
+            "may never have received",
+            "Desk tried twice and it never showed in the session, so it won't put it in again. \
+             Check its last reply (crew.history) before resending, and send it again only if it \
+             still matters.",
+        );
+    }
+
+    /// The boss's `m`, said never to have been received, went in after all.
+    fn received_late(self: &Arc<Self>, m: &LineMessage) {
+        self.said_of_message(
+            m,
+            "received",
+            "it arrived after all, after Desk had said it never showed in the session, so don't \
+             send it again.",
+        );
+    }
+
+    /// Wakes the boss that sent `m` with what its session `did` with it,
+    /// and `then`: one word per message, a later one taking an earlier's
+    /// place while it waits.
+    fn said_of_message(self: &Arc<Self>, m: &LineMessage, did: &str, then: &str) {
         let Some(session) = m.to_session() else {
             return;
         };
@@ -1452,9 +1480,7 @@ impl CrewHub {
             session,
             format!("unreceived:{}", m.id),
             format!(
-                "{} never received your message of {at} (“{}”, message_id {}): it went in twice and \
-                 never showed in the session either time, so Desk won't put it in again. Read where \
-                 it stands (crew.history), and send it again if it still matters.",
+                "{} {did} your message of {at} (“{}”, message_id {}): {then}",
                 self.session_name(session),
                 crew::words(&m.text, 20),
                 m.id,
@@ -1462,20 +1488,30 @@ impl CrewHub {
         );
     }
 
-    async fn never_went_in(&self, a: &Assignment) {
+    /// `a`'s line message was withdrawn, refused, or never shown to have
+    /// gone in: it holds nothing. Given up on, its boss is told as it
+    /// closes, once.
+    async fn never_went_in(self: &Arc<Self>, a: &Assignment) {
         let why = "its message never went in";
-        if let Ok(Some(a)) = self
-            .desk
-            .store()
+        let store = self.desk.store();
+        let Ok(Some(a)) = store
             .assignment_close(a.id, AssignmentState::Cancelled, "desk", why)
             .await
-        {
-            self.note_assignment(
-                Kind::AssignmentClosed,
-                &Party::manager(&a.boss, &a.boss),
-                &a,
-                format!("cancelled {}: {why}", short(a.id)),
-            );
+        else {
+            return;
+        };
+        self.note_assignment(
+            Kind::AssignmentClosed,
+            &Party::manager(&a.boss, &a.boss),
+            &a,
+            format!("cancelled {}: {why}", short(a.id)),
+        );
+        let line = match a.line_message {
+            Some(id) => store.line_message(id).await.ok().flatten(),
+            None => None,
+        };
+        if let Some(m) = line.filter(|m| m.delivery == Delivery::Unreceived) {
+            self.unreceived(&m);
         }
     }
 

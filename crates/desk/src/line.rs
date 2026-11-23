@@ -39,8 +39,9 @@ text_enum!(Delivery {
     Withdrawn => "withdrawn",
     // Shown in the thread only, never typed into the session.
     Noted => "noted",
-    // Never shown to have gone in: it went in twice, and its marker never
-    // came back either time. Its sender is told; it isn't put in again.
+    // Never shown to have gone in: Desk tried twice and it never showed in
+    // the session (nor once where nothing can show it). Its sender is
+    // told; it isn't put in again, and an ask is withdrawn.
     Unreceived => "unreceived",
 });
 
@@ -373,6 +374,10 @@ pub struct LineMessage {
     /// What the person can do with it now, while it waits (not stored).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub actions: Vec<LineAction>,
+    /// Given up on ([`Delivery::Unreceived`]), then shown to have gone in
+    /// after all: set on the one word of its going in (not stored).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub late: bool,
 }
 
 impl LineMessage {
@@ -403,6 +408,7 @@ impl LineMessage {
             waiting: None,
             actions: Vec::new(),
             urgency: None,
+            late: false,
         }
     }
 

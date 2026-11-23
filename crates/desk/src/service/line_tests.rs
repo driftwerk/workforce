@@ -3210,17 +3210,25 @@ async fn a_hand_off_claude_code_queues_behind_a_turn_is_never_handed_again_in_it
             .line_next(s.id, Duration::from_millis(200))
             .await
             .is_none());
-        // At an idle it never said went in, it was lost: it goes again.
+        // Claude Code submits it as that turn ends: its wait runs from the
+        // end, and once the plugin says so it is in (the person's own
+        // words carry no marker), handed once.
         hook(
             &d,
             s.id,
             json!({"hook_event_name": "Stop", "last_assistant_message": "Fixed."}),
         )
         .await;
+        looked_after(&d, MARK_WITHIN - chrono::Duration::seconds(5)).await;
+        assert_eq!(row(&d, m.id).await.delivery, Delivery::Handed);
+        assert!(d
+            .line_next(s.id, Duration::from_millis(200))
+            .await
+            .is_none());
+        d.line_ack(s.id, m.id, true).await.unwrap();
+        assert_eq!(row(&d, m.id).await.delivery, Delivery::Delivered);
         hand_offs_gone_stale(&d).await;
-        assert_eq!(row(&d, m.id).await.delivery, Delivery::Queued);
-        let again = d.line_next(s.id, Duration::from_secs(1)).await.unwrap();
-        assert_eq!(again["id"], json!(m.id));
+        assert_eq!(row(&d, m.id).await.delivery, Delivery::Delivered);
     })
     .await;
 }
@@ -3404,6 +3412,21 @@ async fn noticed_turn(d: &Desk, s: Uuid) {
     .await;
 }
 
+/// `s` starts with a Claude Code transcript, empty so far, and Desk's
+/// plugin in it is heard from: the transcript's path.
+async fn idle_transcribed(d: &Desk, s: Uuid, dir: &Path) -> PathBuf {
+    let transcript = dir.join(format!("{s}.jsonl"));
+    std::fs::write(&transcript, "").unwrap();
+    hook(
+        d,
+        s,
+        json!({"hook_event_name": "SessionStart", "session_id": s.to_string(), "transcript_path": transcript}),
+    )
+    .await;
+    d.plugin_heard_from(s);
+    transcript
+}
+
 fn sarah() -> By {
     By::manager("sarah", "Sarah", "It should open the PR.")
 }
@@ -3506,9 +3529,8 @@ async fn what_waits_behind_a_lost_hand_off_says_so_and_it_goes_again_even_in_a_t
     with_test_pool(build_pool, |pool| async move {
         let dir = tempfile::tempdir().unwrap();
         let d = desk(pool, dir.path()).await;
-        let s = new_session(&d, dir.path()).await;
-        idle(&d, s.id).await;
-        let s = s.id;
+        let s = new_session(&d, dir.path()).await.id;
+        idle_transcribed(&d, s, dir.path()).await;
         let m = d
             .line_send(Sender::Overseer(sarah()), tell(s, "Open the prod pin PR now."))
             .await
@@ -3572,7 +3594,7 @@ async fn a_submit_whose_marker_never_comes_back_goes_again_once_then_is_not_rece
         let dir = tempfile::tempdir().unwrap();
         let d = desk(pool, dir.path()).await;
         let s = new_session(&d, dir.path()).await.id;
-        idle(&d, s).await;
+        idle_transcribed(&d, s, dir.path()).await;
         let m = d
             .line_send(Sender::Overseer(sarah()), tell(s, "Open the PR."))
             .await
@@ -3625,12 +3647,18 @@ async fn a_submit_whose_marker_never_comes_back_goes_again_once_then_is_not_rece
         );
         let then = d.line_next(s, Duration::from_secs(1)).await.unwrap();
         assert_eq!(then["id"], json!(n.id), "what waited behind it goes on");
+        let mut events = d.0.events.subscribe();
         submitted(&d, s, &again).await;
         assert_eq!(
             row(&d, m.id).await.delivery,
             Delivery::Delivered,
             "its marker is proof"
         );
+        let late = std::iter::from_fn(|| events.try_recv().ok()).any(|e| {
+            matches!(e, DeskEvent::Line { message, .. }
+                if message.id == m.id && message.delivery == Delivery::Delivered && message.late)
+        });
+        assert!(late, "said to have arrived after all");
     })
     .await;
 }
@@ -3663,7 +3691,7 @@ async fn a_submit_whose_marker_comes_back_late_is_in_once() {
         )
         .await;
         assert!(d.line_next(s, Duration::from_millis(200)).await.is_none());
-        assert!(d.0.state.lock().lines.acked.is_empty());
+        assert!(d.0.state.lock().lines.handoffs.is_empty());
     })
     .await;
 }
@@ -3708,6 +3736,208 @@ async fn a_message_typed_in_is_in_once_its_marker_comes_back() {
             .unwrap();
         d.line_pump(s).await;
         assert_eq!(row(&d, mine.id).await.delivery, Delivery::Delivered);
+    })
+    .await;
+}
+
+/// Submitted behind a long turn of the person's, a hand-off is held for
+/// as long as that turn runs, and its wait runs from the turn's end: it
+/// is never handed twice.
+#[tokio::test]
+async fn a_hand_off_behind_a_long_turn_waits_from_its_end_and_never_goes_twice() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(pool, dir.path()).await;
+        let s = new_session(&d, dir.path()).await.id;
+        idle_transcribed(&d, s, dir.path()).await;
+        let m = d
+            .line_send(Sender::Overseer(sarah()), tell(s, "Open the PR."))
+            .await
+            .unwrap();
+        let next = d.line_next(s, Duration::from_secs(1)).await.unwrap();
+        hook(
+            &d,
+            s,
+            json!({"hook_event_name": "UserPromptSubmit", "prompt": "fix the build first"}),
+        )
+        .await;
+        d.line_ack(s, m.id, true).await.unwrap();
+        looked_after(&d, chrono::Duration::hours(1)).await;
+        assert_eq!(
+            row(&d, m.id).await.delivery,
+            Delivery::Handed,
+            "its turn holds it"
+        );
+        hook(
+            &d,
+            s,
+            json!({"hook_event_name": "Stop", "last_assistant_message": "Fixed."}),
+        )
+        .await;
+        looked_after(&d, MARK_WITHIN - chrono::Duration::seconds(5)).await;
+        assert_eq!(
+            row(&d, m.id).await.delivery,
+            Delivery::Handed,
+            "within its wait"
+        );
+        assert!(d.line_next(s, Duration::from_millis(200)).await.is_none());
+        submitted(&d, s, &next).await;
+        assert_eq!(row(&d, m.id).await.delivery, Delivery::Delivered);
+    })
+    .await;
+}
+
+/// Desk started again since a hand-off and has no record of it: a turn
+/// its session is in holds it however long, and only past its wait at an
+/// idle, its transcript showing it isn't in, does it go again.
+#[tokio::test]
+async fn a_hand_off_from_before_desk_started_again_is_held_by_a_turn() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(pool, dir.path()).await;
+        let s = new_session(&d, dir.path()).await.id;
+        idle_transcribed(&d, s, dir.path()).await;
+        let m = d
+            .line_send(Sender::Overseer(sarah()), tell(s, "Open the PR."))
+            .await
+            .unwrap();
+        d.line_next(s, Duration::from_secs(1)).await.unwrap();
+        hook(
+            &d,
+            s,
+            json!({"hook_event_name": "UserPromptSubmit", "prompt": "fix the build first"}),
+        )
+        .await;
+        d.line_ack(s, m.id, true).await.unwrap();
+        {
+            let mut st = d.0.state.lock();
+            st.lines.handoffs.clear();
+            st.live.get_mut(&s).unwrap().ended_at = Some(chrono::Utc::now());
+        }
+        looked_after(&d, chrono::Duration::hours(1)).await;
+        assert_eq!(
+            row(&d, m.id).await.delivery,
+            Delivery::Handed,
+            "a turn holds it"
+        );
+        hook(
+            &d,
+            s,
+            json!({"hook_event_name": "Stop", "last_assistant_message": "Fixed."}),
+        )
+        .await;
+        looked_after(&d, HANDED_FOR + chrono::Duration::seconds(1)).await;
+        assert_eq!(row(&d, m.id).await.delivery, Delivery::Queued);
+    })
+    .await;
+}
+
+/// A hand-off whose marker never came back by its prompt hook, though
+/// its session's transcript has it, is in: never handed again.
+#[tokio::test]
+async fn a_hand_off_its_transcript_shows_is_in_and_never_goes_again() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(pool, dir.path()).await;
+        let s = new_session(&d, dir.path()).await.id;
+        let transcript = idle_transcribed(&d, s, dir.path()).await;
+        let m = d
+            .line_send(Sender::Overseer(sarah()), tell(s, "Open the PR."))
+            .await
+            .unwrap();
+        let next = d.line_next(s, Duration::from_secs(1)).await.unwrap();
+        d.line_ack(s, m.id, true).await.unwrap();
+        let prompt = json!({"type": "user", "message": {"role": "user",
+            "content": format!("The desk plugin sent a message: {}", next["text"].as_str().unwrap())}});
+        std::fs::write(&transcript, format!("{prompt}\n")).unwrap();
+        looked_after(&d, MARK_WITHIN + chrono::Duration::seconds(1)).await;
+        assert_eq!(row(&d, m.id).await.delivery, Delivery::Delivered);
+        assert!(d.line_next(s, Duration::from_millis(200)).await.is_none());
+    })
+    .await;
+}
+
+/// With no transcript to show a lost hand-off isn't in, it is never put
+/// in again: given up on at once.
+#[tokio::test]
+async fn a_lost_hand_off_nothing_can_show_absent_is_given_up_on_without_going_again() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(pool, dir.path()).await;
+        let s = new_session(&d, dir.path()).await.id;
+        idle(&d, s).await;
+        let m = d
+            .line_send(Sender::Overseer(sarah()), tell(s, "Open the PR."))
+            .await
+            .unwrap();
+        d.line_next(s, Duration::from_secs(1)).await.unwrap();
+        d.line_ack(s, m.id, true).await.unwrap();
+        looked_after(&d, MARK_WITHIN + chrono::Duration::seconds(1)).await;
+        assert_eq!(row(&d, m.id).await.delivery, Delivery::Unreceived);
+        assert!(d.line_next(s, Duration::from_millis(200)).await.is_none());
+    })
+    .await;
+}
+
+/// A session's question to another that is given up on is withdrawn and
+/// its asker told, in words; reaching it after all, the asker is told so.
+#[tokio::test]
+async fn a_sessions_question_given_up_on_is_withdrawn_and_its_asker_told() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(pool, dir.path()).await;
+        let a = new_session(&d, dir.path()).await.id;
+        let b = new_session(&d, dir.path()).await.id;
+        idle(&d, a).await;
+        idle(&d, b).await;
+        let q = d
+            .line_send(
+                Sender::Session(a),
+                Send::Ask {
+                    to: Target::Session(b),
+                    text: "Which index does the ledger use?".into(),
+                    wait: Duration::from_secs(60),
+                    chose: None,
+                    parts: Default::default(),
+                },
+            )
+            .await
+            .unwrap();
+        let next = d.line_next(b, Duration::from_secs(1)).await.unwrap();
+        assert_eq!(next["id"], json!(q.id));
+        d.line_ack(b, q.id, true).await.unwrap();
+        looked_after(&d, MARK_WITHIN + chrono::Duration::seconds(1)).await;
+        let gone = row(&d, q.id).await;
+        assert_eq!(
+            (gone.delivery, gone.asked),
+            (Delivery::Unreceived, Some(Asked::Withdrawn))
+        );
+        let told = |says: &'static str| {
+            let d = d.clone();
+            async move {
+                d.line_thread(a, None, None)
+                    .await
+                    .unwrap()
+                    .into_iter()
+                    .find(|m| m.to_session() == Some(a) && m.text.contains(says))
+            }
+        };
+        let note = told("Desk tried twice and it never showed in the session")
+            .await
+            .expect("its asker told");
+        assert!(
+            note.text.contains("Which index does the ledger use?"),
+            "{}",
+            note.text
+        );
+        assert!(
+            note.text.contains("your question is withdrawn"),
+            "{}",
+            note.text
+        );
+        submitted(&d, b, &next).await;
+        assert_eq!(row(&d, q.id).await.delivery, Delivery::Delivered);
+        told("reached it after all").await.expect("told it arrived");
     })
     .await;
 }
