@@ -2850,11 +2850,13 @@ impl CrewHub {
         let Ok(detail) = self.desk.plan(id).await else {
             return;
         };
+        // Finished, it has no turn left: what was gathered for it is moot.
         if matches!(
             detail.summary.plan.state,
             PlanState::Done | PlanState::Dropped
         ) {
             self.unmet_said.lock().remove(&id);
+            return;
         }
         let Some((service, o)) = self.boss_of_plan(&detail.summary.plan) else {
             return;
@@ -2919,6 +2921,9 @@ impl CrewHub {
         }
         if !closing && !self.spend_boss_turn(&service, &o) {
             return;
+        }
+        if closing {
+            self.closing_started(id);
         }
         let said: Vec<String> = lines.iter().map(|l| format!("- {l}")).collect();
         let progress = &detail.summary.progress;

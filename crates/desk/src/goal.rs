@@ -728,6 +728,16 @@ impl GoalSaid {
     }
 }
 
+/// Where each of a goal's branches and pull requests stood, by
+/// [`head_key`]: what a commit shown toward it must come after.
+pub type Heads = BTreeMap<String, String>;
+
+/// What a head of branch `branch` of `repo` is kept by, `branch` being
+/// `#n` for pull request `n`'s.
+pub fn head_key(repo: &str, branch: &str) -> String {
+    format!("{} {branch}", repo.trim().to_ascii_lowercase())
+}
+
 /// The stall leading `stalls`: the furthest in its spells, the longest
 /// stuck of those.
 pub fn leading(stalls: &[Stall]) -> Option<&Stall> {
@@ -756,6 +766,9 @@ pub enum Found {
     /// It may be there, but Desk can't look up where the goal's work is to
     /// place it.
     Unplaced,
+    /// It is the goal's work, but from before the goal was agreed or its
+    /// part's last checkpoint.
+    Old,
 }
 
 /// Why a checkpoint isn't accepted toward its judged part.
@@ -769,6 +782,9 @@ pub enum NotShown {
     OffGoal(Evidence),
     /// This piece of it can't be placed on the goal's work.
     Unplaced(Evidence),
+    /// This piece of it was there before the goal was agreed, or before
+    /// its part's last checkpoint.
+    Old(Evidence),
     /// Every piece was shown toward the part already.
     NothingNew,
 }
@@ -791,6 +807,7 @@ pub fn checkpoint_shows(
             Found::OffGoal => return Err(NotShown::OffGoal(e.clone())),
             Found::Missing => return Err(NotShown::Missing(e.clone())),
             Found::Unplaced => return Err(NotShown::Unplaced(e.clone())),
+            Found::Old => return Err(NotShown::Old(e.clone())),
         }
     }
     if found.len() < evidence.len() {

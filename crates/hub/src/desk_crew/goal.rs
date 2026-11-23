@@ -483,7 +483,8 @@ impl CrewHub {
                 .filter(|c| c.kind == FactKind::Checkpoint)
             {
                 let part = c.part.unwrap_or_default();
-                self.checkpoint_shown(&b.service, detail, r, part, &c.evidence)
+                c.evidence = self
+                    .checkpoint_shown(&b.service, detail, r, part, &c.evidence)
                     .await?;
                 c.shown = true;
             }

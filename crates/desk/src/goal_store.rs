@@ -7,7 +7,7 @@ use eyre::{Context, Result};
 use tokio_postgres::Row;
 use uuid::Uuid;
 
-use crate::goal::{Fact, FactKind, GoalSaid, Met, Reading};
+use crate::goal::{Fact, FactKind, GoalSaid, Heads, Met, Reading};
 use crate::plan::Plan;
 use crate::plan_store::PLAN;
 use crate::store::DeskStore;
@@ -174,23 +174,54 @@ impl DeskStore {
     /// What plan `plan`'s boss was told of its goal by the hub's checks:
     /// nothing for a plan there isn't.
     pub async fn goal_said(&self, plan: Uuid) -> Result<GoalSaid> {
-        let client = self.pool().get().await?;
-        let row = client
-            .query_opt("SELECT goal_said FROM plans WHERE id = $1", &[&plan])
-            .await?;
-        Ok(match row {
-            Some(r) => serde_json::from_value(r.try_get(0)?).context("a goal's said")?,
-            None => GoalSaid::default(),
-        })
+        self.plan_kept(plan, "goal_said").await
     }
 
     /// Keeps `said` as what plan `plan`'s boss was told of its goal.
     pub async fn keep_goal_said(&self, plan: Uuid, said: &GoalSaid) -> Result<()> {
+        self.keep_plan_kept(plan, "goal_said", said).await
+    }
+
+    /// Where plan `plan`'s goal's branches and pull requests stood when it
+    /// was agreed or a checkpoint last moved it: none when not yet kept.
+    pub async fn goal_heads(&self, plan: Uuid) -> Result<Heads> {
+        self.plan_kept(plan, "goal_heads").await
+    }
+
+    /// Keeps `heads` as where plan `plan`'s goal's work stands now.
+    pub async fn keep_goal_heads(&self, plan: Uuid, heads: &Heads) -> Result<()> {
+        self.keep_plan_kept(plan, "goal_heads", heads).await
+    }
+
+    /// What the goal checks keep in plan `plan`'s `column`: its default
+    /// when there is no such plan.
+    async fn plan_kept<T: serde::de::DeserializeOwned + Default>(
+        &self,
+        plan: Uuid,
+        column: &'static str,
+    ) -> Result<T> {
+        let client = self.pool().get().await?;
+        let row = client
+            .query_opt(&format!("SELECT {column} FROM plans WHERE id = $1"), &[&plan])
+            .await?;
+        Ok(match row {
+            Some(r) => serde_json::from_value(r.try_get(0)?).with_context(|| format!("a plan's {column}"))?,
+            None => T::default(),
+        })
+    }
+
+    /// Keeps `value` in plan `plan`'s `column`.
+    async fn keep_plan_kept<T: serde::Serialize>(
+        &self,
+        plan: Uuid,
+        column: &'static str,
+        value: &T,
+    ) -> Result<()> {
         let client = self.pool().get().await?;
         client
             .execute(
-                "UPDATE plans SET goal_said = $2 WHERE id = $1",
-                &[&plan, &serde_json::to_value(said)?],
+                &format!("UPDATE plans SET {column} = $2 WHERE id = $1"),
+                &[&plan, &serde_json::to_value(value)?],
             )
             .await?;
         Ok(())
@@ -376,6 +407,11 @@ mod tests {
                 s.goal_said(Uuid::new_v4()).await.unwrap(),
                 GoalSaid::default()
             );
+            assert!(s.goal_heads(p.id).await.unwrap().is_empty());
+            let heads = Heads::from([(crate::goal::head_key("Acme/Web", "main"), "a".repeat(40))]);
+            s.keep_goal_heads(p.id, &heads).await.unwrap();
+            assert_eq!(s.goal_heads(p.id).await.unwrap(), heads);
+            assert_eq!(s.goal_said(p.id).await.unwrap(), said, "each kept apart");
         })
         .await;
     }

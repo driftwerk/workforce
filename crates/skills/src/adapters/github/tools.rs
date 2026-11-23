@@ -2766,6 +2766,7 @@ impl Tool for GithubCompareTool {
                 Ok(ToolResult::success(
                     serde_json::json!({
                         "status": result["status"],
+                        "base_sha": result["base_commit"]["sha"],
                         "ahead_by": result["ahead_by"],
                         "behind_by": result["behind_by"],
                         "total_commits": result["total_commits"],

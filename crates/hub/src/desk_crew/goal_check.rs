@@ -67,6 +67,9 @@ const NOTE_SPELL: u32 = 2;
 const NOTES_KEPT: usize = 20;
 /// The most goals looked at once.
 const GOALS_AT_ONCE: usize = 4;
+/// The longest one look at every goal may take: one held up (a store that
+/// doesn't answer) never keeps the next from starting.
+const LOOK_FOR: std::time::Duration = std::time::Duration::from_secs(300);
 /// What a stall's wake adds while its plan is paused at its budget.
 const BUDGET_PAUSED: &str = "Its plan is paused at its budget: tell the person what is stuck and what it would take, rather than pushing its sessions on.";
 
@@ -88,6 +91,9 @@ pub(crate) struct GoalChecks {
     looking: bool,
     /// The met plans whose closing turn was started.
     closing: HashSet<Uuid>,
+    /// The goals where their work stood is kept for: what a commit shown
+    /// toward them must come after.
+    headed: HashSet<Uuid>,
 }
 
 /// What brought a goal's next reading forward.
@@ -137,11 +143,12 @@ struct GoalNote {
     text: String,
 }
 
-/// One goal looked at: whose, its sessions, and what its boss is woken
-/// with.
+/// One goal looked at: whose, its words, its sessions, and what its boss
+/// is woken with.
 struct Looked {
     boss: String,
     plan: Uuid,
+    goal: String,
     sessions: Vec<String>,
     lines: Vec<String>,
 }
@@ -182,7 +189,7 @@ fn last_read(p: &Progress) -> (Option<DateTime<Utc>>, bool) {
 /// What the boss is told of part `part` of goal `goal` that hasn't come
 /// nearer for `stalled`: its best, its target, what Desk sees inside the
 /// plan's sessions (`seen`), and what to do, a checkpoint only as one the
-/// goal, naming `refs`, would take.
+/// goal would take (`shows`).
 pub(crate) fn stall_line(
     goal: &str,
     part: &Measure,
@@ -190,7 +197,7 @@ pub(crate) fn stall_line(
     stalled: Duration,
     tz: chrono_tz::Tz,
     seen: &[String],
-    refs: &GoalRefs,
+    shows: &str,
 ) -> String {
     let hm = |at: DateTime<Utc>| at.with_timezone(&tz).format("%H:%M").to_string();
     let best = match (part.measured(), &now.best, now.improved_at) {
@@ -206,8 +213,7 @@ pub(crate) fn stall_line(
     let then = match part.measured() {
         true => "Get the work back onto the goal, or tell the person why it can't be.".to_string(),
         false => format!(
-            "Judge it from the work (crew.inside): when it moves the goal on, record a checkpoint (crew.plan_update checkpoint) citing {}; else get the work back onto the goal, or tell the person why it can't be.",
-            shows_what(refs)
+            "Judge it from the work (crew.inside): when it moves the goal on, record a checkpoint (crew.plan_update checkpoint) citing {shows}; else get the work back onto the goal, or tell the person why it can't be."
         ),
     };
     format!(
@@ -262,7 +268,7 @@ pub(crate) fn note_line(
 }
 
 /// The lines of one boss's goals woken in one turn, `looked` in order: on
-/// the first goal's plan, the others' said with their plan.
+/// the first goal's plan, the others' said with their goal and plan.
 fn one_turn(looked: Vec<Looked>) -> Option<(Uuid, Vec<String>)> {
     let mut woken = looked.into_iter().filter(|l| !l.lines.is_empty());
     let first = woken.next()?;
@@ -272,7 +278,10 @@ fn one_turn(looked: Vec<Looked>) -> Option<(Uuid, Vec<String>)> {
             other
                 .lines
                 .into_iter()
-                .map(|l| format!("On your plan {}: {l}", other.plan)),
+                .map(|l| {
+                    let goal = crew::one_line(&other.goal, 80);
+                    format!("On your goal “{goal}” (plan_id {}): {l}", other.plan)
+                }),
         );
     }
     Some((first.plan, lines))
@@ -312,13 +321,16 @@ impl CrewHub {
         }
         let looking = Looking(crew);
         tokio::spawn(async move {
-            looking.0.check_goals().await;
+            if tokio::time::timeout(LOOK_FOR, looking.0.check_goals()).await.is_err() {
+                tracing::warn!("a look at the goals took too long; the next starts afresh");
+            }
             drop(looking);
         });
     }
 
     /// The goals checked now, each with its boss and how it oversees:
-    /// agreed, not met, running or paused, its boss watching its work.
+    /// agreed by the person and approved, not met, running or paused, its
+    /// boss watching its work.
     async fn goals_checked(&self) -> Option<Vec<(Plan, Arc<AgentService>, Oversight)>> {
         let goals = match self.desk.store().open_goals(None).await {
             Ok(g) => g,
@@ -330,7 +342,7 @@ impl CrewHub {
         Some(
             goals
                 .into_iter()
-                .filter(|p| p.approved_revision.is_some())
+                .filter(|p| p.approved_revision.is_some() && p.agreed_at.is_some())
                 .filter(|p| matches!(p.state, PlanState::Running | PlanState::Paused))
                 .filter_map(|p| {
                     let (service, o) = self.overseer_named(&p.boss)?;
@@ -376,6 +388,7 @@ impl CrewHub {
             let mut c = self.goal_checks.lock();
             c.pulled.retain(|plan, _| open.contains(plan));
             c.pulls.retain(|(plan, ..), _| open.contains(plan));
+            c.headed.retain(|plan| open.contains(plan));
             for notes in c.notes.values_mut() {
                 notes.retain(|n| open.contains(&n.plan));
             }
@@ -413,6 +426,7 @@ impl CrewHub {
             .await;
         Some(Looked {
             boss: detail.summary.plan.boss,
+            goal: detail.summary.plan.goal,
             plan: id,
             sessions: sessions.into_iter().map(|(id, _)| id).collect(),
             lines,
@@ -436,6 +450,7 @@ impl CrewHub {
         let now = Utc::now();
         let minute = Duration::from_std(self.timing.minute).unwrap_or_default();
         let detail = self.read_when_due(service, detail, &r, now, minute).await;
+        self.heads_kept(service, &detail, &r).await;
         let plan = &detail.summary.plan;
         let id = plan.id;
         if plan.met.is_some() || !matches!(plan.state, PlanState::Running | PlanState::Paused) {
@@ -513,6 +528,22 @@ impl CrewHub {
         self.read_kept(service, &detail).await.unwrap_or(detail)
     }
 
+    /// Where goal plan `detail`'s work (by its result `r`) stands, kept
+    /// once as it is first checked: what was there as it was agreed.
+    async fn heads_kept(&self, service: &AgentService, detail: &PlanDetail, r: &goal::GoalResult) {
+        let id = detail.summary.plan.id;
+        if self.goal_checks.lock().headed.contains(&id) {
+            return;
+        }
+        let refs = GoalRefs::of(r, &readings_of(detail));
+        let kept = refs.is_empty()
+            || self.desk.store().goal_heads(id).await.is_ok_and(|h| !h.is_empty())
+            || !self.keep_heads(service, id, &refs).await.is_empty();
+        if kept {
+            self.goal_checks.lock().headed.insert(id);
+        }
+    }
+
     /// What goal plan `detail`'s stalls (`stalls`) wake its boss with,
     /// noted in `told`: every stalled part once a spell of the leading
     /// stall, a part read failing [`FAILING_WAKE`] times in a row by why
@@ -552,6 +583,7 @@ impl CrewHub {
             let tz = self.desk.timezone();
             let seen = self.seen_of(sessions, o, tz, now);
             let refs = GoalRefs::of(r, &readings_of(detail));
+            let shows = shows_what(&refs, &self.work_repos(detail));
             for s in stalls {
                 let n = usize::from(s.part);
                 out.push(match failing.iter().find(|(part, ..)| *part == s.part) {
@@ -566,7 +598,7 @@ impl CrewHub {
                         now - s.since,
                         tz,
                         &seen,
-                        &refs,
+                        &shows,
                     ),
                 });
             }
@@ -688,7 +720,7 @@ impl CrewHub {
     /// Plan `id`, its goal met for `why`, closed by its boss's closing
     /// turn, run once on its own.
     pub(crate) fn close_met(&self, id: Uuid, why: &str) {
-        if !self.goal_checks.lock().closing.insert(id) {
+        if !self.closing_started(id) {
             return;
         }
         let Some(crew) = self.me.upgrade() else {
@@ -696,6 +728,12 @@ impl CrewHub {
         };
         let line = format!("The goal is met: {}", crew::one_line(why, 200));
         tokio::spawn(async move { crew.plan_turn(id, vec![line]).await });
+    }
+
+    /// Notes plan `id`'s closing turn as started: true the first time, so
+    /// that it is run once whichever way its goal was met.
+    pub(crate) fn closing_started(&self, id: Uuid) -> bool {
+        self.goal_checks.lock().closing.insert(id)
     }
 
     /// Whether a pull request goal plan `id` names (`refs`) moved since
@@ -892,7 +930,7 @@ mod tests {
             Duration::minutes(90),
             tz,
             &["MAN-768's session: nothing runs under it".into()],
-            &refs,
+            "",
         );
         assert_eq!(
             line,
@@ -905,6 +943,7 @@ mod tests {
             evidence: "only the touched services run".into(),
         };
         let stalled = |refs: &GoalRefs| {
+            let repos = std::collections::BTreeSet::from(["acme/mantis".to_string()]);
             stall_line(
                 "g",
                 &judged,
@@ -912,7 +951,7 @@ mod tests {
                 Duration::minutes(30),
                 tz,
                 &[],
-                refs,
+                &shows_what(refs, &repos),
             )
         };
         let line = stalled(&refs);
@@ -924,7 +963,7 @@ mod tests {
         );
         let line = stalled(&GoalRefs::default());
         assert!(
-            line.contains("citing the pull request, commits or runs on GitHub"),
+            line.contains("citing a pull request or run since the goal was agreed, in the plan's repositories (acme/mantis)"),
             "{line}"
         );
     }
@@ -934,6 +973,7 @@ mod tests {
         let looked = |plan: u128, lines: &[&str]| Looked {
             boss: "desk".into(),
             plan: Uuid::from_u128(plan),
+            goal: format!("Goal {plan}"),
             sessions: Vec::new(),
             lines: lines.iter().map(|l| l.to_string()).collect(),
         };
@@ -949,8 +989,8 @@ mod tests {
             lines,
             [
                 "CI is stuck.".to_string(),
-                format!("On your plan {}: Docs are stuck.", Uuid::from_u128(3)),
-                format!("On your plan {}: A message waits.", Uuid::from_u128(3)),
+                format!("On your goal “Goal 3” (plan_id {}): Docs are stuck.", Uuid::from_u128(3)),
+                format!("On your goal “Goal 3” (plan_id {}): A message waits.", Uuid::from_u128(3)),
             ]
         );
     }

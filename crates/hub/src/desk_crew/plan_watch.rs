@@ -28,8 +28,9 @@
 //!   the boss's promise to check, not a session left open.
 //! - **Nothing moved** for `stall_minutes` while a ticket is ready or in
 //!   Doing and none works: the person is told once, in plain words, what
-//!   is stuck and why. A plan with a goal is its goal's check's instead
-//!   ([`super::goal_check`]), which tells its boss alone, paused or not.
+//!   is stuck and why. A plan whose goal the person agreed is its goal's
+//!   check's instead ([`super::goal_check`]), which tells its boss alone,
+//!   paused or not.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -349,8 +350,8 @@ impl CrewHub {
                 }
             }
         }
-        // A goal's stall is its check's to say, to its boss alone.
-        if p.summary.plan.result.is_none() {
+        // An agreed goal's stall is its check's to say, to its boss alone.
+        if p.summary.plan.agreed_at.is_none() {
             self.say_stall(boss, o, p, busy, &stuck, now).await;
         }
     }

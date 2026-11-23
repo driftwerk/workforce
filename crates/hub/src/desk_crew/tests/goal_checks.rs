@@ -29,9 +29,12 @@ pub(super) fn checking(minutes: u32) -> String {
 pub(super) const STALLED: &str = "No progress toward";
 
 /// GitHub as the person's key reads it: acme/mantis's main has three
-/// finished runs of CI since `from`, each job of each taking `minutes`;
-/// a commit compared with a branch is `compared` to it. Runs answer
-/// `status` (an error from 400).
+/// finished runs of CI since `from`, each job of each taking `minutes`,
+/// and pull request #40 into main, last updated at `from`. Commit
+/// [`COMMIT`] is `compared` to main: "ahead" (on it, and after where main
+/// stood as the goal was agreed, [`MAIN_HEAD`]), "old" (on it, but there
+/// already then) or another status (off it). Runs answer `status` (an error
+/// from 400).
 pub(super) async fn mantis(
     from: chrono::DateTime<chrono::Utc>,
     minutes: i64,
@@ -87,12 +90,44 @@ async fn mantis_reads(
         .mount(gh)
         .await;
     Mock::given(method("GET"))
-        .and(path_regex(r"^/repos/acme/mantis/compare/.+$"))
+        .and(path_regex(r"^/repos/acme/mantis/actions/runs/[0-9]+$"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "status": compared, "ahead_by": 0, "behind_by": 3, "total_commits": 0, "files": [] })))
+            "id": 9, "name": "CI", "head_branch": "main", "status": "completed",
+            "conclusion": conclusion, "created_at": stamp(0), "updated_at": stamp(minutes) })))
         .mount(gh)
         .await;
+    Mock::given(method("GET"))
+        .and(path("/repos/acme/mantis/pulls/40"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "number": 40, "state": "open", "merged": false, "updated_at": stamp(0),
+            "head": { "ref": "fix/cache", "sha": "b".repeat(40) }, "base": { "ref": "main" } })))
+        .mount(gh)
+        .await;
+    let (on, after) = match compared {
+        "old" => ("ahead", "behind"),
+        on => (on, "ahead"),
+    };
+    let compare = |base: &str, head: &str, status: &str, sha: &str| {
+        Mock::given(method("GET"))
+            .and(path(format!("/repos/acme/mantis/compare/{base}...{head}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "status": status, "base_commit": { "sha": sha }, "ahead_by": 1, "behind_by": 0,
+                "total_commits": 1, "files": [] })))
+    };
+    let whole = format!("{COMMIT}{}", "0".repeat(40 - COMMIT.len()));
+    for m in [
+        compare("main", "main", "identical", MAIN_HEAD),
+        compare(COMMIT, "main", on, &whole),
+        compare(MAIN_HEAD, COMMIT, after, MAIN_HEAD),
+    ] {
+        m.mount(gh).await;
+    }
 }
+
+/// The commit a boss's checkpoint cites.
+pub(super) const COMMIT: &str = "d05e8a4c0ffee";
+/// Where acme/mantis's main stood as the goal was agreed.
+const MAIN_HEAD: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
 /// Each CI job on acme/mantis's main at most 5 minutes, three runs in a
 /// row, and, when `judged`, only the services a change touches tested.
@@ -184,7 +219,9 @@ async fn goal_capped(
         .await
         .unwrap();
     let id = p.summary.plan.id;
-    d.approve_plan(id, 1, &By::you()).await.unwrap();
+    d.approve_agreed(id, 1, "keep Mantis CI fast", chrono::Utc::now(), &By::manager("desk", "Desk", "Sam agreed it."))
+        .await
+        .unwrap();
     let s = eventually("its ticket's session", async || {
         let held = d
             .plan(id)
@@ -237,6 +274,20 @@ async fn watching(d: &Desk, id: uuid::Uuid) -> uuid::Uuid {
     }
 }
 
+/// How many of the boss's turns came once its goal was met, of any kind:
+/// each carries that it is met. Counted once nothing more comes.
+async fn turns_after_met(llm: &wiremock::MockServer) -> usize {
+    let mut seen = asked_with(llm, &["The goal is met"]).await;
+    loop {
+        tokio::time::sleep(Duration::from_millis(800)).await;
+        let now = asked_with(llm, &["The goal is met"]).await;
+        if now == seen {
+            return now;
+        }
+        seen = now;
+    }
+}
+
 /// The boss's closing turns of a goal read met.
 const CLOSING: &[&str] = &["The goal is met: it reads met", "closing summary"];
 
@@ -264,7 +315,8 @@ async fn a_met_reading_closes_the_goal_and_ends_its_plans_watches_without_a_word
             d.ticket(ticket).await.unwrap().ticket.state,
             TicketState::Done
         );
-        assert_eq!(asked_after(&llm, CLOSING, 800).await, 1, "one closing turn");
+        assert_eq!(turns_after_met(&llm).await, 1, "one turn once it is met: its closing");
+        assert_eq!(asked_with(&llm, CLOSING).await, 1);
         assert!(d
             .store()
             .watches_open("desk", PERSON)
@@ -312,7 +364,8 @@ async fn a_goal_met_while_the_person_paused_it_is_closed_once_they_resume_it() {
             (d.plan(id).await.ok()?.summary.plan.state == PlanState::Done).then_some(())
         })
         .await;
-        assert_eq!(asked_after(&llm, CLOSING, 800).await, 1);
+        assert_eq!(turns_after_met(&llm).await, 1, "one turn once it is met: its closing");
+        assert_eq!(asked_with(&llm, CLOSING).await, 1);
     })
     .await;
 }
@@ -427,29 +480,61 @@ async fn a_part_read_failing_six_times_in_a_row_wakes_its_boss_once() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_checkpoint_on_the_goals_work_moves_its_judged_part_on() {
+async fn a_checkpoint_takes_only_the_goals_work_since_it_was_agreed() {
     with_test_pool(workforce_desk::store::build_pool, |pool| async move {
         let dir = tempfile::tempdir().unwrap();
         let base = std::fs::canonicalize(dir.path()).unwrap();
-        let gh = mantis(chrono::Utc::now(), 22, "ahead").await;
+        // The runs and the pull request are from before the goal; the
+        // commit was on main already as it was agreed.
+        let from = chrono::Utc::now() - chrono::Duration::hours(3);
+        let gh = mantis(from, 22, "old").await;
         let (overseer, _, d, _) = boss_on(&base, pool, &checking(1440), &gh).await;
         let (id, _) = goal_running(&d, &base, fast_ci(true)).await;
-        eventually("the goal read", async || {
-            d.plan(id).await.ok()?.goal?.parts.first()?.newest.clone()
+        let main = workforce_desk::goal::head_key("acme/mantis", "main");
+        eventually("where main stood kept", async || {
+            let heads = d.store().goal_heads(id).await.ok()?;
+            (heads.get(&main).map(String::as_str) == Some(MAIN_HEAD)).then_some(())
         })
         .await;
+        let checkpoint = |evidence: Value| {
+            run(
+                &overseer,
+                "crew.plan_update",
+                json!({ "plan_id": id.to_string(), "why": "Showing the work",
+                        "checkpoint": { "part": 2, "said": "Only api's tests ran",
+                                        "evidence": [evidence] } }),
+            )
+        };
+        let commit = json!({ "kind": "commit", "repo": "acme/mantis", "sha": COMMIT });
+        for (evidence, refused) in [
+            (commit.clone(), "Commit d05e8a4 of acme/mantis was there before"),
+            (json!({ "kind": "run", "repo": "acme/mantis", "id": 9 }), "Run 9 of acme/mantis was there before"),
+            (json!({ "kind": "pull", "repo": "acme/mantis", "number": 40 }), "PR #40 of acme/mantis was there before"),
+        ] {
+            let r = checkpoint(evidence).await;
+            assert!(!r.success, "{r:?}");
+            let error = r.error.unwrap_or_default();
+            assert!(error.starts_with(refused), "{error}");
+        }
+
+        // A commit on main since: taken, by its whole id.
+        mantis_reads(&gh, from, 22, "ahead", 200).await;
         let before = chrono::Utc::now();
-        let r = run(
-            &overseer,
-            "crew.plan_update",
-            json!({ "plan_id": id.to_string(), "why": "Showing the work",
-                    "checkpoint": { "part": 2, "said": "Only api's tests ran",
-                                    "evidence": [{ "kind": "commit", "repo": "acme/mantis", "sha": "d05e8a4c0ffee" }] } }),
-        )
-        .await;
+        let r = checkpoint(commit).await;
         assert!(r.success, "{r:?}");
         let p = d.plan(id).await.unwrap();
-        assert!(p.facts.iter().any(|f| f.checked && f.part == Some(1)), "{:?}", p.facts);
+        let shown = p
+            .facts
+            .iter()
+            .find(|f| f.checked && f.part == Some(1))
+            .unwrap_or_else(|| panic!("{:?}", p.facts));
+        assert_eq!(
+            shown.evidence,
+            [workforce_desk::goal::Evidence::Commit {
+                repo: "acme/mantis".into(),
+                sha: format!("{COMMIT}{}", "0".repeat(40 - COMMIT.len())),
+            }]
+        );
         let goal = p.goal.expect("its progress");
         assert!(goal.parts[1].improved_at.is_some_and(|at| at >= before), "its stall starts again");
         assert!(!goal.parts[0].met, "CI is still stuck");
