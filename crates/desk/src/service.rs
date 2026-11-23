@@ -3371,8 +3371,17 @@ impl Desk {
         id: Uuid,
         f: impl FnOnce(&mut SessionRecord, Option<&mut Live>),
     ) {
-        let mut guard = self.0.state.lock();
-        let st = &mut *guard;
+        self.change_in(&mut self.0.state.lock(), seen, id, f);
+    }
+
+    /// [`Self::change_since`], with Desk's state already held.
+    fn change_in(
+        &self,
+        st: &mut State,
+        seen: Option<SessionView>,
+        id: Uuid,
+        f: impl FnOnce(&mut SessionRecord, Option<&mut Live>),
+    ) {
         let Some(old) = st.records.get(&id) else {
             return;
         };
@@ -3389,18 +3398,18 @@ impl Desk {
     /// look counting the shells it missed), else saved and announced as any
     /// change is.
     fn change_unseen(&self, id: Uuid, f: impl FnOnce(&mut State)) {
-        let mut st = self.0.state.lock();
-        let Some(before) = st.records.get(&id).map(|r| Self::view_of(&st, r)) else {
+        let mut guard = self.0.state.lock();
+        let st = &mut *guard;
+        let Some(before) = st.records.get(&id).map(|r| Self::view_of(st, r)) else {
             return;
         };
-        f(&mut st);
-        let seen = st
+        f(st);
+        if st
             .records
             .get(&id)
-            .is_some_and(|r| Self::view_of(&st, r) != before);
-        drop(st);
-        if seen {
-            self.change_since(Some(before), id, |_, _| {});
+            .is_some_and(|r| Self::view_of(st, r) != before)
+        {
+            self.change_in(st, Some(before), id, |_, _| {});
         }
     }
 
