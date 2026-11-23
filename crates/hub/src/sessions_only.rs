@@ -164,7 +164,11 @@ impl Held {
         }
         matches!(
             name,
-            "filesystem.write" | "filesystem.edit" | "filesystem.delete" | "fs.remove"
+            "filesystem.write"
+                | "filesystem.edit"
+                | "filesystem.delete"
+                | "filesystem.trash"
+                | "fs.remove"
         )
         .then_some(Self::Files)
     }
@@ -249,6 +253,7 @@ impl Bounds {
                 Effect::Exec { .. }
                 | Effect::Write { .. }
                 | Effect::Delete { .. }
+                | Effect::Trash { .. }
                 | Effect::Move { .. } => true,
                 Effect::Session { .. } | Effect::Connector { .. } | Effect::Unknown => {
                     held.is_some()
@@ -273,7 +278,7 @@ impl Bounds {
             }
             (Some(Held::Shell), _) => Some(Doing::Command),
             (_, Effect::None | Effect::Read { .. }) => None,
-            (_, Effect::Write { paths } | Effect::Delete { paths }) => {
+            (_, Effect::Write { paths } | Effect::Delete { paths } | Effect::Trash { paths }) => {
                 touches(&paths.iter().collect::<Vec<_>>()).then_some(Doing::Code)
             }
             (_, Effect::Move { from, to }) => {

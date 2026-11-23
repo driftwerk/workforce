@@ -158,16 +158,6 @@ pub fn works_in(value: Option<&Value>) -> Result<Vec<PathBuf>, String> {
     Ok(out)
 }
 
-/// Under home, what no folder an agent works in may be, sit in or hold,
-/// beside the secret and start-file folders a boss never touches: the rest
-/// of the person's own configuration, and the engines' sign-ins.
-const KEPT_IN_HOME: &[&str] = &[
-    ".config",
-    ".claude",
-    ".claude.json",
-    ".local/share/keyrings",
-];
-
 /// Why the agent may not work in `folder` on a machine whose home is `home`
 /// and that keeps `withheld` (Desk's data, the keychains) from every agent;
 /// `None` when it may. It must be inside home, and not home itself; never a
@@ -176,7 +166,7 @@ const KEPT_IN_HOME: &[&str] = &[
 /// inside or holding what is withheld. Checked as written and with its links
 /// followed, names compared as a case-insensitive disk (APFS) compares them.
 pub fn works_in_refusal(folder: &Path, home: &Path, withheld: &[PathBuf]) -> Option<String> {
-    use workforce_core::home_secrets::{fold, SECRET_DIRS, START_FILES};
+    use workforce_core::home_secrets::{fold, KEPT_IN_HOME, SECRET_DIRS, START_FILES};
     let real = std::fs::canonicalize(folder).unwrap_or_else(|_| folder.to_path_buf());
     let home_real = std::fs::canonicalize(home).unwrap_or_else(|_| home.to_path_buf());
     let shown = folder.display();

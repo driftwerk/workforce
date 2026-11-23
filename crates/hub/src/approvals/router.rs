@@ -670,6 +670,7 @@ mod tests {
             approver_user_ids: vec![bob.to_string()],
             ttl: Duration::from_secs(60),
             chat: false,
+            origin: None,
         };
         f.router.defer(&core).unwrap();
         // Read it back through the same pending store via a fresh handle.
