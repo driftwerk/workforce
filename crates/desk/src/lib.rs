@@ -52,6 +52,8 @@ pub mod floor;
 pub mod folders;
 pub mod gist;
 pub mod github_sync;
+pub mod goal;
+pub mod goal_store;
 pub mod grant;
 mod grant_api;
 pub mod grant_store;

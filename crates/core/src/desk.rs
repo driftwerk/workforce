@@ -51,6 +51,10 @@ pub fn is_desk_boss_channel(channel: &str) -> bool {
         .is_some_and(|p| p.eq_ignore_ascii_case(DESK_BOSS_PREFIX))
 }
 
+/// What a boss's goals block opens with: a transcript is given it whole on
+/// every turn, never left out as unchanged.
+pub const GOALS_MARKER: &str = "[DESK GOALS]";
+
 /// Whether `channel` is one of a boss's own conversations off its DM, where
 /// it works for the person unprompted: its check-ins (`desk:checkin:`), a
 /// session's line (`desk:line:`, on this computer or a machine) and a plan's

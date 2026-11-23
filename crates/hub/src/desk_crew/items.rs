@@ -140,7 +140,9 @@ pub fn schema(name: &str) -> Value {
             "items": { "type": "array", "items": { "type": "string" }, "description": "The points it covers when there are several: the person is shown at most 2, each at most 12 words" },
             "recommended": { "type": "string", "description": "The one of options you recommend, word for word" },
             "not_blocking": { "type": "string", "description": "What carries on meanwhile, e.g. \"The docs PR doesn't depend on it\"" },
-            "scope": { "type": "string", "description": "With generalizes: what the person's \"always\" would cover: all (default), group:<id>, or repo:<owner/name> when the case is about a repository's work (merging, deploying)" }
+            "scope": { "type": "string", "description": "With generalizes: what the person's \"always\" would cover: all (default), group:<id>, or repo:<owner/name> when the case is about a repository's work (merging, deploying)" },
+            "plan_id": { "type": "string", "description": "The plan whose goal it is about: their answer is what crew.plan_update applies (person_said)" },
+            "proposal": super::goal::proposal_schema()
         }, "required": ["text"] }),
         PROMISE => json!({ "type": "object", "properties": {
             "session_id": { "type": "string" },
@@ -330,6 +332,26 @@ impl CrewHub {
                 .map(str::to_string)
         };
         let cant_decide = some_of("cant_decide");
+        // A question about a goal of its own: what it proposes is checked
+        // now, so the person's answer applies only that.
+        let about_goal = match input["plan_id"].as_str() {
+            Some(id) => {
+                let id: Uuid = id
+                    .trim()
+                    .parse()
+                    .map_err(|_| "plan_id is a plan's id, from crew.board.".to_string())?;
+                let plan = self.own_plan(b, id).await?.summary.plan.id;
+                let proposal = match input.get("proposal").filter(|p| !p.is_null()) {
+                    Some(p) => super::goal::proposal_of(p)?,
+                    None => workforce_desk::goal::Proposal::default(),
+                };
+                Some((plan, proposal))
+            }
+            None if input.get("proposal").is_some_and(|p| !p.is_null()) => {
+                return Err("A proposal is about a plan's goal: give its plan_id too.".into())
+            }
+            None => None,
+        };
         // The session it is about is in its scope, checked before anything
         // is read of it.
         let session = match input["session_id"].as_str() {
@@ -346,8 +368,10 @@ impl CrewHub {
         // instructions; it asks only what they don't cover and it truly
         // can't decide, and says why. Before its first ask of a matter it
         // is given those instructions, in their words, to check against.
+        // A goal and how it's measured are the person's at every level:
+        // asked about, never decided.
         let mut at_full = false;
-        if kind != OpenKind::Todo {
+        if kind != OpenKind::Todo && about_goal.is_none() {
             let full = self.overseer_named(boss).filter(|(_, o)| {
                 self.level_now(boss, o).0 == workforce_common::oversight::Level::Full
             });
@@ -510,6 +534,13 @@ impl CrewHub {
                 },
                 Err(e) => tracing::warn!(error = %e, "an ask's preference scope wasn't kept"),
             }
+        }
+        if let Some((plan, proposal)) = &about_goal {
+            self.desk
+                .store()
+                .item_set_goal(opened.item().id, *plan, proposal, crew::now())
+                .await
+                .map_err(Self::item_err)?;
         }
         let tz = self.desk.timezone();
         match opened {

@@ -55,6 +55,8 @@ async fn running(d: &Desk, folder: &Path, n: usize) -> (uuid::Uuid, Vec<SessionV
                 engine: Engine::Claude,
                 group: None,
                 budget: None,
+                result: None,
+                goal_ticket: None,
             },
             &Party::manager("desk", "Desk"),
             &By::manager("desk", "Desk", "Sam asked for M8."),

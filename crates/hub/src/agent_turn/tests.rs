@@ -5066,6 +5066,30 @@ async fn a_crew_conversation_is_not_given_again_what_its_transcript_holds() {
 }
 
 #[tokio::test]
+async fn a_crew_conversation_is_given_its_goals_whole_every_turn() {
+    let hub = hub(claude_first).await;
+    hub.claude_login(ALICE);
+    hub.claude.reply(Some(1), &read(40_000));
+    hub.claude.reply(Some(2), &read(30_000));
+    let goals = format!(
+        "{} The goals you agreed with the person.\n- “Upgrade the gateway” · unmet\nDesk's goal facts, newest first:\n- 23:18 fact: The gateway is upgraded on staging. {}",
+        workforce_core::desk::GOALS_MARKER,
+        "It is checked. ".repeat(20)
+    );
+
+    hub.wake(CREW, &format!("{goals}\n\nwake one")).await;
+    hub.wake(CREW, &format!("{goals}\n\nwake two")).await;
+
+    let second = hub.claude.calls()[1].text();
+    assert!(hub.claude.calls()[1].has("--resume"));
+    assert!(!second.contains(&standing()), "the rest is held");
+    assert!(
+        second.contains("The gateway is upgraded on staging."),
+        "{second}"
+    );
+}
+
+#[tokio::test]
 async fn the_person_s_own_conversation_is_always_given_everything() {
     let hub = hub(claude_first).await;
     hub.claude_login(ALICE);

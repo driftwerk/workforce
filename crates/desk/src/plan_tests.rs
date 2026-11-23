@@ -29,6 +29,12 @@ fn plan(state: PlanState) -> Plan {
         },
         created_at: now,
         updated_at: now,
+        result: None,
+        agreed: None,
+        agreed_at: None,
+        read_back_at: None,
+        goal_ticket: None,
+        met: None,
     }
 }
 
@@ -65,6 +71,7 @@ fn planned(n: u128, title: &str, needs: &[u128]) -> Planned {
         machine: None,
         model: None,
         adopted: false,
+        session: None,
     }
 }
 
@@ -107,6 +114,7 @@ fn draft_ticket(title: &str, needs: &[usize]) -> DraftTicket {
         repo: None,
         id: None,
         adopt: None,
+        session: None,
         title: title.into(),
         body: String::new(),
         engine: None,
@@ -202,6 +210,7 @@ fn a_draft_names_its_needs_by_place_and_gets_ids_and_the_default_engine() {
 #[test]
 fn a_draft_keeps_the_ids_of_the_tickets_it_changes_and_refuses_others() {
     let before = Snapshot {
+        result: None,
         parallel: None,
         budget: None,
         goal: "Ship".into(),
@@ -289,6 +298,7 @@ fn a_ticket_says_its_machine_and_model_and_keeps_them_unless_changed() {
     there.machine = Some("devbox".into());
     there.model = Some("gpt-5.5".into());
     let before = Snapshot {
+        result: None,
         parallel: None,
         budget: None,
         goal: "Ship".into(),
@@ -367,6 +377,7 @@ fn a_tickets_model_goes_with_its_engine() {
     codex.engine = Engine::Codex;
     codex.model = Some("gpt-6.1-sol".into());
     let before = Snapshot {
+        result: None,
         parallel: None,
         budget: None,
         goal: "Ship".into(),
@@ -440,6 +451,7 @@ fn a_machine_ticket_is_checked_there_not_on_this_computer() {
     pane.machine = Some("devbox".into());
     pane.engine = Engine::Cursor;
     let s = Snapshot {
+        result: None,
         parallel: None,
         budget: None,
         goal: "Ship".into(),
@@ -471,6 +483,7 @@ fn a_machine_ticket_is_checked_there_not_on_this_computer() {
 #[test]
 fn a_plan_that_can_run_here_is_valid() {
     let s = Snapshot {
+        result: None,
         parallel: None,
         budget: None,
         goal: "Ship the new checkout".into(),
@@ -502,6 +515,7 @@ fn each_thing_that_keeps_a_plan_from_running_is_said() {
     untitled.body = "x".repeat(BODY_MAX + 1);
     let outside = planned(10, "Outside", &[77]);
     let s = Snapshot {
+        result: None,
         parallel: None,
         budget: None,
         goal: String::new(),
@@ -565,6 +579,7 @@ fn each_thing_that_keeps_a_plan_from_running_is_said() {
 #[test]
 fn a_cycle_is_refused_naming_the_tickets_in_it() {
     let s = Snapshot {
+        result: None,
         parallel: None,
         budget: None,
         goal: "g".into(),
@@ -584,6 +599,7 @@ fn a_cycle_is_refused_naming_the_tickets_in_it() {
 #[test]
 fn a_plan_has_one_to_thirty_tickets_and_a_short_enough_goal() {
     let none = Snapshot {
+        result: None,
         parallel: None,
         budget: None,
         goal: "g".into(),
@@ -594,6 +610,7 @@ fn a_plan_has_one_to_thirty_tickets_and_a_short_enough_goal() {
         Err(vec![Problem::NoTickets])
     );
     let many = Snapshot {
+        result: None,
         parallel: None,
         budget: None,
         goal: "x".repeat(GOAL_MAX + 1),
@@ -857,6 +874,7 @@ fn base() -> Snapshot {
         ],
         parallel: Some(2),
         budget: None,
+        result: None,
     }
 }
 
@@ -867,12 +885,12 @@ type Edit<'a> = (&'a str, &'a dyn Fn(&mut Snapshot));
 fn plan_change_classifies_each_kind_of_edit() {
     let none = HashSet::new();
     let a = base();
-    assert_eq!(plan_change(&a, &a, &none), Ok(None));
+    assert_eq!(plan_change(&a, &a, &none, None), Ok(None));
 
     let minor = |f: &dyn Fn(&mut Snapshot)| {
         let mut b = base();
         f(&mut b);
-        plan_change(&a, &b, &none)
+        plan_change(&a, &b, &none, None)
     };
     let edits: [Edit; 7] = [
         ("order", &|s| s.tickets.swap(0, 2)),
@@ -908,6 +926,108 @@ fn plan_change_classifies_each_kind_of_edit() {
     }
 }
 
+/// An agreed goal covers the work toward its result: tickets added or
+/// dropped and what they say need no approval, all but its own ticket's;
+/// the goal, the result, where it runs and what it may spend stay the
+/// person's.
+#[test]
+fn a_covered_goal_s_own_work_is_minor() {
+    let none = HashSet::new();
+    let a = base();
+    let goal = Covered {
+        goal_ticket: Some(u(1)),
+    };
+    let covered = |f: &dyn Fn(&mut Snapshot)| {
+        let mut b = base();
+        f(&mut b);
+        plan_change(&a, &b, &none, Some(&goal))
+    };
+    let minors: [Edit; 3] = [
+        ("added", &|s| s.tickets.push(planned(4, "Refunds", &[]))),
+        ("dropped", &|s| {
+            s.tickets.pop();
+        }),
+        ("body", &|s| s.tickets[2].body = "Retry it".into()),
+    ];
+    for (what, f) in minors {
+        assert_eq!(covered(f), Ok(Some(Change::Minor)), "{what}");
+    }
+    let scopes: [Edit; 7] = [
+        ("goal", &|s| s.goal = "Ship checkout and refunds".into()),
+        ("result", &|s| {
+            s.result = Some(crate::goal::GoalResult {
+                words: "the PR merged".into(),
+                parts: vec![crate::goal::Measure::Judged {
+                    evidence: "it ships".into(),
+                }],
+            })
+        }),
+        ("goal ticket dropped", &|s| {
+            s.tickets.remove(0);
+        }),
+        ("goal ticket's body", &|s| {
+            s.tickets[0].body = "Use the v2 schema".into()
+        }),
+        ("new folder", &|s| {
+            s.tickets[0].folder = "/work/acme-docs".into()
+        }),
+        ("higher limit", &|s| s.parallel = Some(3)),
+        ("no limit", &|s| s.parallel = None),
+    ];
+    for (what, f) in scopes {
+        assert_eq!(covered(f), Ok(Some(Change::Scope)), "{what}");
+    }
+    let measured = |repo: &str| crate::goal::GoalResult {
+        words: "CI under 5 minutes".into(),
+        parts: vec![crate::goal::Measure::Ci {
+            repo: repo.into(),
+            workflow: None,
+            branch: "main".into(),
+            want: crate::goal::Want::Green { runs: 1 },
+        }],
+    };
+    let mut was = base();
+    was.result = Some(measured("acme/api"));
+    let mut repaired = was.clone();
+    repaired.result = Some(measured("acme/api-v2"));
+    assert_eq!(
+        plan_change(&was, &repaired, &none, Some(&goal)),
+        Ok(Some(Change::Minor)),
+        "where it reads from"
+    );
+    assert_eq!(
+        describe(&was, &repaired),
+        "Changed where its goal is read from"
+    );
+    let mut bound = repaired.clone();
+    bound.result.as_mut().unwrap().parts[0] = crate::goal::Measure::Ci {
+        repo: "acme/api".into(),
+        workflow: None,
+        branch: "main".into(),
+        want: crate::goal::Want::Green { runs: 2 },
+    };
+    assert_eq!(
+        plan_change(&was, &bound, &none, None),
+        Ok(Some(Change::Scope)),
+        "its bound"
+    );
+    let no_goal_ticket = Covered { goal_ticket: None };
+    let mut dropped = base();
+    dropped.tickets.remove(0);
+    assert_eq!(
+        plan_change(&a, &dropped, &none, Some(&no_goal_ticket)),
+        Ok(Some(Change::Minor))
+    );
+    let mut b = base();
+    b.budget = Some(PlanBudget::usd(10.0));
+    let mut looser = base();
+    looser.budget = Some(PlanBudget::usd(20.0));
+    assert_eq!(
+        plan_change(&b, &looser, &none, Some(&goal)),
+        Ok(Some(Change::Scope))
+    );
+}
+
 /// A plan's budget is part of what the person approves: setting or
 /// lowering it is within that, raising it or taking it off is theirs again.
 #[test]
@@ -919,32 +1039,38 @@ fn a_plans_budget_raised_or_taken_off_is_a_change_of_scope() {
     };
     let a = capped(40.0);
     assert_eq!(
-        plan_change(&base(), &a, &none),
+        plan_change(&base(), &a, &none, None),
         Ok(Some(Change::Minor)),
         "set"
     );
     assert_eq!(
-        plan_change(&a, &capped(30.0), &none),
+        plan_change(&a, &capped(30.0), &none, None),
         Ok(Some(Change::Minor))
     );
     assert_eq!(
-        plan_change(&a, &capped(60.0), &none),
+        plan_change(&a, &capped(60.0), &none, None),
         Ok(Some(Change::Scope))
     );
-    assert_eq!(plan_change(&a, &base(), &none), Ok(Some(Change::Scope)));
+    assert_eq!(
+        plan_change(&a, &base(), &none, None),
+        Ok(Some(Change::Scope))
+    );
     let mut later = capped(40.0);
     later.budget.as_mut().unwrap().warn_at = 0.95;
-    assert_eq!(plan_change(&a, &later, &none), Ok(Some(Change::Scope)));
+    assert_eq!(
+        plan_change(&a, &later, &none, None),
+        Ok(Some(Change::Scope))
+    );
     let mut daily = capped(10.0);
     daily.budget.as_mut().unwrap().period = Period::Day;
     assert_eq!(
-        plan_change(&a, &daily, &none),
+        plan_change(&a, &daily, &none, None),
         Ok(Some(Change::Scope)),
         "counted another way"
     );
     let mut told = capped(40.0);
     told.budget.as_mut().unwrap().on_exceed = OnExceed::Warn;
-    assert_eq!(plan_change(&a, &told, &none), Ok(Some(Change::Scope)));
+    assert_eq!(plan_change(&a, &told, &none, None), Ok(Some(Change::Scope)));
     assert_eq!(describe(&base(), &a), "Capped it at a total budget of $40");
     assert_eq!(describe(&a, &base()), "Took its budget off");
     let mut nothing = capped(0.0);
@@ -970,18 +1096,18 @@ fn where_a_started_ticket_runs_cant_change() {
     let mut b = base();
     b.tickets[0].folder = "/work/acme-api".into();
     assert_eq!(
-        plan_change(&a, &b, &started),
+        plan_change(&a, &b, &started, None),
         Err(Problem::Started {
             title: "Add the cart API".into()
         })
     );
     let mut c = base();
     c.tickets[0].engine = Engine::Codex;
-    assert!(plan_change(&a, &c, &started).is_err());
+    assert!(plan_change(&a, &c, &started, None).is_err());
     // Its title may.
     let mut d = base();
     d.tickets[0].title = "Add the basket API".into();
-    assert_eq!(plan_change(&a, &d, &started), Ok(Some(Change::Minor)));
+    assert_eq!(plan_change(&a, &d, &started, None), Ok(Some(Change::Minor)));
 }
 
 #[test]
@@ -1234,6 +1360,7 @@ fn an_edit_by_key_changes_only_what_it_says() {
     let mut b = planned(2, "Use the cache", &[1]);
     b.body = "Read through the cache.".into();
     let before = Snapshot {
+        result: None,
         goal: "Faster reads".into(),
         tickets: vec![a.clone(), b.clone()],
         parallel: Some(2),
@@ -1354,6 +1481,7 @@ fn a_ticket_moved_with_its_repository_leaves_its_old_folder_behind() {
     a.repo = Some("github.com/driftwerk/vellev".into());
     let b = planned(2, "Use the cache", &[1]);
     let before = Snapshot {
+        result: None,
         goal: "Faster reads".into(),
         tickets: vec![a.clone(), b],
         parallel: None,

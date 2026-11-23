@@ -6,10 +6,11 @@
 use std::collections::HashMap;
 
 use chrono::{DateTime, Utc};
-use eyre::Result;
+use eyre::{Context, Result};
 use tokio_postgres::Row;
 use uuid::Uuid;
 
+use crate::goal::{GoalAsk, Proposal};
 use crate::open_item::{AskLayout, ClosedBy, NewItem, OpenItem, OpenKind, OpenState};
 use crate::store::DeskStore;
 
@@ -103,6 +104,52 @@ impl DeskStore {
             )
             .await?;
         Ok(())
+    }
+
+    /// Keeps item `id` as the boss's question about plan `plan`'s goal,
+    /// proposing `proposal`: proposed `at` when it proposes something
+    /// other than it did.
+    pub async fn item_set_goal(
+        &self,
+        id: Uuid,
+        plan: Uuid,
+        proposal: &Proposal,
+        at: DateTime<Utc>,
+    ) -> Result<()> {
+        let client = self.pool().get().await?;
+        client
+            .execute(
+                "UPDATE boss_open_items SET plan = $2, proposal = $3, \
+                 proposed_at = CASE WHEN proposal IS NOT DISTINCT FROM $3 AND plan = $2 \
+                 THEN proposed_at ELSE $4 END WHERE id = $1",
+                &[&id, &plan, &serde_json::to_value(proposal)?, &at],
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// The boss's questions not closed about plan `plan`'s goal, newest
+    /// proposed first.
+    pub async fn goal_asks(&self, plan: Uuid) -> Result<Vec<GoalAsk>> {
+        let client = self.pool().get().await?;
+        client
+            .query(
+                "SELECT id, proposal, proposed_at FROM boss_open_items \
+                 WHERE plan = $1 AND state <> 'closed' AND proposal IS NOT NULL \
+                 AND proposed_at IS NOT NULL ORDER BY proposed_at DESC, id",
+                &[&plan],
+            )
+            .await?
+            .iter()
+            .map(|r| {
+                Ok(GoalAsk {
+                    item: r.try_get("id")?,
+                    proposal: serde_json::from_value(r.try_get("proposal")?)
+                        .context("reading what a question proposed")?,
+                    at: r.try_get("proposed_at")?,
+                })
+            })
+            .collect()
     }
 
     /// Opens `new`, or updates the item not closed with its key: in one

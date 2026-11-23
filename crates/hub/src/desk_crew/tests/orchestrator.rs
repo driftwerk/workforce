@@ -233,6 +233,8 @@ async fn a_plan_of_chained_tickets_runs_to_its_end_with_no_word_from_the_person(
                     engine: Engine::Claude,
                     group: None,
                     budget: None,
+                    result: None,
+                    goal_ticket: None,
                 },
                 &Party::manager("desk", "Desk"),
                 &By::manager("desk", "Desk", "Sam asked for sign-in."),

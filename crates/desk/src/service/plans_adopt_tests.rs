@@ -109,6 +109,7 @@ fn by_sarah() -> By {
 fn adopt(id: Uuid, dir: &Path, needs: &[usize]) -> DraftTicket {
     DraftTicket {
         adopt: Some(id),
+        session: None,
         folder: dir.to_string_lossy().into_owned(),
         needs: needs.to_vec(),
         ..Default::default()
@@ -135,6 +136,8 @@ fn plan_of(tickets: Vec<DraftTicket>) -> NewPlan {
         engine: Engine::Claude,
         group: None,
         budget: None,
+        result: None,
+        goal_ticket: None,
     }
 }
 
@@ -333,7 +336,7 @@ async fn a_ticket_someone_holds_is_refused_plainly() {
             ..Default::default()
         };
         assert!(matches!(
-            d.0.store.adopt_ticket(four.id, &runs).await,
+            d.0.store.adopt_ticket(four.id, &runs, None).await,
             Err(Adopt::Held(id)) if id == four.id
         ));
         // A ticket not on a board of the plan's group isn't found.

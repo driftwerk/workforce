@@ -877,7 +877,7 @@ async fn plan_on_devbox(boss: &AgentService, d: &Desk, goal: &str, folder: &str)
     let r = run(
         boss,
         "crew.plan",
-        json!({"goal": goal, "machine": "devbox", "tickets": tickets}),
+        json!({"result": super::plans::judged(), "goal": goal, "machine": "devbox", "tickets": tickets}),
     )
     .await;
     assert!(r.success, "{r:?}");
