@@ -81,24 +81,6 @@ const TURN_OWNED_METADATA: [&str; 6] = [
     crate::hub_core::subscriptions::CliKind::Codex.slot_key(),
 ];
 
-/// Persist the turn's own metadata through a narrow write, after its last
-/// whole-session save.
-///
-/// Riding that save loses these values whenever a concurrent writer bumped the
-/// row's revision first — measured at ~2/hour on the busiest install, silently
-/// stranding the token calibration that compaction thresholds read. A key
-/// absent from the finished session is removed rather than left stale: the
-/// round-cap record is cleared exactly that way by a turn that did not cap.
-pub fn persist_turn_owned_metadata(
-    sessions: &Arc<dyn workforce_common::session::SessionStore>,
-    session: &workforce_common::session::Session,
-) {
-    let (patch, remove) = turn_owned(session);
-    if let Err(e) = sessions.merge_metadata(&session.id, patch, &remove) {
-        tracing::warn!(error = %e, session_id = %session.id, "Failed to persist turn metadata");
-    }
-}
-
 /// Saves the turn's `session`, its own metadata keys as it has them in the
 /// same write, and refreshes it from what is stored. Its messages in
 /// `archive`, as it held them before the save, as the store holds them now:
@@ -147,28 +129,6 @@ fn saved_with(
         .filter(|m| ids.contains(&m.id))
         .cloned()
         .collect())
-}
-
-/// The turn's own metadata keys in `session`: those it holds, and those it
-/// doesn't, to remove.
-fn turn_owned(
-    session: &workforce_common::session::Session,
-) -> (
-    serde_json::Map<String, serde_json::Value>,
-    Vec<&'static str>,
-) {
-    TURN_OWNED_METADATA.into_iter().fold(
-        (serde_json::Map::new(), Vec::new()),
-        |(mut patch, mut remove), key| {
-            match session.metadata.get(key) {
-                Some(value) => {
-                    patch.insert(key.to_string(), value.clone());
-                }
-                None => remove.push(key),
-            }
-            (patch, remove)
-        },
-    )
 }
 
 /// End the session's turn record. Called on every turn teardown EXCEPT
@@ -3932,36 +3892,6 @@ pub mod tests {
                 .map(|m| m.id.as_str())
                 .collect::<Vec<_>>(),
             [kept.as_str(), answer.as_str()]
-        );
-    }
-
-    #[test]
-    fn turn_owned_metadata_patches_what_is_present_and_removes_what_is_not() {
-        let mut session = Session::new("test", "user", "agent");
-        session.metadata = serde_json::json!({
-            "observed_input_tokens": 4242,
-            "estimate_calibration": 1.5,
-            "channel_name": "DM with Kings",
-        });
-        let (patch, remove) = turn_owned(&session);
-        assert_eq!(patch.len(), 2);
-        assert_eq!(
-            patch.get("observed_input_tokens"),
-            Some(&serde_json::json!(4242))
-        );
-        assert_eq!(
-            remove,
-            vec![
-                "turn_content_scope",
-                "round_cap_continuation",
-                "agent_engine:claude-code",
-                "agent_engine:codex"
-            ],
-            "a turn that did not cap clears the record rather than leaving it stale"
-        );
-        assert!(
-            !patch.contains_key("channel_name"),
-            "keys the turn does not own are never written by this path"
         );
     }
 

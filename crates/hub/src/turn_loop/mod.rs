@@ -68,14 +68,13 @@ use workforce_agent::runner::AgentRunner;
 use crate::hosts::TurnHost;
 use crate::serve::{
     answer_is_code_shaped, build_prior_messages_reading, data_claim_grounding_skip,
-    end_turn_record, infer_task_type, is_person, is_workflow_step_session,
-    persist_turn_owned_metadata, prompt_privacy, prompt_visibility, record_round_cap_continuation,
-    render_shared_visibility_block, render_slack_identity_block, reply_only,
-    save_refreshing_archiving, save_turn, select_visible_other_sessions, session_owner_for_turn,
-    stop_turn_record, worker_tool_patterns, AgentService, IsolatedRoute, IsolatedRun,
-    MessageProgress, PromptPrivacy, RunAuthor, SharedReplay, Skip, TurnInbox, TurnOutcome,
-    CLAIM_GROUNDING_MIN_RESPONSE, COMMITMENT_CHECK_TIMEOUT_SECS, CURATION_DATABASE_READ_TOOLS,
-    REPLY_REVIEW_BACKSTOP_SLACK,
+    end_turn_record, infer_task_type, is_person, is_workflow_step_session, prompt_privacy,
+    prompt_visibility, record_round_cap_continuation, render_shared_visibility_block,
+    render_slack_identity_block, reply_only, save_refreshing_archiving, save_turn,
+    select_visible_other_sessions, session_owner_for_turn, stop_turn_record, worker_tool_patterns,
+    AgentService, IsolatedRoute, IsolatedRun, MessageProgress, PromptPrivacy, RunAuthor,
+    SharedReplay, Skip, TurnInbox, TurnOutcome, CLAIM_GROUNDING_MIN_RESPONSE,
+    COMMITMENT_CHECK_TIMEOUT_SECS, CURATION_DATABASE_READ_TOOLS, REPLY_REVIEW_BACKSTOP_SLACK,
 };
 
 /// Per-session runner-slot lifecycle (single write-lock acquisition each, no
@@ -3986,11 +3985,10 @@ pub(crate) async fn process_admitted(
     record_round_cap_continuation(&mut session, &result);
     crate::monitor::scope::keep_turn(&mut session, &result);
     extraction::note_personal_read(&service.sessions, &mut session, &result.tool_invocations);
-    service.sessions.save(&session)?;
+    let answered = save_turn(&service.sessions, &mut session, archive_base..)?;
     turn_journal.clear();
-    persist_turn_owned_metadata(&service.sessions, &session);
 
-    for msg in session.messages.get(archive_base..).unwrap_or_default() {
+    for msg in &answered {
         if let Err(e) = service.sessions.append_to_archive(&session.id, msg) {
             warn!(error = %e, "Failed to append to session archive");
         }
@@ -5906,9 +5904,6 @@ pub(crate) async fn stream_admitted(
                 }
                 record_round_cap_continuation(&mut session, &result);
                 crate::monitor::scope::keep_turn(&mut session, &result);
-                // A save that lost CAS keeps what is stored, metadata too;
-                // the turn's own keys then get a narrow write that cannot
-                // lose.
                 let answered = save_turn(&sessions, &mut session, archived_upto..)?;
                 turn_journal.clear();
                 // After the transcript, never before: a crash in between
