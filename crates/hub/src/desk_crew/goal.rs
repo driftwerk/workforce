@@ -12,7 +12,8 @@ use serde_json::{json, Value};
 use uuid::Uuid;
 use workforce_desk::crew::{self, Party};
 use workforce_desk::goal::{
-    self, Evidence, Fact, FactKind, GoalResult, Measure, Met, MetBy, Proposal, Reading, Said,
+    self, Evidence, Fact, FactKind, GoalResult, Measure, Met, MetBy, NotSaid, Proposal, Reading,
+    Said,
 };
 use workforce_desk::plan::Plan;
 use workforce_desk::PlanDetail;
@@ -24,12 +25,19 @@ use crate::serve::AgentService;
 
 /// How far back the person's words agreeing a goal are looked for.
 const AGREED_WITHIN: Duration = Duration::hours(24);
-/// The person's messages read for their words.
+/// How far back the person's messages are read, so words older than they
+/// may be are said to be so.
+const WORDS_LOOKED: Duration = Duration::days(7);
+/// The person's messages read for their words, in the DM and in each
+/// thread.
 const MESSAGES_READ: usize = 200;
 /// Failed reads in a row of a part before its address may be repaired.
 pub(super) const REPAIR_AFTER: u32 = 3;
 /// The most facts one update records.
 const FACTS_AT_ONCE: usize = 10;
+
+/// Where Desk looks for the person's words, as a refusal says it.
+const WHERE_LOOKED: &str = "the person's own messages to you in your Desk DM and its threads";
 
 /// What a boss is told to do when the person agrees work with it.
 pub(super) const SAVE_GOALS: &str = "When the person agrees work with you, save it at once as a \
@@ -37,20 +45,53 @@ goal with crew.plan (agreed: their words; result: how it is measured, judged onl
 can measure it), adopting the session already on it, and record what you report as done as facts \
 on it (crew.plan_update facts).";
 
-/// Refused when the words quoted aren't the person's, or aren't new enough.
-pub(super) const NOT_THEIR_WORDS: &str = "Those aren't the person's words in your DM after your \
-question. Quote them exactly.";
-/// Refused when the words agreeing a goal aren't in the person's DM.
-const NOT_AGREED: &str = "Those aren't the person's words in your DM. Quote exactly what they \
-wrote agreeing it.";
 /// Refused when the change applied isn't what the question proposed.
-const ANOTHER_PROPOSAL: &str = "The person answered a different proposal: ask them about this one.";
+const ANOTHER_PROPOSAL: &str = "Your question about this plan proposed something else, so its \
+answer doesn't apply this. Ask about this change: crew.ask_person with plan_id and proposal \
+(exactly the goal, result or met you pass here), then pass their reply as person_said; a short \
+“yes” counts.";
 /// Refused when a goal or its result changes without the person's words.
-pub(super) const ASK_FIRST: &str = "The goal and how it's measured are the person's: ask them \
-(crew.ask_person with plan_id and proposal), then pass their words (person_said).";
-/// Refused when a goal is said met without the person's words.
-pub(super) const MET_ASK: &str = "Only a reading or the person closes a goal. Ask them with the \
-evidence (crew.ask_person with plan_id and proposal: {met}), then pass their words.";
+pub(super) const ASK_FIRST: &str = "The goal and how it's measured are the person's. Ask them: \
+crew.ask_person with plan_id and proposal (the goal and/or result you'd change it to), then pass \
+their reply as person_said; a short “yes” counts. If they asked for a new goal themselves, pass \
+their words as person_said, with the goal said in their words.";
+/// Refused when a plan is given its first goal without the person's words.
+const FIRST_GOAL: &str = "A goal is the person's: give this plan its first goal with the words they agreed it in (agreed: {person_said}, from the last 24 hours), with its result.";
+/// Why the person's words `quote` don't count for `said`, and how the boss
+/// gets them to.
+pub(super) fn not_said(quote: &str, why: NotSaid, said: Said) -> String {
+    let q = crew::one_line(quote, 120);
+    let ask = " Or ask them (crew.ask_person with plan_id and proposal) and pass their reply, which counts however short.";
+    match (why, said) {
+        (NotSaid::TooShort { words, chars }, Said::Changing) => format!(
+            "“{q}” is too little of what the person wrote to change their goal on its own: quote at least {words} words and {chars} characters of their message, exactly.{ask}"
+        ),
+        (NotSaid::TooShort { words, chars }, _) => format!(
+            "“{q}” is only part of a longer message of the person's: quote their whole message, or at least {words} words and {chars} characters of it, exactly as they wrote it."
+        ),
+        (NotSaid::TooOld(at), Said::Answering) => format!(
+            "The person wrote “{q}” before your question ({}): their answer is what they reply after it, on its buttons or in your DM. Wait for their reply, then pass it.",
+            at.format("%Y-%m-%d %H:%M UTC")
+        ),
+        (NotSaid::TooOld(at), Said::Agreeing) => format!(
+            "The person wrote “{q}” at {}, more than 24 hours ago: ask them to confirm it in your DM, then quote their reply.",
+            at.format("%Y-%m-%d %H:%M UTC")
+        ),
+        (NotSaid::TooOld(at), Said::Changing) => format!(
+            "The person wrote “{q}” at {}, before the goal was last said back to them or more than 24 hours ago, so it doesn't change it now.{ask}",
+            at.format("%Y-%m-%d %H:%M UTC")
+        ),
+        (NotSaid::NotFound, Said::Answering) => format!(
+            "Desk looked for “{q}” in {WHERE_LOOKED} since your question, and in their answer on its buttons, and didn't find it word for word. Quote their reply exactly as they wrote it; if they haven't replied yet, wait for it."
+        ),
+        (NotSaid::NotFound, Said::Agreeing) => format!(
+            "Desk looked for “{q}” in {WHERE_LOOKED} over the last 24 hours and didn't find it word for word. Quote one message of theirs exactly as they wrote it: not your own words, and not spread over two messages."
+        ),
+        (NotSaid::NotFound, Said::Changing) => format!(
+            "Desk looked for “{q}” in {WHERE_LOOKED} over the last 24 hours and didn't find it word for word. Quote one message of theirs exactly as they wrote it.{ask}"
+        ),
+    }
+}
 
 fn measure_schema() -> Value {
     let repo = json!({ "type": "string", "description": "The GitHub repository as owner/name" });
@@ -346,11 +387,13 @@ pub(super) struct GoalEdit {
     /// Whether its goal or result changes, so the person is told it again.
     changes: bool,
     /// The person's answer it applies: their words, the question they
-    /// answered and when they wrote it.
-    answered: Option<(String, Uuid, DateTime<Utc>)>,
+    /// answered (none when they asked for it themselves) and when they
+    /// wrote it.
+    answered: Option<(String, Option<Uuid>, DateTime<Utc>)>,
     recorded: Vec<Recorded>,
-    /// The person's words saying it is met, and the question they answered.
-    met: Option<(String, Uuid)>,
+    /// The person's words saying it is met, and the question they
+    /// answered, if they answered one.
+    met: Option<(String, Option<Uuid>)>,
 }
 
 impl GoalEdit {
@@ -361,7 +404,7 @@ impl GoalEdit {
 
     /// The person's answer it applies: their words, the question they
     /// answered and when they wrote it.
-    pub fn answer(&self) -> Option<(&str, Uuid, DateTime<Utc>)> {
+    pub fn answer(&self) -> Option<(&str, Option<Uuid>, DateTime<Utc>)> {
         self.answered
             .as_ref()
             .map(|(words, item, at)| (words.as_str(), *item, *at))
@@ -375,6 +418,9 @@ impl GoalEdit {
             .then_some(ASK_TO_APPLY)
     }
 }
+
+/// Refused when the answer given was applied already.
+pub(super) const APPLIED: &str = "That answer of the person's was applied already: ask them about this change (crew.ask_person with plan_id and proposal) and pass their new reply.";
 
 /// Said when a change to an agreed goal waits on the person.
 const ASK_TO_APPLY: &str = "Put it to the person (crew.ask_person with plan_id, and proposal when it changes the goal or how it's measured), then pass their words (person_said) to apply it.";
@@ -418,16 +464,32 @@ impl CrewHub {
         // are theirs to change.
         let theirs = (p.result.is_some() || result_to.is_some())
             && (p.agreed.is_some() || p.approved_revision.is_some());
-        let answered = match quoted {
-            None if changes && theirs => return Err(ASK_FIRST.into()),
-            None => None,
-            Some(words) => {
+        // A plan's first goal is agreed as a new one's is: on the person's
+        // words of the last day.
+        let agreed = said_of(input, "agreed")?;
+        if agreed.is_some() && (p.result.is_some() || result_to.is_none()) {
+            return Err(match p.result.is_some() {
+                true => "agreed gives a plan its first goal; this one has its goal already. To change it, pass the person's words as person_said.".into(),
+                false => "agreed gives this plan its first goal: say how it's measured too (result).".into(),
+            });
+        }
+        let answered = match (quoted, agreed) {
+            (_, Some(words)) => {
+                let at = self.agreed_at(&b.service, &words)?;
+                Some((words, None, at))
+            }
+            (None, None) if changes && theirs && p.result.is_none() => {
+                return Err(FIRST_GOAL.into())
+            }
+            (None, None) if changes && theirs => return Err(ASK_FIRST.into()),
+            (None, None) => None,
+            (Some(words), None) => {
                 let applying = Proposal {
                     goal: goal_to.map(str::to_string),
                     result: result_to.clone(),
                     met: None,
                 };
-                let (item, at) = self.answer_of(&b.service, p.id, words, &applying).await?;
+                let (item, at) = self.answer_of(&b.service, p, words, &applying).await?;
                 Some((words.to_string(), item, at))
             }
         };
@@ -439,13 +501,7 @@ impl CrewHub {
                     met: Some(words.clone()),
                     ..Proposal::default()
                 };
-                let (item, _) = self
-                    .answer_of(&b.service, p.id, &words, &applying)
-                    .await
-                    .map_err(|e| match e.as_str() {
-                        ASK_FIRST => MET_ASK.to_string(),
-                        _ => e,
-                    })?;
+                let (item, _) = self.answer_of(&b.service, p, &words, &applying).await?;
                 Some((words, item))
             }
         };
@@ -498,95 +554,148 @@ impl CrewHub {
                 .collect::<Vec<_>>());
         }
         if let Some((words, item)) = edit.met {
+            if let Some(item) = item {
+                if !self.ask_applied(item).await? {
+                    return Err(APPLIED.into());
+                }
+            }
             let met = Met {
                 at: crew::now(),
                 by: MetBy::Person,
                 why: format!("the person said: “{}”", crew::one_line(&words, 200)),
             };
-            self.goal_met(p.id, met).await?;
-            self.close_answered(item).await;
-            out["met"] = json!("The goal is met on the person's word: Desk moved its ticket to Done and the plan's closing turn finishes it.");
+            if let Err(e) = self.goal_met(p.id, met).await {
+                if let Some(item) = item {
+                    self.ask_unapplied(item).await;
+                }
+                return Err(e);
+            }
+            out["met"] = json!("The goal is met on the person's word: Desk moved its ticket to Done, and the plan's closing turn comes next, where you write the person its closing summary.");
         }
         Ok(out)
     }
 
-    /// The person's messages in `service`'s DM since `since`.
-    fn person_said_since(
+    /// The person's messages to `service` since `since`, in its DM and the
+    /// DM's threads: of an answer they gave on an item's buttons, only
+    /// what they answered.
+    fn person_words(
         &self,
         service: &AgentService,
         since: DateTime<Utc>,
     ) -> Vec<(DateTime<Utc>, String)> {
-        match self.person(Some(service)) {
-            Some(person) => {
-                super::orchestrator::person_messages(service, &person, since, MESSAGES_READ)
-            }
-            None => Vec::new(),
-        }
+        let Some(person) = self.person(Some(service)) else {
+            return Vec::new();
+        };
+        let mut out = super::orchestrator::person_messages(service, &person, since, MESSAGES_READ);
+        out.extend(super::orchestrator::person_thread_messages(
+            service,
+            &person,
+            since,
+            MESSAGES_READ,
+        ));
+        out.into_iter()
+            .map(|(at, text)| (at, goal::answered_text(&text).to_string()))
+            .collect()
     }
 
-    /// When the person agreed in `quote`, word for word in one of their DM
+    /// When the person agreed in `quote`, word for word in one of their
     /// messages of the last day.
     pub(super) fn agreed_at(
         &self,
         service: &AgentService,
         quote: &str,
     ) -> Result<DateTime<Utc>, String> {
-        let since = crew::now() - AGREED_WITHIN;
+        let now = crew::now();
         goal::said_by(
-            &self.person_said_since(service, since),
+            &self.person_words(service, now - WORDS_LOOKED),
             quote,
-            since,
+            now - AGREED_WITHIN,
             Said::Agreeing,
         )
-        .ok_or_else(|| NOT_AGREED.into())
+        .map_err(|e| not_said(quote, e, Said::Agreeing))
     }
 
-    /// The question about plan `plan` that `applying` answers and when the
-    /// person answered it in `quote`: newer than the question, word for
-    /// word in one of their DM messages, and the very change it proposed.
+    /// The person's word for `applying`, a change to plan `p`'s goal, in
+    /// `quote`: their reply to the question that proposed it, newer than it,
+    /// on its buttons or in their messages, however short; or, when no
+    /// question of the boss's proposed it, their own words asking for it
+    /// unprompted (a goal in their words, or that it is met), newer than the
+    /// goal was last said back. The question it answers, if one, and when.
     pub(super) async fn answer_of(
         &self,
         service: &AgentService,
-        plan: Uuid,
+        p: &Plan,
         quote: &str,
         applying: &Proposal,
-    ) -> Result<(Uuid, DateTime<Utc>), String> {
+    ) -> Result<(Option<Uuid>, DateTime<Utc>), String> {
         let asks = self
             .desk
             .store()
-            .goal_asks(plan)
+            .goal_asks(p.id)
             .await
             .map_err(|e| format!("The questions about this goal couldn't be read: {e}"))?;
-        if asks.is_empty() {
-            return Err(ASK_FIRST.into());
-        }
-        let ask = asks
+        if let Some(ask) = asks
             .iter()
             .find(|a| goal::same_proposal(&a.proposal, applying))
-            .ok_or(ANOTHER_PROPOSAL)?;
-        let at = goal::said_by(
-            &self.person_said_since(service, ask.at),
-            quote,
-            ask.at,
-            Said::Changing,
-        )
-        .ok_or(NOT_THEIR_WORDS)?;
-        Ok((ask.item, at))
+        {
+            let mut messages = self.person_words(service, ask.at - WORDS_LOOKED);
+            messages.extend(ask.answered.clone());
+            let at = goal::said_by(&messages, quote, ask.at, Said::Answering)
+                .map_err(|e| not_said(quote, e, Said::Answering))?;
+            return Ok((Some(ask.item), at));
+        }
+        // A result is changed only on an answer: its parts are the boss's
+        // to put to the person.
+        if applying.result.is_some() {
+            return Err(match asks.is_empty() {
+                true => ASK_FIRST.into(),
+                false => ANOTHER_PROPOSAL.into(),
+            });
+        }
+        let now = crew::now();
+        let since = [Some(now - AGREED_WITHIN), p.read_back_at, p.agreed_at]
+            .into_iter()
+            .flatten()
+            .max()
+            .unwrap_or(now - AGREED_WITHIN);
+        let messages = self.person_words(service, now - WORDS_LOOKED);
+        let at = goal::said_by(&messages, quote, since, Said::Changing).map_err(|e| {
+            let lead = match applying.met.is_some() {
+                true => "No question of yours proposed that it is met, so the person's own words must say so. ",
+                false => "No question of yours proposed this goal, so the person's own words must ask for it. ",
+            };
+            format!("{lead}{}", not_said(quote, e, Said::Changing))
+        })?;
+        if let Some(to) = &applying.goal {
+            let theirs = messages
+                .iter()
+                .filter(|(when, _)| *when == at)
+                .any(|(_, text)| goal::says_goal(text, to));
+            if !theirs {
+                return Err(format!(
+                    "The person's message with “{}” doesn't say the new goal “{}” in their words: set goal to what they wrote, word for word, or ask them (crew.ask_person with plan_id and proposal: {{goal}}) and pass their reply.",
+                    crew::one_line(quote, 120),
+                    crew::one_line(to, 120)
+                ));
+            }
+        }
+        Ok((None, at))
     }
 
-    /// Closes question `item`, the person having answered it.
-    pub(super) async fn close_answered(&self, item: Uuid) {
-        if let Err(e) = self
-            .desk
+    /// Notes that question `item`'s proposal applies now, and closes it:
+    /// whether this did, so one answer is applied once.
+    pub(super) async fn ask_applied(&self, item: Uuid) -> Result<bool, String> {
+        self.desk
             .store()
-            .item_close(
-                item,
-                workforce_desk::open_item::ClosedBy::Person,
-                "Answered",
-            )
+            .ask_applied(item)
             .await
-        {
-            tracing::warn!(%item, error = %e, "an answered goal question wasn't closed");
+            .map_err(|e| format!("The question answered couldn't be noted: {e}"))
+    }
+
+    /// Lets question `item` be answered again: what it was to apply didn't.
+    pub(super) async fn ask_unapplied(&self, item: Uuid) {
+        if let Err(e) = self.desk.store().ask_unapplied(item).await {
+            tracing::warn!(%item, error = %e, "a goal question wasn't let go after its change failed");
         }
     }
 
@@ -599,20 +708,89 @@ impl CrewHub {
         r: &GoalResult,
         agreed_at: DateTime<Utc>,
     ) -> Result<Vec<Reading>, String> {
+        let mut out = Vec::new();
+        for (i, read) in self.read_parts(service, r, agreed_at).await {
+            match read {
+                Ok(reading) => out.push(reading),
+                Err(measure::Unreadable(why)) => return Err(format!("Part {}: {why}", i + 1)),
+            }
+        }
+        Ok(out)
+    }
+
+    /// Each measured part of `r`, agreed at `agreed_at`, read now as the
+    /// person in scope, by its place.
+    async fn read_parts(
+        &self,
+        service: &AgentService,
+        r: &GoalResult,
+        agreed_at: DateTime<Utc>,
+    ) -> Vec<(usize, Result<Reading, measure::Unreadable>)> {
         let at = crew::now();
         let access = access(service);
         self.as_person(service, async {
             let mut out = Vec::new();
             for (i, part) in r.parts.iter().enumerate().filter(|(_, p)| p.measured()) {
                 let n = u16::try_from(i).unwrap_or_default();
-                match measure::read(&access, part, n, agreed_at, at).await {
-                    Ok(reading) => out.push(reading),
-                    Err(measure::Unreadable(why)) => return Err(format!("Part {}: {why}", i + 1)),
-                }
+                out.push((i, measure::read(&access, part, n, agreed_at, at).await));
             }
-            Ok(out)
+            out
         })
         .await
+    }
+
+    /// Plan `p`'s measured parts read again, as the person, and kept: a
+    /// part that can't be read where it says is kept as a failed reading,
+    /// never stopping what reads it. The goal is met when every part reads
+    /// met. The plan as it is after, when it has an agreed goal to read.
+    pub(super) async fn goal_reread(
+        &self,
+        service: &AgentService,
+        p: &PlanDetail,
+    ) -> Option<PlanDetail> {
+        use workforce_desk::plan::PlanState;
+        let plan = &p.summary.plan;
+        let r = plan.result.as_ref()?;
+        let reads = plan.met.is_none()
+            && plan.approved_revision.is_some()
+            && matches!(plan.state, PlanState::Running | PlanState::Paused)
+            && r.parts.iter().any(Measure::measured);
+        if !reads {
+            return None;
+        }
+        let agreed_at = plan.agreed_at.unwrap_or(plan.created_at);
+        let at = crew::now();
+        let readings: Vec<Reading> = self
+            .read_parts(service, r, agreed_at)
+            .await
+            .into_iter()
+            .map(|(i, read)| match read {
+                Ok(reading) => reading,
+                Err(measure::Unreadable(why)) => Reading {
+                    at,
+                    part: u16::try_from(i).unwrap_or_default(),
+                    value: None,
+                    met: false,
+                    words: String::new(),
+                    evidence: Vec::new(),
+                    failed: Some(crew::one_line(&why, 300)),
+                },
+            })
+            .collect();
+        self.keep_readings(plan.id, r, &readings).await;
+        let fresh = self.desk.plan(plan.id).await.ok()?;
+        let Some(progress) = fresh.goal.as_ref().filter(|g| goal::met(g)) else {
+            return Some(fresh);
+        };
+        let met = Met {
+            at,
+            by: MetBy::Result,
+            why: format!("it reads met: {}", goal::progress_line(r, progress)),
+        };
+        if let Err(e) = self.desk.goal_met(plan.id, &met).await {
+            tracing::warn!(plan = %plan.id, error = %e, "a goal read met wasn't kept met");
+        }
+        self.desk.plan(plan.id).await.ok()
     }
 
     /// `read` run as the person `service` works for: what GitHub is read
@@ -660,7 +838,8 @@ impl CrewHub {
     }
 
     /// Plan `id`'s goal met as `met` says: kept once, its ticket moved to
-    /// Done by Desk, and its closing turn run, which finishes it.
+    /// Done by Desk, and its closing turn, which finishes it, run after on
+    /// its own as any plan turn is: never inside the call that met it.
     pub(super) async fn goal_met(&self, id: Uuid, met: Met) -> Result<(), String> {
         let why = met.why.clone();
         let first = self
@@ -669,7 +848,11 @@ impl CrewHub {
             .await
             .map_err(|e| format!("The goal couldn't be marked met: {e}"))?;
         if first {
-            Box::pin(self.plan_turn_now(id, vec![format!("The goal is met: {why}")])).await;
+            let crew = self.me();
+            tokio::spawn(async move {
+                crew.plan_turn(id, vec![format!("The goal is met: {why}")])
+                    .await;
+            });
         }
         Ok(())
     }
@@ -783,27 +966,31 @@ impl CrewHub {
         goal::goals_block(&standing, &facts)
     }
 
-    /// The sessions boss `service` runs and sent work to after the person
-    /// last spoke with it, with no goal saved for them: a line each, for
-    /// its turn's context and its nudges.
+    /// The sessions boss `service` started or was handed and sent work to
+    /// as the person asked for it, in the last day, with no agreed goal
+    /// holding them: a line each, for its turn's context and its nudges.
     pub(super) async fn unsaved_lines(&self, service: &AgentService) -> Vec<(Uuid, String)> {
+        use workforce_desk::charge::How;
         let boss = service.agent_id.as_str();
         let runs: Vec<Uuid> = self
             .desk
             .charges()
             .into_iter()
-            .filter(|c| c.boss == boss)
+            .filter(|c| c.boss == boss && matches!(c.how, How::Started | How::Handed))
             .map(|c| c.session)
             .collect();
         if runs.is_empty() {
             return Vec::new();
         }
+        let Some(person) = self.person(Some(service)) else {
+            return Vec::new();
+        };
         let since = crew::now() - AGREED_WITHIN;
-        let turns: Vec<DateTime<Utc>> = self
-            .person_said_since(service, since)
-            .into_iter()
-            .map(|(at, _)| at)
-            .collect();
+        let turns: Vec<DateTime<Utc>> =
+            super::orchestrator::person_messages(service, &person, since, MESSAGES_READ)
+                .into_iter()
+                .map(|(at, _)| at)
+                .collect();
         let sends = self.boss_sends(boss, &runs, since).await;
         let on_goals = self.goal_sessions(boss).await;
         goal::unsaved_goals(&runs, &sends, &turns, &on_goals)
@@ -829,7 +1016,9 @@ impl CrewHub {
         }
     }
 
-    /// The sessions boss `boss`'s open goals hold: their tickets' sessions.
+    /// The sessions boss `boss`'s agreed open goals hold: their tickets'
+    /// sessions. A draft holds none: saving the goal the person agreed is
+    /// what does.
     async fn goal_sessions(&self, boss: &str) -> HashSet<Uuid> {
         let mut out = HashSet::new();
         for p in self
@@ -838,6 +1027,8 @@ impl CrewHub {
             .open_goals(Some(boss))
             .await
             .unwrap_or_default()
+            .into_iter()
+            .filter(|p| p.approved_revision.is_some())
         {
             for t in self.desk.plan_tickets(p.id).await.unwrap_or_default() {
                 out.extend(
@@ -898,24 +1089,26 @@ async fn github_found(
 /// What the boss is told of a session it sent work and saved no goal for.
 pub(super) fn unsaved_line(name: &str, session: Uuid) -> String {
     format!(
-        "{name} (session {session}) has work from you and no saved goal: if the person agreed a goal for it, save it with crew.plan (agreed: their words; result), adopting the session."
+        "{name} (session {session}) has work from you and no agreed goal saved: if the person agreed a goal for it, save it with crew.plan (agreed: their words from the last 24 hours, or ask them to confirm older ones; result), adopting the session with tickets: [{{session: \"{session}\"}}]."
     )
 }
 
-/// Why the boss can't move a goal's ticket on: "MAN-768 stands for the goal
-/// “…”, which isn't met (…); Desk moves it to Done when the goal is met."
+/// Why the boss can't move a goal's ticket on, and what it does instead:
+/// "MAN-768 stands for the goal “…”, which isn't met (…); Desk moves it to
+/// Done when the goal is met. …"
 pub(super) fn held_line(key: &str, p: &Plan, progress: &str) -> String {
     format!(
-        "{key} stands for the goal “{}”, which isn't met ({progress}); Desk moves it to Done when the goal is met.",
-        crew::one_line(&p.goal, 160)
+        "{key} stands for the goal “{}”, which isn't met ({progress}); Desk moves it to Done when the goal is met. Keep the work going toward it; if you think it is done, ask the person with what shows it (crew.ask_person with plan_id {} and proposal: {{met: \"<what shows it>\"}}), then pass their reply with crew.plan_update met: {{person_said}}.",
+        crew::one_line(&p.goal, 160),
+        p.id
     )
 }
 
-/// What a plan turn says of a plan whose tickets are all settled while its
-/// goal isn't met.
-pub(super) fn settled_unmet(progress: &str) -> String {
+/// What a plan turn says of plan `plan` whose tickets are all settled
+/// while its goal isn't met.
+pub(super) fn settled_unmet(plan: Uuid, progress: &str) -> String {
     format!(
-        "Every ticket is settled but the goal isn't met: {progress}. Add the work it needs (crew.plan_update tickets; the person's agreement covers it), or ask the person with the evidence."
+        "Every ticket is settled but the goal isn't met: {progress}. Add the work it needs with crew.plan_update (plan_id {plan}, tickets; the person's agreement covers it). If you think it is met, ask them with what shows it: crew.ask_person with plan_id {plan} and proposal: {{met: \"<what shows it>\"}}, then pass their reply with crew.plan_update met: {{person_said}}; a short “yes” counts."
     )
 }
 
@@ -1029,12 +1222,16 @@ mod tests {
     #[test]
     fn the_lines_say_what_to_do() {
         let s = Uuid::nil();
-        assert_eq!(
-            unsaved_line("acme-web", s),
-            format!("acme-web (session {s}) has work from you and no saved goal: if the person agreed a goal for it, save it with crew.plan (agreed: their words; result), adopting the session.")
-        );
-        assert!(settled_unmet("CI: 9 minutes").starts_with(
+        assert!(unsaved_line("acme-web", s).starts_with(&format!(
+            "acme-web (session {s}) has work from you and no agreed goal saved: if the person agreed a goal for it, save it with crew.plan (agreed: their words from the last 24 hours"
+        )));
+        let unmet = settled_unmet(s, "CI: 9 minutes");
+        assert!(unmet.starts_with(
             "Every ticket is settled but the goal isn't met: CI: 9 minutes. Add the work it needs"
         ));
+        assert!(unmet.contains(&format!(
+            "crew.ask_person with plan_id {s} and proposal: {{met:"
+        )));
+        assert!(unmet.contains("crew.plan_update met: {person_said}"));
     }
 }

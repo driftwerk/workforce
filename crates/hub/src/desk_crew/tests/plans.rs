@@ -522,6 +522,20 @@ async fn an_unbound_boss_starts_its_own_plan_only_when_the_person_said_to() {
         assert!(p.summary.plan.revision > before);
         assert_eq!(p.summary.plan.approved_revision, Some(p.summary.plan.revision));
         assert!(d.plan_needs().is_empty());
+        // So does one its goal doesn't cover: a raised limit.
+        let r = update
+            .execute(json!({ "plan_id": id.to_string(), "parallel": 2, "why": "Fewer at once." }))
+            .await
+            .unwrap();
+        assert!(r.success, "{r:?}");
+        let r = update
+            .execute(json!({ "plan_id": id.to_string(), "parallel": 3, "why": "One more at once." }))
+            .await
+            .unwrap();
+        assert!(r.success, "{r:?}");
+        assert_eq!(r.output["change"], "scope", "{r:?}");
+        assert_eq!(r.output["applied"], true, "{r:?}");
+        assert!(d.plan_needs().is_empty());
     })
     .await;
 }
@@ -1733,11 +1747,11 @@ async fn a_held_bosss_plans_pause_until_the_person_lets_it_go_on() {
     .await;
 }
 
-/// Below unbound, start_now changes nothing: a boss's plan waits for the
-/// person whatever it quotes. A start_now that doesn't read changes
+/// Bound at Act, start_now is the person's agreement, as `agreed` is: a
+/// draft starts on their checked words. One that doesn't read changes
 /// nothing else of the call either.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_bound_boss_cant_start_its_own_plan_whatever_it_quotes() {
+async fn a_bound_boss_starts_its_own_plan_only_on_the_persons_words() {
     with_test_pool(workforce_desk::store::build_pool, |pool| async move {
         let dir = tempfile::tempdir().unwrap();
         let (overseer, state, d, _llm) = hub_with(dir.path(), pool, ACTS).await;
@@ -1746,7 +1760,6 @@ async fn a_bound_boss_cant_start_its_own_plan_whatever_it_quotes() {
             overseer.tools.has("crew.plan").then_some(())
         })
         .await;
-        person_says(&overseer, "Start it now, go ahead");
         let r = overseer
             .tools
             .get("crew.plan")
@@ -1755,7 +1768,6 @@ async fn a_bound_boss_cant_start_its_own_plan_whatever_it_quotes() {
                 "result": judged(),
                 "goal": "Make the suite green",
                 "tickets": tickets(dir.path(), 2),
-                "start_now": { "person_said": "Start it now" },
             }))
             .await
             .unwrap();
@@ -1767,16 +1779,6 @@ async fn a_bound_boss_cant_start_its_own_plan_whatever_it_quotes() {
             .parse()
             .unwrap();
         let update = overseer.tools.get("crew.plan_update").unwrap();
-        let r = update
-            .execute(json!({
-                "plan_id": id.to_string(),
-                "start_now": { "person_said": "Go ahead" },
-                "why": "The person asked.",
-            }))
-            .await
-            .unwrap();
-        assert!(r.success, "{r:?}");
-        assert_eq!(r.output["plan"]["state"], "proposed", "{r:?}");
         // One that doesn't read: refused before the goal changes.
         let before = d.plan(id).await.unwrap().summary.plan.revision;
         let r = update
@@ -1795,6 +1797,19 @@ async fn a_bound_boss_cant_start_its_own_plan_whatever_it_quotes() {
         tokio::time::sleep(Duration::from_millis(400)).await;
         assert!(started(&d).is_empty(), "nothing starts");
         assert_eq!(d.plan_needs().len(), 1, "the person is asked");
+        // Their own words start it.
+        person_says(&overseer, "Start it now, go ahead");
+        let r = update
+            .execute(json!({
+                "plan_id": id.to_string(),
+                "start_now": { "person_said": "go ahead" },
+                "why": "The person asked.",
+            }))
+            .await
+            .unwrap();
+        assert!(r.success, "{r:?}");
+        assert_ne!(r.output["plan"]["state"], "proposed", "{r:?}");
+        assert!(d.plan_needs().is_empty());
     })
     .await;
 }

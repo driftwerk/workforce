@@ -35,6 +35,13 @@ async fn github() -> wiremock::MockServer {
         .mount(&gh)
         .await;
     Mock::given(method("GET"))
+        .and(path("/repos/acme/flaky/actions/runs"))
+        .respond_with(
+            ResponseTemplate::new(500).set_body_json(json!({ "message": "Server Error" })),
+        )
+        .mount(&gh)
+        .await;
+    Mock::given(method("GET"))
         .and(path("/repos/acme/nope/actions/runs"))
         .respond_with(ResponseTemplate::new(404).set_body_json(json!({ "message": "Not Found" })))
         .mount(&gh)
@@ -133,6 +140,18 @@ async fn a_goal_the_person_agreed_is_kept_by_desk_until_it_is_met() {
         })
         .await;
 
+        // "20:14": work sent before the person said anything isn't theirs.
+        let r = run(
+            &overseer,
+            "crew.nudge",
+            json!({ "session_id": s.id.to_string(), "message": "Look at the CI logs.", "reason": "Checking" }),
+        )
+        .await;
+        assert!(r.success, "{r:?}");
+        assert!(
+            !r.output["note"].as_str().unwrap_or_default().contains("no agreed goal saved"),
+            "{r:?}"
+        );
         // Work sent after the person spoke, with no goal saved: said at once.
         person_says(&overseer, "Yes please, get CI on main green today");
         let r = run(
@@ -145,7 +164,7 @@ async fn a_goal_the_person_agreed_is_kept_by_desk_until_it_is_met() {
         assert!(
             r.output["note"]
                 .as_str()
-                .is_some_and(|n| n.contains("has work from you and no saved goal: if the person agreed a goal for it")),
+                .is_some_and(|n| n.contains("has work from you and no agreed goal saved: if the person agreed a goal for it")),
             "{r:?}"
         );
 
@@ -160,7 +179,7 @@ async fn a_goal_the_person_agreed_is_kept_by_desk_until_it_is_met() {
         // Words the person never wrote save nothing.
         let r = run(&overseer, "crew.plan", plan("ship it all tonight", green("acme/web", 1))).await;
         assert!(!r.success);
-        assert!(r.error.unwrap().contains("aren't the person's words"));
+        assert!(r.error.unwrap().contains("didn't find it word for word"));
         // A repository GitHub hasn't got refuses it as it is saved.
         let r = run(&overseer, "crew.plan", plan("get CI on main green", green("acme/nope", 1))).await;
         assert!(!r.success, "{r:?}");
@@ -241,7 +260,7 @@ async fn a_goal_the_person_agreed_is_kept_by_desk_until_it_is_met() {
         )
         .await;
         assert!(!r.success);
-        assert!(r.error.unwrap().contains("answered a different proposal"));
+        assert!(r.error.unwrap().contains("proposed something else"));
         let r = run(
             &overseer,
             "crew.plan_update",
@@ -263,7 +282,10 @@ async fn a_goal_the_person_agreed_is_kept_by_desk_until_it_is_met() {
         )
         .await;
         assert!(!r.success);
-        assert!(r.error.unwrap().starts_with("Only a reading or the person closes a goal"));
+        assert!(r
+            .error
+            .unwrap()
+            .starts_with("No question of yours proposed that it is met"));
 
         // Every ticket settled while the goal isn't met: the plan runs on,
         // and its turn is told once.
@@ -324,6 +346,406 @@ async fn at_suggest_a_boss_only_proposes_what_the_person_agreed() {
         .await;
         assert!(!r.success, "a result is said");
         assert!(d.plans(None, None).await.unwrap().is_empty());
+    })
+    .await;
+}
+
+/// GitHub where acme/web's CI on main reads red once, as the goal is
+/// saved, and green from then on.
+async fn github_turning_green() -> wiremock::MockServer {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+    let gh = MockServer::start().await;
+    let runs = |conclusion: &str| {
+        let now = chrono::Utc::now().to_rfc3339();
+        json!({ "total_count": 1, "workflow_runs": [{ "id": 8, "name": "CI", "head_branch": "main",
+            "status": "completed", "conclusion": conclusion, "run_number": 8,
+            "created_at": now, "run_started_at": now, "updated_at": now }] })
+    };
+    Mock::given(method("GET"))
+        .and(path("/repos/acme/web/actions/runs"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(runs("failure")))
+        .up_to_n_times(1)
+        .with_priority(1)
+        .mount(&gh)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/repos/acme/web/actions/runs"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(runs("success")))
+        .mount(&gh)
+        .await;
+    gh
+}
+
+/// A session of the boss's on `folder`, working on `goal`.
+async fn session_on(
+    boss: &AgentService,
+    d: &Desk,
+    folder: &str,
+    goal: &str,
+) -> workforce_desk::model::SessionView {
+    let r = run(
+        boss,
+        "crew.start_session",
+        json!({ "folder": folder, "goal": goal, "reason": "Sam asked" }),
+    )
+    .await;
+    assert!(r.success, "{r:?}");
+    eventually("its session", async || {
+        d.list().into_iter().find(|v| v.goal == goal)
+    })
+    .await
+}
+
+/// The goal plan the person agreed, saved by the boss for session `s`.
+async fn agreed_plan(
+    boss: &AgentService,
+    s: &workforce_desk::model::SessionView,
+    result: Value,
+) -> uuid::Uuid {
+    person_says(boss, "Yes, keep the docs build green");
+    let r = run(
+        boss,
+        "crew.plan",
+        json!({ "goal": "Keep the docs build green", "agreed": { "person_said": "keep the docs build green" },
+                "result": result, "tickets": [{ "session": s.id.to_string() }] }),
+    )
+    .await;
+    assert!(r.success, "{r:?}");
+    r.output["proposed"]["plan_id"]
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap()
+}
+
+/// The newest question of the boss's about plan `id` not yet applied.
+async fn asked(d: &Desk, id: uuid::Uuid) -> uuid::Uuid {
+    d.store().goal_asks(id).await.unwrap()[0].item
+}
+
+/// The person writes `text` in a thread of `boss`'s DM.
+fn person_says_in_a_thread(boss: &AgentService, text: &str) {
+    let channel = workforce_core::desk::dm_thread_channel(&uuid::Uuid::new_v4().to_string());
+    let mut thread = boss
+        .sessions
+        .get_or_create(&channel, PERSON, "desk")
+        .unwrap();
+    thread.add_user_message(text, None);
+    boss.sessions.save(&thread).unwrap();
+    boss.sessions
+        .append_to_archive(&thread.id, thread.messages.last().unwrap())
+        .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_persons_short_reply_on_the_buttons_in_the_dm_or_a_thread_applies_what_was_asked_once()
+{
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(dir.path()).unwrap();
+        let gh = github().await;
+        let (overseer, crew, d, _llm) = boss_on(&base, pool, ACTS, &gh).await;
+        let s = session_on(&overseer, &d, &base.to_string_lossy(), "Fix the docs build").await;
+        let id = agreed_plan(&overseer, &s, judged()).await;
+
+        // On the item's buttons: "yes" answers what it proposed.
+        let to = "Keep the docs build green and fast";
+        let r = run(
+            &overseer,
+            "crew.ask_person",
+            json!({ "text": "Shall the goal also be a fast docs build?", "plan_id": id.to_string(),
+                    "proposal": { "goal": to } }),
+        )
+        .await;
+        assert!(r.success, "{r:?}");
+        let item = asked(&d, id).await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        crew.answer_item(item, "yes").await.unwrap();
+        let change = json!({ "plan_id": id.to_string(), "goal": to, "person_said": "yes", "why": "They said yes." });
+        let r = run(&overseer, "crew.plan_update", change.clone()).await;
+        assert!(r.success, "{r:?}");
+        let p = d.plan(id).await.unwrap().summary.plan;
+        assert_eq!(p.goal, to);
+        assert!(!p.awaiting(), "their answer approves it");
+        // Applied once: the same answer again is no answer.
+        let again = json!({ "plan_id": id.to_string(), "goal": "Keep the docs build fast", "person_said": "yes", "why": "Again." });
+        let r = run(&overseer, "crew.plan_update", again).await;
+        assert!(!r.success, "{r:?}");
+        assert!(r.error.unwrap().contains("Or ask them"), "the refusal says how");
+
+        // Answered in the DM, the question closed by the boss first.
+        let to = "Keep the docs build green, fast and small";
+        let r = run(
+            &overseer,
+            "crew.ask_person",
+            json!({ "text": "Shall the goal also be a small docs build?", "plan_id": id.to_string(),
+                    "proposal": { "goal": to } }),
+        )
+        .await;
+        assert!(r.success, "{r:?}");
+        let item = asked(&d, id).await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        person_says(&overseer, "ok");
+        d.store()
+            .item_close(item, workforce_desk::open_item::ClosedBy::Boss, "They said ok.")
+            .await
+            .unwrap();
+        let r = run(
+            &overseer,
+            "crew.plan_update",
+            json!({ "plan_id": id.to_string(), "goal": to, "person_said": "ok", "why": "They said ok." }),
+        )
+        .await;
+        assert!(r.success, "{r:?}");
+        assert_eq!(d.plan(id).await.unwrap().summary.plan.goal, to);
+
+        // Met, answered in a thread of the DM: Desk closes its ticket, and
+        // the closing turn runs after the call, which finishes the plan.
+        let r = run(
+            &overseer,
+            "crew.ask_person",
+            json!({ "text": "The docs build is green and fast: is it done?", "plan_id": id.to_string(),
+                    "proposal": { "met": "the docs build ran green in 2 minutes" } }),
+        )
+        .await;
+        assert!(r.success, "{r:?}");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        person_says_in_a_thread(&overseer, "Yes!");
+        let r = run(
+            &overseer,
+            "crew.plan_update",
+            json!({ "plan_id": id.to_string(), "met": { "person_said": "yes" }, "why": "They said so." }),
+        )
+        .await;
+        assert!(r.success, "{r:?}");
+        let p = d.plan(id).await.unwrap().summary.plan;
+        assert_eq!(p.met.as_ref().map(|m| m.by), Some(workforce_desk::goal::MetBy::Person));
+        let t = d.ticket(p.goal_ticket.unwrap()).await.unwrap();
+        assert_eq!(t.ticket.state, TicketState::Done);
+        eventually("the closing turn to finish it", async || {
+            (d.plan(id).await.unwrap().summary.plan.state == PlanState::Done).then_some(())
+        })
+        .await;
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_measured_goal_is_met_by_its_reading_in_the_plans_turn() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(dir.path()).unwrap();
+        let gh = github_turning_green().await;
+        let (overseer, crew, d, _llm) = boss_on(&base, pool, ACTS, &gh).await;
+        let s = session_on(&overseer, &d, &base.to_string_lossy(), "Make CI green").await;
+        let id = agreed_plan(&overseer, &s, green("acme/web", 1)).await;
+        let p = d.plan(id).await.unwrap().summary.plan;
+        assert_eq!(p.state, PlanState::Running);
+        assert!(p.met.is_none(), "red as it was saved");
+
+        crew.plan_turn_now(id, vec!["A turn of its session ended.".into()])
+            .await;
+        let p = d.plan(id).await.unwrap().summary.plan;
+        assert_eq!(
+            p.met.as_ref().map(|m| m.by),
+            Some(workforce_desk::goal::MetBy::Result)
+        );
+        assert_eq!(p.state, PlanState::Done, "closed in that turn");
+        let t = d.ticket(p.goal_ticket.unwrap()).await.unwrap();
+        assert_eq!(t.ticket.state, TicketState::Done);
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_agreed_goal_covers_work_added_toward_it_and_its_own_ticket_waits_for_the_person() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(dir.path()).unwrap();
+        let folder = base.to_string_lossy().to_string();
+        let gh = github().await;
+        let (overseer, _crew, d, _llm) = boss_on(&base, pool, ACTS, &gh).await;
+        let s = session_on(&overseer, &d, &folder, "Fix the docs build").await;
+        let id = agreed_plan(&overseer, &s, judged()).await;
+        let goal_ticket = d.plan(id).await.unwrap().summary.plan.goal_ticket.unwrap();
+        let key = d.ticket(goal_ticket).await.unwrap().key.unwrap();
+
+        // A ticket added toward it applies at once.
+        let r = run(
+            &overseer,
+            "crew.plan_update",
+            json!({ "plan_id": id.to_string(), "why": "The lint step fails too.",
+                    "tickets": [{ "key": key, "folder": folder }, { "title": "Fix the lint step", "folder": folder }] }),
+        )
+        .await;
+        assert!(r.success, "{r:?}");
+        assert_eq!(r.output["applied"], true, "{r:?}");
+        assert!(!d.plan(id).await.unwrap().summary.plan.awaiting());
+
+        // Its own ticket's words are the person's to change.
+        let r = run(
+            &overseer,
+            "crew.plan_update",
+            json!({ "plan_id": id.to_string(), "why": "Narrower.",
+                    "tickets_edit": [{ "key": key, "body": "Only the API docs." }] }),
+        )
+        .await;
+        assert!(r.success, "{r:?}");
+        assert_eq!(r.output["applied"], false, "{r:?}");
+        assert!(r.output["note"].as_str().unwrap().contains("crew.ask_person with plan_id"), "{r:?}");
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_dropped_goal_ticket_waits_for_the_person() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(dir.path()).unwrap();
+        let folder = base.to_string_lossy().to_string();
+        let gh = github().await;
+        let (overseer, _crew, d, _llm) = boss_on(&base, pool, ACTS, &gh).await;
+        let s = session_on(&overseer, &d, &folder, "Fix the docs build").await;
+        let id = agreed_plan(&overseer, &s, judged()).await;
+        let r = run(
+            &overseer,
+            "crew.plan_update",
+            json!({ "plan_id": id.to_string(), "why": "Another way.",
+                    "tickets": [{ "title": "Rewrite the docs build", "folder": folder }] }),
+        )
+        .await;
+        assert!(r.success, "{r:?}");
+        assert_eq!(r.output["applied"], false, "{r:?}");
+        assert!(d.plan(id).await.unwrap().summary.plan.awaiting());
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_machines_session_gets_its_goal_on_the_plan_that_runs_it() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(dir.path()).unwrap();
+        let folder = base.to_string_lossy().to_string();
+        let gh = github().await;
+        let (overseer, crew, d, _llm) = boss_on(&base, pool, ACTS, &gh).await;
+        // A plan of the boss's, approved, with no goal: its ticket runs on
+        // the devbox.
+        let p = super::plans::proposed(&d, &base, 1).await;
+        let id = p.summary.plan.id;
+        d.approve_plan(id, 1, &By::you()).await.unwrap();
+        let ticket = p.tickets[0].ticket.ticket.id;
+        let key = p.tickets[0].ticket.key.clone().unwrap();
+        let remote = uuid::Uuid::new_v4();
+        let item = format!("devbox/{remote}");
+        crew.machine_seen.lock().insert(
+            item.clone(),
+            crate::desk_crew::plan::MachineSeen {
+                plan: id,
+                ticket,
+                boss: "desk".into(),
+                goal: p.summary.plan.goal.clone(),
+                key: key.clone(),
+                engine: None,
+                state: "working".into(),
+                reply: None,
+                misses: 0,
+            },
+        );
+
+        // A new plan for it is pointed at the one that runs it.
+        person_says(&overseer, "Yes, get the flaky tests fixed today");
+        let r = run(
+            &overseer,
+            "crew.plan",
+            json!({ "goal": "Fix the flaky tests", "agreed": { "person_said": "get the flaky tests fixed today" },
+                    "result": judged(), "tickets": [{ "session": item }] }),
+        )
+        .await;
+        assert!(!r.success);
+        let why = r.error.unwrap();
+        assert!(why.contains(&format!("runs for your plan {id}")), "{why}");
+        // That plan takes the goal on the person's words.
+        let r = run(
+            &overseer,
+            "crew.plan_update",
+            json!({ "plan_id": id.to_string(), "result": judged(),
+                    "agreed": { "person_said": "get the flaky tests fixed today" }, "why": "They agreed it." }),
+        )
+        .await;
+        assert!(r.success, "{r:?}");
+        let p = d.plan(id).await.unwrap().summary.plan;
+        assert!(p.result.is_some());
+        assert_eq!(p.agreed.as_deref(), Some("get the flaky tests fixed today"));
+        assert!(!p.awaiting());
+        let _ = folder;
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_bound_boss_starts_a_plan_on_the_persons_words_and_is_told_how_when_they_dont_check() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(dir.path()).unwrap();
+        let folder = base.to_string_lossy().to_string();
+        let gh = github().await;
+        let (overseer, _crew, d, _llm) = boss_on(&base, pool, ACTS, &gh).await;
+        let plan = |said: &str| {
+            json!({ "goal": "Make the suite green", "start_now": { "person_said": said },
+                    "result": judged(), "tickets": [{ "title": "Fix it", "folder": folder }] })
+        };
+        let r = run(&overseer, "crew.plan", plan("go ahead, start it")).await;
+        assert!(!r.success);
+        let why = r.error.unwrap();
+        assert!(why.contains("Quote one message of theirs exactly"), "{why}");
+        assert!(d.plans(None, None).await.unwrap().is_empty());
+        person_says(&overseer, "Go ahead, start it");
+        let r = run(&overseer, "crew.plan", plan("go ahead, start it")).await;
+        assert!(r.success, "{r:?}");
+        let id: uuid::Uuid = r.output["proposed"]["plan_id"]
+            .as_str()
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert_eq!(
+            d.plan(id).await.unwrap().summary.plan.state,
+            PlanState::Running
+        );
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_part_whose_reads_keep_failing_is_repaired_where_it_reads_from() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(dir.path()).unwrap();
+        let gh = github().await;
+        let (overseer, crew, d, _llm) = boss_on(&base, pool, ACTS, &gh).await;
+        let s = session_on(&overseer, &d, &base.to_string_lossy(), "Make CI green").await;
+        // Read failing as it is saved: kept, not refused.
+        let id = agreed_plan(&overseer, &s, green("acme/flaky", 1)).await;
+        let repair = json!({ "plan_id": id.to_string(), "why": "The repository moved.",
+            "repair": { "part": 1, "measure": { "kind": "ci", "repo": "acme/web", "branch": "main",
+                "want": { "kind": "green", "runs": 1 } } } });
+        let r = run(&overseer, "crew.plan_update", repair.clone()).await;
+        assert!(!r.success, "{r:?}");
+        assert!(r
+            .error
+            .unwrap()
+            .contains("only once its newest 3 reads failed"));
+        crew.plan_turn_now(id, vec!["One.".into()]).await;
+        crew.plan_turn_now(id, vec!["Two.".into()]).await;
+        let r = run(&overseer, "crew.plan_update", repair).await;
+        assert!(r.success, "{r:?}");
+        let p = d.plan(id).await.unwrap().summary.plan;
+        assert_eq!(
+            p.result,
+            Some(serde_json::from_value(green("acme/web", 1)).unwrap())
+        );
+        assert!(!p.awaiting(), "a repair needs no approval");
     })
     .await;
 }

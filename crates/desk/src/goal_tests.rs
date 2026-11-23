@@ -349,53 +349,52 @@ fn said_by_finds_the_quote_in_one_message_after_since() {
         (at(0), "Hmm, not sure yet.".to_string()),
         (at(10), "Yes, go ahead and make CI faster!".to_string()),
         (at(20), "Also the deploy".to_string()),
+        (at(30), "ok".to_string()),
     ];
+    let agreed = |quote: &str, since: i64| said_by(&messages, quote, at(since), Said::Agreeing);
+    assert_eq!(agreed("go ahead and make CI faster", -60), Ok(at(10)));
     assert_eq!(
-        said_by(
-            &messages,
-            "go ahead and make CI faster",
-            at(-60),
-            Said::Agreeing
-        ),
-        Some(at(10))
-    );
-    assert_eq!(
-        said_by(&messages, "“Yes, go ahead”", at(-60), Said::Agreeing),
-        Some(at(10)),
+        agreed("“Yes, go ahead”", -60),
+        Ok(at(10)),
         "quotes, case and punctuation are folded"
     );
     assert_eq!(
-        said_by(&messages, "faster also the deploy", at(-60), Said::Agreeing),
-        None,
+        agreed("faster also the deploy", -60),
+        Err(NotSaid::NotFound),
         "a quote across two messages"
     );
     assert_eq!(
-        said_by(&messages, "go ahead and make", at(10), Said::Agreeing),
-        None,
-        "before since"
+        agreed("go ahead and make", 10),
+        Err(NotSaid::TooOld(at(10))),
+        "only before since"
+    );
+    assert_eq!(agreed("go ahead and break CI", -60), Err(NotSaid::NotFound));
+    assert_eq!(agreed("make CI", -60), Ok(at(10)));
+    assert_eq!(
+        agreed("ahead", -60),
+        Err(NotSaid::TooShort { words: 2, chars: 6 }),
+        "one word of a longer message"
     );
     assert_eq!(
-        said_by(&messages, "go ahead and break CI", at(-60), Said::Agreeing),
-        None
-    );
-    assert_eq!(
-        said_by(&messages, "make CI", at(-60), Said::Agreeing),
-        Some(at(10))
-    );
-    assert_eq!(
-        said_by(&messages, "ahead", at(-60), Said::Agreeing),
-        None,
-        "one word"
-    );
-    assert_eq!(
-        said_by(&[(at(1), "go on".into())], "go on", at(-60), Said::Agreeing),
-        None,
-        "under 6 characters"
+        agreed("OK.", -60),
+        Ok(at(30)),
+        "the whole of a short message"
     );
     assert_eq!(
         said_by(&messages, "make CI faster", at(-60), Said::Changing),
-        None,
+        Err(NotSaid::TooShort {
+            words: 4,
+            chars: 15
+        }),
         "three words don't change a goal"
+    );
+    assert_eq!(
+        said_by(&messages, "ok", at(-60), Said::Changing),
+        Err(NotSaid::TooShort {
+            words: 4,
+            chars: 15
+        }),
+        "nor a whole short message, unprompted"
     );
     assert_eq!(
         said_by(
@@ -404,8 +403,51 @@ fn said_by_finds_the_quote_in_one_message_after_since() {
             at(-60),
             Said::Changing
         ),
-        Some(at(10))
+        Ok(at(10))
     );
+}
+
+#[test]
+fn a_short_reply_answers_a_question_whole_and_never_as_part_of_another() {
+    let messages = vec![
+        (at(0), "yes".to_string()),
+        (at(10), "Yes, do it".to_string()),
+        (at(20), "No — yes, I see why, but not now".to_string()),
+    ];
+    let answered = |quote: &str, since: i64| said_by(&messages, quote, at(since), Said::Answering);
+    assert_eq!(answered("yes", -60), Ok(at(0)));
+    assert_eq!(answered("Yes, do it", -60), Ok(at(10)));
+    assert_eq!(answered("yes, do", -60), Ok(at(10)), "two words of a reply");
+    assert_eq!(
+        answered("yes", 0),
+        Err(NotSaid::TooShort { words: 2, chars: 6 }),
+        "a lone yes inside a longer reply after the question isn't one"
+    );
+    assert_eq!(
+        answered("yes", 5),
+        Err(NotSaid::TooShort { words: 2, chars: 6 })
+    );
+    assert_eq!(
+        said_by(&messages[..1], "yes", at(5), Said::Answering),
+        Err(NotSaid::TooOld(at(0))),
+        "before the question"
+    );
+    assert_eq!(answered("go", -60), Err(NotSaid::NotFound));
+}
+
+#[test]
+fn an_answer_from_an_items_buttons_is_only_what_follows_its_question() {
+    let posted = format!("{ANSWER_LEAD}Change the goal to “ship it”?”: no");
+    assert_eq!(answered_text(&posted), "no");
+    assert_eq!(answered_text("yes please"), "yes please");
+    assert!(says_goal(
+        "Change the goal to: ship the API by Friday!",
+        "Ship the API by Friday"
+    ));
+    assert!(!says_goal(
+        "Change the goal to shipping",
+        "Ship the API by Friday"
+    ));
 }
 
 #[test]
@@ -470,12 +512,20 @@ fn a_session_sent_work_after_the_person_s_turn_with_no_goal_is_unsaved() {
         Uuid::new_v4(),
         Uuid::new_v4(),
     );
-    let sends = [(a, at(15)), (b, at(15)), (c, at(5)), (d, at(30))];
+    let late = Uuid::new_v4();
+    let sends = [
+        (a, at(15)),
+        (b, at(15)),
+        (c, at(5)),
+        (d, at(30)),
+        (late, at(10 + 31)),
+    ];
     let on_goals = HashSet::from([b]);
     assert_eq!(
-        unsaved_goals(&[a, b, c], &sends, &[at(10)], &on_goals),
+        unsaved_goals(&[a, b, c, late], &sends, &[at(10)], &on_goals),
         vec![a],
-        "b is on a goal, c was sent work before the person spoke, d isn't the boss's to run"
+        "b is on a goal, c was sent work before the person spoke, d isn't the boss's to run, \
+         and late was sent long after the person's turn, not as work they asked for"
     );
     assert!(unsaved_goals(&[a], &sends, &[], &on_goals).is_empty());
 }
@@ -513,12 +563,19 @@ fn the_goals_block_opens_with_its_marker_and_shows_the_newest_facts() {
         .rev()
         .map(|i| fact(i, FactKind::Fact, None, i % 2 == 0, &format!("fact {i}")))
         .collect();
-    let block = goals_block(&[(p, progress)], &facts).unwrap();
+    let mut draft = goal_plan("Ship the docs", r.clone());
+    draft.approved_revision = None;
+    draft.state = PlanState::Proposed;
+    let id = p.id;
+    let block = goals_block(&[(p, progress.clone()), (draft.clone(), progress)], &facts).unwrap();
     assert!(block.starts_with(GOALS_MARKER));
-    assert!(block.contains(
-        "- “Make CI fast” · Done when each service's CI job on main takes at most 5 minutes · \
+    let drafts = block.find("Proposed, not yet agreed").unwrap();
+    assert!(block.find("“Make CI fast”").unwrap() < drafts);
+    assert!(block.find("“Ship the docs”").unwrap() > drafts);
+    assert!(block.contains(&format!(
+        "- “Make CI fast” (plan_id {id}) · Done when each service's CI job on main takes at most 5 minutes · \
          now: CI on main of acme/api: 22 minutes, for at most 5 minutes a job, 3 runs in a row · unmet"
-    ));
+    )));
     assert!(block.contains("fact 9 (unchecked)"));
     assert!(block.contains("fact 8\n"));
     assert!(block.contains("fact 2"));

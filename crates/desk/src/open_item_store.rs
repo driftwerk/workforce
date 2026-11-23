@@ -121,35 +121,81 @@ impl DeskStore {
             .execute(
                 "UPDATE boss_open_items SET plan = $2, proposal = $3, \
                  proposed_at = CASE WHEN proposal IS NOT DISTINCT FROM $3 AND plan = $2 \
-                 THEN proposed_at ELSE $4 END WHERE id = $1",
+                 THEN proposed_at ELSE $4 END, \
+                 applied_at = CASE WHEN proposal IS NOT DISTINCT FROM $3 AND plan = $2 \
+                 THEN applied_at END WHERE id = $1",
                 &[&id, &plan, &serde_json::to_value(proposal)?, &at],
             )
             .await?;
         Ok(())
     }
 
-    /// The boss's questions not closed about plan `plan`'s goal, newest
-    /// proposed first.
+    /// The boss's questions about plan `plan`'s goal whose proposal isn't
+    /// applied yet, open or closed, newest proposed first: the person may
+    /// answer one on its buttons, which closes it, or the boss close it with
+    /// their answer before it applies it.
     pub async fn goal_asks(&self, plan: Uuid) -> Result<Vec<GoalAsk>> {
         let client = self.pool().get().await?;
         client
             .query(
-                "SELECT id, proposal, proposed_at FROM boss_open_items \
-                 WHERE plan = $1 AND state <> 'closed' AND proposal IS NOT NULL \
-                 AND proposed_at IS NOT NULL ORDER BY proposed_at DESC, id",
+                "SELECT id, proposal, proposed_at, closed_at, closed_by, closed_why \
+                 FROM boss_open_items WHERE plan = $1 AND proposal IS NOT NULL \
+                 AND proposed_at IS NOT NULL AND applied_at IS NULL \
+                 ORDER BY proposed_at DESC, id",
                 &[&plan],
             )
             .await?
             .iter()
             .map(|r| {
+                let by: Option<String> = r.try_get("closed_by")?;
+                let why: Option<String> = r.try_get("closed_why")?;
+                let at: Option<DateTime<Utc>> = r.try_get("closed_at")?;
+                let answered = match (by.as_deref(), why, at) {
+                    (Some("person"), Some(why), Some(at)) => why
+                        .strip_prefix(crate::goal::YOU_ANSWERED)
+                        .map(|a| (at, a.to_string())),
+                    _ => None,
+                };
                 Ok(GoalAsk {
                     item: r.try_get("id")?,
                     proposal: serde_json::from_value(r.try_get("proposal")?)
                         .context("reading what a question proposed")?,
                     at: r.try_get("proposed_at")?,
+                    answered,
                 })
             })
             .collect()
+    }
+
+    /// Notes that question `item`'s proposal was applied, and closes it as
+    /// answered if it is still open: whether this did, so an answer is
+    /// applied once.
+    pub async fn ask_applied(&self, item: Uuid) -> Result<bool> {
+        let client = self.pool().get().await?;
+        let n = client
+            .execute(
+                "UPDATE boss_open_items SET applied_at = now(), changed_at = now(), \
+                 state = 'closed', closed_at = COALESCE(closed_at, now()), \
+                 closed_by = COALESCE(closed_by, 'person'), \
+                 closed_why = COALESCE(closed_why, 'Answered') \
+                 WHERE id = $1 AND applied_at IS NULL",
+                &[&item],
+            )
+            .await?;
+        Ok(n == 1)
+    }
+
+    /// Lets question `item` be answered again: what applying it was to do
+    /// didn't happen.
+    pub async fn ask_unapplied(&self, item: Uuid) -> Result<()> {
+        let client = self.pool().get().await?;
+        client
+            .execute(
+                "UPDATE boss_open_items SET applied_at = NULL WHERE id = $1",
+                &[&item],
+            )
+            .await?;
+        Ok(())
     }
 
     /// Opens `new`, or updates the item not closed with its key: in one

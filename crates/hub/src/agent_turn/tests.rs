@@ -5089,6 +5089,32 @@ async fn a_crew_conversation_is_given_its_goals_whole_every_turn() {
     );
 }
 
+/// "Gateway upgrade": a fact the boss recorded is in the opening of the
+/// fresh thread a crew conversation starts once it outgrew its cap.
+#[tokio::test]
+async fn a_crew_conversation_s_fresh_thread_after_a_rotation_opens_with_its_goals() {
+    let hub = hub(claude_first).await;
+    hub.claude_login(ALICE);
+    hub.claude.reply(None, &read(250_000));
+    let goals = format!(
+        "{} The goals you agreed with the person.\n- “Upgrade the gateway” · unmet\nDesk's goal facts, newest first:\n- 23:18 fact: The gateway is upgraded on staging.",
+        workforce_core::desk::GOALS_MARKER
+    );
+
+    hub.wake(CREW, &format!("{goals}\n\nwake one")).await;
+    hub.wake(CREW, &format!("{goals}\n\nwake two")).await;
+
+    let calls = hub.claude.calls();
+    assert!(!calls[1].has("--resume"), "the crew transcript is replaced");
+    assert!(
+        calls[1]
+            .text()
+            .contains("23:18 fact: The gateway is upgraded on staging."),
+        "{}",
+        calls[1].text()
+    );
+}
+
 #[tokio::test]
 async fn the_person_s_own_conversation_is_always_given_everything() {
     let hub = hub(claude_first).await;

@@ -220,7 +220,13 @@ pub struct GoalAsk {
     pub item: Uuid,
     pub proposal: Proposal,
     pub at: DateTime<Utc>,
+    /// The person's answer on the item's buttons, when they answered it
+    /// there: when, and what.
+    pub answered: Option<(DateTime<Utc>, String)>,
 }
+
+/// How an item the person answered on its buttons says their answer.
+pub const YOU_ANSWERED: &str = "You answered: ";
 
 /// Why a result doesn't read, in the boss's words.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -594,23 +600,49 @@ fn reading_words(now: &PartProgress) -> String {
     }
 }
 
-/// How sure the person's quoted words must be.
+/// How the person's quoted words are found.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Said {
-    /// Agreeing a goal or starting its work: at least 2 words, 6 characters.
+    /// Agreeing a goal or starting its work, with no question of the
+    /// boss's to answer: the whole of one of their messages, or at least 2
+    /// words and 6 characters of it.
     Agreeing,
-    /// Changing a goal or its result, or saying it is met: at least 4
-    /// words, 15 characters.
+    /// Changing an agreed goal, or saying it is met, unprompted: at least 4
+    /// words and 15 characters of one message.
     Changing,
+    /// Answering the boss's question that proposed the change: its
+    /// proposal says what the answer means, so their whole reply counts,
+    /// however short ("yes"), as does at least 2 words and 6 characters of
+    /// a longer one.
+    Answering,
 }
 
 impl Said {
-    fn floor(self) -> (usize, usize) {
+    /// The fewest words and characters a quote of part of a message has.
+    pub fn floor(self) -> (usize, usize) {
         match self {
-            Self::Agreeing => (2, 6),
+            Self::Agreeing | Self::Answering => (2, 6),
             Self::Changing => (4, 15),
         }
     }
+
+    /// Whether the whole of a message counts, however short.
+    fn whole_counts(self) -> bool {
+        matches!(self, Self::Agreeing | Self::Answering)
+    }
+}
+
+/// Why the person's quoted words weren't found as they must be.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NotSaid {
+    /// Part of a message, under the floor of what it is for: the fewest
+    /// words and characters.
+    TooShort { words: usize, chars: usize },
+    /// Found, but only in a message older than it may be, the newest of
+    /// them written at this time.
+    TooOld(DateTime<Utc>),
+    /// In none of their messages, word for word.
+    NotFound,
 }
 
 /// Text as it is compared: compatibility forms folded (NFKC), curly
@@ -645,29 +677,65 @@ fn compared_words(text: &str) -> Vec<String> {
 }
 
 /// When the person said `quote`, word for word in one of their
-/// `messages` newer than `since`, sure enough for `said`: the newest
-/// such message's time.
+/// `messages` newer than `since`, as `said` asks: the newest such
+/// message's time, or why it isn't one.
 pub fn said_by(
     messages: &[(DateTime<Utc>, String)],
     quote: &str,
     since: DateTime<Utc>,
     said: Said,
-) -> Option<DateTime<Utc>> {
+) -> Result<DateTime<Utc>, NotSaid> {
     let quoted = compared_words(quote);
-    let (least_words, least_chars) = said.floor();
-    if quoted.len() < least_words || quoted.join(" ").chars().count() < least_chars {
-        return None;
+    if quoted.is_empty() {
+        return Err(NotSaid::NotFound);
     }
-    messages
-        .iter()
-        .filter(|(at, _)| *at > since)
-        .filter(|(_, text)| {
-            compared_words(text)
-                .windows(quoted.len())
-                .any(|w| w == quoted.as_slice())
-        })
-        .map(|(at, _)| *at)
-        .max()
+    let (least_words, least_chars) = said.floor();
+    let short = quoted.len() < least_words || quoted.join(" ").chars().count() < least_chars;
+    let mut found = None;
+    let mut too_short = false;
+    for (at, text) in messages {
+        let words = compared_words(text);
+        let whole = words == quoted;
+        let part = words.windows(quoted.len()).any(|w| w == quoted.as_slice());
+        let counts = (whole && said.whole_counts()) || (part && !short);
+        too_short |= part && !counts && *at > since;
+        if counts {
+            found = found.max(Some(*at));
+        }
+    }
+    match found {
+        Some(at) if at > since => Ok(at),
+        _ if too_short => Err(NotSaid::TooShort {
+            words: least_words,
+            chars: least_chars,
+        }),
+        Some(at) => Err(NotSaid::TooOld(at)),
+        None => Err(NotSaid::NotFound),
+    }
+}
+
+/// Whether the person's message `text` holds `goal` in their own words:
+/// the goal they change it to, said by them.
+pub fn says_goal(text: &str, goal: &str) -> bool {
+    let words = compared_words(goal);
+    !words.is_empty()
+        && compared_words(text)
+            .windows(words.len())
+            .any(|w| w == words.as_slice())
+}
+
+/// The prefix the person's answer on an item's buttons is posted with in
+/// their DM: "My answer to “…”: ".
+pub const ANSWER_LEAD: &str = "My answer to “";
+
+/// What the person answered in `text`, a message of theirs: after
+/// [`ANSWER_LEAD`]'s question when it is an answer posted from an item,
+/// so the question's own words are never read as theirs; else all of it.
+pub fn answered_text(text: &str) -> &str {
+    match text.strip_prefix(ANSWER_LEAD) {
+        Some(rest) => rest.rsplit_once("”: ").map_or(text, |(_, answer)| answer),
+        None => text,
+    }
 }
 
 /// Whether `applying` is the change `asked` proposed: the same goal in
@@ -679,49 +747,69 @@ pub fn same_proposal(asked: &Proposal, applying: &Proposal) -> bool {
         && asked.met.is_some() == applying.met.is_some()
 }
 
-/// The sessions the boss sent work to and holds no goal for: each of
-/// `runs` (live, and the boss runs it) that the boss sent a line message
-/// (`sends`) after one of the person's own turns (`turns`), and that no
-/// open goal holds (`on_goals`). In `runs`' order.
+/// How soon after the person's turn the boss's message to a session is
+/// work they asked for.
+pub const SENT_ON_ASK: chrono::Duration = chrono::Duration::minutes(30);
+
+/// The sessions the boss sent work to and holds no agreed goal for: each
+/// of `runs` (live, started or handed to the boss) that the boss sent a
+/// line message (`sends`) within [`SENT_ON_ASK`] of one of the person's
+/// own turns (`turns`), so as work they asked for, and that no agreed goal
+/// holds (`on_goals`). In `runs`' order.
 pub fn unsaved_goals(
     runs: &[Uuid],
     sends: &[(Uuid, DateTime<Utc>)],
     turns: &[DateTime<Utc>],
     on_goals: &HashSet<Uuid>,
 ) -> Vec<Uuid> {
-    let Some(first_turn) = turns.iter().min() else {
-        return Vec::new();
-    };
+    let asked = |sent: &DateTime<Utc>| turns.iter().any(|t| t < sent && *sent <= *t + SENT_ON_ASK);
     runs.iter()
         .filter(|s| !on_goals.contains(s))
-        .filter(|s| sends.iter().any(|(to, at)| to == *s && at > first_turn))
+        .filter(|s| sends.iter().any(|(to, at)| to == *s && asked(at)))
         .copied()
         .collect()
 }
 
 /// The boss's open goals and the newest facts and checkpoints on them, as
-/// its context says them: a line per goal, then the facts; none with no
-/// open goal. `goals` is each open goal with its progress, `facts` theirs
-/// newest first.
+/// its context says them: a line per agreed goal, the drafts apart, then
+/// the facts; none with no open goal. `goals` is each open goal with its
+/// progress, `facts` theirs newest first.
 pub fn goals_block(goals: &[(Plan, Progress)], facts: &[Fact]) -> Option<String> {
-    let lines: Vec<String> = goals
+    let line = |(p, progress): &(Plan, Progress)| {
+        let r = p.result.as_ref()?;
+        Some(format!(
+            "- “{}” (plan_id {}) · {} · now: {} · {}",
+            crate::crew::one_line(&p.goal, 300),
+            p.id,
+            crate::crew::one_line(&r.words, WORDS_MAX),
+            progress_line(r, progress),
+            match met(progress) {
+                true => "met",
+                false => "unmet",
+            }
+        ))
+    };
+    let agreed: Vec<String> = goals
         .iter()
-        .filter_map(|(p, progress)| {
-            let r = p.result.as_ref()?;
-            Some(format!(
-                "- “{}” · {} · now: {} · {}",
-                crate::crew::one_line(&p.goal, 300),
-                crate::crew::one_line(&r.words, WORDS_MAX),
-                progress_line(r, progress),
-                match met(progress) {
-                    true => "met",
-                    false => "unmet",
-                }
-            ))
-        })
+        .filter(|(p, _)| p.approved_revision.is_some())
+        .filter_map(line)
         .collect();
-    if lines.is_empty() {
+    let drafts: Vec<String> = goals
+        .iter()
+        .filter(|(p, _)| p.approved_revision.is_none())
+        .filter_map(line)
+        .collect();
+    if agreed.is_empty() && drafts.is_empty() {
         return None;
+    }
+    let mut out = vec![format!(
+        "{GOALS_MARKER} The goals you agreed with the person. Only a met reading or the person's \
+         own words close one."
+    )];
+    out.extend(agreed);
+    if !drafts.is_empty() {
+        out.push("Proposed, not yet agreed (the person approves them on the board, or agrees them in your DM):".into());
+        out.extend(drafts);
     }
     let shown: Vec<String> = facts
         .iter()
@@ -745,16 +833,12 @@ pub fn goals_block(goals: &[(Plan, Progress)], facts: &[Fact]) -> Option<String>
             )
         })
         .collect();
-    let facts = match shown.is_empty() {
-        true => String::new(),
-        false => format!("\nDesk's goal facts, newest first:\n{}", shown.join("\n")),
-    };
+    if !shown.is_empty() {
+        out.push("Desk's goal facts, newest first:".into());
+        out.extend(shown);
+    }
     // One passage, so a transcript never holds part of it back.
-    Some(format!(
-        "{GOALS_MARKER} The goals you agreed with the person. Only a met reading or the person's \
-         own words close one.\n{}{facts}",
-        lines.join("\n")
-    ))
+    Some(out.join("\n"))
 }
 
 #[cfg(test)]

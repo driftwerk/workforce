@@ -1402,7 +1402,11 @@ impl CrewHub {
             return Ok("Sent.".into());
         }
         let closed = store
-            .item_close(id, ClosedBy::Person, &format!("You answered: {answer}"))
+            .item_close(
+                id,
+                ClosedBy::Person,
+                &format!("{}{answer}", workforce_desk::goal::YOU_ANSWERED),
+            )
             .await
             .map_err(|e| ItemRefused::Cant(Self::item_err(e)))?
             .ok_or(ItemRefused::Closed)?;
@@ -1417,7 +1421,11 @@ impl CrewHub {
         let Some(owner) = self.person(Some(&service)) else {
             return Ok("Answered.".into());
         };
-        let message = format!("My answer to “{}”: {answer}", closed.text);
+        let message = format!(
+            "{}{}”: {answer}",
+            workforce_desk::goal::ANSWER_LEAD,
+            closed.text
+        );
         let crew = self.me();
         tokio::spawn(async move {
             if let Err(e) = crew

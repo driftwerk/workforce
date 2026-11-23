@@ -709,6 +709,67 @@ pub(super) fn person_messages(
         .collect()
 }
 
+/// The threads read for the person's words, at most: the ones last
+/// written to.
+const THREADS_READ: usize = 20;
+
+/// The person's own messages in the threads of `service`'s DM with
+/// `person` written to since `since`, newer than it: their replies there,
+/// as [`person_messages`] reads the DM itself.
+pub(super) fn person_thread_messages(
+    service: &AgentService,
+    person: &str,
+    since: DateTime<Utc>,
+    look: usize,
+) -> Vec<(DateTime<Utc>, String)> {
+    use workforce_desk::conversations::{Author, SpeakerKind};
+    let store = service.sessions.as_ref();
+    let mut threads: Vec<_> = match store.list_for_owner(person, 2_000) {
+        Ok(all) => all
+            .into_iter()
+            .filter(|s| {
+                !s.is_sealed()
+                    && s.updated_at > since
+                    && workforce_core::desk::dm_thread_parent(&s.channel).is_some()
+            })
+            .collect(),
+        Err(e) => {
+            tracing::info!(error = %e, "the person's DM threads couldn't be listed");
+            return Vec::new();
+        }
+    };
+    threads.sort_by_key(|s| std::cmp::Reverse(s.updated_at));
+    let speaker = workforce_desk::Speaker::agent(service.agent_id.as_str(), &name_of(service));
+    let mut out = Vec::new();
+    for head in threads.into_iter().take(THREADS_READ) {
+        let page = match crate::desk_conversations::page(
+            store,
+            &speaker,
+            person,
+            &head.channel,
+            workforce_desk::Cursor::Newest,
+            look,
+        ) {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::info!(error = %e, "a DM thread's words couldn't be read");
+                continue;
+            }
+        };
+        out.extend(
+            page.messages
+                .into_iter()
+                .filter(|m| m.at > since)
+                .filter(|m| m.from == Author::User && m.author.kind == SpeakerKind::You)
+                .filter(|m| {
+                    !crate::desk_surface::hub_note(m.text.trim()) && !m.text.trim().is_empty()
+                })
+                .map(|m| (m.at, m.text)),
+        );
+    }
+    out
+}
+
 /// The person's own words in `service`'s DM with `person` since `since`
 /// (else the last [`DM_FIRST_LOOK_HOURS`]): their answers and orders.
 fn dm_words(service: &AgentService, person: &str, since: Option<DateTime<Utc>>) -> Option<String> {

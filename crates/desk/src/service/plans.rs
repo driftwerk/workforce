@@ -760,8 +760,17 @@ impl Desk {
     ) -> Result<PlanDetail, DeskError> {
         let _write = self.0.plan_write.lock().await;
         let mut draft = new.draft;
-        self.take_sessions_on(&mut draft.tickets, None, new.group.as_deref(), by)
-            .await?;
+        let goal = draft.goal.clone();
+        self.take_sessions_on(
+            &mut draft.tickets,
+            None,
+            new.group.as_deref(),
+            None,
+            &goal,
+            new.engine,
+            by,
+        )
+        .await?;
         let taking = self
             .adoptable(&draft.tickets, None, new.group.as_deref(), None)
             .await?;
@@ -1007,13 +1016,21 @@ impl Desk {
     /// made for it now on the board of `group`, named by its goal and
     /// assigned to it in Doing. Its folder and engine are the session's
     /// when it says neither. One `before` has already is left as it is.
+    /// A ticket is made for a session only once the plan, `goal` with
+    /// these tickets and `engine` their default, checks out: a plan
+    /// refused leaves nothing behind on the board.
+    #[allow(clippy::too_many_arguments)]
     async fn take_sessions_on(
         &self,
         draft: &mut [DraftTicket],
         before: Option<&Snapshot>,
         group: Option<&str>,
+        plan: Option<Uuid>,
+        goal: &str,
+        engine: Engine,
         by: &By,
     ) -> Result<(), DeskError> {
+        let mut makes = Vec::new();
         for (i, d) in draft.iter_mut().enumerate() {
             let Some(session) = d.session else {
                 continue;
@@ -1034,11 +1051,13 @@ impl Desk {
                 )));
             }
             let had = before.and_then(|b| b.tickets.iter().find(|t| t.session == Some(session)));
-            let ticket = match had {
-                Some(t) => t.id,
-                None => self.session_ticket(&view, group, by).await?,
-            };
-            d.adopt = Some(ticket);
+            match had {
+                Some(t) => d.adopt = Some(t.id),
+                None => match self.open_session_ticket(view.id).await? {
+                    Some(t) => d.adopt = Some(t),
+                    None => makes.push((i, view.clone())),
+                },
+            }
             if d.folder.trim().is_empty() && d.repo.is_none() {
                 d.folder.clone_from(&view.cwd);
             }
@@ -1046,7 +1065,46 @@ impl Desk {
                 d.engine = Some(view.engine.as_str().to_string());
             }
         }
+        if makes.is_empty() {
+            return Ok(());
+        }
+        // Checked first as if each were a new ticket of the plan's.
+        let mut dry = draft.to_vec();
+        for (i, view) in &makes {
+            dry[*i].session = None;
+            dry[*i].title = session_title(view);
+        }
+        let taking = self.adoptable(&dry, before, group, plan).await?;
+        let s = plan::snapshot_with(
+            &Draft {
+                goal: goal.to_string(),
+                tickets: dry,
+            },
+            before,
+            engine,
+            &titles_of(&taking),
+            &mut Uuid::new_v4,
+        )
+        .map_err(problems)?;
+        plan::validate(&s, &self.engines(), &self.folder_fits()).map_err(problems)?;
+        for (i, view) in makes {
+            draft[i].adopt = Some(self.session_ticket(&view, group, by).await?);
+        }
         Ok(())
+    }
+
+    /// The ticket session `session` works on, not yet settled, if it has
+    /// one.
+    async fn open_session_ticket(&self, session: Uuid) -> Result<Option<Uuid>, DeskError> {
+        Ok(self
+            .0
+            .store
+            .session_tickets(session)
+            .await
+            .map_err(internal)?
+            .into_iter()
+            .find(|t| !matches!(t.state, TicketState::Done | TicketState::Dropped))
+            .map(|t| t.id))
     }
 
     /// The ticket session `view` works on, not yet settled: the one given
@@ -1058,28 +1116,16 @@ impl Desk {
         group: Option<&str>,
         by: &By,
     ) -> Result<Uuid, DeskError> {
-        let open = self
-            .0
-            .store
-            .session_tickets(view.id)
-            .await
-            .map_err(internal)?
-            .into_iter()
-            .find(|t| !matches!(t.state, TicketState::Done | TicketState::Dropped));
-        if let Some(t) = open {
-            return Ok(t.id);
+        if let Some(t) = self.open_session_ticket(view.id).await? {
+            return Ok(t);
         }
         let shown = self.plan_board(group).await?;
         let b = self.new_tickets_board(&shown).await?;
-        let title = match view.goal.trim() {
-            "" => view.label().to_string(),
-            goal => crew::one_line(goal, board::TITLE_MAX),
-        };
         let made = self
             .create_ticket(
                 super::board::NewTicket {
                     board: b.id,
-                    title,
+                    title: session_title(view),
                     body: String::new(),
                     state: Some(TicketState::Todo),
                     needs: Vec::new(),
@@ -1873,8 +1919,17 @@ impl Desk {
             }
             (Some(tickets), None) => {
                 let mut tickets = tickets.clone();
-                self.take_sessions_on(&mut tickets, Some(&newest), p.group.as_deref(), by)
-                    .await?;
+                let goal = edit.goal.clone().unwrap_or_else(|| newest.goal.clone());
+                self.take_sessions_on(
+                    &mut tickets,
+                    Some(&newest),
+                    p.group.as_deref(),
+                    Some(p.id),
+                    &goal,
+                    engine,
+                    by,
+                )
+                .await?;
                 let taking = self
                     .adoptable(&tickets, Some(&newest), p.group.as_deref(), Some(p.id))
                     .await?;
@@ -2566,30 +2621,40 @@ impl Desk {
     }
 
     /// Plan `id`'s goal is met as `met` says: kept once, and the ticket
-    /// standing for it moved to Done by Desk. False when it was met
+    /// standing for it moved to Done by Desk, as well as it can be: a move
+    /// that fails is logged and leaves the goal met. False when it was met
     /// already, and nothing else is done.
     pub async fn goal_met(&self, id: Uuid, met: &Met) -> Result<bool, DeskError> {
         if !self.0.store.mark_met(id, met).await.map_err(internal)? {
             return Ok(false);
         }
-        let p = self.plan_of(id).await?;
-        if let Some(ticket) = p.goal_ticket {
-            let t = self.ticket_of(ticket).await?;
-            if !matches!(t.state, TicketState::Done | TicketState::Dropped) {
-                let by = By::desk(&format!(
-                    "The goal is met: {}",
-                    crew::one_line(&met.why, 200)
-                ));
-                let mv = Move {
-                    state: TicketState::Done,
-                    before: None,
-                    after: None,
-                };
-                self.move_read(t, mv, &by).await?;
-            }
+        if let Err(e) = self.goal_ticket_done(id, met).await {
+            tracing::warn!(plan = %id, error = %e, "a met goal's ticket wasn't moved to Done");
         }
         self.plan_touched(id).await;
         Ok(true)
+    }
+
+    /// Moves met plan `id`'s goal ticket to Done, unless it is settled.
+    async fn goal_ticket_done(&self, id: Uuid, met: &Met) -> Result<(), DeskError> {
+        let p = self.plan_of(id).await?;
+        let Some(ticket) = p.goal_ticket else {
+            return Ok(());
+        };
+        let t = self.ticket_of(ticket).await?;
+        if matches!(t.state, TicketState::Done | TicketState::Dropped) {
+            return Ok(());
+        }
+        let by = By::desk(&format!(
+            "The goal is met: {}",
+            crew::one_line(&met.why, 200)
+        ));
+        let mv = Move {
+            state: TicketState::Done,
+            before: None,
+            after: None,
+        };
+        self.move_read(t, mv, &by).await.map(|_| ())
     }
 
     // ── Starting ────────────────────────────────────────────────────────
@@ -3447,8 +3512,14 @@ fn plan_ticket(
     }
 }
 
-/// The titles of the tickets a draft takes on, as
-/// [`plan::snapshot_with`] reads them.
+/// The title of the ticket made for session `view`: its goal.
+fn session_title(view: &SessionView) -> String {
+    match view.goal.trim() {
+        "" => view.label().to_string(),
+        goal => crew::one_line(goal, board::TITLE_MAX),
+    }
+}
+
 /// `p` as revision `next` says its goal: what it achieves, how that is
 /// measured, and its goal's ticket while it still has it.
 fn follow_goal(p: &mut Plan, next: &Snapshot) {
@@ -3457,6 +3528,8 @@ fn follow_goal(p: &mut Plan, next: &Snapshot) {
     p.goal_ticket = p.goal_ticket.filter(|g| next.ticket(*g).is_some());
 }
 
+/// The titles of the tickets a draft takes on, as
+/// [`plan::snapshot_with`] reads them.
 fn titles_of(taking: &HashMap<Uuid, Ticket>) -> HashMap<Uuid, String> {
     taking.iter().map(|(id, t)| (*id, t.said_title())).collect()
 }
