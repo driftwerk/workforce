@@ -1453,6 +1453,18 @@ impl Desk {
                 Err(e) => return Err(stale(e)),
             }
         }
+        // One that ended as it was given the ticket ended before the ticket
+        // was its own, unmarked: marked now, it holds no slot of its plan.
+        if self
+            .record(view.id)
+            .map_or(true, |r| r.state == SessionState::Closed)
+        {
+            self.0
+                .store
+                .close_session_tickets(&view.id.to_string(), true)
+                .await
+                .map_err(internal)?;
+        }
         self.0
             .store
             .put_link(t.id, &Link::Session { session: view.id }, at)

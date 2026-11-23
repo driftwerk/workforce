@@ -491,6 +491,25 @@ async fn a_group_stays_a_boundary_until_its_boss_is_taken_off_and_then_opens_fro
     .await;
 }
 
+/// A config read before the person took the boss off a group binds it no
+/// more: what was read is older than their word. One read after binds it.
+#[tokio::test]
+async fn a_config_read_before_a_group_opened_leaves_it_open() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(pool, dir.path()).await;
+        groups(&d).await;
+        d.bound_groups(["acme".to_string()]).await;
+        let read = Utc::now();
+        d.unbound_group("acme").await;
+        assert!(!d.bound_groups_read(["acme".to_string()], read));
+        assert!(!d.0.scopes.lock().bounded.contains("acme"));
+        assert!(d.bound_groups_read(["acme".to_string()], Utc::now()));
+        assert!(d.0.scopes.lock().bounded.contains("acme"));
+    })
+    .await;
+}
+
 #[tokio::test]
 async fn a_session_moved_across_bosses_leaves_its_ticket_questions_and_boss_behind() {
     use crate::board::TicketState;

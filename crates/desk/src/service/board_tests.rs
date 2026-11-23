@@ -1391,6 +1391,36 @@ async fn an_assignment_made_over_a_change_meanwhile_keeps_it_and_links_once() {
     .await;
 }
 
+#[tokio::test]
+async fn a_session_that_ended_as_it_was_given_a_ticket_holds_it_as_ended() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(pool, dir.path()).await;
+        let b = board(&d, "Acme").await;
+        let t = ticket(&d, b.id, "Fix the login", TicketState::Todo).await;
+        let s = session(&d, dir.path(), "acme-web", "").await;
+        // As a plan's start does: it links the session it started, which
+        // ended before the link was written.
+        let read = d.0.store.ticket(t.ticket.id).await.unwrap().unwrap();
+        d.change(s.id, |r, _| r.state = SessionState::Closed);
+        d.persisted().await;
+        d.assign_session(read, "ACM-1", s, &By::you(), false)
+            .await
+            .unwrap();
+        let c = d.0.store.pool().get().await.unwrap();
+        let ended: bool = c
+            .query_one(
+                "SELECT session_closed_at IS NOT NULL FROM tickets WHERE id = $1",
+                &[&t.ticket.id],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        assert!(ended, "it holds no slot of a plan");
+    })
+    .await;
+}
+
 /// An agent crew that checks the board already says the ticket is its
 /// when it is handed, and can refuse.
 struct Checking {

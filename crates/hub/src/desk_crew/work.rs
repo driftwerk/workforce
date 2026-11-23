@@ -330,7 +330,12 @@ impl CrewHub {
         self.unbossed
             .lock()
             .retain(|session, _| charges.iter().any(|c| c.session == *session));
-        for c in charges {
+        // One still starting isn't in its group or grant yet: judged once
+        // it is.
+        for c in charges
+            .into_iter()
+            .filter(|c| !self.desk.charge_placing(c.session))
+        {
             let group = self
                 .desk
                 .view(c.session)
@@ -348,9 +353,7 @@ impl CrewHub {
                     })
                 });
                 if !live {
-                    let by =
-                        By::manager(&c.boss, &c.boss_name, "Its boss's grant is no longer live.");
-                    if let Err(e) = self.desk.release(c.session, &by).await {
+                    if let Err(e) = self.desk.release(c.session, &By::grant_not_live()).await {
                         tracing::info!(session = %c.session, error = %e, "a session wasn't let go");
                     }
                 }

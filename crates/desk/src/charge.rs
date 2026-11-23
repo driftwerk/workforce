@@ -237,12 +237,14 @@ pub fn busy(charges: &[Charge], states: &HashMap<Uuid, SessionState>) -> usize {
 /// Who has the wheel of `c` at `now`, given when the person last gave the
 /// session input (typed in its terminal, prompted it, wrote to it) and how
 /// long that input holds it (`hold`). Only input since the boss last had
-/// the wheel counts: since it was charged, or handed back. The person keeps
-/// it only while they are active, `hold` after their last input (or after
-/// they took it by a click); then it is the boss's again, whatever the
-/// session is doing, unless they pinned it. So a question or request the
-/// session raises once they have stopped is the boss's to answer, and one
-/// raised while they are still typing waits for them.
+/// the wheel counts: since it was charged, or handed back; a session a boss
+/// took on by itself was never given to it, so its input before counts
+/// too. The person keeps it only while they are active, `hold` after their
+/// last input (or after they took it by a click); then it is the boss's
+/// again, whatever the session is doing, unless they pinned it. So a
+/// question or request the session raises once they have stopped is the
+/// boss's to answer, and one raised while they are still typing waits for
+/// them.
 pub fn wheel(
     c: &Charge,
     last_person_input: Option<DateTime<Utc>>,
@@ -254,11 +256,12 @@ pub fn wheel(
         Wheel::Person => Some(c.wheel_since.unwrap_or(c.since)),
         Wheel::Boss => None,
     };
-    let boss_since = match c.wheel {
-        Wheel::Boss => c.wheel_since.unwrap_or(c.since),
-        Wheel::Person | Wheel::PersonPinned => c.since,
+    let boss_since = match (c.wheel, c.how, c.wheel_since) {
+        (Wheel::Boss, How::Taken, None) => None,
+        (Wheel::Boss, _, since) => Some(since.unwrap_or(c.since)),
+        (Wheel::Person | Wheel::PersonPinned, ..) => Some(c.since),
     };
-    let input = last_person_input.filter(|t| *t > boss_since);
+    let input = last_person_input.filter(|t| boss_since.is_none_or(|since| *t > since));
     match taken.max(input) {
         Some(last) if now - last < hold => Wheel::Person,
         _ => Wheel::Boss,
@@ -1008,6 +1011,18 @@ mod tests {
         c.wheel = Wheel::PersonPinned;
         c.wheel_since = Some(ago(600));
         assert_eq!(wheel(&c, None, HOLD, now), Wheel::PersonPinned);
+
+        // Taken on as they typed: theirs while they are at it.
+        let mut taken = Charge::new(Uuid::new_v4(), "sarah", How::Taken, None);
+        taken.since = secs(10);
+        assert_eq!(wheel(&taken, Some(secs(20)), HOLD, now), Wheel::Person);
+        assert_eq!(wheel(&taken, Some(ago(3)), HOLD, now), Wheel::Boss);
+        taken.wheel_since = Some(secs(5));
+        assert_eq!(
+            wheel(&taken, Some(secs(20)), HOLD, now),
+            Wheel::Boss,
+            "handed back since: what they typed before doesn't take it again"
+        );
     }
 
     #[test]

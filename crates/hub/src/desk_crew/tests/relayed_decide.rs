@@ -282,15 +282,16 @@ async fn a_machine_unbinds_the_homes_boss_only_while_its_home_holds_it_and_takes
         // Sent again: taken once.
         let out = answer(given["decideId"].clone(), json!({"text": "ALLOW: again"})).await;
         assert_eq!(out["status"], "refused", "{out}");
-        let rows = d
-            .store()
-            .decisions_since(SARAH, chrono::DateTime::UNIX_EPOCH, 50)
-            .await
-            .unwrap();
-        let row = rows
-            .iter()
-            .find(|r| r.need == Need::Approval && r.need_ref == Some(a1.to_string()))
-            .unwrap_or_else(|| panic!("{rows:?}"));
+        // Kept once it is done: the session has its answer first.
+        let row = eventually("its decision kept", async || {
+            d.store()
+                .decisions_since(SARAH, chrono::DateTime::UNIX_EPOCH, 50)
+                .await
+                .unwrap()
+                .into_iter()
+                .find(|r| r.need == Need::Approval && r.need_ref == Some(a1.to_string()))
+        })
+        .await;
         assert!(row.what.contains("(by sarah at home)"), "{}", row.what);
         assert!(row.why.contains("the fix is ready to ship"), "{}", row.why);
 

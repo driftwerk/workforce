@@ -317,6 +317,12 @@ pub struct By {
 }
 
 impl By {
+    /// Desk letting a served boss's session go, its grant no longer live
+    /// for it: whichever side sees it first, the same release.
+    pub fn grant_not_live() -> Self {
+        Self::desk("Its boss's grant is no longer live.")
+    }
+
     /// Desk itself, for `reason`: no boss or person did it.
     pub fn desk(reason: &str) -> Self {
         Self {

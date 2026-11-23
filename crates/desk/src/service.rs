@@ -3829,15 +3829,14 @@ impl Desk {
             created_at: now,
             updated_at: now,
         };
-        {
+        let placing = {
             let mut st = self.0.state.lock();
             st.records.insert(id, record.clone());
-            if let Some(boss) = boss {
-                Self::reserve_charge(&mut st, id, boss, group.as_deref());
-            }
-        }
+            boss.map(|boss| self.reserve_charge(&mut st, id, boss, group.as_deref()))
+        };
         // Where it belongs, before it can do or spend anything.
         let mut placed = self.start_placed(id, group.as_deref(), boss).await;
+        drop(placing);
         // A session named before it starts (a plan's) is written down
         // before its process is: after a stop between the two, its id is
         // known, and the process the holder kept for it is adopted rather
