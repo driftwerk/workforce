@@ -56,6 +56,11 @@ pub fn line_channel(session: Uuid) -> String {
     format!("{DESK_CHANNEL}:line:{session}")
 }
 
+/// The overseer's own conversation for the line of `session` on `machine`.
+pub fn machine_line_channel(machine: &str, session: Uuid) -> String {
+    format!("{DESK_CHANNEL}:line:{machine}/{session}")
+}
+
 /// What becomes of a question a line turn left open.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Settle {
@@ -1409,5 +1414,25 @@ mod tests {
         let channel = line_channel(id);
         assert_eq!(channel, format!("desk:line:{id}"));
         assert!(!workforce_common::channels::is_desk_conversation(&channel));
+        assert_eq!(
+            machine_line_channel("devbox", id),
+            format!("desk:line:devbox/{id}")
+        );
+    }
+
+    #[test]
+    fn every_conversation_a_boss_has_off_its_dm_is_a_crew_channel() {
+        let id = Uuid::new_v4();
+        for channel in [
+            line_channel(id),
+            machine_line_channel("devbox", id),
+            super::super::plan::plan_channel(id),
+            super::super::watcher::check_in_channel("desk"),
+        ] {
+            assert!(
+                workforce_common::channels::is_crew_channel(&channel),
+                "{channel}"
+            );
+        }
     }
 }

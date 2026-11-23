@@ -51,6 +51,18 @@ pub fn is_desk_boss_channel(channel: &str) -> bool {
         .is_some_and(|p| p.eq_ignore_ascii_case(DESK_BOSS_PREFIX))
 }
 
+/// Whether `channel` is one of a boss's own conversations off its DM, where
+/// it works for the person unprompted: its check-ins (`desk:checkin:`), a
+/// session's line (`desk:line:`, on this computer or a machine) and a plan's
+/// turns (`desk:plan:`). Its DM, its threads and a handover are the person's.
+pub fn is_crew_channel(channel: &str) -> bool {
+    channel
+        .strip_prefix(DESK_CHANNEL)
+        .and_then(|rest| rest.strip_prefix(':'))
+        .and_then(|rest| rest.split_once(':'))
+        .is_some_and(|(kind, id)| matches!(kind, "checkin" | "line" | "plan") && !id.is_empty())
+}
+
 /// What the channel of a thread in a DM starts with:
 /// `desk:thread:<the parent message's id>`. Not a room ([`is_desk_room`]
 /// refuses its `:`).
@@ -1161,6 +1173,30 @@ mod tests {
 
     fn room_id() -> Uuid {
         Uuid::parse_str(ROOM).unwrap()
+    }
+
+    #[test]
+    fn only_a_boss_s_own_conversations_off_its_dm_are_crew_channels() {
+        for crew in [
+            "desk:checkin:boss",
+            "desk:line:6f1c2a4e-0b7d-4c55-9a51-3d2e8f9b1c07",
+            "desk:line:mac-mini/6f1c2a4e-0b7d-4c55-9a51-3d2e8f9b1c07",
+            "desk:plan:6f1c2a4e-0b7d-4c55-9a51-3d2e8f9b1c07",
+        ] {
+            assert!(is_crew_channel(crew), "{crew}");
+        }
+        for theirs in [
+            DESK_CHANNEL,
+            "desk:thread:6f1c2a4e-0b7d-4c55-9a51-3d2e8f9b1c07",
+            "desk:handover:6f1c2a4e-0b7d-4c55-9a51-3d2e8f9b1c07",
+            "desk:boss:group",
+            "desk:general",
+            "desk:line:",
+            "web",
+            "cc:desk:line:x",
+        ] {
+            assert!(!is_crew_channel(theirs), "{theirs}");
+        }
     }
 
     #[test]

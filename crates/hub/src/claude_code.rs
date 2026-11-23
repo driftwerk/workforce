@@ -398,6 +398,11 @@ pub trait StreamGrammar: Default + Send + 'static {
     fn thread(&self) -> Option<String> {
         None
     }
+
+    /// The CLI compacted its transcript during the stream.
+    fn compacted(&self) -> bool {
+        false
+    }
 }
 
 /// A CLI run the transport carries: the command, its stdin, its wall clock,
@@ -463,6 +468,12 @@ pub struct ClaudeCodeResult {
     pub output_tokens: u64,
     pub cache_creation_tokens: u64,
     pub cache_read_tokens: u64,
+    /// What the round's last model call read, cached or not: how big its
+    /// transcript had grown. 0 when the CLI reported no call. Codex reports
+    /// neither this nor `compacted`.
+    pub context_tokens: u64,
+    /// The CLI compacted its transcript during the round.
+    pub compacted: bool,
     pub cost_usd: f64,
     pub num_turns: u32,
     /// Why the round ended. Every retry / classification / surfacing decision
@@ -570,6 +581,7 @@ pub struct Interrupted {
     program: String,
     pub spent: TokenUsage,
     pub thread: Option<String>,
+    pub compacted: bool,
 }
 
 impl Interrupted {
@@ -578,6 +590,7 @@ impl Interrupted {
             program,
             spent: capture.spent(),
             thread: capture.thread(),
+            compacted: capture.compacted(),
         }
     }
 }
@@ -756,6 +769,9 @@ struct StreamCapture {
     /// Each model call's usage as its assistant events reported it, in
     /// order: the CLI repeats one call's usage on each of its content blocks.
     calls: Vec<(Option<String>, TokenUsage)>,
+    /// The CLI compacted its transcript during the round (a
+    /// `compact_boundary`).
+    compacted: bool,
 }
 
 /// How a round's stream reads as progress.
@@ -793,6 +809,10 @@ impl StreamGrammar for StreamCapture {
             .map(|(_, usage)| usage.clone())
             .fold(TokenUsage::default(), std::ops::Add::add)
     }
+
+    fn compacted(&self) -> bool {
+        self.compacted
+    }
 }
 
 impl StreamCapture {
@@ -827,6 +847,11 @@ impl StreamCapture {
                     .and_then(|e| e.as_bool())
                     .unwrap_or(false);
                 self.result = Some(event.clone());
+            }
+            Some("system")
+                if event.get("subtype").and_then(|s| s.as_str()) == Some("compact_boundary") =>
+            {
+                self.compacted = true;
             }
             Some("rate_limit_event") => {
                 self.limit = crate::subscription::limits::claude_rate_limit_event(event);
@@ -896,6 +921,20 @@ impl StreamCapture {
         self.is_error
             .then(|| self.result.as_ref()?.get("result")?.as_str())
             .flatten()
+    }
+
+    /// What the last model call the CLI reported read: its whole context.
+    fn context_tokens(&self) -> u64 {
+        self.calls.last().map_or(0, |(_, usage)| {
+            [
+                usage.input_tokens,
+                usage.cache_read_input_tokens,
+                usage.cache_creation_input_tokens,
+            ]
+            .into_iter()
+            .map(u64::from)
+            .sum()
+        })
     }
 
     /// Nothing was captured — the process produced no parseable output at all.
@@ -1909,6 +1948,8 @@ fn assemble_result(
         output_tokens: run.capture.usage("/usage/output_tokens"),
         cache_creation_tokens: run.capture.usage("/usage/cache_creation_input_tokens"),
         cache_read_tokens: run.capture.usage("/usage/cache_read_input_tokens"),
+        context_tokens: run.capture.context_tokens(),
+        compacted: run.capture.compacted,
         cost_usd: run
             .capture
             .result
@@ -3809,6 +3850,51 @@ pub(crate) mod tests {
             "type": "assistant",
             "message": { "content": [{ "type": "text", "text": text }] },
         })
+    }
+
+    #[test]
+    fn a_round_s_context_is_what_its_last_call_read() {
+        let call = |id: &str, input: u64, read: u64, created: u64| {
+            serde_json::json!({
+                "type": "assistant",
+                "message": {
+                    "id": id,
+                    "content": [{ "type": "text", "text": "…" }],
+                    "usage": {
+                        "input_tokens": input,
+                        "cache_read_input_tokens": read,
+                        "cache_creation_input_tokens": created,
+                        "output_tokens": 50,
+                    },
+                },
+            })
+        };
+        let capture = capture_of(&[
+            call("msg_1", 10, 40_000, 2_000),
+            call("msg_2", 12, 42_000, 900),
+            result_event("success", 2),
+        ]);
+        assert_eq!(
+            capture.context_tokens(),
+            42_912,
+            "the second call, not their sum"
+        );
+        assert_eq!(
+            capture_of(&[result_event("success", 1)]).context_tokens(),
+            0
+        );
+    }
+
+    #[test]
+    fn a_round_says_the_cli_compacted_its_transcript() {
+        let boundary = serde_json::json!({
+            "type": "system",
+            "subtype": "compact_boundary",
+            "compact_metadata": { "trigger": "auto", "pre_tokens": 160_000 },
+        });
+        assert!(capture_of(&[assistant("…"), boundary, result_event("success", 2)]).compacted);
+        let init = serde_json::json!({ "type": "system", "subtype": "init" });
+        assert!(!capture_of(&[init, result_event("success", 1)]).compacted);
     }
 
     fn result_event(subtype: &str, num_turns: u64) -> serde_json::Value {

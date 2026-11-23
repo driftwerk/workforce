@@ -658,6 +658,7 @@ impl CompactionEngine {
                 &conversation_text,
                 target_summary_tokens,
                 compacting_tokens,
+                !workforce_core::desk::is_crew_channel(&session.channel),
             )
             .await?;
 
@@ -751,6 +752,7 @@ impl CompactionEngine {
                 &conversation_text,
                 target_summary_tokens,
                 compacting_tokens,
+                !workforce_core::desk::is_crew_channel(&session.channel),
             )
             .await?;
 
@@ -804,13 +806,16 @@ impl CompactionEngine {
         Ok(response)
     }
 
-    /// Call the LLM to summarise, retrying once if the output is absurdly short.
+    /// Call the LLM to summarise, retrying once if the output is absurdly
+    /// short and `retry_short`. A boss's own conversation off its DM keeps
+    /// what it got: its turns open from Desk's stores, not its summary.
     async fn summarise_with_retry(
         &self,
         system_prompt: &str,
         conversation_text: &str,
         target_summary_tokens: u32,
         compacting_tokens: u32,
+        retry_short: bool,
     ) -> Result<String> {
         let user_msg = format!("Summarise this conversation:\n\n{conversation_text}");
 
@@ -828,7 +833,7 @@ impl CompactionEngine {
         let summary_tokens = estimate_tokens(&text);
 
         let min_expected = (compacting_tokens / 20).max(256);
-        if summary_tokens < min_expected && compacting_tokens > 5000 {
+        if retry_short && summary_tokens < min_expected && compacting_tokens > 5000 {
             warn!(
                 summary_tokens,
                 compacting_tokens,
@@ -1365,6 +1370,37 @@ mod tests {
             None,
         );
         assert!(!keep_message_for_summary(&private, &bare));
+    }
+
+    #[tokio::test]
+    async fn a_short_summary_is_retried_except_in_a_boss_s_own_conversation() {
+        let summarise = |channel: &str| {
+            let mut session = make_large_session(30);
+            session.channel = channel.to_string();
+            for message in &mut session.messages {
+                message.tokens = 500;
+            }
+            let llm = Arc::new(MockCompactionLlm::new(vec![
+                "Too short.",
+                &"A summary that says enough this time. ".repeat(40),
+            ]));
+            let engine = CompactionEngine::new(CompactionConfig::default(), llm.clone(), None);
+            async move {
+                let summary = engine.summarise_old_messages(&session).await.unwrap();
+                (summary, llm.responses.lock().unwrap().len())
+            }
+        };
+
+        let (summary, left) = summarise("web").await;
+        assert!(
+            summary.starts_with("A summary that says enough"),
+            "{summary}"
+        );
+        assert_eq!(left, 0, "retried once");
+
+        let (summary, left) = summarise("desk:line:6f1c2a4e-0b7d-4c55-9a51-3d2e8f9b1c07").await;
+        assert_eq!(summary, "Too short.");
+        assert_eq!(left, 1, "no second call");
     }
 
     #[tokio::test]
