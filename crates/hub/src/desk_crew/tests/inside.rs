@@ -184,6 +184,63 @@ async fn every_facet_is_fenced_and_names_no_secret() {
     .await;
 }
 
+/// A wait said in output Desk found no process of the session's writing
+/// is never stuck: once nothing moves under it, the boss is only told to
+/// look, as for a remote command.
+#[test]
+fn a_wait_in_no_process_desk_sees_only_has_the_boss_look() {
+    use workforce_desk::sight::{self, Glance, Kind, Reading, StallKind, Thresholds, Wait};
+    let since = chrono::Utc::now() - chrono::Duration::hours(2);
+    let g = |pid| Glance {
+        reading: Reading {
+            kind: Kind::Waits(Wait::Queue),
+            words: "waiting for a build slot".into(),
+            since,
+            by: None,
+            on: None,
+            pid,
+            call: Some("b1".into()),
+        },
+        open_call: None,
+        transcript: None,
+        cpu_active_at: Some(since),
+        output_at: None,
+        output: None,
+        background: 1,
+        settled: true,
+        since,
+        as_of: Some(chrono::Utc::now()),
+        aged: false,
+        workspace: None,
+        stall: None,
+    };
+    let t = Thresholds {
+        quiet: chrono::Duration::minutes(30),
+        stall: chrono::Duration::minutes(60),
+    };
+    let stall = |g: &Glance| {
+        sight::verdict(
+            g,
+            workforce_desk::model::SessionState::Done,
+            chrono::Utc::now(),
+            t,
+        )
+        .unwrap()
+    };
+    let placed = g(Some(4242));
+    assert_eq!(stall(&placed).kind, StallKind::Queued);
+    assert!(!super::super::inside::only_looks(&placed, &stall(&placed)));
+    let unplaced = g(None);
+    let s = stall(&unplaced);
+    assert_eq!(s.kind, StallKind::Still);
+    assert!(super::super::inside::only_looks(&unplaced, &s));
+    assert!(
+        super::super::inside::evidence_line("tests", &unplaced, &s)
+            .ends_with("Look inside (crew.inside) to see whether it still works there."),
+        "{s:?}"
+    );
+}
+
 #[test]
 fn ask_session_is_the_last_resort_and_every_text_names_crew_inside_first() {
     use super::super::{context, items, picture, tools, watcher};

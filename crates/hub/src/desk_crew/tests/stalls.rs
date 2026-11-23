@@ -1008,8 +1008,9 @@ pub(super) enum Says {
 }
 
 /// A Claude Code stand-in in `dir`, installed as far as Desk can tell,
-/// whose tool shell runs `ssh devbox ~/bin/rbuild-run w cargo test` (the
-/// night of the overnight stall) with an `ssh` that says `says`; each
+/// whose tool shell makes `dir`'s `shell.output` as it starts and runs
+/// `ssh devbox ~/bin/rbuild-run w cargo test` (the night of the overnight
+/// stall) with an `ssh` that says `says`; each
 /// `ssh` notes its pid and its build's in `dir`'s `ssh.pid` for
 /// [`builds_stop`].
 pub(super) fn building_cli(dir: &Path, says: Says) -> PathBuf {
@@ -1034,7 +1035,7 @@ pub(super) fn building_cli(dir: &Path, says: Says) -> PathBuf {
         format!(
             "#!/bin/sh\ncase \"$1\" in --version) echo '2.1.300 (Claude Code)'; exit 0;; auth) exit 1;; esac\n\
              printf '%s\\n' \"$@\" > \"{dir}/args-$$\"\n\
-             /bin/sh -c 'PATH={bin}:$PATH ssh devbox ~/bin/rbuild-run w cargo test; : /h/.claude/shell-snapshots/snapshot-sh-1.sh' &\n\
+             /bin/sh -c ': > \"{dir}/shell.output\"; PATH={bin}:$PATH ssh devbox ~/bin/rbuild-run w cargo test; : /h/.claude/shell-snapshots/snapshot-sh-1.sh' &\n\
              exec sleep 60\n",
             dir = dir.display(),
             bin = bin.display(),
@@ -1315,7 +1316,13 @@ pub(super) async fn at_work_as(d: &Desk, base: &Path, s: uuid::Uuid, shape: Shap
                     .filter(|v| v.state == SessionState::Done && v.waiting_on() == 1)
             })
             .await;
-            tasks.join("b1.output")
+            // Claude Code makes a background shell's output file as it
+            // starts the shell: the stand-in's, born with its shell.
+            let born = base.join("shell.output");
+            eventually("its shell started", async || born.exists().then_some(())).await;
+            let output = tasks.join("b1.output");
+            std::fs::hard_link(&born, &output).unwrap();
+            output
         }
     };
     append(&output, "   Compiling workforce-hub v0.1.0\n");

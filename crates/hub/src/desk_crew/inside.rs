@@ -126,9 +126,10 @@ pub(super) fn moves(kind: StallKind) -> bool {
 
 /// Whether stall `s` in glance `g` only asks the boss to look: nothing
 /// moves under it while its ssh command may still run on another computer,
-/// which alone says nothing is stuck.
+/// or while it waits in no process Desk can see, which alone says nothing
+/// is stuck.
 pub(super) fn only_looks(g: &Glance, s: &Stall) -> bool {
-    s.kind == StallKind::Still && g.reading.kind == Kind::Remote
+    s.kind == StallKind::Still && (g.reading.kind == Kind::Remote || g.reading.unplaced())
 }
 
 /// What the boss is told of `who`'s stall `s` in glance `g`: what it is,
