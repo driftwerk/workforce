@@ -709,8 +709,9 @@ pub(super) fn person_messages(
         .collect()
 }
 
-/// When `service` last wrote in its DM with `person`, among its `look`
-/// newest messages there.
+/// When `service` last replied in its DM with `person` in a turn of its
+/// own, among the `look` newest messages there: Desk's posts by it (plan
+/// cards, updates, notices, a turn's failure) aren't its words to answer.
 pub(super) fn boss_last_said(
     service: &AgentService,
     person: &str,
@@ -730,6 +731,11 @@ pub(super) fn boss_last_said(
             .messages
             .into_iter()
             .filter(|m| m.from == Author::Agent && !m.text.trim().is_empty())
+            .filter(|m| {
+                m.mark
+                    .as_ref()
+                    .is_none_or(|k| k.delivery.is_none() && !k.failed)
+            })
             .map(|m| m.at)
             .max(),
         Err(e) => {

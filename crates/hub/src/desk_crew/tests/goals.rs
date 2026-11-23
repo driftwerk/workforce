@@ -903,10 +903,23 @@ async fn a_short_agreement_counts_only_after_the_bosss_last_message() {
         assert!(d.plans(None, None).await.unwrap().is_empty());
         tokio::time::sleep(Duration::from_millis(20)).await;
         person_says(&overseer, "ok");
+        // A post of Desk's landing after it isn't the boss asking anything.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        desk_posts(&overseer, "**Update.** acme-web finished its tests.").await;
         let r = run(&overseer, "crew.plan", plan).await;
         assert!(r.success, "{r:?}");
     })
     .await;
+}
+
+/// Desk posts `text` in `boss`'s DM with the person, as an update.
+async fn desk_posts(boss: &AgentService, text: &str) {
+    use workforce_common::channels::desk::{DeliveryKind, DeskPlace, DeskTarget};
+    let target = DeskTarget::of_turn(&DeskPlace::Dm { thread: None }, DESK_CHANNEL, None, false);
+    let delivery = crate::desk_surface::Delivery::text(DeliveryKind::Update, text);
+    crate::desk_surface::deliver(boss, PERSON, &target, delivery)
+        .await
+        .unwrap();
 }
 
 /// The boss writes `text` in its DM with the person.
