@@ -5057,7 +5057,7 @@ async fn a_crew_conversation_is_not_given_again_what_its_transcript_holds() {
     let second = calls[1].text();
     assert!(calls[1].has("--resume"));
     assert!(!second.contains(&standing()), "{second}");
-    assert!(second.contains("[Unchanged since your last turn, which has it whole:"));
+    assert!(second.contains("[Unchanged since it was given earlier in this conversation:"));
     assert!(second.ends_with("wake two"), "{second}");
     assert!(
         calls[2].text().contains(&standing()),
@@ -5140,5 +5140,36 @@ async fn a_crew_conversation_grows_by_its_news_alone_over_a_night_of_wakes() {
             .filter(|call| call.has("--resume"))
             .all(|call| !call.text().contains("[CONVERSATION SO FAR")),
         "a resumed transcript is never caught up on what it holds"
+    );
+}
+
+#[tokio::test]
+async fn a_crew_conversation_the_cli_compacted_mid_turn_is_given_everything_again() {
+    let hub = hub(claude_first).await;
+    hub.claude_login(ALICE);
+    hub.claude.reply(Some(1), &read(60_000));
+    let compacted_then_grew: Vec<Value> = std::iter::once(json!({
+        "type": "system",
+        "subtype": "compact_boundary",
+        "compact_metadata": { "trigger": "auto", "pre_tokens": 110_000 },
+    }))
+    .chain(read(65_000))
+    .collect();
+    hub.claude.reply(Some(2), &compacted_then_grew);
+    hub.claude.reply(Some(3), &read(70_000));
+
+    hub.wake(CREW, "one").await;
+    hub.wake(CREW, "two").await;
+    hub.wake(CREW, "three").await;
+
+    let calls = hub.claude.calls();
+    assert!(
+        !calls[1].text().contains(&standing()),
+        "held before the compaction"
+    );
+    assert!(calls[2].has("--resume"));
+    assert!(
+        calls[2].text().contains(&standing()),
+        "the transcript only has its own summary of it now"
     );
 }

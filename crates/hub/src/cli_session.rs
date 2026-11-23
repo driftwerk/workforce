@@ -59,12 +59,20 @@ pub struct CrewCap {
 
 impl CrewCap {
     /// The most context a transcript on a model of `window` tokens keeps;
-    /// `None` when it never rotates on size. An unknown window leaves
-    /// `tokens` alone.
-    pub(crate) fn limit(&self, window: Option<u32>) -> Option<u64> {
-        let share =
-            |window: u32| u64::from(window) * u64::from(self.window_percent.clamp(1, 100)) / 100;
-        (self.tokens > 0).then(|| window.map_or(self.tokens, |w| self.tokens.min(share(w))))
+    /// `None` when it never rotates on size.
+    pub(crate) fn limit(&self, window: u32) -> Option<u64> {
+        let share = u64::from(window) * u64::from(self.window_percent.clamp(1, 100)) / 100;
+        (self.tokens > 0).then(|| self.tokens.min(share))
+    }
+}
+
+/// The window Claude Code runs `model` in, as the turn names it: a million
+/// tokens only when it asks for one (`opus[1m]`), else 200 000, whatever
+/// the model itself could take.
+pub(crate) fn cli_window(model: &str) -> u32 {
+    match model.trim().to_ascii_lowercase().ends_with("[1m]") {
+        true => 1_000_000,
+        false => 200_000,
     }
 }
 
@@ -129,7 +137,7 @@ impl RotationPolicy {
         turns: u64,
         last_reply_at: Option<DateTime<Utc>>,
         context_tokens: u64,
-        window: Option<u32>,
+        window: u32,
         now: DateTime<Utc>,
     ) -> Option<RotationReason> {
         self.crew
@@ -237,13 +245,22 @@ mod tests {
         let now = chrono::Utc::now();
         let policy = RotationPolicy::default();
         assert_eq!(
-            policy.crew_rotation(DEFAULT_ROTATE_AFTER_TURNS, Some(now), 200_000, None, now),
+            policy.crew_rotation(
+                DEFAULT_ROTATE_AFTER_TURNS,
+                Some(now),
+                200_000,
+                1_000_000,
+                now
+            ),
             Some(RotationReason::Size),
             "size is said before the turn count"
         );
-        assert_eq!(policy.crew_rotation(1, Some(now), 199_999, None, now), None);
         assert_eq!(
-            policy.crew_rotation(DEFAULT_ROTATE_AFTER_TURNS, Some(now), 0, None, now),
+            policy.crew_rotation(1, Some(now), 199_999, 1_000_000, now),
+            None
+        );
+        assert_eq!(
+            policy.crew_rotation(DEFAULT_ROTATE_AFTER_TURNS, Some(now), 0, 1_000_000, now),
             Some(RotationReason::TurnCount),
             "an unknown size falls through to the other limits"
         );
@@ -252,20 +269,28 @@ mod tests {
     #[test]
     fn the_crew_cap_is_the_lower_of_its_tokens_and_its_share_of_the_window() {
         let cap = RotationPolicy::default().crew;
-        assert_eq!(cap.limit(Some(1_000_000)), Some(200_000));
-        assert_eq!(cap.limit(Some(200_000)), Some(120_000));
-        assert_eq!(
-            cap.limit(None),
-            Some(200_000),
-            "an unknown model keeps the tokens"
-        );
+        assert_eq!(cap.limit(1_000_000), Some(200_000));
+        assert_eq!(cap.limit(200_000), Some(120_000));
         let off = CrewCap { tokens: 0, ..cap };
-        assert_eq!(off.limit(Some(200_000)), None, "0 turns it off");
+        assert_eq!(off.limit(200_000), None, "0 turns it off");
         let wild = CrewCap {
             window_percent: 250,
             ..cap
         };
-        assert_eq!(wild.limit(Some(100_000)), Some(100_000), "kept within 100%");
+        assert_eq!(wild.limit(100_000), Some(100_000), "kept within 100%");
+    }
+
+    #[test]
+    fn claude_code_s_window_is_the_one_the_turn_asks_for() {
+        assert_eq!(cli_window("opus[1m]"), 1_000_000);
+        assert_eq!(cli_window("claude-opus-5[1M]"), 1_000_000);
+        assert_eq!(
+            cli_window("claude-opus-5"),
+            200_000,
+            "a 1M-capable model without [1m] runs in 200k"
+        );
+        assert_eq!(cli_window("sonnet"), 200_000);
+        assert_eq!(cli_window(""), 200_000);
     }
 
     #[test]

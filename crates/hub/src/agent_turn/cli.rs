@@ -232,6 +232,8 @@ struct Tally {
     injected: Vec<InjectedUserMessage>,
     /// What the last round's last model call read.
     context_tokens: u64,
+    /// The CLI compacted the transcript during one of its rounds.
+    compacted: bool,
 }
 
 impl Tally {
@@ -243,6 +245,7 @@ impl Tally {
         self.spend(result.usage());
         self.rounds += result.num_turns;
         self.context_tokens = result.context_tokens;
+        self.compacted |= result.compacted;
     }
 }
 
@@ -744,6 +747,7 @@ impl AgentTurnRig {
                 conversation.map(|c| c.session.channel.as_str()),
                 &turn.task,
                 tally.context_tokens,
+                tally.compacted,
             )
         });
         let served_turn = CliServed {

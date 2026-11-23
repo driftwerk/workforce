@@ -869,6 +869,7 @@ fn result_of(
         cache_creation_tokens: spent.cache_creation_input_tokens.into(),
         cache_read_tokens: spent.cache_read_input_tokens.into(),
         context_tokens: 0,
+        compacted: false,
         cost_usd: 0.0,
         num_turns: run.capture.turns.max(1),
         completion,

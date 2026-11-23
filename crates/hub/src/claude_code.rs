@@ -466,6 +466,8 @@ pub struct ClaudeCodeResult {
     /// What the round's last model call read, cached or not: how big its
     /// transcript had grown. 0 when the CLI reported no call.
     pub context_tokens: u64,
+    /// The CLI compacted its transcript during the round.
+    pub compacted: bool,
     pub cost_usd: f64,
     pub num_turns: u32,
     /// Why the round ended. Every retry / classification / surfacing decision
@@ -759,6 +761,9 @@ struct StreamCapture {
     /// Each model call's usage as its assistant events reported it, in
     /// order: the CLI repeats one call's usage on each of its content blocks.
     calls: Vec<(Option<String>, TokenUsage)>,
+    /// The CLI compacted its transcript during the round (a
+    /// `compact_boundary`).
+    compacted: bool,
 }
 
 /// How a round's stream reads as progress.
@@ -830,6 +835,11 @@ impl StreamCapture {
                     .and_then(|e| e.as_bool())
                     .unwrap_or(false);
                 self.result = Some(event.clone());
+            }
+            Some("system")
+                if event.get("subtype").and_then(|s| s.as_str()) == Some("compact_boundary") =>
+            {
+                self.compacted = true;
             }
             Some("rate_limit_event") => {
                 self.limit = crate::subscription::limits::claude_rate_limit_event(event);
@@ -1927,6 +1937,7 @@ fn assemble_result(
         cache_creation_tokens: run.capture.usage("/usage/cache_creation_input_tokens"),
         cache_read_tokens: run.capture.usage("/usage/cache_read_input_tokens"),
         context_tokens: run.capture.context_tokens(),
+        compacted: run.capture.compacted,
         cost_usd: run
             .capture
             .result
@@ -3860,6 +3871,18 @@ pub(crate) mod tests {
             capture_of(&[result_event("success", 1)]).context_tokens(),
             0
         );
+    }
+
+    #[test]
+    fn a_round_says_the_cli_compacted_its_transcript() {
+        let boundary = serde_json::json!({
+            "type": "system",
+            "subtype": "compact_boundary",
+            "compact_metadata": { "trigger": "auto", "pre_tokens": 160_000 },
+        });
+        assert!(capture_of(&[assistant("…"), boundary, result_event("success", 2)]).compacted);
+        let init = serde_json::json!({ "type": "system", "subtype": "init" });
+        assert!(!capture_of(&[init, result_event("success", 1)]).compacted);
     }
 
     fn result_event(subtype: &str, num_turns: u64) -> serde_json::Value {

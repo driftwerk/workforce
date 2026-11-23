@@ -29,7 +29,6 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
-use workforce_common::channels::DESK_CHANNEL;
 use workforce_common::oversight::Oversight;
 use workforce_desk::charge::Wheel;
 use workforce_desk::crew::{self, By, Event, Kind};
@@ -1233,7 +1232,7 @@ impl CrewHub {
             .map(|l| l.said.id)
             .collect();
         let prompt = self.machine_work_prompt(k, run, work, o);
-        let channel = format!("{DESK_CHANNEL}:line:{}/{}", k.0, run.id);
+        let channel = super::line::machine_line_channel(&k.0, run.id);
         let ran = self
             .run_turn_with(service, &owner, &channel, &prompt, hop, None, None, None)
             .await;

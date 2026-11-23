@@ -60,7 +60,7 @@ impl Transcript {
                 kept.turns,
                 kept.last_reply_at,
                 kept.context_tokens,
-                workforce_agent::llm::model_limits::context_for(model),
+                crate::cli_session::cli_window(model),
                 Utc::now(),
             ),
             false => rotation.rotation(kept.turns, kept.last_reply_at, Utc::now()),
@@ -119,16 +119,20 @@ pub(super) fn opening(
 }
 
 /// `slot` once a turn of `task` was answered in it on `channel`, its last
-/// call reading `context_tokens`. A boss's own conversation keeps the
-/// passages it was given, to be left out of the next turn's; none when the
-/// size is unknown or fell, the CLI having compacted the transcript itself.
+/// call reading `context_tokens`, the CLI having `compacted` the transcript
+/// itself during it or not. A boss's own conversation keeps the passages it
+/// was given, to be left out of the next turn's; none once the CLI
+/// compacted, or when the size is unknown or fell (a compaction it didn't
+/// say).
 pub(super) fn answered(
     slot: EngineSlot,
     channel: Option<&str>,
     task: &[ContentBlock],
     context_tokens: u64,
+    compacted: bool,
 ) -> EngineSlot {
     let kept = channel.is_some_and(is_crew_channel)
+        && !compacted
         && context_tokens > 0
         && context_tokens >= slot.context_tokens;
     EngineSlot {
@@ -175,7 +179,7 @@ fn unheld(text: &str, holds: &BTreeSet<u64>) -> String {
         .map(|p| {
             match p.chars().count() >= HELD_PASSAGE_CHARS && holds.contains(&passage_hash(p)) {
                 true => format!(
-                    "[Unchanged since your last turn, which has it whole: “{}”]",
+                    "[Unchanged since it was given earlier in this conversation: “{}”]",
                     truncate_with_ellipsis(p.lines().next().unwrap_or_default().trim(), 80)
                 ),
                 false => p.to_string(),
@@ -200,7 +204,10 @@ fn readable(block: &ContentBlock) -> ContentBlock {
 /// saw it, up to the message being answered, scoped to what `replay`'s
 /// viewer may see, newest kept first within [`CATCH_UP_BUDGET`]: from the
 /// last message it saw, or the ones saved after it once a compaction removed
-/// it; for a fresh transcript, from the last compaction summary.
+/// it; for a fresh transcript, from the last compaction summary. "After" is
+/// by each message's own saved time: a session's messages are stamped by the
+/// one hub that serves it, so the order holds without a clock shared across
+/// hubs; the store keeps no sequence that a compaction doesn't renumber.
 pub(crate) fn catch_up(
     session: &Session,
     resumed: Option<&EngineSlot>,
@@ -326,14 +333,14 @@ mod tests {
     fn a_resumed_crew_transcript_is_given_only_the_passages_it_lacks() {
         let (directives, picture) = (long("directives"), long("picture"));
         let first = task(&["## Heading", &directives, &picture, "wake one"]);
-        let slot = answered(EngineSlot::fresh(), Some(CREW), &first, 30_000);
+        let slot = answered(EngineSlot::fresh(), Some(CREW), &first, 30_000, false);
 
         let next = task(&["## Heading", &directives, &long("changed"), "wake two"]);
         let opened = said(&opening(&next, &resumed(slot.clone()), None));
 
         assert!(!opened.contains(&directives), "{opened}");
         assert!(opened.contains(
-            "[Unchanged since your last turn, which has it whole: “directives directives"
+            "[Unchanged since it was given earlier in this conversation: “directives directives"
         ));
         assert!(
             opened.contains(&long("changed")),
@@ -353,29 +360,46 @@ mod tests {
     }
 
     #[test]
-    fn what_a_transcript_holds_is_kept_only_while_its_size_is_known_and_grew() {
+    fn what_a_transcript_holds_is_kept_only_while_the_cli_never_compacted_it() {
         let first = task(&[&long("standing"), "wake"]);
-        let grown = answered(EngineSlot::fresh(), Some(CREW), &first, 30_000);
+        let grown = answered(EngineSlot::fresh(), Some(CREW), &first, 30_000, false);
         assert_eq!(grown.holds.len(), 1, "only the long passage");
         assert_eq!((grown.turns, grown.context_tokens), (1, 30_000));
 
-        let compacted = answered(grown.clone(), Some(CREW), &first, 12_000);
-        assert!(compacted.holds.is_empty(), "the CLI compacted it itself");
-        assert_eq!(compacted.context_tokens, 12_000);
+        let fell = answered(grown.clone(), Some(CREW), &first, 12_000, false);
+        assert!(
+            fell.holds.is_empty(),
+            "its size fell: the CLI compacted it unsaid"
+        );
+        assert_eq!(fell.context_tokens, 12_000);
+
+        let regrown = answered(grown.clone(), Some(CREW), &first, 155_000, true);
+        assert!(
+            regrown.holds.is_empty(),
+            "compacted during the turn and grown past where it was: still dropped"
+        );
+        assert!(
+            !answered(grown.clone(), Some(CREW), &first, 155_000, false)
+                .holds
+                .is_empty(),
+            "grown with no compaction: kept"
+        );
 
         assert!(
-            answered(grown.clone(), Some(CREW), &first, 0)
+            answered(grown.clone(), Some(CREW), &first, 0, false)
                 .holds
                 .is_empty(),
             "size unknown"
         );
         assert!(
-            answered(grown.clone(), Some("web"), &first, 40_000)
+            answered(grown.clone(), Some("web"), &first, 40_000, false)
                 .holds
                 .is_empty(),
             "the person's own"
         );
-        assert!(answered(grown, None, &first, 40_000).holds.is_empty());
+        assert!(answered(grown, None, &first, 40_000, false)
+            .holds
+            .is_empty());
     }
 
     /// A session whose transcript saw "old question" and "old answer", then
