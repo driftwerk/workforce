@@ -432,11 +432,14 @@ impl RouteTag {
             slot: Some(slot),
         } = self
         {
-            let synced_through = session.messages.last().map(|m| m.id.clone());
+            let last = session.messages.last();
+            let (synced_through, synced_at) =
+                (last.map(|m| m.id.clone()), last.map(|m| m.timestamp));
             session.set_engine_slot(
                 cli.slot_key(),
                 &EngineSlot {
                     synced_through,
+                    synced_at,
                     ..slot
                 },
             );
