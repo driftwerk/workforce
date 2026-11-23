@@ -393,6 +393,14 @@ pub trait MonitorHost: Send + Sync {
         owner: Option<&str>,
         edit: EditContext<'_>,
     ) -> eyre::Result<()>;
+    /// Pause or resume a monitor; a resume starts it from now.
+    async fn set_enabled(
+        &self,
+        id: &str,
+        owner: Option<&str>,
+        enabled: bool,
+        edit: EditContext<'_>,
+    ) -> eyre::Result<MonitorDefinition>;
     /// What a save or resume of `def` does about the events it missed.
     async fn apply_catch_up_policy(
         &self,

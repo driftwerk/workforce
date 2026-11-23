@@ -272,6 +272,8 @@ const STANDING_RULES: &[(&str, &[&str])] = &[
     ("google.gmail.filter_create", &[]),
     ("google.gmail.filter_delete", &[]),
     ("google.gmail.vacation_set", &[]),
+    ("email.sort_rules", &["set_enabled", "remove"]),
+    ("email.sort_rule_save", &[]),
 ];
 
 /// Tools that keep what they're told for the agent's later turns, with the
@@ -991,6 +993,9 @@ pub fn assess(
             host_of(url).unwrap_or("a web address").to_string(),
         ));
     }
+    if tool == "email.unsubscribe" {
+        return Some(exfiltration("outside".to_string()));
+    }
     // A write that says where it goes runs only there. A message that
     // names nowhere goes to the conversation the turn is in, and is judged
     // as going there; with no conversation to go to, it is held. Any other
@@ -1494,6 +1499,31 @@ mod tests {
             guard.check("email.confirm", &json!({ "action": "cancel" }), None),
             None
         );
+        let leaving = SurfaceEffect::Writes {
+            platform: "email".to_string(),
+            destination: "leave@shop.com".to_string(),
+        };
+        let expecting_it = armed(ContentScope {
+            expected: vec![Place::on("email", "leave@shop.com")],
+            ..ContentScope::default()
+        });
+        assert!(
+            matches!(
+                expecting_it
+                    .check(
+                        "email.unsubscribe",
+                        &json!({ "lists": [{ "id": "news.shop.com", "via": "leave@shop.com" }] }),
+                        Some(&leaving),
+                    )
+                    .map(|h| h.signal),
+                Some(AnomalySignal::Exfiltration { .. })
+            ),
+            "an unsubscribe a mail asked for reaches its sender, wherever the turn delivers"
+        );
+        assert_eq!(
+            guard.check("email.unsubscribe_lists", &json!({}), None),
+            None
+        );
     }
 
     #[test]
@@ -1548,6 +1578,14 @@ mod tests {
         );
         assert!(signal("monitor", "save").is_some());
         assert!(signal("monitor", " Save ").is_some(), "in any case");
+        assert!(signal("email.sort_rules", "set_enabled").is_some());
+        assert!(signal("email.sort_rules", "list").is_none());
+        assert_eq!(
+            guard
+                .check("email.sort_rule_save", &json!({"account": "home"}), None)
+                .map(|h| h.signal.description()),
+            Some("`email.sort_rule_save` would change standing automation".to_string())
+        );
         assert!(signal("scheduler", "create").is_some());
         assert!(signal("scheduler", "run").is_some());
         assert!(signal("scheduler", "set_bill_to").is_some());

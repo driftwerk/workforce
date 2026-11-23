@@ -385,6 +385,15 @@ impl ToolResult {
         }
     }
 
+    /// What a call that answered `outcome` reports, timed from `started`.
+    pub fn timed(outcome: Result<serde_json::Value, String>, started: std::time::Instant) -> Self {
+        let duration_ms = started.elapsed().as_millis() as u64;
+        match outcome {
+            Ok(output) => Self::success(output, duration_ms),
+            Err(why) => Self::failure(why, duration_ms),
+        }
+    }
+
     /// A refusal-for-rate-limiting failure carrying the typed signal.
     pub fn rate_limited(
         error: impl Into<String>,
@@ -450,6 +459,16 @@ impl ToolResult {
 #[cfg(test)]
 mod tool_result_tests {
     use super::*;
+
+    #[test]
+    fn a_timed_outcome_is_a_success_or_a_failure() {
+        let started = std::time::Instant::now();
+        let ok = ToolResult::timed(Ok(serde_json::json!({ "n": 1 })), started);
+        assert!(ok.success && ok.error.is_none());
+        let failed = ToolResult::timed(Err("no".to_string()), started);
+        assert!(!failed.success);
+        assert_eq!(failed.error.as_deref(), Some("no"));
+    }
 
     /// An empty lookup is a success carrying a fact, not a failure. It must
     /// leave `error` unset: the post-turn notice reads exactly that field, and
