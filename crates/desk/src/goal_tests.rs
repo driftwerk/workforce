@@ -537,3 +537,165 @@ fn a_long_fact_is_cut_in_the_goals_block() {
     assert!(line.chars().count() < FACT_MAX + 60, "{line}");
     assert!(line.contains("checkpoint (part 1)"));
 }
+
+#[test]
+fn a_spell_backs_off_at_one_two_four_and_eight_windows_then_every_eight() {
+    let window = Duration::minutes(30);
+    let spell = |minutes: i64| spell_of(Duration::minutes(minutes), window);
+    assert_eq!(spell(29), None);
+    assert_eq!(spell(30), Some(0));
+    assert_eq!(spell(59), Some(0));
+    assert_eq!(spell(60), Some(1));
+    assert_eq!(spell(120), Some(2));
+    assert_eq!(spell(239), Some(2));
+    assert_eq!(spell(240), Some(3));
+    assert_eq!(spell(479), Some(3));
+    assert_eq!(spell(480), Some(4));
+    assert_eq!(spell(720), Some(5));
+    assert_eq!(spell_of(Duration::minutes(90), Duration::zero()), None);
+}
+
+#[test]
+fn each_part_stalls_on_its_own_since_it_last_came_nearer() {
+    let r = result(vec![ci_minutes(5.0, 1), judged()]);
+    let window = Duration::minutes(30);
+    // CI stuck at 22 minutes all night; the judged part shown at 60.
+    let readings = [reading(0, 0, Some(22.0), false), reading(50, 0, Some(22.0), false)];
+    let facts = [fact(60, FactKind::Checkpoint, Some(1), true, "only api ran")];
+    let p = progress(&r, &readings, &facts);
+    assert_eq!(
+        stalls(&p, at(-10), at(70), window),
+        vec![Stall {
+            part: 0,
+            since: at(0),
+            spell: 1
+        }],
+        "a checkpoint on the judged part never resets the stuck CI"
+    );
+    assert_eq!(
+        stalls(&p, at(-10), at(100), window),
+        vec![
+            Stall {
+                part: 0,
+                since: at(0),
+                spell: 1
+            },
+            Stall {
+                part: 1,
+                since: at(60),
+                spell: 0
+            }
+        ]
+    );
+    // Better CI resets only its own part.
+    let better = [reading(0, 0, Some(22.0), false), reading(80, 0, Some(9.0), false)];
+    let p = progress(&r, &better, &facts);
+    assert_eq!(
+        stalls(&p, at(-10), at(100), window),
+        vec![Stall {
+            part: 1,
+            since: at(60),
+            spell: 0
+        }]
+    );
+    // Never read, nor shown: stalled since it was agreed.
+    let p = progress(&r, &[], &[]);
+    assert_eq!(stalls(&p, at(0), at(29), window), vec![]);
+    assert_eq!(stalls(&p, at(0), at(30), window).len(), 2);
+}
+
+#[test]
+fn a_met_part_never_stalls() {
+    let r = result(vec![ci_minutes(5.0, 1)]);
+    let p = progress(&r, &[reading(0, 0, Some(4.0), true)], &[]);
+    assert!(met(&p));
+    assert!(stalls(&p, at(0), at(600), Duration::minutes(30)).is_empty());
+}
+
+#[test]
+fn failed_reads_are_counted_in_a_row_from_the_first_and_reset_by_a_good_one() {
+    let r = result(vec![ci_minutes(5.0, 1)]);
+    let failed = [reading(10, 0, None, false), reading(20, 0, None, false)];
+    let p = progress(&r, &failed, &[]);
+    assert_eq!(p.parts[0].failing, 2);
+    assert_eq!(p.parts[0].failing_since, Some(at(10)));
+    let mut again = failed.to_vec();
+    again.push(reading(30, 0, Some(9.0), false));
+    again.push(reading(40, 0, None, false));
+    let p = progress(&r, &again, &[]);
+    assert_eq!(p.parts[0].failing, 1);
+    assert_eq!(p.parts[0].failing_since, Some(at(40)));
+}
+
+fn pull(n: u64) -> Evidence {
+    Evidence::Pull {
+        repo: "acme/api".into(),
+        number: n,
+    }
+}
+
+#[test]
+fn a_goal_names_its_branches_and_pull_requests_and_those_its_heads_found() {
+    let r = result(vec![
+        ci_minutes(5.0, 1),
+        Measure::PrMerged {
+            repo: "Acme/API".into(),
+            pr: PrPick::Head("fix-ci".into()),
+        },
+        Measure::ChecksGreen {
+            repo: "acme/web".into(),
+            pr: PrPick::Number(7),
+        },
+        judged(),
+    ]);
+    let mut found = reading(0, 1, Some(1.0), false);
+    found.evidence = vec![pull(12)];
+    let mut other = reading(0, 0, Some(9.0), false);
+    other.evidence = vec![pull(99)];
+    let refs = GoalRefs::of(&r, &[found, other]);
+    assert!(refs.names_branch("acme/api", "main"));
+    assert!(refs.names_branch("ACME/api", "fix-ci"));
+    assert!(!refs.names_branch("acme/api", "spike"));
+    assert!(refs.names_pull("acme/api", 12));
+    assert!(refs.names_pull("acme/web", 7));
+    assert!(!refs.names_pull("acme/api", 99), "a CI part's evidence names no PR of the goal");
+    let mut branches: Vec<&str> = refs.branches_of("acme/api").collect();
+    branches.sort_unstable();
+    assert_eq!(branches, vec!["fix-ci", "main"]);
+    assert_eq!(refs.branches_of("acme/web").count(), 0);
+}
+
+#[test]
+fn a_checkpoint_shows_only_new_evidence_of_the_goal_s_own_work() {
+    let commit = |sha: &str| Evidence::Commit {
+        repo: "acme/api".into(),
+        sha: sha.into(),
+    };
+    let (a, b) = (commit("aaaa111"), commit("bbbb222"));
+    assert_eq!(checkpoint_shows(&[], &[], &[]), Err(NotShown::Nothing));
+    assert_eq!(
+        checkpoint_shows(&[a.clone()], &[Found::OnGoal], &[]),
+        Ok(())
+    );
+    assert_eq!(
+        checkpoint_shows(&[a.clone(), b.clone()], &[Found::OnGoal, Found::OffGoal], &[]),
+        Err(NotShown::OffGoal(b.clone())),
+        "22 Nov: a commit on another branch doesn't count"
+    );
+    assert_eq!(
+        checkpoint_shows(&[b.clone()], &[Found::Missing], &[]),
+        Err(NotShown::Missing(b.clone()))
+    );
+    assert_eq!(
+        checkpoint_shows(&[a.clone()], &[Found::OnGoal], &[&a]),
+        Err(NotShown::NothingNew)
+    );
+    assert_eq!(
+        checkpoint_shows(&[a.clone(), b.clone()], &[Found::OnGoal, Found::OnGoal], &[&a]),
+        Ok(())
+    );
+    assert_eq!(
+        checkpoint_shows(&[a.clone(), b.clone()], &[Found::OnGoal], &[]),
+        Err(NotShown::Missing(b))
+    );
+}

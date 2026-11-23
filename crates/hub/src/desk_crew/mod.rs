@@ -44,6 +44,7 @@ mod find;
 mod github;
 mod github_seen;
 mod goal;
+mod goal_check;
 mod handover;
 mod held;
 mod idle;
@@ -323,6 +324,8 @@ pub struct CrewHub {
     plan_failed: Mutex<HashMap<uuid::Uuid, plan::Failed>>,
     /// What the plan watchdog did, once each ([`plan_watch`]).
     plan_watch: Mutex<plan_watch::Watch>,
+    /// What the goal checks keep between looks ([`goal_check`]).
+    goal_checks: Mutex<goal_check::GoalChecks>,
     /// What failed to start, for its plan's next turn.
     plan_failures: Mutex<Vec<(uuid::Uuid, String)>>,
     /// What its boss is told of how a ticket started, when it isn't as
@@ -835,6 +838,7 @@ impl CrewHub {
             starting: tokio::sync::Mutex::new(()),
             plan_failed: Mutex::default(),
             plan_watch: Mutex::default(),
+            goal_checks: Mutex::default(),
             plan_failures: Mutex::default(),
             plan_notes: Mutex::default(),
             plan_waiting: Mutex::default(),

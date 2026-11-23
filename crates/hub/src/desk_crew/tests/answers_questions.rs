@@ -35,7 +35,7 @@ async fn told(d: &Desk, id: uuid::Uuid) -> Vec<String> {
 }
 
 /// The person prompts `url`'s session, and its turn ends asking `question`.
-async fn asks(url: &str, question: &str) {
+pub(super) async fn asks(url: &str, question: &str) {
     hook(
         url,
         json!({"hook_event_name": "UserPromptSubmit", "prompt": "carry on with the release"}),

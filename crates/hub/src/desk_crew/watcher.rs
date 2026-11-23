@@ -24,7 +24,7 @@ use workforce_desk::crew::{
     self, Event, ItemKind, ItemState, Kind, MentionedApproval, Party, PartyKind,
 };
 use workforce_desk::line::{LineMessage, Wait};
-use workforce_desk::model::{DeskEvent, Origin};
+use workforce_desk::model::{DeskEvent, Origin, SessionView};
 use workforce_desk::CheckIn;
 
 use super::github::CHECK_GITHUB;
@@ -60,11 +60,41 @@ pub(super) const UNBOUND_CHECKINS_PER_DAY: u32 = 3000;
 /// sooner.
 const UNBOUND_WAITING_MINUTES: u32 = 1;
 const UNBOUND_QUIET_MINUTES: u32 = 3;
-/// How often, in minutes, an unbound overseer sweeps its scope while it
-/// has anything in it.
+/// How often, in minutes, an unbound overseer may sweep its scope, when
+/// its look found something.
 const UNBOUND_SWEEP_MINUTES: u32 = 2;
+/// How often, in minutes, an unbound overseer sweeps its scope whatever was
+/// found, while it has open goals or running plans: the net under the
+/// deterministic looks.
+const UNBOUND_SWEEP_NET_MINUTES: u32 = 60;
 /// What a check-in tried again is marked with: tried again once only.
 const RETRIED: &str = "(again, as the last check-in didn't run) ";
+
+/// Why an unbound overseer sweeps its scope now.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Sweep {
+    /// Its look found something.
+    Found,
+    /// Nothing was found for an hour: the net, while it keeps work.
+    Net,
+}
+
+/// Whether an unbound overseer that last swept `swept` ago (never, none)
+/// sweeps now, `found` whether its look found anything: with what it
+/// found at most every [`UNBOUND_SWEEP_MINUTES`], else as the net every
+/// [`UNBOUND_SWEEP_NET_MINUTES`]; never for nothing found sooner.
+pub(super) fn sweep_due(
+    found: bool,
+    swept: Option<std::time::Duration>,
+    minute: std::time::Duration,
+) -> Option<Sweep> {
+    let past = |m: u32| swept.is_none_or(|s| s >= minute * m);
+    match (found && past(UNBOUND_SWEEP_MINUTES), past(UNBOUND_SWEEP_NET_MINUTES)) {
+        (true, _) => Some(Sweep::Found),
+        (false, true) => Some(Sweep::Net),
+        (false, false) => None,
+    }
+}
 
 /// What a sweep wakes an unbound overseer with.
 pub(super) const SWEEP: &str = "Regular sweep: nothing may sit idle. Look over every session \
@@ -690,8 +720,12 @@ impl CrewHub {
                         )
                     })
             });
-            // Said once a stall, instead of its quiet from then on.
-            let waits = waiting.get(&item.id).map(Vec::as_slice).unwrap_or_default();
+            // Said once a stall, instead of its quiet from then on. A goal's
+            // session is its goal check's to say ([`super::goal_check`]).
+            let waits = match self.on_goal(&item.id) {
+                true => &[][..],
+                false => waiting.get(&item.id).map(Vec::as_slice).unwrap_or_default(),
+            };
             if let Some(oldest) = waits.first() {
                 let key = format!("undelivered:{}:{}:{}", item.id, oldest.id, moved_at(item));
                 holding.insert(key.clone());
@@ -818,7 +852,7 @@ impl CrewHub {
 
     /// `overseer`'s own messages still waiting to go into each session, by
     /// session id, oldest first.
-    async fn waiting_from(&self, overseer: &str) -> HashMap<String, Vec<LineMessage>> {
+    pub(super) async fn waiting_from(&self, overseer: &str) -> HashMap<String, Vec<LineMessage>> {
         match self.desk.store().line_waiting().await {
             Ok(rows) => rows
                 .into_iter()
@@ -858,35 +892,7 @@ impl CrewHub {
         if !view.state.is_running() || self.person_has_questions(&view, overseer) {
             return None;
         }
-        let waits = self.desk.rows_wait(&view, waiting)?;
-        const LONG_STEP: &str =
-            "it may be stuck, or in one long step (a build, a test run), which a restart would cut off";
-        let first = match view.pending {
-            Some(_) => Some(Wait::Dialog),
-            None => waits.first().copied().flatten(),
-        };
-        let (why, behind_person) = match first {
-            Some(Wait::Dialog) => (
-                "it waits on an approval or a dialog in its terminal, and your messages wait behind that"
-                    .to_string(),
-                true,
-            ),
-            Some(Wait::Asking) => (
-                "it ended its turn asking the person something, and your messages wait behind that"
-                    .to_string(),
-                true,
-            ),
-            Some(Wait::Stopped) => ("Desk can't reach it to put them in".to_string(), false),
-            Some(Wait::Working) => (format!("its turn hasn't ended: {LONG_STEP}"), false),
-            Some(Wait::NextCall) => (
-                format!("it was told to read it with its next tool call, and hasn't made one: {LONG_STEP}"),
-                false,
-            ),
-            None => ("it was free to take it, and nothing took it in".to_string(), false),
-            Some(Wait::Typing | Wait::Paused | Wait::PersonDriving | Wait::ModeEnding) => {
-                return None
-            }
-        };
+        let (why, behind_person) = self.why_waiting(&view, waiting)?;
         let move_it = match behind_person {
             true => {
                 "Answer what it waits on if that is yours to (crew.history shows it); it stays \
@@ -926,6 +932,45 @@ impl CrewHub {
         })
     }
 
+    /// Why `waiting`, messages to `view` (oldest first), haven't gone in,
+    /// and whether they wait behind what it asks the person: none while
+    /// the person is in it, or Desk holds them on purpose.
+    pub(super) fn why_waiting(
+        &self,
+        view: &SessionView,
+        waiting: &[LineMessage],
+    ) -> Option<(String, bool)> {
+        let waits = self.desk.rows_wait(view, waiting)?;
+        const LONG_STEP: &str =
+            "it may be stuck, or in one long step (a build, a test run), which a restart would cut off";
+        let first = match view.pending {
+            Some(_) => Some(Wait::Dialog),
+            None => waits.first().copied().flatten(),
+        };
+        Some(match first {
+            Some(Wait::Dialog) => (
+                "it waits on an approval or a dialog in its terminal, and your messages wait behind that"
+                    .to_string(),
+                true,
+            ),
+            Some(Wait::Asking) => (
+                "it ended its turn asking the person something, and your messages wait behind that"
+                    .to_string(),
+                true,
+            ),
+            Some(Wait::Stopped) => ("Desk can't reach it to put them in".to_string(), false),
+            Some(Wait::Working) => (format!("its turn hasn't ended: {LONG_STEP}"), false),
+            Some(Wait::NextCall) => (
+                format!("it was told to read it with its next tool call, and hasn't made one: {LONG_STEP}"),
+                false,
+            ),
+            None => ("it was free to take it, and nothing took it in".to_string(), false),
+            Some(Wait::Typing | Wait::Paused | Wait::PersonDriving | Wait::ModeEnding) => {
+                return None
+            }
+        })
+    }
+
     /// What an unbound overseer is told each time it wakes: be the boss.
     pub(super) fn boss_hint(o: &Oversight) -> String {
         format!(
@@ -943,16 +988,6 @@ impl CrewHub {
              answer settles that kind of case from then on. Give a reason each time; the person reads them in Activity. Your own limits stay theirs: asked to change them, say plainly you can't and post crew.ask_oversight_change. {STANDING_RULE} {PLAN_DRAFT} {SAVE_GOALS} {CHECK_GITHUB}",
             o.work.parallel, o.work.parallel
         )
-    }
-
-    /// Whether the overseer `overseer`'s scope has a session or an agent
-    /// in it but itself.
-    pub(super) async fn has_work(&self, overseer: &str, o: &Oversight) -> bool {
-        let seen = self.desk.seen_by(&o.scope);
-        self.desk
-            .overview_for(self, None, Some(&seen))
-            .await
-            .is_ok_and(|v| v.items.iter().any(|i| i.id != overseer))
     }
 
     /// What the overseer is told it may do at `level`, under `o`'s
@@ -1506,18 +1541,23 @@ pub(super) fn wake_loop(
                         let at = crew.thresholds(&id, o, &mut noted).await;
                         let w = waking.entry(id.clone()).or_default();
                         w.noted = noted;
+                        let swept = w.swept;
+                        let looked_found = !at.is_empty();
                         found.extend(at.into_iter().map(|mut t| {
                             t.routine = true;
                             (id.clone(), t)
                         }));
-                        // Unbound, it sweeps its scope every few minutes while
-                        // there is anything in it, whatever else woke it.
-                        let every = crew.timing.minute * UNBOUND_SWEEP_MINUTES;
-                        let due = w.swept.is_none_or(|at| at.elapsed() >= every);
-                        // Running on notices, it is swept only once they have
-                        // been quiet a while: the net under them.
+                        // Unbound, it sweeps its scope with what its look found,
+                        // and as a net while it has goals or plans running.
+                        // Running on notices, only once they have been quiet a
+                        // while: the net under them.
                         let noticed = crew.orchestrates(&id) && crew.noticed_lately(&id);
-                        if due && !noticed && crew.unbound(o) && crew.has_work(&id, o).await {
+                        let sweeps = match sweep_due(looked_found, swept.map(|at| at.elapsed()), crew.timing.minute) {
+                            Some(Sweep::Found) => true,
+                            Some(Sweep::Net) => crew.keeps_work(&id).await,
+                            None => false,
+                        };
+                        if sweeps && !noticed && crew.unbound(o) {
                             if let Some(w) = waking.get_mut(&id) {
                                 w.swept = Some(Instant::now());
                             }
@@ -1828,5 +1868,18 @@ mod budget_tests {
             pending.last().unwrap().line,
             format!("web asks “{}”", MAX_HELD + 4)
         );
+    }
+
+    #[test]
+    fn an_unbound_sweep_comes_with_what_was_found_and_as_an_hourly_net() {
+        let minute = std::time::Duration::from_secs(60);
+        let ago = |m: u64| Some(minute * m as u32);
+        assert_eq!(sweep_due(false, ago(1), minute), None, "nothing found");
+        assert_eq!(sweep_due(false, ago(59), minute), None);
+        assert_eq!(sweep_due(true, ago(1), minute), None, "not twice in two minutes");
+        assert_eq!(sweep_due(true, ago(2), minute), Some(Sweep::Found));
+        assert_eq!(sweep_due(false, ago(60), minute), Some(Sweep::Net));
+        assert_eq!(sweep_due(false, None, minute), Some(Sweep::Net));
+        assert_eq!(sweep_due(true, None, minute), Some(Sweep::Found));
     }
 }

@@ -28,7 +28,8 @@
 //!   the boss's promise to check, not a session left open.
 //! - **Nothing moved** for `stall_minutes` while a ticket is ready or in
 //!   Doing and none works: the person is told once, in plain words, what
-//!   is stuck and why.
+//!   is stuck and why. A plan with a goal is its goal's check's instead
+//!   ([`super::goal_check`]), which tells its boss alone, paused or not.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -60,6 +61,13 @@ const STOPPED_KEY: &str = "plan-stopped:";
 #[derive(Default)]
 pub(crate) struct Watch {
     done: HashSet<String>,
+}
+
+impl Watch {
+    /// Notes `key` as done: true the first time.
+    pub(crate) fn said(&mut self, key: String) -> bool {
+        self.done.insert(key)
+    }
 }
 
 /// Where one of a plan's tickets stands, as the watchdog reads it.
@@ -212,6 +220,7 @@ impl CrewHub {
             };
             self.watch_plan(&service, &o, &detail).await;
         }
+        self.check_goals().await;
     }
 
     /// Whether `session` is `boss`'s to look after: in its charge, started
@@ -342,7 +351,10 @@ impl CrewHub {
                 }
             }
         }
-        self.say_stall(boss, o, p, busy, &stuck, now).await;
+        // A goal's stall is its check's to say, to its boss alone.
+        if p.summary.plan.result.is_none() {
+            self.say_stall(boss, o, p, busy, &stuck, now).await;
+        }
     }
 
     /// What Desk sees inside ticket `key`'s session (`seen`: its glance and
@@ -649,10 +661,15 @@ impl CrewHub {
     /// Wakes plan `id`'s boss with `line`, on its own task: its turn
     /// never holds up the minute's other looks.
     fn wake_plan(&self, id: Uuid, line: String) {
+        self.wake_plan_with(id, vec![line]);
+    }
+
+    /// Wakes plan `id`'s boss with `lines` in one turn, on its own task.
+    pub(crate) fn wake_plan_with(&self, id: Uuid, lines: Vec<String>) {
         let Some(crew) = self.me.upgrade() else {
             return;
         };
-        tokio::spawn(async move { crew.plan_turn(id, vec![line]).await });
+        tokio::spawn(async move { crew.plan_turn(id, lines).await });
     }
 
     /// Tells the person, once a stall, that plan `p` hasn't moved in

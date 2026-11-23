@@ -116,6 +116,18 @@ pub enum Evidence {
     Ticket { key: String },
 }
 
+impl Evidence {
+    /// The repository it is of, when it is GitHub's.
+    pub fn repo(&self) -> Option<&str> {
+        match self {
+            Self::Run { repo, .. } | Self::Pull { repo, .. } | Self::Commit { repo, .. } => {
+                Some(repo)
+            }
+            Self::Ticket { .. } => None,
+        }
+    }
+}
+
 /// One reading of a measured part: its value, none when it couldn't be
 /// read (then `failed` says why), and whether it met the part.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -186,6 +198,8 @@ pub struct PartProgress {
     pub newest: Option<Reading>,
     /// Failed reads in a row, newest last.
     pub failing: u32,
+    /// When the first of those failed reads was taken.
+    pub failing_since: Option<DateTime<Utc>>,
 }
 
 /// How a goal stands, part by part, in its result's order.
@@ -473,9 +487,13 @@ fn measured_progress(part: &Measure, n: u16, readings: &[Reading]) -> PartProgre
     own.into_iter().fold(PartProgress::default(), |mut p, r| {
         p.newest = Some(r.clone());
         match r.value {
-            None => p.failing += 1,
+            None => {
+                p.failing_since = p.failing_since.or(Some(r.at));
+                p.failing += 1;
+            }
             Some(v) => {
                 p.failing = 0;
+                p.failing_since = None;
                 p.met = r.met;
                 let beats = p
                     .best
@@ -497,6 +515,176 @@ fn measured_progress(part: &Measure, n: u16, readings: &[Reading]) -> PartProgre
 /// Whether every part is met.
 pub fn met(p: &Progress) -> bool {
     !p.parts.is_empty() && p.parts.iter().all(|part| part.met)
+}
+
+/// A part with no progress toward its target for a spell of the window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Stall {
+    pub part: u16,
+    /// When it last came nearer, or the goal was agreed.
+    pub since: DateTime<Utc>,
+    /// Which spell of it this is: 0 from one window, 1 from two, 2 from
+    /// four, 3 from eight, then one more every eight.
+    pub spell: u32,
+}
+
+/// The spell `stalled` is in, in windows of `window`: none under one.
+pub fn spell_of(stalled: chrono::Duration, window: chrono::Duration) -> Option<u32> {
+    let window = window.num_milliseconds();
+    if window <= 0 {
+        return None;
+    }
+    match stalled.num_milliseconds() / window {
+        n if n < 1 => None,
+        n if n < 2 => Some(0),
+        n if n < 4 => Some(1),
+        n if n < 8 => Some(2),
+        n => Some(u32::try_from(n / 8 + 2).unwrap_or(u32::MAX)),
+    }
+}
+
+/// Each part of `p`, agreed at `agreed_at`, that isn't met and hasn't come
+/// nearer for at least `window` by `now`: on its own, so one part coming
+/// nearer never hides another stuck.
+pub fn stalls(
+    p: &Progress,
+    agreed_at: DateTime<Utc>,
+    now: DateTime<Utc>,
+    window: chrono::Duration,
+) -> Vec<Stall> {
+    p.parts
+        .iter()
+        .enumerate()
+        .filter(|(_, part)| !part.met)
+        .filter_map(|(i, part)| {
+            let since = part.improved_at.map_or(agreed_at, |at| at.max(agreed_at));
+            Some(Stall {
+                part: u16::try_from(i).ok()?,
+                since,
+                spell: spell_of(now - since, window)?,
+            })
+        })
+        .collect()
+}
+
+/// What a goal names on GitHub, by repository: the branches its work is
+/// on, and its pull requests by number.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GoalRefs {
+    pub branches: HashSet<(String, String)>,
+    pub pulls: HashSet<(String, u64)>,
+}
+
+impl GoalRefs {
+    /// What `r` names, with the pull requests its `readings` found by their
+    /// head branch.
+    pub fn of(r: &GoalResult, readings: &[Reading]) -> Self {
+        let key = |repo: &str| repo.trim().to_ascii_lowercase();
+        let mut refs = Self::default();
+        for (i, part) in r.parts.iter().enumerate() {
+            match part {
+                Measure::Ci { repo, branch, .. } => {
+                    refs.branches.insert((key(repo), branch.trim().to_string()));
+                }
+                Measure::PrMerged { repo, pr } | Measure::ChecksGreen { repo, pr } => {
+                    match pr {
+                        PrPick::Number(n) => {
+                            refs.pulls.insert((key(repo), *n));
+                        }
+                        PrPick::Head(head) => {
+                            refs.branches.insert((key(repo), head.trim().to_string()));
+                        }
+                    }
+                    refs.pulls.extend(
+                        readings
+                            .iter()
+                            .filter(|reading| usize::from(reading.part) == i)
+                            .flat_map(|reading| &reading.evidence)
+                            .filter_map(|e| match e {
+                                Evidence::Pull { repo, number } => Some((key(repo), *number)),
+                                _ => None,
+                            }),
+                    );
+                }
+                Measure::Judged { .. } => {}
+            }
+        }
+        refs
+    }
+
+    /// Whether pull request `number` of `repo` is one of the goal's.
+    pub fn names_pull(&self, repo: &str, number: u64) -> bool {
+        self.pulls
+            .contains(&(repo.trim().to_ascii_lowercase(), number))
+    }
+
+    /// Whether `branch` of `repo` is one the goal's work is on.
+    pub fn names_branch(&self, repo: &str, branch: &str) -> bool {
+        self.branches
+            .contains(&(repo.trim().to_ascii_lowercase(), branch.trim().to_string()))
+    }
+
+    /// The goal's branches on `repo`.
+    pub fn branches_of<'a>(&'a self, repo: &str) -> impl Iterator<Item = &'a str> {
+        let repo = repo.trim().to_ascii_lowercase();
+        self.branches
+            .iter()
+            .filter(move |(r, _)| *r == repo)
+            .map(|(_, b)| b.as_str())
+    }
+}
+
+/// What Desk found of one piece of a checkpoint's evidence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Found {
+    /// It is there, and part of the goal's own work: on its branches or
+    /// its pull requests.
+    OnGoal,
+    /// It is there, but other work.
+    OffGoal,
+    /// It isn't there as it says, or couldn't be looked up.
+    Missing,
+}
+
+/// Why a checkpoint isn't accepted toward its judged part.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NotShown {
+    /// It shows no evidence.
+    Nothing,
+    /// This piece of it isn't there as it says.
+    Missing(Evidence),
+    /// This piece of it is other work than the goal's.
+    OffGoal(Evidence),
+    /// Every piece was shown toward the part already.
+    NothingNew,
+}
+
+/// Whether a checkpoint showing `evidence`, each piece as `found` says,
+/// moves its judged part on from `earlier`, what its accepted checkpoints
+/// showed: every piece there and the goal's own work, and one at least
+/// new.
+pub fn checkpoint_shows(
+    evidence: &[Evidence],
+    found: &[Found],
+    earlier: &[&Evidence],
+) -> Result<(), NotShown> {
+    if evidence.is_empty() {
+        return Err(NotShown::Nothing);
+    }
+    for (e, f) in evidence.iter().zip(found) {
+        match f {
+            Found::OnGoal => {}
+            Found::OffGoal => return Err(NotShown::OffGoal(e.clone())),
+            Found::Missing => return Err(NotShown::Missing(e.clone())),
+        }
+    }
+    if found.len() < evidence.len() {
+        return Err(NotShown::Missing(evidence[found.len()].clone()));
+    }
+    match evidence.iter().any(|e| !earlier.contains(&e)) {
+        true => Ok(()),
+        false => Err(NotShown::NothingNew),
+    }
 }
 
 /// How each part stands, in a line: "CI on main of acme/api: 22 minutes,

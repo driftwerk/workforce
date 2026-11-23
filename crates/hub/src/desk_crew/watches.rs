@@ -320,9 +320,14 @@ impl CrewHub {
                 for w in open {
                     if let Some(outcome) = self.look_at_watch(&w, now).await {
                         match store.watch_end(w.id, &outcome.0).await {
-                            // What it read, kept for the notice; told below.
-                            Ok(Some(_)) => {
+                            // What it read, kept for the notice; told below. Its
+                            // plan's goal is read again soon: what it waited on
+                            // may have moved it.
+                            Ok(Some(ended)) => {
                                 self.watch_reads.lock().insert(w.id, outcome.1);
+                                if let Some(plan) = ended.plan {
+                                    self.pull_goal(plan);
+                                }
                             }
                             // Ended meanwhile (the boss ended it).
                             Ok(None) => {}

@@ -31,11 +31,12 @@ pub(super) const BRANCH: &str = "crew.github_branch";
 pub(super) const CI: &str = "crew.github_ci";
 
 /// The GitHub adapter's tools these call: reads alone.
-pub(super) const CALLS: [&str; 4] = [
+pub(super) const CALLS: [&str; 5] = [
     "github.get_pull",
     "github.list_pulls",
     "github.workflow_runs",
     "github.workflow_run_logs",
+    "github.compare",
 ];
 
 /// What the boss is told when GitHub can't be read as the person.

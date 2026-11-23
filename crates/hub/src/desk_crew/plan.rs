@@ -2609,7 +2609,8 @@ impl CrewHub {
 
     /// What `event` adds to a plan's next turn, and which plan: the person
     /// changing, approving, pausing, resuming or dropping it, or one of its
-    /// tickets' sessions failing.
+    /// tickets' sessions failing. One of them ending a turn moves its
+    /// goal's next reading forward instead.
     async fn plan_line(&self, event: &crew::Event) -> Option<(Uuid, String)> {
         match event.kind {
             Kind::PlanChanged
@@ -2649,6 +2650,14 @@ impl CrewHub {
                     return Some((plan, format!("{key}'s session failed: {}", event.text)));
                 };
                 self.hold_back_died(plan, ticket, key, session.to_string(), None, e);
+                None
+            }
+            // One of its sessions ended a turn: its goal is read again soon,
+            // and its turn told nothing.
+            Kind::Finished => {
+                let session: Uuid = event.subject.as_ref()?.id.parse().ok()?;
+                let (plan, ..) = self.plan_ticket_of(session).await?;
+                self.pull_goal(plan);
                 None
             }
             _ => None,

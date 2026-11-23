@@ -273,13 +273,14 @@ async fn with_switches_off_and_a_list_of_repositories_act_fully_is_unbound_all_t
 /// sweeps its scope every few minutes while there is anything in it; at
 /// Act, neither.
 #[tokio::test(flavor = "multi_thread")]
-async fn unbound_wakes_at_once_for_what_waits_and_sweeps_its_scope() {
+async fn unbound_sweeps_its_scope_with_what_its_look_found_and_never_for_nothing() {
     with_test_pool(workforce_desk::store::build_pool, |pool| async move {
         let dir = tempfile::tempdir().unwrap();
-        let (_, crew, d, llm) = overseeing(dir.path(), pool, "ok", UNBOUND, &[]).await;
+        let base = std::fs::canonicalize(dir.path()).unwrap();
+        let (_, crew, d, llm) = overseeing(&base, pool, "ok", UNBOUND, &[]).await;
         super::boss_allows(&llm).await;
         let (_, o) = crew.overseer_service().unwrap();
-        let web = new_session(&d, dir.path(), "acme-web").await;
+        let web = new_session(&d, &base, "acme-web").await;
         let party = Party::session(&web);
         let waits = Event::new(
             Kind::NeedsYou,
@@ -288,6 +289,19 @@ async fn unbound_wakes_at_once_for_what_waits_and_sweeps_its_scope() {
             "needs you",
         );
         assert!(crew.trigger_for(&waits, "desk", &o).is_some());
+        // Nothing found and no work kept: several sweeps' worth of minutes
+        // go by without one.
+        tokio::time::sleep(Duration::from_millis(800)).await;
+        let latest = d.store().latest_check_in("desk").await.unwrap();
+        assert!(
+            latest
+                .as_ref()
+                .is_none_or(|c| !c.prompt.contains("Regular sweep")),
+            "{latest:?}"
+        );
+        // Its look finds a session asking: the sweep comes with it.
+        let url = hook_url(&base, web.id).await;
+        super::answers_questions::asks(&url, "Ship it?").await;
         let swept = eventually("a sweep", async || {
             let c = d.store().latest_check_in("desk").await.unwrap()?;
             c.prompt.contains("Regular sweep").then_some(c)

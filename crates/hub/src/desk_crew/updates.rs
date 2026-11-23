@@ -1142,18 +1142,10 @@ impl CrewHub {
         for k in &b.kept {
             lines.push((
                 SectionKey::Finished,
-                Said {
-                    kind: EventKind::Finished,
-                    headline: k.trim_start_matches('✓').trim().to_string(),
-                    body: String::new(),
-                    ids: vec![],
-                    not_checked: None,
-                    session: None,
-                    did: vec![],
-                    at: None,
-                    decisions: None,
-                    moves: None,
-                },
+                Said::line(
+                    EventKind::Finished,
+                    k.trim_start_matches('✓').trim().to_string(),
+                ),
             ));
         }
         // What background work used of the person's plans, when a notable
@@ -1202,20 +1194,16 @@ impl CrewHub {
         if let Some(headline) = background_plan_use(rows, notable, &format!("since {at}")) {
             lines.push((
                 SectionKey::WorthKnowing,
-                Said {
-                    kind: EventKind::Problem,
-                    headline,
-                    body: String::new(),
-                    ids: vec![],
-                    not_checked: None,
-                    session: None,
-                    did: vec![],
-                    at: None,
-                    decisions: None,
-                    moves: None,
-                },
+                Said::line(EventKind::Problem, headline),
             ));
         }
+        // A goal with no progress for spells on end: worth knowing, never
+        // sent on its own.
+        lines.extend(
+            self.goal_notes(boss, now)
+                .into_iter()
+                .map(|text| (SectionKey::WorthKnowing, Said::line(EventKind::Problem, text))),
+        );
         let runs = told
             .routine
             .iter()
@@ -1680,6 +1668,10 @@ impl CrewHub {
             made.retain(|(at, _)| *at > cutoff);
         }
         self.closing_told(service.agent_id.as_str(), cutoff);
+        // Goal notes are said only in a roundup: kept until one goes.
+        if p.update.roundup.is_some() {
+            self.goal_notes_told(service.agent_id.as_str(), cutoff);
+        }
         let read = service
             .sessions
             .desk_read(owner, DESK_CHANNEL)

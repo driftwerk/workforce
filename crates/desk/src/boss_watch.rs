@@ -319,6 +319,19 @@ impl DeskStore {
         Ok(n > 0)
     }
 
+    /// Ends plan `plan`'s open watches with `outcome`, as told: its closing
+    /// turn says why they ended. How many.
+    pub async fn watches_end_plan(&self, plan: Uuid, outcome: &str) -> Result<u64> {
+        let client = self.pool().get().await?;
+        Ok(client
+            .execute(
+                "UPDATE boss_watches SET ended_at = now(), outcome = $2, delivered_at = now() \
+                 WHERE plan = $1 AND ended_at IS NULL",
+                &[&plan, &outcome],
+            )
+            .await?)
+    }
+
     /// Notes that the boss was told the ends of `ids`.
     pub async fn watches_delivered(&self, ids: &[Uuid]) -> Result<()> {
         if ids.is_empty() {
@@ -455,6 +468,38 @@ mod tests {
                     .await
                     .unwrap(),
                 2
+            );
+        })
+        .await;
+    }
+
+    /// A plan's watches end together, told already, and no one else's.
+    #[tokio::test]
+    async fn a_plan_s_watches_end_together_without_a_word() {
+        with_test_pool(build_pool, |pool| async move {
+            DeskStore::migrate(&pool).await.unwrap();
+            let store = DeskStore::from_pool(pool);
+            let plan = Uuid::new_v4();
+            let on = |number| NewWatch {
+                plan: Some(plan),
+                ..pr("desk", "sam", number)
+            };
+            for w in [on(1), on(2), pr("desk", "sam", 3)] {
+                assert!(matches!(
+                    store.watch_open(&w).await.unwrap(),
+                    Opened::Started(_)
+                ));
+            }
+            assert_eq!(
+                store.watches_end_plan(plan, "its goal is met").await.unwrap(),
+                2
+            );
+            let open = store.watches_open("desk", "sam").await.unwrap();
+            assert_eq!(open.iter().map(|w| w.plan).collect::<Vec<_>>(), [None]);
+            assert!(store.watches_undelivered().await.unwrap().is_empty());
+            assert_eq!(
+                store.watches_end_plan(plan, "again").await.unwrap(),
+                0
             );
         })
         .await;
