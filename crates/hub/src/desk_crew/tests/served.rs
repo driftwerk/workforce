@@ -1356,7 +1356,7 @@ async fn a_served_boss_reads_a_long_reply_on_page_by_page() {
         let stale =
             read(json!({"session_id": mine.id, "reply_from": 8000, "turn": "00000000"})).await;
         assert!(
-            stale.contains("its reply changed since you began reading it"),
+            stale.contains("its reply changed since you began reading it. Read the new one"),
             "{stale}"
         );
     })

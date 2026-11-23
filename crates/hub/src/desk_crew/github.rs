@@ -81,22 +81,9 @@ pub(super) fn schema(name: &str) -> Value {
 
 /// `repo` as GitHub's owner and name.
 fn owner_repo(input: &Value) -> Result<(String, String), String> {
-    let repo = input["repo"].as_str().map(str::trim).unwrap_or_default();
-    // GitHub's own characters alone: nothing that steers the request
-    // elsewhere (`?`, `#`, `..`).
-    let part = |p: &str| {
-        !p.is_empty()
-            && p != "."
-            && p != ".."
-            && p.chars()
-                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
-    };
-    match repo.split_once('/') {
-        Some((owner, name)) if part(owner) && part(name) => {
-            Ok((owner.to_string(), name.to_string()))
-        }
-        _ => Err("Say the repository as owner/name (driftwerk/workforce).".into()),
-    }
+    workforce_desk::goal::github_repo(input["repo"].as_str().unwrap_or_default())
+        .map(|(owner, name)| (owner.to_string(), name.to_string()))
+        .ok_or_else(|| "Say the repository as owner/name (driftwerk/workforce).".into())
 }
 
 fn number(v: &Value) -> Option<u64> {
@@ -281,16 +268,56 @@ pub(crate) async fn fetch(
         },
         _ => return Err("not a GitHub read".into()),
     };
+    let (person, mut out) = calls_as_person(
+        &GithubAccess {
+            vault,
+            global,
+            config,
+            registry,
+        },
+        calls,
+    )
+    .await?;
+    let got = out.pop().unwrap_or(Value::Null);
+    if name == PR {
+        if let (Some(n), Some(title)) = (got["number"].as_u64(), got["title"].as_str()) {
+            keep_title(&person, &owner, &repo, n, title);
+        }
+    }
+    Ok(got)
+}
+
+/// Where a GitHub read as the person finds their keys: the agent's vault,
+/// the hub's, and the tiers the agent's `[skills]` pins.
+pub(super) struct GithubAccess<'a> {
+    pub vault: Option<Arc<Vault>>,
+    pub global: Option<Arc<Vault>>,
+    pub config: &'a WorkforceConfig,
+    pub registry: &'a ToolRegistry,
+}
+
+/// Runs `calls`, each one of [`CALLS`], in order, as the person in scope:
+/// who they are and what each answered. Refused in the boss's words when
+/// GitHub can't be read as them, or one call fails.
+pub(super) async fn calls_as_person(
+    access: &GithubAccess<'_>,
+    calls: Vec<(&str, Value)>,
+) -> Result<(String, Vec<Value>), GithubError> {
     // The person whose turn it is; none, nobody's key is read.
     let person = workforce_agent::runner::CURRENT_USER_ID
         .try_with(Clone::clone)
         .ok()
         .filter(|p| !p.is_empty() && p != workforce_agent::runner::SYSTEM_USER_ID);
-    let (Some(person), Some(vault)) = (person, vault) else {
+    let (Some(person), Some(vault)) = (person, access.vault.clone()) else {
         return Err(GithubError::NotConnected);
     };
     let skill = workforce_agent::runner::CURRENT_USER_ID.sync_scope(person.clone(), || {
-        crate::skill_loader::github_skill_for(vault, global, config, registry)
+        crate::skill_loader::github_skill_for(
+            vault,
+            access.global.clone(),
+            access.config,
+            access.registry,
+        )
     });
     let Ok(skill) = skill else {
         return Err(GithubError::NotConnected);
@@ -318,14 +345,14 @@ pub(crate) async fn fetch(
         }
         out.push(r.output);
     }
-    let got = out.pop().unwrap_or(Value::Null);
-    if name == PR {
-        if let (Some(n), Some(title)) = (got["number"].as_u64(), got["title"].as_str()) {
-            keep_title(&person, &owner, &repo, n, title);
-        }
-    }
-    Ok(got)
+    Ok((person, out))
 }
+
+/// What the boss is told when GitHub answers that what was asked isn't
+/// there for the person.
+pub(super) const NOT_FOUND: &str = "GitHub says there's no such pull request, run or repository \
+    that the person's GitHub can see. Check the repo and number; if it's private, the person's \
+    key may not reach it. Don't say it merged or passed.";
 
 /// A pull request's checks overall, as the boss is told them: none when
 /// they couldn't be read, `none yet` when none reported on its head.
@@ -359,10 +386,7 @@ fn refused(error: &str) -> String {
     }
     // GitHub answers 404 for what the key may not see, too.
     if lower.contains("not found") {
-        return "GitHub says there's no such pull request, run or repository that the person's \
-            GitHub can see. Check the repo and number; if it's private, the person's key may not \
-            reach it. Don't say it merged or passed."
-            .into();
+        return NOT_FOUND.into();
     }
     format!(
         "GitHub couldn't be read: {}",

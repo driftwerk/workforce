@@ -151,6 +151,8 @@ async fn a_bosss_plan_is_approved_from_the_floor_by_the_person_alone_as_of_the_r
                         engine: Engine::Claude,
                         group: None,
                         budget: None,
+                        result: None,
+                        goal_ticket: None,
                     },
                     &sarah,
                     &by_sarah,
