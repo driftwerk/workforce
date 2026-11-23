@@ -19,6 +19,9 @@ CREATE INDEX IF NOT EXISTS plans_open_goals ON plans (state)
 ALTER TABLE boss_open_items ADD COLUMN IF NOT EXISTS plan UUID;
 ALTER TABLE boss_open_items ADD COLUMN IF NOT EXISTS proposal JSONB;
 ALTER TABLE boss_open_items ADD COLUMN IF NOT EXISTS proposed_at TIMESTAMPTZ;
+-- When the change it proposed was applied: an ask is answered once, open
+-- or closed (the person's answer on its buttons closes it first).
+ALTER TABLE boss_open_items ADD COLUMN IF NOT EXISTS applied_at TIMESTAMPTZ;
 CREATE INDEX IF NOT EXISTS boss_open_items_plan ON boss_open_items (plan)
     WHERE plan IS NOT NULL;
 -- Each reading of a measured part: its value (none when it couldn't be

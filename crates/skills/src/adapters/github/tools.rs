@@ -3669,6 +3669,48 @@ impl Tool for GithubCiStatusTool {
     }
 }
 
+/// The id of `owner/repo`'s workflow `named`: by its id or file name as
+/// GitHub takes them, else found by its name (or file name) among the
+/// repository's workflows; none when it has no such workflow.
+async fn workflow_id(
+    client: &GithubClient,
+    owner: &str,
+    repo: &str,
+    named: &str,
+) -> eyre::Result<Option<String>> {
+    if named.parse::<u64>().is_ok() {
+        return Ok(Some(named.to_string()));
+    }
+    let listed = client
+        .get_with_query(
+            &format!("/repos/{owner}/{repo}/actions/workflows"),
+            &[("per_page", "100")],
+        )
+        .await?;
+    Ok(workflow_named(&listed, named))
+}
+
+/// The id of the workflow of `listed` (GitHub's list of a repository's
+/// workflows) called `named`, or whose file is `named`.
+fn workflow_named(listed: &serde_json::Value, named: &str) -> Option<String> {
+    let named = named.trim();
+    listed["workflows"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|w| {
+            w["name"]
+                .as_str()
+                .is_some_and(|n| n.trim().eq_ignore_ascii_case(named))
+                || w["path"]
+                    .as_str()
+                    .and_then(|p| p.rsplit('/').next())
+                    .is_some_and(|f| f.eq_ignore_ascii_case(named))
+        })
+        .and_then(|w| w["id"].as_u64())
+        .map(|id| id.to_string())
+}
+
 // ── github.workflow_runs ─────────────────────────────────────────
 
 pub struct GithubWorkflowRunsTool {
@@ -3708,6 +3750,7 @@ impl Tool for GithubWorkflowRunsTool {
                 "owner": { "type": "string", "description": owner_description(&self.clients, &self.default_workspace) },
                 "repo": { "type": "string", "description": "Repository name" },
                 "branch": { "type": "string", "description": "Filter by branch name" },
+                "workflow": { "type": "string", "description": "Only this workflow's runs: its name, its file name (ci.yml) or its id" },
                 "status": { "type": "string", "enum": ["completed", "action_required", "cancelled", "failure", "neutral", "skipped", "stale", "success", "timed_out", "in_progress", "queued", "requested", "waiting", "pending"], "description": "Filter by status" },
                 "per_page": { "type": "integer", "description": "Results per page (integer, default: 10, max: 30)", "minimum": 1, "maximum": 30 }
             },
@@ -3744,7 +3787,28 @@ impl Tool for GithubWorkflowRunsTool {
             .unwrap_or(10)
             .min(30)
             .to_string();
-        let path = format!("/repos/{owner}/{repo}/actions/runs");
+        let workflow = input["workflow"]
+            .as_str()
+            .map(str::trim)
+            .filter(|w| !w.is_empty());
+        let path = match workflow {
+            None => format!("/repos/{owner}/{repo}/actions/runs"),
+            Some(w) => match workflow_id(&client, &owner, repo, w).await {
+                Ok(Some(id)) => format!("/repos/{owner}/{repo}/actions/workflows/{id}/runs"),
+                Ok(None) => {
+                    return Ok(ToolResult::failure(
+                        format!("Workflow “{w}” not found in {owner}/{repo}"),
+                        start.elapsed().as_millis() as u64,
+                    ))
+                }
+                Err(e) => {
+                    return Ok(ToolResult::from_report(
+                        &e.wrap_err("Failed to list workflows"),
+                        start.elapsed().as_millis() as u64,
+                    ))
+                }
+            },
+        };
 
         let mut params: Vec<(&str, &str)> = vec![("per_page", &per_page)];
         let branch_val;
@@ -3774,8 +3838,10 @@ impl Tool for GithubWorkflowRunsTool {
                             "status": r["status"],
                             "conclusion": r["conclusion"],
                             "run_number": r["run_number"],
+                            "run_attempt": r["run_attempt"],
                             "html_url": r["html_url"],
                             "created_at": r["created_at"],
+                            "run_started_at": r["run_started_at"],
                             "updated_at": r["updated_at"],
                         })
                     })
@@ -5475,6 +5541,17 @@ mod tests {
     }
 
     #[test]
+    fn a_workflow_is_found_by_its_name_or_its_file() {
+        let listed = serde_json::json!({ "workflows": [
+            { "id": 11, "name": "Deploy", "path": ".github/workflows/deploy.yml" },
+            { "id": 12, "name": "CI", "path": ".github/workflows/ci.yml" }
+        ] });
+        assert_eq!(workflow_named(&listed, "ci").as_deref(), Some("12"));
+        assert_eq!(workflow_named(&listed, "deploy.yml").as_deref(), Some("11"));
+        assert_eq!(workflow_named(&listed, "Lint"), None);
+    }
+
+    #[test]
     fn workflow_runs_tool_metadata() {
         let tool = GithubWorkflowRunsTool::new(mock_clients(), default_ws(), None);
         assert_eq!(tool.name(), "github.workflow_runs");
@@ -6131,6 +6208,54 @@ mod tests {
     /// Two connections to `server`: the default on `first`, another on
     /// `second`. Each test has keys of its own: what GitHub said of a key
     /// is kept for the whole process.
+    /// A workflow named by its name reads only its own runs, by its id,
+    /// with each run's start and attempt; one the repository hasn't got
+    /// is not found.
+    #[tokio::test]
+    async fn a_workflows_runs_are_read_by_its_name() {
+        let server = MockServer::start().await;
+        Mock::given(path("/repos/acme/app/actions/workflows"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "workflows": [{ "id": 77, "name": "CI", "path": ".github/workflows/ci.yml" }]
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(path("/repos/acme/app/actions/workflows/77/runs"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "total_count": 1,
+                "workflow_runs": [{ "id": 5, "name": "CI", "status": "completed", "conclusion": "success",
+                    "run_attempt": 2, "created_at": "2026-11-20T10:00:00Z",
+                    "run_started_at": "2026-11-20T11:00:00Z", "updated_at": "2026-11-20T11:04:00Z" }]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let tool = GithubWorkflowRunsTool::new(
+            Arc::new(LiveInstances::from(HashMap::from([(
+                "default".to_string(),
+                Arc::new(GithubClient::new("unsaid", &server.uri()).unwrap()),
+            )]))),
+            default_ws(),
+            None,
+        );
+        let out = tool
+            .execute(serde_json::json!({"owner": "acme", "repo": "app", "workflow": "ci"}))
+            .await
+            .unwrap();
+        assert!(out.success, "{:?}", out.error);
+        assert_eq!(
+            out.output["runs"][0]["run_started_at"],
+            "2026-11-20T11:00:00Z"
+        );
+        assert_eq!(out.output["runs"][0]["run_attempt"], 2);
+        let out = tool
+            .execute(serde_json::json!({"owner": "acme", "repo": "app", "workflow": "Lint"}))
+            .await
+            .unwrap();
+        assert!(!out.success);
+        assert!(out.error.unwrap().contains("not found"));
+    }
+
     fn two(server: &MockServer, first: &str, second: &str) -> GithubGetRepoTool {
         let client = |t: &str| Arc::new(GithubClient::new(t, &server.uri()).unwrap());
         GithubGetRepoTool::new(

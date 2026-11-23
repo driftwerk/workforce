@@ -190,11 +190,15 @@ impl DeskStore {
             .await
     }
 
-    /// The goal not yet met, of a plan that hasn't ended, that `ticket`
-    /// stands for.
+    /// The agreed goal not yet met, of a plan running or paused, that
+    /// `ticket` stands for: a draft's ticket is no goal's yet.
     pub async fn open_goal_of_ticket(&self, ticket: Uuid) -> Result<Option<Plan>> {
         Ok(self
-            .goals_where("goal_ticket = $1", &[&ticket])
+            .goals_where(
+                "goal_ticket = $1 AND state IN ('running', 'paused') \
+                 AND approved_revision IS NOT NULL",
+                &[&ticket],
+            )
             .await?
             .into_iter()
             .next())
@@ -274,6 +278,14 @@ mod tests {
             assert_eq!(s.plan(p.id).await.unwrap().as_ref(), Some(&p));
             assert_eq!(s.open_goals(Some("sarah")).await.unwrap(), vec![p.clone()]);
             assert!(s.open_goals(Some("other")).await.unwrap().is_empty());
+            assert_eq!(
+                s.open_goal_of_ticket(t.id).await.unwrap(),
+                None,
+                "a draft's ticket is no goal's yet"
+            );
+            p.state = PlanState::Running;
+            p.approved_revision = Some(p.revision);
+            s.put_plan(&p).await.unwrap();
             assert_eq!(s.open_goal_of_ticket(t.id).await.unwrap(), Some(p.clone()));
             assert_eq!(s.open_goal_of_ticket(Uuid::new_v4()).await.unwrap(), None);
 

@@ -132,21 +132,20 @@ async fn read_ci(
     agreed_at: DateTime<Utc>,
 ) -> Result<Found, String> {
     let (owner, name) = split(repo)?;
-    let listed = calls(
-        access,
-        vec![(
-            "github.workflow_runs",
-            json!({ "owner": owner, "repo": name, "branch": branch, "status": "completed", "per_page": RUNS_READ }),
-        )],
-    )
-    .await?;
-    let list = listed.into_iter().next().unwrap_or(Value::Null);
-    let runs = finished_runs(&list, workflow);
-    if let (Some(w), true, false) = (workflow, runs.is_empty(), runs_of(&list).is_empty()) {
-        return Err(format!(
-            "{NOT_THERE} workflow named “{w}” that has run on {branch} of {repo}."
-        ));
+    // Only the workflow's own runs, by its id: in a busy repository the
+    // newest runs of every workflow would crowd its own out.
+    let mut args = json!({ "owner": owner, "repo": name, "branch": branch, "status": "completed", "per_page": RUNS_READ });
+    if let Some(w) = workflow {
+        args["workflow"] = json!(w);
     }
+    let listed = calls(access, vec![("github.workflow_runs", args)])
+        .await
+        .map_err(|e| match (workflow, e == github::NOT_FOUND) {
+            (Some(w), true) => format!("{NOT_THERE} workflow named “{w}” in {repo}."),
+            _ => e,
+        })?;
+    let list = listed.into_iter().next().unwrap_or(Value::Null);
+    let runs = finished_runs(&list);
     let newest: Vec<Run> = runs.into_iter().take(usize::from(want.runs())).collect();
     let jobs = match want {
         Want::Minutes { per: Per::Job, .. } if !newest.is_empty() => {
@@ -171,6 +170,9 @@ async fn read_ci(
 pub(super) struct Run {
     pub id: u64,
     pub created_at: DateTime<Utc>,
+    /// When its newest attempt started: a run that is re-run is timed,
+    /// and counted since the goal was agreed, by the attempt that ended it.
+    pub started_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     pub success: bool,
 }
@@ -181,42 +183,34 @@ fn time(v: &Value) -> Option<DateTime<Utc>> {
         .map(|t| t.with_timezone(&Utc))
 }
 
-/// Every finished run of a list, newest first.
-fn runs_of(list: &Value) -> Vec<(Run, &str)> {
-    let mut runs: Vec<(Run, &str)> = list["runs"]
+/// The finished runs of a list (one workflow's when it was read so),
+/// newest first: each once, however often it was re-run.
+pub(super) fn finished_runs(list: &Value) -> Vec<Run> {
+    let mut seen = std::collections::HashSet::new();
+    let mut runs: Vec<Run> = list["runs"]
         .as_array()
         .into_iter()
         .flatten()
         .filter(|r| r["status"].as_str() == Some("completed"))
         .filter_map(|r| {
-            Some((
-                Run {
-                    id: r["id"].as_u64()?,
-                    created_at: time(&r["created_at"])?,
-                    updated_at: time(&r["updated_at"])?,
-                    success: r["conclusion"].as_str() == Some("success"),
-                },
-                r["name"].as_str().unwrap_or_default(),
-            ))
+            let created_at = time(&r["created_at"])?;
+            Some(Run {
+                id: r["id"].as_u64()?,
+                created_at,
+                started_at: time(&r["run_started_at"]).unwrap_or(created_at),
+                updated_at: time(&r["updated_at"])?,
+                success: r["conclusion"].as_str() == Some("success"),
+            })
         })
+        .filter(|r| seen.insert(r.id))
         .collect();
-    runs.sort_by_key(|(r, _)| std::cmp::Reverse(r.created_at));
+    runs.sort_by_key(|r| std::cmp::Reverse(r.created_at));
     runs
 }
 
-/// The finished runs of a list of `workflow` (every one when none), newest
-/// first.
-pub(super) fn finished_runs(list: &Value, workflow: Option<&str>) -> Vec<Run> {
-    runs_of(list)
-        .into_iter()
-        .filter(|(_, name)| workflow.is_none_or(|w| name.trim().eq_ignore_ascii_case(w.trim())))
-        .map(|(r, _)| r)
-        .collect()
-}
-
-/// The minutes a run took, start to end.
+/// The minutes a run took: its newest attempt, start to end.
 fn run_minutes(r: &Run) -> f64 {
-    (r.updated_at - r.created_at).num_seconds().max(0) as f64 / 60.0
+    (r.updated_at - r.started_at).num_seconds().max(0) as f64 / 60.0
 }
 
 /// The minutes the longest job of a run took (its `workflow_run_logs`),
@@ -248,7 +242,7 @@ pub(super) fn ci_reading(
         return Found::unread(format!("no run on {branch} of {repo} has finished yet"));
     }
     let runs = usize::from(want.runs());
-    let enough = newest.len() >= runs && newest.iter().all(|r| r.created_at + SLACK >= agreed_at);
+    let enough = newest.len() >= runs && newest.iter().all(|r| r.started_at + SLACK >= agreed_at);
     let evidence = newest
         .iter()
         .map(|r| Evidence::Run {
@@ -445,33 +439,48 @@ mod tests {
     }
 
     #[test]
-    fn finished_runs_are_newest_first_and_of_their_workflow() {
+    fn finished_runs_are_newest_first_and_each_once() {
         let mut list = listed(&[
             (1, "CI", 0, 10, "success"),
-            (2, "Deploy", 20, 25, "success"),
-            (3, "ci", 30, 42, "failure"),
+            (3, "CI", 30, 42, "failure"),
+            (2, "CI", 20, 25, "success"),
         ]);
-        list["runs"]
-            .as_array_mut()
-            .unwrap()
-            .push(json!({ "id": 4, "name": "CI", "status": "in_progress", "created_at": stamp(40), "updated_at": stamp(41) }));
-        let ids = |w| {
-            finished_runs(&list, w)
-                .iter()
-                .map(|r| r.id)
-                .collect::<Vec<_>>()
-        };
-        assert_eq!(ids(Some("CI")), vec![3, 1]);
-        assert_eq!(ids(None), vec![3, 2, 1]);
-        assert!(ids(Some("Lint")).is_empty());
+        let runs = list["runs"].as_array_mut().unwrap();
+        runs.push(json!({ "id": 4, "name": "CI", "status": "in_progress", "created_at": stamp(40), "updated_at": stamp(41) }));
+        runs.push(runs[0].clone());
+        let ids: Vec<u64> = finished_runs(&list).iter().map(|r| r.id).collect();
+        assert_eq!(ids, vec![3, 2, 1]);
+    }
+
+    #[test]
+    fn a_rerun_is_timed_and_counted_by_its_newest_attempt() {
+        // Made before the goal was agreed, re-run after it: 4 minutes, not
+        // the hour and 4 minutes since it was first made.
+        let list = json!({ "runs": [{
+            "id": 9, "name": "CI", "status": "completed", "conclusion": "success",
+            "run_attempt": 2, "created_at": stamp(-60), "run_started_at": stamp(10),
+            "updated_at": stamp(14),
+        }] });
+        let runs = finished_runs(&list);
+        assert_eq!(runs[0].started_at, at(10));
+        let r = ci_reading(
+            "acme/api",
+            "main",
+            &minutes(Per::Run, 5.0, 1),
+            &runs,
+            &[],
+            at(0),
+        );
+        assert_eq!(r.value, Some(4.0));
+        assert!(r.met, "{r:?}");
     }
 
     #[test]
     fn ci_minutes_per_run_is_the_most_a_run_took() {
-        let runs = finished_runs(
-            &listed(&[(1, "CI", 10, 14, "success"), (2, "CI", 20, 26, "success")]),
-            None,
-        );
+        let runs = finished_runs(&listed(&[
+            (1, "CI", 10, 14, "success"),
+            (2, "CI", 20, 26, "success"),
+        ]));
         let r = ci_reading(
             "acme/api",
             "main",
@@ -509,7 +518,7 @@ mod tests {
 
     #[test]
     fn ci_minutes_per_job_leaves_skipped_jobs_out() {
-        let runs = finished_runs(&listed(&[(1, "CI", 10, 40, "success")]), None);
+        let runs = finished_runs(&listed(&[(1, "CI", 10, 40, "success")]));
         let jobs = [logs(&[
             (10, 13, "success"),
             (10, 30, "skipped"),
@@ -531,10 +540,10 @@ mod tests {
 
     #[test]
     fn runs_before_the_goal_was_agreed_never_meet_it() {
-        let runs = finished_runs(
-            &listed(&[(1, "CI", 0, 3, "success"), (2, "CI", 10, 12, "success")]),
-            None,
-        );
+        let runs = finished_runs(&listed(&[
+            (1, "CI", 0, 3, "success"),
+            (2, "CI", 10, 12, "success"),
+        ]));
         let want = minutes(Per::Run, 5.0, 2);
         let r = ci_reading("acme/api", "main", &want, &runs, &[], at(9));
         assert_eq!(r.value, Some(3.0), "read, but not met");
@@ -547,7 +556,7 @@ mod tests {
 
     #[test]
     fn fewer_runs_than_it_wants_dont_meet_it() {
-        let runs = finished_runs(&listed(&[(1, "CI", 10, 12, "success")]), None);
+        let runs = finished_runs(&listed(&[(1, "CI", 10, 12, "success")]));
         let r = ci_reading(
             "acme/api",
             "main",
@@ -574,14 +583,11 @@ mod tests {
 
     #[test]
     fn ci_green_counts_the_newest_successes_in_a_row() {
-        let runs = finished_runs(
-            &listed(&[
-                (1, "Deploy", 10, 12, "failure"),
-                (2, "Deploy", 20, 22, "success"),
-                (3, "Deploy", 30, 32, "success"),
-            ]),
-            None,
-        );
+        let runs = finished_runs(&listed(&[
+            (1, "Deploy", 10, 12, "failure"),
+            (2, "Deploy", 20, 22, "success"),
+            (3, "Deploy", 30, 32, "success"),
+        ]));
         let r = ci_reading(
             "acme/api",
             "main",
