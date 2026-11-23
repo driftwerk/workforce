@@ -498,7 +498,7 @@ fn row_to_session(r: &tokio_postgres::Row) -> Result<Session> {
     let context_type: Option<String> = r.get(6);
     let compaction_json: serde_json::Value = r.get(11);
     let messages_json: serde_json::Value = r.get(14);
-    Ok(Session {
+    let mut session = Session {
         id: id.to_string(),
         label: r.get(1),
         channel: r.get(2),
@@ -516,7 +516,10 @@ fn row_to_session(r: &tokio_postgres::Row) -> Result<Session> {
         model_override: r.get(12),
         cached_message_count: None,
         loaded_revision: Some(r.get::<_, i64>(15)),
-    })
+        read_message_ids: Default::default(),
+    };
+    session.mark_read();
+    Ok(session)
 }
 
 /// Build a session shell (empty `messages`, populated `message_count`,
@@ -548,6 +551,7 @@ fn row_to_shell(r: &tokio_postgres::Row) -> Result<Session> {
         // something to hydrate, so message_count() answers correctly.
         cached_message_count: (message_count > 0).then_some(message_count as usize),
         loaded_revision: Some(r.get::<_, i64>(14)),
+        read_message_ids: Default::default(),
     })
 }
 
@@ -699,6 +703,7 @@ impl SessionStore for PostgresSessionStore {
     fn save_refreshing(&self, session: &mut Session) -> Result<()> {
         let revision = self.save_returning_revision(session)?;
         session.loaded_revision = Some(revision);
+        session.mark_read();
         Ok(())
     }
 
@@ -2617,7 +2622,7 @@ impl PostgresSessionStore {
                     // New ids land at the end, so a summary from a
                     // CAS-losing compaction trails recent turns until the
                     // next uncontended compaction; no message is ever lost.
-                    let merged = appended(stored, &session.messages, &Default::default());
+                    let merged = appended(stored, &session.messages, &session.read_message_ids);
                     let total: i64 = merged.iter().map(|m| i64::from(m.tokens)).sum();
                     let count = merged.len() as i32;
                     let json = serde_json::to_value(&merged).context("encode merged messages")?;
@@ -3955,6 +3960,39 @@ pub(crate) mod tests {
                 2,
                 "stale-baseline save append-merged rather than replaced"
             );
+        })
+        .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_truncate_or_a_redaction_while_a_save_was_read_stays_in_place() {
+        with_store(|store| async move {
+            let s: Arc<dyn SessionStore> = store;
+            let mut session = s.get_or_create("cli", "u", "agent-a").unwrap();
+            let kept = session.add_user_message("keep this", None);
+            let secret = concat!("ghp_AB", "CDEFGHIJKLMNOPQRSTUVWXYZabcdefghij1234");
+            session.add_user_message(&format!("my token is {secret}"), None);
+            let cut = session.add_user_message("retry from here", None);
+            s.save_refreshing(&mut session).unwrap();
+
+            s.truncate_from_message(&session.id, &cut).unwrap();
+            assert_eq!(
+                s.redact_secrets_in_session(&session.id, false)
+                    .unwrap()
+                    .messages_redacted,
+                1
+            );
+            let reply = session.add_assistant_message("an answer to what was cut", 2);
+            s.save(&session).unwrap();
+
+            let got = s.get(&session.id).unwrap().unwrap();
+            let got_ids: Vec<&str> = got.messages.iter().map(|m| m.id.as_str()).collect();
+            assert_eq!(got_ids[0], kept);
+            assert_eq!(got_ids.len(), 3, "{got_ids:?}");
+            assert_eq!(got_ids[2], reply);
+            assert!(!serde_json::to_string(&got.messages)
+                .unwrap()
+                .contains(secret));
         })
         .await;
     }
