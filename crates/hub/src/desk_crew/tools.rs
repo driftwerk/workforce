@@ -1360,6 +1360,28 @@ impl Tool for CrewTool {
         describe(self.name)
     }
 
+    /// The person's standing choice lets this call run when the overseer
+    /// still oversees its scope and the crew's gate would run its action
+    /// as it stands ([`CrewHub::gate`]). Its reads, and what it keeps for
+    /// itself, are its own at any level it has them; a call that names no
+    /// action the gate weighs is not.
+    fn standing_choice(&self, input: &Value) -> bool {
+        let Some(crew) = self.crew.upgrade() else {
+            return false;
+        };
+        let Some((_, oversight)) = crew
+            .overseer_named(&self.agent)
+            .filter(|(_, o)| o.scope == self.scope)
+        else {
+            return false;
+        };
+        if READ.contains(&self.name) {
+            return true;
+        }
+        super::actions::Action::parse(self.name, input)
+            .is_ok_and(|action| matches!(crew.gate(&action, &oversight), super::actions::Gate::Run))
+    }
+
     fn input_schema(&self) -> Value {
         schema(self.name, || {
             self.crew

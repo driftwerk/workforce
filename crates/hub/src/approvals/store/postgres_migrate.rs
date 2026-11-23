@@ -257,6 +257,7 @@ mod tests {
             ttl: std::time::Duration::from_secs(3600),
             chat: false,
             origin: None,
+            content_scope: None,
         }
     }
 

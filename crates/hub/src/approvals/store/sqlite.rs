@@ -92,6 +92,10 @@ impl SqlitePendingApprovalStore {
                 "origin",
                 "ALTER TABLE pending_approvals ADD COLUMN origin TEXT;",
             ),
+            (
+                "content_scope",
+                "ALTER TABLE pending_approvals ADD COLUMN content_scope TEXT;",
+            ),
         ] {
             let has = conn
                 .prepare("SELECT 1 FROM pragma_table_info('pending_approvals') WHERE name = ?1")?
@@ -129,6 +133,7 @@ fn parse_approval(row: &Row<'_>) -> rusqlite::Result<PendingApproval> {
     let created_at: String = row.get("created_at")?;
     let expires_at: String = row.get("expires_at")?;
     let chat: i64 = row.get("chat")?;
+    let content_scope: Option<String> = row.get("content_scope")?;
     Ok(PendingApproval {
         request_id: row.get("request_id")?,
         agent_id: row.get("agent_id")?,
@@ -149,6 +154,7 @@ fn parse_approval(row: &Row<'_>) -> rusqlite::Result<PendingApproval> {
         expires_at: parse_ts(&expires_at),
         chat: chat != 0,
         origin: row.get("origin")?,
+        content_scope: content_scope.and_then(|kept| serde_json::from_str(&kept).ok()),
     })
 }
 
@@ -164,7 +170,7 @@ fn parse_target(row: &Row<'_>) -> rusqlite::Result<Target> {
 
 const SELECT_COLS: &str = "request_id, agent_id, session_key, workspace_id, channel_id, thread_ts,
      requester_id, tool_name, tool_input, reason, allow_self_approval, status,
-     resolved_by, channel_notice, channel_notice_ts, created_at, expires_at, chat, origin";
+     resolved_by, channel_notice, channel_notice_ts, created_at, expires_at, chat, origin, content_scope";
 
 impl PendingApprovalStore for SqlitePendingApprovalStore {
     fn insert_core(
@@ -180,8 +186,8 @@ impl PendingApprovalStore for SqlitePendingApprovalStore {
             "INSERT INTO pending_approvals (
                 request_id, agent_id, session_key, workspace_id, channel_id, thread_ts,
                 requester_id, tool_name, tool_input, reason, allow_self_approval, status,
-                created_at, expires_at, chat, origin
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 'pending', ?12, ?13, ?14, ?15)
+                created_at, expires_at, chat, origin, content_scope
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 'pending', ?12, ?13, ?14, ?15, ?16)
              ON CONFLICT (request_id) DO NOTHING",
             params![
                 core.request_id,
@@ -199,6 +205,7 @@ impl PendingApprovalStore for SqlitePendingApprovalStore {
                 expires_at.to_rfc3339(),
                 core.chat as i64,
                 core.origin,
+                core.content_scope.as_ref().map(|kept| kept.to_string()),
             ],
         )
         .wrap_err("insert_core failed")?;
@@ -431,6 +438,7 @@ mod tests {
             ttl: std::time::Duration::from_secs(3600),
             chat: false,
             origin: None,
+            content_scope: None,
         }
     }
 
@@ -502,6 +510,13 @@ mod tests {
         // Opened again, nothing more to add.
         let again = SqlitePendingApprovalStore::open(&path).unwrap();
         assert!(again.get("r1").unwrap().unwrap().chat);
+    }
+
+    #[test]
+    fn the_asking_turns_guard_is_kept_on_its_row() {
+        crate::approvals::store::kept_scope_contract(
+            &SqlitePendingApprovalStore::in_memory().unwrap(),
+        );
     }
 
     #[test]

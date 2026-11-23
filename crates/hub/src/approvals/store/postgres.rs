@@ -92,6 +92,9 @@ fn row_to_approval(row: &Row) -> Result<PendingApproval> {
         expires_at: row.try_get("expires_at")?,
         chat: row.try_get("chat")?,
         origin: row.try_get("origin")?,
+        content_scope: row
+            .try_get::<_, Option<String>>("content_scope")?
+            .and_then(|kept| serde_json::from_str(&kept).ok()),
     })
 }
 
@@ -111,7 +114,7 @@ fn parse_uuid(s: &str) -> Result<uuid::Uuid> {
 
 const SELECT_COLS: &str = "request_id, agent_id, session_key, workspace_id, channel_id, thread_ts,
      requester_id, tool_name, tool_input, reason, allow_self_approval, status,
-     resolved_by, channel_notice, channel_notice_ts, created_at, expires_at, chat, origin";
+     resolved_by, channel_notice, channel_notice_ts, created_at, expires_at, chat, origin, content_scope";
 
 impl PendingApprovalStore for PostgresPendingApprovalStore {
     fn insert_core(
@@ -125,6 +128,7 @@ impl PendingApprovalStore for PostgresPendingApprovalStore {
         let tool_input = serde_json::to_string(&core.tool_input)?;
         let workspace_id = workspace_id.map(str::to_string);
         let thread_ts = thread_ts.map(str::to_string);
+        let content_scope = core.content_scope.as_ref().map(|kept| kept.to_string());
         let core = core.clone();
         self.block_on(async move {
             let conn = self.pool.get().await?;
@@ -132,8 +136,8 @@ impl PendingApprovalStore for PostgresPendingApprovalStore {
                 "INSERT INTO pending_approvals (
                     request_id, agent_id, session_key, workspace_id, channel_id, thread_ts,
                     requester_id, tool_name, tool_input, reason, allow_self_approval, status,
-                    created_at, expires_at, chat, origin
-                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 'pending', $12, $13, $14, $15)
+                    created_at, expires_at, chat, origin, content_scope
+                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 'pending', $12, $13, $14, $15, $16)
                  ON CONFLICT (request_id) DO NOTHING",
                 &[
                     &request_id,
@@ -151,6 +155,7 @@ impl PendingApprovalStore for PostgresPendingApprovalStore {
                     &expires_at,
                     &core.chat,
                     &core.origin,
+                    &content_scope,
                 ],
             )
             .await
@@ -419,6 +424,18 @@ mod tests {
             |pool| async move {
                 let store = PostgresPendingApprovalStore::with_pool(pool).await.unwrap();
                 crate::approvals::store::pending_for_contract(store.as_ref());
+            },
+        )
+        .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_asking_turns_guard_is_kept_on_its_row() {
+        with_test_pool(
+            PostgresPendingApprovalStore::build_pool,
+            |pool| async move {
+                let store = PostgresPendingApprovalStore::with_pool(pool).await.unwrap();
+                crate::approvals::store::kept_scope_contract(store.as_ref());
             },
         )
         .await;

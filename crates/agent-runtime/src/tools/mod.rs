@@ -273,6 +273,25 @@ pub trait Tool: Send + Sync {
         None
     }
 
+    /// Whether what this tool returns is content from outside (mail, a
+    /// channel's messages) even where it isn't fenced, as in a listing whose
+    /// fields other code reads. A turn that calls it is armed against that
+    /// content steering it ([`crate::security::monitor`]), as one that reads
+    /// a fence is. `false`, the default.
+    fn reads_outside_content(&self) -> bool {
+        false
+    }
+
+    /// Whether the person's standing choice already lets this call with
+    /// `input` run for the agent the tool is registered for, as an
+    /// overseer's crew tools are let by its oversight level and act
+    /// switches. A turn steered by outside content takes it as named for the
+    /// turn ([`Call::standing`](crate::security::monitor::Call::standing)).
+    /// `false`, the default.
+    fn standing_choice(&self, _input: &serde_json::Value) -> bool {
+        false
+    }
+
     /// What THIS call does to this computer: reads, writes or deletes which
     /// paths, runs which command where, starts a session where. A hub with
     /// `[desk]` decides a call in a namespace that touches this computer by
@@ -308,6 +327,39 @@ pub trait Tool: Send + Sync {
             input_schema: self.input_schema(),
         }
     }
+}
+
+#[doc(hidden)]
+pub use workforce_core::computer::Effect as CallEffect;
+
+/// The methods a tool wrapping another answers as the tool it wraps,
+/// saying what a call does: where it writes, whether what it returns is
+/// outside content, whether the person's standing choice decides it, and
+/// what it does to this computer. Every wrapper says them through this, so
+/// one added here is never silently dropped by a wrapper that forgot it.
+/// `$inner` is the wrapped tool's field.
+#[macro_export]
+macro_rules! delegate_call_facts {
+    ($($inner:tt)+) => {
+        fn surface_effect(
+            &self,
+            input: &serde_json::Value,
+        ) -> Option<$crate::tools::SurfaceEffect> {
+            self.$($inner)+.surface_effect(input)
+        }
+
+        fn reads_outside_content(&self) -> bool {
+            self.$($inner)+.reads_outside_content()
+        }
+
+        fn standing_choice(&self, input: &serde_json::Value) -> bool {
+            self.$($inner)+.standing_choice(input)
+        }
+
+        fn effect(&self, input: &serde_json::Value) -> $crate::tools::CallEffect {
+            self.$($inner)+.effect(input)
+        }
+    };
 }
 
 impl ToolResult {

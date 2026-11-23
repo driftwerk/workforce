@@ -609,6 +609,7 @@ impl ProgressReporter {
             username: None,
             icon_url: None,
             blocks: None,
+            outside: false,
         }
     }
 }

@@ -992,6 +992,7 @@ mod tests {
                     surface_allows: None,
                     computer_gate: None,
                     arguments: workforce_agent::tools::arguments::ArgumentValidation::default(),
+                    content_guard: None,
                 },
                 policy: Arc::new(
                     PolicyEngine::from_yaml(

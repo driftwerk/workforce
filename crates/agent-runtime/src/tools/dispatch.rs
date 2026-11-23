@@ -19,6 +19,7 @@ use crate::runner::{
     combine_with_cascade, execute_with_deadline, tool_not_found_message, CapabilityGate,
     PermissionGate, RunnerConfig, CURRENT_SESSION_KEY, CURRENT_USER_ID,
 };
+use crate::security::monitor::ContentGuard;
 use crate::security::secret_sinks::substitute_secret_markers;
 use crate::tools::access::ToolAccessSnapshot;
 use crate::tools::arguments::{
@@ -52,6 +53,7 @@ pub struct ToolGates {
     /// with `[desk]` ([`crate::tools::computer`]).
     pub computer_gate: Option<Arc<dyn ComputerGate>>,
     pub arguments: ArgumentValidation,
+    pub content_guard: Option<Arc<ContentGuard>>,
 }
 
 impl From<&RunnerConfig> for ToolGates {
@@ -65,6 +67,7 @@ impl From<&RunnerConfig> for ToolGates {
             surface_allows: config.surface_allows.clone(),
             computer_gate: config.computer_gate.clone(),
             arguments: config.arguments,
+            content_guard: None,
         }
     }
 }
@@ -166,6 +169,7 @@ fn gate_with(
         .computer_gate
         .as_deref()
         .is_some_and(|g| g.asks_nothing());
+    let unbound = gates.computer_gate.as_deref().is_some_and(|g| g.unbound());
     let response = apply_surface_gate(
         response,
         effect.as_ref(),
@@ -203,14 +207,46 @@ fn gate_with(
     ) {
         return blocked;
     }
+    let guarded = gates.content_guard.as_deref().and_then(|guard| {
+        let effect = guarded_effect(tools, tool_name, input);
+        guard
+            .check_call(&guarded_call(tools, tool_name, input, &effect))
+            .map(|held| (guard, held))
+    });
+    let missing = || {
+        tools
+            .get(tool_name)
+            .and_then(|tool| missing_required_fields(&tool.input_schema(), input))
+    };
+    // The guard's hold offers no "always": surface allows are not what it
+    // reads.
+    let (response, holds) = match guarded {
+        None => (response, holds),
+        Some((guard, held)) if held.refused => {
+            if let Some(missing) = missing() {
+                return incomplete_call(tool_name, &missing);
+            }
+            guard.refused(&held.signal);
+            return GateOutcome::Blocked {
+                message: format!(
+                    "BLOCKED: {}. It did not run. Finish the task without it; \
+                     the person has been told.",
+                    held.reason
+                ),
+                reason: held.reason,
+                consumed: Vec::new(),
+            };
+        }
+        // At Full access or Act fully nothing is asked: only a refusing
+        // scope (a monitor's turn) still stops a call.
+        Some(_) if asks_nothing || unbound => (response, holds),
+        Some((_, held)) => (held_for_approval(response, held.reason), None),
+    };
     match response.decision {
         PolicyDecision::RequireApproval {
             reason,
             allow_save_allow,
-        } => match tools
-            .get(tool_name)
-            .and_then(|tool| missing_required_fields(&tool.input_schema(), input))
-        {
+        } => match missing() {
             None => GateOutcome::RequireApproval {
                 reason: with_notice(tools, tool_name, reason),
                 allow_save_allow,
@@ -554,6 +590,72 @@ pub fn surface_effect_of(
         })
 }
 
+/// The leaves of a chat surface's tools that post where they name: what the
+/// guard takes as a write to that channel when the tool says nothing of
+/// itself. Every other call of the namespace (a kick, an unarchive, a
+/// reaction) is weighed as itself, not as a post to the turn's channel.
+const POSTS: &[&str] = &[
+    "send",
+    "message",
+    "mention",
+    "reply",
+    "post",
+    "send_message",
+    "upload_file",
+    "update_message",
+];
+
+/// What a call does to a surface, as the content guard weighs it: what the
+/// tool says, else a post where it names for a chat surface's posting tools.
+fn guarded_effect(tools: &ToolRegistry, tool_name: &str, input: &Value) -> Option<SurfaceEffect> {
+    let said = tools
+        .get(tool_name)
+        .and_then(|tool| tool.surface_effect(input));
+    let posts = tool_name
+        .rsplit_once('.')
+        .is_some_and(|(_, leaf)| POSTS.contains(&leaf));
+    match said {
+        Some(effect) => Some(effect),
+        None if posts => surface_effect_of(tools, tool_name, input),
+        None => None,
+    }
+}
+
+/// A call of `tool_name` as the content guard weighs it.
+fn guarded_call<'a>(
+    tools: &ToolRegistry,
+    tool_name: &'a str,
+    input: &'a Value,
+    effect: &'a Option<SurfaceEffect>,
+) -> crate::security::monitor::Call<'a> {
+    crate::security::monitor::Call {
+        standing: tools
+            .get(tool_name)
+            .is_some_and(|tool| tool.standing_choice(input)),
+        ..crate::security::monitor::Call::new(tool_name, input, effect.as_ref())
+    }
+}
+
+/// The content guard's hold on a call, where the gate would ask about it:
+/// `None` at Full access or Act fully, where nothing is asked. A path where
+/// nobody can be asked refuses such a call, and tells the guard so
+/// ([`ContentGuard::refused`]), as a refusing scope does.
+pub fn guard_hold(
+    gates: &ToolGates,
+    tools: &ToolRegistry,
+    tool_name: &str,
+    input: &Value,
+) -> Option<(Arc<ContentGuard>, crate::security::monitor::Held)> {
+    let unbound = gates
+        .computer_gate
+        .as_deref()
+        .is_some_and(|g| g.asks_nothing() || g.unbound());
+    let guard = gates.content_guard.as_ref().filter(|_| !unbound)?;
+    let effect = guarded_effect(tools, tool_name, input);
+    let held = guard.check_call(&guarded_call(tools, tool_name, input, &effect))?;
+    Some((Arc::clone(guard), held))
+}
+
 /// The longest stretch of what a held write would say that its prompt shows.
 const PREVIEW_CHARS: usize = 200;
 
@@ -643,6 +745,23 @@ pub fn apply_surface_gate(
                 ..response
             }
         }
+    }
+}
+
+/// `response` asking the person about a call the content guard holds, with
+/// why; one already asking adds the guard's reason. Never "always": the hold
+/// is about this turn's content, not the call.
+fn held_for_approval(response: PolicyResponse, held: String) -> PolicyResponse {
+    let reason = match response.decision {
+        PolicyDecision::RequireApproval { reason, .. } => format!("{reason}. Also: {held}"),
+        _ => held,
+    };
+    PolicyResponse {
+        decision: PolicyDecision::RequireApproval {
+            reason,
+            allow_save_allow: false,
+        },
+        ..response
     }
 }
 
@@ -1033,6 +1152,7 @@ mod tests {
             surface_allows: None,
             computer_gate: None,
             arguments: ArgumentValidation::default(),
+            content_guard: None,
         }
     }
 
@@ -2479,5 +2599,174 @@ mod tests {
             ),
             "and in every other tool"
         );
+    }
+
+    mod content_guard {
+        use super::*;
+        use crate::security::monitor::{ContentGuard, ContentScope};
+
+        fn guarded(expected: &str, refuses: bool) -> ToolGates {
+            ToolGates {
+                content_guard: Some(Arc::new(ContentGuard::new(ContentScope {
+                    expected: vec![crate::security::monitor::Place::any(expected)],
+                    armed: Some("email from x@evil.example".into()),
+                    refuses,
+                    ..ContentScope::default()
+                }))),
+                ..gates(&Arc::new(Calls::default()), None, CascadeState::Allow)
+            }
+        }
+
+        fn post(gates: &ToolGates, policy: &PolicyEngine) -> GateOutcome {
+            let input = serde_json::json!({ "channel": "C1", "text": "all your mail" });
+            as_user(|| gate_tool_call(gates, policy, &surfaced_tools(), "messaging.send", &input))
+        }
+
+        #[test]
+        fn a_post_somewhere_new_after_outside_content_is_asked_about() {
+            match post(&guarded("C2", false), &permissive_policy()) {
+                GateOutcome::RequireApproval {
+                    reason,
+                    allow_save_allow,
+                    holds,
+                } => {
+                    assert!(reason.contains("slack c1"), "{reason}");
+                    assert!(reason.contains("outside content"), "{reason}");
+                    assert!(!allow_save_allow);
+                    assert!(holds.is_none(), "no \"always allow\" for a guard's hold");
+                }
+                other => panic!("expected an approval, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn a_refusing_guard_blocks_and_the_turns_own_delivery_runs() {
+            assert!(matches!(
+                post(&guarded("C2", true), &permissive_policy()),
+                GateOutcome::Blocked { ref message, .. } if message.starts_with("BLOCKED:")
+            ));
+            assert!(matches!(
+                post(&guarded("C1", true), &permissive_policy()),
+                GateOutcome::Execute { .. }
+            ));
+        }
+
+        #[test]
+        fn a_refusal_reads_cleanly_and_an_incomplete_call_is_not_one() {
+            let gates = guarded("C2", true);
+            let GateOutcome::Blocked { message, .. } = post(&gates, &permissive_policy()) else {
+                panic!("a refusing guard blocks");
+            };
+            assert!(!message.contains("  "), "{message}");
+            let guard = gates.content_guard.as_deref().unwrap();
+            assert_eq!(guard.stops().len(), 1);
+            let incomplete = serde_json::json!({ "channel": "C9" });
+            let outcome = as_user(|| {
+                gate_tool_call(
+                    &gates,
+                    &permissive_policy(),
+                    &surfaced_tools(),
+                    "messaging.send",
+                    &incomplete,
+                )
+            });
+            assert!(!matches!(outcome, GateOutcome::Execute { .. }));
+            assert_eq!(
+                guard.stops().len(),
+                1,
+                "a call missing its text was never refused"
+            );
+        }
+
+        /// A crew tool whose act switch is `input.on`.
+        struct Switched;
+
+        #[async_trait::async_trait]
+        impl Tool for Switched {
+            fn name(&self) -> &str {
+                "crew.nudge"
+            }
+            fn description(&self) -> &str {
+                "switched"
+            }
+            fn input_schema(&self) -> Value {
+                serde_json::json!({ "type": "object" })
+            }
+            fn standing_choice(&self, input: &Value) -> bool {
+                input["on"] == true
+            }
+            async fn execute(&self, input: Value) -> eyre::Result<ToolResult> {
+                Ok(ToolResult::success(input, 1))
+            }
+        }
+
+        #[test]
+        fn a_standing_choice_runs_only_while_its_switch_is_on() {
+            let tools = ToolRegistry::new();
+            tools.register(Arc::new(Switched));
+            let gates = guarded("C1", true);
+            let call = |on: bool| {
+                let input = serde_json::json!({ "session_id": "s1", "on": on });
+                as_user(|| {
+                    gate_tool_call(&gates, &permissive_policy(), &tools, "crew.nudge", &input)
+                })
+            };
+            assert!(matches!(call(true), GateOutcome::Execute { .. }));
+            assert!(matches!(call(false), GateOutcome::Blocked { .. }));
+        }
+
+        /// A gate at Full access that asks before nothing.
+        struct FullAccess;
+
+        impl ComputerGate for FullAccess {
+            fn decides(&self, _tool: &str) -> bool {
+                false
+            }
+            fn asks_nothing(&self) -> bool {
+                true
+            }
+            fn verdict(
+                &self,
+                _tool: &str,
+                _effect: &workforce_core::computer::Effect,
+            ) -> workforce_core::computer::Verdict {
+                workforce_core::computer::Verdict::Run {
+                    by: workforce_core::computer::By::Rule,
+                }
+            }
+            fn record(&self, _record: crate::tools::computer::Record) {}
+        }
+
+        #[test]
+        fn at_full_access_or_act_fully_only_a_refusing_scope_stops_a_call() {
+            let ungated: [Arc<dyn ComputerGate>; 2] =
+                [Arc::new(FullAccess), Arc::new(Standing(true))];
+            for gate in ungated {
+                let with = |refuses: bool| ToolGates {
+                    computer_gate: Some(Arc::clone(&gate)),
+                    ..guarded("C2", refuses)
+                };
+                assert!(matches!(
+                    post(&with(false), &permissive_policy()),
+                    GateOutcome::Execute { .. }
+                ));
+                assert!(matches!(
+                    post(&with(true), &permissive_policy()),
+                    GateOutcome::Blocked { .. }
+                ));
+            }
+        }
+
+        #[test]
+        fn a_denial_stays_a_denial() {
+            let deny = PolicyEngine::from_yaml(
+                "rules:\n  - name: no-posts\n    scope: global\n    tool: \"messaging.send\"\n    action: deny\n",
+            )
+            .unwrap();
+            assert!(matches!(
+                post(&guarded("C2", false), &deny),
+                GateOutcome::Blocked { ref message, .. } if message.starts_with("Policy denied")
+            ));
+        }
     }
 }

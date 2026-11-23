@@ -26,6 +26,31 @@ use crate::definition::{
 
 pub use config::{EmailAccountConfig, EmailSkillConfig};
 
+/// The email tools that only read the person's mail.
+pub const READ_TOOLS: &[&str] = &[
+    "email.accounts",
+    "email.inbox",
+    "email.folders",
+    "email.read",
+    "email.get_attachment",
+    "email.search",
+];
+
+/// The email tools that send, change mail or folders, or keep something.
+pub const WRITE_TOOLS: &[&str] = &[
+    "email.setup",
+    "email.send",
+    "email.draft",
+    "email.mark",
+    "email.move",
+    "email.archive",
+    "email.delete",
+    "email.forward",
+    "email.confirm",
+    "email.contacts",
+    "email.rules",
+];
+
 /// The Email skill — multi-account IMAP/SMTP integration.
 ///
 /// Holds an `ImapConnector` behind `Arc<tokio::sync::Mutex>` for
@@ -705,6 +730,15 @@ impl EmailSkill {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn read_and_write_tools_partition_the_skill() {
+        crate::adapters::test_support::assert_read_write_partition(
+            EmailSkill::tool_names(),
+            READ_TOOLS,
+            WRITE_TOOLS,
+        );
+    }
 
     #[test]
     fn get_attachment_is_named_defined_and_allowed() {

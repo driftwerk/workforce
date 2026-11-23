@@ -1292,6 +1292,7 @@ mod tests {
             surface_allows: None,
             computer_gate: gate,
             arguments: Default::default(),
+            content_guard: None,
         }
     }
 

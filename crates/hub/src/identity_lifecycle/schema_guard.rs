@@ -468,6 +468,12 @@ const CLAIMS: &[(&str, &str, &str, Claim)] = &[
     ("hub", "interventions", "person", By(C::DecisionRecords)),
     ("hub", "interventions", "actor", By(C::DecisionRecords)),
     ("hub", "pending_approvals", "requester_id", By(C::Approvals)),
+    (
+        "hub",
+        "pending_approvals",
+        "content_scope",
+        NotPersonal("the content guard the asking turn ran under, erased with its row"),
+    ),
     ("hub", "turns", "owner", By(C::Signals)),
     (
         "hub",

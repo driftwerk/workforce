@@ -158,6 +158,34 @@ pub fn read_only_adapter_tools() -> Vec<&'static str> {
     tools
 }
 
+/// The tools whose results are what other people wrote in a connected
+/// system (an issue, a comment, a page, a ticket, an alert): outside content
+/// as it is, fenced or not, so a turn that reads it is guarded against it
+/// ([`workforce_agent::security::monitor::Knowledge::outside_reads`]). Each
+/// only reads.
+pub fn outside_reads() -> Vec<String> {
+    let mut tools: Vec<&'static str> = Vec::new();
+    #[cfg(feature = "datadog")]
+    tools.extend_from_slice(datadog::READ_TOOLS);
+    #[cfg(feature = "jira")]
+    tools.extend_from_slice(jira::READ_TOOLS);
+    #[cfg(feature = "linear")]
+    tools.extend_from_slice(linear::READ_TOOLS);
+    #[cfg(feature = "metabase")]
+    tools.extend_from_slice(metabase::READ_TOOLS);
+    #[cfg(feature = "notion")]
+    tools.extend_from_slice(notion::READ_TOOLS);
+    #[cfg(feature = "github")]
+    tools.extend_from_slice(github::READ_TOOLS);
+    #[cfg(feature = "hubspot")]
+    tools.extend(
+        hubspot::HubspotSkill::tool_names()
+            .into_iter()
+            .filter(|tool| workforce_common::connector_binding::is_read(tool)),
+    );
+    tools.into_iter().map(str::to_string).collect()
+}
+
 #[cfg(all(
     test,
     feature = "datadog",
@@ -189,6 +217,25 @@ mod read_only_adapter_tools_tests {
             "metabase.card_create",
         ] {
             assert!(!reads.contains(&name), "{name} must not be read-only");
+        }
+    }
+}
+
+#[cfg(all(test, feature = "linear", feature = "hubspot", feature = "github"))]
+mod outside_reads_tests {
+    #[test]
+    fn a_connectors_reads_are_outside_content_and_its_writes_are_not() {
+        let reads = super::outside_reads();
+        for read in [
+            "linear.issue_get",
+            "linear.comment_list",
+            "github.list_issues",
+            "hubspot.ticket_get",
+        ] {
+            assert!(reads.iter().any(|t| t == read), "{read}");
+        }
+        for write in ["linear.issue_create", "linear.comment_add", "hubspot.api"] {
+            assert!(!reads.iter().any(|t| t == write), "{write}");
         }
     }
 }

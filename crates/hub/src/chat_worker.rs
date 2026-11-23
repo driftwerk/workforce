@@ -366,6 +366,8 @@ fn chat_progress(
         }
         ProgressEvent::CompactStart => Some(ChatProgress::CompactStart),
         ProgressEvent::CompactEnd => Some(ChatProgress::CompactEnd),
+        // A chat posts no previews: nothing to mark.
+        ProgressEvent::OutsideContent { .. } => None,
         ProgressEvent::ContextUpdate {
             estimated_tokens,
             context_max,
