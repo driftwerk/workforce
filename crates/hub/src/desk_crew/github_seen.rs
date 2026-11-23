@@ -1000,14 +1000,17 @@ mod tests {
         let h = hub(&server);
         let read = |name, input| h.fetch("ann", name, input);
         let seen = Mutex::new(GithubSeen::default());
-        assert_eq!(seen.lock().branch_kept("acme/web", "fix"), None);
         let t0 = Instant::now();
+        assert_eq!(seen.lock().branch_kept("acme/web", "fix", t0, MINUTE), None);
         let got = branch_pull(&seen, &read, "acme/web", "fix", t0)
             .await
             .unwrap();
         let p = got.value.unwrap();
         assert_eq!(p.number, 12);
-        assert_eq!(seen.lock().branch_kept("acme/web", "fix"), Some(p.clone()));
+        assert_eq!(
+            seen.lock().branch_kept("acme/web", "fix", t0, MINUTE),
+            Some(p.clone())
+        );
         assert_eq!(p.checks.as_deref(), Some("failure"));
         assert_eq!(
             (p.failed, p.failed_names),
