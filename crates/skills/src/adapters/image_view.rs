@@ -460,6 +460,7 @@ mod tests {
             thread_id: None,
             files,
             bot_id: None,
+            outside: false,
         }
     }
 

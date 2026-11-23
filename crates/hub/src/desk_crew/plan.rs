@@ -134,12 +134,14 @@ impl MachineSeen {
 }
 
 /// What a plan's boss is told of its session on `machine` going from `was`
-/// to `now`, if anything: a turn ended (with its last reply), it asks the
-/// person there, or it ended.
+/// to `now`, if anything: a turn ended (with its last reply), one ended on
+/// a question for it (none while its answerer there has it, `answered`), a
+/// request waits there, or it ended.
 pub(crate) fn machine_line(
     machine: &str,
     was: &MachineSeen,
     now: &MachineSession,
+    answered: bool,
 ) -> Option<String> {
     let key = &was.key;
     let ended = matches!(now.state.as_str(), "closed" | "stopped");
@@ -168,9 +170,14 @@ pub(crate) fn machine_line(
             reply()
         ));
     }
-    if matches!(now.state.as_str(), "asking" | "blocked")
-        && !matches!(was.state.as_str(), "asking" | "blocked")
-    {
+    if now.state == "asking" {
+        return (!answered).then(|| format!(
+            "{key}'s session on {machine} finished a turn on a question for you.{} Answer it with \
+             crew.nudge as the person would, so it goes on; tell the person only what only they can answer.",
+            reply()
+        ));
+    }
+    if now.state == "blocked" && was.state != "blocked" {
         return Some(format!(
             "{key}'s session on {machine} is waiting on a request there: the person answers it in Desk."
         ));
@@ -1566,8 +1573,12 @@ impl CrewHub {
         if !self.desk.charges_loaded() {
             return;
         }
-        self.watch_machines().await;
-        self.retry_machine_starts().await;
+        // What the machines' Ungrouped grants are made of is read beside
+        // the plans' own work, never in its way.
+        tokio::join!(self.watch_ungrouped(), async {
+            self.watch_machines().await;
+            self.retry_machine_starts().await;
+        });
         match self.desk.plans(Some(PlanState::Paused), None).await {
             Ok(paused) => {
                 for s in paused {
@@ -1588,14 +1599,22 @@ impl CrewHub {
         }
     }
 
-    /// How many of `boss`'s plans' sessions on the person's machines hold a
-    /// slot: working, or not read yet.
+    /// How many of `boss`'s sessions on the person's machines hold a slot:
+    /// its plans' working or not read yet, and the others it runs there
+    /// working ([`super::relayed_work`]).
     fn machine_busy(&self, boss: &str) -> usize {
-        self.machine_seen
-            .lock()
-            .values()
-            .filter(|s| s.boss == boss && s.busy())
-            .count()
+        let seen = self.machine_seen.lock();
+        seen.values().filter(|s| s.boss == boss && s.busy()).count()
+            + self.machine_runs_busy(boss, |k| seen.contains_key(k))
+    }
+
+    /// Says on the tickets of `item`, a session on a machine, that it was
+    /// closed or removed there, or runs again when not `closed`: a closed
+    /// one's hold no slot of their plan.
+    async fn session_closed(&self, item: &str, closed: bool) {
+        if let Err(e) = self.desk.store().close_session_tickets(item, closed).await {
+            tracing::warn!(session = %item, error = format!("{e:#}"), "a machine session's close wasn't kept on its tickets");
+        }
     }
 
     /// Reads each machine that open plans' tickets work on, at most once a
@@ -1606,7 +1625,7 @@ impl CrewHub {
     /// A session here in Doing that ended as it started is held back too:
     /// one that ended before its ticket was its was missed as it ended.
     async fn watch_machines(&self) {
-        let gap = self.timing.tick.min(Duration::from_secs(15));
+        let gap = self.machine_gap();
         // The plans themselves are read once a gap apart, too.
         {
             let mut read = self.machine_read.lock();
@@ -1717,19 +1736,25 @@ impl CrewHub {
                 read.insert(machine.clone(), Instant::now());
             }
             let (_, first, group, _) = &sessions[0];
+            // Each one watched: one no longer listed may have been closed or
+            // removed there, which it says of them, however long ago.
+            let ids: Vec<&str> = sessions
+                .iter()
+                .filter_map(|(item, ..)| item.rsplit('/').next())
+                .collect();
             let listed = self
                 .machine_call(
                     &machine,
                     group.as_deref(),
                     &first.boss,
                     "desk.sessions",
-                    json!({}),
+                    json!({ "ids": ids }),
                 )
                 .await;
             let listed: Vec<MachineSession> = match listed {
                 Ok(v) => {
                     self.machine_down.lock().remove(&machine);
-                    serde_json::from_value(v).unwrap_or_default()
+                    self.machine_listed(&machine, v).unwrap_or_default()
                 }
                 Err(e) => {
                     tracing::debug!(%machine, error = %e, "a machine's plan sessions weren't read");
@@ -1781,8 +1806,13 @@ impl CrewHub {
                     .and_then(MachineSession::ended_as_started);
                 let line = match (now, &was) {
                     // In Review, its turns are the person's to read.
-                    (Some(now), Some(was)) => machine_line(&machine, was, now)
-                        .filter(|l| !(review && l.contains("finished a turn"))),
+                    (Some(now), Some(was)) => {
+                        let answered = now
+                            .boss_answers
+                            .unwrap_or_else(|| self.answered_on_machine(&item));
+                        machine_line(&machine, was, now, answered)
+                            .filter(|l| !(review && l.contains("finished a turn")))
+                    }
                     (None, Some(was)) if was.state == "starting" && was.misses >= 1 => {
                         Some(gone(was))
                     }
@@ -1802,6 +1832,12 @@ impl CrewHub {
                     ),
                     (None, Some(line)) => self.plan_failures.lock().push((fresh.plan, line)),
                     (None, None) => {}
+                }
+                if let Some(now) = now {
+                    let closed = now.state == "closed";
+                    if was.as_ref().is_none_or(|w| (w.state == "closed") != closed) {
+                        self.session_closed(&item, closed).await;
+                    }
                 }
                 let mut next = was.unwrap_or(fresh);
                 match now {
@@ -1838,7 +1874,7 @@ impl CrewHub {
 
     /// The boss of `p` and its settings, while it oversees the scope the
     /// plan is in.
-    fn boss_of_plan(&self, p: &Plan) -> Option<(Arc<AgentService>, Oversight)> {
+    pub(super) fn boss_of_plan(&self, p: &Plan) -> Option<(Arc<AgentService>, Oversight)> {
         self.overseer_named(&p.boss)
             .filter(|(_, o)| self.desk.seen_by(&o.scope).sees(p.group.as_deref()))
     }
@@ -1945,7 +1981,9 @@ impl CrewHub {
                 let busy = self.desk.charges_busy(&boss.id)
                     + self.desk.starts_under_way(&boss.id).await
                     + self.machine_busy(&boss.id);
-                for s in plan::next_starts(&p, &rows, busy, limit, standing) {
+                let held = plan::held(&tickets);
+                let room = plan::room(&p, held, busy, limit);
+                for s in plan::next_starts(&p, &rows, room, standing) {
                     match self.desk.plan_start(&p, &s, &boss, &by).await {
                         Ok(started) => {
                             self.plan_failed.lock().remove(&s.ticket);
@@ -2186,28 +2224,41 @@ impl CrewHub {
             .map(|t| (t.ticket.ticket.id, t.ticket.ticket.updated_at.to_rfc3339()))
             .collect();
         let revision = p.approved_revision.unwrap_or(p.revision);
-        let suggested: HashSet<String> = made
+        let ticket_of =
+            |s: &crew::Suggestion| s.action["input"]["ticket_id"].as_str().map(str::to_string);
+        // An open suggestion is as good as starting; one taken or dismissed
+        // for this revision of the ticket isn't suggested again, but holds
+        // no slot.
+        let (open, settled): (Vec<_>, Vec<_>) = made
             .iter()
+            .partition(|s| s.state == crew::SuggestionState::Open);
+        let open: HashSet<String> = open.into_iter().filter_map(ticket_of).collect();
+        let settled: HashSet<String> = settled
+            .into_iter()
             .filter(|s| {
                 let i = &s.action["input"];
-                s.state == crew::SuggestionState::Open
-                    || (i["plan_id"].as_str() == Some(&p.id.to_string())
-                        && i["plan_revision"].as_i64() == Some(i64::from(revision))
-                        && i["ticket_id"]
-                            .as_str()
-                            .and_then(|t| t.parse::<Uuid>().ok())
-                            .and_then(|t| at.get(&t))
-                            .is_some_and(|now| i["ticket_at"].as_str() == Some(now.as_str())))
+                i["plan_id"].as_str() == Some(&p.id.to_string())
+                    && i["plan_revision"].as_i64() == Some(i64::from(revision))
+                    && i["ticket_id"]
+                        .as_str()
+                        .and_then(|t| t.parse::<Uuid>().ok())
+                        .and_then(|t| at.get(&t))
+                        .is_some_and(|now| i["ticket_at"].as_str() == Some(now.as_str()))
             })
-            .filter_map(|s| s.action["input"]["ticket_id"].as_str().map(str::to_string))
+            .filter_map(ticket_of)
             .collect();
-        let mut rows = tickets.to_vec();
-        // A ticket already suggested is as good as starting.
-        for t in &mut rows {
-            if suggested.contains(&t.id.to_string()) {
+        let mark = |rows: &mut [PlanTicket], these: &HashSet<String>| {
+            for t in rows
+                .iter_mut()
+                .filter(|t| these.contains(&t.id.to_string()))
+            {
                 t.starting = true;
             }
-        }
+        };
+        let mut rows = tickets.to_vec();
+        mark(&mut rows, &open);
+        let held = plan::held(&rows);
+        mark(&mut rows, &settled);
         let opened = self
             .desk
             .store()
@@ -2215,11 +2266,12 @@ impl CrewHub {
             .await
             .map_or(0, |n| usize::try_from(n).unwrap_or(usize::MAX));
         let busy = self.desk.charges_busy(boss) + opened;
+        let room = plan::room(p, held, busy, o.work.parallel as usize);
         let by = self.by_boss(
             service,
             "The person approved the plan; you decide each start.",
         );
-        for s in plan::next_starts(p, &rows, busy, o.work.parallel as usize, standing) {
+        for s in plan::next_starts(p, &rows, room, standing) {
             let Some(t) = tickets.iter().find(|t| t.id == s.ticket) else {
                 continue;
             };
@@ -2506,7 +2558,7 @@ impl CrewHub {
         let said: Vec<String> = lines.iter().map(|l| format!("- {l}")).collect();
         let progress = &detail.summary.progress;
         let stands = format!(
-            "{} of {} done · {} doing · {} in review · {} ready{}",
+            "{} of {} done · {} doing · {} in review · {} ready{}{}",
             progress.done,
             progress.total,
             progress.doing,
@@ -2515,7 +2567,12 @@ impl CrewHub {
             match progress.next.is_empty() {
                 true => String::new(),
                 false => format!(" · next {}", progress.next.join(", ")),
-            }
+            },
+            plan::full(progress, p.limit(o.work.parallel as usize))
+                .map(|f| format!(
+                    " · {f}: it starts no more until one is closed or its ticket moves on"
+                ))
+                .unwrap_or_default()
         );
         let then = match closing {
             true => "Every ticket is done or dropped. Write the person a short closing summary: what was done, what was dropped and why, and anything left for them. Your reply is posted in your DM.".to_string(),
@@ -2744,6 +2801,12 @@ pub(super) fn plan_loop(
 mod tests {
     use super::*;
 
+    /// What a plan's boss is told of a session on `machine` its answerer
+    /// there doesn't have.
+    fn told(machine: &str, was: &MachineSeen, now: &MachineSession) -> Option<String> {
+        machine_line(machine, was, now, false)
+    }
+
     #[test]
     fn a_brief_names_the_paths_only_this_computer_has_by_their_roots() {
         let roots = |brief: &str| local_roots(brief, "/Users/kim/");
@@ -2819,6 +2882,7 @@ mod tests {
             machine: None,
             model: None,
             assigned: false,
+            session: None,
             starting: false,
             held_back: None,
         };
@@ -2863,19 +2927,21 @@ mod tests {
             last_reply: reply.map(str::to_string),
             created_at: None,
             boss_has: None,
+            boss_answers: None,
+            grant: None,
             exited: None,
         };
         // Nothing new: nothing said.
         assert_eq!(
-            machine_line("devbox", &seen("idle", Some("a")), &now("idle", Some("a"))),
+            told("devbox", &seen("idle", Some("a")), &now("idle", Some("a"))),
             None
         );
         assert_eq!(
-            machine_line("devbox", &seen("working", None), &now("working", None)),
+            told("devbox", &seen("working", None), &now("working", None)),
             None
         );
         // A turn ends, with its reply.
-        let ended = machine_line(
+        let ended = told(
             "devbox",
             &seen("working", None),
             &now("idle", Some("Done the parser.")),
@@ -2890,23 +2956,61 @@ mod tests {
             "{ended}"
         );
         // First read after its start, already idle: its turn ended.
-        assert!(machine_line("devbox", &seen("starting", None), &now("idle", None)).is_some());
+        assert!(told("devbox", &seen("starting", None), &now("idle", None)).is_some());
         // A whole turn between two reads: a new reply.
-        let quick =
-            machine_line("devbox", &seen("idle", Some("a")), &now("idle", Some("b"))).unwrap();
+        let quick = told("devbox", &seen("idle", Some("a")), &now("idle", Some("b"))).unwrap();
         assert!(
             quick.contains("finished a turn") && quick.contains("“b”"),
             "{quick}"
         );
-        // It asks the person there, once.
-        let asks = machine_line("devbox", &seen("working", None), &now("asking", None)).unwrap();
-        assert!(asks.contains("waiting on a request there"), "{asks}");
+        // A turn that ends on a question is the boss's to answer, once a
+        // question.
+        let asks = told(
+            "devbox",
+            &seen("working", None),
+            &now("asking", Some("Which branch?")),
+        )
+        .unwrap();
+        assert!(
+            asks.starts_with("VEL-3's session on devbox finished a turn on a question for you.")
+                && asks.contains("“Which branch?”")
+                && asks.contains("crew.nudge"),
+            "{asks}"
+        );
         assert_eq!(
-            machine_line("devbox", &seen("asking", None), &now("blocked", None)),
+            told(
+                "devbox",
+                &seen("asking", Some("Which branch?")),
+                &now("asking", Some("Which branch?"))
+            ),
+            None
+        );
+        let again = told(
+            "devbox",
+            &seen("asking", Some("Which branch?")),
+            &now("asking", Some("Main or dev?")),
+        )
+        .unwrap();
+        assert!(again.contains("“Main or dev?”"), "{again}");
+        // Its answerer there has it: the boss isn't told.
+        assert_eq!(
+            machine_line(
+                "devbox",
+                &seen("working", None),
+                &now("asking", Some("Which branch?")),
+                true
+            ),
+            None
+        );
+        // A request waits there, once.
+        let request = told("devbox", &seen("working", None), &now("blocked", None)).unwrap();
+        assert!(request.contains("waiting on a request there"), "{request}");
+        assert_eq!(
+            told("devbox", &seen("blocked", None), &now("blocked", None)),
             None
         );
         // It ends, once.
-        let gone = machine_line(
+        let gone = told(
             "devbox",
             &seen("idle", Some("a")),
             &now("closed", Some("a")),
@@ -2917,7 +3021,7 @@ mod tests {
             "{gone}"
         );
         assert_eq!(
-            machine_line(
+            told(
                 "devbox",
                 &seen("closed", Some("a")),
                 &now("stopped", Some("a"))

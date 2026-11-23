@@ -199,7 +199,7 @@ pub(crate) async fn wire(
     // vault tools use lets admins bind anywhere / mutate globals; the
     // binding gate verifies a non-admin can reach the channel a save
     // would watch, and wherever its action would deliver.
-    service.register_tool(Arc::new(
+    let monitor_tool = Arc::new(
         super::MonitorTool::new(Arc::clone(&monitor_runtime), durable)
             .with_agent(tool_agent)
             .with_write_auth(def_write_auth.clone())
@@ -210,5 +210,16 @@ pub(crate) async fn wire(
                     move || identities.read().clone()
                 }),
             )),
-    ));
+    );
+    // Sort rules are monitors, saved and read through the monitor tool so
+    // they meet its ownership and binding rules.
+    service.register_tool(Arc::new(super::sort_rule::SortRulesTool::new(
+        Arc::clone(&monitor_tool),
+        Arc::clone(&service.tools),
+    )));
+    service.register_tool(Arc::new(super::sort_rule::SortRuleSaveTool::new(
+        Arc::clone(&monitor_tool),
+        Arc::clone(&service.tools),
+    )));
+    service.register_tool(monitor_tool);
 }

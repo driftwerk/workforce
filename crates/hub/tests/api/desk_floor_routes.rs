@@ -141,10 +141,16 @@ async fn the_floor_is_the_callers_own_for_their_day() {
 
         let day = now - chrono::Duration::hours(2);
         let mine = token_for(&alice);
+        let bobs_token = token_for(&bob);
+        // The log applies the turns in the order they were sent, so once
+        // Bob's question, the last of them, is in, every turn is.
         let floor = eventually(async || {
+            let (_, bobs) = get(addr, &day_path(day), Some(&bobs_token)).await;
+            if bobs["counts"]["needsYou"] != 1 {
+                return None;
+            }
             let (status, body) = get(addr, &day_path(day), Some(&mine)).await;
-            (status == 200 && body["needs"].as_array().is_some_and(|n| n.len() == 1))
-                .then_some(body)
+            (status == 200).then_some(body)
         })
         .await;
         assert_eq!(floor["needs"][0]["id"], format!("question:{}", asked.id));
@@ -293,6 +299,8 @@ async fn a_routed_approval_needs_its_approver_alone_and_is_decided_once() {
                     approver_user_ids: vec![alice.id.to_string()],
                     ttl: Duration::from_secs(3600),
                     chat: false,
+                    origin: None,
+                    content_scope: None,
                 },
                 None,
                 None,

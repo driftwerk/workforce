@@ -32,6 +32,7 @@ use workforce_agent::tools::computer::{describe, ComputerGate, Outcome, Record};
 use workforce_common::settings::{AgentWorkspaceConfig, WorkforceConfig};
 use workforce_core::computer::{By, ComputerAccess, Effect, Refusal, Refused, Verdict};
 use workforce_core::policy::PermissionChoice;
+pub use workforce_desk::computer::policy::is_browser_key;
 use workforce_desk::computer::policy::{namespace, shown, Namespace};
 use workforce_desk::computer::{
     browser_site, Activity, AgentPolicy, Browser, Browsing, CallFacts, Computer, NewGrant,
@@ -51,16 +52,6 @@ pub struct HubComputerGate {
 /// The browser tools that only read: everything else in `browser.*`
 /// changes a page.
 pub const BROWSER_READS: &[&str] = workforce_skills::adapters::browser::READS;
-
-/// Whether `connector` is what a browser call is kept under: a site in the
-/// person's Chrome (`chrome:<origin>`, `chrome-visit:<origin>`), or
-/// `chrome` itself.
-pub fn is_browser_key(connector: &str) -> bool {
-    connector == "chrome"
-        || connector
-            .strip_prefix("chrome")
-            .is_some_and(|rest| rest.starts_with(':') || rest.starts_with("-visit:"))
-}
 
 /// Whether `tool` is a browser tool that changes a page.
 pub fn changes_a_page(tool: &str) -> bool {
@@ -140,6 +131,14 @@ fn unbound_now(agent: &str) -> bool {
     JUDGE.get().is_some_and(|judge| judge(agent))
 }
 
+static ACTS_FULLY: std::sync::OnceLock<UnboundJudge> = std::sync::OnceLock::new();
+
+/// Installs who judges whether an agent's Act fully is in force by its
+/// settings and grant, whoever's turn it is: once, with Desk's browser.
+pub fn judge_acts_fully_with(judge: UnboundJudge) -> bool {
+    ACTS_FULLY.set(judge).is_ok()
+}
+
 /// Whether an identity is the person whose Desk this is: the only one whose
 /// turns may use their own Chrome, signed in as them.
 pub type HolderJudge = Box<dyn Fn(Option<&str>) -> bool + Send + Sync>;
@@ -169,11 +168,46 @@ pub(crate) fn the_holders_turn() -> bool {
     HOLDER.get().is_some_and(|judge| judge(user.as_deref()))
 }
 
+/// The automated origins that are the agent's own jobs: what the person
+/// set it to do (a schedule of their own, a workflow they started, its
+/// check-ins). A monitor's turn, which processes what came from outside (an
+/// event, an email's body), a run a webhook started, a job someone else
+/// set or changed, and a boss's wakes are none of them.
+const OWN_JOBS: [&str; 4] = ["scheduler", "workflow", "workflow-engine", "heartbeat"];
+
+/// Whether the turn in scope is one what the agent does on its own applies
+/// to: the person whose Desk this is, in a turn they started or one of the
+/// agent's own jobs ([`OWN_JOBS`]). Both the origin the work carries and
+/// the one its session names must be: a sub-agent carrying a job's origin
+/// in a monitor's session gets none of it, nor does an unknown origin.
+pub(crate) fn on_its_own_turn() -> bool {
+    let own = |origin: Option<String>| origin.is_none_or(|o| OWN_JOBS.contains(&o.as_str()));
+    the_holders_turn()
+        && own(crate::hub_core::origins::carried_origin())
+        && own(crate::hub_core::origins::session_origin())
+}
+
 /// Whether `tool` with `effect` uses the person's Chrome: every browser
 /// call, and anything kept under a site there.
 fn uses_their_chrome(tool: &str, effect: &Effect) -> bool {
     tool.starts_with("browser.")
         || matches!(effect, Effect::Connector { connector, .. } if is_browser_key(connector))
+}
+
+/// Why a browser call on BankSync's site, in the person's Chrome or Desk's
+/// own headless browser, may not be made in this run: its pages show the person's banks, accounts and transactions, so they are
+/// opened only where the bank may be read (the person's own Desk, watched).
+fn banksync_refusal(effect: &Effect) -> Option<&'static str> {
+    let Effect::Connector { connector, .. } = effect else {
+        return None;
+    };
+    let origin = connector
+        .strip_prefix("chrome-visit:")
+        .or_else(|| connector.strip_prefix("chrome:"))
+        .or_else(|| connector.strip_prefix("browser:"))?;
+    (origin == crate::desk_connections::catalog::BANKSYNC_APP)
+        .then(crate::personal_access::read_refusal)
+        .flatten()
 }
 
 /// Where the person's home is.
@@ -247,8 +281,9 @@ fn works_in_of(subject: &ComputerSubject, config: &WorkforceConfig, home: &Path)
 }
 
 /// This agent's `[skills]` binding, as the verdict reads it: `None` (every
-/// connector) where it names no `enabled` nor `read_only`. One that can't be
-/// read turns every connector off: admission refuses it before it is written.
+/// connector) where it names no `enabled` nor connections and no connector
+/// only reads. One that can't be read turns every connector off: admission
+/// refuses it before it is written.
 fn connectors_of(subject: &ComputerSubject) -> Option<workforce_desk::computer::Connectors> {
     let binding = match AgentWorkspaceConfig::load(&subject.workspace) {
         Ok(Some(config)) => config.connectors().unwrap_or_else(|e| {
@@ -260,18 +295,22 @@ fn connectors_of(subject: &ComputerSubject) -> Option<workforce_desk::computer::
         }),
         _ => return None,
     };
-    if binding.enabled.is_none() && binding.read_only.is_empty() && binding.connections.is_empty() {
+    let connectors = workforce_common::connector_binding::CONNECTORS;
+    if binding.enabled.is_none()
+        && binding.connections.is_empty()
+        && !connectors.iter().any(|c| binding.reads_only(c))
+    {
         return None;
     }
     // A connector it uses no connection of is off; one connection that only
     // reads is refused where the adapter resolves it, not here.
     Some(workforce_desk::computer::Connectors {
-        enabled: workforce_common::connector_binding::CONNECTORS
+        enabled: connectors
             .iter()
             .filter(|c| binding.is_on(c))
             .map(|c| c.to_string())
             .collect(),
-        read_only: workforce_common::connector_binding::CONNECTORS
+        read_only: connectors
             .iter()
             .filter(|c| binding.reads_only(c))
             .map(|c| c.to_string())
@@ -405,6 +444,7 @@ impl HubComputerGate {
                 withheld: withheld(config, &home),
                 config: own_config(&subject.workspace),
                 scratch: scratch(),
+                trash: workforce_desk::computer::policy::has_trash(&home),
                 home,
                 // Commands can't be contained yet (AC5).
                 contained: false,
@@ -413,6 +453,7 @@ impl HubComputerGate {
                     browsing: browsing_for(subject),
                     hostile: false,
                 },
+                on_its_own: Default::default(),
             },
         }
     }
@@ -428,6 +469,7 @@ impl HubComputerGate {
             session_id: local(&CURRENT_SESSION_KEY),
             run: None,
             folder: folder_for(effect, &self.policy.home),
+            own_work: on_its_own_turn(),
         }
     }
 
@@ -460,6 +502,11 @@ impl HubComputerGate {
         let always = choices.iter().find_map(|c| match c {
             Choice::Always(Always::Folder(f)) => Some(shown(f, home)),
             Choice::Always(Always::Connector(c)) => Some(c.clone()),
+            Choice::Always(Always::OnItsOwn { scope, .. }) => Some(scope_shown(scope, home)),
+            _ => None,
+        });
+        options.allow_scope = choices.iter().find_map(|c| match c {
+            Choice::Always(Always::OnItsOwn { kind, .. }) => Some(*kind),
             _ => None,
         });
         // A session allowance is scoped to the same folder an "always" would
@@ -481,9 +528,25 @@ impl HubComputerGate {
             facts.effect = "sign_in".into();
             options.allow_session = false;
             options.allow_in_folder = None;
+            options.allow_scope = None;
         }
         options.facts = Some(Box::new(facts));
         options
+    }
+}
+
+/// An override's scope as the person reads it: a folder with `~`, a host,
+/// a site's host.
+fn scope_shown(scope: &workforce_core::computer::Scope, home: &Path) -> String {
+    use workforce_core::computer::Scope;
+    match scope {
+        Scope::Whole => String::new(),
+        Scope::Folder(f) => shown(f, home),
+        Scope::Host(h) => h.clone(),
+        Scope::Site(s) => s
+            .split_once("://")
+            .map_or(s.as_str(), |(_, host)| host)
+            .to_string(),
     }
 }
 
@@ -498,6 +561,7 @@ fn facts_of(effect: &Effect, home: &Path, why: &str) -> workforce_core::computer
         Effect::Read { paths } => (facts.effect, facts.paths) = ("read".into(), list(paths)),
         Effect::Write { paths } => (facts.effect, facts.paths) = ("write".into(), list(paths)),
         Effect::Delete { paths } => (facts.effect, facts.paths) = ("delete".into(), list(paths)),
+        Effect::Trash { paths } => (facts.effect, facts.paths) = ("trash".into(), list(paths)),
         Effect::Move { from, to } => {
             facts.effect = "write".into();
             facts.paths = list(from);
@@ -527,9 +591,10 @@ fn facts_of(effect: &Effect, home: &Path, why: &str) -> workforce_core::computer
 /// home, the root or a volume.
 fn folder_for(effect: &Effect, home: &Path) -> Option<PathBuf> {
     let start = match effect {
-        Effect::Write { paths } | Effect::Delete { paths } | Effect::Read { paths } => {
-            paths.first()?.parent()?.to_path_buf()
-        }
+        Effect::Write { paths }
+        | Effect::Delete { paths }
+        | Effect::Trash { paths }
+        | Effect::Read { paths } => paths.first()?.parent()?.to_path_buf(),
         Effect::Move { to, .. } => to.parent()?.to_path_buf(),
         Effect::Exec { cwd, .. } | Effect::Session { cwd } => cwd.clone()?,
         _ => return None,
@@ -571,7 +636,9 @@ impl HubComputerGate {
         let (kind, folder) = match &record.decision.effect {
             Effect::Read { paths } => ("read", paths.first().cloned()),
             Effect::Write { paths } => ("write", paths.first().cloned()),
-            Effect::Delete { paths } => ("delete", paths.first().cloned()),
+            Effect::Delete { paths } | Effect::Trash { paths } => {
+                ("delete", paths.first().cloned())
+            }
             Effect::Move { to, .. } => ("write", Some(to.clone())),
             Effect::Exec { cwd, .. } => ("exec", cwd.clone()),
             Effect::Session { cwd } => ("session", cwd.clone()),
@@ -581,6 +648,7 @@ impl HubComputerGate {
         let decided_by = match (&record.decision.verdict, record.outcome) {
             (Verdict::Run { by: By::Grant(_) }, _) => "grant",
             (Verdict::Run { by: By::Session(_) }, _) => "session",
+            (Verdict::Run { by: By::OnItsOwn }, _) => "on_its_own",
             (_, Outcome::Allowed | Outcome::Declined | Outcome::NotAnswered) => "person",
             _ => "rule",
         };
@@ -685,6 +753,15 @@ pub fn prune_daily(computer: Computer, cancel: tokio_util::sync::CancellationTok
     });
 }
 
+/// The connector `tool` is of, as Desk decides it: a bound connector's,
+/// or a books service's (Xero's isn't bound, but its writes still ask).
+fn books_connector(tool: &str) -> Option<&str> {
+    workforce_common::connector_binding::connector_of(tool).or_else(|| {
+        let (prefix, _) = tool.split_once('.')?;
+        workforce_core::computer::Books::of(prefix).map(|_| prefix)
+    })
+}
+
 impl ComputerGate for HubComputerGate {
     fn decides(&self, tool: &str) -> bool {
         match namespace(tool) {
@@ -692,7 +769,7 @@ impl ComputerGate for HubComputerGate {
             Some(Namespace::Connector) => {
                 tool.starts_with("browser.")
                     || tool.starts_with("connections.")
-                    || workforce_common::connector_binding::connector_of(tool).is_some()
+                    || books_connector(tool).is_some()
             }
             // Its own `[skills]`: a change that widens what it reaches.
             None => tool == "system.config",
@@ -713,10 +790,7 @@ impl ComputerGate for HubComputerGate {
                 write: changes_a_page(tool),
             };
         }
-        match (
-            effect,
-            workforce_common::connector_binding::connector_of(tool),
-        ) {
+        match (effect, books_connector(tool)) {
             (Effect::Unknown, Some(connector)) => Effect::Connector {
                 connector: connector.to_string(),
                 write: !workforce_common::connector_binding::is_read(tool),
@@ -730,9 +804,10 @@ impl ComputerGate for HubComputerGate {
         let level = self.policy.access.access;
         let reaches = match effect {
             Effect::Read { .. } => level != Access::OwnFolder,
-            Effect::Write { .. } | Effect::Delete { .. } | Effect::Move { .. } => {
-                level == Access::Full
-            }
+            Effect::Write { .. }
+            | Effect::Delete { .. }
+            | Effect::Trash { .. }
+            | Effect::Move { .. } => level == Access::Full,
             _ => false,
         };
         if reaches {
@@ -748,6 +823,7 @@ impl ComputerGate for HubComputerGate {
             Effect::Read { .. }
                 | Effect::Write { .. }
                 | Effect::Delete { .. }
+                | Effect::Trash { .. }
                 | Effect::Move { .. }
                 | Effect::Exec { .. }
                 | Effect::Session { .. }
@@ -775,6 +851,29 @@ impl ComputerGate for HubComputerGate {
         };
         if !offered {
             eyre::bail!("{choice:?} wasn't offered for this call");
+        }
+        let raised = match &decision.verdict {
+            Verdict::Ask { choices, .. } => choices.iter().find_map(|c| match c {
+                workforce_core::computer::Choice::Always(
+                    workforce_core::computer::Always::OnItsOwn { kind, scope },
+                ) => Some((*kind, scope)),
+                _ => None,
+            }),
+            _ => None,
+        };
+        if let (PermissionChoice::AllowInFolder, Some((kind, scope))) = (choice, raised) {
+            if !on_its_own_turn() {
+                eyre::bail!("only the person whose Desk this is lets an agent work on its own");
+            }
+            return self
+                .block_on(self.computer.store().set_on_its_own(
+                    &self.policy.hub,
+                    &self.policy.agent,
+                    kind,
+                    scope,
+                    Some(workforce_core::computer::Level::Anywhere),
+                ))
+                .map(|_| ());
         }
         // The folder kept is the one the card showed, never found again.
         let shown_folder = match &decision.verdict {
@@ -885,6 +984,13 @@ impl ComputerGate for HubComputerGate {
         self.policy.browser.browsing == Browsing::Unbound && unbound_now(&self.policy.agent)
     }
 
+    fn acts_fully(&self) -> bool {
+        self.policy.browser.browsing == Browsing::Unbound
+            && ACTS_FULLY
+                .get()
+                .is_some_and(|judge| judge(&self.policy.agent))
+    }
+
     fn asks_unattended(&self, tool: &str) -> bool {
         tool.starts_with("browser.")
     }
@@ -933,6 +1039,16 @@ impl ComputerGate for HubComputerGate {
                         "{} uses the browser only in a turn of the person whose Desk this is: it is their own Chrome, signed in as them.",
                         self.policy.name
                     ),
+                },
+            };
+        }
+        // BankSync's pages show the person's banks and their transactions:
+        // the browser opens them only where the bank itself may be read.
+        if let Some(why) = banksync_refusal(effect) {
+            return Verdict::Refuse {
+                refusal: Refusal {
+                    rule: Refused::OutsideLevel,
+                    sentence: why.to_string(),
                 },
             };
         }
@@ -1064,6 +1180,48 @@ mod tests {
     use std::path::Path;
     use std::time::Duration;
 
+    /// BankSync's site is opened in the browser only where the bank itself
+    /// may be read: never off Desk, in a room, or unwatched; another site is
+    /// left to the gate.
+    #[tokio::test]
+    async fn banksync_s_pages_are_opened_only_where_the_bank_is_read() {
+        use workforce_common::channels::desk::{DeskPlace, DeskScope, DeskTarget};
+        let at = |site: &str, visit: bool| Effect::Connector {
+            connector: workforce_skills::adapters::browser::site_key(visit, Some(site)),
+            write: false,
+        };
+        let bank = crate::desk_connections::catalog::BANKSYNC_APP;
+        assert!(
+            super::banksync_refusal(&at(bank, true)).is_some(),
+            "off Desk"
+        );
+        assert!(super::banksync_refusal(&at(bank, false)).is_some());
+        assert!(super::banksync_refusal(&at("https://linear.app", true)).is_none());
+        let headless = Effect::Connector {
+            connector: format!("browser:{bank}"),
+            write: false,
+        };
+        assert!(super::banksync_refusal(&headless).is_some(), "headless too");
+        let desk = |place: DeskPlace, attended: bool| DeskScope {
+            target: DeskTarget::of_turn(&place, "desk", None, false),
+            owner: "ann".into(),
+            attended,
+            relayed: false,
+        };
+        let in_dm = workforce_agent::runner::with_desk(
+            Some(desk(DeskPlace::Dm { thread: None }, true)),
+            async { super::banksync_refusal(&at(bank, true)) },
+        )
+        .await;
+        assert_eq!(in_dm, None);
+        let unwatched = workforce_agent::runner::with_desk(
+            Some(desk(DeskPlace::Dm { thread: None }, false)),
+            async { super::banksync_refusal(&at(bank, false)) },
+        )
+        .await;
+        assert!(unwatched.is_some());
+    }
+
     use async_trait::async_trait;
     use serde_json::{json, Value};
     use workforce_agent::runner::{CURRENT_SESSION_KEY, CURRENT_USER_ID};
@@ -1113,6 +1271,9 @@ mod tests {
             ExecCommand::default().with_workspace(workspace.to_path_buf()),
         ));
         tools.register(Arc::new(WriteFile::new(vec![workspace.to_path_buf()])));
+        tools.register(Arc::new(
+            workforce_agent::tools::filesystem::TrashFiles::new(vec![workspace.to_path_buf()]),
+        ));
         tools.register(Arc::new(workforce_agent::tools::filesystem::ReadFile::new(
             vec![workspace.to_path_buf()],
         )));
@@ -1131,6 +1292,7 @@ mod tests {
             surface_allows: None,
             computer_gate: gate,
             arguments: Default::default(),
+            content_guard: None,
         }
     }
 
@@ -1222,6 +1384,8 @@ mod tests {
             contained: false,
             connectors: None,
             browser: Browser::default(),
+            on_its_own: Default::default(),
+            trash: true,
         };
         let profile = root.join("0123abcd/Default/Cookies");
         for effect in [
@@ -1239,6 +1403,7 @@ mod tests {
                 session_id: Some("s1".into()),
                 run: None,
                 folder: None,
+                own_work: true,
             };
             let verdict = workforce_desk::computer::policy::verdict(&policy, false, &[], &call);
             assert!(
@@ -1392,6 +1557,10 @@ mod tests {
                 "github.pr_get",
                 "jira.search",
                 "browser.navigate",
+                "freeagent.invoices_list",
+                "freeagent.invoice_create",
+                "xero.invoices_list",
+                "xero.invoice_create",
             ] {
                 tools.register(Arc::new(Elsewhere(name)));
             }
@@ -1422,6 +1591,18 @@ mod tests {
             // No binding: every connector, as before; a send still asks.
             assert_eq!(decide_with("", "jira.search").0, "run");
             assert_eq!(decide_with("", "slack.send").0, "asks once");
+            // FreeAgent reads only until a connection of it is writable,
+            // and a change to the books then asks, unless it asks never.
+            assert_eq!(decide_with("", "freeagent.invoices_list").0, "run");
+            assert_eq!(decide_with("", "freeagent.invoice_create").0, "refused");
+            let harbor = "[skills]\nwritable = [\"freeagent:harbor\"]\n";
+            assert_eq!(decide_with(harbor, "freeagent.invoice_create").0, "asks once");
+            let never = format!("[computer]\nasks = \"never\"\n\n{harbor}");
+            assert_eq!(decide_with(&never, "freeagent.invoice_create").0, "run");
+            // Xero isn't bound by connection, but its writes still ask in
+            // Desk's words, and its reads run.
+            assert_eq!(decide_with("", "xero.invoices_list").0, "run");
+            assert_eq!(decide_with("", "xero.invoice_create").0, "asks once");
         })
         .await;
     }
@@ -2125,6 +2306,227 @@ mod tests {
         .await;
     }
 
+    /// A force push in a repo of the person's offers its folder for
+    /// commands on their own; "always" keeps that as a level, never a
+    /// grant, and the next one there runs on its own turns only.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_card_lets_an_agent_run_commands_in_a_folder_on_its_own() {
+        with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+            use workforce_core::computer::{ActionKind, Scope};
+            let store = Arc::new(DeskStore::with_pool(pool).await.unwrap());
+            let hub = hub();
+            let home = workforce_agent::tools::paths::resolve_real(hub._dir.path());
+            let repo = home.join("dev/acme-web");
+            std::fs::create_dir_all(repo.join(".git")).unwrap();
+            let gate = HubComputerGate::for_agent_at(
+                Computer::new(Arc::clone(&store)),
+                &hub.config,
+                &hub.subject,
+                home.clone(),
+            );
+            let force = Effect::Exec {
+                command: "git push --force".into(),
+                cwd: Some(repo.clone()),
+            };
+            let asked = Decision {
+                verdict: as_sarah(|| gate.verdict("exec.run", &force)),
+                effect: force.clone(),
+                reach: None,
+            };
+            let card = as_sarah(|| gate.prompt(&asked));
+            assert_eq!(card.allow_scope, Some(ActionKind::Commands));
+            assert_eq!(card.allow_in_folder.as_deref(), Some("~/dev/acme-web"));
+            assert!(card.allow_once && !card.allow_session);
+            assert!(as_sarah(|| gate.keep(&asked, PermissionChoice::AllowSession)).is_err());
+
+            as_sarah(|| gate.keep(&asked, PermissionChoice::AllowInFolder)).unwrap();
+            assert_eq!(
+                store.on_its_own("local", "allan").await.unwrap().scoped,
+                vec![(ActionKind::Commands, Scope::Folder(repo.clone()))]
+            );
+            assert!(store.grants(Some("allan")).await.unwrap().is_empty());
+            assert_eq!(
+                as_sarah(|| gate.verdict("exec.run", &force)),
+                Verdict::Run { by: By::OnItsOwn }
+            );
+            for origin in ["monitor", "webhook", crate::boss_links::wake::ORIGIN] {
+                assert!(
+                    matches!(
+                        from(origin, || gate.verdict("exec.run", &force)),
+                        Verdict::Ask { .. }
+                    ),
+                    "{origin}"
+                );
+            }
+            let elsewhere = Effect::Exec {
+                command: "git -C .. push --force".into(),
+                cwd: Some(repo.clone()),
+            };
+            assert!(matches!(
+                as_sarah(|| gate.verdict("exec.run", &elsewhere)),
+                Verdict::Ask { .. }
+            ));
+        })
+        .await;
+    }
+
+    /// In `origin`'s automated turn, as sarah.
+    fn from<T>(origin: &str, f: impl FnOnce() -> T) -> T {
+        workforce_agent::runner::CURRENT_AUTOMATED_ORIGIN.sync_scope(origin.into(), || as_sarah(f))
+    }
+
+    #[test]
+    fn on_its_own_applies_to_the_persons_turns_and_the_agents_own_jobs_only() {
+        assert!(as_sarah(on_its_own_turn));
+        for own in ["scheduler", "workflow", "workflow-engine", "heartbeat"] {
+            assert!(from(own, on_its_own_turn), "{own}");
+        }
+        for outside in [
+            "monitor",
+            "webhook",
+            "handoff",
+            "workflow-outside",
+            crate::scheduler::ON_BEHALF_ORIGIN,
+            crate::boss_links::wake::ORIGIN,
+            "email",
+            "something-new",
+        ] {
+            assert!(!from(outside, on_its_own_turn), "{outside}");
+        }
+        // The session's own origin counts too: a sub-agent carrying a job's
+        // origin in a monitor's session gets none of it.
+        let in_session = |key: &str, carried: Option<&str>| {
+            sarah_holds();
+            CURRENT_USER_ID.sync_scope("sarah".into(), || {
+                CURRENT_SESSION_KEY.sync_scope(key.into(), || match carried {
+                    Some(origin) => workforce_agent::runner::CURRENT_AUTOMATED_ORIGIN
+                        .sync_scope(origin.into(), on_its_own_turn),
+                    None => on_its_own_turn(),
+                })
+            })
+        };
+        assert!(in_session("scheduler:sarah:D1", None));
+        assert!(in_session("scheduler:sarah:D1", Some("scheduler")));
+        assert!(!in_session("monitor:m1", None));
+        assert!(!in_session("monitor:m1", Some("scheduler")));
+        assert!(!in_session("scheduler:sarah:D1", Some("monitor")));
+        sarah_holds();
+        assert!(!CURRENT_USER_ID.sync_scope("tom".into(), on_its_own_turn));
+    }
+
+    /// A card offers the one host a command reaches; "always" keeps it as
+    /// what the agent does on its own, and the next such call runs, on its
+    /// own turns only, recorded as done on its own.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_card_lets_an_agent_reach_a_host_on_its_own_and_it_sticks() {
+        with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+            use workforce_core::computer::{ActionKind, Level, Scope};
+            let store = Arc::new(DeskStore::with_pool(pool).await.unwrap());
+            let hub = hub();
+            let gate = HubComputerGate::for_agent(
+                Computer::new(Arc::clone(&store)),
+                &hub.config,
+                &hub.subject,
+            );
+            let ssh = Effect::Exec {
+                command: "ssh dev@devbox 'rm -rf build'".into(),
+                cwd: Some(hub.subject.workspace.clone()),
+            };
+            let asked = Decision {
+                verdict: as_sarah(|| gate.verdict("exec.run", &ssh)),
+                effect: ssh.clone(),
+                reach: None,
+            };
+            let card = as_sarah(|| gate.prompt(&asked));
+            assert_eq!(card.allow_in_folder.as_deref(), Some("devbox"));
+            assert_eq!(card.allow_scope, Some(ActionKind::Network));
+            assert!(!card.person_only());
+            assert!(!crate::mcp_gate::offered(
+                &card,
+                PermissionChoice::AllowInFolder
+            ));
+            // A monitor's turn can't raise it.
+            assert!(from("monitor", || gate
+                .keep(&asked, PermissionChoice::AllowInFolder))
+            .is_err());
+            assert!(store
+                .on_its_own("local", "allan")
+                .await
+                .unwrap()
+                .scoped
+                .is_empty());
+
+            as_sarah(|| gate.keep(&asked, PermissionChoice::AllowInFolder)).unwrap();
+            assert_eq!(
+                store.on_its_own("local", "allan").await.unwrap().scoped,
+                vec![(ActionKind::Network, Scope::Host("devbox".into()))]
+            );
+            assert!(store.grants(Some("allan")).await.unwrap().is_empty());
+            let alone = as_sarah(|| gate.verdict("exec.run", &ssh));
+            assert_eq!(alone, Verdict::Run { by: By::OnItsOwn });
+            assert!(matches!(
+                from("monitor", || gate.verdict("exec.run", &ssh)),
+                Verdict::Ask { .. }
+            ));
+            assert!(matches!(
+                as_sarah(|| gate.verdict(
+                    "exec.run",
+                    &Effect::Exec {
+                        command: "ssh prod 'rm -rf build'".into(),
+                        cwd: Some(hub.subject.workspace.clone()),
+                    }
+                )),
+                Verdict::Ask { .. }
+            ));
+
+            as_sarah(|| {
+                gate.record(Record {
+                    tool: "exec.run".into(),
+                    decision: Decision {
+                        verdict: alone.clone(),
+                        effect: ssh.clone(),
+                        reach: None,
+                    },
+                    input: json!({"command": "ssh dev@devbox 'rm -rf build'"}),
+                    outcome: Outcome::Ran,
+                    reason: None,
+                    request_id: None,
+                })
+            });
+            let rows = wait_for(&store, 1).await;
+            assert_eq!(rows[0].activity.decided_by, "on_its_own");
+
+            store
+                .set_on_its_own(
+                    "local",
+                    "allan",
+                    ActionKind::Commands,
+                    &Scope::Whole,
+                    Some(Level::Anywhere),
+                )
+                .await
+                .unwrap();
+            let force = Effect::Exec {
+                command: "git push --force".into(),
+                cwd: Some(hub.subject.workspace.clone()),
+            };
+            assert_eq!(
+                as_sarah(|| gate.verdict("exec.run", &force)),
+                Verdict::Run { by: By::OnItsOwn }
+            );
+            // What stays the person's still asks.
+            let sudo = Effect::Exec {
+                command: "sudo ls".into(),
+                cwd: Some(hub.subject.workspace.clone()),
+            };
+            assert!(matches!(
+                as_sarah(|| gate.verdict("exec.run", &sudo)),
+                Verdict::Ask { .. }
+            ));
+        })
+        .await;
+    }
+
     /// An approved call that would now do something else than the card
     /// showed is refused, not run.
     #[tokio::test(flavor = "multi_thread")]
@@ -2139,37 +2541,93 @@ mod tests {
             ));
             let tools = tools(&hub.subject.workspace);
             let g = gates(Some(Arc::clone(&gate)));
-            let input = json!({"command": "echo hi"});
-            let shown = Decision {
-                effect: Effect::Exec {
-                    command: "echo hi".into(),
-                    cwd: Some(PathBuf::from("/somewhere/else")),
-                },
-                verdict: Verdict::Ask {
-                    choices: vec![],
-                    why: workforce_core::computer::Why::Runs,
-                },
-                reach: None,
-            };
             let access = workforce_agent::tools::access::ToolAccessSnapshot::default();
-            let exec = CURRENT_USER_ID
-                .scope(
-                    "sarah".into(),
-                    workforce_agent::tools::dispatch::execute_approved(
-                        &g,
-                        &policy(),
+            let elsewhere = PathBuf::from("/somewhere/else");
+            let cases = [
+                (
+                    "exec.run",
+                    json!({"command": "echo hi"}),
+                    Effect::Exec {
+                        command: "echo hi".into(),
+                        cwd: Some(elsewhere.clone()),
+                    },
+                ),
+                (
+                    "filesystem.trash",
+                    json!({"paths": ["build"]}),
+                    Effect::Trash {
+                        paths: vec![elsewhere.join("build")],
+                    },
+                ),
+            ];
+            for (tool, input, effect) in cases {
+                let shown = Decision {
+                    effect,
+                    verdict: Verdict::Ask {
+                        choices: vec![],
+                        why: workforce_core::computer::Why::Runs,
+                    },
+                    reach: None,
+                };
+                let exec = CURRENT_USER_ID
+                    .scope(
+                        "sarah".into(),
+                        workforce_agent::tools::dispatch::execute_approved(
+                            &g,
+                            &policy(),
+                            &tools,
+                            &access,
+                            tool,
+                            &input,
+                            Some(&shown),
+                        ),
+                    )
+                    .await;
+                assert_eq!(
+                    exec.deny_reason.as_deref(),
+                    Some(workforce_agent::tools::computer::CHANGED_SINCE_ALLOWED),
+                    "{tool}"
+                );
+            }
+        })
+        .await;
+    }
+
+    /// Act fully in force has no restraints: a job runs what the person
+    /// would be asked about, a program given as text included; at Act it is
+    /// refused with nobody there to ask.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn act_fully_runs_in_a_job_what_an_act_level_agent_is_refused() {
+        with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+            let store = Arc::new(DeskStore::with_pool(pool).await.unwrap());
+            let hub = hub();
+            let tools = tools(&hub.subject.workspace);
+            judge_acts_fully_with(Box::new(|_| true));
+            let input = json!({"command": "python3 -c 'print(1)'"});
+            let act = UNBOUND.replace("level = \"full\"", "level = \"act\"");
+            for (body, runs) in [(UNBOUND, true), (act.as_str(), false)] {
+                std::fs::write(hub.subject.workspace.join("config.toml"), body).unwrap();
+                let gate = HubComputerGate::for_agent(
+                    Computer::new(Arc::clone(&store)),
+                    &hub.config,
+                    &hub.subject,
+                );
+                let decided = as_sarah(|| {
+                    workforce_agent::tools::computer::decide_unattended(
+                        Some(&gate),
                         &tools,
-                        &access,
                         "exec.run",
                         &input,
-                        Some(&shown),
-                    ),
-                )
-                .await;
-            assert_eq!(
-                exec.deny_reason.as_deref(),
-                Some(workforce_agent::tools::computer::CHANGED_SINCE_ALLOWED)
-            );
+                    )
+                })
+                .unwrap();
+                assert_eq!(
+                    matches!(decided.verdict, Verdict::Run { .. }),
+                    runs,
+                    "{body}: {:?}",
+                    decided.verdict
+                );
+            }
         })
         .await;
     }

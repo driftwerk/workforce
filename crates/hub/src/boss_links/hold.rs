@@ -36,7 +36,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use workforce_agent::tools::registry::ToolRegistry;
-use workforce_agent::tools::{SurfaceEffect, Tool, ToolResult};
+use workforce_agent::tools::{Tool, ToolResult};
 
 /// The design's hold list, as tool names: refused in a boss conversation
 /// whatever [`KEPT`] says.
@@ -150,13 +150,7 @@ impl Tool for Held {
         Some(self.why.clone())
     }
 
-    fn surface_effect(&self, input: &serde_json::Value) -> Option<SurfaceEffect> {
-        self.inner.surface_effect(input)
-    }
-
-    fn effect(&self, input: &serde_json::Value) -> workforce_core::computer::Effect {
-        self.inner.effect(input)
-    }
+    workforce_agent::delegate_call_facts!(inner);
 
     async fn collect(
         &self,

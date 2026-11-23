@@ -772,6 +772,14 @@ pub struct MachineSession {
     /// it, or from a Desk that doesn't say.
     #[serde(default)]
     pub boss_has: Option<String>,
+    /// Whether its boss's question answerer there has what it asks; none
+    /// from a Desk that doesn't say.
+    #[serde(default)]
+    pub boss_answers: Option<bool>,
+    /// The grant there that holds it, by its group's key; none while none
+    /// does, or from a Desk that doesn't say.
+    #[serde(default)]
+    pub grant: Option<String>,
     /// How its process last ended on its own; none from a Desk that
     /// doesn't say, or says it in a way this one can't read.
     #[serde(default, deserialize_with = "exited_or_none")]
@@ -837,6 +845,12 @@ pub trait Crew: Send + Sync {
     ) -> Result<String, String> {
         Err("no boss here interrupts sessions".into())
     }
+    /// What closing `v` would leave, `known` with what only the hub reads:
+    /// its folder's uncommitted or unpushed work and its open pull
+    /// requests, as its boss's own close reads them.
+    async fn closing(&self, _v: &SessionView, known: crate::Closing) -> crate::Closing {
+        known
+    }
     /// The agent overseeing the crew, if one does.
     fn overseer(&self) -> Option<Overseer>;
     /// The hub's agents, with the turn each is running.
@@ -854,6 +868,11 @@ pub trait Crew: Send + Sync {
     /// The engine the boss `agent` starts sessions on when nothing says
     /// another (`[oversight.work] engine`), while it oversees.
     fn default_engine(&self, _agent: &str) -> Option<String> {
+        None
+    }
+    /// How many sessions `plan`'s boss runs at once
+    /// (`[oversight.work] parallel`), while it oversees the plan's scope.
+    fn boss_limit(&self, _plan: &crate::plan::Plan) -> Option<usize> {
         None
     }
     /// The start of today, in the person's time.
@@ -959,6 +978,16 @@ pub trait Crew: Send + Sync {
     /// Whether the overseer answers what sessions ask it on Desk's line;
     /// otherwise their questions to it go to the person.
     fn answers_lines(&self) -> bool {
+        false
+    }
+    /// Whether `boss`, a boss served from a grant that runs `session` here,
+    /// takes what that session says on Desk's line now: one relayed from
+    /// the home, while its home reads it under that grant.
+    fn answers_for(&self, _boss: &str, _session: uuid::Uuid) -> bool {
+        false
+    }
+    /// Whether `view`'s boss answers what it asks itself, here.
+    fn answers_itself(&self, _view: &crate::model::SessionView) -> bool {
         false
     }
     /// Gives the agent `agent` a task in its Desk conversation, as you,

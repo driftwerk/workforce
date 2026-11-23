@@ -303,6 +303,25 @@ async fn a_machines_rows_follow_its_grants_and_the_first_restamps_them_once() {
     .await;
 }
 
+/// A boss served from a grant reaches its grant's group, and of it only
+/// the sessions its grant holds.
+#[tokio::test]
+async fn a_served_boss_reaches_only_the_sessions_its_grant_holds() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = engine(pool, dir.path(), true).await;
+        let (held, other) = (Uuid::new_v4(), Uuid::new_v4());
+        put(&d, "g-acme", body(1, "Acme", &[held])).await;
+        let allan = "driftwerk/allan";
+        assert!(d.boss_reaches(allan, Some("g-acme"), None));
+        assert!(d.boss_reaches(allan, Some("g-acme"), Some(held)));
+        assert!(!d.boss_reaches(allan, Some("g-acme"), Some(other)));
+        assert!(!d.boss_reaches(allan, Some("g-globex"), None));
+        assert!(!d.boss_reaches("driftwerk/bob", Some("g-acme"), Some(held)));
+    })
+    .await;
+}
+
 #[tokio::test]
 async fn a_session_named_by_one_grant_is_refused_by_another() {
     with_test_pool(build_pool, |pool| async move {

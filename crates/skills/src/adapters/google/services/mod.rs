@@ -8,7 +8,8 @@ use std::sync::Arc;
 
 use workforce_agent::tools::Tool;
 
-use super::api::GoogleApiContext;
+use super::api::GoogleApis;
+use crate::adapters::utils::WorkspacesTool;
 
 pub mod calendar;
 pub mod chat;
@@ -21,7 +22,7 @@ pub mod slides;
 pub mod tasks;
 
 /// Build the complete tool set for every service the google skill supports.
-pub fn build_all(ctx: Arc<GoogleApiContext>) -> Vec<Arc<dyn Tool>> {
+pub fn build_all(ctx: Arc<GoogleApis>) -> Vec<Arc<dyn Tool>> {
     let mut out: Vec<Arc<dyn Tool>> = Vec::new();
     out.extend(calendar::tools(ctx.clone()));
     out.extend(drive::tools(ctx.clone()));
@@ -31,7 +32,13 @@ pub fn build_all(ctx: Arc<GoogleApiContext>) -> Vec<Arc<dyn Tool>> {
     out.extend(tasks::tools(ctx.clone()));
     out.extend(contacts::tools(ctx.clone()));
     out.extend(chat::tools(ctx.clone()));
-    out.extend(slides::tools(ctx));
+    out.extend(slides::tools(ctx.clone()));
+    out.push(Arc::new(WorkspacesTool::new(
+        "google.workspaces",
+        "The Google accounts you can use, by name, as {workspaces, default}: default is the one a call without `workspace` goes to, or null when you must pass one. Takes no arguments.",
+        ctx,
+        None,
+    )));
     out
 }
 
@@ -64,7 +71,7 @@ mod tests {
         }
     }
 
-    fn context() -> Arc<GoogleApiContext> {
+    fn context() -> Arc<GoogleApis> {
         let creds = OAuthClientCreds {
             client_id: "test".into(),
             client_secret: "test".into(),
@@ -72,9 +79,14 @@ mod tests {
         };
         let http = reqwest::Client::new();
         let tokens = TokenStore::new(Arc::new(NullStore), "default".into(), creds, http.clone());
-        Arc::new(GoogleApiContext::single(Arc::new(GoogleApi::new(
-            http, tokens,
-        ))))
+        Arc::new(GoogleApis::fixed_map(
+            [(
+                "default".to_string(),
+                Arc::new(GoogleApi::new(http, tokens)),
+            )]
+            .into(),
+            "default",
+        ))
     }
 
     #[test]
@@ -120,6 +132,27 @@ mod tests {
         ));
         assert_eq!(effect("google.gmail.search", json!({})), None);
         assert_eq!(effect("google.chat.messages_list", json!({})), None);
+    }
+
+    #[test]
+    fn a_tool_that_returns_what_someone_wrote_says_so() {
+        let tools = build_all(context());
+        let outside: HashSet<&str> = tools
+            .iter()
+            .filter(|t| t.reads_outside_content())
+            .map(|t| t.name())
+            .collect();
+        assert_eq!(
+            outside,
+            HashSet::from_iter(
+                crate::adapters::google::tool_helpers::OUTSIDE_READS
+                    .iter()
+                    .copied()
+            ),
+            "every listed read is a real tool"
+        );
+        assert!(outside.contains("google.calendar.event_get"));
+        assert!(!outside.contains("google.calendar.create"));
     }
 
     /// Regression: the `tool_names()` enumeration on the parent

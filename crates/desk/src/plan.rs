@@ -1144,6 +1144,10 @@ pub struct PlanTicket {
     /// A session or an agent has it.
     #[serde(default)]
     pub assigned: bool,
+    /// The session that has it, by its assignee's id (`machine/id` for one
+    /// on a machine).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session: Option<String>,
     /// The runner is starting a session for it.
     #[serde(default)]
     pub starting: bool,
@@ -1202,17 +1206,48 @@ pub struct Start {
     pub repo: Option<String>,
 }
 
+/// The tickets of the sessions a plan holds, one each in order: every
+/// session its tickets in Doing or Review are on until it is closed or
+/// removed, and every start of one under way or whose outcome isn't known
+/// yet.
+pub fn holding(tickets: &[PlanTicket]) -> Vec<&PlanTicket> {
+    let mut seen = HashSet::new();
+    tickets
+        .iter()
+        .filter(|t| {
+            let on = t.session.as_deref().filter(|_| {
+                t.starting || matches!(t.state, TicketState::Doing | TicketState::Review)
+            });
+            match on {
+                Some(s) => seen.insert(s.to_string()),
+                None => t.starting && seen.insert(t.id.to_string()),
+            }
+        })
+        .collect()
+}
+
+/// How many sessions a plan holds ([`holding`]).
+pub fn held(tickets: &[PlanTicket]) -> usize {
+    holding(tickets).len()
+}
+
+/// How many more sessions `plan` may start now: fewer than its own limit
+/// counts what it `held`, and fewer than its boss's `limit` counts the
+/// boss's sessions starting or working (`busy`).
+pub fn room(plan: &Plan, held: usize, busy: usize, limit: usize) -> usize {
+    plan.limit(limit)
+        .saturating_sub(held)
+        .min(limit.saturating_sub(busy))
+}
+
 /// What the runner starts now for `plan`: its ready tickets in rank order,
-/// while the boss's sessions starting or working (`busy`, counting the
-/// starts under way) are fewer than the plan's limit (the boss's own being
-/// `limit`). None while the plan doesn't run (not approved, paused, done or
-/// dropped), or while `standing`, its group's spend, is at its warning or
-/// over.
+/// at most `room` of them ([`room`]). None while the plan doesn't run (not
+/// approved, paused, done or dropped), or while `standing`, its group's
+/// spend, is at its warning or over.
 pub fn next_starts(
     plan: &Plan,
     tickets: &[PlanTicket],
-    busy: usize,
-    limit: usize,
+    room: usize,
     standing: Option<Status>,
 ) -> Vec<Start> {
     if !plan.runs() {
@@ -1222,7 +1257,6 @@ pub fn next_starts(
         Some(Status::Warn | Status::Over) => return Vec::new(),
         Some(Status::Under) | None => {}
     }
-    let cap = plan.limit(limit);
     let states: HashMap<Uuid, TicketState> = tickets.iter().map(|t| (t.id, t.state)).collect();
     let mut ready: Vec<&PlanTicket> = tickets.iter().filter(|t| startable(t, &states)).collect();
     ready.sort_by(|a, b| a.rank.total_cmp(&b.rank));
@@ -1245,10 +1279,9 @@ pub fn next_starts(
         .filter(|t| t.state == TicketState::Doing || t.starting)
         .flat_map(|t| places(t).into_iter().map(|f| (t.machine.as_deref(), f)))
         .collect();
-    let mut busy = busy;
     let mut out = Vec::new();
     for t in ready {
-        if busy >= cap {
+        if out.len() >= room {
             break;
         }
         let at = places(t);
@@ -1267,7 +1300,6 @@ pub fn next_starts(
             worktree: shared,
             repo: t.repo.clone(),
         });
-        busy += 1;
     }
     out
 }
@@ -1290,6 +1322,9 @@ pub struct Progress {
     pub total: usize,
     /// The tickets that start next as slots free, by key, in order.
     pub next: Vec<String>,
+    /// The tickets of the sessions it holds, one each ([`holding`]), by key.
+    #[serde(default)]
+    pub holding: Vec<String>,
 }
 
 /// Where `tickets`, a plan's, stand.
@@ -1323,7 +1358,19 @@ pub fn progress(tickets: &[PlanTicket]) -> Progress {
     }
     next.sort_by(|a, b| a.rank.total_cmp(&b.rank));
     p.next = next.iter().map(|t| t.name()).collect();
+    p.holding = holding(tickets).iter().map(|t| t.name()).collect();
     p
+}
+
+/// "holds 4 of 4 sessions: DES-1, DES-2, DES-3, DES-4", while `plan` holds
+/// as many sessions as it may run at once (`cap`): it starts no more until
+/// one of them is closed or its ticket moves on.
+pub fn full(p: &Progress, cap: usize) -> Option<String> {
+    let n = p.holding.len();
+    (cap > 0 && n >= cap).then(|| {
+        let sessions = if cap == 1 { "session" } else { "sessions" };
+        format!("holds {n} of {cap} {sessions}: {}", p.holding.join(", "))
+    })
 }
 
 /// Whether every one of a plan's tickets is Done or Dropped: its boss

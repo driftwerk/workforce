@@ -188,7 +188,7 @@ type Q = Query<TokenQuery>;
 
 async fn list(State(s): S, h: HeaderMap, Query(q): Q) -> Response {
     guarded!(s, h, q);
-    Json(s.desk.list()).into_response()
+    Json(s.desk.listed()).into_response()
 }
 
 /// Which spend a route asks for: a period (`day`, `week`, `month`,
@@ -839,6 +839,11 @@ async fn end(State(s): S, h: HeaderMap, Query(q): Q, Path(id): Path<Uuid>) -> Re
         .await
         .map(Json)
         .into_response()
+}
+
+async fn closing(State(s): S, h: HeaderMap, Query(q): Q, Path(id): Path<Uuid>) -> Response {
+    guarded!(s, h, q);
+    s.desk.closing(id).await.map(Json).into_response()
 }
 
 async fn closed(State(s): S, h: HeaderMap, Query(q): Q) -> Response {
@@ -2083,6 +2088,7 @@ pub fn sessions_router(desk: Desk, auth: Arc<dyn Authorize>) -> Router {
         .route("/api/desk/sessions/clear", post(clear))
         .route("/api/desk/sessions/{id}/remove", post(remove))
         .route("/api/desk/sessions/{id}/end", post(end))
+        .route("/api/desk/sessions/{id}/closing", get(closing))
         .route("/api/desk/sessions/{id}/stop", post(stop))
         .route("/api/desk/sessions/{id}/interrupt", post(interrupt))
         .route("/api/desk/sessions/{id}/asked/allow", post(allow_asked))
@@ -3513,6 +3519,7 @@ mod tests {
                     Some(json!({ "transcript": true })),
                 ),
                 ("POST", format!("/api/desk/sessions/{id}/end"), None),
+                ("GET", format!("/api/desk/sessions/{id}/closing"), None),
                 ("DELETE", format!("/api/desk/sessions/{id}"), None),
             ] {
                 let (status, _) = call(&app, method, &uri, body).await;

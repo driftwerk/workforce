@@ -154,6 +154,7 @@ pub async fn deliver_routed_approval(
                 username: None,
                 icon_url: None,
                 blocks: Some(blocks),
+                outside: false,
             })
             .await
         {
@@ -191,6 +192,7 @@ pub async fn deliver_routed_approval(
             username: None,
             icon_url: None,
             blocks: None,
+            outside: false,
         })
         .await
     {
@@ -436,6 +438,7 @@ pub async fn rewrite_all_targets(
             username: None,
             icon_url: None,
             blocks: Some(blocks),
+            outside: false,
         };
         if let Err(e) = surface.update_message(dm, ts, &outbound).await {
             tracing::warn!(error = %e, request = %row.request_id, "failed to rewrite approver DM");
@@ -450,6 +453,7 @@ pub async fn rewrite_all_targets(
             username: None,
             icon_url: None,
             blocks: None,
+            outside: false,
         };
         if let Err(e) = surface.update_message(channel, ts, &outbound).await {
             tracing::warn!(error = %e, "failed to rewrite origin-channel approval notice");
@@ -486,6 +490,7 @@ pub async fn rewrite_single_target(
         username: None,
         icon_url: None,
         blocks: Some(blocks),
+        outside: false,
     };
     if let Err(e) = surface.update_message(dm, ts, &outbound).await {
         tracing::warn!(error = %e, "failed to rewrite loser DM");
@@ -615,6 +620,8 @@ mod tests {
             created_at: now,
             expires_at: now,
             chat: false,
+            origin: None,
+            content_scope: None,
         };
 
         let card = reconstructed_prompt(&service, &row).to_string();
@@ -701,6 +708,8 @@ mod tests {
             approver_user_ids: vec![person.clone()],
             ttl: std::time::Duration::from_secs(3600),
             chat: false,
+            origin: None,
+            content_scope: None,
         };
         store
             .insert_core(
@@ -808,6 +817,8 @@ mod tests {
             approver_user_ids: vec!["bob".to_string()],
             ttl: std::time::Duration::from_secs(3600),
             chat: false,
+            origin: None,
+            content_scope: None,
         };
         store
             .insert_core(

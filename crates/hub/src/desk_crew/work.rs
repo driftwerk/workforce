@@ -280,7 +280,7 @@ impl CrewHub {
     }
 
     /// What the overseer reads of a session's turn ending, in a work turn.
-    pub(crate) fn work_intro(&self, session: Uuid, ended: &[String], o: &Oversight) -> String {
+    pub(crate) fn work_intro(&self, session: &str, ended: &[String], o: &Oversight) -> String {
         let lines: Vec<String> = ended.iter().map(|l| format!("- {l}")).collect();
         let parallel = o.work.parallel;
         format!(

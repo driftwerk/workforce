@@ -80,11 +80,9 @@ async fn hand(
     let Some(boss) = s.desk.boss_of(&s.desk.scope_of_group(group.as_deref())) else {
         // No agent here oversees its group: the boss its group's live grant
         // names (one on another hub, or the home's own of a machine's
-        // sessions) runs it, when the grant holds it.
+        // sessions, Ungrouped's too) runs it, when the grant holds it.
         let none = || DeskError::Conflict("No agent oversees the crew to hand it to.".into());
-        let Some(g) = group else {
-            return none().into_response();
-        };
+        let g = group.unwrap_or_else(|| crate::service::UNGROUPED.to_string());
         let party = match s.desk.grant_boss_for(&g, id) {
             Ok(party) => party,
             Err(None) => return none().into_response(),
@@ -104,7 +102,7 @@ async fn hand(
                 id,
                 &party,
                 How::Handed,
-                &crate::scope::Scope::Group(g.clone()),
+                &crate::grant::scope_of_group(&g),
                 &By::you(),
             )
             .await;

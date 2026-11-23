@@ -25,8 +25,8 @@ use crate::first_run;
 use crate::floor::{Outcome, Scope, Subject, SubjectKey, Turn, TurnLog, TurnOp};
 use crate::holder::{Held, Holder};
 use crate::model::{
-    Approvals, Decision, DeskEvent, Engine, Exited, NewSession, Origin, PendingApproval,
-    SessionPatch, SessionRecord, SessionState, SessionView,
+    Approvals, Decision, DeskEvent, Engine, Exited, ListedSession, NewSession, Origin,
+    PendingApproval, SessionPatch, SessionRecord, SessionState, SessionView,
 };
 use crate::procs;
 use crate::pty::{Exit, Pty};
@@ -82,7 +82,7 @@ mod issues;
 mod lifecycle;
 mod line;
 mod picture;
-pub use lifecycle::{Clearing, Hidden, KeptSession, Removal, Removed};
+pub use lifecycle::{Clearing, Closing, Hidden, KeptSession, Removal, Removed};
 #[cfg(test)]
 mod accounts_tests;
 #[cfg(test)]
@@ -1074,6 +1074,9 @@ enum Persist {
     Terminal(Box<TerminalRecord>),
     DeleteTerminal(Uuid),
     Put(Box<SessionRecord>),
+    /// A session was closed, or runs again when not: its tickets say so
+    /// ([`DeskStore::close_session_tickets`]).
+    Closed(Uuid, bool),
     Attention(Uuid, DateTime<Utc>),
     /// Sessions forgotten with all Activity says of them and how far they
     /// were read, and the CLI sessions of those removed hidden, in one
@@ -2632,6 +2635,13 @@ impl Desk {
             });
         }
         let _ = self.0.persist.send(Persist::Put(Box::new(r)));
+        let closed = view.state == SessionState::Closed;
+        if before
+            .as_ref()
+            .is_none_or(|b| (b.state == SessionState::Closed) != closed)
+        {
+            let _ = self.0.persist.send(Persist::Closed(id, closed));
+        }
         if noticed {
             let _ = self.0.persist.send(Persist::Attention(id, view.updated_at));
         }
@@ -3400,6 +3410,21 @@ impl Desk {
             .get(&id)
             .map(|r| Self::view_of(&st, r))
             .ok_or(DeskError::NotFound)
+    }
+
+    /// [`Self::list`], each saying whether its boss answers what it asks
+    /// itself and which grant holds it: what Desk's list of the sessions
+    /// shows.
+    pub fn listed(&self) -> Vec<ListedSession> {
+        let crew = self.crew();
+        self.list()
+            .into_iter()
+            .map(|view| ListedSession {
+                boss_answers: crew.as_ref().is_some_and(|c| c.answers_itself(&view)),
+                grant: self.grant_group_of(view.id),
+                view,
+            })
+            .collect()
     }
 
     pub fn list(&self) -> Vec<SessionView> {
@@ -8666,6 +8691,10 @@ async fn persist_loop(
                 }
                 put
             }
+            Persist::Closed(id, closed) => store
+                .close_session_tickets(&id.to_string(), closed)
+                .await
+                .map(drop),
             Persist::Attention(id, at) => store.set_attention(id, at).await,
             Persist::Forget {
                 ids,

@@ -8,6 +8,7 @@
 use std::collections::{HashMap, HashSet};
 
 use chrono::{DateTime, Utc};
+use uuid::Uuid;
 
 use crate::crew::{Event, Party, PartyKind};
 use crate::floor::{self, BossView, FloorView, Who};
@@ -388,16 +389,26 @@ impl Desk {
             .map(|b| b.scope)
     }
 
-    /// Whether the boss `agent` may reach what is in `group`: what its scope
-    /// sees, once the hub has said who the bosses are (before, there is one
-    /// scope). One that isn't a boss reaches nothing.
-    pub(crate) fn boss_reaches(&self, agent: &str, group: Option<&str>) -> bool {
-        // A boss served from a grant reaches its live grant's group alone.
+    /// Whether the boss `agent` may reach `session` (when one is named) in
+    /// `group`: what its scope sees, once the hub has said who the bosses
+    /// are (before, there is one scope). One that isn't a boss reaches
+    /// nothing.
+    pub(crate) fn boss_reaches(
+        &self,
+        agent: &str,
+        group: Option<&str>,
+        session: Option<Uuid>,
+    ) -> bool {
+        // A boss served from a grant reaches its live grant's group alone,
+        // Ungrouped's for a row of no group, and only the sessions it holds.
         if crate::grant::is_served(agent) {
-            return group.is_some_and(|g| {
-                self.grant_live(g)
-                    .is_ok_and(|grant| grant.boss.is_some_and(|b| b.party_id() == agent))
-            });
+            return self
+                .grant_live(group.unwrap_or(super::UNGROUPED))
+                .is_ok_and(|grant| {
+                    grant.boss.as_ref().is_some_and(|b| b.party_id() == agent)
+                        && session
+                            .is_none_or(|s| grant.members.contains(&s) || grant.born.contains(&s))
+                });
         }
         let s = self.0.scopes.lock();
         let Some(bosses) = &s.bosses else {

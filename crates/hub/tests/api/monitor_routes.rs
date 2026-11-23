@@ -63,6 +63,7 @@ impl MemberSurface {
             thread_id: None,
             files: vec![],
             bot_id: None,
+            outside: false,
         });
     }
 }
@@ -153,6 +154,7 @@ fn monitor_toml(channel: &str, enabled: bool) -> String {
 struct Fixture {
     state: Arc<GatewayState>,
     alice: Identity,
+    bob: Identity,
     admin: Identity,
     surface: Arc<MemberSurface>,
     sink: Arc<RecordingSink>,
@@ -167,8 +169,10 @@ impl Fixture {
         let identities = SqliteIdentityStore::in_memory().expect("in-memory identity store");
         let alice =
             Identity::new("Alice", IdentityRole::Member).with_linked_id("slack", ALICE_SLACK);
+        let bob = Identity::new("Bob", IdentityRole::Member);
         let admin = Identity::new("Admin", IdentityRole::SystemAdmin);
         identities.create(&alice).unwrap();
+        identities.create(&bob).unwrap();
         identities.create(&admin).unwrap();
         let identity_store: Arc<dyn IdentityStore> = Arc::new(identities);
 
@@ -221,6 +225,7 @@ impl Fixture {
         Self {
             state,
             alice,
+            bob,
             admin,
             surface,
             sink,
@@ -236,6 +241,7 @@ impl Fixture {
     }
 
     /// Fire a request at the gateway router, returning `(status, body text)`.
+    /// A body goes as JSON, which the TOML routes read as plain text.
     async fn send(
         &self,
         method: &str,
@@ -246,7 +252,8 @@ impl Fixture {
         let builder = Request::builder()
             .method(method)
             .uri(path)
-            .header("authorization", format!("Bearer {bearer}"));
+            .header("authorization", format!("Bearer {bearer}"))
+            .header("content-type", "application/json");
         let req = builder
             .body(body.map(Body::from).unwrap_or_else(Body::empty))
             .unwrap();
@@ -272,14 +279,19 @@ impl Fixture {
     /// Seed a revision straight through the definition store, bypassing the
     /// gate — the only way to get a revision bound somewhere alice cannot reach.
     async fn seed_revision(&self, channel: &str) {
-        let toml = monitor_toml(channel, true);
-        let def = MonitorDefinition::from_toml(&toml).unwrap();
-        let owner = self.alice.id.to_string();
+        self.seed(&self.alice, "ops-releases", &monitor_toml(channel, true))
+            .await;
+    }
+
+    /// Save `toml` as `owner`'s monitor `id` straight through the store.
+    async fn seed(&self, owner: &Identity, id: &str, toml: &str) {
+        let def = MonitorDefinition::from_toml(toml).unwrap();
+        let owner = owner.id.to_string();
         self.defs
             .save(
-                "ops-releases",
+                id,
                 KIND_MONITOR,
-                &toml,
+                toml,
                 Some(serde_json::to_value(&def).unwrap()),
                 Some(&owner),
                 workforce_core::access::Visibility::Private,
@@ -489,6 +501,73 @@ async fn restoring_a_revision_bound_elsewhere_is_refused() {
                 .await
                 .is_some_and(|def| def.monitor.binding().is_some_and(|b| b.channel == WATCHED)),
             "a refused restore leaves the stored monitor alone"
+        );
+    })
+    .await;
+}
+
+/// A mail sort rule of alice's, as `email.sort_rule_save` keeps it.
+fn sort_rule_toml() -> String {
+    let rule: workforce_hub::monitor::sort_rule::SortRule =
+        serde_json::from_value(serde_json::json!({
+            "account": "home", "match": {"from": "news@shop.com"}, "then": {"do": "archive"}
+        }))
+        .unwrap();
+    toml::to_string(&rule.monitor("sort-alice")).unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn sort_rules_are_listed_and_changed_only_by_their_owner() {
+    with_fixture(|fx| async move {
+        fx.seed(&fx.alice, "sort-alice", &sort_rule_toml()).await;
+        let listed = |who: &Identity| {
+            let token = fx.token(who);
+            let fx = &fx;
+            async move {
+                let (status, body) = fx
+                    .send("GET", "/api/monitors/sort-rules", &token, None)
+                    .await;
+                assert_eq!(status, StatusCode::OK, "{body}");
+                serde_json::from_str::<serde_json::Value>(&body).unwrap()["rules"]
+                    .as_array()
+                    .unwrap()
+                    .len()
+            }
+        };
+        assert_eq!(listed(&fx.alice).await, 1);
+        assert_eq!(
+            listed(&fx.admin).await,
+            0,
+            "an administrator sees a colleague's monitor, never as their own rule"
+        );
+        assert_eq!(listed(&fx.bob).await, 0);
+
+        let owner = fx.alice.id.to_string();
+        let bob = fx.token(&fx.bob);
+        let (status, body) = fx
+            .send(
+                "PUT",
+                &format!("/api/monitors/sort-alice/enabled?owner={owner}"),
+                &bob,
+                Some(r#"{"enabled":false}"#.to_string()),
+            )
+            .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+        let (status, body) = fx
+            .send(
+                "DELETE",
+                &format!("/api/monitors/sort-alice?owner={owner}"),
+                &bob,
+                None,
+            )
+            .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+        assert!(
+            fx.runtime
+                .stored_definition("sort-alice", Some(&owner))
+                .await
+                .is_some_and(|def| def.monitor.enabled),
+            "another person's refused writes leave the rule alone"
         );
     })
     .await;

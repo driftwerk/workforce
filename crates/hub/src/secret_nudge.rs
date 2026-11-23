@@ -106,6 +106,7 @@ pub async fn post_capture_confirmation(
             username: None,
             icon_url: None,
             blocks: None,
+            outside: false,
         })
         .await;
     if let Err(e) = result {
@@ -160,6 +161,7 @@ pub async fn post_consumed_followup(
             username: None,
             icon_url: None,
             blocks: None,
+            outside: false,
         })
         .await;
     if let Err(e) = result {

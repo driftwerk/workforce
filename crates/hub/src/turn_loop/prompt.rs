@@ -419,6 +419,11 @@ pub(crate) fn format_thread_history(
             ("", markers) => markers.to_string(),
             (text, markers) => format!("{text} {markers}"),
         };
+        let body = if msg.outside && !body.is_empty() {
+            crate::serve::what_a_monitor_saw(&body)
+        } else {
+            body
+        };
         if !body.is_empty() {
             lines.push(format!("{display}: {body}"));
         }

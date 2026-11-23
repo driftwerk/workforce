@@ -22,7 +22,7 @@ use uuid::Uuid;
 use serde_json::Value;
 
 use crate::computer::boss;
-use crate::computer::policy::sends_to_people;
+use crate::computer::policy::always_asks;
 use crate::engine::{Deliver, Engine};
 use crate::model::{text_enum, Origin, PendingApproval, Request, SessionState, SessionView};
 use crate::scope::{sees, Scope};
@@ -799,7 +799,7 @@ pub fn answerable(
         } => {
             let named = format!("{server} · {tool}");
             let dotted = format!("{}.{tool}", server.rsplit('_').next().unwrap_or(server));
-            let sends = sends_to_people(&dotted)
+            let sends = always_asks(&dotted) == Some(workforce_core::computer::Why::SendsToPeople)
                 || ["post", "send", "reply", "invite", "share"]
                     .iter()
                     .any(|w| tool.contains(w));

@@ -836,6 +836,7 @@ impl ExtensionCell {
         &self,
         selector: Option<&str>,
         connector: &str,
+        field: Option<&str>,
     ) -> Result<Value> {
         let Some(hooks) = hooks::hooks() else {
             return Err(eyre!(NO_BROWSER));
@@ -865,12 +866,17 @@ impl ExtensionCell {
                     "Desk's tab isn't on {connector}'s key page, so no key was read."
                 ));
             }
+            // A named field is searched for by its own shape, so an app's
+            // identifier and secret are each found alone.
+            let shape = field
+                .and_then(|f| hooks.key_shape(connector, f))
+                .unwrap_or_else(|| page.shape.as_str().to_string());
             let read = self
                 .ask(
                     "capture_key",
                     // No selector: the extension finds the one element
                     // showing a whole key of this shape itself.
-                    json!({ "selector": selector, "shape": page.shape.as_str(), "origin": page.origin, "paths": keys::paths_at(&page, url) }),
+                    json!({ "selector": selector, "shape": shape, "origin": page.origin, "paths": keys::paths_at(&page, url) }),
                 )
                 .await?;
             let value = read["value"].as_str().unwrap_or_default().to_string();
@@ -887,6 +893,7 @@ impl ExtensionCell {
                     agent: &self.agent,
                     conversation: &conversation,
                     connector,
+                    field,
                     origin: read["origin"].as_str().unwrap_or_default(),
                     path: read["path"].as_str().unwrap_or_default(),
                     key: &value,
