@@ -494,9 +494,32 @@ fn first_read(folder: &TaskFolder, path: &Path) -> Option<Tracked> {
     Some(Tracked::from(path.to_path_buf(), meta.created().ok(), from))
 }
 
+/// Whether the output file at `path` says its command ended.
+fn has_ended(path: &Path) -> bool {
+    read_on(Tracked::from(path.to_path_buf(), None, 0), None)
+        .0
+        .ended
+}
+
+/// The output file open call `c` writes to: the one it was read from
+/// before (`held`) while that hasn't ended, its own not ending while it is
+/// open (one that has was another call's, taken while `c` waited on the
+/// person), else [`call_file`]'s.
+fn call_output_of(
+    c: &OpenCall,
+    claims: &[Claim],
+    folder: &TaskFolder,
+    shells: &[PathBuf],
+    held: Option<Tracked>,
+) -> Option<Tracked> {
+    held.filter(|t| !t.ended)
+        .or_else(|| call_file(c, claims, folder, shells))
+}
+
 /// The output file `call` writes to in `folder`: of the files made since
 /// each open Bash call (`claims`, by id and when it began) began that are
-/// no background shell's (`shells`), each call has the one made nearest
+/// no background shell's (`shells`) and whose command hasn't ended (one
+/// that has is a closed call's), each call has the one made nearest
 /// when it began, the nearest first and none given to two. A sub-agent's
 /// call asked while `call` waits on the person keeps its own file, and
 /// `call` has none until its own is made.
@@ -512,13 +535,16 @@ fn call_file(
             .filter(|(id, _)| *id != call.id)
             .map(|(id, since)| (id.as_str(), *since)),
     );
+    let free: Vec<&(PathBuf, SystemTime)> = folder
+        .born
+        .iter()
+        .filter(|(p, _)| !shells.contains(p) && !has_ended(p))
+        .collect();
     let mut pairs: Vec<(chrono::Duration, &str, &PathBuf)> = calls
         .flat_map(|(id, since)| {
-            folder
-                .born
-                .iter()
+            free.iter()
                 .map(move |(p, made)| (to_utc(*made) - since, id, p))
-                .filter(|(gap, _, p)| *gap >= -sight_procs::SKEW && !shells.contains(p))
+                .filter(|(gap, ..)| *gap >= -sight_procs::SKEW)
         })
         .collect();
     pairs.sort_by_key(|&(gap, id, _)| (gap.abs(), id));
@@ -604,7 +630,7 @@ fn read_files(
         .as_ref()
         .filter(|c| c.tool == SHELL_TOOL)
         .and_then(|c| {
-            let t = held(&c.id).or_else(|| call_file(c, &claims, &folder, &shell_paths))?;
+            let t = call_output_of(c, &claims, &folder, &shell_paths, held(&c.id))?;
             Some((c.id.clone(), t))
         });
     let shells: Vec<Output> = shells
@@ -1605,6 +1631,83 @@ mod tests {
             call_file(&call, &claims, &both, &[]).map(|t| t.path),
             Some(own),
             "its own, made at T2"
+        );
+    }
+
+    #[test]
+    fn a_call_that_waited_reads_its_own_file_not_one_a_closed_sub_agent_call_left() {
+        let dir = tempfile::tempdir().unwrap();
+        let at = |s| SystemTime::UNIX_EPOCH + Duration::from_secs(s);
+        let path = |name: &str| dir.path().join(name);
+        let (sub, own) = (path("s1.output"), path("f1.output"));
+        let call = OpenCall {
+            id: "toolu_main".into(),
+            tool: "Bash".into(),
+            input: String::new(),
+            since: to_utc(at(1000)),
+        };
+        let folder = |born: Vec<(PathBuf, SystemTime)>| TaskFolder {
+            path: dir.path().to_path_buf(),
+            first: at(0),
+            changed: at(0),
+            names: HashSet::new(),
+            born,
+        };
+        let main_only = [("toolu_main".to_string(), call.since)];
+        // T0: it waits on the person. T1: a sub-agent's quick call opens.
+        std::fs::write(&sub, "ok\n").unwrap();
+        let sub_open = folder(vec![(sub.clone(), at(1010))]);
+        let both = [
+            main_only[0].clone(),
+            ("toolu_sub".to_string(), to_utc(at(1010))),
+        ];
+        assert!(call_output_of(&call, &both, &sub_open, &[], None).is_none());
+        // It closes, its file ended: never taken, nor kept where it was.
+        std::fs::write(&sub, "ok\n[exited with code 0]\n").unwrap();
+        assert!(call_output_of(&call, &main_only, &sub_open, &[], None).is_none());
+        let taken = read_on(first_read(&sub_open, &sub).unwrap(), None).0;
+        assert!(taken.ended);
+        assert!(
+            call_output_of(&call, &main_only, &sub_open, &[], Some(taken)).is_none(),
+            "one held that ended is let go"
+        );
+        // T2: approved, its own shell starts and its file is made.
+        let wait = "rbuild: all 3 build slots are busy; waiting for one";
+        std::fs::write(&own, format!("{wait}\n")).unwrap();
+        let made = folder(vec![(sub, at(1010)), (own.clone(), at(1030))]);
+        let t = call_output_of(&call, &main_only, &made, &[], None).unwrap();
+        assert_eq!(t.path, own, "its own file");
+        let (_, new) = read_on(t, Some(redactor_for_tests().as_ref()));
+        let said = sight_procs::said_after(None, &call.id, &new, to_utc(at(1031)), false);
+        assert!(
+            said.is_some_and(|s| s.words.contains("build slot")),
+            "its wait is read"
+        );
+        let shell = |pid, ran| Stat {
+            proc: procs::Proc {
+                pid,
+                ppid: 1,
+                args: "/bin/zsh -c source /h/.claude/shell-snapshots/snapshot-zsh-1.sh && eval 'x'"
+                    .into(),
+            },
+            state: 'S',
+            foreground: false,
+            elapsed_secs: ran,
+            cpu_secs: 0,
+            rss_kb: 1000,
+        };
+        let (s, f) = (shell(110, 25), shell(120, 5));
+        let placed = sight_procs::placed(
+            &[&s, &f],
+            Some(&call),
+            Some(to_utc(at(1030))),
+            &[],
+            to_utc(at(1035)),
+        );
+        assert_eq!(
+            placed.get("toolu_main").map(|p| p.proc.pid),
+            Some(120),
+            "its own shell"
         );
     }
 
