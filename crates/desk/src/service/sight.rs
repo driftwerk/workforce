@@ -543,7 +543,12 @@ fn call_file(
     let free: Vec<&(PathBuf, SystemTime)> = folder
         .born
         .iter()
-        .filter(|(p, made)| to_utc(*made) >= earliest - sight_procs::SKEW && !shells.contains(p))
+        .filter(|(p, made)| {
+            earliest
+                .checked_sub_signed(sight_procs::SKEW)
+                .is_none_or(|from| to_utc(*made) >= from)
+                && !shells.contains(p)
+        })
         .filter(|(p, _)| !has_ended(p))
         .collect();
     let mut pairs: Vec<(chrono::Duration, &str, &PathBuf)> = calls
@@ -672,6 +677,15 @@ fn read_files(
     }
 }
 
+/// How long a process ran, `secs` as `ps` said it: unknown when that is
+/// more than a time can say.
+fn ran_for(secs: u64) -> String {
+    i64::try_from(secs)
+        .ok()
+        .and_then(chrono::Duration::try_seconds)
+        .map_or_else(|| "unknown".to_string(), sight::lasted)
+}
+
 /// `secs` as `ps` says CPU time: "0:03", "2:05:03".
 fn clock(secs: u64) -> String {
     match secs / 3600 {
@@ -715,9 +729,7 @@ fn rows_of(s: &Sample, redactor: Option<&dyn Redactor>) -> (Vec<ProcessRow>, usi
             program: p.proc.program().unwrap_or_default(),
             args: redactor.map(|r| crate::crew::clip(&r.stored(&p.proc.args).text, ARGS_MAX)),
             state: format!("{}{}", p.state, if p.foreground { "+" } else { "" }),
-            ran: sight::lasted(chrono::Duration::seconds(
-                i64::try_from(p.elapsed_secs).unwrap_or(i64::MAX / 2),
-            )),
+            ran: ran_for(p.elapsed_secs),
             cpu: clock(p.cpu_secs),
             cpu_growing: s.cpu_growing.contains(&p.proc.pid),
             rss: format!("{} MB", p.rss_kb / 1024),
@@ -1538,6 +1550,13 @@ mod tests {
         let mut never_placed = vec![("b2".to_string(), read_on(unread(&path), None).0)];
         mark_over(&mut never_placed, &HashMap::new());
         assert!(never_placed[0].1.over, "one never placed goes by its line");
+    }
+
+    #[test]
+    fn a_run_more_than_a_time_can_say_is_unknown() {
+        assert_eq!(ran_for(u64::MAX), "unknown");
+        assert_eq!(ran_for(u64::MAX / 2), "unknown");
+        assert_eq!(ran_for(90), sight::lasted(chrono::Duration::seconds(90)));
     }
 
     #[test]
