@@ -264,6 +264,36 @@ async fn a_served_boss_is_decided_by_its_grant_on_the_engine_that_holds_the_sess
             !text.contains("last_reply") && !text.contains("terminal"),
             "{text}"
         );
+        // What Desk sees inside its own session, at Status: kinds, counts
+        // and durations, never its transcript or logs; another's, nothing.
+        let inside = |id: uuid::Uuid, facet: &str| {
+            serve(
+                &crew,
+                allan(),
+                super::super::inside::NAME,
+                json!({"session_id": id, "facet": facet}),
+            )
+        };
+        let r = inside(mine.id, "glance").await;
+        assert_eq!(r.status, ServedStatus::Ok, "{:?}", r.body);
+        assert_eq!(r.body["sees"], "status");
+        assert_eq!(r.body["glance"]["reading"]["words"], "");
+        assert!(r.body["glance"]["open_call"].is_null());
+        for facet in ["transcript", "logs"] {
+            let r = inside(mine.id, facet).await;
+            assert_eq!(r.status, ServedStatus::Refused);
+            assert!(r.body["error"]
+                .as_str()
+                .unwrap()
+                .contains("shows Status only, not inside"));
+        }
+        let r = inside(mine.id, "processes").await;
+        assert_eq!(r.status, ServedStatus::Ok, "{:?}", r.body);
+        assert!(!r.body.to_string().contains("\"args\":\""), "{:?}", r.body);
+        assert_eq!(
+            inside(other.id, "glance").await.status,
+            ServedStatus::Refused
+        );
 
         // A tool not served, or a session it doesn't run, isn't its to do.
         let r = serve(&crew, allan(), "crew.board", json!({})).await;
