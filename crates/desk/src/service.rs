@@ -3125,25 +3125,13 @@ impl Desk {
         for (id, look) in due {
             let running = Self::running(table, &look);
             let now = Utc::now();
-            let looked = {
-                let st = self.0.state.lock();
+            self.change_unseen(id, |st| {
                 let found = st.sight.get(&id).map(|s| &s.found);
-                st.live
-                    .get(&id)
-                    .map(|l| {
-                        let after = l.background.clone().looked(running, found, now, unseen);
-                        (after, &l.background)
-                    })
-                    .filter(|(after, before)| after != *before)
-                    .map(|(after, _)| after)
-            };
-            if let Some(after) = looked {
-                self.change(id, |_, l| {
-                    if let Some(l) = l {
-                        l.background = after;
-                    }
-                });
-            }
+                if let Some(l) = st.live.get_mut(&id) {
+                    l.background =
+                        std::mem::take(&mut l.background).looked(running, found, now, unseen);
+                }
+            });
         }
     }
 
@@ -3383,8 +3371,17 @@ impl Desk {
         id: Uuid,
         f: impl FnOnce(&mut SessionRecord, Option<&mut Live>),
     ) {
-        let mut guard = self.0.state.lock();
-        let st = &mut *guard;
+        self.change_in(&mut self.0.state.lock(), seen, id, f);
+    }
+
+    /// [`Self::change_since`], with Desk's state already held.
+    fn change_in(
+        &self,
+        st: &mut State,
+        seen: Option<SessionView>,
+        id: Uuid,
+        f: impl FnOnce(&mut SessionRecord, Option<&mut Live>),
+    ) {
         let Some(old) = st.records.get(&id) else {
             return;
         };
@@ -3394,6 +3391,26 @@ impl Desk {
         r.updated_at = Utc::now();
         let r = r.clone();
         self.saved(st, Some(before), r);
+    }
+
+    /// Applies `f` to what Desk keeps of a session beside its record: kept
+    /// as it is while what a Desk sees of the session stays the same (a
+    /// look counting the shells it missed), else saved and announced as any
+    /// change is.
+    fn change_unseen(&self, id: Uuid, f: impl FnOnce(&mut State)) {
+        let mut guard = self.0.state.lock();
+        let st = &mut *guard;
+        let Some(before) = st.records.get(&id).map(|r| Self::view_of(st, r)) else {
+            return;
+        };
+        f(st);
+        if st
+            .records
+            .get(&id)
+            .is_some_and(|r| Self::view_of(st, r) != before)
+        {
+            self.change_in(st, Some(before), id, |_, _| {});
+        }
     }
 
     fn record(&self, id: Uuid) -> Result<SessionRecord, DeskError> {
@@ -10369,6 +10386,79 @@ mod tests {
         )
         .unwrap();
         path
+    }
+
+    #[tokio::test]
+    async fn looks_that_miss_a_reported_shell_say_nothing_until_it_is_taken_to_have_ended() {
+        with_test_pool(build_pool, |pool| async move {
+            let dir = tempfile::tempdir().unwrap();
+            DeskStore::migrate(&pool).await.unwrap();
+            let d = Desk::start(
+                DeskStore::from_pool(pool),
+                Options {
+                    sight: SightOptions {
+                        shell_unseen: Duration::ZERO,
+                        ..SightOptions::default()
+                    },
+                    ..options(dir.path())
+                },
+                Floor::default(),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+            let s = new_session(&d, dir.path()).await;
+            post(
+                &d,
+                s.id,
+                json!({"hook_event_name": "UserPromptSubmit", "prompt": "start the server"}),
+            )
+            .await;
+            post(
+                &d,
+                s.id,
+                json!({"hook_event_name": "Stop", "last_assistant_message": "Started.",
+                "background_tasks": [{"id": "b1", "type": "shell", "status": "running"}]}),
+            )
+            .await;
+            let before = d.view(s.id).unwrap();
+            assert_eq!((before.state, before.waiting_on()), (SessionState::Done, 1));
+            let (_, mut events) = d.subscribe();
+            let said = |events: &mut broadcast::Receiver<DeskEvent>| {
+                std::iter::from_fn(|| events.try_recv().ok())
+                    .filter(|e| matches!(e, DeskEvent::Session { session } if session.id == s.id))
+                    .count()
+            };
+
+            d.look_at_background(&[s.id]).await;
+            assert_eq!(
+                said(&mut events),
+                0,
+                "a look that misses the shell changes nothing a Desk sees"
+            );
+            assert_eq!(
+                d.view(s.id).unwrap(),
+                before,
+                "nor when it was last changed"
+            );
+
+            let mut looks = 1;
+            while d.view(s.id).unwrap().waiting_on() > 0 && looks < 10 {
+                d.look_at_background(&[s.id]).await;
+                looks += 1;
+            }
+            assert_eq!(
+                d.view(s.id).unwrap().waiting_on(),
+                0,
+                "missed look after look, it ended"
+            );
+            assert_eq!(
+                said(&mut events),
+                1,
+                "only the look that took it to have ended said so"
+            );
+        })
+        .await;
     }
 
     #[tokio::test]
