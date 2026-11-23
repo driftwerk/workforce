@@ -5,7 +5,7 @@
 //! overview, the boss and the stall checks read without any I/O of their
 //! own.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::ffi::OsString;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -117,6 +117,9 @@ pub struct Sample {
     folder: Option<Arc<TaskFolder>>,
     call_output: Option<Output>,
     shells: Vec<Output>,
+    /// Its background shells found running in a process of their own
+    /// ([`sight_procs::placed`]).
+    pub found: BTreeSet<String>,
     /// What its open call's and background shells' own output says each
     /// waits on.
     said: Vec<Said>,
@@ -197,8 +200,9 @@ type Output = (String, Tracked);
 #[derive(Debug, Clone, PartialEq)]
 struct Tracked {
     path: PathBuf,
-    /// When it was made: when the command writing it started.
-    made: DateTime<Utc>,
+    /// When it was born, where its system keeps that: when the command
+    /// writing it started.
+    born: Option<DateTime<Utc>>,
     /// Its length then.
     len: u64,
     /// How far its whole lines were read.
@@ -210,10 +214,10 @@ struct Tracked {
 }
 
 impl Tracked {
-    fn from(path: PathBuf, made: SystemTime, read_to: u64) -> Self {
+    fn from(path: PathBuf, born: Option<SystemTime>, read_to: u64) -> Self {
         Self {
             path,
-            made: to_utc(made),
+            born: born.map(to_utc),
             len: read_to,
             read_to,
             lines: Vec::new(),
@@ -448,12 +452,11 @@ fn open_call_in(path: &Path, engine: Engine) -> Option<OpenCall> {
 /// the folder was first listed, from its end when it was there before.
 fn first_read(folder: &TaskFolder, path: &Path) -> Option<Tracked> {
     let meta = plain(path)?;
-    let made = made(&meta)?;
-    let from = match made >= folder.first {
+    let from = match made(&meta)? >= folder.first {
         true => 0,
         false => meta.len(),
     };
-    Some(Tracked::from(path.to_path_buf(), made, from))
+    Some(Tracked::from(path.to_path_buf(), meta.created().ok(), from))
 }
 
 /// The output file `call` writes to in `folder`: the first made since it
@@ -835,18 +838,16 @@ impl Desk {
             Some(_) => now,
             None => last_write.unwrap_or(now),
         };
-        let started = |id: &str| match files.open_call.as_ref().filter(|c| c.id == id) {
-            Some(c) => Some(c.since),
-            None => files
-                .shells
-                .iter()
-                .find(|(shell, _)| shell == id)
-                .map(|(_, t)| t.made),
-        };
+        let born: Vec<(&str, DateTime<Utc>)> = files
+            .shells
+            .iter()
+            .filter_map(|(id, t)| Some((id.as_str(), t.born?)))
+            .collect();
+        let placed = sight_procs::placed(&refs, files.open_call.as_ref(), &born, now);
         let busy = |id: &str| {
-            started(id)
-                .zip(prev)
-                .is_some_and(|(since, p)| sight_procs::shell_busy(&p.runs, &refs, since, now))
+            prev.zip(placed.get(id)).is_some_and(|(p, head)| {
+                sight_procs::active(&p.runs, &sight_procs::subtree(&refs, head))
+            })
         };
         let said: Vec<Said> = files
             .new
@@ -860,6 +861,7 @@ impl Desk {
             tree: &refs,
             open_call: files.open_call.as_ref(),
             said: &said,
+            placed: &placed,
             active_at,
             now,
             poll: chrono::Duration::from_std(self.0.opts.sight.poll).unwrap_or_default(),
@@ -898,6 +900,13 @@ impl Desk {
             }
             _ => now,
         };
+        let found = files
+            .shells
+            .iter()
+            .map(|(id, _)| id)
+            .filter(|id| placed.contains_key(*id))
+            .cloned()
+            .collect();
         let open_call = files.open_call.map(|c| match kept_out {
             true => OpenCall {
                 input: String::new(),
@@ -921,6 +930,7 @@ impl Desk {
             folder: files.folder,
             call_output: files.call_output,
             shells: files.shells,
+            found,
             said,
             output,
             output_at,
@@ -995,7 +1005,7 @@ mod tests {
 
     /// `path` as a file not yet read.
     fn unread(path: &Path) -> Tracked {
-        Tracked::from(path.to_path_buf(), SystemTime::now(), 0)
+        Tracked::from(path.to_path_buf(), Some(SystemTime::now()), 0)
     }
 
     #[test]
@@ -1204,6 +1214,7 @@ mod tests {
             folder: None,
             call_output: None,
             shells: vec![],
+            found: BTreeSet::new(),
             said: vec![],
             output: vec![],
             output_at: now,
