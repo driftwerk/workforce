@@ -635,7 +635,9 @@ mod tests {
         assert!(
             not_shown_line(&NotShown::NothingNew, &t).contains("shown toward this part already")
         );
-        assert!(shows_what(&t.refs, &t.repos).contains("counts once a pull request carries it there"));
+        assert!(
+            shows_what(&t.refs, &t.repos).contains("counts once a pull request carries it there")
+        );
 
         let none = taken(GoalRefs::default());
         assert_eq!(

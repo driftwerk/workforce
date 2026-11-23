@@ -202,10 +202,14 @@ impl DeskStore {
     ) -> Result<T> {
         let client = self.pool().get().await?;
         let row = client
-            .query_opt(&format!("SELECT {column} FROM plans WHERE id = $1"), &[&plan])
+            .query_opt(
+                &format!("SELECT {column} FROM plans WHERE id = $1"),
+                &[&plan],
+            )
             .await?;
         Ok(match row {
-            Some(r) => serde_json::from_value(r.try_get(0)?).with_context(|| format!("a plan's {column}"))?,
+            Some(r) => serde_json::from_value(r.try_get(0)?)
+                .with_context(|| format!("a plan's {column}"))?,
             None => T::default(),
         })
     }

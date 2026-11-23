@@ -219,9 +219,15 @@ async fn goal_capped(
         .await
         .unwrap();
     let id = p.summary.plan.id;
-    d.approve_agreed(id, 1, "keep Mantis CI fast", chrono::Utc::now(), &By::manager("desk", "Desk", "Sam agreed it."))
-        .await
-        .unwrap();
+    d.approve_agreed(
+        id,
+        1,
+        "keep Mantis CI fast",
+        chrono::Utc::now(),
+        &By::manager("desk", "Desk", "Sam agreed it."),
+    )
+    .await
+    .unwrap();
     let s = eventually("its ticket's session", async || {
         let held = d
             .plan(id)
@@ -315,7 +321,11 @@ async fn a_met_reading_closes_the_goal_and_ends_its_plans_watches_without_a_word
             d.ticket(ticket).await.unwrap().ticket.state,
             TicketState::Done
         );
-        assert_eq!(turns_after_met(&llm).await, 1, "one turn once it is met: its closing");
+        assert_eq!(
+            turns_after_met(&llm).await,
+            1,
+            "one turn once it is met: its closing"
+        );
         assert_eq!(asked_with(&llm, CLOSING).await, 1);
         assert!(d
             .store()
@@ -364,7 +374,11 @@ async fn a_goal_met_while_the_person_paused_it_is_closed_once_they_resume_it() {
             (d.plan(id).await.ok()?.summary.plan.state == PlanState::Done).then_some(())
         })
         .await;
-        assert_eq!(turns_after_met(&llm).await, 1, "one turn once it is met: its closing");
+        assert_eq!(
+            turns_after_met(&llm).await,
+            1,
+            "one turn once it is met: its closing"
+        );
         assert_eq!(asked_with(&llm, CLOSING).await, 1);
     })
     .await;
@@ -507,9 +521,18 @@ async fn a_checkpoint_takes_only_the_goals_work_since_it_was_agreed() {
         };
         let commit = json!({ "kind": "commit", "repo": "acme/mantis", "sha": COMMIT });
         for (evidence, refused) in [
-            (commit.clone(), "Commit d05e8a4 of acme/mantis was there before"),
-            (json!({ "kind": "run", "repo": "acme/mantis", "id": 9 }), "Run 9 of acme/mantis was there before"),
-            (json!({ "kind": "pull", "repo": "acme/mantis", "number": 40 }), "PR #40 of acme/mantis was there before"),
+            (
+                commit.clone(),
+                "Commit d05e8a4 of acme/mantis was there before",
+            ),
+            (
+                json!({ "kind": "run", "repo": "acme/mantis", "id": 9 }),
+                "Run 9 of acme/mantis was there before",
+            ),
+            (
+                json!({ "kind": "pull", "repo": "acme/mantis", "number": 40 }),
+                "PR #40 of acme/mantis was there before",
+            ),
         ] {
             let r = checkpoint(evidence).await;
             assert!(!r.success, "{r:?}");
@@ -536,7 +559,10 @@ async fn a_checkpoint_takes_only_the_goals_work_since_it_was_agreed() {
             }]
         );
         let goal = p.goal.expect("its progress");
-        assert!(goal.parts[1].improved_at.is_some_and(|at| at >= before), "its stall starts again");
+        assert!(
+            goal.parts[1].improved_at.is_some_and(|at| at >= before),
+            "its stall starts again"
+        );
         assert!(!goal.parts[0].met, "CI is still stuck");
         assert!(p.summary.plan.met.is_none());
     })

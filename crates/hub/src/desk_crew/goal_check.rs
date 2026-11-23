@@ -274,15 +274,10 @@ fn one_turn(looked: Vec<Looked>) -> Option<(Uuid, Vec<String>)> {
     let first = woken.next()?;
     let mut lines = first.lines;
     for other in woken {
-        lines.extend(
-            other
-                .lines
-                .into_iter()
-                .map(|l| {
-                    let goal = crew::one_line(&other.goal, 80);
-                    format!("On your goal “{goal}” (plan_id {}): {l}", other.plan)
-                }),
-        );
+        lines.extend(other.lines.into_iter().map(|l| {
+            let goal = crew::one_line(&other.goal, 80);
+            format!("On your goal “{goal}” (plan_id {}): {l}", other.plan)
+        }));
     }
     Some((first.plan, lines))
 }
@@ -321,7 +316,10 @@ impl CrewHub {
         }
         let looking = Looking(crew);
         tokio::spawn(async move {
-            if tokio::time::timeout(LOOK_FOR, looking.0.check_goals()).await.is_err() {
+            if tokio::time::timeout(LOOK_FOR, looking.0.check_goals())
+                .await
+                .is_err()
+            {
                 tracing::warn!("a look at the goals took too long; the next starts afresh");
             }
             drop(looking);
@@ -537,7 +535,12 @@ impl CrewHub {
         }
         let refs = GoalRefs::of(r, &readings_of(detail));
         let kept = refs.is_empty()
-            || self.desk.store().goal_heads(id).await.is_ok_and(|h| !h.is_empty())
+            || self
+                .desk
+                .store()
+                .goal_heads(id)
+                .await
+                .is_ok_and(|h| !h.is_empty())
             || !self.keep_heads(service, id, &refs).await.is_empty();
         if kept {
             self.goal_checks.lock().headed.insert(id);
@@ -989,8 +992,14 @@ mod tests {
             lines,
             [
                 "CI is stuck.".to_string(),
-                format!("On your goal “Goal 3” (plan_id {}): Docs are stuck.", Uuid::from_u128(3)),
-                format!("On your goal “Goal 3” (plan_id {}): A message waits.", Uuid::from_u128(3)),
+                format!(
+                    "On your goal “Goal 3” (plan_id {}): Docs are stuck.",
+                    Uuid::from_u128(3)
+                ),
+                format!(
+                    "On your goal “Goal 3” (plan_id {}): A message waits.",
+                    Uuid::from_u128(3)
+                ),
             ]
         );
     }
