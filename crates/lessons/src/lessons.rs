@@ -1738,20 +1738,15 @@ pub struct LessonPipelineConfig<'a> {
 /// flows can never drift. Spawns fire-and-forget tasks for extraction and
 /// reinforcement; returns immediately.
 ///
-/// `archive_base` is the pre-turn session message count — the turn's
-/// new messages start at `session.messages[archive_base..]`.
+/// `turn_messages` are the turn's own messages, as its save kept them.
 pub fn run_post_turn(
     cfg: LessonPipelineConfig<'_>,
     session: &mut workforce_common::session::Session,
-    archive_base: usize,
+    turn_messages: &[SessionMessage],
     user_message: &str,
     agent_response: &str,
 ) {
-    let turn_messages: Vec<SessionMessage> = session
-        .messages
-        .get(archive_base..)
-        .unwrap_or_default()
-        .to_vec();
+    let turn_messages = turn_messages.to_vec();
     let channel = session.channel.clone();
     let session_id = session.id.clone();
 
@@ -1810,7 +1805,10 @@ pub fn run_post_turn(
                 );
             }
         }
-        if let Err(e) = cfg.sessions.save(session) {
+        if let Err(e) = cfg
+            .sessions
+            .save_refreshing_owning(session, &["injected_lessons"])
+        {
             warn!(error = %e, "Failed to clear injected_lessons metadata");
         }
     }

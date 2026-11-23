@@ -961,8 +961,10 @@ impl CrewHub {
         // Every group any agent's config names for a boss is a boundary,
         // whether that config loads, is on, or its agent serves: it stays
         // one until the person takes the boss off it.
-        // In force at once; kept for the next start behind it.
-        if self.desk.bound_groups_now(self.named_on_disk(None)) {
+        // In force at once; kept for the next start behind it. One the
+        // person opened as the configs were read stays open.
+        let read = Utc::now();
+        if self.desk.bound_groups_read(self.named_on_disk(None), read) {
             let desk = self.desk.clone();
             tokio::spawn(async move { desk.keep_boundaries().await });
         }
