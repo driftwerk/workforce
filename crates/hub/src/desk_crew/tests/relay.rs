@@ -1616,6 +1616,257 @@ async fn every_machine_call_is_refused_at_the_served_route() {
     .await;
 }
 
+/// A glance as a machine gives it: waiting on a build slot since `since`,
+/// in its call `toolu_1`.
+fn machine_glance(id: uuid::Uuid, since: chrono::DateTime<chrono::Utc>) -> Value {
+    use workforce_desk::sight::{Glance, Kind, Reading, Wait};
+    let g = Glance {
+        reading: Reading {
+            kind: Kind::Waits(Wait::Queue),
+            words: "waiting for a build slot".into(),
+            since,
+            by: Some("ssh".into()),
+            on: None,
+            pid: Some(4242),
+            call: Some("toolu_1".into()),
+        },
+        open_call: None,
+        transcript: None,
+        cpu_active_at: Some(since),
+        output_at: None,
+        output: None,
+        background: 0,
+        settled: true,
+        since,
+        as_of: Some(chrono::Utc::now()),
+        aged: false,
+        workspace: None,
+        stall: None,
+    };
+    json!({"id": id, "name": "acme-api", "state": "working", "glance": g, "sees": "everything", "pr_ref": null})
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_machine_sessions_inside_is_read_there_judged_here_and_an_older_desk_is_said_once() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (sarah, crew, d, _llm) = overseeing(dir.path(), pool, "ok", SARAH, &[]).await;
+        let remote = uuid::Uuid::new_v4();
+        let old = uuid::Uuid::new_v4();
+        let on = |m: &str, id: uuid::Uuid| format!("session:{m}/{id}");
+        d.change_layout(|l| l.create("acme", "Acme", &[on("devbox", remote), on("oldbox", old)], None))
+            .await
+            .unwrap();
+        eventually("Sarah's tools", async || {
+            sarah.tools.get(super::super::inside::NAME).map(drop)
+        })
+        .await;
+        let inside = |input: Value| run(&sarah, super::super::inside::NAME, input);
+        let session = format!("devbox/{remote}");
+
+        // Desk isn't relaying: said as any relayed call is.
+        let r = inside(json!({"session_id": session})).await;
+        assert!(r.error.unwrap().contains("can't be reached"));
+
+        let since = chrono::Utc::now() - chrono::Duration::hours(3);
+        let seen: Arc<parking_lot::Mutex<Vec<RelayCall>>> = Arc::default();
+        // What was asked of `machine` for crew.inside: the relay carries
+        // other calls on their own times too (its work taken, each minute).
+        let asked_inside = |machine: &str| -> Vec<RelayCall> {
+            seen.lock()
+                .iter()
+                .filter(|c| c.machine == machine && c.tool == super::super::inside::NAME)
+                .cloned()
+                .collect()
+        };
+        let _poller = {
+            let (crew, seen) = (Arc::clone(&crew), Arc::clone(&seen));
+            tokio::spawn(async move {
+                loop {
+                    for c in crew.relay_take(Duration::from_millis(200)).await {
+                        seen.lock().push(c.clone());
+                        let (status, body) = match (c.machine.as_str(), c.tool.as_str()) {
+                            ("oldbox", tool) => (
+                                ServedStatus::Refused,
+                                json!({"error": super::super::served::not_served(tool)}),
+                            ),
+                            (_, "crew.history") => {
+                                (ServedStatus::Ok, json!({"session": "its last reply"}))
+                            }
+                            _ => match c.input["facet"].as_str().unwrap_or("glance") {
+                                "glance" => (ServedStatus::Ok, machine_glance(remote, since)),
+                                _ => (
+                                    ServedStatus::Ok,
+                                    json!({"transcript": {"exchanges": [{"said": "<<<x \"y\""}], "before": null}}),
+                                ),
+                            },
+                        };
+                        assert!(crew.relay_answer(c.id, RelayAnswer { status, body }));
+                    }
+                }
+            })
+        };
+        eventually("Desk polling", async || {
+            crew.relay.polled_ever().then_some(())
+        })
+        .await;
+
+        // Read there, judged here: its wait is the boss's stall.
+        let r = inside(json!({"session_id": session})).await;
+        assert!(r.success, "{r:?}");
+        let said = r.output["glance"].as_str().unwrap();
+        assert!(said.starts_with("<<<EXTERNAL_UNTRUSTED_CONTENT_"), "{said}");
+        assert!(said.contains("Stall: has waited 3 h for a build slot"), "{said}");
+        assert_eq!(
+            asked_inside("devbox").last().unwrap().input["session_id"],
+            json!(remote.to_string())
+        );
+
+        // A page is fenced field by field, and what is fenced is still JSON.
+        let r = inside(json!({"session_id": session, "facet": "transcript"})).await;
+        let fenced = r.output["transcript"].as_str().unwrap();
+        let json = &fenced[fenced.find('{').unwrap()..=fenced.rfind('}').unwrap()];
+        let page: Value = serde_json::from_str(json).unwrap_or_else(|e| panic!("{e}: {fenced}"));
+        assert_eq!(page["exchanges"][0]["said"], "‹‹‹x \"y\"");
+
+        // Its account is its history and its glance, asked at once.
+        let r = run(&sarah, "crew.account", json!({"session_id": session})).await;
+        assert!(r.success, "{r:?}");
+        assert!(r.output["session"].as_str().unwrap().contains("its last reply"), "{r:?}");
+        assert!(r.output["inside"].as_str().unwrap().contains("waiting for a build slot"), "{r:?}");
+
+        // An older Desk: said once, then not asked again for a while.
+        let r = inside(json!({"session_id": format!("oldbox/{old}")})).await;
+        let older = r.error.unwrap();
+        assert!(older.starts_with("oldbox runs an older Desk"), "{older}");
+        let asked = asked_inside("oldbox").len();
+        assert!(asked >= 1, "its refusal came from asking it");
+        let r = inside(json!({"session_id": format!("oldbox/{old}")})).await;
+        assert_eq!(r.error.as_deref(), Some(older.as_str()));
+        assert_eq!(asked_inside("oldbox").len(), asked, "not asked again");
+    })
+    .await;
+}
+
+/// A plan's ticket at work on a machine keeps its plan moving while what
+/// Desk sees of its session there is unknown, past the plan's stall; once
+/// its glance there shows it waiting hours on a build slot, the ticket is
+/// stuck and the person is told the plan's stall once, naming the wait;
+/// once it finishes there, that glance no longer stands.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_machine_ticket_is_busy_while_its_evidence_is_unknown_and_stuck_once_it_shows_a_wait() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (main, _llm) = agent(dir.path(), "desk", "ok").await;
+        write_config(
+            &main,
+            &format!(
+                "{MAIN}[oversight.work]\nstall_minutes = 5\n[oversight.wake]\nquiet_minutes = 40\n"
+            ),
+        );
+        let state = hub(std::slice::from_ref(&main));
+        let d = desk_running(
+            pool,
+            dir.path(),
+            Default::default(),
+            installed_cli(dir.path()),
+            not_installed(dir.path()),
+        )
+        .await;
+        let dm = main
+            .sessions
+            .get_or_create(DESK_CHANNEL, PERSON, "desk")
+            .unwrap();
+        main.sessions.save(&dm).unwrap();
+        let crew = CrewHub::start(state, d.clone(), FAST, CancellationToken::new());
+        // devbox: its sessions, each start made, and their glances there.
+        let listed: Arc<parking_lot::Mutex<Vec<Value>>> = Arc::default();
+        let answered = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let since = chrono::Utc::now() - chrono::Duration::hours(3);
+        let _poller = {
+            let (crew, listed, answered) = (
+                Arc::clone(&crew),
+                Arc::clone(&listed),
+                Arc::clone(&answered),
+            );
+            tokio::spawn(async move {
+                loop {
+                    for c in crew.relay_take(Duration::from_millis(200)).await {
+                        answered.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        let body = match c.tool.as_str() {
+                            "desk.sessions" => Value::Array(listed.lock().clone()),
+                            "desk.session_start" => {
+                                let s = json!({"id": uuid::Uuid::new_v4(), "name": c.input["name"],
+                                               "cwd": c.input["cwd"], "state": "working"});
+                                listed.lock().push(s.clone());
+                                s
+                            }
+                            _ if c.tool == super::super::inside::NAME => {
+                                let glances: Vec<Value> = listed
+                                    .lock()
+                                    .iter()
+                                    .filter_map(|s| s["id"].as_str()?.parse().ok())
+                                    .map(|id| machine_glance(id, since))
+                                    .collect();
+                                json!({ "glances": glances })
+                            }
+                            _ => json!({"done": "read"}),
+                        };
+                        let status = ServedStatus::Ok;
+                        crew.relay_answer(c.id, RelayAnswer { status, body });
+                    }
+                }
+            })
+        };
+        planned_on_devbox(&main, &d, "Speed up recall", "/home/dev/vellev").await;
+        let stalls = || {
+            main.sessions
+                .find(DESK_CHANNEL, PERSON)
+                .unwrap()
+                .map(|s| s.messages)
+                .unwrap_or_default()
+                .iter()
+                .filter(|m| m.content.contains("hasn't moved in"))
+                .map(|m| m.content.clone())
+                .collect::<Vec<_>>()
+        };
+        // Past the plan's stall and short of its session's quiet nothing
+        // is known of it there, so it is at work: the first stall said is
+        // its wait's.
+        let said = eventually("the plan's stall said", async || {
+            let s = stalls();
+            (!s.is_empty()).then_some(s)
+        })
+        .await;
+        assert!(
+            said[0].contains("has waited 3 h for a build slot"),
+            "{said:?}"
+        );
+        let after = answered.load(std::sync::atomic::Ordering::SeqCst);
+        eventually("the plan looked at again", async || {
+            (answered.load(std::sync::atomic::Ordering::SeqCst) >= after + 10).then_some(())
+        })
+        .await;
+        assert_eq!(stalls().len(), 1, "once");
+
+        // Its session there finishes: what was seen inside it as it worked
+        // no longer says what it does.
+        let item = format!("devbox/{}", listed.lock()[0]["id"].as_str().unwrap());
+        let (_, o) = crew.overseer_named("desk").unwrap();
+        assert!(crew.seen_inside(&item, &o).is_some());
+        {
+            let mut l = listed.lock();
+            l[0]["state"] = json!("idle");
+            l[0]["last_reply"] = json!("The tests ran.");
+        }
+        eventually("its glance there let go", async || {
+            crew.seen_inside(&item, &o).is_none().then_some(())
+        })
+        .await;
+    })
+    .await;
+}
+
 /// The main overseer at Act, taking on every session it may.
 const MAIN_ALL: &str = "[oversight]\nenabled = true\nlevel = \"act\"\n\
     [oversight.act]\nnudge = true\nanswer_sessions = true\nhand_out_work = false\n\
@@ -1639,6 +1890,33 @@ async fn the_main_overseer_takes_on_and_works_a_session_the_person_started_on_a_
         .await;
     })
     .await;
+}
+
+/// A dev server under a session reads as the same process however often
+/// the session waits: each wait is told apart by its own call, so a later
+/// one is said again, and the same one, its start read a second off, never.
+#[test]
+fn a_wait_is_keyed_by_its_own_call_not_a_process_that_outlives_it() {
+    use workforce_desk::sight::{Glance, Stall, StallKind};
+    let since = chrono::Utc::now() - chrono::Duration::hours(1);
+    let g: Glance =
+        serde_json::from_value(machine_glance(uuid::Uuid::new_v4(), since)["glance"].clone())
+            .unwrap();
+    let s = Stall {
+        kind: StallKind::Queued,
+        since,
+        words: "has waited 1 h for a build slot".into(),
+    };
+    let key = |g: &Glance, s: &Stall| super::super::inside::evidence_key("devbox/s1", g, s);
+    let mut later = g.clone();
+    later.reading.call = Some("toolu_2".into());
+    assert_eq!(later.reading.pid, g.reading.pid);
+    assert_ne!(key(&g, &s), key(&later, &s));
+    let read_again = Stall {
+        since: since - chrono::Duration::seconds(1),
+        ..s.clone()
+    };
+    assert_eq!(key(&g, &s), key(&g, &read_again));
 }
 
 async fn works_a_machine_session(
@@ -1767,11 +2045,15 @@ async fn works_a_machine_session(
         .charge_of(vel9.id)
         .expect("run there by the Mac's boss");
     assert!(c.live() && c.boss == "home/desk", "{c:?}");
-    let sent = carried.lock().last().cloned().unwrap();
-    assert_eq!(
-        (sent.group.as_str(), sent.tool.as_str()),
-        ("ungrouped", "crew.take_on")
-    );
+    // Its glances there are asked for beside it: the take-on is the one
+    // that says the home's switch.
+    let sent = carried
+        .lock()
+        .iter()
+        .rfind(|c| c.tool == "crew.take_on")
+        .cloned()
+        .expect("its take-on relayed");
+    assert_eq!(sent.group, "ungrouped");
     assert_eq!(
         sent.act["take_on_all"],
         json!(true),

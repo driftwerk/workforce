@@ -188,7 +188,7 @@ impl ToolRegistry {
             None => tool,
         };
         let name = tool.name().to_string();
-        tracing::info!(tool = %name, "Registered tool");
+        tracing::debug!(tool = %name, "Registered tool");
         if let Some(upstream) = &self.upstream {
             upstream.own.write().insert(name.clone());
         }
@@ -220,8 +220,7 @@ impl ToolRegistry {
 
     /// Build a registry from an existing tool set in one shot, logging a single
     /// count rather than a line per tool. For per-request registries assembled
-    /// on a hot path — [`register`](Self::register)'s per-tool line is meant for
-    /// process startup, where it is read once.
+    /// on a hot path.
     pub fn from_tools(tools: impl IntoIterator<Item = Arc<dyn Tool>>) -> Self {
         let registry = Self::new();
         {

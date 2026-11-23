@@ -266,24 +266,6 @@ pub fn resume_arg(args: &str) -> Option<&str> {
         .filter(|w| !w.is_empty() && w.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-'))
 }
 
-/// Seconds a process has run, from `ps -o etime=` (`[[dd-]hh:]mm:ss`).
-pub fn parse_etime(etime: &str) -> Option<u64> {
-    let (days, rest) = match etime.trim().split_once('-') {
-        Some((d, r)) => (d.parse::<u64>().ok()?, r),
-        None => (0, etime.trim()),
-    };
-    let parts: Vec<u64> = rest
-        .split(':')
-        .map(|p| p.parse().ok())
-        .collect::<Option<_>>()?;
-    let secs = match parts[..] {
-        [m, s] => m * 60 + s,
-        [h, m, s] => h * 3600 + m * 60 + s,
-        _ => return None,
-    };
-    Some(days * 86_400 + secs)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -629,14 +611,5 @@ mod tests {
         assert_eq!(resume_arg("/x/codex resume --last"), None);
         assert_eq!(resume_arg("codex --remote unix:///s.sock"), None);
         assert_eq!(resume_arg("codex resume ../../etc"), None);
-    }
-
-    #[test]
-    fn elapsed_times_are_read_in_every_form_ps_prints() {
-        assert_eq!(parse_etime("00:07"), Some(7));
-        assert_eq!(parse_etime("12:07"), Some(727));
-        assert_eq!(parse_etime("01:02:03"), Some(3723));
-        assert_eq!(parse_etime("2-01:02:03"), Some(2 * 86_400 + 3723));
-        assert_eq!(parse_etime("soon"), None);
     }
 }

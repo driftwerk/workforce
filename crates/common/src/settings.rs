@@ -752,6 +752,10 @@ pub struct DeskConfig {
     /// the home. Unset: `~/projects`.
     #[serde(default)]
     pub projects_root: Option<String>,
+    /// Desk's own logs folder, which a session's logs are read from. Unset:
+    /// found beside the hub's folder when the hub is Desk's.
+    #[serde(default)]
+    pub logs_dir: Option<String>,
     /// Where the person's engine accounts' sign-ins are kept (`[desk.accounts]`).
     /// Unset: Desk keeps no accounts, and every session runs on the CLI's
     /// own sign-in on this computer.
@@ -1138,6 +1142,7 @@ impl Default for DeskConfig {
             attachment_retention_days: default_desk_attachment_retention_days(),
             github_client_id: None,
             projects_root: None,
+            logs_dir: None,
             accounts: DeskAccounts::default(),
             agents: true,
             machine: None,
