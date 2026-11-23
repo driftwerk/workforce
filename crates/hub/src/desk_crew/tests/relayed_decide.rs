@@ -159,16 +159,24 @@ async fn a_machine_unbinds_the_homes_boss_only_while_its_home_holds_it_and_takes
         let decision = |v: &Value| v["hookSpecificOutput"]["permissionDecision"].clone();
         let app = super::super::relay::routes(Arc::clone(&crew.state), Arc::clone(&crew));
         let token = crew.state.auth_token.clone();
-        let take = |in_force: bool, level: &'static str| {
+        let take_sent = |in_force: bool, level: &'static str, sent: i64| {
             let (app, token) = (app.clone(), token.clone());
             async move {
                 post(
                     &app,
                     &token,
-                    relayed(TAKE, counted(json!({"inForce": in_force, "sentAt": chrono::Utc::now().timestamp_millis()})), "local:sarah", level),
+                    relayed(
+                        TAKE,
+                        counted(json!({"inForce": in_force, "sentAt": sent})),
+                        "local:sarah",
+                        level,
+                    ),
                 )
                 .await
             }
+        };
+        let take = |in_force: bool, level: &'static str| {
+            take_sent(in_force, level, chrono::Utc::now().timestamp_millis())
         };
         let answer = |id: Value, input: Value| {
             let (app, token) = (app.clone(), token.clone());
@@ -208,7 +216,12 @@ async fn a_machine_unbinds_the_homes_boss_only_while_its_home_holds_it_and_takes
         let out = post(
             &app,
             &token,
-            relayed(TAKE, counted(json!({"inForce": true, "sentAt": chrono::Utc::now().timestamp_millis()})), "local:bob", "full"),
+            relayed(
+                TAKE,
+                counted(json!({"inForce": true, "sentAt": chrono::Utc::now().timestamp_millis()})),
+                "local:bob",
+                "full",
+            ),
         )
         .await;
         assert_eq!(out["status"], "refused", "{out}");
@@ -223,7 +236,12 @@ async fn a_machine_unbinds_the_homes_boss_only_while_its_home_holds_it_and_takes
             let out = post(
                 &app,
                 &token,
-                relayed(TAKE, counted(json!({"inForce": true, "sentAt": sent})), "local:sarah", "full"),
+                relayed(
+                    TAKE,
+                    counted(json!({"inForce": true, "sentAt": sent})),
+                    "local:sarah",
+                    "full",
+                ),
             )
             .await;
             assert_eq!(out["body"]["full"], false, "{out}");
@@ -316,23 +334,13 @@ async fn a_machine_unbinds_the_homes_boss_only_while_its_home_holds_it_and_takes
         // at once, and the request is the person's.
         let asked = ask(&url, "make release");
         let a3 = pending(&d, started, "make release").await;
-        take(false, "full").await;
+        let ended = chrono::Utc::now().timestamp_millis();
+        take_sent(false, "full", ended).await;
         assert!(crew.served_full(SARAH).is_none());
         assert!(!d.boss_unbound(SARAH));
         // A take its home sent before that one, come late, says nothing
         // of now: it doesn't bind it again.
-        let late = post(
-            &app,
-            &token,
-            relayed(
-                TAKE,
-                counted(json!({"inForce": true,
-                               "sentAt": chrono::Utc::now().timestamp_millis() - 1_000})),
-                "local:sarah",
-                "full",
-            ),
-        )
-        .await;
+        let late = take_sent(true, "full", ended - 1).await;
         assert_eq!(late["body"]["decisions"], json!([]), "{late}");
         assert!(crew.served_full(SARAH).is_none(), "{late}");
         waits_on_person(&d, started).await;
@@ -366,9 +374,11 @@ async fn a_machine_unbinds_the_homes_boss_only_while_its_home_holds_it_and_takes
         assert_eq!(out["body"]["full"], true, "{out}");
         assert_eq!(out["body"]["spentUsd"], 0.0, "{out}");
         assert_eq!(out["body"]["countFrom"], json!(from.timestamp_millis()));
-        super::act_fully_budget::spent(&d, started, workforce_desk::ledger::Billing::Key, 30.0).await;
+        super::act_fully_budget::spent(&d, started, workforce_desk::ledger::Billing::Key, 30.0)
+            .await;
         // A plan's use is never real money.
-        super::act_fully_budget::spent(&d, started, workforce_desk::ledger::Billing::Plan, 500.0).await;
+        super::act_fully_budget::spent(&d, started, workforce_desk::ledger::Billing::Plan, 500.0)
+            .await;
         let out = take_at(json!(15.0), Some(from)).await;
         assert_eq!(out["body"]["full"], true, "{out}");
         assert_eq!(out["body"]["spentUsd"], 30.0, "{out}");
@@ -391,7 +401,10 @@ async fn a_machine_unbinds_the_homes_boss_only_while_its_home_holds_it_and_takes
             (json!(0.0), None),
             (Value::Null, Some(from)),
             (json!(-1.0), Some(from)),
-            (json!(0.0), Some(chrono::Utc::now() + chrono::Duration::hours(1))),
+            (
+                json!(0.0),
+                Some(chrono::Utc::now() + chrono::Duration::hours(1)),
+            ),
         ] {
             let out = take_at(elsewhere, from).await;
             assert_eq!(out["body"]["full"], false, "{out}");

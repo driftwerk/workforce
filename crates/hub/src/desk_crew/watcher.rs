@@ -641,10 +641,12 @@ impl CrewHub {
         // to read.
         self.glance_group_machines(overseer, o);
         let seen = self.desk.seen_by(&o.scope);
+        // Before the overview is read: how long each item has been quiet is
+        // judged from when its activity was, not after the read.
+        let now = Utc::now();
         let Ok(overview) = self.desk.overview_for(self, None, Some(&seen)).await else {
             return Vec::new();
         };
-        let now = Utc::now();
         let tz = self.desk.timezone();
         let minute = chrono::Duration::from_std(self.timing.minute).unwrap_or_default();
         let past = |at: Option<chrono::DateTime<Utc>>, minutes: u32| {
