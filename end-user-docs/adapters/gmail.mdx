@@ -240,12 +240,12 @@ Manage filters, send-as aliases, and vacation responses.
 
 ## Multi-account support
 
-Use the `account` parameter to target a specific workspace when you have multiple Google accounts connected.
+Use the `workspace` parameter to target a specific Google account when you have more than one connected. Without it, the call goes to your default account.
 
 **Example:**
 ```json
 {
-  "account": "work",
+  "workspace": "work",
   "q": "from:boss@company.com"
 }
 ```
