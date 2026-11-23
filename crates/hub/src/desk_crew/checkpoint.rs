@@ -1,16 +1,18 @@
 //! A checkpoint toward a judged part is kept only once it shows the goal's
 //! own work moving it on since it was agreed (designs/boss-keeps-goals.md
 //! §7.3): every piece of its evidence found on GitHub as the person, one at
-//! least new for that part, each on the goal's work and done since the goal
+//! least new for that part, each on the goal's work and new since the goal
 //! was agreed or its part's last checkpoint. On the goal's work is a commit
 //! reachable from one of the goal's branches or the head of one of its pull
 //! requests, one of those pull requests or one into or from those branches,
 //! or a run on those branches; a goal that names nothing on GitHub takes a
-//! pull request or run in its tickets' repositories. Since then is a run
-//! made, or a pull request updated, after it, and a commit that comes after
-//! where that branch or pull request stood ([`Heads`], kept when the goal is
-//! first checked and whenever a checkpoint moves it). What it refuses names
-//! what it would take instead.
+//! pull request or run in its tickets' repositories. New is a commit not
+//! already in where its branch or pull request stood then ([`Heads`]): the
+//! commit itself, a run's, or a pull request's head (or the pull request
+//! merged since). Without such a head kept, a commit is new, and a pull
+//! request or run is new when it was opened, merged or made since. Heads
+//! are kept as the goal is checked, and for its part whenever a checkpoint
+//! moves it. What it refuses names what it would take instead.
 
 use std::collections::BTreeSet;
 
@@ -18,7 +20,8 @@ use chrono::{DateTime, Utc};
 use serde_json::{json, Value};
 use uuid::Uuid;
 use workforce_desk::goal::{
-    self, head_key, Evidence, FactKind, Found, GoalRefs, GoalResult, Heads, NotShown, Reading,
+    self, head_for, head_key, part_head_key, Evidence, FactKind, Found, GoalRefs, GoalResult,
+    Heads, NotShown, Reading,
 };
 use workforce_desk::PlanDetail;
 
@@ -53,19 +56,29 @@ fn evidence_words(e: &Evidence) -> String {
 
 /// What a checkpoint toward a goal may show: work on what it names
 /// (`refs`), or in its tickets' repositories (`repos`) when it names
-/// nothing, done since `since`, a commit after where its work stood then
-/// (`heads`).
+/// nothing, new since `since` for judged part `part`, by where its work
+/// stood then (`heads`).
 pub(super) struct Taken {
     pub refs: GoalRefs,
     pub repos: BTreeSet<String>,
     pub since: DateTime<Utc>,
     pub heads: Heads,
+    pub part: u16,
+}
+
+impl Taken {
+    /// Where head `key` stood as this part last moved, when it is kept.
+    fn then(&self, key: &str) -> Option<&str> {
+        head_for(&self.heads, self.part, key)
+    }
 }
 
 /// `repos` in words.
 fn repos_words(repos: &BTreeSet<String>) -> String {
     match repos.is_empty() {
-        true => "none Desk can tell".into(),
+        true => {
+            "which Desk can't tell: none of its tickets names one, and none has a session".into()
+        }
         false => repos.iter().cloned().collect::<Vec<_>>().join(", "),
     }
 }
@@ -151,7 +164,8 @@ impl CrewHub {
     /// goal plan `detail`, its result `r`, moves it on, looked up on GitHub
     /// as the person: its evidence as GitHub names it (each commit by its
     /// whole id), or refused in the boss's words. Taken, where the goal's
-    /// work stands is kept as what the next must come after.
+    /// work stands is kept for that part, as what its next must be new
+    /// against.
     pub(super) async fn checkpoint_shown(
         &self,
         service: &AgentService,
@@ -161,74 +175,102 @@ impl CrewHub {
         evidence: &[Evidence],
     ) -> Result<Vec<Evidence>, String> {
         let plan = &detail.summary.plan;
-        let refs = GoalRefs::of(r, &readings_of(detail));
         let checkpoints: Vec<&goal::Fact> = detail
             .facts
             .iter()
             .filter(|f| f.kind == FactKind::Checkpoint && f.checked && f.part == Some(part))
             .collect();
         let earlier: Vec<&Evidence> = checkpoints.iter().flat_map(|f| &f.evidence).collect();
-        let since = checkpoints
-            .iter()
-            .map(|f| f.at)
-            .max()
-            .or(plan.agreed_at)
-            .unwrap_or(plan.created_at);
-        let heads = match self.desk.store().goal_heads(plan.id).await {
-            Ok(h) if !h.is_empty() || refs.is_empty() => h,
-            _ => self.keep_heads(service, plan.id, &refs).await,
-        };
         let taken = Taken {
+            refs: GoalRefs::of(r, &readings_of(detail)),
             repos: self.work_repos(detail),
-            refs,
-            since,
-            heads,
+            since: checkpoints
+                .iter()
+                .map(|f| f.at)
+                .max()
+                .or(plan.agreed_at)
+                .unwrap_or(plan.created_at),
+            heads: self
+                .desk
+                .store()
+                .goal_heads(plan.id)
+                .await
+                .unwrap_or_default(),
+            part,
         };
         let access = super::goal::access(service);
-        let (found, shown) = self
+        let Shown {
+            found,
+            evidence: shown,
+            heads,
+        } = self
             .as_person(service, found_on_goal(&access, &taken, evidence))
             .await;
         goal::checkpoint_shows(&shown, &found, &earlier)
             .map_err(|why| not_shown_line(&why, &taken))?;
-        if !taken.refs.is_empty() {
-            self.keep_heads(service, plan.id, &taken.refs).await;
-        }
+        let now = self
+            .as_person(service, heads_now(&access, &taken.refs, &Heads::new()))
+            .await;
+        let moved: Heads = heads
+            .into_iter()
+            .chain(now)
+            .map(|(key, sha)| (part_head_key(part, &key), sha))
+            .collect();
+        self.keep_heads(plan.id, &moved, true).await;
         Ok(shown)
     }
 
-    /// Where the work of goal plan `plan`, naming `refs`, stands now on
-    /// GitHub, read as the person and kept with it: none it couldn't read.
-    pub(super) async fn keep_heads(
-        &self,
-        service: &AgentService,
-        plan: Uuid,
-        refs: &GoalRefs,
-    ) -> Heads {
+    /// Where goal plan `plan`'s work, naming `refs`, stood, kept for each
+    /// branch and pull request not kept yet, as read now as the person:
+    /// what was there as it was agreed.
+    pub(super) async fn heads_kept(&self, service: &AgentService, plan: Uuid, refs: &GoalRefs) {
+        let Ok(kept) = self.desk.store().goal_heads(plan).await else {
+            return;
+        };
         let access = super::goal::access(service);
-        let heads = self.as_person(service, heads_now(&access, refs)).await;
-        if !heads.is_empty() {
-            if let Err(e) = self.desk.store().keep_goal_heads(plan, &heads).await {
-                tracing::info!(plan = %plan, error = %e, "where a goal's work stands wasn't kept");
-            }
-        }
-        heads
+        let now = self
+            .as_person(service, heads_now(&access, refs, &kept))
+            .await;
+        self.keep_heads(plan, &now, false).await;
     }
 
-    /// The repositories goal plan `detail`'s tickets' sessions here work
-    /// in: what a goal that names nothing on GitHub takes work from.
+    /// Keeps `heads` with goal plan `plan`'s, over those it names when
+    /// `over`, else only where none is kept.
+    async fn keep_heads(&self, plan: Uuid, heads: &Heads, over: bool) {
+        if heads.is_empty() {
+            return;
+        }
+        if let Err(e) = self.desk.store().keep_goal_heads(plan, heads, over).await {
+            tracing::info!(plan = %plan, error = %e, "where a goal's work stands wasn't kept");
+        }
+    }
+
+    /// The repositories goal plan `detail`'s tickets work in: what a goal
+    /// that names nothing on GitHub takes work from. Each by the one it
+    /// names, else its session's here, else its folder's here.
     pub(super) fn work_repos(&self, detail: &PlanDetail) -> BTreeSet<String> {
         detail
             .tickets
             .iter()
-            .filter_map(|t| t.ticket.ticket.session())
-            .filter_map(|s| self.desk.repo_of_session(s))
+            .filter_map(|t| {
+                t.repo
+                    .as_deref()
+                    .and_then(workforce_desk::charge::repo_name)
+                    .map(|r| r.path)
+                    .or_else(|| self.desk.repo_of_session(t.ticket.ticket.session()?))
+                    .or_else(|| match t.machine {
+                        Some(_) => None,
+                        None => workforce_desk::Desk::repo_of_folder(t.folder.as_deref()?),
+                    })
+            })
             .collect()
     }
 }
 
-/// Where each of `refs`' branches and pull requests stands now, as the
-/// person in scope reads it, by [`head_key`].
-async fn heads_now(access: &GithubAccess<'_>, refs: &GoalRefs) -> Heads {
+/// Where each of `refs`' branches and pull requests not in `kept` stands
+/// now, as the person in scope reads it, by [`head_key`]: none it couldn't
+/// read.
+async fn heads_now(access: &GithubAccess<'_>, refs: &GoalRefs, kept: &Heads) -> Heads {
     let mut asks: Vec<(String, (&str, Value))> = refs
         .branches
         .iter()
@@ -243,6 +285,7 @@ async fn heads_now(access: &GithubAccess<'_>, refs: &GoalRefs) -> Heads {
             let args = json!({ "owner": owner, "repo": name, "number": n });
             Some((head_key(repo, &format!("#{n}")), ("github.get_pull", args)))
         }))
+        .filter(|(key, _)| !kept.contains_key(key))
         .collect();
     asks.sort_by(|a, b| a.0.cmp(&b.0));
     if asks.is_empty() {
@@ -290,15 +333,41 @@ fn fresh(at: &Value, since: DateTime<Utc>) -> bool {
         .is_some_and(|t| t >= since)
 }
 
+/// What a commit is to where its branch or pull request stood, as GitHub's
+/// compare from there to it says: new when not already in it (`ahead`, or
+/// `diverged` after a rebase or a force-push), else there already.
+fn newer(got: Option<&Value>) -> Found {
+    match got.and_then(|g| g["status"].as_str()) {
+        Some("ahead" | "diverged") => Found::OnGoal,
+        Some(_) => Found::Old,
+        None => Found::Missing,
+    }
+}
+
+/// What is found of a checkpoint's evidence: each piece as found, as
+/// GitHub names it, and the heads of its pull requests by [`head_key`].
+struct Shown {
+    found: Vec<Found>,
+    evidence: Vec<Evidence>,
+    heads: Heads,
+}
+
+/// How a piece of evidence on the goal's work is judged new, once its own
+/// reading is in.
+enum Judging {
+    /// Judged already.
+    Found(Found),
+    /// By one compare, from where its work stood to its commit.
+    Compare(Value),
+    /// A commit, by where it is placed.
+    Commit(Placing),
+}
+
 /// What is found of each of `evidence` on GitHub, as the person in scope,
-/// against what goal `t` takes, and the evidence as GitHub names it: two
-/// rounds of reads, what the goal's pull requests and the evidence's own
-/// say, then where each commit is.
-async fn found_on_goal(
-    access: &GithubAccess<'_>,
-    t: &Taken,
-    evidence: &[Evidence],
-) -> (Vec<Found>, Vec<Evidence>) {
+/// against what goal `t` takes: two rounds of reads, what the goal's pull
+/// requests and the evidence's own say, then where each commit is and
+/// whether each is new.
+async fn found_on_goal(access: &GithubAccess<'_>, t: &Taken, evidence: &[Evidence]) -> Shown {
     let pull = |repo: &str, n: u64| {
         goal::github_repo(repo).map(|(owner, name)| {
             (
@@ -332,7 +401,11 @@ async fn found_on_goal(
         .chain(own_calls.iter().flatten().cloned())
         .collect();
     let Ok(answered) = each_as_person(access, calls).await else {
-        return (vec![Found::Missing; evidence.len()], evidence.to_vec());
+        return Shown {
+            found: vec![Found::Missing; evidence.len()],
+            evidence: evidence.to_vec(),
+            heads: Heads::new(),
+        };
     };
     let mut answered = answered.into_iter().map(Result::ok);
     let pulls: Vec<GoalPull> = goal_calls
@@ -351,55 +424,131 @@ async fn found_on_goal(
                 .any(|p| p.repo.eq_ignore_ascii_case(repo) && p.head.as_deref() == Some(b))
     };
     let in_repos = |repo: &str| t.repos.contains(&repo.trim().to_ascii_lowercase());
-    let since = |yes: bool, at: &Value| match (yes, fresh(at, t.since)) {
-        (false, _) => Found::OffGoal,
-        (true, true) => Found::OnGoal,
-        (true, false) => Found::Old,
+    // Where branch `b` of `repo` stood: its own, else that of the goal's
+    // pull request from it.
+    let then_of = |repo: &str, b: &str| {
+        t.then(&head_key(repo, b)).or_else(|| {
+            pulls
+                .iter()
+                .find(|p| p.repo.eq_ignore_ascii_case(repo) && p.head.as_deref() == Some(b))
+                .and_then(|p| t.then(&head_key(repo, &format!("#{}", p.number))))
+        })
     };
-    let commits = commits_placed(access, t, &pulls, evidence).await;
-    let found = evidence
+    let compare = |repo: &str, then: &str, sha: &str| {
+        goal::github_repo(repo)
+            .map(|(owner, name)| json!({ "owner": owner, "repo": name, "base": then, "head": sha }))
+    };
+    // New when its head is past where it stood, else, with none kept, when
+    // `at` is since.
+    let new_by = |repo: &str, then: Option<&str>, sha: Option<&str>, at: &Value| match (
+        then,
+        sha.filter(|s| is_sha(s)),
+    ) {
+        (Some(then), Some(sha)) => {
+            compare(repo, then, sha).map_or(Judging::Found(Found::Missing), Judging::Compare)
+        }
+        (Some(_), None) => Judging::Found(Found::Missing),
+        (None, _) => Judging::Found(match fresh(at, t.since) {
+            true => Found::OnGoal,
+            false => Found::Old,
+        }),
+    };
+    let judging: Vec<Judging> = evidence
         .iter()
-        .zip(own)
-        .zip(&commits)
-        .map(|((e, got), (placed, _))| match (e, got) {
-            (Evidence::Commit { .. }, _) => *placed,
-            (Evidence::Ticket { .. }, _) => Found::OffGoal,
-            (_, None) => Found::Missing,
+        .zip(&own)
+        .map(|(e, got)| match (e, got) {
+            (Evidence::Commit { repo, sha }, _) => commit_placing(t, &pulls, repo, sha),
+            (Evidence::Ticket { .. }, _) => Judging::Found(Found::OffGoal),
+            (_, None) => Judging::Found(Found::Missing),
             (Evidence::Pull { repo, number }, Some(got)) => {
                 let branch = |k: &str| got[k].as_str().is_some_and(|b| on_branch(repo, b));
                 let on = match t.refs.is_empty() {
                     true => in_repos(repo),
                     false => t.refs.names_pull(repo, *number) || branch("head") || branch("base"),
                 };
-                since(on, &got["updated_at"])
+                let then = t
+                    .then(&head_key(repo, &format!("#{number}")))
+                    .or_else(|| then_of(repo, got["head"].as_str()?));
+                match (on, fresh(&got["merged_at"], t.since)) {
+                    (false, _) => Judging::Found(Found::OffGoal),
+                    (true, true) => Judging::Found(Found::OnGoal),
+                    (true, false) => {
+                        new_by(repo, then, got["head_sha"].as_str(), &got["created_at"])
+                    }
+                }
             }
             (Evidence::Run { repo, .. }, Some(got)) => {
+                let run = &got["run"];
+                let branch = run["head_branch"].as_str();
                 let on = match t.refs.is_empty() {
                     true => in_repos(repo),
-                    false => got["run"]["head_branch"]
-                        .as_str()
-                        .is_some_and(|b| on_branch(repo, b)),
+                    false => branch.is_some_and(|b| on_branch(repo, b)),
                 };
-                since(on, &got["run"]["created_at"])
+                match on {
+                    false => Judging::Found(Found::OffGoal),
+                    true => new_by(
+                        repo,
+                        branch.and_then(|b| then_of(repo, b)),
+                        run["head_sha"].as_str(),
+                        &run["created_at"],
+                    ),
+                }
             }
+        })
+        .collect();
+    let calls: Vec<(&str, Value)> = judging
+        .iter()
+        .flat_map(|j| match j {
+            Judging::Found(_) => Vec::new(),
+            Judging::Compare(args) => vec![args.clone()],
+            Judging::Commit(c) => c.compares(),
+        })
+        .map(|args| ("github.compare", args))
+        .collect();
+    let answered = match calls.is_empty() {
+        true => Vec::new(),
+        false => each_as_person(access, calls).await.unwrap_or_default(),
+    };
+    let mut answered = answered.into_iter().map(Result::ok);
+    let judged: Vec<(Found, Option<String>)> = judging
+        .iter()
+        .map(|j| match j {
+            Judging::Found(f) => (*f, None),
+            Judging::Compare(_) => (newer(answered.next().flatten().as_ref()), None),
+            Judging::Commit(c) => c.placed(&mut answered),
+        })
+        .collect();
+    let heads = evidence
+        .iter()
+        .zip(&own)
+        .filter_map(|(e, got)| match (e, got) {
+            (Evidence::Pull { repo, number }, Some(got)) => {
+                let sha = got["head_sha"].as_str().filter(|s| is_sha(s))?;
+                Some((head_key(repo, &format!("#{number}")), sha.to_string()))
+            }
+            _ => None,
         })
         .collect();
     let shown = evidence
         .iter()
-        .zip(commits)
+        .zip(&judged)
         .map(|(e, (_, whole))| match (e, whole) {
             (Evidence::Commit { repo, .. }, Some(sha)) => Evidence::Commit {
                 repo: repo.clone(),
-                sha,
+                sha: sha.clone(),
             },
             (e, _) => e.clone(),
         })
         .collect();
-    (found, shown)
+    Shown {
+        found: judged.into_iter().map(|(f, _)| f).collect(),
+        evidence: shown,
+        heads,
+    }
 }
 
 /// One branch or pull request head a commit is placed by: where it stands
-/// now, and where it stood when the goal last moved.
+/// now, and where it stood as the part last moved, when that is kept.
 struct Target {
     now: String,
     then: Option<String>,
@@ -414,132 +563,136 @@ struct Placing {
     unplain: bool,
 }
 
-/// Where each commit of `evidence` is, by the goal's branches and the
-/// heads of its pull requests (`pulls`), in one round of reads, with its
-/// whole id: reachable from one of them now, and after where it stood when
-/// the goal last moved. A goal that names nothing places no commit.
-async fn commits_placed(
-    access: &GithubAccess<'_>,
-    t: &Taken,
-    pulls: &[GoalPull],
-    evidence: &[Evidence],
-) -> Vec<(Found, Option<String>)> {
-    let targets = |repo: &str| -> (Vec<Target>, bool) {
-        let branches: Vec<&str> = t.refs.branches_of(repo).collect();
-        let unplain = branches.iter().any(|b| !plain_ref(b));
-        let then = |key: String| t.heads.get(&key).cloned();
-        let targets = branches
-            .into_iter()
-            .filter(|b| plain_ref(b))
-            .map(|b| Target {
-                now: b.to_string(),
-                then: then(head_key(repo, b)),
-            })
-            .chain(
-                pulls
-                    .iter()
-                    .filter(|p| p.repo.eq_ignore_ascii_case(repo))
-                    .filter_map(|p| {
-                        Some(Target {
-                            now: p.head_sha.clone()?,
-                            then: then(head_key(repo, &format!("#{}", p.number))),
-                        })
-                    }),
-            )
-            .collect();
-        (targets, unplain)
+/// Where commit `sha` of `repo` is placed by, on goal `t`'s branches and
+/// the heads of its pull requests (`pulls`). A goal that names nothing
+/// places no commit: it is Unplaced in its repositories, else off them.
+fn commit_placing(t: &Taken, pulls: &[GoalPull], repo: &str, sha: &str) -> Judging {
+    if !is_sha(sha) {
+        return Judging::Found(Found::Missing);
+    }
+    if t.refs.is_empty() {
+        return Judging::Found(match t.repos.contains(&repo.trim().to_ascii_lowercase()) {
+            true => Found::Unplaced,
+            false => Found::OffGoal,
+        });
+    }
+    let Some((owner, name)) = goal::github_repo(repo) else {
+        return Judging::Found(Found::Missing);
     };
-    let placing: Vec<Option<Placing>> = evidence
+    let branches: Vec<&str> = t.refs.branches_of(repo).collect();
+    let then = |key: String| t.then(&key).map(str::to_string);
+    let targets = branches
         .iter()
-        .map(|e| match e {
-            Evidence::Commit { repo, sha } if is_sha(sha) && !t.refs.is_empty() => {
-                let (owner, name) = goal::github_repo(repo)?;
-                let (targets, unplain) = targets(repo);
-                Some(Placing {
-                    args: json!({ "owner": owner, "repo": name }),
-                    sha: sha.clone(),
-                    targets,
-                    unplain,
-                })
-            }
-            _ => None,
+        .filter(|b| plain_ref(b))
+        .map(|b| Target {
+            now: b.to_string(),
+            then: then(head_key(repo, b)),
         })
-        .collect();
-    let compare = |c: &Placing, base: &str, head: &str| {
-        let mut args = c.args.clone();
-        args["base"] = json!(base);
-        args["head"] = json!(head);
-        ("github.compare", args)
-    };
-    let calls: Vec<(&str, Value)> = placing
-        .iter()
-        .flatten()
-        .flat_map(|c| {
-            c.targets.iter().flat_map(move |g| {
-                std::iter::once(compare(c, &c.sha, &g.now))
-                    .chain(g.then.as_deref().map(|then| compare(c, then, &c.sha)))
-            })
-        })
-        .collect();
-    let answered = match calls.is_empty() {
-        true => Vec::new(),
-        false => each_as_person(access, calls).await.unwrap_or_default(),
-    };
-    let mut answered = answered.into_iter().map(Result::ok);
-    let status = |g: &Option<Value>, of: &[&str]| {
-        g.as_ref()
-            .and_then(|g| g["status"].as_str())
-            .is_some_and(|s| of.contains(&s))
-    };
-    evidence
-        .iter()
-        .zip(&placing)
-        .map(|(e, placing)| match (e, placing) {
-            (Evidence::Commit { repo, sha }, None) if is_sha(sha) && t.refs.is_empty() => {
-                match t.repos.contains(&repo.trim().to_ascii_lowercase()) {
-                    true => (Found::Unplaced, None),
-                    false => (Found::OffGoal, None),
-                }
-            }
-            (Evidence::Commit { .. }, None) => (Found::Missing, None),
-            (_, None) => (Found::OffGoal, None),
-            (_, Some(c)) => {
-                let read: Vec<(Option<Value>, Option<Option<Value>>)> = c
-                    .targets
-                    .iter()
-                    .map(|g| {
-                        let on = answered.next().flatten();
-                        (on, g.then.as_ref().map(|_| answered.next().flatten()))
+        .chain(
+            pulls
+                .iter()
+                .filter(|p| p.repo.eq_ignore_ascii_case(repo))
+                .filter_map(|p| {
+                    Some(Target {
+                        now: p.head_sha.clone()?,
+                        then: then(head_key(repo, &format!("#{}", p.number))),
                     })
-                    .collect();
-                let whole = read
-                    .iter()
-                    .filter_map(|(on, _)| on.as_ref()?["base_sha"].as_str())
-                    .find(|s| is_sha(s))
+                }),
+        )
+        .collect();
+    Judging::Commit(Placing {
+        args: json!({ "owner": owner, "repo": name }),
+        sha: sha.to_string(),
+        targets,
+        unplain: branches.iter().any(|b| !plain_ref(b)),
+    })
+}
+
+/// How a commit stands to one of its targets.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Reach {
+    /// Unanswered.
+    Unread,
+    /// Not reachable from it.
+    Off,
+    /// Reachable from it, and new against where it stood (or none kept).
+    New,
+    /// Reachable from it, but there already as the part last moved.
+    Old,
+    /// Reachable from it; whether it is new couldn't be read.
+    Unknown,
+}
+
+impl Placing {
+    /// The compares that place it, in order: whether each target reaches
+    /// it, then, where that target's head is kept, whether it is new.
+    fn compares(&self) -> Vec<Value> {
+        let compare = |base: &str, head: &str| {
+            let mut args = self.args.clone();
+            args["base"] = json!(base);
+            args["head"] = json!(head);
+            args
+        };
+        self.targets
+            .iter()
+            .flat_map(|g| {
+                std::iter::once(compare(&self.sha, &g.now))
+                    .chain(g.then.as_deref().map(|then| compare(then, &self.sha)))
+            })
+            .collect()
+    }
+
+    /// Where it is, from the answers to [`Self::compares`] (taken from
+    /// `answered` in order), and its whole id.
+    fn placed(
+        &self,
+        answered: &mut impl Iterator<Item = Option<Value>>,
+    ) -> (Found, Option<String>) {
+        let read: Vec<(Reach, Option<String>)> = self
+            .targets
+            .iter()
+            .map(|g| {
+                let on = answered.next().flatten();
+                let after = g.then.as_ref().map(|_| answered.next().flatten());
+                let Some(on) = on else {
+                    return (Reach::Unread, None);
+                };
+                let whole = on["base_sha"]
+                    .as_str()
+                    .filter(|s| is_sha(s))
                     .map(str::to_string);
-                let reached = |(on, _): &&(Option<Value>, Option<Option<Value>>)| {
-                    status(on, &["ahead", "identical"])
+                let reach = match (on["status"].as_str(), after) {
+                    (Some("ahead" | "identical"), None) => Reach::New,
+                    (Some("ahead" | "identical"), Some(after)) => match newer(after.as_ref()) {
+                        Found::OnGoal => Reach::New,
+                        Found::Old => Reach::Old,
+                        _ => Reach::Unknown,
+                    },
+                    _ => Reach::Off,
                 };
-                let since = |(_, after): &&(Option<Value>, Option<Option<Value>>)| {
-                    after.as_ref().is_some_and(|a| status(a, &["ahead"]))
-                };
-                let found = match (
-                    read.iter().filter(reached).any(|r| since(&r)),
-                    read.iter().any(|r| reached(&r)),
-                    read.iter().any(|(on, _)| on.is_some()),
-                    c.targets.is_empty(),
-                ) {
-                    (true, ..) => Found::OnGoal,
-                    (false, true, ..) => Found::Old,
-                    (false, false, true, _) => Found::OffGoal,
-                    (false, false, false, true) if c.unplain => Found::Unplaced,
-                    (false, false, false, true) => Found::OffGoal,
-                    (false, false, false, false) => Found::Missing,
-                };
-                (found, whole)
-            }
-        })
-        .collect()
+                (reach, whole)
+            })
+            .collect();
+        let whole = read.iter().find_map(|(_, w)| w.clone());
+        let reach: Vec<Reach> = read.into_iter().map(|(r, _)| r).collect();
+        let found = [
+            (Reach::New, Found::OnGoal),
+            (Reach::Old, Found::Old),
+            (Reach::Unknown, Found::Missing),
+            (Reach::Off, Found::OffGoal),
+        ]
+        .into_iter()
+        .find(|(r, _)| reach.contains(r))
+        .map_or(
+            match (reach.is_empty(), self.unplain) {
+                (true, true) => Found::Unplaced,
+                (true, false) => Found::OffGoal,
+                (false, _) => Found::Missing,
+            },
+            |(_, f)| f,
+        );
+        (found, whole)
+    }
 }
 
 #[cfg(test)]
@@ -601,6 +754,7 @@ mod tests {
             repos: BTreeSet::from(["acme/mantis".to_string()]),
             since: Utc::now(),
             heads: Heads::new(),
+            part: 1,
         }
     }
 
@@ -649,6 +803,16 @@ mod tests {
             .starts_with("PR #40 of acme/mantis isn't in the plan's repositories (acme/mantis)"));
         assert!(not_shown_line(&NotShown::Unplaced(commit), &none)
             .contains("as the goal names no branch: cite the pull request"));
+        let unknown = Taken {
+            repos: BTreeSet::new(),
+            ..taken(GoalRefs::default())
+        };
+        let line = not_shown_line(&NotShown::Nothing, &unknown);
+        assert!(
+            line.contains("(which Desk can't tell: none of its tickets names one"),
+            "{line}"
+        );
+        assert!(!line.contains("()"), "{line}");
     }
 
     #[test]
@@ -658,5 +822,59 @@ mod tests {
         assert!(fresh(&at(1), since) && fresh(&at(0), since));
         assert!(!fresh(&at(-1), since));
         assert!(!fresh(&Value::Null, since), "no time is no proof");
+    }
+
+    #[test]
+    fn a_commit_is_new_unless_it_was_there_already() {
+        let status = |s: &str| Some(json!({ "status": s }));
+        for (s, found) in [
+            ("ahead", Found::OnGoal),
+            ("diverged", Found::OnGoal),
+            ("behind", Found::Old),
+            ("identical", Found::Old),
+        ] {
+            assert_eq!(newer(status(s).as_ref()), found, "{s}");
+        }
+        assert_eq!(newer(None), Found::Missing);
+
+        let placing = |then: Option<&str>| Placing {
+            args: json!({ "owner": "acme", "repo": "mantis" }),
+            sha: "d05e8a4".into(),
+            targets: vec![Target {
+                now: "main".into(),
+                then: then.map(str::to_string),
+            }],
+            unplain: false,
+        };
+        let whole = format!("d05e8a4{}", "0".repeat(33));
+        let on = |s: &str| Some(json!({ "status": s, "base_sha": whole }));
+        let placed = |p: &Placing, answers: Vec<Option<Value>>| p.placed(&mut answers.into_iter());
+        let kept = placing(Some(&"a".repeat(40)));
+        assert_eq!(kept.compares().len(), 2, "reached, then new");
+        for (after, found) in [
+            ("ahead", Found::OnGoal),
+            ("diverged", Found::OnGoal),
+            ("behind", Found::Old),
+            ("identical", Found::Old),
+        ] {
+            assert_eq!(
+                placed(&kept, vec![on("ahead"), status(after)]),
+                (found, Some(whole.clone())),
+                "{after}"
+            );
+        }
+        assert_eq!(placed(&kept, vec![on("ahead"), None]).0, Found::Missing);
+        assert_eq!(
+            placed(&kept, vec![on("diverged"), status("ahead")]).0,
+            Found::OffGoal
+        );
+        assert_eq!(placed(&kept, vec![None, None]).0, Found::Missing);
+        let none_kept = placing(None);
+        assert_eq!(none_kept.compares().len(), 1);
+        assert_eq!(
+            placed(&none_kept, vec![on("identical")]).0,
+            Found::OnGoal,
+            "with no head kept, it is new"
+        );
     }
 }

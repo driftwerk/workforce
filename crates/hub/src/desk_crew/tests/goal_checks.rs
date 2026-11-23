@@ -29,12 +29,12 @@ pub(super) fn checking(minutes: u32) -> String {
 pub(super) const STALLED: &str = "No progress toward";
 
 /// GitHub as the person's key reads it: acme/mantis's main has three
-/// finished runs of CI since `from`, each job of each taking `minutes`,
-/// and pull request #40 into main, last updated at `from`. Commit
-/// [`COMMIT`] is `compared` to main: "ahead" (on it, and after where main
-/// stood as the goal was agreed, [`MAIN_HEAD`]), "old" (on it, but there
-/// already then) or another status (off it). Runs answer `status` (an error
-/// from 400).
+/// finished runs of CI since `from` on main as it stands ([`MAIN_HEAD`]),
+/// each job of each taking `minutes`, and pull request #40 into main, opened
+/// at `from` and commented on just now. Commit [`COMMIT`] is `compared` to
+/// main: "ahead" (on it, and after where main stood as the goal was agreed,
+/// [`MAIN_HEAD`]), "old" (on it, but there already then) or another status
+/// (off it). Runs answer `status` (an error from 400).
 pub(super) async fn mantis(
     from: chrono::DateTime<chrono::Utc>,
     minutes: i64,
@@ -92,15 +92,16 @@ async fn mantis_reads(
     Mock::given(method("GET"))
         .and(path_regex(r"^/repos/acme/mantis/actions/runs/[0-9]+$"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "id": 9, "name": "CI", "head_branch": "main", "status": "completed",
+            "id": 9, "name": "CI", "head_branch": "main", "head_sha": MAIN_HEAD, "status": "completed",
             "conclusion": conclusion, "created_at": stamp(0), "updated_at": stamp(minutes) })))
         .mount(gh)
         .await;
     Mock::given(method("GET"))
         .and(path("/repos/acme/mantis/pulls/40"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "number": 40, "state": "open", "merged": false, "updated_at": stamp(0),
-            "head": { "ref": "fix/cache", "sha": "b".repeat(40) }, "base": { "ref": "main" } })))
+            "number": 40, "state": "open", "merged": false, "merged_at": null,
+            "created_at": stamp(0), "updated_at": chrono::Utc::now().to_rfc3339(),
+            "head": { "ref": "fix/cache", "sha": PULL_HEAD }, "base": { "ref": "main" } })))
         .mount(gh)
         .await;
     let (on, after) = match compared {
@@ -119,6 +120,7 @@ async fn mantis_reads(
         compare("main", "main", "identical", MAIN_HEAD),
         compare(COMMIT, "main", on, &whole),
         compare(MAIN_HEAD, COMMIT, after, MAIN_HEAD),
+        compare(MAIN_HEAD, MAIN_HEAD, "identical", MAIN_HEAD),
     ] {
         m.mount(gh).await;
     }
@@ -128,6 +130,8 @@ async fn mantis_reads(
 pub(super) const COMMIT: &str = "d05e8a4c0ffee";
 /// Where acme/mantis's main stood as the goal was agreed.
 const MAIN_HEAD: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+/// Pull request #40's head.
+const PULL_HEAD: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 
 /// Each CI job on acme/mantis's main at most 5 minutes, three runs in a
 /// row, and, when `judged`, only the services a change touches tested.
@@ -498,8 +502,9 @@ async fn a_checkpoint_takes_only_the_goals_work_since_it_was_agreed() {
     with_test_pool(workforce_desk::store::build_pool, |pool| async move {
         let dir = tempfile::tempdir().unwrap();
         let base = std::fs::canonicalize(dir.path()).unwrap();
-        // The runs and the pull request are from before the goal; the
-        // commit was on main already as it was agreed.
+        // The commit was on main already as the goal was agreed, the run is
+        // a cron's on main as it stood, and the pull request, opened before
+        // and with no head kept, was only commented on since.
         let from = chrono::Utc::now() - chrono::Duration::hours(3);
         let gh = mantis(from, 22, "old").await;
         let (overseer, _, d, _) = boss_on(&base, pool, &checking(1440), &gh).await;
@@ -565,6 +570,57 @@ async fn a_checkpoint_takes_only_the_goals_work_since_it_was_agreed() {
         );
         assert!(!goal.parts[0].met, "CI is still stuck");
         assert!(p.summary.plan.met.is_none());
+        let heads = d.store().goal_heads(id).await.unwrap();
+        let part = workforce_desk::goal::part_head_key(1, &main);
+        assert_eq!(heads.get(&part).map(String::as_str), Some(MAIN_HEAD), "{heads:?}");
+        assert_eq!(heads.get(&main).map(String::as_str), Some(MAIN_HEAD), "as agreed, kept");
+
+        // The pull request's head moved on (rebased) since where it was
+        // kept, and a run is on main past where the last checkpoint left
+        // it: both new, however long ago each was opened or made.
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+        let pull = workforce_desk::goal::head_key("acme/mantis", "#40");
+        let kept = workforce_desk::goal::Heads::from([(pull.clone(), "e".repeat(40))]);
+        d.store().keep_goal_heads(id, &kept, false).await.unwrap();
+        let run_head = "c".repeat(40);
+        for (base, head) in [
+            ("e".repeat(40), PULL_HEAD.to_string()),
+            (MAIN_HEAD.to_string(), run_head.clone()),
+        ] {
+            Mock::given(method("GET"))
+                .and(path(format!("/repos/acme/mantis/compare/{base}...{head}")))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "status": "diverged", "base_commit": { "sha": base }, "files": [] })))
+                .mount(&gh)
+                .await;
+        }
+        Mock::given(method("GET"))
+            .and(path("/repos/acme/mantis/actions/runs/10"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": 10, "name": "CI", "head_branch": "main", "head_sha": run_head,
+                "status": "completed", "conclusion": "failure", "created_at": from.to_rfc3339() })))
+            .with_priority(1)
+            .mount(&gh)
+            .await;
+        let r = run(
+            &overseer,
+            "crew.plan_update",
+            json!({ "plan_id": id.to_string(), "why": "Showing more",
+                    "checkpoint": { "part": 2, "said": "Only web's tests ran",
+                                    "evidence": [{ "kind": "pull", "repo": "acme/mantis", "number": 40 },
+                                                 { "kind": "run", "repo": "acme/mantis", "id": 10 }] } }),
+        )
+        .await;
+        assert!(r.success, "{r:?}");
+        let heads = d.store().goal_heads(id).await.unwrap();
+        assert_eq!(
+            heads
+                .get(&workforce_desk::goal::part_head_key(1, &pull))
+                .map(String::as_str),
+            Some(PULL_HEAD),
+            "{heads:?}"
+        );
     })
     .await;
 }

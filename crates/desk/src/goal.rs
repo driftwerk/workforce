@@ -728,14 +728,31 @@ impl GoalSaid {
     }
 }
 
-/// Where each of a goal's branches and pull requests stood, by
-/// [`head_key`]: what a commit shown toward it must come after.
+/// Where each of a goal's branches and pull requests stood as it was
+/// agreed, by [`head_key`], and as each judged part's last checkpoint left
+/// it, by [`part_head_key`]: what work shown toward that part must come
+/// after.
 pub type Heads = BTreeMap<String, String>;
 
 /// What a head of branch `branch` of `repo` is kept by, `branch` being
 /// `#n` for pull request `n`'s.
 pub fn head_key(repo: &str, branch: &str) -> String {
     format!("{} {branch}", repo.trim().to_ascii_lowercase())
+}
+
+/// What head `key` is kept by for judged part `part`, once a checkpoint
+/// toward it moved it.
+pub fn part_head_key(part: u16, key: &str) -> String {
+    format!("part {part}: {key}")
+}
+
+/// Where head `key` stood for judged part `part` in `heads`: as its last
+/// checkpoint left it, else as the goal was agreed.
+pub fn head_for<'a>(heads: &'a Heads, part: u16, key: &str) -> Option<&'a str> {
+    heads
+        .get(&part_head_key(part, key))
+        .or_else(|| heads.get(key))
+        .map(String::as_str)
 }
 
 /// The stall leading `stalls`: the furthest in its spells, the longest

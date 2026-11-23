@@ -1497,6 +1497,16 @@ async fn holds_its_own(pool: workforce_postgres::PostgresPool) {
         assert!(!r.success, "{s}: {r:?}");
     }
     assert_eq!(histories().len(), before);
+    // Every call carried, the glances too, went under its own boss's grant:
+    // the main overseer's under its plan's, Sarah's under Acme's.
+    for c in carried.lock().iter() {
+        let own = match c.boss.as_str() {
+            "local:desk" => key.as_str(),
+            "local:sarah" => "acme",
+            boss => panic!("{boss}: {c:?}"),
+        };
+        assert_eq!(c.group, own, "{c:?}");
+    }
     poller.abort();
 }
 

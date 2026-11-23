@@ -188,9 +188,22 @@ impl DeskStore {
         self.plan_kept(plan, "goal_heads").await
     }
 
-    /// Keeps `heads` as where plan `plan`'s goal's work stands now.
-    pub async fn keep_goal_heads(&self, plan: Uuid, heads: &Heads) -> Result<()> {
-        self.keep_plan_kept(plan, "goal_heads", heads).await
+    /// Keeps `heads` with plan `plan`'s goal's, in one write: over those
+    /// kept by the same keys when `over`, else only where none is kept yet.
+    /// Those it doesn't name stay as they are.
+    pub async fn keep_goal_heads(&self, plan: Uuid, heads: &Heads, over: bool) -> Result<()> {
+        let merged = match over {
+            true => "goal_heads || $2",
+            false => "$2 || goal_heads",
+        };
+        let client = self.pool().get().await?;
+        client
+            .execute(
+                &format!("UPDATE plans SET goal_heads = {merged} WHERE id = $1"),
+                &[&plan, &serde_json::to_value(heads)?],
+            )
+            .await?;
+        Ok(())
     }
 
     /// What the goal checks keep in plan `plan`'s `column`: its default
@@ -412,9 +425,33 @@ mod tests {
                 GoalSaid::default()
             );
             assert!(s.goal_heads(p.id).await.unwrap().is_empty());
-            let heads = Heads::from([(crate::goal::head_key("Acme/Web", "main"), "a".repeat(40))]);
-            s.keep_goal_heads(p.id, &heads).await.unwrap();
-            assert_eq!(s.goal_heads(p.id).await.unwrap(), heads);
+            let main = crate::goal::head_key("Acme/Web", "main");
+            let pull = crate::goal::head_key("Acme/Web", "#4");
+            let kept = |pairs: &[(&String, char)]| -> Heads {
+                pairs
+                    .iter()
+                    .map(|(k, c)| ((*k).clone(), c.to_string().repeat(40)))
+                    .collect()
+            };
+            s.keep_goal_heads(p.id, &kept(&[(&main, 'a')]), false)
+                .await
+                .unwrap();
+            s.keep_goal_heads(p.id, &kept(&[(&main, 'b'), (&pull, 'c')]), false)
+                .await
+                .unwrap();
+            assert_eq!(
+                s.goal_heads(p.id).await.unwrap(),
+                kept(&[(&main, 'a'), (&pull, 'c')]),
+                "what is kept stays, what is missing is added"
+            );
+            s.keep_goal_heads(p.id, &kept(&[(&pull, 'd')]), true)
+                .await
+                .unwrap();
+            assert_eq!(
+                s.goal_heads(p.id).await.unwrap(),
+                kept(&[(&main, 'a'), (&pull, 'd')]),
+                "moved, the rest stays"
+            );
             assert_eq!(s.goal_said(p.id).await.unwrap(), said, "each kept apart");
         })
         .await;

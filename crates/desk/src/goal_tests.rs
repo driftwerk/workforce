@@ -896,3 +896,15 @@ fn a_plan_approved_holds_what_a_question_proposed_when_it_holds_each_part() {
     );
     assert!(!covers(&Proposal::default()));
 }
+
+#[test]
+fn a_parts_head_is_where_its_last_checkpoint_left_it_else_where_it_was_agreed() {
+    let main = head_key("Acme/Web", "main");
+    let heads = Heads::from([
+        (main.clone(), "a".repeat(40)),
+        (part_head_key(1, &main), "b".repeat(40)),
+    ]);
+    assert_eq!(head_for(&heads, 1, &main), Some(&*"b".repeat(40)));
+    assert_eq!(head_for(&heads, 2, &main), Some(&*"a".repeat(40)));
+    assert_eq!(head_for(&heads, 1, &head_key("acme/web", "#4")), None);
+}

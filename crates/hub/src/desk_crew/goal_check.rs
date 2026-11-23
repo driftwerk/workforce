@@ -91,9 +91,6 @@ pub(crate) struct GoalChecks {
     looking: bool,
     /// The met plans whose closing turn was started.
     closing: HashSet<Uuid>,
-    /// The goals where their work stood is kept for: what a commit shown
-    /// toward them must come after.
-    headed: HashSet<Uuid>,
 }
 
 /// What brought a goal's next reading forward.
@@ -386,7 +383,6 @@ impl CrewHub {
             let mut c = self.goal_checks.lock();
             c.pulled.retain(|plan, _| open.contains(plan));
             c.pulls.retain(|(plan, ..), _| open.contains(plan));
-            c.headed.retain(|plan| open.contains(plan));
             for notes in c.notes.values_mut() {
                 notes.retain(|n| open.contains(&n.plan));
             }
@@ -448,9 +444,10 @@ impl CrewHub {
         let now = Utc::now();
         let minute = Duration::from_std(self.timing.minute).unwrap_or_default();
         let detail = self.read_when_due(service, detail, &r, now, minute).await;
-        self.heads_kept(service, &detail, &r).await;
+        let id = detail.summary.plan.id;
+        self.heads_kept(service, id, &GoalRefs::of(&r, &readings_of(&detail)))
+            .await;
         let plan = &detail.summary.plan;
-        let id = plan.id;
         if plan.met.is_some() || !matches!(plan.state, PlanState::Running | PlanState::Paused) {
             return Vec::new();
         }
@@ -524,27 +521,6 @@ impl CrewHub {
         }
         self.goal_checks.lock().pulled.remove(&id);
         self.read_kept(service, &detail).await.unwrap_or(detail)
-    }
-
-    /// Where goal plan `detail`'s work (by its result `r`) stands, kept
-    /// once as it is first checked: what was there as it was agreed.
-    async fn heads_kept(&self, service: &AgentService, detail: &PlanDetail, r: &goal::GoalResult) {
-        let id = detail.summary.plan.id;
-        if self.goal_checks.lock().headed.contains(&id) {
-            return;
-        }
-        let refs = GoalRefs::of(r, &readings_of(detail));
-        let kept = refs.is_empty()
-            || self
-                .desk
-                .store()
-                .goal_heads(id)
-                .await
-                .is_ok_and(|h| !h.is_empty())
-            || !self.keep_heads(service, id, &refs).await.is_empty();
-        if kept {
-            self.goal_checks.lock().headed.insert(id);
-        }
     }
 
     /// What goal plan `detail`'s stalls (`stalls`) wake its boss with,
