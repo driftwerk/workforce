@@ -876,8 +876,10 @@ impl CrewTool {
 /// What a local overseer may ask of its group's or its plans' sessions on
 /// a machine, through the relay: by a session id of the machine's
 /// (`devbox/<id>`).
-const RELAYED: [&str; 9] = [
+const RELAYED: [&str; 11] = [
     "crew.history",
+    "crew.take_on",
+    "crew.escalate",
     "crew.nudge",
     "crew.approve",
     "crew.deny",
@@ -924,7 +926,8 @@ impl CrewTool {
 
     /// The grant session `id` of `machine` is under there for this boss,
     /// or why it may not be reached: its group's, holding it by the
-    /// sidebar, or one of its own plans' that holds it.
+    /// sidebar; or one of its own plans' that holds it, else the machine's
+    /// Ungrouped grant.
     fn grant_for(
         &self,
         crew: &CrewHub,
@@ -937,19 +940,20 @@ impl CrewTool {
             // also say: nothing outside it is sent anywhere.
             Some(g)
                 if workforce_desk::grant::plan_of(g).is_none()
-                    && crew.desk.group_of_member(&format!("session:{machine}/{id}")).as_deref()
+                    && crew
+                        .desk
+                        .group_of_member(&format!("session:{machine}/{id}"))
+                        .as_deref()
                         == Some(g) =>
             {
                 Ok(g.to_string())
             }
             Some(_) => Err(crew.not_ours(&self.scope)),
-            None => crew
-                .plan_grant_of(b.service.agent_id.as_str(), &b.oversight, machine, id)
-                .ok_or_else(|| {
-                    format!(
-                        "On {machine} you run only your own plans' ticket sessions, and this isn't one of them."
-                    )
-                }),
+            None => {
+                let agent = b.service.agent_id.as_str();
+                crew.plan_grant_of(agent, &b.oversight, machine, id)
+                    .map_or_else(|| crew.ungrouped_grant_of(&b.oversight, machine, id), Ok)
+            }
         }
     }
 
@@ -963,8 +967,18 @@ impl CrewTool {
         b: &Bound,
         input: &Value,
     ) -> Option<Result<Value, String>> {
-        let named = input["session_id"].as_str()?;
-        let (machine, id) = super::relay::machine_session(named)?;
+        // A machine's line message a turn here was shown is relayed to its
+        // session there.
+        let (machine, id) = match input["session_id"].as_str() {
+            Some(named) => {
+                super::relay::machine_session(named).map(|(m, id)| (m.to_string(), id))?
+            }
+            None => input["message_id"]
+                .as_str()
+                .and_then(|m| m.parse().ok())
+                .and_then(|m| crew.machine_line(m))?,
+        };
+        let machine = machine.as_str();
         // A machine keeps no account of its sessions here: what it gives
         // is its history of one, as crew.history reads it.
         let name = match self.name {
@@ -1048,7 +1062,9 @@ impl CrewTool {
                          which preference you followed yourself."
                 );
                 match a.status {
-                    super::served::ServedStatus::Refused => Err(said),
+                    super::served::ServedStatus::Refused => {
+                        Err(super::relay::older(machine, name, &a).unwrap_or(said))
+                    }
                     super::served::ServedStatus::Ok if cited => {
                         Ok(json!({ "done": said, "note": uncited }))
                     }
@@ -1121,8 +1137,8 @@ pub(crate) fn describe(name: &str) -> &'static str {
             "crew.assign" => "Hand a task to one of the crew's agents, in its DM.",
             "crew.assign_ticket" => "Hand a ticket on the board (ticket, its key like ACM-12) to a session (to: { \"session\": id }), an agent (to: { \"agent\": id }) or a new session started for it, which you run (to: { \"newSession\": { \"folder\": path, \"engine\": optional } }). The ticket moves to Doing and its holder is told. Only a ready ticket can be handed out (crew.board); a new session counts against your limit of sessions at once. Handing out work is for what the person has let you hand out.",
             "crew.move_ticket" => "Move a ticket on the board (ticket, its key like ACM-12) to a column (state): backlog, todo, doing, review or done. Dropping a ticket is always the person's call, so it becomes a suggestion for them. Read a ticket in full with crew.ticket; change its words with crew.edit_ticket, comment with crew.comment_ticket.",
-            "crew.take_on" => "Run a session for the person (session_id): it wakes you each time its turn ends, so you can tell it the next step. You take it on yourself only when the person lets you take on every session; otherwise this offers it to them. The person can take over any time by typing in it; it is theirs while they are active there (a couple of minutes after their last input, unless they pin it), and your messages wait until then.",
-            "crew.release" => "Let a session you run go (session_id): the person runs it on their own, and its turn ends no longer wake you. Say why in reason. Pass done: true only when the session's work is finished: that release alone keeps your right to close it with crew.close_session; any other release leaves closing it to the person.",
+            "crew.take_on" => "Run a session for the person (session_id): it wakes you each time its turn ends, so you can tell it the next step. You take it on yourself only when the person lets you take on every session; otherwise this offers it to them. The person can take over any time by typing in it; it is theirs while they are active there (a couple of minutes after their last input, unless they pin it), and your messages wait until then. A session on one of the person's machines is named <machine>/<id>, as crew.overview lists it.",
+            "crew.release" => "Let a session you run go (session_id): the person runs it on their own, and its turn ends no longer wake you. Say why in reason. Pass done: true only when the session's work is finished: that release alone keeps your right to close it with crew.close_session (a session on one of the person's machines is always theirs to close); any other release leaves closing it to the person.",
             LOGINS => "The person's logins for each engine (their Claude accounts, as Desk keeps them): each one's name, provider, id, whether it is the default, whether its sign-in can be used, how far into its plan's windows it was last read and when they reset, whether it is at its limit or turned away by the provider (and why, and until when), and which sessions run on it. Name a login by its name or id in crew.switch_login and crew.handoff.",
             SWITCH_LOGIN => "Move a Desk session (session_id) to another of the person's logins of the same provider (login: its name or id from crew.logins), its conversation kept: Desk checks first that the login serves, then starts the session again in place on it (one whose turn stopped on its old login's limit is told why and carries on; one working moves once its turn and the work it left running end). Use it when a session's login is at its limit or turned away and Desk hasn't moved it already; Desk never moves a session to another provider's login. Say why in reason.",
             "crew.set_mode" => "Change a Desk session's permission mode (session_id, mode): default (manual: it asks), acceptEdits, plan, auto (it decides what is safe) or bypassPermissions (it asks for nothing). Desk starts it again in place in that mode, its conversation kept, and says the mode it now runs in. Set it between turns, never while it works or waits on an answer: auto before routine work, default before work that will need your judgement. auto and bypassPermissions are for an unbound overseer only, on a session it runs (take it on first), and end with unbound: once you aren't unbound or don't run it, it starts in its own mode again, as it does when the person resumes it. Below unbound, only default, acceptEdits and plan, where the person switched it on.",
@@ -1460,6 +1476,12 @@ impl Tool for CrewTool {
 mod tests {
     use super::*;
     use workforce_desk::model::{Engine, Origin};
+
+    #[test]
+    fn a_boss_is_never_told_it_may_close_a_machine_session_it_cant() {
+        assert!(!RELAYED.contains(&"crew.close_session"));
+        assert!(describe("crew.release").contains("machines is always theirs to close"));
+    }
 
     #[test]
     fn the_crew_reads_that_only_look_and_those_that_keep_something_are_every_read() {

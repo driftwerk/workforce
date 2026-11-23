@@ -316,6 +316,10 @@ async fn a_plans_session_on_a_machine_holds_its_slot_until_the_machine_says_it_w
                                 there.lock().push(s.clone());
                                 s
                             }
+                            // The work loop's and the pump's takes, which this
+                            // machine doesn't answer.
+                            super::super::relayed_work::WORK_TAKE
+                            | super::super::relayed_decide::TAKE => Value::Null,
                             other => panic!("{other} relayed"),
                         };
                         crew.relay_answer(
@@ -1980,6 +1984,10 @@ async fn a_plans_ticket_on_a_machine_starts_there_once_and_its_turns_wake_the_bo
                                 there.lock().push(s.clone());
                                 s
                             }
+                            // The work loop's and the pump's takes, which this
+                            // machine doesn't answer.
+                            super::super::relayed_work::WORK_TAKE
+                            | super::super::relayed_decide::TAKE => Value::Null,
                             other => panic!("{other} relayed"),
                         };
                         crew.relay_answer(
@@ -2144,6 +2152,10 @@ async fn a_machine_start_never_answered_is_found_there_and_never_made_twice() {
                                 }));
                                 // No answer.
                             }
+                            // The work loop's and the pump's takes, which this
+                            // machine doesn't answer.
+                            super::super::relayed_work::WORK_TAKE
+                            | super::super::relayed_decide::TAKE => {}
                             other => panic!("{other} relayed"),
                         }
                     }
@@ -2251,6 +2263,10 @@ async fn a_machine_start_whose_retry_cant_read_there_keeps_its_link() {
                                     "createdAt": chrono::Utc::now().to_rfc3339(),
                                 }));
                             }
+                            // The work loop's and the pump's takes, which this
+                            // machine doesn't answer.
+                            super::super::relayed_work::WORK_TAKE
+                            | super::super::relayed_decide::TAKE => {}
                             other => panic!("{other} relayed"),
                         }
                     }
@@ -2815,6 +2831,10 @@ async fn a_ticket_whose_session_on_a_machine_ends_as_it_starts_waits_in_to_do_it
                                 there.lock().push(s.clone());
                                 s
                             }
+                            // The work loop's and the pump's takes, which this
+                            // machine doesn't answer.
+                            super::super::relayed_work::WORK_TAKE
+                            | super::super::relayed_decide::TAKE => Value::Null,
                             other => panic!("{other} relayed"),
                         };
                         crew.relay_answer(

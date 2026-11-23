@@ -280,6 +280,22 @@ pub struct SessionView {
     pub updated_at: DateTime<Utc>,
 }
 
+/// A session as Desk's list of them says it ([`crate::Desk::listed`]), for
+/// the hub of a boss that runs it from another computer: its view, and what
+/// only that list says of it.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ListedSession {
+    #[serde(flatten)]
+    pub view: SessionView,
+    /// Whether its Act fully boss answers what it asks itself, here.
+    pub boss_answers: bool,
+    /// The grant here that holds it (its group's key), null when none does:
+    /// the Mac never asks for it in another. Always said, so a list that
+    /// says it is a Desk's that knows its grants.
+    pub grant: Option<String>,
+}
+
 impl SessionView {
     /// What it waits on of its own work while its turn is done; none while
     /// it works, or while it asks the person something (asking beats

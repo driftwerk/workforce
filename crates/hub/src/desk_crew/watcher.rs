@@ -584,6 +584,41 @@ impl CrewHub {
         })
     }
 
+    /// Whether what `item` waits on is not raised to `overseer` here: a
+    /// question of a session the person is in control of, or its Act fully
+    /// boss answers itself (`answer`), and a request its decision call has
+    /// (`decide`).
+    pub(crate) fn raised_elsewhere(&self, item: &crew::Item, overseer: &str) -> bool {
+        item.kind == ItemKind::Session
+            && item
+                .id
+                .parse()
+                .ok()
+                .and_then(|s| self.desk.view(s).ok())
+                .is_some_and(|v| match (&item.approval, &item.question) {
+                    // Only while its call may still be deciding it: one it
+                    // left to the person, or Desk refused, is raised.
+                    // Answered since the overview was read (often by the
+                    // decision call itself): it no longer waits.
+                    (Some(a), _) if v.pending.as_ref().is_none_or(|p| p.id.to_string() != a.id) => {
+                        true
+                    }
+                    (Some(_), _) => {
+                        (self.answers_at_once(&v)
+                            && v.pending
+                                .as_ref()
+                                .is_some_and(|p| Utc::now() - p.since < super::decide::DECIDING))
+                            || self.dialog_is_persons(&v, overseer)
+                    }
+                    (None, Some(_)) => {
+                        super::answer::question_of(&v).is_some()
+                            && (self.person_has_questions(&v, overseer)
+                                || self.answers_question_itself(&v))
+                    }
+                    (None, None) => false,
+                })
+    }
+
     /// What has waited on the person, or gone quiet, past the overseer's
     /// thresholds. What waits is said each time, about its open question
     /// ([`fresh`] says whether it is worth raising); work gone quiet once
@@ -614,7 +649,8 @@ impl CrewHub {
         let mut holding = HashSet::new();
         let mut out = Vec::new();
         let waiting = self.waiting_from(overseer).await;
-        for item in &overview.items {
+        let away = self.machine_items(overseer);
+        for item in overview.items.iter().chain(&away) {
             if item.id == overseer {
                 continue;
             }
@@ -653,40 +689,7 @@ impl CrewHub {
                     }
                 }
             }
-            // A session's question the person is in control of, or its Act
-            // fully boss answers itself (`answer`), and a request its decision
-            // call has (`decide`): not raised here.
-            if item.kind == ItemKind::Session
-                && item
-                    .id
-                    .parse()
-                    .ok()
-                    .and_then(|s| self.desk.view(s).ok())
-                    .is_some_and(|v| match (&item.approval, &item.question) {
-                        // Only while its call may still be deciding it: one
-                        // it left to the person, or Desk refused, is raised.
-                        // Answered since the overview was read (often by the
-                        // decision call itself): it no longer waits.
-                        (Some(a), _)
-                            if v.pending.as_ref().is_none_or(|p| p.id.to_string() != a.id) =>
-                        {
-                            true
-                        }
-                        (Some(_), _) => {
-                            (self.answers_at_once(&v)
-                                && v.pending.as_ref().is_some_and(|p| {
-                                    Utc::now() - p.since < super::decide::DECIDING
-                                }))
-                                || self.dialog_is_persons(&v, overseer)
-                        }
-                        (None, Some(_)) => {
-                            super::answer::question_of(&v).is_some()
-                                && (self.person_has_questions(&v, overseer)
-                                    || self.answers_question_itself(&v))
-                        }
-                        (None, None) => false,
-                    })
-            {
+            if self.raised_elsewhere(item, overseer) {
                 continue;
             }
             let (key, trigger) = match item.state {

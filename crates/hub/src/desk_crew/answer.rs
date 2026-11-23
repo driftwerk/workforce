@@ -30,7 +30,10 @@ use workforce_desk::model::{DeskEvent, PendingApproval, SessionView};
 
 use super::actions::{Action, Target};
 use super::decide::{MARK, WITHIN};
-use super::{name_of, CrewHub};
+use super::left::Left;
+use super::relayed_decide::Call;
+use super::remote_decide::{Decider, Failed};
+use super::CrewHub;
 
 /// How often every open question is looked at again: one the person had
 /// is the boss's once they have been quiet long enough.
@@ -223,6 +226,31 @@ fn asking(crew: &CrewHub) -> Vec<Uuid> {
         .collect()
 }
 
+/// Why a reply the boss's model gave can't be used.
+fn neither(text: &str) -> String {
+    format!(
+        "its answer was neither an answer nor a question for you (“{}”)",
+        workforce_desk::crew::one_line(text, 120)
+    )
+}
+
+/// Why an answer call made no answer: its model's own error, or what its
+/// home said of a call relayed there.
+fn failure(e: &Failed) -> String {
+    let why = workforce_desk::crew::one_line(&e.why, 160);
+    match e.code {
+        None => format!("its model failed: {why}"),
+        Some(_) => why,
+    }
+}
+
+/// When Desk stops holding `p`, a dialog held at its start
+/// ([`workforce_desk::DIALOG_HOLD`]), less a margin.
+fn held_until(p: &PendingApproval) -> chrono::DateTime<chrono::Utc> {
+    p.since + chrono::Duration::from_std(workforce_desk::DIALOG_HOLD).unwrap_or_default()
+        - chrono::Duration::seconds(5)
+}
+
 /// What became of a question handed to its boss.
 enum Answered {
     /// Answered, left to the person, or no longer asked.
@@ -247,11 +275,21 @@ impl CrewHub {
     /// Whether the person is in control of `view` for its questions, as its
     /// boss `boss`'s settings say: then nothing is said of them.
     pub(crate) fn person_has_questions(&self, view: &SessionView, boss: &str) -> bool {
-        let gap = self
-            .overseer_named(boss)
-            .map(|(_, o)| self.answer_gap(&o))
-            .unwrap_or_else(|| self.answer_gap(&workforce_common::oversight::Oversight::default()));
-        self.desk.person_in_control(view.id, gap)
+        let o = self
+            .decider_of(boss, view)
+            .map(|d| d.oversight)
+            .unwrap_or_default();
+        self.desk.person_in_control(view.id, self.answer_gap(&o))
+    }
+
+    /// Who makes `call` on `view` for `boss` itself, now: `boss` at Act
+    /// fully in force, when it makes it here ([`CrewHub::answers`]).
+    fn question_answerer(&self, boss: &str, view: &SessionView, call: Call) -> Option<Decider> {
+        self.desk
+            .boss_unbound(boss)
+            .then(|| self.decider_of(boss, view))
+            .flatten()
+            .filter(|d| self.answers(d, call))
     }
 
     /// Whether `view` waits on a question its dialog asks (not a permission
@@ -268,9 +306,9 @@ impl CrewHub {
         // A boss on another hub answers questions in its own turns there,
         // woken as before: none is swallowed here.
         question_of(view).is_some()
-            && self.boss_over(view).is_some_and(|b| {
-                !workforce_desk::grant::is_served(&b) && self.desk.boss_unbound(&b)
-            })
+            && self
+                .boss_over(view)
+                .is_some_and(|b| self.question_answerer(&b, view, Call::Question).is_some())
     }
 
     /// Looks at session `id`'s question: hands it to its boss (once,
@@ -292,8 +330,9 @@ impl CrewHub {
             return;
         };
         // A boss on another hub answers questions in its own turns there.
-        if workforce_desk::grant::is_served(&boss)
-            || !self.desk.boss_unbound(&boss)
+        if self
+            .question_answerer(&boss, &view, Call::Question)
+            .is_none()
             || !self.desk.charges_loaded()
             || self.person_has_questions(&view, &boss)
         {
@@ -355,48 +394,20 @@ impl CrewHub {
         turn: workforce_desk::line::TurnMark,
         boss: &str,
     ) -> Answered {
-        let Some((service, o)) = self.overseer_named(boss) else {
+        let Some(d) = self.question_answerer(boss, view, Call::Question) else {
             return Answered::Done;
         };
-        let name = name_of(&service);
-        let (session, prefs) = self.session_brief(boss, view, &o).await;
+        let (session, prefs) = self.session_brief(boss, view, &d.oversight).await;
         let question = serde_json::json!({"question": q.ask, "options": q.options});
         let prompt = format!(
             "{MARK} A session you oversee ended its turn asking this. Answer it now.\n\n{}\n\n{}{prefs}",
             super::watcher::reported(&session.to_string(), "the session"),
             super::watcher::reported(&question.to_string(), "its question"),
         );
-        let mut failed = String::new();
-        let mut replied = None;
-        for _ in 0..2 {
-            match tokio::time::timeout(WITHIN, self.decision_call(&service, SYSTEM, &prompt)).await
-            {
-                Ok(Ok(text)) => match reply(&text) {
-                    Some(r) => {
-                        replied = Some(r);
-                        break;
-                    }
-                    None => {
-                        failed = format!(
-                            "its answer was neither an answer nor a question for you (“{}”)",
-                            workforce_desk::crew::one_line(&text, 120)
-                        )
-                    }
-                },
-                Ok(Err(e)) => {
-                    failed = format!(
-                        "its model failed: {}",
-                        workforce_desk::crew::one_line(&e, 160)
-                    )
-                }
-                Err(_) => {
-                    failed = format!(
-                        "its model didn't answer within {} seconds",
-                        WITHIN.as_secs()
-                    )
-                }
-            }
-        }
+        let replied = self
+            .tries(&d, Call::Question, &prompt, None, reply, neither)
+            .await;
+        self.after_decided(&d).await;
         // Answered meanwhile, by the person or the session going on; or the
         // person took it, or Act fully ended: nothing is said now.
         let Ok(now) = self.desk.view(view.id) else {
@@ -414,23 +425,33 @@ impl CrewHub {
         let shown = workforce_desk::crew::one_line(&q.ask, SHOWN);
         let label = view.label();
         match replied {
-            None => {
+            Err(failed) => {
                 tracing::warn!(session = %view.id, %boss, failed, "the boss couldn't answer a question");
                 self.record_question_left(boss, view, q, &format!("couldn't answer: {failed}"))
                     .await;
-                self.tell_dm(
+                self.leave(
                     boss,
-                    &format!(
-                        "{label} asks “{shown}”. I couldn't answer it, as {failed}: it's yours."
-                    ),
+                    Left::Unanswered {
+                        session: label.to_string(),
+                        ask: shown,
+                        why: failed,
+                        terminal: false,
+                    },
                 )
                 .await;
             }
-            Some(Reply::Ask(ask)) => {
+            Ok(Reply::Ask(ask)) => {
                 self.record_question_left(boss, view, q, &ask).await;
-                self.tell_dm(boss, &format!("{label} asks: {ask}")).await;
+                self.leave(
+                    boss,
+                    Left::Asks {
+                        session: label.to_string(),
+                        ask,
+                    },
+                )
+                .await;
             }
-            Some(Reply::Answer { text, why }) => {
+            Ok(Reply::Answer { text, why }) => {
                 let why = match why.is_empty() {
                     true => format!("it asked “{shown}”"),
                     false => format!("it asked “{shown}”: {why}"),
@@ -445,7 +466,7 @@ impl CrewHub {
                     ..Default::default()
                 };
                 match self
-                    .perform_with(&action, By::manager(boss, &name, &why), &order)
+                    .perform_with(&action, By::manager(boss, &d.name, &why), &order)
                     .await
                 {
                     Ok(done) => {
@@ -462,9 +483,13 @@ impl CrewHub {
                             &format!("Desk refused its answer: {refused}"),
                         )
                         .await;
-                        self.tell_dm(
+                        self.leave(
                             boss,
-                            &format!("{label} asks “{shown}”. I answered, but Desk refused it: {refused}"),
+                            Left::AnswerRefused {
+                                session: label.to_string(),
+                                ask: shown,
+                                why: refused,
+                            },
                         )
                         .await;
                     }
@@ -486,11 +511,10 @@ impl CrewHub {
         let release = || {
             self.desk.release_dialog(view.id, p.id);
         };
-        let Some((service, o)) = self.overseer_named(boss) else {
+        let Some(d) = self.question_answerer(boss, view, Call::Question) else {
             return release();
         };
-        let name = name_of(&service);
-        let (session, prefs) = self.session_brief(boss, view, &o).await;
+        let (session, prefs) = self.session_brief(boss, view, &d.oversight).await;
         let questions = p
             .request
             .as_ref()
@@ -516,47 +540,19 @@ impl CrewHub {
         // holds its question until it is answered: the boss's two tries.
         let deadline = match codex {
             true => chrono::Utc::now() + chrono::Duration::from_std(WITHIN * 2).unwrap_or_default(),
-            false => {
-                p.since
-                    + chrono::Duration::from_std(workforce_desk::DIALOG_HOLD).unwrap_or_default()
-                    - chrono::Duration::seconds(5)
-            }
+            false => held_until(p),
         };
-        let mut failed = String::new();
-        let mut replied = None;
-        for _ in 0..2 {
-            let left = (deadline - chrono::Utc::now()).to_std().unwrap_or_default();
-            if left < Duration::from_secs(2) {
-                failed = "it ran out of time before the dialog had to open".into();
-                break;
-            }
-            match tokio::time::timeout(
-                left.min(WITHIN),
-                self.decision_call(&service, SYSTEM, &prompt),
+        let replied = self
+            .tries(
+                &d,
+                Call::Question,
+                &prompt,
+                Some((deadline, "the dialog")),
+                reply,
+                neither,
             )
-            .await
-            {
-                Ok(Ok(text)) => match reply(&text) {
-                    Some(r) => {
-                        replied = Some(r);
-                        break;
-                    }
-                    None => {
-                        failed = format!(
-                            "its answer was neither an answer nor a question for you (“{}”)",
-                            workforce_desk::crew::one_line(&text, 120)
-                        )
-                    }
-                },
-                Ok(Err(e)) => {
-                    failed = format!(
-                        "its model failed: {}",
-                        workforce_desk::crew::one_line(&e, 160)
-                    )
-                }
-                Err(_) => failed = "its model didn't answer in time".into(),
-            }
-        }
+            .await;
+        self.after_decided(&d).await;
         // Gone meanwhile (answered, released to the person), or theirs now.
         let still = self.desk.view(view.id).ok().filter(|v| {
             v.pending
@@ -578,12 +574,15 @@ impl CrewHub {
             denied: None,
         };
         match replied {
-            Some(Reply::Answer { text, .. }) => {
+            Ok(Reply::Answer { text, .. }) => {
                 let action = Action::Deny {
                     session: view.id,
                     approval: p.id,
                 };
-                if let Err(refused) = self.perform(&action, By::manager(boss, &name, &text)).await {
+                if let Err(refused) = self
+                    .perform(&action, By::manager(boss, &d.name, &text))
+                    .await
+                {
                     // Let go meanwhile (the person took the session, or the
                     // hold ran out): it is theirs, and nothing is said.
                     let held = self.desk.view(view.id).ok().filter(|v| {
@@ -603,29 +602,42 @@ impl CrewHub {
                         &format!("Desk refused its answer: {refused}"),
                     )
                     .await;
-                    self.tell_dm(
+                    self.leave(
                         boss,
-                        &format!(
-                            "{label} asks “{shown}”. I answered, but Desk refused it: {refused}"
-                        ),
+                        Left::AnswerRefused {
+                            session: label.to_string(),
+                            ask: shown,
+                            why: refused,
+                        },
                     )
                     .await;
                 }
             }
-            Some(Reply::Ask(question)) => {
+            Ok(Reply::Ask(question)) => {
                 release();
                 self.record_question_left(boss, view, &ask, &question).await;
-                self.tell_dm(boss, &format!("{label} asks: {question}"))
-                    .await;
+                self.leave(
+                    boss,
+                    Left::Asks {
+                        session: label.to_string(),
+                        ask: question,
+                    },
+                )
+                .await;
             }
-            None => {
+            Err(failed) => {
                 tracing::warn!(session = %view.id, %boss, failed, "the boss couldn't answer a dialog");
                 release();
                 self.record_question_left(boss, view, &ask, &format!("couldn't answer: {failed}"))
                     .await;
-                self.tell_dm(
+                self.leave(
                     boss,
-                    &format!("{label} asks “{shown}”. I couldn't answer it, as {failed}: it's yours, in its terminal."),
+                    Left::Unanswered {
+                        session: label.to_string(),
+                        ask: shown,
+                        why: failed,
+                        terminal: true,
+                    },
                 )
                 .await;
             }
@@ -641,11 +653,10 @@ impl CrewHub {
         let release = || {
             self.desk.release_dialog(view.id, p.id);
         };
-        let Some((service, o)) = self.overseer_named(boss) else {
+        let Some(d) = self.question_answerer(boss, view, Call::Plan) else {
             return release();
         };
-        let name = name_of(&service);
-        let (session, prefs) = self.session_brief(boss, view, &o).await;
+        let (session, prefs) = self.session_brief(boss, view, &d.oversight).await;
         let plan = p
             .request
             .as_ref()
@@ -658,44 +669,22 @@ impl CrewHub {
             super::watcher::reported(&session.to_string(), "the session"),
             super::watcher::reported(&plan, "its plan"),
         );
-        let deadline = p.since
-            + chrono::Duration::from_std(workforce_desk::DIALOG_HOLD).unwrap_or_default()
-            - chrono::Duration::seconds(5);
-        let mut failed = String::new();
-        let mut said = None;
-        for _ in 0..2 {
-            let left = (deadline - chrono::Utc::now()).to_std().unwrap_or_default();
-            if left < Duration::from_secs(2) {
-                failed = "it ran out of time before the plan's dialog had to open".into();
-                break;
-            }
-            match tokio::time::timeout(
-                left.min(WITHIN),
-                self.decision_call(&service, PLAN_SYSTEM, &prompt),
-            )
-            .await
-            {
-                Ok(Ok(text)) => match review(&text) {
-                    Some(r) => {
-                        said = Some(r);
-                        break;
-                    }
-                    None => {
-                        failed = format!(
+        let said = self
+            .tries(
+                &d,
+                Call::Plan,
+                &prompt,
+                Some((held_until(p), "the plan's dialog")),
+                review,
+                |text| {
+                    format!(
                         "its review was neither an approval, changes nor a question for you (“{}”)",
-                        workforce_desk::crew::one_line(&text, 120)
+                        workforce_desk::crew::one_line(text, 120)
                     )
-                    }
                 },
-                Ok(Err(e)) => {
-                    failed = format!(
-                        "its model failed: {}",
-                        workforce_desk::crew::one_line(&e, 160)
-                    )
-                }
-                Err(_) => failed = "its model didn't answer in time".into(),
-            }
-        }
+            )
+            .await;
+        self.after_decided(&d).await;
         // Still held for it, and its boss's to review.
         let held = || {
             self.desk.view(view.id).ok().filter(|v| {
@@ -719,31 +708,35 @@ impl CrewHub {
             denied: None,
         };
         let (action, why) = match said {
-            Some(Review::Approve(why)) => (
+            Ok(Review::Approve(why)) => (
                 Action::Approve {
                     session: view.id,
                     approval: p.id,
                 },
                 why,
             ),
-            Some(Review::Changes(changes)) => (
+            Ok(Review::Changes(changes)) => (
                 Action::Deny {
                     session: view.id,
                     approval: p.id,
                 },
                 changes,
             ),
-            Some(Review::Ask(question)) => {
+            Ok(Review::Ask(question)) => {
                 release();
                 self.record_question_left(boss, view, &ask, &question).await;
-                self.tell_dm(
+                self.leave(
                     boss,
-                    &format!("{label}'s plan “{heading}” waits for you: {question}"),
+                    Left::PlanAsks {
+                        session: label.to_string(),
+                        plan: heading,
+                        ask: question,
+                    },
                 )
                 .await;
                 return;
             }
-            None => {
+            Err(failed) => {
                 tracing::warn!(session = %view.id, %boss, failed, "the boss couldn't review a plan");
                 release();
                 self.record_question_left(
@@ -753,15 +746,22 @@ impl CrewHub {
                     &format!("couldn't review it: {failed}"),
                 )
                 .await;
-                self.tell_dm(
+                self.leave(
                     boss,
-                    &format!("{label}'s plan “{heading}” waits for you in its terminal: I couldn't review it, as {failed}."),
+                    Left::PlanUnreviewed {
+                        session: label.to_string(),
+                        plan: heading,
+                        why: failed,
+                    },
                 )
                 .await;
                 return;
             }
         };
-        if let Err(refused) = self.perform(&action, By::manager(boss, &name, &why)).await {
+        if let Err(refused) = self
+            .perform(&action, By::manager(boss, &d.name, &why))
+            .await
+        {
             // Let go meanwhile: theirs, and nothing is said.
             if held().is_none_or(|v| self.person_has_questions(&v, boss)) {
                 return release();
@@ -775,12 +775,64 @@ impl CrewHub {
                 &format!("Desk refused its review: {refused}"),
             )
             .await;
-            self.tell_dm(
+            self.leave(
                 boss,
-                &format!("{label}'s plan “{heading}” waits for you: I reviewed it, but Desk refused it: {refused}"),
+                Left::PlanRefused {
+                    session: label.to_string(),
+                    plan: heading,
+                    why: refused,
+                },
             )
             .await;
         }
+    }
+
+    /// `d`'s reply to `prompt` for `call`, as `read` reads it (`unread`
+    /// says why one it can't is no use): in two tries, each within
+    /// [`WITHIN`] and, when it has one, before what `deadline` holds must
+    /// open, less a margin; or why there is none.
+    async fn tries<T>(
+        &self,
+        d: &Decider,
+        call: Call,
+        prompt: &str,
+        deadline: Option<(chrono::DateTime<chrono::Utc>, &str)>,
+        read: impl Fn(&str) -> Option<T>,
+        unread: impl Fn(&str) -> String,
+    ) -> Result<T, String> {
+        let mut failed = String::new();
+        for _ in 0..2 {
+            let within = match deadline {
+                None => WITHIN,
+                Some((at, what)) => {
+                    let left = (at - chrono::Utc::now()).to_std().unwrap_or_default();
+                    if left < Duration::from_secs(2) {
+                        return Err(format!("it ran out of time before {what} had to open"));
+                    }
+                    left.min(WITHIN)
+                }
+            };
+            match tokio::time::timeout(within, self.answer_by(d, call, prompt)).await {
+                Ok(Ok(text)) => match read(&text) {
+                    Some(r) => return Ok(r),
+                    None => failed = unread(&text),
+                },
+                Ok(Err(e)) => {
+                    failed = failure(&e);
+                    if !e.again() {
+                        break;
+                    }
+                }
+                Err(_) if deadline.is_some() => failed = "its model didn't answer in time".into(),
+                Err(_) => {
+                    failed = format!(
+                        "its model didn't answer within {} seconds",
+                        WITHIN.as_secs()
+                    )
+                }
+            }
+        }
+        Err(failed)
     }
 
     /// The sessions whose dialog questions an Act fully boss answers itself
@@ -799,11 +851,10 @@ impl CrewHub {
                 let boss = self.boss_over(v)?;
                 // A boss on another hub answers in its own turns there: Desk
                 // holds nothing for it.
-                if workforce_desk::grant::is_served(&boss) || !self.desk.boss_unbound(&boss) {
-                    return None;
-                }
-                let (_, o) = self.overseer_named(&boss)?;
-                let gap = self.answer_gap(&o);
+                let d = Call::BEYOND
+                    .into_iter()
+                    .find_map(|c| self.question_answerer(&boss, v, c))?;
+                let gap = self.answer_gap(&d.oversight);
                 Some((v.id, workforce_desk::DialogAnswerer { boss, gap }))
             })
             .collect();
