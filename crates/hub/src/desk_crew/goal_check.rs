@@ -28,7 +28,6 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::time::Duration as StdDuration;
 
 use chrono::{DateTime, Duration, Utc};
 use serde_json::{json, Value};
@@ -57,9 +56,6 @@ const BACKOFF_MINUTES: u32 = 5;
 pub(crate) const FAILING_WAKE: u32 = 6;
 /// The spell from which a stall is said in the person's roundup too.
 const NOTE_SPELL: u32 = 2;
-/// The longest one goal's reading may take: GitHub slow never holds up the
-/// watchdog's other looks.
-const READ_FOR: StdDuration = StdDuration::from_secs(30);
 /// The most notes kept for one boss's roundup.
 const NOTES_KEPT: usize = 20;
 
@@ -353,14 +349,7 @@ impl CrewHub {
         {
             true => {
                 self.goal_checks.lock().pulled.remove(&id);
-                match tokio::time::timeout(READ_FOR, self.read_kept(service, &detail)).await {
-                    Ok(Some(fresh)) => fresh,
-                    Ok(None) => detail,
-                    Err(_) => {
-                        tracing::info!(plan = %id, "a goal's reading took too long; it is read again next time");
-                        detail
-                    }
-                }
+                self.read_kept(service, &detail).await.unwrap_or(detail)
             }
             false => detail,
         };
@@ -390,7 +379,7 @@ impl CrewHub {
         );
         let sessions = plan_sessions(&detail);
         let mut lines = self.stall_lines(o, &detail, &r, &progress, &stalls, &sessions, now);
-        lines.extend(self.undelivered_lines(id, &sessions, waiting, window, now));
+        lines.extend(self.undelivered_lines(plan, &sessions, waiting, window, now));
         if let Some(note) = self
             .goal_note(service, &detail, &stalls, &sessions, now)
             .await
@@ -499,13 +488,14 @@ impl CrewHub {
             .collect()
     }
 
-    /// What goal plan `id`'s boss is told of its messages to the plan's
+    /// What goal plan `plan`'s boss is told of its messages to the plan's
     /// `sessions` that have waited `window` and more without going in
     /// (`waiting`, by session, oldest first): once each, whatever state the
-    /// session is in, but never while the person is in it.
+    /// session is in, but never while the person is in it, took it back, or
+    /// has questions waiting in it.
     fn undelivered_lines(
         &self,
-        id: Uuid,
+        plan: &Plan,
         sessions: &[(String, String)],
         waiting: &HashMap<String, Vec<LineMessage>>,
         window: Duration,
@@ -519,15 +509,16 @@ impl CrewHub {
                 if now - oldest.at < window {
                     return None;
                 }
-                let why = match session
-                    .parse::<Uuid>()
-                    .ok()
-                    .and_then(|s| self.desk.view(s).ok())
-                {
+                let local = session.parse::<Uuid>().ok();
+                if local.is_some_and(|s| self.taken_back(s)) {
+                    return None;
+                }
+                let why = match local.and_then(|s| self.desk.view(s).ok()) {
+                    Some(v) if self.person_has_questions(&v, &plan.boss) => return None,
                     Some(v) => self.why_waiting(&v, &waiting[session])?.0,
                     None => "Desk can't reach it to put it in".to_string(),
                 };
-                said(format!("goal-undelivered:{id}:{}", oldest.id))
+                said(format!("goal-undelivered:{}:{}", plan.id, oldest.id))
                     .then(|| undelivered_line(name, now - oldest.at, &why))
             })
             .collect()

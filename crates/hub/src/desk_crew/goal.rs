@@ -23,6 +23,10 @@ use super::measure;
 use super::CrewHub;
 use crate::serve::AgentService;
 
+/// The longest one goal's reading may take: GitHub slow never holds up a
+/// plan turn or the watchdog's other looks.
+const READ_FOR: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// How far back the person's words agreeing a goal are looked for.
 const AGREED_WITHIN: Duration = Duration::hours(24);
 /// How far back the person's messages are read, so words older than they
@@ -790,7 +794,8 @@ impl CrewHub {
 
     /// Plan `p`'s measured parts read now as the person and kept: the plan
     /// fresh, none when it isn't read (no goal agreed, met already, not
-    /// running or paused, or nothing measured).
+    /// running or paused, nothing measured, or GitHub slower than
+    /// [`READ_FOR`]: nothing is kept then).
     pub(super) async fn read_kept(
         &self,
         service: &AgentService,
@@ -808,9 +813,12 @@ impl CrewHub {
         }
         let agreed_at = plan.agreed_at.unwrap_or(plan.created_at);
         let at = crew::now();
-        let readings: Vec<Reading> = self
-            .read_parts(service, r, agreed_at)
-            .await
+        let Ok(read) = tokio::time::timeout(READ_FOR, self.read_parts(service, r, agreed_at)).await
+        else {
+            tracing::info!(plan = %plan.id, "a goal's reading took too long; it is read again next time");
+            return None;
+        };
+        let readings: Vec<Reading> = read
             .into_iter()
             .map(|(i, read)| match read {
                 Ok(reading) => reading,

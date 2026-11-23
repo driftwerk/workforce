@@ -1,17 +1,12 @@
 //! The hub checks goals on a schedule (DW-729): no boss turn and no watch
-//! keeps them going. The night of 22 November replayed: a goal of two
-//! parts, CI per job at most 5 minutes and one judged; its session works
-//! on another branch all night, the boss's checkpoints from those commits
-//! are refused as off the goal, CI stays at 22 minutes, and the boss arms
-//! no watch. It is woken at the stall window, at twice and at four times
-//! it, the person's roundup is given one note at four times, and the hub
-//! tells the person nothing directly. A met reading closes the goal, its
+//! keeps them going (the night of 22 November is replayed in
+//! [`super::plan_watch`]). A met reading closes the goal, its
 //! ticket and its plan's watches without a word, and wakes the boss's
 //! closing turn; a plan the person
 //! paused is read and wakes no one; a boss message held from a goal's
 //! session wakes its boss once.
 
-use super::goals::{boss_on, run, ACTS};
+use super::goals::{boss_on, ACTS};
 use super::plan_watch::{asked_with, turn_ends};
 use super::*;
 use workforce_desk::boss_watch::{NewWatch, WatchKind};
@@ -22,24 +17,37 @@ use workforce_desk::model::SessionView;
 use workforce_desk::plan::{Draft, DraftTicket, Paused};
 use workforce_desk::NewPlan;
 
-/// Act, watching, with a stall window of half a second.
-fn checking() -> String {
-    format!("{ACTS}[oversight.work]\nstall_minutes = 5\n")
+/// Act, watching, with a stall window of `minutes` crew minutes (a tenth of
+/// a second each).
+pub(super) fn checking(minutes: u32) -> String {
+    format!("{ACTS}[oversight.work]\nstall_minutes = {minutes}\n")
 }
 
-const STALLED: &str = "No progress toward";
+pub(super) const STALLED: &str = "No progress toward";
 
 /// GitHub as the person's key reads it: acme/mantis's main has three
 /// finished runs of CI since `from`, each job of each taking `minutes`;
 /// a commit compared with a branch is `compared` to it.
-async fn mantis(
+pub(super) async fn mantis(
     from: chrono::DateTime<chrono::Utc>,
     minutes: i64,
     compared: &str,
 ) -> wiremock::MockServer {
+    let gh = wiremock::MockServer::start().await;
+    mantis_reads(&gh, from, minutes, compared).await;
+    gh
+}
+
+/// `gh` answering as [`mantis`] says, whatever it answered before.
+async fn mantis_reads(
+    gh: &wiremock::MockServer,
+    from: chrono::DateTime<chrono::Utc>,
+    minutes: i64,
+    compared: &str,
+) {
     use wiremock::matchers::{method, path, path_regex};
-    use wiremock::{Mock, MockServer, ResponseTemplate};
-    let gh = MockServer::start().await;
+    use wiremock::{Mock, ResponseTemplate};
+    gh.reset().await;
     let stamp = |m: i64| (from + chrono::Duration::minutes(m)).to_rfc3339();
     let conclusion = if minutes <= 5 { "success" } else { "failure" };
     let runs: Vec<Value> = [9u64, 8, 7]
@@ -60,7 +68,7 @@ async fn mantis(
             ResponseTemplate::new(200)
                 .set_body_json(json!({ "total_count": runs.len(), "workflow_runs": runs })),
         )
-        .mount(&gh)
+        .mount(gh)
         .await;
     Mock::given(method("GET"))
         .and(path_regex(r"^/repos/acme/mantis/actions/runs/[0-9]+/jobs$"))
@@ -69,20 +77,19 @@ async fn mantis(
             "id": 1, "name": "test", "status": "completed", "conclusion": conclusion,
             "started_at": stamp(0), "completed_at": stamp(minutes), "steps": [] }] }),
         ))
-        .mount(&gh)
+        .mount(gh)
         .await;
     Mock::given(method("GET"))
         .and(path_regex(r"^/repos/acme/mantis/compare/.+$"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "status": compared, "ahead_by": 0, "behind_by": 3, "total_commits": 0, "files": [] })))
-        .mount(&gh)
+        .mount(gh)
         .await;
-    gh
 }
 
 /// Each CI job on acme/mantis's main at most 5 minutes, three runs in a
 /// row, and, when `judged`, only the services a change touches tested.
-fn fast_ci(judged: bool) -> GoalResult {
+pub(super) fn fast_ci(judged: bool) -> GoalResult {
     let mut parts = vec![Measure::Ci {
         repo: "acme/mantis".into(),
         workflow: None,
@@ -106,7 +113,11 @@ fn fast_ci(judged: bool) -> GoalResult {
 
 /// An approved goal plan of one ticket in `folder`, measured by `r`, its
 /// session started by the runner.
-async fn goal_running(d: &Desk, folder: &Path, r: GoalResult) -> (uuid::Uuid, SessionView) {
+pub(super) async fn goal_running(
+    d: &Desk,
+    folder: &Path,
+    r: GoalResult,
+) -> (uuid::Uuid, SessionView) {
     let p = d
         .propose_plan(
             NewPlan {
@@ -151,86 +162,20 @@ async fn goal_running(d: &Desk, folder: &Path, r: GoalResult) -> (uuid::Uuid, Se
 
 /// How many of the boss's plan turns were woken with a stall of `part`:
 /// each wake is one turn, and the boss here answers each in one go.
-async fn stalls_said(llm: &wiremock::MockServer, part: &str) -> usize {
+pub(super) async fn stalls_said(llm: &wiremock::MockServer, part: &str) -> usize {
     asked_with(llm, &[STALLED, part]).await
 }
 
-const CI: &str = "on CI on main of acme/mantis";
-const JUDGED: &str = "on “only the services";
-
-#[tokio::test(flavor = "multi_thread")]
-async fn the_night_of_22_november() {
-    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
-        let dir = tempfile::tempdir().unwrap();
-        let base = std::fs::canonicalize(dir.path()).unwrap();
-        let gh = mantis(chrono::Utc::now(), 22, "diverged").await;
-        let (overseer, crew, d, llm) = boss_on(&base, pool, &checking(), &gh).await;
-        let (id, s) = goal_running(&d, &base, fast_ci(true)).await;
-        // It finishes its turn on another branch: Done, all night.
-        turn_ends(&d, &base, &s, "Pushed the cache work to spike-cache.").await;
-
-        // Read with no boss turn and no watch.
-        let read = eventually("the goal read on its own", async || {
-            let p = d.plan(id).await.ok()?;
-            let part = p.goal?.parts.first()?.newest.clone()?;
-            (part.value == Some(22.0)).then_some(part)
-        })
-        .await;
-        assert!(!read.met);
-        assert!(d
-            .store()
-            .watches_open("desk", PERSON)
-            .await
-            .unwrap()
-            .is_empty());
-
-        // Its checkpoints from those commits are refused as off the goal.
-        let r = run(
-            &overseer,
-            "crew.plan_update",
-            json!({ "plan_id": id.to_string(), "why": "Showing the work",
-                    "checkpoint": { "part": 2, "said": "Only api's tests ran",
-                                    "evidence": [{ "kind": "commit", "repo": "acme/mantis", "sha": "d05e8a4c0ffee" }] } }),
-        )
-        .await;
-        assert!(!r.success, "{r:?}");
-        assert!(
-            r.error.as_deref().unwrap_or_default().contains("isn't the goal's own work"),
-            "{r:?}"
-        );
-
-        // Woken at the window, at twice it and at four times it, each part
-        // on its own; the roundup is given a note at four times.
-        let notes = eventually("a note for the roundup", async || {
-            let n = crew.goal_notes("desk", chrono::Utc::now());
-            (!n.is_empty()).then_some(n)
-        })
-        .await;
-        eventually("its third spell's turn", async || {
-            (stalls_said(&llm, CI).await >= 3).then_some(())
-        })
-        .await;
-        assert_eq!(stalls_said(&llm, CI).await, 3, "once a spell, never again within one");
-        assert_eq!(stalls_said(&llm, JUDGED).await, 3, "both parts in each wake");
-        assert!(asked_with(&llm, &[CI, "22 minutes"]).await > 0);
-        assert_eq!(notes.len(), 1, "{notes:?}");
-        assert!(notes[0].starts_with("No progress on “Mantis CI"), "{notes:?}");
-        // No checkpoint reset the CI part, and the person was told nothing.
-        let p = d.plan(id).await.unwrap();
-        assert!(p.facts.iter().all(|f| !f.checked));
-        assert_eq!(super::decides_at_once::said(&overseer, &[STALLED]), 0);
-        assert_eq!(super::decides_at_once::said(&overseer, &["hasn't moved in"]), 0);
-    })
-    .await;
-}
+pub(super) const CI: &str = "on CI on main of acme/mantis";
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_met_reading_closes_the_goal_and_ends_its_plans_watches_without_a_word() {
     with_test_pool(workforce_desk::store::build_pool, |pool| async move {
         let dir = tempfile::tempdir().unwrap();
         let base = std::fs::canonicalize(dir.path()).unwrap();
-        let gh = mantis(chrono::Utc::now(), 4, "ahead").await;
-        let (_, _, d, llm) = boss_on(&base, pool, &checking(), &gh).await;
+        let from = chrono::Utc::now();
+        let gh = mantis(from, 22, "ahead").await;
+        let (_, _, d, llm) = boss_on(&base, pool, &checking(5), &gh).await;
         let (id, _) = goal_running(&d, &base, fast_ci(false)).await;
         let w = d
             .store()
@@ -254,6 +199,8 @@ async fn a_met_reading_closes_the_goal_and_ends_its_plans_watches_without_a_word
             workforce_desk::boss_watch::Opened::Started(w) => w,
             other => panic!("{other:?}"),
         };
+        // CI gets fast: its next reading meets the goal.
+        mantis_reads(&gh, from, 4, "ahead").await;
         let p = eventually("the goal met", async || {
             let p = d.plan(id).await.ok()?;
             p.summary.plan.met.is_some().then_some(p)
@@ -286,7 +233,7 @@ async fn a_goal_the_person_paused_is_read_and_wakes_no_one_one_paused_for_budget
         let dir = tempfile::tempdir().unwrap();
         let base = std::fs::canonicalize(dir.path()).unwrap();
         let gh = mantis(chrono::Utc::now(), 22, "diverged").await;
-        let (_, crew, d, llm) = boss_on(&base, pool, &checking(), &gh).await;
+        let (_, crew, d, llm) = boss_on(&base, pool, &checking(5), &gh).await;
         let (id, s) = goal_running(&d, &base, fast_ci(false)).await;
         turn_ends(&d, &base, &s, "Done for now.").await;
         d.pause_plan(id, Paused::Person, &By::you()).await.unwrap();
@@ -326,7 +273,7 @@ async fn a_boss_message_held_from_a_goals_session_wakes_its_boss_once() {
         let dir = tempfile::tempdir().unwrap();
         let base = std::fs::canonicalize(dir.path()).unwrap();
         let gh = mantis(chrono::Utc::now(), 4, "ahead").await;
-        let (_, crew, d, llm) = boss_on(&base, pool, &checking(), &gh).await;
+        let (_, crew, d, llm) = boss_on(&base, pool, &checking(5), &gh).await;
         let (_, s) = goal_running(&d, &base, fast_ci(true)).await;
         // Its turn never ends: the boss's message waits behind it.
         let mut held = LineMessage::new(

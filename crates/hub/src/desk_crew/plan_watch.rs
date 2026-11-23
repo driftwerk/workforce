@@ -60,7 +60,7 @@ const STOPPED_KEY: &str = "plan-stopped:";
 /// What the watchdog did, once each, by what it was about.
 #[derive(Default)]
 pub(crate) struct Watch {
-    done: HashSet<String>,
+    pub(super) done: HashSet<String>,
 }
 
 impl Watch {
