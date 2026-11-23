@@ -95,7 +95,7 @@ async fn running(d: &Desk, folder: &Path, n: usize) -> (uuid::Uuid, Vec<SessionV
 }
 
 /// Ends `s`'s turn with `said`, as its engine would.
-async fn turn_ends(d: &Desk, base: &Path, s: &SessionView, said: &str) -> SessionView {
+pub(super) async fn turn_ends(d: &Desk, base: &Path, s: &SessionView, said: &str) -> SessionView {
     let url = hook_url(base, s.id).await;
     hook(
         &url,
@@ -141,7 +141,7 @@ async fn ticket(d: &Desk, id: uuid::Uuid, key: &str) -> workforce_desk::PlanTick
 }
 
 /// How many of the boss's turns were asked with every one of `words`.
-async fn asked_with(llm: &wiremock::MockServer, words: &[&str]) -> usize {
+pub(super) async fn asked_with(llm: &wiremock::MockServer, words: &[&str]) -> usize {
     llm.received_requests()
         .await
         .unwrap_or_default()

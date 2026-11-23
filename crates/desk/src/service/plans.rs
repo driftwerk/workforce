@@ -2621,8 +2621,9 @@ impl Desk {
     }
 
     /// Plan `id`'s goal is met as `met` says: kept once, and the ticket
-    /// standing for it moved to Done by Desk, as well as it can be: a move
-    /// that fails is logged and leaves the goal met. False when it was met
+    /// standing for it moved to Done by Desk and its plan's watches ended
+    /// without a word, as well as it can be: a step that fails is logged
+    /// and leaves the goal met. False when it was met
     /// already, and nothing else is done.
     pub async fn goal_met(&self, id: Uuid, met: &Met) -> Result<bool, DeskError> {
         if !self.0.store.mark_met(id, met).await.map_err(internal)? {
@@ -2630,6 +2631,10 @@ impl Desk {
         }
         if let Err(e) = self.goal_ticket_done(id, met).await {
             tracing::warn!(plan = %id, error = %e, "a met goal's ticket wasn't moved to Done");
+        }
+        // Nothing is waited on for it now: its closing turn says so.
+        if let Err(e) = self.0.store.watches_end_plan(id, "its goal is met").await {
+            tracing::warn!(plan = %id, error = %e, "a met goal's watches weren't ended");
         }
         self.plan_touched(id).await;
         Ok(true)

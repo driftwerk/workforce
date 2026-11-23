@@ -552,19 +552,17 @@ impl CrewHub {
     }
 
     /// Whether a checkpoint showing `evidence` toward judged part `part` of
-    /// goal plan `detail` moves it on (designs/boss-keeps-goals.md §7.3),
+    /// goal plan `detail`, its result `r`, moves it on (designs/boss-keeps-goals.md §7.3),
     /// looked up on GitHub as the person: refused in the boss's words when
     /// it doesn't.
     pub(super) async fn checkpoint_shown(
         &self,
         service: &AgentService,
         detail: &PlanDetail,
+        r: &goal::GoalResult,
         part: u16,
         evidence: &[Evidence],
     ) -> Result<(), String> {
-        let Some(r) = detail.summary.plan.result.as_ref() else {
-            return Err("This plan has no result to show a checkpoint toward.".into());
-        };
         let read: Vec<goal::Reading> = detail
             .goal
             .iter()

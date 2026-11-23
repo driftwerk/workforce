@@ -12,8 +12,8 @@ use serde_json::{json, Value};
 use uuid::Uuid;
 use workforce_desk::crew::{self, Party};
 use workforce_desk::goal::{
-    self, Evidence, Fact, FactKind, GoalResult, Measure, Met, MetBy, NotSaid, Proposal, Reading,
-    Said,
+    self, Evidence, Fact, FactKind, GoalResult, Measure, Met, MetBy, NotSaid, Progress, Proposal,
+    Reading, Said,
 };
 use workforce_desk::plan::Plan;
 use workforce_desk::PlanDetail;
@@ -189,6 +189,15 @@ fn evidence_schema() -> Value {
     ] } })
 }
 
+/// `r` met as `progress` reads it at `at`, in its own words.
+pub(super) fn met_by_reading(r: &GoalResult, progress: &Progress, at: DateTime<Utc>) -> Met {
+    Met {
+        at,
+        by: MetBy::Result,
+        why: format!("it reads met: {}", goal::progress_line(r, progress)),
+    }
+}
+
 /// A result as a tool's input says it, checked.
 pub(super) fn result_of(v: &Value) -> Result<GoalResult, String> {
     let r: GoalResult =
@@ -267,6 +276,8 @@ pub(super) struct Recorded {
     pub said: String,
     pub evidence: Vec<Evidence>,
     pub replaces: Option<Uuid>,
+    /// A checkpoint whose evidence was found to be the goal's own new work.
+    pub shown: bool,
 }
 
 /// The facts and checkpoint a `crew.plan_update` input records, checked
@@ -305,6 +316,7 @@ pub(super) fn recorded_of(input: &Value, r: Option<&GoalResult>) -> Result<Vec<R
                     ),
                     None => None,
                 },
+                shown: false,
             });
         }
     }
@@ -329,6 +341,7 @@ pub(super) fn recorded_of(input: &Value, r: Option<&GoalResult>) -> Result<Vec<R
             said: said(c)?,
             evidence,
             replaces: None,
+            shown: false,
         });
     }
     Ok(out)
@@ -454,7 +467,15 @@ impl CrewHub {
         if repaired.is_some() && result_to.is_some() {
             return Err("Repair a part or change the result, not both.".into());
         }
-        let recorded = recorded_of(input, result_to.as_ref().or(p.result.as_ref()))?;
+        let mut recorded = recorded_of(input, result_to.as_ref().or(p.result.as_ref()))?;
+        if let Some(r) = result_to.as_ref().or(p.result.as_ref()) {
+            for c in recorded.iter_mut().filter(|c| c.kind == FactKind::Checkpoint) {
+                let part = c.part.unwrap_or_default();
+                self.checkpoint_shown(&b.service, detail, r, part, &c.evidence)
+                    .await?;
+                c.shown = true;
+            }
+        }
         let quoted = input["person_said"]
             .as_str()
             .map(str::trim)
@@ -739,15 +760,31 @@ impl CrewHub {
         .await
     }
 
-    /// Plan `p`'s measured parts read again, as the person, and kept: a
-    /// part that can't be read where it says is kept as a failed reading,
-    /// never stopping what reads it. The goal is met when every part reads
-    /// met. The plan as it is after, when it has an agreed goal to read.
+    /// Plan `p`'s goal read now and kept, once it reads met kept met, as a
+    /// plan turn reads it: the plan fresh, none when it isn't read.
     pub(super) async fn goal_reread(
         &self,
         service: &AgentService,
         p: &PlanDetail,
     ) -> Option<PlanDetail> {
+        let fresh = self.read_kept(service, p).await?;
+        let (Some(r), Some(progress)) = (&fresh.summary.plan.result, &fresh.goal) else {
+            return Some(fresh);
+        };
+        if !goal::met(progress) {
+            return Some(fresh);
+        }
+        let id = fresh.summary.plan.id;
+        if let Err(e) = self.desk.goal_met(id, &met_by_reading(r, progress, crew::now())).await {
+            tracing::warn!(plan = %id, error = %e, "a goal read met wasn't kept met");
+        }
+        self.desk.plan(id).await.ok()
+    }
+
+    /// Plan `p`'s measured parts read now as the person and kept: the plan
+    /// fresh, none when it isn't read (no goal agreed, met already, not
+    /// running or paused, or nothing measured).
+    pub(super) async fn read_kept(&self, service: &AgentService, p: &PlanDetail) -> Option<PlanDetail> {
         use workforce_desk::plan::PlanState;
         let plan = &p.summary.plan;
         let r = plan.result.as_ref()?;
@@ -778,24 +815,12 @@ impl CrewHub {
             })
             .collect();
         self.keep_readings(plan.id, r, &readings).await;
-        let fresh = self.desk.plan(plan.id).await.ok()?;
-        let Some(progress) = fresh.goal.as_ref().filter(|g| goal::met(g)) else {
-            return Some(fresh);
-        };
-        let met = Met {
-            at,
-            by: MetBy::Result,
-            why: format!("it reads met: {}", goal::progress_line(r, progress)),
-        };
-        if let Err(e) = self.desk.goal_met(plan.id, &met).await {
-            tracing::warn!(plan = %plan.id, error = %e, "a goal read met wasn't kept met");
-        }
         self.desk.plan(plan.id).await.ok()
     }
 
     /// `read` run as the person `service` works for: what GitHub is read
     /// as, whoever's turn it is.
-    async fn as_person<T>(
+    pub(super) async fn as_person<T>(
         &self,
         service: &AgentService,
         read: impl std::future::Future<Output = T>,
@@ -884,7 +909,7 @@ impl CrewHub {
     ) -> Result<Vec<(Uuid, bool)>, String> {
         let mut kept = Vec::with_capacity(recorded.len());
         for r in recorded {
-            let checked = self.evidence_found(service, &r.evidence).await;
+            let checked = r.shown || self.evidence_found(service, &r.evidence).await;
             let f = Fact {
                 id: Uuid::new_v4(),
                 plan,

@@ -279,16 +279,6 @@ async fn unbound_sweeps_its_scope_with_what_its_look_found_and_never_for_nothing
         let base = std::fs::canonicalize(dir.path()).unwrap();
         let (_, crew, d, llm) = overseeing(&base, pool, "ok", UNBOUND, &[]).await;
         super::boss_allows(&llm).await;
-        let (_, o) = crew.overseer_service().unwrap();
-        let web = new_session(&d, &base, "acme-web").await;
-        let party = Party::session(&web);
-        let waits = Event::new(
-            Kind::NeedsYou,
-            party.clone(),
-            Some(party.clone()),
-            "needs you",
-        );
-        assert!(crew.trigger_for(&waits, "desk", &o).is_some());
         // Nothing found and no work kept: several sweeps' worth of minutes
         // go by without one.
         tokio::time::sleep(Duration::from_millis(800)).await;
@@ -299,6 +289,16 @@ async fn unbound_sweeps_its_scope_with_what_its_look_found_and_never_for_nothing
                 .is_none_or(|c| !c.prompt.contains("Regular sweep")),
             "{latest:?}"
         );
+        let (_, o) = crew.overseer_service().unwrap();
+        let web = new_session(&d, &base, "acme-web").await;
+        let party = Party::session(&web);
+        let waits = Event::new(
+            Kind::NeedsYou,
+            party.clone(),
+            Some(party.clone()),
+            "needs you",
+        );
+        assert!(crew.trigger_for(&waits, "desk", &o).is_some());
         // Its look finds a session asking: the sweep comes with it.
         let url = hook_url(&base, web.id).await;
         super::answers_questions::asks(&url, "Ship it?").await;

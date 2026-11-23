@@ -13,7 +13,7 @@ use workforce_desk::plan::PlanState;
 
 use super::plans::{judged, person_says};
 
-const ACTS: &str = "[oversight]\nenabled = true\nlevel = \"act\"\n[oversight.act]\nhand_out_work = true\nnudge = true\n";
+pub(super) const ACTS: &str = "[oversight]\nenabled = true\nlevel = \"act\"\n[oversight.act]\nhand_out_work = true\nnudge = true\n";
 
 const SUGGESTS: &str = "[oversight]\nenabled = true\nlevel = \"suggest\"\n";
 
@@ -51,7 +51,7 @@ async fn github() -> wiremock::MockServer {
 
 /// The boss at `oversight`, its GitHub `gh` with the person's own key; its
 /// DM open, its crew started.
-async fn boss_on(
+pub(super) async fn boss_on(
     dir: &Path,
     pool: workforce_postgres::PostgresPool,
     oversight: &str,
@@ -101,7 +101,7 @@ async fn boss_on(
     (overseer, crew, d, llm)
 }
 
-async fn run(boss: &AgentService, tool: &str, input: Value) -> workforce_agent::tools::ToolResult {
+pub(super) async fn run(boss: &AgentService, tool: &str, input: Value) -> workforce_agent::tools::ToolResult {
     boss.tools.get(tool).unwrap().execute(input).await.unwrap()
 }
 

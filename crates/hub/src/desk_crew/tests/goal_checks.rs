@@ -5,8 +5,9 @@
 //! are refused as off the goal, CI stays at 22 minutes, and the boss arms
 //! no watch. It is woken at the stall window, at twice and at four times
 //! it, the person's roundup is given one note at four times, and the hub
-//! tells the person nothing directly. A met reading closes the goal, ends
-//! its plan's watches without a word and finishes it; a plan the person
+//! tells the person nothing directly. A met reading closes the goal, its
+//! ticket and its plan's watches without a word, and wakes the boss's
+//! closing turn; a plan the person
 //! paused is read and wakes no one; a boss message held from a goal's
 //! session wakes its boss once.
 
@@ -18,7 +19,7 @@ use workforce_desk::crew::Party;
 use workforce_desk::goal::{GoalResult, Measure, Per, Want};
 use workforce_desk::line::{LineKind, LineMessage};
 use workforce_desk::model::SessionView;
-use workforce_desk::plan::{Draft, DraftTicket, Paused, PlanState};
+use workforce_desk::plan::{Draft, DraftTicket, Paused};
 use workforce_desk::NewPlan;
 
 /// Act, watching, with a stall window of half a second.
@@ -134,17 +135,26 @@ async fn goal_running(d: &Desk, folder: &Path, r: GoalResult) -> (uuid::Uuid, Se
     (id, s)
 }
 
-/// How many stall lines the boss's plan turns were given so far: each
-/// turn's request carries the plan conversation's earlier turns too.
-async fn stalls_said(llm: &wiremock::MockServer) -> usize {
+/// The distinct stall lines the boss's plan turns were given so far that
+/// name `part`: a turn's request carries the plan's earlier turns too.
+async fn stalls_said(llm: &wiremock::MockServer, part: &str) -> usize {
     llm.received_requests()
         .await
         .unwrap_or_default()
         .iter()
-        .map(|r| String::from_utf8_lossy(&r.body).matches(STALLED).count())
-        .max()
-        .unwrap_or_default()
+        .flat_map(|r| {
+            let body = String::from_utf8_lossy(&r.body).into_owned();
+            body.split(STALLED)
+                .skip(1)
+                .filter_map(|l| l.split_once(". What Desk sees").map(|(l, _)| l.to_string()))
+                .collect::<Vec<_>>()
+        })
+        .filter(|l| l.contains(part))
+        .collect::<std::collections::HashSet<_>>()
+        .len()
 }
+
+const CI: &str = "on CI on main of acme/mantis";
 
 #[tokio::test(flavor = "multi_thread")]
 async fn the_night_of_22_november() {
@@ -176,7 +186,7 @@ async fn the_night_of_22_november() {
         let r = run(
             &overseer,
             "crew.plan_update",
-            json!({ "plan_id": id.to_string(), "reason": "Showing the work",
+            json!({ "plan_id": id.to_string(), "why": "Showing the work",
                     "checkpoint": { "part": 2, "said": "Only api's tests ran",
                                     "evidence": [{ "kind": "commit", "repo": "acme/mantis", "sha": "d05e8a4c0ffee" }] } }),
         )
@@ -187,14 +197,16 @@ async fn the_night_of_22_november() {
             "{r:?}"
         );
 
-        // Woken at the window, at twice it and at four times it.
-        eventually("three spells said", async || {
-            (stalls_said(&llm).await >= 3).then_some(())
+        // Woken at the window, at twice it and at four times it, each part
+        // on its own; the roundup is given a note at four times.
+        let notes = eventually("a note for the roundup", async || {
+            let n = crew.goal_notes("desk", chrono::Utc::now());
+            (!n.is_empty()).then_some(n)
         })
         .await;
-        assert_eq!(stalls_said(&llm).await, 3, "once a spell, never again within one");
-        assert!(asked_with(&llm, &["on CI on main of acme/mantis", "22 minutes"]).await > 0);
-        let notes = crew.goal_notes("desk", chrono::Utc::now());
+        assert_eq!(stalls_said(&llm, CI).await, 3, "once a spell, never again within one");
+        assert_eq!(stalls_said(&llm, "on “only the services").await, 3);
+        assert!(asked_with(&llm, &[CI, "22 minutes"]).await > 0);
         assert_eq!(notes.len(), 1, "{notes:?}");
         assert!(notes[0].starts_with("No progress on “Mantis CI"), "{notes:?}");
         // No checkpoint reset the CI part, and the person was told nothing.
@@ -207,12 +219,12 @@ async fn the_night_of_22_november() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_met_reading_finishes_the_goal_and_ends_its_plans_watches_without_a_word() {
+async fn a_met_reading_closes_the_goal_and_ends_its_plans_watches_without_a_word() {
     with_test_pool(workforce_desk::store::build_pool, |pool| async move {
         let dir = tempfile::tempdir().unwrap();
         let base = std::fs::canonicalize(dir.path()).unwrap();
         let gh = mantis(chrono::Utc::now(), 4, "ahead").await;
-        let (_, _, d, _) = boss_on(&base, pool, &checking(), &gh).await;
+        let (_, _, d, llm) = boss_on(&base, pool, &checking(), &gh).await;
         let (id, _) = goal_running(&d, &base, fast_ci(false)).await;
         let w = d
             .store()
@@ -236,13 +248,17 @@ async fn a_met_reading_finishes_the_goal_and_ends_its_plans_watches_without_a_wo
             workforce_desk::boss_watch::Opened::Started(w) => w,
             other => panic!("{other:?}"),
         };
-        let p = eventually("the goal met and its plan finished", async || {
+        let p = eventually("the goal met", async || {
             let p = d.plan(id).await.ok()?;
-            (p.summary.plan.state == PlanState::Done).then_some(p)
+            p.summary.plan.met.is_some().then_some(p)
         })
         .await;
-        let met = p.summary.plan.met.expect("met");
-        assert!(met.why.contains("met"), "{met:?}");
+        let met = p.summary.plan.met.clone().expect("met");
+        assert!(met.why.starts_with("it reads met:"), "{met:?}");
+        eventually("its closing turn", async || {
+            (asked_with(&llm, &["The goal is met: it reads met"]).await > 0).then_some(())
+        })
+        .await;
         assert!(d
             .store()
             .watches_open("desk", PERSON)
@@ -273,7 +289,7 @@ async fn a_goal_the_person_paused_is_read_and_wakes_no_one_one_paused_for_budget
         })
         .await;
         tokio::time::sleep(Duration::from_millis(1500)).await;
-        assert_eq!(stalls_said(&llm).await, 0, "the person's pause wakes no one");
+        assert_eq!(stalls_said(&llm, CI).await, 0, "the person's pause wakes no one");
         assert!(crew.goal_notes("desk", chrono::Utc::now()).is_empty());
 
         d.resume_plan(id, &[Paused::Person], &By::you()).await.unwrap();
@@ -281,7 +297,7 @@ async fn a_goal_the_person_paused_is_read_and_wakes_no_one_one_paused_for_budget
             .await
             .unwrap();
         eventually("a budget pause woken", async || {
-            (stalls_said(&llm).await > 0).then_some(())
+            (stalls_said(&llm, CI).await > 0).then_some(())
         })
         .await;
     })
@@ -296,7 +312,7 @@ async fn a_boss_message_held_from_a_goals_session_wakes_its_boss_once() {
         let gh = mantis(chrono::Utc::now(), 4, "ahead").await;
         let (_, crew, d, llm) = boss_on(&base, pool, &checking(), &gh).await;
         let (_, s) = goal_running(&d, &base, fast_ci(true)).await;
-        d.stop_session(s.id, &By::you()).await.unwrap();
+        // Its turn never ends: the boss's message waits behind it.
         let mut held = LineMessage::new(
             Party::manager("desk", "Desk"),
             Party::session(&s),
