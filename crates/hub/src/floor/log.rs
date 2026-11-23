@@ -9,7 +9,7 @@ use tracing::{info, warn};
 use workforce_common::channels::desk::DeskSignal;
 use workforce_common::settings::WorkforceConfig;
 use workforce_desk::floor::{Scope, Turn, TurnLog, TurnOp};
-use workforce_postgres::PostgresConfig;
+use workforce_postgres::{PostgresConfig, PostgresError};
 
 use super::gists::Gists;
 use super::plans::Plans;
@@ -26,6 +26,10 @@ const KEPT_DAYS: i64 = 8;
 const BACKLOG: usize = 1024;
 /// How often a full backlog is reported.
 const DROP_WARN_EVERY: Duration = Duration::from_secs(60);
+/// How many times an op is tried while what stops it is passing.
+const TRIES: u32 = 3;
+/// The wait before an op is tried again, doubled each time.
+const RETRY_FIRST: Duration = Duration::from_millis(200);
 
 static INSTALLED: OnceLock<Installed> = OnceLock::new();
 
@@ -153,7 +157,7 @@ impl Logged {
         let writer = Arc::clone(&store);
         tokio::spawn(async move {
             while let Some(op) = rx.recv().await {
-                match writer.apply(&op).await {
+                match applied(|| writer.apply(&op), RETRY_FIRST).await {
                     Ok(Some(owner)) => {
                         gists.saw(&op);
                         if op.lists() {
@@ -161,9 +165,13 @@ impl Logged {
                         }
                     }
                     Ok(None) => {}
-                    Err(e) => {
-                        warn!(target: "floor", error = %format!("{e:#}"), "recording a turn failed")
-                    }
+                    Err(e) => warn!(
+                        target: "floor",
+                        op = op.kind(),
+                        turn = ?op.turn(),
+                        error = %format!("{e:#}"),
+                        "recording a turn failed; dropped"
+                    ),
                 }
             }
         });
@@ -173,6 +181,53 @@ impl Logged {
             warned: Mutex::new(None),
         }
     }
+}
+
+/// What `apply` answered once it succeeded, or failed for good, or failed
+/// [`TRIES`] times over something passing, waiting `wait`, then twice that,
+/// between tries.
+async fn applied<T, F, Fut>(mut apply: F, mut wait: Duration) -> eyre::Result<T>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = eyre::Result<T>>,
+{
+    let mut tried = 1;
+    loop {
+        match apply().await {
+            Err(e) if tried < TRIES && passing(&e) => {
+                tokio::time::sleep(wait).await;
+                wait *= 2;
+                tried += 1;
+            }
+            answered => return answered,
+        }
+    }
+}
+
+/// Whether `e` is one a moment can clear: no connection to be had or kept,
+/// or Postgres giving up on a lock, a serialization, a deadlock or its own
+/// load.
+fn passing(e: &eyre::Report) -> bool {
+    e.chain().any(|cause| {
+        cause.is::<std::io::Error>()
+            || cause.downcast_ref::<PostgresError>().is_some_and(|pg| {
+                matches!(
+                    pg,
+                    PostgresError::Pool(_) | PostgresError::LockNotAvailable(_)
+                )
+            })
+            || cause
+                .downcast_ref::<tokio_postgres::Error>()
+                .is_some_and(|pg| {
+                    pg.is_closed()
+                        || pg.code().is_some_and(|state| {
+                            let code = state.code();
+                            ["08", "40001", "40P01", "53300", "55P03", "57P01", "57P03"]
+                                .iter()
+                                .any(|passing| code.starts_with(passing))
+                        })
+                })
+    })
 }
 
 #[async_trait]
@@ -244,5 +299,56 @@ mod tests {
             began.elapsed(),
             Duration::from_secs(1 + 2 + 4 + 8 + 16 + 32 + 60 + 60 + 60)
         );
+    }
+
+    /// Each try of an op answering `answers` in turn: what [`applied`]
+    /// answered, how many times it tried, and how long it took.
+    async fn tried(answers: Vec<eyre::Result<u8>>) -> (eyre::Result<u8>, usize, Duration) {
+        let answers = Mutex::new(answers.into_iter());
+        let tries = AtomicUsize::new(0);
+        let began = tokio::time::Instant::now();
+        let answered = applied(
+            || {
+                tries.fetch_add(1, Ordering::SeqCst);
+                let next = answers.lock().next().expect("tried past its answers");
+                async move { next }
+            },
+            RETRY_FIRST,
+        )
+        .await;
+        (answered, tries.into_inner(), began.elapsed())
+    }
+
+    fn pool_timeout() -> eyre::Result<u8> {
+        Err(PostgresError::Pool("timed out waiting for a connection".into()).into())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_op_a_passing_error_stopped_is_tried_again_and_one_that_cant_be_never() {
+        let (answered, tries, took) = tried(vec![pool_timeout(), pool_timeout(), Ok(7)]).await;
+        assert_eq!(answered.unwrap(), 7);
+        assert_eq!((tries, took), (3, RETRY_FIRST * 3));
+
+        let (answered, tries, took) =
+            tried(vec![pool_timeout(), pool_timeout(), pool_timeout()]).await;
+        assert!(passing(&answered.unwrap_err()));
+        assert_eq!(
+            (tries, took),
+            (TRIES as usize, RETRY_FIRST * 3),
+            "then dropped"
+        );
+
+        let (answered, tries, took) = tried(vec![Err(PostgresError::Query(
+            "no such column".into(),
+        )
+        .into())])
+        .await;
+        assert!(!passing(&answered.unwrap_err()));
+        assert_eq!((tries, took), (1, Duration::ZERO), "dropped at once");
+
+        let lost = std::io::Error::from(std::io::ErrorKind::ConnectionReset);
+        assert!(passing(
+            &eyre::Report::new(lost).wrap_err("writing the turn")
+        ));
     }
 }

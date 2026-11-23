@@ -350,6 +350,23 @@ impl TurnOp {
         !matches!(self, Self::Progress { .. })
     }
 
+    /// What kind of write it is, as a log line names it.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::Begin { .. } => "begin",
+            Self::Progress { .. } => "progress",
+            Self::Wait { .. } => "wait",
+            Self::Unwait { .. } => "unwait",
+            Self::Background { .. } => "background",
+            Self::End { .. } => "end",
+            Self::Settle { .. } => "settle",
+            Self::Forget { .. } => "forget",
+            Self::ForgetGists { .. } => "forget gists",
+            Self::CarryPurpose { .. } => "carry purpose",
+            Self::ForgetCarried { .. } => "forget carried",
+        }
+    }
+
     /// The one turn it writes to, if it writes to one already logged.
     pub fn turn(&self) -> Option<Uuid> {
         match self {
