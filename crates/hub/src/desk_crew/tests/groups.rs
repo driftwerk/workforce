@@ -454,6 +454,7 @@ fn pointed_at(name: &str, mine: Option<&str>, other: &Client, dir: &Path) -> Vec
             (
                 json!({
                     "goal": "Ship it",
+                    "result": super::plans::judged(),
                     "board": other.ticket.split('-').next().unwrap_or_default(),
                     "tickets": [{ "title": "Look around", "folder": dir.to_string_lossy() }],
                 }),
@@ -462,6 +463,7 @@ fn pointed_at(name: &str, mine: Option<&str>, other: &Client, dir: &Path) -> Vec
             (
                 json!({
                     "goal": "Ship it",
+                    "result": super::plans::judged(),
                     "new_board": { "name": "Mine now", "group": other.group },
                     "tickets": [{ "title": "Look around", "folder": dir.to_string_lossy() }],
                 }),
@@ -471,6 +473,7 @@ fn pointed_at(name: &str, mine: Option<&str>, other: &Client, dir: &Path) -> Vec
             (
                 json!({
                     "goal": "Ship it",
+                    "result": super::plans::judged(),
                     "tickets": [{ "adopt": other.ticket, "folder": dir.to_string_lossy() }],
                 }),
                 true,

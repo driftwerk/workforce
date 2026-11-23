@@ -323,6 +323,18 @@ const CLAIMS: &[(&str, &str, &str, Claim)] = &[
     ),
     (
         "desk",
+        "plan_facts",
+        "made_by",
+        NotPersonal("the boss agent or `you`, the one person of the Desk, as a party"),
+    ),
+    (
+        "desk",
+        "plans",
+        "met_by",
+        NotPersonal("how a goal was met: `result` or `person`, never an id"),
+    ),
+    (
+        "desk",
         "plan_revisions",
         "made_by",
         NotPersonal("the boss agent or `you`, the one person of the Desk, as a party"),
