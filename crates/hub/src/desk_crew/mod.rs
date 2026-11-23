@@ -43,6 +43,7 @@ mod extras;
 mod find;
 mod github;
 mod github_seen;
+mod goal;
 mod handover;
 mod held;
 mod idle;
@@ -53,6 +54,7 @@ mod line;
 mod logins;
 pub(crate) mod machine_grants;
 mod machines;
+mod measure;
 mod mind;
 pub(crate) mod monitors;
 mod observe;
@@ -254,6 +256,9 @@ pub struct CrewHub {
     /// What each boss last told each session on its line, in plain form,
     /// and when: the same instruction again soon after isn't sent twice.
     told_lines: Mutex<ToldLines>,
+    /// What each plan's turn was last told of a goal whose tickets are all
+    /// settled while it isn't met: told again only when its readings move.
+    unmet_said: Mutex<HashMap<uuid::Uuid, String>>,
     /// Each running boss turn's basis in the picture (`picture`).
     turn_bases: Mutex<picture::Bases>,
     /// One lane per session, for what bosses send it (`picture`).
@@ -804,6 +809,7 @@ impl CrewHub {
             person_turns: Mutex::default(),
             relayed_turns: Mutex::default(),
             told_lines: Mutex::default(),
+            unmet_said: Mutex::default(),
             turn_bases: Mutex::default(),
             lanes: Mutex::default(),
             redecided: Mutex::default(),

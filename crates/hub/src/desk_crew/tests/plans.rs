@@ -81,6 +81,24 @@ pub(super) async fn hub_on(
 pub(super) const ACTS: &str =
     "[oversight]\nenabled = true\nlevel = \"act\"\n[oversight.act]\nhand_out_work = false\n";
 
+/// A result nothing measures: what a plan that is no goal's says.
+pub(super) fn judged() -> Value {
+    json!({ "words": "the suite is green", "parts": [{ "kind": "judged", "evidence": "the sessions' test runs" }] })
+}
+
+/// The person writes `text` in `boss`'s DM.
+pub(super) fn person_says(boss: &AgentService, text: &str) {
+    let mut dm = boss
+        .sessions
+        .get_or_create(DESK_CHANNEL, PERSON, "desk")
+        .unwrap();
+    dm.add_user_message(text, None);
+    boss.sessions.save(&dm).unwrap();
+    boss.sessions
+        .append_to_archive(&dm.id, dm.messages.last().unwrap())
+        .unwrap();
+}
+
 fn tickets(dir: &Path, n: usize) -> Vec<Value> {
     (1..=n)
         .map(|i| json!({ "title": format!("Fix flaky test {i}"), "folder": dir.to_string_lossy() }))
@@ -107,6 +125,8 @@ pub(super) async fn proposed(d: &Desk, dir: &Path, n: usize) -> workforce_desk::
             engine: Engine::Claude,
             group: None,
             budget: None,
+            result: None,
+            goal_ticket: None,
         },
         &Party::manager("desk", "Desk"),
         &By::manager("desk", "Desk", "Sam asked for a green suite."),
@@ -138,7 +158,7 @@ async fn an_approved_plan_starts_four_sessions_and_the_fifth_when_one_finishes()
             .tools
             .get("crew.plan")
             .unwrap()
-            .execute(json!({ "goal": "Make the suite green", "tickets": tickets(dir.path(), 5) }))
+            .execute(json!({ "result": judged(), "goal": "Make the suite green", "tickets": tickets(dir.path(), 5) }))
             .await
             .unwrap();
         assert!(r.success, "{r:?}");
@@ -352,6 +372,7 @@ async fn a_plans_session_on_a_machine_holds_its_slot_until_the_machine_says_it_w
             .get("crew.plan")
             .unwrap()
             .execute(json!({
+                "result": judged(),
                 "goal": "Speed up vellev's recall",
                 "machine": "devbox",
                 "parallel": 1,
@@ -421,7 +442,7 @@ async fn an_unbound_boss_starts_its_own_plan_only_when_the_person_said_to() {
             .tools
             .get("crew.plan")
             .unwrap()
-            .execute(json!({ "goal": "Make the suite green", "tickets": tickets(dir.path(), 5) }))
+            .execute(json!({ "result": judged(), "goal": "Make the suite green", "tickets": tickets(dir.path(), 5) }))
             .await
             .unwrap();
         assert!(r.success, "{r:?}");
@@ -445,6 +466,7 @@ async fn an_unbound_boss_starts_its_own_plan_only_when_the_person_said_to() {
         assert!(!r.success, "{r:?}");
         assert!(started(&d).is_empty());
         // The person says to start it: the boss starts it, saying their words.
+        person_says(&overseer, "Looks good, start it now");
         let r = update
             .execute(json!({
                 "plan_id": id.to_string(),
@@ -469,13 +491,29 @@ async fn an_unbound_boss_starts_its_own_plan_only_when_the_person_said_to() {
         })
         .await;
 
+        // Its goal is the person's, unbound too: changed only on their
+        // answer.
+        let update = overseer.tools.get("crew.plan_update").unwrap();
+        let r = update
+            .execute(json!({ "plan_id": id.to_string(), "goal": "Make the whole suite green", "why": "Wider." }))
+            .await
+            .unwrap();
+        assert!(!r.success, "{r:?}");
+        assert!(r.error.unwrap().starts_with("The goal and how it's measured are the person's"));
         // A change of scope applies at once, as the person's would.
         let before = d.plan(id).await.unwrap().summary.plan.revision;
-        let r = overseer
-            .tools
-            .get("crew.plan_update")
+        let mut more = tickets(dir.path(), 6);
+        let kept: Vec<Value> = d
+            .plan(id)
+            .await
             .unwrap()
-            .execute(json!({ "plan_id": id.to_string(), "goal": "Make the whole suite green", "why": "Wider." }))
+            .tickets
+            .iter()
+            .map(|t| json!({ "id": t.ticket.ticket.id.to_string(), "folder": t.folder }))
+            .collect();
+        more.splice(0..5, kept);
+        let r = update
+            .execute(json!({ "plan_id": id.to_string(), "tickets": more, "why": "One more flaky test." }))
             .await
             .unwrap();
         assert!(r.success, "{r:?}");
@@ -483,6 +521,20 @@ async fn an_unbound_boss_starts_its_own_plan_only_when_the_person_said_to() {
         let p = d.plan(id).await.unwrap();
         assert!(p.summary.plan.revision > before);
         assert_eq!(p.summary.plan.approved_revision, Some(p.summary.plan.revision));
+        assert!(d.plan_needs().is_empty());
+        // So does one its goal doesn't cover: a raised limit.
+        let r = update
+            .execute(json!({ "plan_id": id.to_string(), "parallel": 2, "why": "Fewer at once." }))
+            .await
+            .unwrap();
+        assert!(r.success, "{r:?}");
+        let r = update
+            .execute(json!({ "plan_id": id.to_string(), "parallel": 3, "why": "One more at once." }))
+            .await
+            .unwrap();
+        assert!(r.success, "{r:?}");
+        assert_eq!(r.output["change"], "scope", "{r:?}");
+        assert_eq!(r.output["applied"], true, "{r:?}");
         assert!(d.plan_needs().is_empty());
     })
     .await;
@@ -683,7 +735,7 @@ async fn a_boss_keeps_its_plan_current_and_a_change_of_scope_waits_for_the_perso
             .tools
             .get("crew.plan")
             .unwrap()
-            .execute(json!({ "goal": "Make the suite green", "tickets": tickets(dir.path(), 2), "parallel": 1 }))
+            .execute(json!({ "result": judged(), "goal": "Make the suite green", "tickets": tickets(dir.path(), 2), "parallel": 1 }))
             .await
             .unwrap();
         let plan = &made.output["proposed"];
@@ -759,7 +811,7 @@ async fn plan_with_local_paths(
         .tools
         .get("crew.plan")
         .unwrap()
-        .execute(json!({ "goal": "Faster reads", "tickets": [
+        .execute(json!({ "result": judged(), "goal": "Faster reads", "tickets": [
             { "title": "Add the cache", "body": format!("Read {home}/Library/Desk/notes.md and /Volumes/T9/data/x.csv."), "folder": folder },
             { "title": "Use the cache", "body": "Read through the cache.", "folder": folder },
         ] }))
@@ -836,6 +888,7 @@ async fn a_boss_moving_tickets_to_a_machine_is_told_of_paths_in_briefs_only_this
         // Told to start it as it moves: it waits for the briefs.
         let (id, keys) = plan_with_local_paths(&overseer, &d, dir.path()).await;
         let mut start = moved(&id, &keys, "devbox");
+        person_says(&overseer, "Move it to devbox and start it now");
         start["start_now"] = json!({ "person_said": "Move it to devbox and start it now" });
         let r = update.execute(start).await.unwrap();
         assert!(r.success, "{r:?}");
@@ -895,7 +948,7 @@ async fn a_boss_moves_tickets_by_key_keeping_their_briefs_and_reads_them_back() 
             .tools
             .get("crew.plan")
             .unwrap()
-            .execute(json!({ "goal": "Faster reads", "tickets": [
+            .execute(json!({ "result": judged(), "goal": "Faster reads", "tickets": [
                 { "title": "Add the cache", "body": "Cache the index; keep it under 50 MB.", "folder": folder },
                 { "title": "Use the cache", "body": "Read through the cache.", "folder": folder, "needs": [0] },
             ] }))
@@ -999,7 +1052,7 @@ async fn a_boss_moves_a_ticket_by_its_repository_and_its_machine_tools_say_what_
             .tools
             .get("crew.plan")
             .unwrap()
-            .execute(json!({ "goal": "Faster reads", "tickets": [
+            .execute(json!({ "result": judged(), "goal": "Faster reads", "tickets": [
                 { "title": "Add the cache", "body": "Cache it.", "folder": folder },
             ] }))
             .await
@@ -1479,6 +1532,8 @@ fn proposal(dir: &Path, n: usize) -> NewPlan {
         engine: Engine::Claude,
         group: None,
         budget: None,
+        result: None,
+        goal_ticket: None,
     }
 }
 
@@ -1692,11 +1747,11 @@ async fn a_held_bosss_plans_pause_until_the_person_lets_it_go_on() {
     .await;
 }
 
-/// Below unbound, start_now changes nothing: a boss's plan waits for the
-/// person whatever it quotes. A start_now that doesn't read changes
+/// Bound at Act, start_now is the person's agreement, as `agreed` is: a
+/// draft starts on their checked words. One that doesn't read changes
 /// nothing else of the call either.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_bound_boss_cant_start_its_own_plan_whatever_it_quotes() {
+async fn a_bound_boss_starts_its_own_plan_only_on_the_persons_words() {
     with_test_pool(workforce_desk::store::build_pool, |pool| async move {
         let dir = tempfile::tempdir().unwrap();
         let (overseer, state, d, _llm) = hub_with(dir.path(), pool, ACTS).await;
@@ -1710,9 +1765,9 @@ async fn a_bound_boss_cant_start_its_own_plan_whatever_it_quotes() {
             .get("crew.plan")
             .unwrap()
             .execute(json!({
+                "result": judged(),
                 "goal": "Make the suite green",
                 "tickets": tickets(dir.path(), 2),
-                "start_now": { "person_said": "Start it now" },
             }))
             .await
             .unwrap();
@@ -1724,16 +1779,6 @@ async fn a_bound_boss_cant_start_its_own_plan_whatever_it_quotes() {
             .parse()
             .unwrap();
         let update = overseer.tools.get("crew.plan_update").unwrap();
-        let r = update
-            .execute(json!({
-                "plan_id": id.to_string(),
-                "start_now": { "person_said": "Go ahead" },
-                "why": "The person asked.",
-            }))
-            .await
-            .unwrap();
-        assert!(r.success, "{r:?}");
-        assert_eq!(r.output["plan"]["state"], "proposed", "{r:?}");
         // One that doesn't read: refused before the goal changes.
         let before = d.plan(id).await.unwrap().summary.plan.revision;
         let r = update
@@ -1752,6 +1797,19 @@ async fn a_bound_boss_cant_start_its_own_plan_whatever_it_quotes() {
         tokio::time::sleep(Duration::from_millis(400)).await;
         assert!(started(&d).is_empty(), "nothing starts");
         assert_eq!(d.plan_needs().len(), 1, "the person is asked");
+        // Their own words start it.
+        person_says(&overseer, "Start it now, go ahead");
+        let r = update
+            .execute(json!({
+                "plan_id": id.to_string(),
+                "start_now": { "person_said": "go ahead" },
+                "why": "The person asked.",
+            }))
+            .await
+            .unwrap();
+        assert!(r.success, "{r:?}");
+        assert_ne!(r.output["plan"]["state"], "proposed", "{r:?}");
+        assert!(d.plan_needs().is_empty());
     })
     .await;
 }
@@ -1768,11 +1826,13 @@ async fn an_unbound_boss_told_to_start_starts_its_plan_as_it_proposes_it() {
             overseer.tools.has("crew.plan").then_some(())
         })
         .await;
+        person_says(&overseer, "Plan it and run it");
         let r = overseer
             .tools
             .get("crew.plan")
             .unwrap()
             .execute(json!({
+                "result": judged(),
                 "goal": "Make the suite green",
                 "tickets": tickets(dir.path(), 2),
                 "start_now": { "person_said": "Plan it and run it" },
@@ -1816,7 +1876,7 @@ async fn a_boss_makes_its_own_board_for_a_plan_and_moves_a_plan_onto_another() {
 
         // A prefix it has no board for: the way to one is said.
         let r = plan
-            .execute(json!({ "goal": "Vellev work", "board": "VEL", "tickets": two }))
+            .execute(json!({ "result": judged(), "goal": "Vellev work", "board": "VEL", "tickets": two }))
             .await
             .unwrap();
         assert!(!r.success);
@@ -1826,6 +1886,7 @@ async fn a_boss_makes_its_own_board_for_a_plan_and_moves_a_plan_onto_another() {
         // new_board makes it, and the plan goes on it.
         let r = plan
             .execute(json!({
+                "result": judged(),
                 "goal": "Vellev work",
                 "new_board": { "name": "Vellev", "prefix": "vel" },
                 "tickets": two,
@@ -2021,6 +2082,7 @@ async fn a_plans_ticket_on_a_machine_starts_there_once_and_its_turns_wake_the_bo
             .get("crew.plan")
             .unwrap()
             .execute(json!({
+                "result": judged(),
                 "goal": "Speed up vellev's recall",
                 "machine": "devbox",
                 "model": "claude-opus-4-8",
@@ -2107,6 +2169,7 @@ async fn a_machine_start_never_answered_is_found_there_and_never_made_twice() {
             .get("crew.plan")
             .unwrap()
             .execute(json!({
+                "result": judged(),
                 "goal": "Speed up vellev's recall",
                 "machine": "devbox",
                 "tickets": [{"title": "Profile recall", "folder": "/home/dev/vellev"}],
@@ -2219,6 +2282,7 @@ async fn a_machine_start_whose_retry_cant_read_there_keeps_its_link() {
             .get("crew.plan")
             .unwrap()
             .execute(json!({
+                "result": judged(),
                 "goal": "Speed up vellev's recall",
                 "machine": "devbox",
                 "tickets": [{"title": "Profile recall", "folder": "/home/dev/vellev"}],
@@ -2375,7 +2439,7 @@ async fn a_boss_finds_tickets_and_plans_on_them_as_they_are() {
             .tools
             .get("crew.plan")
             .unwrap()
-            .execute(json!({ "goal": "Fix the open bugs", "tickets": [
+            .execute(json!({ "result": judged(), "goal": "Fix the open bugs", "tickets": [
                 { "adopt": keys[0], "folder": dir.path().to_string_lossy() },
                 { "adopt": keys[1].to_lowercase(), "folder": dir.path().to_string_lossy(), "needs": [0] },
                 { "title": "Write the release note", "folder": dir.path().to_string_lossy(), "needs": [1] },
@@ -2393,7 +2457,7 @@ async fn a_boss_finds_tickets_and_plans_on_them_as_they_are() {
             .tools
             .get("crew.plan")
             .unwrap()
-            .execute(json!({ "goal": "Again", "tickets": [
+            .execute(json!({ "result": judged(), "goal": "Again", "tickets": [
                 { "adopt": keys[0], "folder": dir.path().to_string_lossy() },
             ]}))
             .await
@@ -2406,7 +2470,7 @@ async fn a_boss_finds_tickets_and_plans_on_them_as_they_are() {
             .tools
             .get("crew.plan")
             .unwrap()
-            .execute(json!({ "goal": "Again", "tickets": [
+            .execute(json!({ "result": judged(), "goal": "Again", "tickets": [
                 { "adopt": keys[2], "title": "Mine", "folder": dir.path().to_string_lossy() },
             ]}))
             .await
@@ -2589,7 +2653,7 @@ async fn editing_a_plans_ticket_goes_through_its_plan() {
             .tools
             .get("crew.plan")
             .unwrap()
-            .execute(json!({ "goal": "Faster reads", "tickets": [
+            .execute(json!({ "result": judged(), "goal": "Faster reads", "tickets": [
                 { "title": "Add the cache", "body": "Cache the index.", "folder": folder },
                 { "title": "Use the cache", "folder": folder },
             ] }))
@@ -2752,6 +2816,8 @@ async fn a_ticket_whose_session_ends_before_it_is_given_it_waits_in_to_do_its_bo
                     engine: Engine::Claude,
                     group: None,
                     budget: None,
+                    result: None,
+                    goal_ticket: None,
                 },
                 &Party::manager("desk", "Desk"),
                 &By::manager("desk", "Desk", "Sam asked for a green suite."),
@@ -2867,6 +2933,7 @@ async fn a_ticket_whose_session_on_a_machine_ends_as_it_starts_waits_in_to_do_it
             .get("crew.plan")
             .unwrap()
             .execute(json!({
+                "result": judged(),
                 "goal": "Speed up vellev's recall",
                 "machine": "devbox",
                 "tickets": [

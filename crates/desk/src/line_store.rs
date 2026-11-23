@@ -885,6 +885,31 @@ impl DeskStore {
             .map(|r| Ok((r.try_get(0)?, r.try_get(1)?, r.try_get(2)?)))
             .collect()
     }
+
+    /// When boss `from` last sent each of `sessions` a message on its line
+    /// after `since`: those it sent none have no row.
+    pub async fn line_sent_by(
+        &self,
+        from: &str,
+        sessions: &[Uuid],
+        since: DateTime<Utc>,
+    ) -> Result<Vec<(Uuid, DateTime<Utc>)>> {
+        let ids: Vec<String> = sessions.iter().map(Uuid::to_string).collect();
+        let client = self.pool().get().await?;
+        let rows = client
+            .query(
+                "SELECT (recipient ->> 'id')::uuid, max(at) FROM line_messages \
+                 WHERE sender ->> 'kind' = 'manager' AND sender ->> 'id' = $1 \
+                   AND recipient ->> 'kind' = 'session' AND recipient ->> 'id' = ANY($2) \
+                   AND at > $3 \
+                 GROUP BY recipient ->> 'id'",
+                &[&from, &ids, &since],
+            )
+            .await?;
+        rows.iter()
+            .map(|r| Ok((r.try_get(0)?, r.try_get(1)?)))
+            .collect()
+    }
 }
 
 #[cfg(test)]
@@ -1096,6 +1121,48 @@ mod tests {
                 .unwrap();
             assert_eq!(thread.len(), 2);
             assert_eq!(thread[0].id, theirs.id, "newest first");
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn what_a_boss_sent_its_sessions_is_read_by_session_since_a_time() {
+        with_test_pool(crate::store::build_pool, |pool| async move {
+            let s = DeskStore::with_pool(pool).await.unwrap();
+            let (a, b, c) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+            let boss = Party::manager("boss-1", "Kat");
+            let since = crate::crew::now();
+            let sent = |to: Uuid, from: &Party| {
+                LineMessage::new(
+                    from.clone(),
+                    session_party(to),
+                    LineKind::Tell,
+                    "go".into(),
+                    1,
+                )
+            };
+            let mut old = sent(a, &boss);
+            old.at = since - chrono::Duration::minutes(5);
+            s.put_line(&old).await.unwrap();
+            let mut first = sent(a, &boss);
+            first.at = since + chrono::Duration::seconds(1);
+            s.put_line(&first).await.unwrap();
+            let mut newest = sent(a, &boss);
+            newest.at = since + chrono::Duration::seconds(2);
+            s.put_line(&newest).await.unwrap();
+            s.put_line(&sent(b, &Party::manager("boss-2", "Ann")))
+                .await
+                .unwrap();
+            s.put_line(&sent(c, &boss)).await.unwrap();
+            let mut got = s.line_sent_by("boss-1", &[a, b], since).await.unwrap();
+            got.sort();
+            assert_eq!(
+                got.len(),
+                1,
+                "another boss's and an unasked session's aren't"
+            );
+            assert_eq!(got[0].0, a);
+            assert_eq!(got[0].1.timestamp_micros(), newest.at.timestamp_micros());
         })
         .await;
     }
