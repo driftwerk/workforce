@@ -10003,6 +10003,18 @@ pub struct ClaudeChatConfig {
     /// `None` uses the hub default (240).
     #[serde(default)]
     pub rotate_after_idle_mins: Option<i64>,
+    /// Start a boss's own conversations off its DM (check-ins, a session's
+    /// line, a plan's turns) on a fresh transcript once the last turn's
+    /// context reached this many tokens. `None` uses the hub default
+    /// (200 000); 0 turns it off. The person's own threads never rotate on
+    /// size.
+    #[serde(default)]
+    pub crew_rotate_after_context_tokens: Option<u64>,
+    /// The same, as a share of the model's window, so a transcript is
+    /// replaced before its CLI would compact it itself: the lower of the two
+    /// holds. `None` uses the hub default (60); kept within 1–100.
+    #[serde(default)]
+    pub crew_rotate_window_percent: Option<u8>,
     /// Where `/cc` turns run: `inherit` follows `[coding_session.executor]`,
     /// `local` pins them to this host.
     #[serde(default)]
@@ -13659,18 +13671,30 @@ model = "opus"
 effort = "high"
 rotate_after_turns = 80
 rotate_after_idle_mins = 480
+crew_rotate_after_context_tokens = 150000
+crew_rotate_window_percent = 50
 "#;
         let config = WorkforceConfig::from_toml(toml).unwrap();
         assert_eq!(config.claude_chat.model.as_deref(), Some("opus"));
         assert_eq!(config.claude_chat.effort.as_deref(), Some("high"));
         assert_eq!(config.claude_chat.rotate_after_turns, Some(80));
         assert_eq!(config.claude_chat.rotate_after_idle_mins, Some(480));
+        assert_eq!(
+            config.claude_chat.crew_rotate_after_context_tokens,
+            Some(150_000)
+        );
+        assert_eq!(config.claude_chat.crew_rotate_window_percent, Some(50));
 
         let defaults = WorkforceConfig::from_toml("").unwrap();
         assert!(defaults.claude_chat.model.is_none());
         assert!(defaults.claude_chat.effort.is_none());
         assert!(defaults.claude_chat.rotate_after_turns.is_none());
         assert!(defaults.claude_chat.rotate_after_idle_mins.is_none());
+        assert!(defaults
+            .claude_chat
+            .crew_rotate_after_context_tokens
+            .is_none());
+        assert!(defaults.claude_chat.crew_rotate_window_percent.is_none());
     }
 
     #[test]

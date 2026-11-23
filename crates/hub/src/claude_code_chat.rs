@@ -2717,7 +2717,7 @@ impl ClaudeChatService {
             RotationReason::WorkspaceMissing => {
                 workspace_reset_blocks(kind.names(), brief.as_deref())
             }
-            RotationReason::TurnCount | RotationReason::Idle => {
+            RotationReason::TurnCount | RotationReason::Idle | RotationReason::Size => {
                 session_rotated_blocks(kind.names(), brief.as_deref())
             }
         };

@@ -463,6 +463,9 @@ pub struct ClaudeCodeResult {
     pub output_tokens: u64,
     pub cache_creation_tokens: u64,
     pub cache_read_tokens: u64,
+    /// What the round's last model call read, cached or not: how big its
+    /// transcript had grown. 0 when the CLI reported no call.
+    pub context_tokens: u64,
     pub cost_usd: f64,
     pub num_turns: u32,
     /// Why the round ended. Every retry / classification / surfacing decision
@@ -896,6 +899,20 @@ impl StreamCapture {
         self.is_error
             .then(|| self.result.as_ref()?.get("result")?.as_str())
             .flatten()
+    }
+
+    /// What the last model call the CLI reported read: its whole context.
+    fn context_tokens(&self) -> u64 {
+        self.calls.last().map_or(0, |(_, usage)| {
+            [
+                usage.input_tokens,
+                usage.cache_read_input_tokens,
+                usage.cache_creation_input_tokens,
+            ]
+            .into_iter()
+            .map(u64::from)
+            .sum()
+        })
     }
 
     /// Nothing was captured — the process produced no parseable output at all.
@@ -1909,6 +1926,7 @@ fn assemble_result(
         output_tokens: run.capture.usage("/usage/output_tokens"),
         cache_creation_tokens: run.capture.usage("/usage/cache_creation_input_tokens"),
         cache_read_tokens: run.capture.usage("/usage/cache_read_input_tokens"),
+        context_tokens: run.capture.context_tokens(),
         cost_usd: run
             .capture
             .result
@@ -3809,6 +3827,39 @@ pub(crate) mod tests {
             "type": "assistant",
             "message": { "content": [{ "type": "text", "text": text }] },
         })
+    }
+
+    #[test]
+    fn a_round_s_context_is_what_its_last_call_read() {
+        let call = |id: &str, input: u64, read: u64, created: u64| {
+            serde_json::json!({
+                "type": "assistant",
+                "message": {
+                    "id": id,
+                    "content": [{ "type": "text", "text": "…" }],
+                    "usage": {
+                        "input_tokens": input,
+                        "cache_read_input_tokens": read,
+                        "cache_creation_input_tokens": created,
+                        "output_tokens": 50,
+                    },
+                },
+            })
+        };
+        let capture = capture_of(&[
+            call("msg_1", 10, 40_000, 2_000),
+            call("msg_2", 12, 42_000, 900),
+            result_event("success", 2),
+        ]);
+        assert_eq!(
+            capture.context_tokens(),
+            42_912,
+            "the second call, not their sum"
+        );
+        assert_eq!(
+            capture_of(&[result_event("success", 1)]).context_tokens(),
+            0
+        );
     }
 
     fn result_event(subtype: &str, num_turns: u64) -> serde_json::Value {

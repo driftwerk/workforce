@@ -6,7 +6,6 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use chrono::Utc;
 use eyre::{ensure, eyre, Result};
 use tokio::sync::mpsc;
 use tokio::time::Instant;
@@ -23,7 +22,7 @@ use workforce_agent::turn_journal::TurnJournal;
 use workforce_common::session::EngineSlot;
 use workforce_common::subscription::Served;
 
-use super::conversation::{opening, Conversation, Transcript};
+use super::conversation::{answered, opening, Conversation, Transcript};
 use super::round::{continued, drain, Round, RoundEnd, RoundInput};
 use super::{model_id, spec, tools_model, CliKind, Oversight, RouteMiss, ANSWER_RESERVE};
 use crate::claude_code::{ClaudeCodeResult, Completion};
@@ -178,7 +177,7 @@ pub(crate) struct CliTurn {
 
 /// How a CLI route took a turn.
 pub(crate) enum CliAttempt {
-    Served(CliServed),
+    Served(Box<CliServed>),
     /// It produced nothing and ran no tool, so the next route may take the
     /// turn.
     Unserved(RouteMiss),
@@ -231,6 +230,8 @@ struct Tally {
     usage: TokenUsage,
     rounds: u32,
     injected: Vec<InjectedUserMessage>,
+    /// What the last round's last model call read.
+    context_tokens: u64,
 }
 
 impl Tally {
@@ -241,6 +242,7 @@ impl Tally {
     fn add(&mut self, result: &ClaudeCodeResult) {
         self.spend(result.usage());
         self.rounds += result.num_turns;
+        self.context_tokens = result.context_tokens;
     }
 }
 
@@ -635,8 +637,13 @@ impl AgentTurnRig {
             );
         }
 
-        let mut transcript =
-            Transcript::of(conversation, turn.cli, &self.rotation, sandbox.fresh());
+        let mut transcript = Transcript::of(
+            conversation,
+            turn.cli,
+            &model,
+            &self.rotation,
+            sandbox.fresh(),
+        );
         let mut tally = Tally::default();
         let mut pending = Vec::new();
         let (follow_ups, mut stopping) = drain(inbox.as_mut(), &mut pending);
@@ -731,10 +738,13 @@ impl AgentTurnRig {
         };
 
         let served = login.served(turn.cli.route(), service.agent_id.as_str());
-        let slot = transcript.slot.map(|slot| EngineSlot {
-            turns: slot.turns + 1,
-            last_reply_at: Some(Utc::now()),
-            ..slot
+        let slot = transcript.slot.map(|slot| {
+            answered(
+                slot,
+                conversation.map(|c| c.session.channel.as_str()),
+                &turn.task,
+                tally.context_tokens,
+            )
         });
         let served_turn = CliServed {
             text: answer.text.clone(),
@@ -752,7 +762,7 @@ impl AgentTurnRig {
             served: served.clone(),
         };
         note_served(served);
-        Ok(CliAttempt::Served(served_turn))
+        Ok(CliAttempt::Served(Box::new(served_turn)))
     }
 }
 

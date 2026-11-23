@@ -15,12 +15,24 @@ pub(crate) const DEFAULT_ROTATE_AFTER_TURNS: u64 = 50;
 /// for cost. Tune per install via `[claude_chat] rotate_after_idle_mins`.
 pub(crate) const DEFAULT_ROTATE_AFTER_IDLE_SECS: i64 = 4 * 3600;
 
+/// Default: start a boss's own conversation off its DM on a fresh transcript
+/// once its context reached this many tokens. Each wake resumes it whole, so
+/// its size is what every wake costs. `[claude_chat]
+/// crew_rotate_after_context_tokens`.
+pub(crate) const DEFAULT_CREW_ROTATE_AFTER_CONTEXT_TOKENS: u64 = 200_000;
+
+/// Default: the same, as a share of the model's window, well before the CLI
+/// compacts the transcript itself. `[claude_chat] crew_rotate_window_percent`.
+pub(crate) const DEFAULT_CREW_ROTATE_WINDOW_PERCENT: u8 = 60;
+
 /// Reason a session was rotated. Drives the Slack notice copy and structured
 /// logging — does not change the rotation mechanics.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RotationReason {
     TurnCount,
     Idle,
+    /// A boss's own conversation grew past its cap ([`CrewCap`]).
+    Size,
     /// The transcript's workspace is no longer on disk — reclaimed by the
     /// idle sweeper, or relocated because the project's repo set changed.
     /// Resuming would leave the model describing files that do not exist.
@@ -28,11 +40,32 @@ pub(crate) enum RotationReason {
 }
 
 /// When a transcript is rotated: after `turns` completed turns, or `idle_secs`
-/// after its last reply (`[claude_chat]`).
+/// after its last reply, and a boss's own conversation once it is as big as
+/// `crew` allows (`[claude_chat]`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RotationPolicy {
     pub turns: u64,
     pub idle_secs: i64,
+    pub crew: CrewCap,
+}
+
+/// How big a boss's own conversation grows before it is replaced: `tokens`
+/// (0, never), and no more than `window_percent` of its model's window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CrewCap {
+    pub tokens: u64,
+    pub window_percent: u8,
+}
+
+impl CrewCap {
+    /// The most context a transcript on a model of `window` tokens keeps;
+    /// `None` when it never rotates on size. An unknown window leaves
+    /// `tokens` alone.
+    pub(crate) fn limit(&self, window: Option<u32>) -> Option<u64> {
+        let share =
+            |window: u32| u64::from(window) * u64::from(self.window_percent.clamp(1, 100)) / 100;
+        (self.tokens > 0).then(|| window.map_or(self.tokens, |w| self.tokens.min(share(w))))
+    }
 }
 
 impl Default for RotationPolicy {
@@ -40,14 +73,19 @@ impl Default for RotationPolicy {
         Self {
             turns: DEFAULT_ROTATE_AFTER_TURNS,
             idle_secs: DEFAULT_ROTATE_AFTER_IDLE_SECS,
+            crew: CrewCap {
+                tokens: DEFAULT_CREW_ROTATE_AFTER_CONTEXT_TOKENS,
+                window_percent: DEFAULT_CREW_ROTATE_WINDOW_PERCENT,
+            },
         }
     }
 }
 
 impl RotationPolicy {
     /// The install's `[claude_chat]` thresholds, each defaulted when unset.
-    /// They govern every CLI transcript: `/cc` threads and agent turns on
-    /// Claude Code and Codex alike.
+    /// The turn and idle ones govern every CLI transcript: `/cc` threads and
+    /// agent turns on Claude Code and Codex alike; the size one only a
+    /// boss's own conversations.
     pub fn of(config: &workforce_common::settings::ClaudeChatConfig) -> Self {
         let defaults = Self::default();
         Self {
@@ -55,6 +93,14 @@ impl RotationPolicy {
             idle_secs: config
                 .rotate_after_idle_mins
                 .map_or(defaults.idle_secs, |mins| mins.saturating_mul(60)),
+            crew: CrewCap {
+                tokens: config
+                    .crew_rotate_after_context_tokens
+                    .unwrap_or(defaults.crew.tokens),
+                window_percent: config
+                    .crew_rotate_window_percent
+                    .unwrap_or(defaults.crew.window_percent),
+            },
         }
     }
 
@@ -73,6 +119,24 @@ impl RotationPolicy {
             (false, true) => Some(RotationReason::Idle),
             (false, false) => None,
         }
+    }
+
+    /// [`Self::rotation`] for a boss's own conversation, whose last turn's
+    /// context was `context_tokens` on a model of `window` tokens: first
+    /// whether it outgrew [`Self::crew`].
+    pub(crate) fn crew_rotation(
+        &self,
+        turns: u64,
+        last_reply_at: Option<DateTime<Utc>>,
+        context_tokens: u64,
+        window: Option<u32>,
+        now: DateTime<Utc>,
+    ) -> Option<RotationReason> {
+        self.crew
+            .limit(window)
+            .filter(|limit| context_tokens >= *limit)
+            .map(|_| RotationReason::Size)
+            .or_else(|| self.rotation(turns, last_reply_at, now))
     }
 }
 
@@ -155,6 +219,7 @@ mod tests {
         let policy = RotationPolicy {
             turns: 5,
             idle_secs: 600,
+            ..RotationPolicy::default()
         };
         assert!(matches!(
             policy.rotation(5, Some(now), now),
@@ -165,5 +230,59 @@ mod tests {
             policy.rotation(1, Some(now - chrono::Duration::seconds(600)), now),
             Some(RotationReason::Idle)
         ));
+    }
+
+    #[test]
+    fn a_crew_conversation_rotates_on_size_first() {
+        let now = chrono::Utc::now();
+        let policy = RotationPolicy::default();
+        assert_eq!(
+            policy.crew_rotation(DEFAULT_ROTATE_AFTER_TURNS, Some(now), 200_000, None, now),
+            Some(RotationReason::Size),
+            "size is said before the turn count"
+        );
+        assert_eq!(policy.crew_rotation(1, Some(now), 199_999, None, now), None);
+        assert_eq!(
+            policy.crew_rotation(DEFAULT_ROTATE_AFTER_TURNS, Some(now), 0, None, now),
+            Some(RotationReason::TurnCount),
+            "an unknown size falls through to the other limits"
+        );
+    }
+
+    #[test]
+    fn the_crew_cap_is_the_lower_of_its_tokens_and_its_share_of_the_window() {
+        let cap = RotationPolicy::default().crew;
+        assert_eq!(cap.limit(Some(1_000_000)), Some(200_000));
+        assert_eq!(cap.limit(Some(200_000)), Some(120_000));
+        assert_eq!(
+            cap.limit(None),
+            Some(200_000),
+            "an unknown model keeps the tokens"
+        );
+        let off = CrewCap { tokens: 0, ..cap };
+        assert_eq!(off.limit(Some(200_000)), None, "0 turns it off");
+        let wild = CrewCap {
+            window_percent: 250,
+            ..cap
+        };
+        assert_eq!(wild.limit(Some(100_000)), Some(100_000), "kept within 100%");
+    }
+
+    #[test]
+    fn the_crew_keys_reach_the_policy() {
+        let config = workforce_common::settings::ClaudeChatConfig {
+            crew_rotate_after_context_tokens: Some(90_000),
+            crew_rotate_window_percent: Some(40),
+            ..Default::default()
+        };
+        let policy = RotationPolicy::of(&config);
+        assert_eq!(
+            policy.crew,
+            CrewCap {
+                tokens: 90_000,
+                window_percent: 40
+            }
+        );
+        assert_eq!(policy.turns, DEFAULT_ROTATE_AFTER_TURNS);
     }
 }
