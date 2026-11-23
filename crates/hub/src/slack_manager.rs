@@ -1160,6 +1160,7 @@ async fn deliver_credential_reply(
             username: None,
             icon_url: None,
             blocks: None,
+            outside: false,
         }
     };
     let in_thread = match reply {
@@ -2395,6 +2396,7 @@ pub fn spawn_slack_dispatch_loop(
                                                 icon_url: None,
 
                                                 blocks: None,
+                                                outside: false,
                                             },
                                         )
                                         .await;
@@ -2548,6 +2550,7 @@ pub fn spawn_slack_dispatch_loop(
                                                 username: None,
                                                 icon_url: None,
                                                 blocks: None,
+                                                outside: false,
                                             },
                                         )
                                         .await;
@@ -3104,6 +3107,7 @@ pub fn spawn_slack_dispatch_loop(
                                                     username: None,
                                                     icon_url: None,
                                                     blocks: None,
+                                                    outside: false,
                                                 },
                                             )
                                             .await;
@@ -4127,6 +4131,10 @@ pub fn spawn_slack_dispatch_loop(
                                 };
 
                                 let (new_phase, status_text) = match &event {
+                                    ProgressEvent::OutsideContent { .. } => {
+                                        answer.mark_outside();
+                                        continue;
+                                    }
                                     ProgressEvent::LlmCall { round } => {
                                         answer.begin_call();
                                         (
@@ -4309,6 +4317,7 @@ pub fn spawn_slack_dispatch_loop(
                                                             username: None,
                                                             icon_url: None,
                                                             blocks: Some(blocks),
+                                                            outside: false,
                                                         })
                                                         .await;
                                                 }
@@ -4391,12 +4400,14 @@ pub fn spawn_slack_dispatch_loop(
                                     ProgressEvent::StreamEnd if answer_settled => {
                                         let block = std::mem::take(&mut annotation_buf);
                                         if !block.trim().is_empty() {
-                                            send_to_surfaces(
+                                            send_to_surfaces_with_blocks(
                                                 &progress_surfaces,
                                                 &progress_channel,
                                                 &progress_thread,
                                                 block.trim(),
                                                 progress_identity.as_ref(),
+                                                None,
+                                                answer.outside,
                                             )
                                             .await;
                                             // Verbatim, separator included: this is
@@ -4848,6 +4859,7 @@ pub fn spawn_slack_dispatch_loop(
                                                 beneath.unwrap_or_default(),
                                                 identity.as_ref(),
                                                 continue_blocks,
+                                                run_result.guard.is_some(),
                                             )
                                             .await;
                                         }
@@ -5457,6 +5469,7 @@ pub fn spawn_slack_dispatch_loop(
                                         username: None,
                                         icon_url: None,
                                         blocks: Some(blocks.clone()),
+                                        outside: false,
                                     };
                                     surface
                                         .update_message(&channel, ts, &outbound)
@@ -5583,6 +5596,7 @@ pub fn spawn_slack_dispatch_loop(
                                         username: None,
                                         icon_url: None,
                                         blocks: Some(blocks.clone()),
+                                        outside: false,
                                     };
                                     surface
                                         .update_message(&channel, ts, &outbound)
@@ -6219,6 +6233,7 @@ pub async fn handle_permission_button(
             username: None,
             icon_url: None,
             blocks: Some(blocks.clone()),
+            outside: false,
         };
         surface.update_message(channel, ts, &outbound).await.is_ok()
     } else {
@@ -7561,11 +7576,15 @@ pub(crate) struct AnswerStream {
     /// The line the settled answer ends on, which the live chunk must fit
     /// as it fits the writing suffix.
     closing: String,
+    /// The turn writing it read outside content: what it says may carry
+    /// that content, so every message of it is marked so from then on.
+    outside: bool,
 }
 
 impl AnswerStream {
     pub(crate) fn new() -> Self {
         Self {
+            outside: false,
             redactor: StreamRedactor::new(sanitize_outbound as fn(&str) -> String),
             call: None,
             round_had_text: false,
@@ -7576,6 +7595,12 @@ impl AnswerStream {
             settled_chunks: 0,
             closing: String::new(),
         }
+    }
+
+    /// The turn writing it read outside content
+    /// ([`ProgressEvent::OutsideContent`]).
+    pub(crate) fn mark_outside(&mut self) {
+        self.outside = true;
     }
 
     /// Measure the first message with the lead [`emit_answer`] puts on it.
@@ -7793,6 +7818,7 @@ pub async fn emit_status(
             username: None,
             icon_url: None,
             blocks: None,
+            outside: false,
         })
         .await
     {
@@ -7862,7 +7888,11 @@ pub(crate) async fn emit_answer(
             // Also covers the settle write for a chunk that has just stopped
             // being live: same edit, minus the suffix, at full length.
             Some(id) => {
-                if let Err(e) = surface.edit_message(channel, id, &body).await {
+                let edited = match answer.outside {
+                    true => surface.edit_outside(channel, id, &body).await,
+                    false => surface.edit_message(channel, id, &body).await,
+                };
+                if let Err(e) = edited {
                     warn!(channel = %channel, message_id = %id, error = %e, "Failed to update answer message");
                     landed = false;
                 }
@@ -7878,6 +7908,7 @@ pub(crate) async fn emit_answer(
                     username: identity.map(|id| id.display_name.clone()),
                     icon_url: identity.and_then(|id| id.icon_url.clone()),
                     blocks: None,
+                    outside: answer.outside,
                 })
                 .await
             {
@@ -7946,6 +7977,7 @@ async fn post_checkin_card(
             username: None,
             icon_url: None,
             blocks: Some(blocks),
+            outside: false,
         })
         .await
         .ok()
@@ -7987,6 +8019,7 @@ async fn settle_checkin_card(
                 username: None,
                 icon_url: None,
                 blocks: Some(blocks),
+                outside: false,
             },
         )
         .await;
@@ -8324,6 +8357,7 @@ mod seed_tests {
             thread_id: None,
             files: Vec::new(),
             bot_id: None,
+            outside: false,
         }
     }
 
@@ -11270,12 +11304,14 @@ async fn send_to_surfaces(
     text: &str,
     identity: Option<&AgentSlackIdentity>,
 ) {
-    send_to_surfaces_with_blocks(surfaces, channel, thread_id, text, identity, None).await
+    send_to_surfaces_with_blocks(surfaces, channel, thread_id, text, identity, None, false).await
 }
 
 /// As [`send_to_surfaces`], but optionally attaches Block Kit `blocks` (e.g. the
 /// playbook Continue/Exit controls) below the text. The same secret-render,
 /// credential-scan and tool-result-stripping defences apply to the text.
+/// `outside`: the turn that wrote it read outside content, so it is marked
+/// so, with no previews of its links.
 async fn send_to_surfaces_with_blocks(
     surfaces: &[Arc<dyn ChannelSurface>],
     channel: &str,
@@ -11283,6 +11319,7 @@ async fn send_to_surfaces_with_blocks(
     text: &str,
     identity: Option<&AgentSlackIdentity>,
     blocks: Option<Vec<serde_json::Value>>,
+    outside: bool,
 ) {
     let text = sanitize_outbound_logged(text);
     let text: &str = &text;
@@ -11326,6 +11363,7 @@ async fn send_to_surfaces_with_blocks(
                 username: username.clone(),
                 icon_url: icon_url.clone(),
                 blocks: outbound_blocks.clone(),
+                outside,
             })
             .await
         {
@@ -11737,7 +11775,14 @@ pub async fn rerun_unanswered(
         else {
             return Attempt::Done(Ok(()));
         };
-        match resume_turn(svc, &session, &waiter.principal, &delivery, prompt).await {
+        // The waiting turn's guard, kept on its waiter: the rerun runs
+        // under it.
+        let kept = waiter
+            .content_scope
+            .as_ref()
+            .map(|kept| crate::monitor::scope::guard_of(kept, &waiter.message_id));
+        let rerun = resume_turn(svc, &session, &waiter.principal, &delivery, prompt);
+        match workforce_agent::runner::with_content_guard(kept, rerun).await {
             Ok(answer) => {
                 deliver_resumed(svc, &delivery, surfaces, push, session_id, answer).await;
                 Attempt::Done(Ok(()))
@@ -11884,6 +11929,7 @@ pub async fn send_to_thread(
                 username: None,
                 icon_url: None,
                 blocks: None,
+                outside: false,
             })
             .await;
     }

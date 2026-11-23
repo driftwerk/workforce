@@ -375,6 +375,14 @@ pub fn group_id_ok(id: &str) -> bool {
     !id.trim().is_empty() && id.len() <= MAX_ID && !id.contains('/') && !id.contains(':')
 }
 
+/// The scope a grant for `group` serves: Ungrouped's, or that group's.
+pub fn scope_of_group(group: &str) -> crate::scope::Scope {
+    match group {
+        UNGROUPED => crate::scope::Scope::Ungrouped,
+        g => crate::scope::Scope::Group(g.to_string()),
+    }
+}
+
 /// What a plan's own grant's id starts with: the home's main overseer runs
 /// no group, so each of its plans has a grant of its own on each machine
 /// its tickets work on.
@@ -844,6 +852,15 @@ mod tests {
 
     fn take(old: Option<&Grant>, p: &GrantPut, now: DateTime<Utc>) -> Result<Accepted, Refusal> {
         accept(old, None, p, "g-acme", &[], now, DEFAULT_HOURS)
+    }
+
+    #[test]
+    fn ungroupeds_grant_serves_ungrouped_and_a_groups_its_group() {
+        assert_eq!(scope_of_group(UNGROUPED), crate::scope::Scope::Ungrouped);
+        assert_eq!(
+            scope_of_group("acme"),
+            crate::scope::Scope::Group("acme".into())
+        );
     }
 
     #[test]

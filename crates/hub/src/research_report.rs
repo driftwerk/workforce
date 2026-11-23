@@ -557,6 +557,7 @@ impl Reporter {
             username: None,
             icon_url: None,
             blocks: None,
+            outside: false,
         }
     }
 }

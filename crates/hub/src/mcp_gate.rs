@@ -80,14 +80,18 @@ pub fn choice_name(choice: PermissionChoice) -> &'static str {
 }
 
 /// What a client trying to answer a card only the person answers is told.
-pub const PERSON_ONLY: &str = "Only the person answers this, in Desk on their computer: it waits while they sign in to a site there.";
+pub const PERSON_ONLY: &str = "Only the person answers this, in Desk on their computer: it uses their own Chrome, or waits while they sign in to a site there.";
 
 /// Whether a prompt offers `choice` to a client; an `always_ask` rule
 /// withholds `allow_always`, and a caller must not be able to type it back
 /// in. A card only the person in Desk answers ("Sign in for me") offers a
-/// client nothing.
+/// client nothing; one whose lasting answer lets the agent work on its own
+/// offers everything but that answer.
 pub fn offered(options: &PermissionPromptOptions, choice: PermissionChoice) -> bool {
     if options.person_only() {
+        return false;
+    }
+    if choice == PermissionChoice::AllowInFolder && options.allow_scope.is_some() {
         return false;
     }
     match choice {
@@ -222,6 +226,23 @@ impl CallSite {
     /// its result for the MCP client from `tools`, the surface it ran on.
     fn report(&self, tools: &ToolRegistry, name: &str, held: Held) -> ToolResult {
         let Held { exec, decision } = held;
+        // What a call returns arms the turn's guard as a runner's call does.
+        if let Some(guard) = &self.gates.content_guard {
+            workforce_agent::runner::arm_on_result(
+                guard,
+                tools,
+                name,
+                exec.success,
+                &exec.output_text,
+            );
+        }
+        // A bank call, or a read-back of a conversation that made one,
+        // marks the turn it was made in (as the call itself did, as it
+        // ran): nothing later in the turn keeps anything of it.
+        if exec.success {
+            workforce_agent::personal::calling(name);
+            workforce_agent::personal::answered(&exec.output);
+        }
         self.audit
             .record(name, decision, exec.deny_reason.as_deref());
         self.shape(tools, name, exec)
@@ -652,7 +673,8 @@ impl GatedExecutor {
                 ApprovalDecision::SelfServe => Gated::Ask(asked),
             },
             RouteResume::InSession => {
-                match route_approval(router, agent_id, name, &asked.reason, input) {
+                let guard = self.site.gates.content_guard.as_deref();
+                match route_approval(router, agent_id, name, &asked.reason, input, guard) {
                     RouteResolution::Routed {
                         request_id,
                         approver_user_ids,
@@ -891,8 +913,15 @@ impl GatedExecutor {
         };
         let options = workforce_agent::tools::dispatch::options_for_tool(tools, name, options);
         let reason = asked.reason;
-        let refused =
-            |refusal: Refusal, reason| Held::refused(refusal.tool_result().into(), reason);
+        // With nobody to ask, the model is told why the call needed a
+        // person, so it can say so: its guard's reason when that held it.
+        let refused = |refusal: Refusal, reason: String| {
+            let told = match refusal {
+                Refusal::Unattended => format!("{} Why: {reason}", refusal.tool_result()),
+                _ => refusal.tool_result().to_string(),
+            };
+            Held::refused(told, reason)
+        };
         let Some(ledger) = &turn.approvals else {
             return refused(Refusal::Unattended, reason);
         };
@@ -1073,6 +1102,21 @@ mod tests {
         for choice in [PermissionChoice::AllowOnce, PermissionChoice::DenyOnce] {
             assert!(!offered(&options, choice), "{choice:?}");
         }
+    }
+
+    /// A card that would let the agent work on its own keeps that answer
+    /// for the person; a client may still allow it once or deny it.
+    #[test]
+    fn a_client_answers_an_on_its_own_card_but_never_raises_the_level() {
+        let mut options = PermissionPromptOptions::ask(false);
+        options.allow_in_folder = Some("devbox".into());
+        options.allow_scope = Some(workforce_core::computer::ActionKind::Network);
+        assert!(!options.person_only());
+        assert!(offered(&options, PermissionChoice::AllowOnce));
+        assert!(offered(&options, PermissionChoice::DenyOnce));
+        assert!(!offered(&options, PermissionChoice::AllowInFolder));
+        options.allow_scope = None;
+        assert!(offered(&options, PermissionChoice::AllowInFolder));
     }
 
     #[test]

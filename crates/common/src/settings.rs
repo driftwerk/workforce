@@ -9853,6 +9853,11 @@ pub struct McpServerConfig {
     /// prod investigation at staging, the exact failure grouping prevents.
     #[serde(default)]
     pub default: bool,
+    /// What this server returns is written outside the person's own work
+    /// (a public forum, a shared inbox, other people's tickets): a turn that
+    /// reads it is guarded as one that read mail is. Default `false`.
+    #[serde(default)]
+    pub external: bool,
 }
 
 fn default_mcp_server_transport() -> String {

@@ -58,6 +58,15 @@ pub struct PendingApproval {
     /// its decision is a chat turn too (`serve::chat_turn`). False for rows
     /// written before this was recorded, which resume as they always did.
     pub chat: bool,
+    /// The automated origin the turn that asked carried
+    /// ([`workforce_agent::runner::CURRENT_AUTOMATED_ORIGIN`]), which the
+    /// turn resumed on its decision carries too. `None` where it carried
+    /// none, and for rows written before this was recorded.
+    pub origin: Option<String>,
+    /// The guard of the turn that asked, armed by outside content it read:
+    /// the turn resumed on the decision runs under it. `None` when it read
+    /// none, and for rows written before this was kept.
+    pub content_scope: Option<serde_json::Value>,
 }
 
 impl PendingApproval {

@@ -2037,6 +2037,7 @@ mod uplink_client;
 
 mod relay;
 mod relayed_decide;
+mod relayed_work;
 mod shared_budget;
 
 mod renamed;

@@ -1088,14 +1088,9 @@ pub fn tool_capability(tool: &str, input: &serde_json::Value) -> Option<Capabili
         // would leave the identical escalation one tool over.
         // `desk.*` drives the person's own Claude Code / Codex terminals, and
         // reads them — the same host reach.
-        "exec.run" | "code.cargo" | "code.build" | "code.test" | "code.lint" | "code.git"
-        | "coding.claude" | "coding.session" | "desk.sessions" | "desk.start" | "desk.prompt"
-        | "desk.read" | "desk.wait" | "desk.approve" | "desk.stop" | "desk.interrupt"
-        // The crew overseer reads and drives the same terminals.
-        | "crew.overview" | "crew.activity" | "crew.history" | "crew.account" | "crew.decisions" | "crew.ask_person" | "crew.close_item" | "crew.open_items" | "crew.promise" | "crew.order" | "crew.spend" | "crew.board" | "crew.nudge" | "crew.ask_session" | "crew.escalate" | "crew.approve"
-        | "crew.deny" | "crew.stop" | "crew.close_session" | "crew.interrupt" | "crew.resume" | "crew.restart" | "crew.start_session"
-        | "crew.assign" | "crew.assign_ticket" | "crew.move_ticket" | "crew.take_on" | "crew.release"
-        | "crew.plan" | "crew.plan_update" | "crew.board_create" | "crew.handover" => {
+        // The list lives with the guard that holds the same class in a turn
+        // steered by outside content, so the two never drift.
+        tool if workforce_agent::security::monitor::RUNS_COMMANDS.contains(&tool) => {
             Some(Capability::ShellExec)
         }
         // A language server loads the project the way a build does (build

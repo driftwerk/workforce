@@ -188,7 +188,8 @@ pub const HEARTBEAT: &str = "heartbeat";
 pub const SCHEDULER: &str = "scheduler";
 /// The identity workflow steps run as when the run has no person.
 pub const WORKFLOW_ENGINE: &str = "workflow-engine";
-const MONITOR: &str = "monitor";
+/// The identity a monitor's turns run as when it reacts to what it saw.
+pub const MONITOR: &str = "monitor";
 const GAMES: &str = "games";
 
 /// The sources automated turns enter the service as, in place of a person.

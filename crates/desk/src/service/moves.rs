@@ -579,7 +579,7 @@ impl Desk {
         })
     }
 
-    pub(super) fn crew(&self) -> Option<std::sync::Arc<dyn crew::Crew>> {
+    pub(crate) fn crew(&self) -> Option<std::sync::Arc<dyn crew::Crew>> {
         self.0
             .line_crew
             .lock()

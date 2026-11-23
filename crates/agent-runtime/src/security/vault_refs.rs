@@ -91,8 +91,10 @@ pub(crate) fn lookup_vault_key(
         return Err(eyre!("{GENERIC_RESOLUTION_ERROR}"));
     }
     let path = format!("{vault_prefix}{key}");
-    if workforce_common::vault_scope::is_desk_link(&path) {
-        warn!(target: "sentinel.audit", "vault marker rejected: a Desk link");
+    if workforce_common::vault_scope::is_desk_link(&path)
+        || workforce_common::connector_binding::is_personal_secret(&path)
+    {
+        warn!(target: "sentinel.audit", "vault marker rejected: a Desk link or a personal key");
         return Err(eyre!("{GENERIC_RESOLUTION_ERROR}"));
     }
     store.get(&path).ok_or_else(|| {
@@ -197,6 +199,29 @@ mod tests {
         fn list(&self, _: Option<&str>) -> Vec<String> {
             Vec::new()
         }
+    }
+
+    /// A marker never reads the person's bank key, under any prefix it
+    /// could be reached by, even where the key is stored.
+    #[test]
+    fn a_marker_never_reads_a_bank_key() {
+        let store = StubStore::with(&[
+            ("skills/bank/api_key", "bsk_x"),
+            ("skills/bank/workspaces/natwest/api_key", "bsk_y"),
+            ("skills/linear/api_key", "lin_z"),
+        ]);
+        for (marker, prefix) in [
+            ("[[vault:api_key]]", "skills/bank/"),
+            ("[[vault:workspaces/natwest/api_key]]", "skills/bank/"),
+            ("[[vault:bank/api_key]]", "skills/"),
+        ] {
+            let err = resolve_vault_refs(marker, &store, prefix).unwrap_err();
+            assert_eq!(err.to_string(), GENERIC_RESOLUTION_ERROR, "{marker}");
+        }
+        assert_eq!(
+            resolve_vault_refs("[[vault:linear/api_key]]", &store, "skills/").unwrap(),
+            "lin_z"
+        );
     }
 
     #[test]

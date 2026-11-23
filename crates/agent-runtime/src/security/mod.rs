@@ -15,4 +15,7 @@ pub mod vault_refs;
 mod adversarial_tests;
 
 #[cfg(test)]
+mod guarded_turn_tests;
+
+#[cfg(test)]
 pub(crate) mod test_support;

@@ -146,12 +146,14 @@ pub fn said_after(
 }
 
 /// The tool shell each output is written from, by its id, no process given
-/// to two, as `tree` was listed from `listed` on: each background shell
-/// (`shells`, by id and when its output file was born), in the order they
-/// were born, has the one started nearest its file's birth, never after it
-/// and at most [`SKEW`] before, in the whole seconds `ps` keeps of a run;
-/// then the open call has the first left of those started since it. One
-/// with none placed waits in no process Desk knows.
+/// to two, as `tree` was listed from `listed` on. Each background shell
+/// (`shells`, by id and when its output file was born) has one started
+/// within a second after its file's birth and at most [`SKEW`] before it,
+/// in the whole seconds `ps` keeps of a run: the nearest pairs are placed
+/// first, one started before its file ahead of one after, then the latest
+/// born with the latest started. Then the open call has the first left of
+/// the shells started since it. One with none placed waits in no process
+/// Desk knows.
 pub fn placed<'a>(
     tree: &[&'a Stat],
     call: Option<&OpenCall>,
@@ -166,25 +168,29 @@ pub fn placed<'a>(
     let free = |placed: &HashMap<String, &Stat>, s: &Stat| {
         !placed.values().any(|p| p.proc.pid == s.proc.pid)
     };
-    let mut born = shells.to_vec();
-    born.sort_by_key(|(id, made)| (*made, *id));
-    let placed = born
-        .into_iter()
-        .fold(HashMap::new(), |mut placed, (id, made)| {
+    let mut pairs: Vec<_> = shells
+        .iter()
+        .flat_map(|&(id, made)| {
             let age = (listed - made).num_milliseconds().div_euclid(1000);
-            let nearest = tools
-                .iter()
-                .copied()
-                .filter(|s| free(&placed, s))
-                .filter_map(|s| {
-                    let before = i64::try_from(s.elapsed_secs).ok()? - age;
-                    (0..=SKEW.num_seconds())
-                        .contains(&before)
-                        .then_some((before, s))
-                })
-                .min_by_key(|(before, s)| (*before, s.proc.pid))
-                .map(|(_, s)| s);
-            if let Some(s) = nearest {
+            tools.iter().copied().filter_map(move |s| {
+                let before = i64::try_from(s.elapsed_secs).ok()? - age;
+                (-1..=SKEW.num_seconds())
+                    .contains(&before)
+                    .then_some((before, made, id, s))
+            })
+        })
+        .collect();
+    pairs.sort_by_key(|(before, made, id, s)| {
+        (
+            before.abs(),
+            *before < 0,
+            std::cmp::Reverse((*made, *id, s.proc.pid)),
+        )
+    });
+    let placed = pairs
+        .into_iter()
+        .fold(HashMap::new(), |mut placed, (_, _, id, s)| {
+            if !placed.contains_key(id) && free(&placed, s) {
                 placed.insert(id.to_string(), s);
             }
             placed
@@ -791,6 +797,37 @@ mod tests {
             pids(&both, Some(&early)),
             [("b1".into(), 110), ("b2".into(), 120), ("t1".into(), 130)],
             "the open call never takes a background shell's"
+        );
+    }
+
+    #[test]
+    fn a_shell_in_the_same_second_as_another_is_placed_in_the_one_started_last() {
+        let at = |ms: i64| now() - Duration::milliseconds(ms);
+        let pids = |all: &[Stat], shells: &[(&str, DateTime<Utc>)]| {
+            let tree = work(all, 100, Engine::Claude, None);
+            let mut pids: Vec<(String, u32)> = placed(&tree, None, shells, now())
+                .into_iter()
+                .map(|(id, s)| (id, s.proc.pid))
+                .collect();
+            pids.sort();
+            pids
+        };
+        let same_second = shells(&[(110, 300, 0), (120, 300, 0)]);
+        assert_eq!(
+            pids(&same_second, &[("b1", at(300_200))]),
+            [("b1".to_string(), 120)],
+            "a sub-agent's shell started that second before it is not its own"
+        );
+        assert_eq!(
+            pids(&same_second, &[("b1", at(300_600)), ("b2", at(300_200))]),
+            [("b1".into(), 110), ("b2".into(), 120)],
+            "twins of one second, each its own"
+        );
+        let after_its_file = shells(&[(110, 305, 0), (120, 299, 0)]);
+        assert_eq!(
+            pids(&after_its_file, &[("b2", at(300_002))]),
+            [("b2".to_string(), 120)],
+            "its file made a few ms before its shell started"
         );
     }
 

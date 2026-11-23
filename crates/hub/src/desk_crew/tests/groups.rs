@@ -1756,41 +1756,25 @@ async fn an_order_sent_on_for_the_person_is_kept_as_theirs() {
 }
 
 /// What a machine says closed to a group's boss asking after its plan's
-/// sessions there: one closed in its group, and one a boss's close removed
-/// from it, by the group the close kept, so its slot is free; never
-/// another group's, or one removed from no group.
+/// sessions there: one closed in its group, and one the person removed,
+/// from its group or any other, so the slot it held is free; never one
+/// closed in another group.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_groups_boss_hears_its_plans_session_was_removed_and_never_anothers() {
-    use workforce_desk::decision::{BossDecision, Need, UndoPlan};
+async fn a_groups_boss_hears_its_plans_session_was_removed_by_the_person() {
     with_test_pool(workforce_desk::store::build_pool, |pool| async move {
         let dir = tempfile::tempdir().unwrap();
         let c = clients(dir.path(), pool).await;
         let d = &c.d;
         let removed = async |group: Option<&str>, name: &str| {
             let s = new_session(d, dir.path(), name).await;
-            d.end(s.id, Some(By::you())).await.unwrap();
-            d.forget(s.id).await.unwrap();
-            let kept = serde_json::from_value(json!({
-                "id": s.id, "engine": "claude", "view": "terminal", "name": name,
-                "cwd": s.cwd, "approvals": "desk", "cliSessionId": format!("cc-{name}"),
-                "group": group, "createdAt": chrono::Utc::now(),
-            }))
-            .unwrap();
-            let mut close = BossDecision::new(
-                "sarah",
-                Need::Choice,
-                &format!("closed {name}"),
-                "Its work is done.",
-                workforce_desk::decision::How::Own,
-            );
-            close.session = Some(s.id);
-            close.action = UndoPlan::Reopen {
-                session: s.id,
-                name: name.into(),
-                removed: Some(Box::new(kept)),
+            if let Some(g) = group {
+                d.change_layout(|l| l.put(&workforce_desk::session_item(s.id), g, None))
+                    .await
+                    .unwrap();
             }
-            .value();
-            d.store().decision_put(&close).await.unwrap();
+            d.remove(s.id, workforce_desk::Removal::default())
+                .await
+                .unwrap();
             s.id
         };
         let mine = removed(Some(c.acme.group.as_str()), "acme-gone").await;
@@ -1804,7 +1788,7 @@ async fn a_groups_boss_hears_its_plans_session_was_removed_and_never_anothers() 
             .into_iter()
             .find(|t| workforce_agent::tools::Tool::name(t) == "desk.sessions")
             .unwrap();
-        let ids = json!({ "ids": [mine, theirs, loose, shut, other_shut, uuid::Uuid::new_v4()] });
+        let ids = json!({ "ids": [mine, theirs, loose, shut, other_shut] });
         let out = workforce_agent::runner::CURRENT_AGENT_ID
             .scope("sarah".to_string(), async move {
                 workforce_agent::tools::Tool::execute(&tool, ids)
@@ -1813,6 +1797,15 @@ async fn a_groups_boss_hears_its_plans_session_was_removed_and_never_anothers() 
             })
             .await
             .output;
+        for gone in [mine, theirs, loose] {
+            let said: Vec<&Value> = out
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|s| s["id"] == json!(gone))
+                .collect();
+            assert_eq!(said, [&json!({ "id": gone, "state": "closed" })]);
+        }
         let listed: Vec<workforce_desk::crew::MachineSession> =
             serde_json::from_value(out).unwrap();
         let closed: Vec<uuid::Uuid> = listed
@@ -1820,7 +1813,7 @@ async fn a_groups_boss_hears_its_plans_session_was_removed_and_never_anothers() 
             .filter(|s| s.state == "closed")
             .map(|s| s.id)
             .collect();
-        assert_eq!(closed, [mine, shut]);
+        assert_eq!(closed, [mine, theirs, loose, shut]);
     })
     .await;
 }

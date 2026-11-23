@@ -175,6 +175,7 @@ fn empty_line(target: &DeskTarget, view: &RoomView) -> ChannelMessage {
         thread_id: None,
         files: Vec::new(),
         bot_id: None,
+        outside: false,
     }
 }
 
@@ -196,6 +197,7 @@ fn lines_of(target: &DeskTarget, view: &RoomView, limit: usize) -> Vec<ChannelMe
             thread_id: None,
             files: Vec::new(),
             bot_id: None,
+            outside: false,
         })
         .collect()
 }

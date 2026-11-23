@@ -483,7 +483,8 @@ pub enum Action {
     },
     /// Run a one-shot agent turn for the matching message and deliver its reply
     /// to `deliver_to` (a `#channel` id or `@user` DM; with `surface = "desk"`,
-    /// `"dm"`, the default, or `"notice"`).
+    /// `"dm"`, the default, or `"notice"`). The turn reads and delivers; `tools`
+    /// names anything more it may use, as a scheduled job's `tools` does.
     AgentTask {
         #[serde(default)]
         agent: Option<String>,
@@ -492,6 +493,8 @@ pub enum Action {
         deliver_to: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         surface: Option<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        tools: Vec<String>,
     },
     /// Bind `agent` to converse in the watched channel with `prompt` as a
     /// channel-scoped system prompt (response mode defaults to `all`). A standing
@@ -643,6 +646,18 @@ fn validate_input(id: &str, what: &str, input: &Value) -> Result<()> {
         ));
     }
     Ok(())
+}
+
+/// Whether `entry` reads as a tool's or a namespace's name: dotted
+/// segments of letters, digits, `_` and `-`.
+fn names_a_tool(entry: &str) -> bool {
+    !entry.is_empty()
+        && entry.split('.').all(|segment| {
+            !segment.is_empty()
+                && segment
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+        })
 }
 
 /// A JSON pointer is empty (the whole document) or starts at its root.
@@ -866,10 +881,17 @@ impl MonitorDefinition {
                 prompt,
                 deliver_to,
                 surface,
+                tools,
                 ..
             } => {
                 if prompt.trim().is_empty() {
                     return Err(needs("a prompt"));
+                }
+                if let Some(bad) = tools.iter().find(|tool| !names_a_tool(tool)) {
+                    return Err(eyre::eyre!(
+                        "Monitor '{id}' agent_task tools has '{bad}': name each tool or namespace \
+                         exactly (`email.move`, `email`), without wildcards"
+                    ));
                 }
                 if surface.as_deref() == Some(SURFACE_DESK) {
                     return Self::validate_desk_target(id, Some(deliver_to));
@@ -1554,6 +1576,27 @@ input = { id = "{{id}}" }
             Some(("@U1", Some("teams")))
         );
         assert!(MonitorDefinition::from_toml(&format!("{ok}surface = \"discord\"\n")).is_err());
+        for tools in [
+            r#"["email.move", "email"]"#,
+            r#"["google.gmail.label_create"]"#,
+        ] {
+            assert!(
+                MonitorDefinition::from_toml(&format!("{ok}tools = {tools}\n")).is_ok(),
+                "{tools}"
+            );
+        }
+        for tools in [
+            r#"["*"]"#,
+            r#"["email.*"]"#,
+            r#"[""]"#,
+            r#"["email move"]"#,
+            r#"["email."]"#,
+        ] {
+            assert!(
+                MonitorDefinition::from_toml(&format!("{ok}tools = {tools}\n")).is_err(),
+                "{tools}"
+            );
+        }
     }
 
     #[test]

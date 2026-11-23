@@ -772,6 +772,14 @@ pub struct MachineSession {
     /// it, or from a Desk that doesn't say.
     #[serde(default)]
     pub boss_has: Option<String>,
+    /// Whether its boss's question answerer there has what it asks; none
+    /// from a Desk that doesn't say.
+    #[serde(default)]
+    pub boss_answers: Option<bool>,
+    /// The grant there that holds it, by its group's key; none while none
+    /// does, or from a Desk that doesn't say.
+    #[serde(default)]
+    pub grant: Option<String>,
     /// How its process last ended on its own; none from a Desk that
     /// doesn't say, or says it in a way this one can't read.
     #[serde(default, deserialize_with = "exited_or_none")]
@@ -970,6 +978,16 @@ pub trait Crew: Send + Sync {
     /// Whether the overseer answers what sessions ask it on Desk's line;
     /// otherwise their questions to it go to the person.
     fn answers_lines(&self) -> bool {
+        false
+    }
+    /// Whether `boss`, a boss served from a grant that runs `session` here,
+    /// takes what that session says on Desk's line now: one relayed from
+    /// the home, while its home reads it under that grant.
+    fn answers_for(&self, _boss: &str, _session: uuid::Uuid) -> bool {
+        false
+    }
+    /// Whether `view`'s boss answers what it asks itself, here.
+    fn answers_itself(&self, _view: &crate::model::SessionView) -> bool {
         false
     }
     /// Gives the agent `agent` a task in its Desk conversation, as you,

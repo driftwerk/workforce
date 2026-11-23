@@ -374,6 +374,21 @@ impl Desk {
         self.overview_for(crew, person, None).await
     }
 
+    /// `views` as the overview shows them now.
+    pub fn session_items(&self, crew: &dyn Crew, views: &[SessionView]) -> Vec<Item> {
+        let now = Utc::now();
+        let quiet = crew
+            .overseer()
+            .as_ref()
+            .map_or(DEFAULT_QUIET_MINUTES, |o| o.quiet_minutes);
+        let midnight = crew.midnight();
+        let tz = self.timezone();
+        views
+            .iter()
+            .map(|v| session_item(v, self.state_since(v.id), now, midnight, quiet, &tz))
+            .collect()
+    }
+
     /// The overview as an overseer that sees `seen` reads it: only what is
     /// in its scope, counted, and only its scope's groups; everything for
     /// none.
@@ -389,12 +404,7 @@ impl Desk {
             .as_ref()
             .map_or(DEFAULT_QUIET_MINUTES, |o| o.quiet_minutes);
         let midnight = crew.midnight();
-        let tz = self.timezone();
-        let mut items: Vec<Item> = self
-            .list()
-            .iter()
-            .map(|v| session_item(v, self.state_since(v.id), now, midnight, quiet, &tz))
-            .collect();
+        let mut items = self.session_items(crew, &self.list());
         let latest = self.store().latest_turn_events().await?;
         let layout = self.layout();
         let bosses = self.bosses();

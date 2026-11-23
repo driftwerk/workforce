@@ -114,6 +114,23 @@ impl MonitorEvent {
         }
     }
 
+    /// Whether `name` carries content from outside: what a message or an
+    /// item said, or an item's own id. A platform's ids, the source's name and
+    /// our own clock are not.
+    fn is_outside(&self, name: &str) -> bool {
+        matches!(name, "text" | "value" | "previous")
+            || name.starts_with("json:")
+            || (name == "id" && matches!(self, Self::Observed(_)))
+    }
+
+    /// Whether `template` puts in what the event said: its `text` or
+    /// `value`.
+    pub fn inlines_body(template: &str) -> bool {
+        placeholder()
+            .captures_iter(template)
+            .any(|captures| matches!(&captures[1], "text" | "value"))
+    }
+
     fn placeholder_value(&self, name: &str, payload: &Value) -> String {
         match (self, name) {
             (_, "text") => self.text().to_string(),
@@ -137,10 +154,21 @@ impl MonitorEvent {
     /// `{{channel}}`, `{{user}}`, `{{ts}}`, `{{value}}`, `{{previous}}` and
     /// `{{json:/a/b}}`. Plain substitution, no escaping.
     pub fn render(&self, template: &str) -> String {
+        self.render_with(template, str::to_string)
+    }
+
+    /// [`Self::render`], with each outside value put in by `fence`. One pass:
+    /// a value is never read for placeholders of its own.
+    pub fn render_with(&self, template: &str, fence: impl Fn(&str) -> String) -> String {
         let payload = self.payload();
         placeholder()
             .replace_all(template, |captures: &regex::Captures<'_>| {
-                self.placeholder_value(&captures[1], &payload)
+                let value = self.placeholder_value(&captures[1], &payload);
+                if self.is_outside(&captures[1]) {
+                    fence(&value)
+                } else {
+                    value
+                }
             })
             .into_owned()
     }
@@ -255,6 +283,49 @@ mod tests {
         assert_eq!(
             ev.render_value(&input),
             json!({ "id": "m-7", "nested": { "list": ["Invoice 42", 3, true] }, "n": 1 })
+        );
+    }
+
+    fn fenced(value: &str) -> String {
+        format!("[{value}]")
+    }
+
+    #[test]
+    fn render_with_fences_outside_content_and_leaves_our_own_ids_plain() {
+        let ev = message();
+        assert_eq!(
+            ev.render_with(
+                "{{user}} {{channel}} {{ts}} {{id}}: {{text}} {{value}} {{json:/surface}}",
+                fenced
+            ),
+            "U1 C1 1.5 1.5: [hello] [hello] [slack]"
+        );
+        let ev = observation();
+        assert_eq!(
+            ev.render_with("{{channel}} {{ts}} {{id}} {{text}} {{previous}}", fenced),
+            "google.gmail.search 2026-10-16T10:00:00+00:00 [m-7] [Invoice 42] [{\"amount\":10,\"subject\":\"Invoice 41\"}]"
+        );
+    }
+
+    #[test]
+    fn inlines_body_sees_only_what_the_event_said() {
+        assert!(MonitorEvent::inlines_body("Summarise {{text}}"));
+        assert!(MonitorEvent::inlines_body("Now {{value}}"));
+        assert!(!MonitorEvent::inlines_body("Subject {{json:/text}}"));
+        assert!(!MonitorEvent::inlines_body("Item {{id}}, was {{previous}}"));
+        assert!(!MonitorEvent::inlines_body("No placeholders"));
+    }
+
+    #[test]
+    fn a_value_is_never_expanded_again() {
+        let ev = MonitorEvent::Message(InboundEvent {
+            text: "{{json:/channel}} {{user}}".into(),
+            ..message().message().unwrap().clone()
+        });
+        assert_eq!(ev.render("{{text}}"), "{{json:/channel}} {{user}}");
+        assert_eq!(
+            ev.render_value(&json!({ "q": "{{text}}" })),
+            json!({ "q": "{{json:/channel}} {{user}}" })
         );
     }
 

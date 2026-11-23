@@ -11,7 +11,7 @@ use workforce_desk::decision::Need;
 use workforce_desk::grant::BossRef;
 
 use super::super::relay::{RelayAnswer, RelayCall};
-use super::super::relayed_decide::{DECIDED, FRESH, TAKE};
+use super::super::relayed_decide::{Call, DECIDED, FRESH, TAKE};
 use super::super::served::{ServedCall, ServedStatus};
 
 const SARAH: &str = "home/sarah";
@@ -39,10 +39,11 @@ fn relayed(tool: &str, input: Value, boss: &str, level: &str) -> Value {
 fn counted(mut take: Value) -> Value {
     take["countFrom"] = json!((chrono::Utc::now() - chrono::Duration::hours(1)).timestamp_millis());
     take["spentElsewhereUsd"] = json!(0.0);
+    take["takes"] = json!(["question", "plan"]);
     take
 }
 
-async fn post(app: &axum::Router, token: &str, body: Value) -> Value {
+pub(super) async fn post(app: &axum::Router, token: &str, body: Value) -> Value {
     let res = app
         .clone()
         .oneshot(
@@ -449,8 +450,11 @@ async fn the_home_takes_its_bosss_decisions_from_its_machines_and_answers_each_w
 {
     with_test_pool(workforce_desk::store::build_pool, |pool| async move {
         let dir = tempfile::tempdir().unwrap();
-        let (_sarah, crew, d, llm) = overseeing(dir.path(), pool, "ok", SARAH_FULL, &[]).await;
+        let (sarah, crew, d, llm) = overseeing(dir.path(), pool, "ok", SARAH_FULL, &[]).await;
         super::decides_at_once::decides(&llm, "git tag v9", "ALLOW: it tags the release").await;
+        super::decides_at_once::decides(&llm, "Ship it?", "ANSWER: Yes, ship it.\nWHY: it is built")
+            .await;
+        super::decides_at_once::decides(&llm, "Plan: tag v9", "APPROVE: it tags the release").await;
         let remote = uuid::Uuid::new_v4();
         d.change_layout(|l| l.create("acme", "Acme", &[format!("session:devbox/{remote}")], None))
             .await
@@ -458,12 +462,18 @@ async fn the_home_takes_its_bosss_decisions_from_its_machines_and_answers_each_w
         crew.read_spent_today(&crew.overseers()).await;
         let decide_id = uuid::Uuid::new_v4();
         let bad_id = uuid::Uuid::new_v4();
+        let question_id = uuid::Uuid::new_v4();
+        let odd_id = uuid::Uuid::new_v4();
+        let plan_id = uuid::Uuid::new_v4();
+        let note_id = uuid::Uuid::new_v4();
         let seen: Arc<parking_lot::Mutex<Vec<RelayCall>>> = Arc::default();
         let handed = Arc::new(std::sync::atomic::AtomicBool::new(false));
         // Desk's native side, and devbox, standing in.
         let poller = {
             let (crew, seen, handed) = (Arc::clone(&crew), Arc::clone(&seen), Arc::clone(&handed));
             tokio::spawn(async move {
+                let note = json!({"id": note_id, "kind": "asks", "session": "acme-web",
+                                  "ask": "which customer gets the first invite? sk-ant-api03-abcdefghijklmnopqrstuvwxyz0123456789"});
                 loop {
                     for c in crew.relay_take(Duration::from_millis(200)).await {
                         seen.lock().push(c.clone());
@@ -477,9 +487,23 @@ async fn the_home_takes_its_bosss_decisions_from_its_machines_and_answers_each_w
                                     {"decideId": decide_id, "prompt": format!(
                                         "{} decide `git tag v9`", super::super::decide::MARK)},
                                     {"decideId": bad_id, "prompt": "write me a poem"},
-                                ]})
+                                    {"decideId": question_id, "kind": "question", "prompt": format!(
+                                        "{} It asks: Ship it?", super::super::decide::MARK)},
+                                    {"decideId": odd_id, "kind": "poem", "prompt": format!(
+                                        "{} It asks: rhyme?", super::super::decide::MARK)},
+                                    {"decideId": plan_id, "kind": "plan", "prompt": format!(
+                                        "{} Review it: Plan: tag v9", super::super::decide::MARK)},
+                                ], "notes": [note]})
                             }
-                            TAKE => json!({"full": in_force, "decisions": []}),
+                            // Handed again on every take until one says it
+                            // was taken.
+                            TAKE if c.input["notesTaken"]
+                                .as_array()
+                                .is_some_and(|t| t.contains(&json!(note_id))) =>
+                            {
+                                json!({"full": in_force, "decisions": []})
+                            }
+                            TAKE => json!({"full": in_force, "decisions": [], "notes": [note]}),
                             _ => json!({"taken": true}),
                         };
                         if c.tool == TAKE {
@@ -528,6 +552,44 @@ async fn the_home_takes_its_bosss_decisions_from_its_machines_and_answers_each_w
         let bad = decided(bad_id).await;
         assert_eq!(bad.input["code"], "not_a_decision", "{:?}", bad.input);
         assert!(bad.input.get("text").is_none());
+        // A question is answered with the answerer's own instructions, and
+        // what devbox says for the person is said in Sarah's DM.
+        let answered = decided(question_id).await;
+        assert_eq!(answered.input["text"], "ANSWER: Yes, ship it.\nWHY: it is built");
+        let asked = super::decides_at_once::calls_about(&llm, "Ship it?").await;
+        assert_eq!(asked.len(), 1);
+        assert!(
+            asked[0].contains("you answer it yourself, now, as the person would"),
+            "{}",
+            asked[0]
+        );
+        let odd = decided(odd_id).await;
+        assert_eq!(odd.input["code"], "not_a_decision", "{:?}", odd.input);
+        // A plan is reviewed with the plan reviewer's own.
+        let reviewed = decided(plan_id).await;
+        assert_eq!(reviewed.input["text"], "APPROVE: it tags the release");
+        let review = super::decides_at_once::calls_about(&llm, "Plan: tag v9").await;
+        assert!(
+            review.len() == 1 && review[0].contains("you review it yourself, now, as the person"),
+            "{review:?}"
+        );
+        // Said once in Sarah's DM, in the Mac's words, its secret hidden,
+        // and the next take says it was taken.
+        eventually("devbox's notice taken", async || {
+            seen.lock()
+                .iter()
+                .any(|c| c.tool == TAKE && c.input["notesTaken"] == json!([note_id]))
+                .then_some(())
+        })
+        .await;
+        let notice = ["On devbox: acme-web asks: which customer gets the first invite?"];
+        assert_eq!(super::decides_at_once::said(&sarah, &notice), 1);
+        assert_eq!(super::decides_at_once::said(&sarah, &["sk-ant-api03"]), 0);
+        assert!(seen
+            .lock()
+            .iter()
+            .filter(|c| c.tool == TAKE)
+            .all(|c| c.input["takes"] == json!(["question", "plan"])));
         assert_eq!(
             super::decides_at_once::calls_about(&llm, "poem")
                 .await
@@ -739,6 +801,272 @@ async fn a_request_beside_a_job_the_home_holds_is_the_persons_on_the_machine() {
         assert_eq!(out["status"], "ok", "{out}");
         waits_on_person(&d, started).await;
         assert!(!asked.is_finished(), "nothing allowed it");
+    })
+    .await;
+}
+
+/// On devbox: at Act fully, a question Sarah's session ends its turn on is
+/// answered by her own model at home, as her questions on the Mac are
+/// (`answer`): the answer is said on its line as hers, and her work turns
+/// aren't woken for it; what only the person can answer goes to her DM at
+/// home with her next take.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_question_of_a_session_the_homes_boss_runs_on_a_machine_is_answered_by_its_home() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (_any, crew, d, _llm) = overseeing(
+            dir.path(),
+            pool,
+            "ok",
+            "[oversight]\nenabled = false\n",
+            &[],
+        )
+        .await;
+        d.boss_bounds_with(workforce_desk::charge::Bounds {
+            home: dir.path().to_path_buf(),
+            ..Default::default()
+        });
+        let acme_api = dir.path().join("acme-api");
+        std::fs::create_dir_all(&acme_api).unwrap();
+        let anchor = new_session(&d, dir.path(), "acme-web").await;
+        let item = workforce_desk::session_item(anchor.id);
+        d.change_layout(|l| l.create("acme", "Acme", std::slice::from_ref(&item), None))
+            .await
+            .unwrap();
+        let (code, out) = native(
+            &d,
+            "PUT",
+            "/api/desk/grants/acme",
+            grant(1, "full", &acme_api),
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK, "{out}");
+        let r = crew
+            .serve_crew(
+                ServedCall {
+                    tool: "crew.start_session".into(),
+                    input: json!({"folder": acme_api.to_string_lossy(), "goal": "Ship the fix",
+                                  "engine": "claude", "reason": "Next up."}),
+                    boss: BossRef::Local {
+                        agent: "sarah".into(),
+                    },
+                    link_id: Some("home-relay".into()),
+                    call_id: Some(uuid::Uuid::new_v4().to_string()),
+                    ceiling: None,
+                },
+                "acme",
+            )
+            .await;
+        assert_eq!(r.status, ServedStatus::Ok, "{:?}", r.body);
+        let started = eventually("Sarah's session", async || {
+            d.charges()
+                .into_iter()
+                .find(|c| c.boss == SARAH)
+                .map(|c| c.session)
+        })
+        .await;
+        let url = hook_url(dir.path(), started).await;
+        let app = super::super::relay::routes(Arc::clone(&crew.state), Arc::clone(&crew));
+        let token = crew.state.auth_token.clone();
+        let take = || {
+            let (app, token) = (app.clone(), token.clone());
+            async move {
+                post(
+                    &app,
+                    &token,
+                    relayed(
+                        TAKE,
+                        counted(json!({"inForce": true,
+                                       "sentAt": chrono::Utc::now().timestamp_millis()})),
+                        "local:sarah",
+                        "full",
+                    ),
+                )
+                .await
+            }
+        };
+        let answer = |id: Value, text: &'static str| {
+            let (app, token) = (app.clone(), token.clone());
+            async move {
+                post(
+                    &app,
+                    &token,
+                    relayed(
+                        DECIDED,
+                        json!({"decideId": id, "text": text, "heldJobs": []}),
+                        "local:sarah",
+                        "full",
+                    ),
+                )
+                .await
+            }
+        };
+        // Takes, holding Act fully in force at home, until a question is
+        // handed back; what each take said for the person is kept.
+        let notes: Arc<parking_lot::Mutex<Vec<Value>>> = Arc::default();
+        let asked = async |about: &str| {
+            for _ in 0..200 {
+                let out = take().await;
+                notes
+                    .lock()
+                    .extend(out["body"]["notes"].as_array().cloned().unwrap_or_default());
+                let handed = out["body"]["decisions"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .find(|d| d["prompt"].as_str().is_some_and(|p| p.contains(about)))
+                    .cloned();
+                if let Some(d) = handed {
+                    return d;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            panic!("{about} wasn't handed back");
+        };
+        let ends_asking = async |question: &str| {
+            hook(
+                &url,
+                json!({"hook_event_name": "Stop",
+                       "last_assistant_message": format!("Built it. {question}")}),
+            )
+            .await;
+        };
+
+        // A home that says it takes no questions is handed none: they stay
+        // the machine's to settle.
+        let mut older = counted(json!({"inForce": true,
+                                       "sentAt": chrono::Utc::now().timestamp_millis()}));
+        older["takes"] = json!([]);
+        post(&app, &token, relayed(TAKE, older, "local:sarah", "full")).await;
+        assert!(crew.home_holds_full(SARAH, "acme"));
+        assert!(!crew.home_takes(SARAH, "acme", Call::Question));
+        take().await;
+        assert!(crew.served_full(SARAH).is_some(), "unbound");
+        assert!(crew.home_takes(SARAH, "acme", Call::Plan));
+        ends_asking("Ship it?").await;
+        let q = asked("Ship it?").await;
+        assert_eq!(q["kind"], "question", "{q}");
+        assert!(
+            q["prompt"]
+                .as_str()
+                .unwrap()
+                .starts_with(super::super::decide::MARK),
+            "{q}"
+        );
+        // Her answerer has it: her work turns hear neither its end nor it.
+        let work = post(
+            &app,
+            &token,
+            relayed(
+                super::super::relayed_work::WORK_TAKE,
+                json!({"peek": true}),
+                "local:sarah",
+                "full",
+            ),
+        )
+        .await;
+        let run = &work["body"]["sessions"][0];
+        assert_eq!(run["answered"], true, "{work}");
+        assert!(
+            work["body"]["events"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|e| !e["line"].as_str().unwrap_or_default().contains("finished")),
+            "{work}"
+        );
+        let out = answer(
+            q["decideId"].clone(),
+            "ANSWER: Yes, ship it.\nWHY: it is built",
+        )
+        .await;
+        assert_eq!(out["status"], "ok", "{out}");
+        let line = eventually("her answer on its line", async || {
+            d.line_thread(started, None, None)
+                .await
+                .unwrap_or_default()
+                .into_iter()
+                .find(|m| m.text.contains("Yes, ship it."))
+        })
+        .await;
+        assert_eq!(line.text, "Yes, ship it.", "{line:?}");
+        assert_eq!(line.kind, workforce_desk::line::LineKind::Answer);
+        assert_eq!(line.from.id, SARAH);
+
+        // Her plan is reviewed by her too, within the dialog's hold, once
+        // the crew's sweep has said she answers its dialogs.
+        take().await;
+        tokio::time::sleep(Duration::from_millis(2500)).await;
+        let plan = json!({"hook_event_name": "PreToolUse", "tool_name": "ExitPlanMode",
+                          "tool_use_id": "toolu_p1",
+                          "tool_input": {"plan": "# Plan: tag v9\n\n1. Tag it."}});
+        let reviewed = tokio::spawn({
+            let url = url.clone();
+            async move { hook(&url, plan).await }
+        });
+        let p = asked("Plan: tag v9").await;
+        assert_eq!(p["kind"], "plan", "{p}");
+        answer(p["decideId"].clone(), "CHANGES: tag it on staging first.").await;
+        let out = tokio::time::timeout(Duration::from_secs(20), reviewed)
+            .await
+            .expect("reviewed within its hold")
+            .unwrap();
+        let o = &out["hookSpecificOutput"];
+        assert_eq!(o["permissionDecision"], "deny", "{out}");
+        assert!(
+            o["permissionDecisionReason"]
+                .as_str()
+                .is_some_and(|r| r.contains("tag it on staging first.")),
+            "{out}"
+        );
+
+        // What only the person can answer goes to her DM at home.
+        hook(
+            &url,
+            json!({"hook_event_name": "UserPromptSubmit", "prompt": "carry on"}),
+        )
+        .await;
+        ends_asking("Which customer gets the first invite?").await;
+        let q = asked("Which customer gets the first invite?").await;
+        answer(
+            q["decideId"].clone(),
+            "ASK: which customer should get the first invite?",
+        )
+        .await;
+        let note = eventually("her notice for the person", async || {
+            take().await["body"]["notes"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .chain(notes.lock().iter())
+                .find(|n| n["ask"] == "which customer should get the first invite?")
+                .cloned()
+        })
+        .await;
+        // Its fields alone: the Mac says them in its own words.
+        assert_eq!(note["kind"], "asks", "{note}");
+        assert_eq!(
+            note["session"],
+            json!(d.view(started).unwrap().label()),
+            "{note}"
+        );
+        assert!(
+            d.view(started).unwrap().asked.is_some(),
+            "still the person's"
+        );
+        // Handed until a take says it was taken, then never again.
+        let mut acked = counted(json!({"inForce": true,
+                                       "sentAt": chrono::Utc::now().timestamp_millis()}));
+        acked["notesTaken"] = json!([note["id"]]);
+        post(&app, &token, relayed(TAKE, acked, "local:sarah", "full")).await;
+        assert!(
+            take().await["body"]["notes"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .all(|n| n["id"] != note["id"]),
+            "taken"
+        );
     })
     .await;
 }
