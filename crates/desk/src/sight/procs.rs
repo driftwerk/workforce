@@ -146,7 +146,7 @@ pub fn said_after(
 }
 
 /// The tool shell each output is written from, by its id, no process given
-/// to two, as `tree` was listed at `listed`: each background shell
+/// to two, as `tree` was listed from `listed` on: each background shell
 /// (`shells`, by id and when its output file was born), in the order they
 /// were born, has the one started nearest its file's birth, never after it
 /// and at most [`SKEW`] before, in the whole seconds `ps` keeps of a run;
