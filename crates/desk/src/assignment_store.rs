@@ -28,8 +28,9 @@ pub const TAKEN_MEANWHILE: &str =
     "it went after it was settled, and another order holds its job now";
 
 /// When the line message carrying it went in, if it did: as the line
-/// row says (taken by the session's hook counts).
-const WENT_IN: &str = "CASE WHEN l.delivery IN ('delivered', 'handed') \
+/// row says. Handed to Desk's plugin is not in yet: it is once the
+/// session's prompt or the plugin says so.
+const WENT_IN: &str = "CASE WHEN l.delivery = 'delivered' \
     THEN COALESCE(l.delivered_at, l.updated_at) END";
 
 fn assignment(r: &Row) -> Result<Assignment> {
@@ -66,6 +67,10 @@ fn assignment(r: &Row) -> Result<Assignment> {
         basis: r.try_get(26)?,
     })
 }
+
+/// Whether an assignment's line message is on its way in: handed to Desk's
+/// plugin, or typed in, and not yet shown to be in.
+const HANDED: &str = "COALESCE(l.delivery = 'handed', false)";
 
 /// A select of assignments with what their line rows say, after `rest`.
 fn select(rest: &str) -> String {
@@ -113,21 +118,27 @@ impl DeskStore {
             &[&new.boss],
         )
         .await?;
+        // One on its way in counts as in: superseded, it would reach its
+        // session beside the new one.
         let live: Vec<Live> = tx
             .query(
-                &select(&format!("WHERE a.boss = $1 AND a.state IN {LIVE}")),
+                &format!(
+                    "SELECT {COLUMNS}, {WENT_IN}, {HANDED} AS handed FROM boss_assignments a \
+                     LEFT JOIN line_messages l ON l.id = a.line_message \
+                     WHERE a.boss = $1 AND a.state IN {LIVE}"
+                ),
                 &[&new.boss],
             )
             .await?
             .iter()
-            .map(assignment)
-            .collect::<Result<Vec<_>>>()?
-            .into_iter()
-            .map(|a| Live {
-                delivered: went_in(&a),
-                a,
+            .map(|r| {
+                let a = assignment(r)?;
+                Ok(Live {
+                    delivered: went_in(&a) || r.try_get::<_, bool>("handed")?,
+                    a,
+                })
             })
-            .collect();
+            .collect::<Result<_>>()?;
         let (supersede, follow_up) = match assignment::rule(new, &live, replacing.map(|(id, _)| id))
         {
             Ruling::Refused { rule, holder } => {
@@ -619,14 +630,14 @@ impl DeskStore {
             .map(|r| r.get(0)))
     }
 
-    /// The live assignments whose line message was withdrawn or refused:
-    /// it never went in, so they hold nothing.
+    /// The live assignments whose line message was withdrawn, refused, or
+    /// never shown to have gone in: they hold nothing.
     pub async fn assignments_never_went_in(&self) -> Result<Vec<Assignment>> {
         let client = self.pool().get().await?;
         client
             .query(
                 &select(
-                    "WHERE a.state IN ('open', 'sending') AND l.delivery IN ('withdrawn', 'refused')",
+                    "WHERE a.state IN ('open', 'sending') AND l.delivery IN ('withdrawn', 'refused', 'unreceived')",
                 ),
                 &[],
             )
@@ -895,19 +906,27 @@ mod tests {
                 .await
                 .unwrap();
             store.assignment_reopen(first.id).await.unwrap();
-            // Gone in: the same order again is refused.
+            // Handed to Desk's plugin is not in yet, but on its way: the
+            // same order again is refused, as once it has gone in.
             store
-                .line_take(m.id, crate::line::Delivery::Delivered)
+                .line_take(m.id, crate::line::Delivery::Handed)
                 .await
                 .unwrap();
-            let third = order("boss", s, "Start Harbor production release 3 now.");
-            assert!(matches!(
-                store.assignment_reserve(&third, None).await.unwrap(),
-                Reserved::Refused {
-                    rule: Rule::SameSession,
-                    ..
-                }
-            ));
+            let handed = store.assignment_of_line(m.id).await.unwrap().unwrap();
+            assert_eq!(handed.delivered_at, None);
+            let refused = async || {
+                let again = order("boss", s, "Start Harbor production release 3 now.");
+                matches!(
+                    store.assignment_reserve(&again, None).await.unwrap(),
+                    Reserved::Refused {
+                        rule: Rule::SameSession,
+                        ..
+                    }
+                )
+            };
+            assert!(refused().await, "on its way in");
+            store.line_ack(m.id).await.unwrap();
+            assert!(refused().await, "gone in");
         })
         .await;
     }

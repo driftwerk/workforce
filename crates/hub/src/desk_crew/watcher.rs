@@ -898,8 +898,15 @@ impl CrewHub {
                 format!("it was told to read it with its next tool call, and hasn't made one: {LONG_STEP}"),
                 false,
             ),
+            Some(Wait::Behind) => (
+                "an earlier message was handed to it and was never said to have gone in, and the rest wait behind it"
+                    .to_string(),
+                false,
+            ),
             None => ("it was free to take it, and nothing took it in".to_string(), false),
-            Some(Wait::Typing | Wait::Paused | Wait::PersonDriving | Wait::ModeEnding) => {
+            Some(
+                Wait::Typing | Wait::Paused | Wait::PersonDriving | Wait::ModeEnding | Wait::Awaited,
+            ) => {
                 return None
             }
         };

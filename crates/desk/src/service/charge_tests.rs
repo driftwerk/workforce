@@ -8,7 +8,7 @@ use serde_json::{json, Value};
 use uuid::Uuid;
 use workforce_postgres::test_support::with_test_pool;
 
-use super::super::tests::{desk, new_session};
+use super::super::tests::{desk, new_session, went_in};
 use super::*;
 use crate::line::{Delivery, Send, Target, Wait, When};
 use crate::service::Sender;
@@ -39,8 +39,7 @@ fn sarah() -> Party {
 /// What the plugin is handed next, said into the session.
 async fn take_next(d: &Desk, id: Uuid, wait: Duration) -> Option<Value> {
     let next = d.line_next(id, wait).await?;
-    let m: Uuid = serde_json::from_value(next["id"].clone()).unwrap();
-    d.line_ack(id, m, true).await.unwrap();
+    went_in(d, id, &next).await;
     Some(next)
 }
 

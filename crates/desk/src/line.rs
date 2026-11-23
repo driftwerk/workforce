@@ -26,7 +26,8 @@ text_enum!(LineKind {
 text_enum!(Delivery {
     // Waiting for the recipient to be able to take it.
     Queued => "queued",
-    // Desk's plugin took it; delivered once it says the session has it.
+    // Handed to Desk's plugin, or typed in: delivered once the session is
+    // shown to have it (its marker came back in a prompt, see [`marked`]).
     Handed => "handed",
     Delivered => "delivered",
     // The recipient isn't running; it goes out when it runs again.
@@ -38,6 +39,10 @@ text_enum!(Delivery {
     Withdrawn => "withdrawn",
     // Shown in the thread only, never typed into the session.
     Noted => "noted",
+    // Never shown to have gone in: Desk tried twice and it never showed in
+    // the session (nor once where nothing can show it). Its sender is
+    // told; it isn't put in again, and an ask is withdrawn.
+    Unreceived => "unreceived",
 });
 
 text_enum!(Asked {
@@ -280,6 +285,12 @@ pub enum Wait {
     /// Sent now into its running turn: it reads it with its next tool
     /// call's result (or, if the turn ends first, at the idle).
     NextCall,
+    /// Its session's own call waits on it, the answer to what it asked:
+    /// that call takes it as its result.
+    Awaited,
+    /// One handed to Desk's plugin before it hasn't been said to have gone
+    /// in yet: one goes at a time, in the order they were sent.
+    Behind,
 }
 
 impl Wait {
@@ -288,7 +299,13 @@ impl Wait {
     pub fn on_purpose(self) -> bool {
         match self {
             Self::Typing | Self::Paused | Self::PersonDriving | Self::ModeEnding => true,
-            Self::Stopped | Self::Working | Self::Asking | Self::Dialog | Self::NextCall => false,
+            Self::Stopped
+            | Self::Working
+            | Self::Asking
+            | Self::Dialog
+            | Self::NextCall
+            | Self::Awaited
+            | Self::Behind => false,
         }
     }
 }
@@ -343,6 +360,9 @@ pub struct LineMessage {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub group: Option<String>,
     pub delivered_at: Option<DateTime<Utc>>,
+    /// When Desk's plugin was handed it, if it was.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub handed_at: Option<DateTime<Utc>>,
     pub updated_at: DateTime<Utc>,
     /// Why it waits, while it is queued or held (not stored).
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -354,6 +374,10 @@ pub struct LineMessage {
     /// What the person can do with it now, while it waits (not stored).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub actions: Vec<LineAction>,
+    /// Given up on ([`Delivery::Unreceived`]), then shown to have gone in
+    /// after all: set on the one word of its going in (not stored).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub late: bool,
 }
 
 impl LineMessage {
@@ -379,10 +403,12 @@ impl LineMessage {
             question: None,
             group: None,
             delivered_at: None,
+            handed_at: None,
             updated_at: at,
             waiting: None,
             actions: Vec::new(),
             urgency: None,
+            late: false,
         }
     }
 
@@ -1110,6 +1136,12 @@ pub fn steering(
 
 /// What a message from another session, or Desk, opens with: how a hook
 /// tells it from the person's own words.
+/// Whether `msg` goes in carrying its [`marker`], which its session's
+/// prompt brings back as it goes in: all but the person's own words.
+pub fn marked(msg: &LineMessage) -> bool {
+    msg.from.kind != PartyKind::You
+}
+
 pub fn marker(id: Uuid) -> String {
     format!("[Desk m:{}]", &id.simple().to_string()[..MARK])
 }
@@ -1359,7 +1391,7 @@ pub fn render(msg: &LineMessage, question: Option<&str>) -> String {
 fn render_raw(msg: &LineMessage, question: Option<&str>) -> String {
     // The person's own words: what they write goes in as written, and an
     // answer says what it answers.
-    if msg.from.kind == PartyKind::You {
+    if !marked(msg) {
         return match (msg.kind, question) {
             (LineKind::Answer, Some(q)) => format!(
                 "Earlier you asked me “{}” and went ahead without my answer. My answer: {}",

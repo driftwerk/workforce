@@ -1262,7 +1262,7 @@ mod tests {
             eventually("queued again, waiting on the question", async || {
                 let m = row(earlier.id).await;
                 (m.delivery == crate::line::Delivery::Queued
-                    && d.line_waits(&m) == Some(crate::line::Wait::Asking))
+                    && d.line_waits(&m).await == Some(crate::line::Wait::Asking))
                 .then_some(())
             })
             .await;
@@ -1275,12 +1275,12 @@ mod tests {
                 .await
                 .unwrap();
             assert_ne!(
-                d.line_waits(&row(after.id).await),
+                d.line_waits(&row(after.id).await).await,
                 Some(crate::line::Wait::Asking),
                 "its running boss answers it"
             );
             assert_eq!(
-                d.line_waits(&row(earlier.id).await),
+                d.line_waits(&row(earlier.id).await).await,
                 Some(crate::line::Wait::Asking)
             );
         })

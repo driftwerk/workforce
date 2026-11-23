@@ -578,8 +578,20 @@ async fn a_question_behind_reports_waiting_for_the_next_hour_is_answered_at_once
 async fn every_report_in_rounds_with_the_boss_that_runs_it_reaches_its_turn() {
     with_test_pool(workforce_desk::store::build_pool, |pool| async move {
         let dir = tempfile::tempdir().unwrap();
-        let (overseer, crew, d, s) = paced_session(50, "Noted.", pool, dir.path()).await;
+        let (overseer, crew, d, llm) =
+            overseeing_at(dir.path(), pool, "Noted.", &paced_config(50), &[], FAST).await;
+        let s = new_session(&d, dir.path(), "Legacy removal").await.id;
+        d.take_on(
+            s,
+            &workforce_desk::crew::Party::manager("desk", &super::super::name_of(&overseer)),
+            workforce_desk::charge::How::Handed,
+            &Default::default(),
+            &By::you(),
+        )
+        .await
+        .unwrap();
         let rounds = usize::try_from(workforce_desk::rooms::MAX_HOPS).unwrap() * 3;
+        let url = hook_url(dir.path(), s).await;
         for round in 1..=rounds {
             let sent = d
                 .line_call(
@@ -592,7 +604,9 @@ async fn every_report_in_rounds_with_the_boss_that_runs_it_reaches_its_turn() {
                 .unwrap_or_else(|e| panic!("report {round} refused: {e}"));
             let report: uuid::Uuid = serde_json::from_value(sent["id"].clone()).unwrap();
             eventually("its report taken by a turn", async || {
-                (line_turns(&overseer, s) == round).then_some(())
+                let taken = d.store().line_message(report).await.ok()??.delivery == Delivery::Delivered;
+                let waits = d.store().line_waiting_for_bosses().await.ok()?;
+                (taken && waits.is_empty() && line_turns(&overseer, s) == round).then_some(())
             })
             .await;
             let hop = d.store().line_message(report).await.unwrap().unwrap().hop;
@@ -610,16 +624,38 @@ async fn every_report_in_rounds_with_the_boss_that_runs_it_reaches_its_turn() {
             })
             .await;
             let id: uuid::Uuid = serde_json::from_value(next["id"].clone()).unwrap();
+            let text = next["text"].as_str().unwrap();
+            hook(
+                &url,
+                json!({"hook_event_name": "UserPromptSubmit", "prompt": format!("The desk plugin sent a message: {text}")}),
+            )
+            .await;
             d.line_ack(s, id, true).await.unwrap();
+            // The turn the answer started ends, saying other than its
+            // report, and its boss's turn on that is past before it reports
+            // again.
+            let ended = format!("Working through step {round}.");
+            hook(&url, json!({"hook_event_name": "Stop", "last_assistant_message": ended})).await;
+            eventually("its turn's end in the boss's turn", async || {
+                llm.received_requests()
+                    .await
+                    .unwrap_or_default()
+                    .iter()
+                    .any(|r| String::from_utf8_lossy(&r.body).contains(&ended))
+                    .then_some(())
+            })
+            .await;
         }
-        let channel = super::super::line::line_channel(s);
-        let line = overseer.sessions.find(&channel, PERSON).unwrap().unwrap();
-        assert!(
-            line.messages
+        let last = format!("Step {rounds} done.");
+        eventually("the last report in the boss's turn", async || {
+            llm.received_requests()
+                .await
+                .unwrap_or_default()
                 .iter()
-                .any(|m| m.content.contains(&format!("Step {rounds} done."))),
-            "the last report reached its turn"
-        );
+                .any(|r| String::from_utf8_lossy(&r.body).contains(&last))
+                .then_some(())
+        })
+        .await;
     })
     .await;
 }
@@ -767,6 +803,75 @@ async fn reports_waiting_go_as_soon_as_the_hours_turns_are_raised() {
         // Taken, it starts no turn again.
         tokio::time::sleep(super::super::line::GATHER * 2).await;
         assert_eq!(line_turns(&overseer, s), 2);
+    })
+    .await;
+}
+
+/// The boss's order went into its session and was never shown to have,
+/// with no transcript to show it isn't in: the boss is woken once, naming
+/// it, however often its line is looked at, and once more when it shows
+/// in the session after all.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_message_never_received_wakes_its_boss_once_and_again_when_it_arrives() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (overseer, crew, d, llm) =
+            overseeing_at(dir.path(), pool, "Noted.", &paced_config(50), &[], FAST).await;
+        let s = new_session(&d, dir.path(), "Legacy removal").await.id;
+        d.take_on(
+            s,
+            &workforce_desk::crew::Party::manager("desk", &super::super::name_of(&overseer)),
+            workforce_desk::charge::How::Handed,
+            &Default::default(),
+            &By::you(),
+        )
+        .await
+        .unwrap();
+        let url = hook_url(dir.path(), s).await;
+        let order = "Open the PR for the ledger fix.";
+        crew.perform(&nudge(s, order, None), crew.by_overseer("It should open it.").unwrap())
+            .await
+            .unwrap();
+        let next = eventually("the order on its line", async || {
+            d.line_next(s, std::time::Duration::from_millis(200)).await
+        })
+        .await;
+        let id: uuid::Uuid = serde_json::from_value(next["id"].clone()).unwrap();
+        d.line_ack(s, id, true).await.unwrap();
+        for _ in 0..3 {
+            d.line_requeue_stale(chrono::Utc::now() + chrono::Duration::minutes(5))
+                .await;
+        }
+        assert_eq!(
+            d.store().line_message(id).await.unwrap().unwrap().delivery,
+            Delivery::Unreceived
+        );
+        let woken = eventually("the boss woken", async || {
+            Some(super::stalls::woken_by(&llm, "may never have received").await)
+                .filter(|w| !w.is_empty())
+        })
+        .await;
+        assert!(woken[0].contains(&id.to_string()), "{woken:?}");
+        assert!(woken[0].contains(order), "{woken:?}");
+        assert!(woken[0].contains("Check its last reply"), "{woken:?}");
+        // The minute's look at its assignments says nothing more.
+        tokio::time::sleep(FAST.minute * 3).await;
+        assert_eq!(
+            super::stalls::woken_by(&llm, "may never have received").await.len(),
+            1
+        );
+        let text = next["text"].as_str().unwrap();
+        hook(
+            &url,
+            json!({"hook_event_name": "UserPromptSubmit", "prompt": format!("The desk plugin sent a message: {text}")}),
+        )
+        .await;
+        let late = eventually("the boss told it arrived", async || {
+            Some(super::stalls::woken_by(&llm, "arrived after all").await).filter(|w| !w.is_empty())
+        })
+        .await;
+        assert_eq!(late.len(), 1, "{late:?}");
+        assert!(late[0].contains(&id.to_string()), "{late:?}");
     })
     .await;
 }

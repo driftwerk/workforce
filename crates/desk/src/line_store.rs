@@ -13,7 +13,8 @@ use crate::line::{Asked, Delivery, LineKind, LineMessage, Urgency};
 use crate::store::DeskStore;
 
 const COLUMNS: &str = "id, at, sender, recipient, kind, text, in_reply_to, hop, delivery, \
-    asked, escalation, group_id, delivered_at, updated_at, chose, about, why, details, urgency";
+    asked, escalation, group_id, delivered_at, handed_at, updated_at, chose, about, why, details, \
+    urgency";
 
 /// A question waiting on the person: asked of them, or given to them by
 /// the overseer (as [`crate::service`]'s `needs_you` reads a row).
@@ -46,6 +47,7 @@ fn message(row: &Row) -> Result<LineMessage> {
         question: None,
         group: row.try_get("group_id")?,
         delivered_at: row.try_get("delivered_at")?,
+        handed_at: row.try_get("handed_at")?,
         updated_at: row.try_get("updated_at")?,
         waiting: None,
         urgency: row
@@ -53,6 +55,7 @@ fn message(row: &Row) -> Result<LineMessage> {
             .map(Urgency::parse)
             .transpose()?,
         actions: Vec::new(),
+        late: false,
     };
     m.shape();
     Ok(m)
@@ -77,11 +80,12 @@ impl DeskStore {
             .execute(
                 &format!(
                     "INSERT INTO line_messages ({COLUMNS}) \
-                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19) \
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20) \
                      ON CONFLICT (id) DO UPDATE SET recipient = EXCLUDED.recipient, \
                      text = EXCLUDED.text, delivery = EXCLUDED.delivery, \
                      asked = EXCLUDED.asked, escalation = EXCLUDED.escalation, \
-                     delivered_at = EXCLUDED.delivered_at, updated_at = EXCLUDED.updated_at"
+                     delivered_at = EXCLUDED.delivered_at, handed_at = EXCLUDED.handed_at, \
+                     updated_at = EXCLUDED.updated_at"
                 ),
                 &[
                     &m.id,
@@ -100,6 +104,7 @@ impl DeskStore {
                         .transpose()?,
                     &m.group,
                     &m.delivered_at,
+                    &m.handed_at,
                     &m.updated_at,
                     &m.chose,
                     &m.about,
@@ -345,8 +350,9 @@ impl DeskStore {
             .transpose()
     }
 
-    /// Desk's plugin says the session has the handed row. `None` when it
-    /// wasn't handed (a second copy that already ran).
+    /// The handed row is in its session, on the word of what took it (one
+    /// that carries no marker to show it). `None` when it wasn't handed (a
+    /// second copy that already ran).
     pub async fn line_ack(&self, id: Uuid) -> Result<Option<LineMessage>> {
         let client = self.pool().get().await?;
         client
@@ -360,6 +366,28 @@ impl DeskStore {
             .await?
             .as_ref()
             .map(message)
+            .transpose()
+    }
+
+    /// The row shown to be in its session (its marker came back in a
+    /// prompt, or is in its transcript), whatever Desk's plugin says of
+    /// it: still handed, put back in the queue since, or given up on. With
+    /// what it was. `None` when it had gone already, or never will.
+    pub async fn line_went_in(&self, id: Uuid) -> Result<Option<(LineMessage, Delivery)>> {
+        let client = self.pool().get().await?;
+        client
+            .query_opt(
+                &format!(
+                    "WITH was AS (SELECT delivery AS was FROM line_messages WHERE id = $1 FOR UPDATE) \
+                     UPDATE line_messages SET delivery = 'delivered', delivered_at = now(), \
+                     updated_at = now() FROM was WHERE id = $1 \
+                     AND delivery IN ('queued', 'handed', 'held', 'unreceived') \
+                     RETURNING {COLUMNS}, was.was"
+                ),
+                &[&id],
+            )
+            .await?
+            .map(|r| Ok((message(&r)?, Delivery::parse(r.try_get("was")?)?)))
             .transpose()
     }
 
@@ -379,6 +407,31 @@ impl DeskStore {
             .iter()
             .map(message)
             .collect()
+    }
+
+    /// Gives up on the row handed before `before`, never shown to have gone
+    /// in: an ask it is is withdrawn with it. `None` when it isn't handed
+    /// from then.
+    pub async fn line_unreceived(
+        &self,
+        id: Uuid,
+        before: DateTime<Utc>,
+    ) -> Result<Option<LineMessage>> {
+        let client = self.pool().get().await?;
+        client
+            .query_opt(
+                &format!(
+                    "UPDATE line_messages SET delivery = 'unreceived', updated_at = now(), \
+                     asked = CASE WHEN asked IN ('open', 'escalated', 'lapsed') \
+                     THEN 'withdrawn' ELSE asked END \
+                     WHERE id = $1 AND delivery = 'handed' AND handed_at < $2 RETURNING {COLUMNS}"
+                ),
+                &[&id, &before],
+            )
+            .await?
+            .as_ref()
+            .map(message)
+            .transpose()
     }
 
     /// Puts handed rows back in the queue: one the plugin dropped (`id`, no
@@ -789,7 +842,7 @@ impl DeskStore {
         tx.execute(
             &format!(
                 "INSERT INTO line_messages ({COLUMNS}) \
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)"
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20)"
             ),
             &[
                 &answer.id,
@@ -809,6 +862,7 @@ impl DeskStore {
                     .transpose()?,
                 &answer.group,
                 &answer.delivered_at,
+                &answer.handed_at,
                 &answer.updated_at,
                 &answer.chose,
                 &answer.about,

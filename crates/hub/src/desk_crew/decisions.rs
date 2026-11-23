@@ -85,8 +85,11 @@ pub(crate) fn undo_of(action: &Action, done: &Done, before: &Before) -> (Undo, O
                     Delivery::Handed | Delivery::Delivered | Delivery::Noted => {
                         (Undo::Correct, Some(plan))
                     }
-                    // It never goes in: nothing to take back.
-                    Delivery::Refused | Delivery::Withdrawn => (Undo::None, None),
+                    // It never goes in, or was given up on: nothing to
+                    // take back.
+                    Delivery::Refused | Delivery::Withdrawn | Delivery::Unreceived => {
+                        (Undo::None, None)
+                    }
                 }
             }
             None => (Undo::None, None),
