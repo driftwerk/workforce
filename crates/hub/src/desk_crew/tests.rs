@@ -2047,6 +2047,7 @@ mod groups;
 
 mod handovers;
 
+mod goals;
 mod plan_watch;
 mod plans;
 

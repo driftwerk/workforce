@@ -197,7 +197,7 @@ async fn a_renamed_boss_runs_its_plan_as_before() {
             .tools
             .get("crew.plan")
             .unwrap()
-            .execute(json!({ "goal": "Make the suite green", "tickets": tickets }))
+            .execute(json!({ "result": super::plans::judged(), "goal": "Make the suite green", "tickets": tickets }))
             .await
             .unwrap();
         assert!(r.success, "{r:?}");

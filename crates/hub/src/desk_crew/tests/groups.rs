@@ -119,6 +119,8 @@ async fn client(
                 engine: Engine::Claude,
                 group: Some(group.into()),
                 budget: None,
+                result: None,
+                goal_ticket: None,
             },
             &Party::manager(boss, boss),
             &By::manager(boss, boss, "For the test."),
@@ -452,6 +454,7 @@ fn pointed_at(name: &str, mine: Option<&str>, other: &Client, dir: &Path) -> Vec
             (
                 json!({
                     "goal": "Ship it",
+                    "result": super::plans::judged(),
                     "board": other.ticket.split('-').next().unwrap_or_default(),
                     "tickets": [{ "title": "Look around", "folder": dir.to_string_lossy() }],
                 }),
@@ -460,6 +463,7 @@ fn pointed_at(name: &str, mine: Option<&str>, other: &Client, dir: &Path) -> Vec
             (
                 json!({
                     "goal": "Ship it",
+                    "result": super::plans::judged(),
                     "new_board": { "name": "Mine now", "group": other.group },
                     "tickets": [{ "title": "Look around", "folder": dir.to_string_lossy() }],
                 }),
@@ -469,6 +473,7 @@ fn pointed_at(name: &str, mine: Option<&str>, other: &Client, dir: &Path) -> Vec
             (
                 json!({
                     "goal": "Ship it",
+                    "result": super::plans::judged(),
                     "tickets": [{ "adopt": other.ticket, "folder": dir.to_string_lossy() }],
                 }),
                 true,
@@ -1847,6 +1852,8 @@ async fn a_plans_limit_is_its_bosss_only_in_the_group_it_oversees() {
                     engine: Engine::Claude,
                     group: Some("infra".into()),
                     budget: None,
+                    result: None,
+                    goal_ticket: None,
                 },
                 &Party::manager("sarah", "sarah"),
                 &By::manager("sarah", "sarah", "For the test."),

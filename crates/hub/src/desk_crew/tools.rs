@@ -835,7 +835,18 @@ impl CrewTool {
                 let order = super::assignments::Order::of(input);
                 let Some((start, name)) = reused else {
                     let done = Box::pin(crew.perform_with(&action, by, &order)).await?;
-                    return Ok(json!({ "done": done }));
+                    let mut out = json!({ "done": done });
+                    // Work sent with no goal saved for it is said at once.
+                    if let Action::Nudge { to: Target::Session(s), .. } = &action {
+                        if let Some((_, line)) = Box::pin(crew.unsaved_lines(&b.service))
+                            .await
+                            .into_iter()
+                            .find(|(u, _)| u == s)
+                        {
+                            out["note"] = json!(line);
+                        }
+                    }
+                    return Ok(out);
                 };
                 let Action::Nudge { to: Target::Session(s), .. } = &action else {
                     return Err("That isn't a session to give work to.".into());

@@ -36,6 +36,7 @@ use workforce_desk::plan::{self, Draft, DraftTicket, Plan, PlanState, PlanTicket
 use workforce_desk::{Changed, NewPlan, PlanDetail, PlanEdit};
 
 use super::actions::{Action, Handout};
+use super::goal;
 use super::tools::Bound;
 use super::watcher::reported;
 use super::{name_of, CrewHub};
@@ -199,8 +200,11 @@ how each runs, and approve; nothing runs before they do, at every level, unbound
 starts the ready tickets' sessions for you, up to your limit at once, and you run them. Asked to \
 make a plan, make it and say it is ready for review on the board; don't start it. Only when the \
 person's own words ask you to start or run the work now (not just to plan it) may an unbound boss \
-pass start_now with those words quoted, and Desk starts it. Use it for work of more than one session. \
-engine defaults to your default engine. board names a board you have by its prefix; when the person \
+pass start_now with those words quoted, and Desk starts it. When the person agreed the work with \
+you, pass agreed with their words quoted and result, how done is measured (judged only when nothing \
+can measure it): at Act and above Desk checks their words, approves it, says the goal back to them \
+and keeps it until it is met; to put work already running under the goal, give its session as a \
+ticket ({session: its id}), which starts nothing. engine defaults to your default engine. board names a board you have by its prefix; when the person \
 asks for a new board, or the work deserves its own, pass new_board ({name, prefix}) instead and \
 Desk makes it in your group first, so you never ask the person to make one. With neither, it goes \
 on your group's board. To plan work on tickets already on a board (a synced Linear or Jira board \
@@ -238,7 +242,40 @@ ticket says, or moving one to a machine or folder the approved plan doesn't use 
 person to approve, while the plan runs on as approved. A draft the person hasn't approved stays \
 one: unbound, start_now with the person's own words asking to start it approves it. board (a \
 prefix) or new_board moves the whole plan to that board in your group, each ticket re-filed under \
-a new key; it applies at once. Say why.";
+a new key; it applies at once. On a goal: goal, result and met are the person's, so ask them \
+first (crew.ask_person with plan_id and proposal) and pass their words (person_said); record what \
+you report as done as facts, a judged part's progress as a checkpoint, and fix where a part is \
+read from with repair once its reads keep failing. Say why.";
+
+/// Refused when a plan says no result.
+/// Refused when the person's answer comes with other changes in one call.
+const ANSWER_ALONE: &str = "Pass the person's answer with only the change it answers (goal, result or met): send ticket, limit, budget or board changes in a call of their own, before or after.";
+/// Said when the person's answer covers a goal change but other changes
+/// of the plan wait on them with it.
+const OTHERS_WAIT: &str = "The person's answer covers the goal change, but this plan has other changes waiting on them too, which only they approve: they approve them all together on the plan's card. Tell them it waits there.";
+
+/// Whether all that waits on the person in `p` is its goal or result: the
+/// newest revision is the approved one but for them.
+fn only_goal_waits(p: &PlanDetail) -> bool {
+    let approved = p
+        .revisions
+        .iter()
+        .find(|r| Some(r.revision) == p.summary.plan.approved_revision);
+    match (approved, p.revisions.last()) {
+        (Some(a), Some(n)) => {
+            let mut a = a.snapshot.clone();
+            a.goal.clone_from(&n.snapshot.goal);
+            a.result.clone_from(&n.snapshot.result);
+            a == n.snapshot
+        }
+        _ => false,
+    }
+}
+
+const RESULT_NEEDED: &str = "Say how done is measured (result): CI's minutes or green runs, a pull request merged or its checks green, and judged only when nothing can measure it.";
+/// Refused when a boss at Suggest says the person agreed a plan.
+const AT_SUGGEST: &str =
+    "At Suggest you only propose plans; the person approves them on the board. Leave agreed out.";
 
 /// The overseer's own conversation for plan `id`.
 pub fn plan_channel(id: Uuid) -> String {
@@ -247,6 +284,7 @@ pub fn plan_channel(id: Uuid) -> String {
 
 fn ticket_schema() -> Value {
     json!({ "type": "object", "properties": {
+        "session": { "type": "string", "description": "A session already on the work, by its id (from crew.overview; machine/id on a machine): its ticket is taken on, or one made for it in Doing, and nothing new starts for it. Not with adopt or title" },
         "id": { "type": "string", "description": "A ticket of the plan's, by its id (crew.plan_update)" },
         "key": { "type": "string", "description": "A ticket of the plan's, by its key, like ACM-12 (crew.plan_update)" },
         "adopt": { "type": "string", "description": "A ticket already on one of your boards to take on as it is, by its key (like MAN-465, from crew.find_tickets), a synced Linear or Jira issue too: its own title and description are what its session reads, so leave title and body out" },
@@ -260,7 +298,7 @@ fn ticket_schema() -> Value {
         "view": { "type": "string", "enum": ["terminal"] },
         "needs": { "type": "array", "items": { "type": "integer", "minimum": 0 },
             "description": "The places (from 0) in this list of the tickets it needs done first" }
-    }, "required": ["folder"] })
+    }, "description": "folder is needed unless it gives session, or repo" })
 }
 
 fn ticket_edit_schema() -> Value {
@@ -360,8 +398,11 @@ pub fn schema() -> Value {
             "description": "At most this many of its sessions at once, when fewer than your limit" },
         "budget": budget_schema(),
         "start_now": start_now_schema(),
+        "agreed": goal::said_schema("agreeing this goal"),
+        "result": goal::result_schema(),
+        "goal_ticket": { "type": "string", "description": "The ticket that stands for the goal, by its key. Defaults to the first one it takes on (session or adopt). It moves to Done only when the goal is met" },
         "tickets": { "type": "array", "items": ticket_schema(), "minItems": 1, "maxItems": plan::MAX_TICKETS }
-    }, "required": ["goal", "tickets"] })
+    }, "required": ["goal", "result", "tickets"] })
 }
 
 pub fn update_schema() -> Value {
@@ -372,7 +413,14 @@ pub fn update_schema() -> Value {
         "new_board": new_board_schema(),
         "machine": machine_schema("Where its new tickets run when one doesn't say"),
         "model": { "type": "string", "description": "The model its new tickets' sessions run when one doesn't say" },
-        "goal": { "type": "string" },
+        "goal": { "type": "string", "description": "The goal, as the person's answer to your question changed it" },
+        "result": goal::result_schema(),
+        "person_said": { "type": "string", "description": "With goal or result: the person's reply to your question (crew.ask_person with plan_id and proposal), quoted exactly; a short “yes” counts. Or their own words asking for the new goal" },
+        "agreed": goal::said_schema("agreeing the first goal of a plan that has none (with result)"),
+        "met": goal::said_schema("saying the goal is met: their reply to your question, or their own words"),
+        "repair": goal::repair_schema(),
+        "facts": goal::facts_schema(),
+        "checkpoint": goal::checkpoint_schema(),
         "parallel": { "type": "integer", "minimum": 1, "maximum": 12 },
         "budget": budget_schema(),
         "tickets": { "type": "array", "items": ticket_schema(), "minItems": 1, "maxItems": plan::MAX_TICKETS },
@@ -437,9 +485,10 @@ fn tickets_of(
                         if o.get("title").and_then(Value::as_str).is_none_or(|s| s.trim().is_empty())
                             && o.get("id").is_none_or(Value::is_null)
                             && o.get("key").is_none_or(Value::is_null)
+                            && o.get("session").is_none_or(Value::is_null)
                         {
                             return Err(format!(
-                                "Ticket {} needs a title, or adopt: the key of a ticket to take on.",
+                                "Ticket {} needs a title, adopt: the key of a ticket to take on, or session: the session already on it.",
                                 i + 1
                             ));
                         }
@@ -945,9 +994,16 @@ fn plan_view(p: &PlanDetail) -> Value {
         .map(|(i, t)| (t.ticket.ticket.id, i))
         .collect();
     let plan = &p.summary.plan;
+    let standing = match (&plan.result, &p.goal) {
+        (Some(r), Some(progress)) => Some(workforce_desk::goal::progress_line(r, progress)),
+        _ => None,
+    };
     json!({
         "plan_id": plan.id.to_string(),
         "state": plan.state.as_str(),
+        "result": plan.result,
+        "goal_now": standing,
+        "met": plan.met.as_ref().map(|m| m.why.as_str()),
         "paused": plan.paused.map(|w| w.as_str()),
         "revision": plan.revision,
         "approved_revision": plan.approved_revision,
@@ -1176,6 +1232,111 @@ impl CrewHub {
         }))
     }
 
+    /// `input` with each ticket that names a session (`session`, by its id
+    /// or `machine/id`) checked as one the boss oversees: a session here
+    /// by its id; one on the person's machines, which only a plan of the
+    /// boss's runs there, as its ticket of that plan (`plan`, the one
+    /// changed), and refused with the plan to give the goal to otherwise.
+    async fn sessions_named(
+        &self,
+        b: &Bound,
+        input: &Value,
+        plan: Option<Uuid>,
+    ) -> Result<Value, String> {
+        let mut out = input.clone();
+        let Some(list) = out.get_mut("tickets").and_then(Value::as_array_mut) else {
+            return Ok(out);
+        };
+        for (i, t) in list.iter_mut().enumerate() {
+            let Some(named) = t
+                .get("session")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .map(str::to_string)
+            else {
+                continue;
+            };
+            let (machine, id) = match named.rsplit_once('/') {
+                Some((m, id)) => (Some(m.trim()).filter(|m| !m.is_empty()), id),
+                None => (None, named.as_str()),
+            };
+            let id: Uuid = id.trim().parse().map_err(|_| {
+                format!(
+                    "Ticket {} names its session by its id (or machine/id), from crew.overview.",
+                    i + 1
+                )
+            })?;
+            let machine = machine.filter(|m| !m.eq_ignore_ascii_case(plan::THIS_COMPUTER));
+            let Some(machine) = machine else {
+                self.session_seen(id, &b.seen)?;
+                if self.taken_back(id) {
+                    return Err(workforce_desk::charge::left_alone(&self.session_name(id)));
+                }
+                t["session"] = json!(id.to_string());
+                continue;
+            };
+            let item = format!("{machine}/{id}");
+            let runs_for = self
+                .machine_seen
+                .lock()
+                .get(&item)
+                .filter(|s| s.boss == b.service.agent_id.as_str())
+                .map(|s| s.plan);
+            let Some(runs_for) = runs_for else {
+                return Err(self.not_ours(&b.oversight.scope));
+            };
+            // A session on a machine runs for a plan of the boss's: that
+            // plan is the one to keep its goal.
+            if plan != Some(runs_for) {
+                return Err(format!(
+                    "{item} runs for your plan {runs_for}: give that plan the goal instead, with crew.plan_update (plan_id {runs_for}, result, and agreed: {{person_said}} with the person's words)."
+                ));
+            }
+            let open = self
+                .desk
+                .store()
+                .party_tickets(&item)
+                .await
+                .map_err(|e| format!("The session's ticket couldn't be read: {e}"))?
+                .into_iter()
+                .find(|t| !matches!(t.state, TicketState::Done | TicketState::Dropped));
+            let Some(ticket) = open else {
+                return Err(format!(
+                    "Ticket {}: {item} has no open ticket to take on. Give the work a ticket (title) instead.",
+                    i + 1
+                ));
+            };
+            let key = self
+                .desk
+                .ticket(ticket.id)
+                .await
+                .map_err(plain)?
+                .key
+                .ok_or_else(|| format!("Ticket {}: {item}'s ticket has no key.", i + 1))?;
+            if let Some(o) = t.as_object_mut() {
+                o.remove("session");
+                o.insert("key".into(), json!(key));
+            }
+        }
+        Ok(out)
+    }
+
+    /// The ticket `input`'s `goal_ticket` names by its key, on a board the
+    /// boss sees.
+    async fn goal_ticket_of(&self, b: &Bound, input: &Value) -> Result<Option<Uuid>, String> {
+        let Some(key) = str_of(input, "goal_ticket") else {
+            return Ok(None);
+        };
+        let seen = &b.seen;
+        self.desk
+            .ticket_by_key_in(key, |g| seen.sees(g))
+            .await
+            .map(|v| Some(v.ticket.id))
+            .map_err(|_| {
+                format!("goal_ticket names {key}, which isn't one of the tickets it takes on.")
+            })
+    }
+
     async fn propose(&self, b: &Bound, input: &Value) -> Result<Value, String> {
         let o = &b.oversight;
         let goal = input
@@ -1184,12 +1345,29 @@ impl CrewHub {
             .map(str::trim)
             .filter(|g| !g.is_empty())
             .ok_or("Say the goal.")?;
+        let result = goal::result_of(
+            input
+                .get("result")
+                .filter(|r| !r.is_null())
+                .ok_or(RESULT_NEEDED)?,
+        )?;
+        let agreed = goal::said_of(input, "agreed")?;
+        let start_now = start_now_of(input)?;
+        if agreed.is_some() && o.level == Level::Suggest {
+            return Err(AT_SUGGEST.into());
+        }
+        // The person's words are checked before anything is saved.
+        let said = match agreed.as_deref().or(start_now.as_deref()) {
+            Some(w) => Some((w.to_string(), self.agreed_at(&b.service, w)?)),
+            None => None,
+        };
+        let input = &self.sessions_named(b, input, None).await?;
         let adopted = self.adopted_of(b, input).await?;
         let tickets = tickets_of(input, &HashMap::new(), &adopted, &HashMap::new())?;
-        let start_now = start_now_of(input)?;
         if tickets.iter().any(|t| t.id.is_some()) {
             return Err("A new plan's tickets have no ids yet.".into());
         }
+        let goal_ticket = self.goal_ticket_of(b, input).await?;
         // Said nowhere, it is on the board of the first ticket it takes on.
         let board = match self.board_named(b, input).await? {
             Some(id) => Some(id),
@@ -1217,6 +1395,10 @@ impl CrewHub {
             false,
         );
         fill_model(&mut tickets, &o.work, false);
+        // Read once before it is saved: a part that names what GitHub
+        // hasn't got refuses it.
+        let since = said.as_ref().map_or_else(crew::now, |(_, at)| *at);
+        let readings = self.first_readings(&b.service, &result, since).await?;
         let new = NewPlan {
             draft: Draft {
                 goal: goal.to_string(),
@@ -1227,6 +1409,8 @@ impl CrewHub {
             engine,
             group: board_group,
             budget: budget_of(input)?.flatten(),
+            result: Some(result.clone()),
+            goal_ticket,
         };
         let boss = Party::manager(b.service.agent_id.as_str(), &name_of(&b.service));
         let by = self.by_boss(&b.service, "It proposed a plan.");
@@ -1235,6 +1419,8 @@ impl CrewHub {
             .propose_plan(new, &boss, &by)
             .await
             .map_err(plain)?;
+        let id = p.summary.plan.id;
+        self.keep_readings(id, &result, &readings).await;
         let text = format!(
             "{} drafted a plan for you to review: {}\n\n{}",
             boss.name,
@@ -1242,37 +1428,51 @@ impl CrewHub {
             self.plan_lines(&p)
         );
         self.post_plan(&b.service, &p.summary.plan, &text).await;
-        let unbound = self.unbound_given(b.service.agent_id.as_str(), &b.oversight);
-        // Started only when the person said to start it, and only unbound:
-        // otherwise a draft for them to review.
-        if let (Some(said), true) = (&start_now, unbound) {
-            let approved = self.approve_said(b, &p, said).await?;
+        let unbound = self.unbound_given(b.service.agent_id.as_str(), o);
+        // Agreed with the person, or asked by them to start it (the same,
+        // in their words), it is approved on those words at Act and above.
+        // Otherwise a draft for them to review.
+        let approves = agreed.is_some() || unbound || o.level != Level::Suggest;
+        let Some((words, at)) = said.filter(|_| approves) else {
             return Ok(json!({
-                "proposed": plan_out(&approved),
-                "note": "The person asked you to start it, so it is approved and Desk starts its ready tickets; they see it as a plan card in your DM and on the board.",
+                "proposed": plan_out(&p),
+                "note": match start_now.is_some() {
+                    true => "It is a draft: only the person approves a plan at your level, so it waits in Backlog on the board for them to review and approve. Say it is ready for review on the board.",
+                    false => "It is a draft: its tickets wait in Backlog on the board for the person to review (where and how each runs too) and approve; nothing of it runs until they do. Say it is ready for review on the board.",
+                },
             }));
-        }
+        };
+        self.approve_words(b, &p, &words, at).await?;
+        let approved = self.desk.plan(id).await.map_err(plain)?;
+        self.read_back(&b.service, &approved).await;
+        self.met_at_once(&approved).await;
         Ok(json!({
-            "proposed": plan_out(&p),
-            "note": match start_now.is_some() {
-                true => "It is a draft: only the person approves a plan at your level, so it waits in Backlog on the board for them to review and approve. Say it is ready for review on the board.",
-                false => "It is a draft: its tickets wait in Backlog on the board for the person to review (where and how each runs too) and approve; nothing of it runs until they do. Say it is ready for review on the board.",
+            "proposed": plan_out(&approved),
+            "note": match agreed.is_some() {
+                true => "The person agreed it, so it is approved and Desk starts its ready tickets. Desk said the goal back to them in your DM and keeps it until it is met.",
+                false => "The person asked you to start it, so it is approved and Desk starts its ready tickets; they see it as a plan card in your DM and on the board.",
             },
         }))
     }
 
     /// Approves the newest revision of `p`, the boss `b`'s own, on the
-    /// person's words `said` asking for the work to start.
-    async fn approve_said(
+    /// person's words `said`, written at `at`, which agree it: kept as what
+    /// agreed its goal, unless other words did first.
+    async fn approve_words(
         &self,
         b: &Bound,
         p: &PlanDetail,
         said: &str,
+        at: chrono::DateTime<chrono::Utc>,
     ) -> Result<PlanDetail, String> {
-        let reason = format!("The person said: “{said}”");
+        let lead = match p.summary.plan.agreed {
+            None => "The person agreed",
+            Some(_) => "The person said",
+        };
+        let reason = format!("{lead}: “{}”", crew::one_line(said, 300));
         let by = self.by_at_level(self.by_boss(&b.service, &reason), &b.oversight);
         self.desk
-            .approve_plan(p.summary.plan.id, p.summary.plan.revision, &by)
+            .approve_agreed(p.summary.plan.id, p.summary.plan.revision, said, at, &by)
             .await
             .map_err(plain)
     }
@@ -1311,7 +1511,11 @@ impl CrewHub {
             })
             .unwrap_or_default();
         // Read before anything changes: one that doesn't read changes nothing.
-        let start_now = start_now_of(input)?;
+        let start_now = match start_now_of(input)? {
+            Some(w) => Some((self.agreed_at(&b.service, &w)?, w)),
+            None => None,
+        };
+        let goal_edit = self.goal_edit(b, &detail, input).await?;
         let mut ticket_edits = edits_of(input, &known, &kept)?;
         // A ticket moved to another machine without its folder there, nor
         // its repository, gets the repository its folder is a checkout of
@@ -1337,8 +1541,12 @@ impl CrewHub {
                 "Say every ticket the plan is to have (tickets) or the ones to change (tickets_edit), not both.".into(),
             );
         }
-        let tickets = match input.get("tickets").filter(|t| !t.is_null()) {
-            Some(_) => {
+        let named = match input.get("tickets").filter(|t| !t.is_null()) {
+            Some(_) => Some(self.sessions_named(b, input, Some(id)).await?),
+            None => None,
+        };
+        let tickets = match &named {
+            Some(input) => {
                 let adopted = self.adopted_of(b, input).await?;
                 let mut t = tickets_of(input, &known, &adopted, &kept)?;
                 // Said for the plan, or else where its group's sessions run:
@@ -1380,6 +1588,7 @@ impl CrewHub {
                 .get("goal")
                 .and_then(Value::as_str)
                 .map(str::to_string),
+            result: goal_edit.result.clone(),
             parallel: input
                 .get("parallel")
                 .and_then(Value::as_i64)
@@ -1397,10 +1606,28 @@ impl CrewHub {
             .await?
             .filter(|to| *to != detail.summary.plan.board);
         let more = edit.goal.is_some()
+            || edit.result.is_some()
             || edit.parallel.is_some()
             || edit.tickets.is_some()
             || edit.ticket_edits.is_some()
             || edit.budget.is_some();
+        let others = edit.parallel.is_some()
+            || edit.tickets.is_some()
+            || edit.ticket_edits.is_some()
+            || edit.budget.is_some()
+            || to.is_some();
+        if goal_edit.answer().is_some() && others {
+            return Err(ANSWER_ALONE.into());
+        }
+        if !more && to.is_none() && goal_edit.any() {
+            let (now, said) = self.goal_answered(b, detail, &goal_edit).await?;
+            let mut out = self.goal_kept(b, &now, goal_edit).await?;
+            out["plan"] = plan_out(&self.desk.plan(id).await.map_err(plain)?);
+            if let Some(said) = said {
+                out["note"] = json!(said);
+            }
+            return Ok(out);
+        }
         // The change first, by the keys the boss read: the move after it
         // renumbers them.
         let changed = match (more, to) {
@@ -1486,6 +1713,14 @@ impl CrewHub {
             (None, Some(c)) => c.plan,
             (None, None) => return Err("Say what to change, or which board to move it to.".into()),
         };
+        let (now, answered) = self.goal_answered(b, now, &goal_edit).await?;
+        if let Some(answered) = answered {
+            note = format!("{note} {answered}").trim().to_string();
+        }
+        if let Some(asking) = goal_edit.asking(&now) {
+            note = format!("{note} {asking}").trim().to_string();
+        }
+        let goal_said = self.goal_kept(b, &now, goal_edit).await?;
         let home = self.desk.home_folder().unwrap_or_default();
         let unseen = unseen_on_machines(&detail, &now, &home.to_string_lossy());
         if let Some(unseen) = &unseen {
@@ -1493,14 +1728,18 @@ impl CrewHub {
         }
         // A draft started on the person's word, by an unbound boss, once
         // its briefs name nothing its machines can't see.
-        if let Some(said) = start_now {
+        if let Some((at, said)) = start_now {
             let draft = now.summary.plan.approved_revision.is_none();
             if draft && unseen.is_some() {
                 note = format!(
                     "{note} So it isn't started yet: once those briefs are fixed, start it with the person's words again."
                 );
-            } else if draft && self.unbound_given(b.service.agent_id.as_str(), o) {
-                let approved = self.approve_said(b, &now, &said).await?;
+            } else if draft
+                && (o.level != Level::Suggest || self.unbound_given(b.service.agent_id.as_str(), o))
+            {
+                self.approve_words(b, &now, &said, at).await?;
+                let approved = self.desk.plan(id).await.map_err(plain)?;
+                self.read_back(&b.service, &approved).await;
                 return Ok(json!({
                     "plan": plan_out(&approved),
                     "change": change,
@@ -1514,12 +1753,58 @@ impl CrewHub {
                     .to_string();
             }
         }
-        Ok(json!({
+        let mut out = json!({
             "plan": plan_out(&now),
             "change": change,
             "applied": applied,
             "note": note,
-        }))
+        });
+        if let (Some(out), Value::Object(said)) = (out.as_object_mut(), goal_said) {
+            out.extend(said);
+        }
+        Ok(out)
+    }
+
+    /// `now`, plan of the boss `b`'s, once the person's answer `edit`
+    /// passes approves the change of it that waits on them, when that
+    /// change is only what they answered: other changes waiting with it
+    /// keep their own approval. What the boss is told of it. The question
+    /// they answered is noted as applied, so their answer applies once.
+    async fn goal_answered(
+        &self,
+        b: &Bound,
+        now: PlanDetail,
+        edit: &goal::GoalEdit,
+    ) -> Result<(PlanDetail, Option<&'static str>), String> {
+        let Some((words, item, at)) = edit.answer() else {
+            return Ok((now, None));
+        };
+        let p = &now.summary.plan;
+        let waits = p.approved_revision.is_some() && p.awaiting();
+        if waits && !only_goal_waits(&now) {
+            return Ok((now, Some(OTHERS_WAIT)));
+        }
+        if let Some(item) = item {
+            if !self.ask_applied(item).await? {
+                return Err(goal::APPLIED.into());
+            }
+        }
+        // Applied at once, it is still agreed in their words: a goal
+        // given to a plan that had none is kept as theirs.
+        if !waits && (p.agreed.is_some() || p.result.is_none()) {
+            return Ok((now, None));
+        }
+        if let Err(e) = self.approve_words(b, &now, words, at).await {
+            if let Some(item) = item {
+                self.ask_unapplied(item).await;
+            }
+            return Err(e);
+        }
+        let now = self.desk.plan(p.id).await.map_err(plain)?;
+        Ok((
+            now,
+            waits.then_some("The person's answer approves it, so it applies now."),
+        ))
     }
 
     /// The plan's tickets in a few lines, for its card.
@@ -1544,7 +1829,7 @@ impl CrewHub {
 
     /// Puts `text` about plan `p` in its boss's DM, as a plan card for the
     /// revision it is at now. With no DM yet, the Floor still shows it.
-    async fn post_plan(&self, service: &Arc<AgentService>, p: &Plan, text: &str) {
+    pub(super) async fn post_plan(&self, service: &Arc<AgentService>, p: &Plan, text: &str) {
         let Some(owner) = self.person(Some(service)) else {
             return;
         };
@@ -1594,6 +1879,11 @@ impl CrewHub {
                 return;
             }
         };
+        // What a plan's turn said of its unmet goal is kept while it runs.
+        {
+            let running: HashSet<Uuid> = plans.iter().map(|s| s.plan.id).collect();
+            self.unmet_said.lock().retain(|id, _| running.contains(id));
+        }
         for s in plans {
             self.run_plan(s.plan).await;
         }
@@ -2547,12 +2837,17 @@ impl CrewHub {
             .await;
     }
 
-    async fn plan_turn_now(&self, id: Uuid, lines: Vec<String>) {
+    pub(super) async fn plan_turn_now(&self, id: Uuid, lines: Vec<String>) {
         let Ok(detail) = self.desk.plan(id).await else {
             return;
         };
-        let p = detail.summary.plan.clone();
-        let Some((service, o)) = self.boss_of_plan(&p) else {
+        if matches!(
+            detail.summary.plan.state,
+            PlanState::Done | PlanState::Dropped
+        ) {
+            self.unmet_said.lock().remove(&id);
+        }
+        let Some((service, o)) = self.boss_of_plan(&detail.summary.plan) else {
             return;
         };
         if o.level == Level::Watch {
@@ -2561,13 +2856,52 @@ impl CrewHub {
         let Some(owner) = self.person(Some(&service)) else {
             return;
         };
+        // Its goal read again first: one met now closes it in this turn.
+        let detail = match self.goal_reread(&service, &detail).await {
+            Some(fresh) => fresh,
+            None => detail,
+        };
+        let p = detail.summary.plan.clone();
         let tickets = self.desk.plan_tickets(id).await.unwrap_or_default();
-        let closing = p.state == PlanState::Running && plan::settled(&tickets);
+        let settled = plan::settled(&tickets);
+        // Settled is not done: a goal ends once it is met.
+        let closing =
+            p.state == PlanState::Running && (p.met.is_some() || settled && p.goal_done());
+        let mut lines = lines;
+        if let (true, false, Some(r), Some(progress)) = (
+            p.state == PlanState::Running && settled,
+            closing,
+            &p.result,
+            &detail.goal,
+        ) {
+            // Said once for its best readings: again only once they move.
+            let best = format!(
+                "{:?}",
+                progress
+                    .parts
+                    .iter()
+                    .map(|part| (
+                        part.best.as_ref().and_then(|b| b.value),
+                        part.improved_at,
+                        part.met
+                    ))
+                    .collect::<Vec<_>>()
+            );
+            let again = self.unmet_said.lock().insert(id, best.clone()) != Some(best);
+            if again {
+                let now = workforce_desk::goal::progress_line(r, progress);
+                lines.push(goal::settled_unmet(id, &now));
+            }
+        }
+        let ended = match &p.met {
+            Some(m) => format!("The goal is met: {}", crew::one_line(&m.why, 200)),
+            None => "Every ticket is settled.".to_string(),
+        };
         // Held by Desk's breaker, its boss takes no turns: a settled plan
         // is finished without its summary.
         if self.desk.agent_held(&p.boss).is_some() {
             if closing {
-                let by = By::desk("Every ticket is settled; its boss is held.");
+                let by = By::desk(&format!("{ended} Its boss is held."));
                 if let Err(e) = self.desk.finish_plan(id, &by).await {
                     tracing::info!(plan = %id, error = %e, "a settled plan wasn't finished");
                 }
@@ -2596,9 +2930,15 @@ impl CrewHub {
                 ))
                 .unwrap_or_default()
         );
-        let then = match closing {
-            true => "Every ticket is done or dropped. Write the person a short closing summary: what was done, what was dropped and why, and anything left for them. Your reply is posted in your DM.".to_string(),
-            false => format!(
+        let then = match (closing, &p.met) {
+            (true, Some(m)) => {
+                let why = crew::one_line(&m.why, 200);
+                format!(
+                    "The goal is met: {why}. Write the person a short closing summary that leads with “Met: {why}”, then what was done, what was dropped and why, and anything left for them. Your reply is posted in your DM."
+                )
+            }
+            (true, None) => "Every ticket is done or dropped. Write the person a short closing summary: what was done, what was dropped and why, and anything left for them. Your reply is posted in your DM.".to_string(),
+            (false, _) => format!(
                 "Review what finished; tell its session more with crew.nudge, move its ticket with crew.move_ticket, \
                  or propose a change with {UPDATE} (plan_id {id}, why). Desk starts the ready tickets for you; you \
                  run at most {} sessions at once. Give the person anything that pushes, deletes, deploys, spends, \
@@ -2607,8 +2947,13 @@ impl CrewHub {
                 o.work.parallel
             ),
         };
+        let goals = self
+            .goals_block(&p.boss)
+            .await
+            .map(|g| format!("\n\n{g}"))
+            .unwrap_or_default();
         let prompt = format!(
-            "{PLAN} Your plan “{}” (plan_id {id}, revision {}) moved on:\n{}\n\nWhere it stands: {stands}.\n\n{then}",
+            "{PLAN} Your plan “{}” (plan_id {id}, revision {}) moved on:\n{}\n\nWhere it stands: {stands}.\n\n{then}{goals}",
             crew::one_line(&p.goal, 200),
             p.revision,
             reported(&said.join("\n"), "Desk's plan"),
@@ -2628,11 +2973,8 @@ impl CrewHub {
                 self.post_plan(&service, &p, reply).await;
             }
         }
-        let by = By::manager(
-            service.agent_id.as_str(),
-            &name_of(&service),
-            "Every ticket is settled.",
-        );
+        self.unmet_said.lock().remove(&id);
+        let by = By::manager(service.agent_id.as_str(), &name_of(&service), &ended);
         if let Err(e) = self.desk.finish_plan(id, &by).await {
             tracing::info!(plan = %id, error = %e, "a settled plan wasn't finished");
         }
@@ -2856,6 +3198,7 @@ mod tests {
             repo: None,
             id: None,
             adopt: None,
+            session: None,
             title: "t".into(),
             body: String::new(),
             engine: engine.map(str::to_string),

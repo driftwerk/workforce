@@ -28,6 +28,7 @@ fn draft(dir: &Path, titles: &[(&str, &[usize])]) -> Draft {
                 repo: None,
                 id: None,
                 adopt: None,
+                session: None,
                 title: (*title).into(),
                 body: String::new(),
                 engine: None,
@@ -49,6 +50,8 @@ fn new_plan(dir: &Path, titles: &[(&str, &[usize])]) -> NewPlan {
         engine: Engine::Claude,
         group: None,
         budget: None,
+        result: None,
+        goal_ticket: None,
     }
 }
 
@@ -61,6 +64,7 @@ fn kept(p: &PlanDetail) -> Vec<DraftTicket> {
             repo: None,
             id: Some(t.ticket.ticket.id),
             adopt: None,
+            session: None,
             title: t.ticket.ticket.title.clone(),
             body: t.ticket.ticket.body.clone(),
             engine: t.engine.map(|e| e.as_str().to_string()),
@@ -2642,6 +2646,83 @@ async fn a_closed_or_removed_session_frees_its_plans_slot_and_a_restart_keeps_it
             .unwrap()
             .iter()
             .all(|t| t.session.as_deref() != Some(gone.as_str())));
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_goal_ends_only_once_it_is_met_and_desk_closes_its_ticket() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(pool, dir.path()).await;
+        let b = d
+            .create_board(NewBoard {
+                name: "Acme".into(),
+                group: None,
+                prefix: Some("ACM".into()),
+            })
+            .await
+            .unwrap();
+        let t = d
+            .create_ticket(
+                super::super::board::NewTicket {
+                    board: b.id,
+                    title: "Make CI fast".into(),
+                    body: String::new(),
+                    state: Some(TicketState::Todo),
+                    needs: vec![],
+                },
+                &By::you(),
+            )
+            .await
+            .unwrap();
+        let mut new = new_plan(dir.path(), &[]);
+        new.draft.tickets = vec![DraftTicket {
+            adopt: Some(t.ticket.id),
+            folder: dir.path().to_string_lossy().into_owned(),
+            ..Default::default()
+        }];
+        new.result = Some(GoalResult {
+            words: "CI is fast".into(),
+            parts: vec![crate::goal::Measure::Judged {
+                evidence: "the runs".into(),
+            }],
+        });
+        let p = d.propose_plan(new, &sarah(), &by_sarah()).await.unwrap();
+        let id = p.summary.plan.id;
+        assert_eq!(
+            p.summary.plan.goal_ticket,
+            Some(t.ticket.id),
+            "the one it takes on"
+        );
+        // The boss approves it on the person's own words.
+        let at = crew::now();
+        let ran = d
+            .approve_agreed(id, 1, "yes, make CI fast", at, &by_sarah())
+            .await
+            .unwrap();
+        assert_eq!(ran.summary.plan.state, PlanState::Running);
+        assert_eq!(
+            ran.summary.plan.agreed.as_deref(),
+            Some("yes, make CI fast")
+        );
+        assert!(ran.summary.plan.covered());
+        let refused = d.finish_plan(id, &by_sarah()).await.unwrap_err();
+        assert!(refused.to_string().contains("goal isn't met"), "{refused}");
+
+        let met = Met {
+            at: crew::now(),
+            by: crate::goal::MetBy::Person,
+            why: "the person said so".into(),
+        };
+        assert!(d.goal_met(id, &met).await.unwrap());
+        assert!(!d.goal_met(id, &met).await.unwrap(), "met once");
+        assert_eq!(
+            d.ticket(t.ticket.id).await.unwrap().ticket.state,
+            TicketState::Done
+        );
+        let done = d.finish_plan(id, &by_sarah()).await.unwrap();
+        assert_eq!(done.summary.plan.state, PlanState::Done);
     })
     .await;
 }
