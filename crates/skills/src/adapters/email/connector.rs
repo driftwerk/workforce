@@ -182,7 +182,6 @@ impl ImapConnector {
         Ok(self.clients.get_mut(&cache_key).unwrap())
     }
 
-    /// List all configured account names.
     /// Lends `account`'s client out of `connector`, once any other call
     /// that has it lent gave it back: one account's long calls run one at a
     /// time, and the connector is never held while they wait or run.
@@ -220,6 +219,7 @@ impl ImapConnector {
         }
     }
 
+    /// List all configured account names.
     pub fn account_names(&self) -> Vec<&str> {
         self.configs.keys().map(|s| s.as_str()).collect()
     }

@@ -641,17 +641,26 @@ fn read_only_account(names: &[String], default: &str, input: &serde_json::Value)
         .map(|refused| refused.message)
 }
 
+/// [`read_only_account`] for a call on `connector`'s accounts.
+pub(super) async fn only_reads(
+    connector: &tokio::sync::Mutex<ImapConnector>,
+    input: &serde_json::Value,
+) -> Option<String> {
+    let (names, default) = {
+        let c = connector.lock().await;
+        (c.resolve_account_names(), c.default_account().to_string())
+    };
+    read_only_account(&names, &default, input)
+}
+
 /// [`read_only_account`] for a write tool's call, as its failure.
 pub(super) async fn refused_write(
     connector: &tokio::sync::Mutex<ImapConnector>,
     input: &serde_json::Value,
     start: std::time::Instant,
 ) -> Option<ToolResult> {
-    let (names, default) = {
-        let c = connector.lock().await;
-        (c.resolve_account_names(), c.default_account().to_string())
-    };
-    read_only_account(&names, &default, input)
+    only_reads(connector, input)
+        .await
         .map(|said| ToolResult::failure(said, start.elapsed().as_millis() as u64))
 }
 

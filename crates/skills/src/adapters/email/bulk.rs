@@ -108,6 +108,22 @@ fn unnumbered(folder: &str) -> String {
     )
 }
 
+/// Why `job` can never be undone, when it can't: without its source's
+/// numbering, what it took can't be told from what was there.
+fn past_undoing(job: &BulkJob) -> Option<String> {
+    job.validity
+        .is_none()
+        .then(|| unnumbered(job.action.source()))
+}
+
+/// What undoing `job` would do, as its notes say it.
+fn undoing(job: &BulkJob) -> String {
+    match past_undoing(job) {
+        None => "email.undo puts back what it did".to_string(),
+        Some(why) => format!("what it did can't be undone, as {why}"),
+    }
+}
+
 /// Why `folder`, numbered `now`, isn't the folder messages were read from
 /// under `expected`, when it isn't; nothing to compare when none was said.
 fn other_numbering(folder: &str, expected: Option<u32>, now: Option<u32>) -> Option<String> {
@@ -279,9 +295,10 @@ async fn message_ids(
 
 /// Where `batch`'s messages were copied in the selected folder, numbered
 /// `validity`, by source uid: found by Message-ID among what arrived there
-/// since the batch was sent, each source message taking the first copy of
+/// since the batch was sent, each source message taking the newest copy of
 /// its id that no other took. So a copy that was there before is never
-/// one, and messages sharing an id find a copy each. Nothing is found once
+/// one, and messages sharing an id find a copy each; where a label move
+/// leaves the batch's own among older mail, the newest are its own. Nothing is found once
 /// the folder was renumbered, or where the batch never knew where its
 /// copies would land.
 async fn copies_of(
@@ -308,10 +325,10 @@ async fn copies_of(
         let arrived = format!("UID {next}:{} {either}", u32::MAX);
         hits = hits.union(&session.search(&arrived).await?);
     }
-    let (read, _) = hits.split_first(COPIES_READ);
+    let read: UidSet = hits.iter().rev().take(COPIES_READ).collect();
     let (_, found) = message_ids(session, &read).await?;
     let mut copies: BTreeMap<String, VecDeque<u32>> = BTreeMap::new();
-    for (uid, id) in found.into_iter().filter(|(uid, _)| *uid >= next) {
+    for (uid, id) in found.into_iter().rev().filter(|(uid, _)| *uid >= next) {
         copies.entry(id).or_default().push_back(uid);
     }
     Ok(batch
@@ -504,8 +521,9 @@ async fn settle(
 
 fn stopped_note(job: &BulkJob) -> String {
     format!(
-        "Job {} stopped; email.undo puts back what it did. {}",
+        "Job {} stopped; {}. {}",
         job.id,
+        undoing(job),
         job.stopped.as_deref().unwrap_or("It stopped.")
     )
 }
@@ -630,8 +648,8 @@ pub async fn undo(
     }
     settle(session, mailbox, job, journal).await?;
     let source = job.action.source().to_string();
-    if job.validity.is_none() {
-        end(job, JobState::Irreversible, unnumbered(&source));
+    if let Some(why) = past_undoing(job) {
+        end(job, JobState::Irreversible, why);
         return keep(journal, job).await;
     }
     if job.state != JobState::Undoing {
@@ -684,7 +702,7 @@ pub fn report(job: &BulkJob, journaled: bool) -> Value {
             "Done. This hub keeps no job journal, so it can't be undone with email.undo."
                 .to_string()
         }
-        (JobState::Done, true) => "Done. email.undo puts it back.".to_string(),
+        (JobState::Done, true) => format!("Done; {}.", undoing(job)),
         (JobState::Undoing, _) => format!(
             "Still putting messages back: call email.undo with job = \"{}\" to carry on.",
             job.id
@@ -1386,6 +1404,38 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn a_gmail_archive_found_by_message_id_takes_back_its_own_among_older_mail() {
+        let mut server = FakeServer::new(&["MOVE", "X-GM-EXT-1"], &["INBOX", "All"]);
+        server.copyuid = false;
+        for _ in 0..COPIES_READ {
+            server.deliver_as("All", "news@shop.com", "<weekly@shop.com>");
+        }
+        server.deliver_as("INBOX", "news@shop.com", "<weekly@shop.com>");
+        let action = BulkAction::Move {
+            from: "INBOX".to_string(),
+            to: "All".to_string(),
+            label: Some("\\Inbox".to_string()),
+        };
+        let mut job = job(&mut server, action, from("news@shop.com")).await;
+        moved_all(&mut server, &mut job, None).await;
+        assert_eq!(server.count("INBOX"), 0);
+        let archived = *server.folders["All"].messages.keys().max().unwrap();
+        undone(&mut server, &mut job).await;
+        assert_eq!(server.count("INBOX"), 1);
+        assert_eq!(
+            server
+                .commands
+                .iter()
+                .filter(|c| c.contains("+X-GM-LABELS.SILENT (\\Inbox)"))
+                .collect::<Vec<_>>(),
+            vec![&format!(
+                "UID STORE {archived} +X-GM-LABELS.SILENT (\\Inbox)"
+            )],
+            "the message archived is the one put back, not older mail sharing its id"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn a_mark_records_only_what_it_changed_and_undo_restores_exactly_that() {
         let mut server = FakeServer::new(&["MOVE", "UIDPLUS"], &["INBOX"]);
         server.deliver("INBOX", "news@shop.com", 6);
@@ -1762,6 +1812,14 @@ mod tests {
         assert_eq!(job.validity, None);
         moved_all(&mut server, &mut job, None).await;
         assert_eq!(server.count("News"), 2);
+        let said = report(&job, true)["note"].as_str().unwrap().to_string();
+        assert!(
+            said.contains("can't be undone") && !said.contains("puts back"),
+            "the job says up front what undo will do: {said}"
+        );
+        job.state = JobState::Stopped;
+        assert!(stopped_note(&job).contains("can't be undone"));
+        job.state = JobState::Done;
         undone(&mut server, &mut job).await;
         assert_eq!(job.state, JobState::Irreversible);
         assert_eq!(server.count("News"), 2, "nothing is guessed back");

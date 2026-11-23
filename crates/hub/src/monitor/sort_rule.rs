@@ -17,6 +17,7 @@ use workforce_agent::tools::registry::ToolRegistry;
 use workforce_agent::tools::{Tool, ToolResult};
 use workforce_orchestrator::monitor::{Action, MonitorDefinition, MonitorMeta, Source};
 use workforce_skills::adapters::email::criteria::{folder_named, Criteria};
+use workforce_skills::adapters::email::manage::READ_ONLY;
 use workforce_skills::adapters::email::schemas;
 
 use super::binding_access::current_turn_user;
@@ -359,9 +360,10 @@ async fn checked(tools: &ToolRegistry, rule: &SortRule) -> Result<Value, String>
         .execute(once["input"].clone())
         .await
         .map_err(|e| format!("{e:#}"))?;
-    match result.success {
-        true => Ok(result.output["count"].clone()),
-        false => Err(format!(
+    match (result.success, result.output[READ_ONLY].as_str()) {
+        (true, None) => Ok(result.output["count"].clone()),
+        (true, Some(said)) => Err(format!("The rule can't run as it is: {said}")),
+        (false, _) => Err(format!(
             "The rule can't run as it is: {}",
             result.error.unwrap_or_default()
         )),
@@ -821,7 +823,8 @@ mod tests {
     }
 
     /// A stand-in for the email skill's tool: a dry run that counts two
-    /// messages, or finds no folder `Nowhere`.
+    /// messages, finds no folder `Nowhere`, or counts on account `work`,
+    /// which the agent only reads.
     struct DryRun(&'static str);
 
     #[async_trait]
@@ -840,12 +843,18 @@ mod tests {
 
         async fn execute(&self, input: Value) -> Result<ToolResult> {
             assert_eq!(input["dry_run"], true, "checking a rule changes nothing");
-            Ok(match input["to_folder"].as_str() {
-                Some("Nowhere") => {
-                    ToolResult::failure("There is no folder Nowhere.".to_string(), 0)
-                }
-                _ => ToolResult::success(json!({ "count": 2 }), 0),
-            })
+            Ok(
+                match (input["to_folder"].as_str(), input["account"].as_str()) {
+                    (Some("Nowhere"), _) => {
+                        ToolResult::failure("There is no folder Nowhere.".to_string(), 0)
+                    }
+                    (_, Some("work")) => ToolResult::success(
+                        json!({ "count": 2, READ_ONLY: "The `work` connection of email only reads for this agent." }),
+                        0,
+                    ),
+                    _ => ToolResult::success(json!({ "count": 2 }), 0),
+                },
+            )
         }
     }
 
@@ -950,6 +959,18 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.contains("There is no folder Nowhere"), "{err}");
+        let on_work = json!({
+            "account": "work", "match": {"from": "news@shop.com"}, "then": {"do": "move", "to": "News"}
+        });
+        let mut propose = on_work.clone();
+        propose["action"] = json!("propose");
+        let err = rules.run(&propose).await.unwrap_err();
+        assert!(err.contains("only reads"), "{err}");
+        let err = save.run(&on_work).await.unwrap_err();
+        assert!(
+            err.contains("only reads"),
+            "a rule on an account the agent only reads would fail on every message: {err}"
+        );
         let mut digest = rule(Then::Archive).monitor("sort-digest");
         digest.monitor.action = Action::RunSkill {
             tool: "email.mark".to_string(),

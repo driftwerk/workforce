@@ -23,9 +23,13 @@ use super::journal::{self, BulkAction, BulkJob, MarkFlag, Origin};
 use super::mailbox::{decoded, Mailbox, Role};
 use super::schemas;
 use super::session::{MailSession, Timed};
-use super::tools::refused_write;
+use super::tools::{only_reads, refused_write};
 use super::uids::UidSet;
 use super::unsubscribe::{self, Method};
+
+/// Where a dry run on an account the agent only reads says so: it counts,
+/// and what would act on its count (a sort rule) is refused.
+pub const READ_ONLY: &str = "read_only";
 
 /// The most recent messages an unsubscribe reads headers from.
 const LIST_SCAN: usize = 2_000;
@@ -92,6 +96,14 @@ async fn on_account<T>(
     .await;
     connector.lock().await.restore(lent);
     done
+}
+
+/// A dry run's count, saying the account only reads when it does.
+fn said_read_only(mut counted: Value, read_only: Option<String>) -> Value {
+    if let (Some(said), Some(fields)) = (read_only, counted.as_object_mut()) {
+        fields.insert(READ_ONLY.to_string(), json!(said));
+    }
+    counted
 }
 
 fn budget(config: &EmailAccountConfig) -> Budget {
@@ -428,16 +440,20 @@ impl Tool for EmailBulkTool {
 
     async fn execute(&self, input: Value) -> Result<ToolResult> {
         let start = Instant::now();
+        let read_only = only_reads(&self.connector, &input).await;
         let counts_only = input["dry_run"].as_bool().unwrap_or(false);
-        if !counts_only {
-            if let Some(refused) = refused_write(&self.connector, &input, start).await {
-                return Ok(refused);
-            }
+        match (read_only, counts_only) {
+            (Some(said), false) => Ok(ToolResult::failure(
+                said,
+                start.elapsed().as_millis() as u64,
+            )),
+            (read_only, _) => Ok(ToolResult::timed(
+                bulk_call(&self.connector, &input, self.intent)
+                    .await
+                    .map(|counted| said_read_only(counted, read_only)),
+                start,
+            )),
         }
-        Ok(ToolResult::timed(
-            bulk_call(&self.connector, &input, self.intent).await,
-            start,
-        ))
     }
 }
 
@@ -1376,6 +1392,16 @@ mod tests {
         assert!(
             !count.error.unwrap_or_default().contains("only reads"),
             "a dry run changes nothing, so it isn't refused as a write"
+        );
+    }
+
+    #[test]
+    fn a_count_on_an_account_that_only_reads_says_so() {
+        let counted = json!({ "count": 3 });
+        assert_eq!(said_read_only(counted.clone(), None), counted);
+        assert_eq!(
+            said_read_only(counted, Some("only reads".into())),
+            json!({ "count": 3, READ_ONLY: "only reads" })
         );
     }
 }
