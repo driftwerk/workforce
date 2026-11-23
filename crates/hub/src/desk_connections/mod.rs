@@ -35,6 +35,7 @@
 //! person whose hub this is may make them.
 
 pub mod app;
+pub mod approvals;
 pub mod catalog;
 pub mod check;
 pub mod gh;
@@ -187,6 +188,9 @@ pub trait Agents: Send + Sync {
     /// copied its keys when it loaded (Email) or holds them in memory
     /// (Slack) uses what is kept now.
     async fn reload(&self, _agent: &str, _connector: &str, _person: &str) {}
+    /// Keeps `agent`'s daily watch of `person`'s bank approvals
+    /// ([`approvals`]) while `on`, and removes it once not.
+    async fn watch_approvals(&self, _agent: &str, _person: &str, _on: bool) {}
     /// Makes `agent` use the connections `choice` names, in its `[skills]`,
     /// through the hub's one write of its `config.toml`, as `person`. What
     /// is wrong, in words.
@@ -345,6 +349,9 @@ pub struct ConnectionView {
     pub detail: Option<String>,
     pub connected_at: Option<DateTime<Utc>>,
     pub checked_at: Option<DateTime<Utc>>,
+    /// When the person's approval at the service lapses, about, for a
+    /// service whose approval does (a bank's).
+    pub approval: Option<ApprovalView>,
     /// The vault tier it is kept at.
     pub source: VaultSource,
     /// The agents it reaches.
@@ -373,9 +380,36 @@ pub struct ConnectorView {
     pub several: bool,
     /// What a new connection's name should be, as the form says.
     pub name_hint: &'static str,
+    /// How its approval is renewed, for one whose approval lapses.
+    pub renewal: Option<catalog::Renewal>,
+    /// It only ever reads.
+    pub reads_only: bool,
     pub connections: Vec<ConnectionView>,
     /// Every agent it reaches, through any of its connections.
     pub used_by: Vec<UsedBy>,
+}
+
+/// When a connection's approval lapses, by the UTC calendar: an estimate,
+/// as the service doesn't say.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ApprovalView {
+    pub until: chrono::NaiveDate,
+    pub days_left: i64,
+    /// It lapses within the week, or has.
+    pub due: bool,
+    pub estimated: bool,
+}
+
+impl From<workforce_skills::adapters::bank::model::Approval> for ApprovalView {
+    fn from(a: workforce_skills::adapters::bank::model::Approval) -> Self {
+        Self {
+            until: a.until,
+            days_left: a.days_left,
+            due: a.due,
+            estimated: a.estimated,
+        }
+    }
 }
 
 /// A sign-in started.
@@ -812,6 +846,7 @@ impl Connections {
             detail: checked.and_then(|k| k.detail.clone()),
             connected_at: checked.map(|k| k.connected_at),
             checked_at: checked.and_then(|k| k.checked_at),
+            approval: self.approval(c, conn, tier, person),
             source: tier,
             used_by,
             approve_again: c.sign_in == SignIn::App
@@ -1129,6 +1164,8 @@ impl Connections {
                     app: self.app_state(c),
                     several: c.named(),
                     name_hint: c.name_hint,
+                    renewal: c.renewal,
+                    reads_only: c.reads_only,
                     connections,
                     used_by,
                 }
@@ -1195,6 +1232,9 @@ impl Connections {
     ) -> Result<VaultSource, Refusal> {
         let tier = Self::tiers(c, level)[0];
         let vault = self.vault_at(tier, level)?;
+        // Its approval was given when it was first kept, to make its key: a
+        // setup run again or a new key moves nothing.
+        let now = Utc::now().to_rfc3339();
         let mut keys: Vec<(String, Option<&str>)> = c
             .fields
             .iter()
@@ -1207,6 +1247,12 @@ impl Connections {
             .collect();
         if let (Some(label), Some(name)) = (c.label_at(key), name) {
             keys.push((key_at(tier, person, &label), Some(name)));
+        }
+        if let Some(at) = Self::consented_path(c, key)
+            .map(|at| key_at(tier, person, &at))
+            .filter(|at| vault.get(at).is_none())
+        {
+            keys.push((at, Some(&now)));
         }
         let ops: Vec<VaultOp<'_>> = keys
             .iter()
@@ -1286,8 +1332,8 @@ impl Connections {
     }
 
     /// Runs `c`'s Test on `fields`, its words scrubbed of them.
-    async fn check(&self, c: &Connector, fields: &BTreeMap<String, String>) -> Found {
-        match self.services.check(c.id, fields).await {
+    async fn check(&self, c: &Connector, person: &str, fields: &BTreeMap<String, String>) -> Found {
+        match self.services.check(c.id, person, fields).await {
             Found::Works { account } => Found::Works { account },
             Found::Refused(e) => Found::Refused(scrub(&e, fields)),
             Found::Failed(e) => Found::Failed(scrub(&e, fields)),
@@ -1334,7 +1380,7 @@ impl Connections {
         self.vault_at(Self::tiers(c, &level)[0], &level)?;
         // A flat connection still kept would be hidden by a named one.
         self.migrate(person).await;
-        let account = match self.check(c, &fields).await {
+        let account = match self.check(c, person, &fields).await {
             Found::Works { account } => account,
             other => return Err(Self::failed(other)),
         };
@@ -1376,7 +1422,7 @@ impl Connections {
                 Refusal::NotFound(format!("That {} connection isn't there any more", c.name))
             })?;
         let fields = Self::fields(c, given)?;
-        let found = self.check(c, &fields).await;
+        let found = self.check(c, person, &fields).await;
         let Found::Works { .. } = &found else {
             return Err(Self::failed(found));
         };
@@ -1426,6 +1472,83 @@ impl Connections {
         self.shown(c, &conn, person).await
     }
 
+    /// Where `c`'s instance `key` keeps when it was approved, for a service
+    /// whose approval lapses.
+    fn consented_path(c: &Connector, key: &str) -> Option<String> {
+        c.renewal?;
+        c.extras
+            .iter()
+            .find(|(_, sub)| *sub == catalog::CONSENTED_AT)
+            .map(|&extra| c.extra_at(extra, key))
+    }
+
+    /// When the approval of `conn` lapses, about: from when it was given.
+    fn approval(
+        &self,
+        c: &Connector,
+        conn: &Conn,
+        tier: VaultSource,
+        person: &str,
+    ) -> Option<ApprovalView> {
+        let at = Self::consented_path(c, &conn.key)?;
+        let given = self
+            .vault_at(tier, &conn.level)
+            .ok()?
+            .get(&key_at(tier, person, &at))?;
+        DateTime::parse_from_rfc3339(given.trim()).ok().map(|t| {
+            workforce_skills::adapters::bank::model::Approval::of(
+                t.with_timezone(&Utc),
+                Utc::now().date_naive(),
+            )
+            .into()
+        })
+    }
+
+    /// The person says they renewed `conn`'s approval at the service (Desk's
+    /// Reconnect), which Desk can't see, so takes their word for: checks it,
+    /// and only on a pass keeps that it was approved now. The only thing
+    /// that moves it. A service whose approval doesn't lapse is only
+    /// checked.
+    pub async fn renew(
+        &self,
+        person: &str,
+        id: &str,
+        conn: &str,
+    ) -> Result<ConnectionView, Refusal> {
+        let c = Self::connector(id)?;
+        let conn = self.conn(conn)?;
+        let Some(at) = Self::consented_path(c, &conn.key) else {
+            return self.test_conn(c, &conn, person).await;
+        };
+        let tier = self
+            .held_at(c, &conn.level, &conn.key, person)
+            .ok_or_else(|| {
+                Refusal::NotFound(format!("That {} connection isn't there any more", c.name))
+            })?;
+        let found = self
+            .check(
+                c,
+                person,
+                &self.kept(c, &conn.level, &conn.key, tier, person),
+            )
+            .await;
+        if let Found::Works { .. } = &found {
+            let path = key_at(tier, person, &at);
+            let now = Utc::now().to_rfc3339();
+            self.vault_at(tier, &conn.level)?
+                .apply(
+                    &[VaultOp::Set {
+                        path: &path,
+                        value: &now,
+                    }],
+                    VaultActor::User(person),
+                )
+                .map_err(Refusal::Internal)?;
+        }
+        self.record(c, &conn, person, &found, false).await;
+        self.shown(c, &conn, person).await
+    }
+
     /// Checks connection `conn` again, and keeps what it found.
     pub async fn test(
         &self,
@@ -1453,7 +1576,7 @@ impl Connections {
             SignIn::App => self.test_app(c, conn, tier, person).await,
             _ => {
                 let fields = self.kept(c, &conn.level, &conn.key, tier, person);
-                (self.check(c, &fields).await, None)
+                (self.check(c, person, &fields).await, None)
             }
         };
         self.record_noted(c, conn, person, &found, false, note)
@@ -1578,7 +1701,9 @@ impl Connections {
         self.disconnect_conn(c, &conn, person).await
     }
 
-    /// Loads `c` again on the agents a change at `level` reaches.
+    /// Loads `c` again on the agents a change at `level` reaches, and for
+    /// a service whose approval lapses, moves its watch to the agents that
+    /// now watch it.
     async fn reload(&self, c: &Connector, level: &Level, person: &str) {
         let agents: Vec<String> = match level {
             Level::All => self.agents.all().into_iter().map(|a| a.id).collect(),
@@ -1587,6 +1712,52 @@ impl Connections {
         for agent in agents {
             self.agents.reload(&agent, c.id, person).await;
         }
+        if c.renewal.is_some() {
+            self.rewatch(person).await;
+        }
+    }
+
+    /// Moves `person`'s watch of every approval that lapses to the agents
+    /// that watch it now: after an agent is removed, its watch is another's.
+    pub async fn rewatch(&self, person: &str) {
+        for c in catalog::CATALOG.iter().filter(|c| c.renewal.is_some()) {
+            let watching = self.watchers(c, person);
+            for agent in self.agents.all() {
+                self.agents
+                    .watch_approvals(&agent.id, person, watching.contains(&agent.id))
+                    .await;
+            }
+        }
+    }
+
+    /// The agents that watch `person`'s connections of `c`: for each, the
+    /// agent whose own it is, or for one of all their agents' the first by
+    /// name it reaches, unless an agent already watching reaches it.
+    fn watchers(&self, c: &Connector, person: &str) -> BTreeSet<String> {
+        let agents = self.agents.all();
+        let mut held: Vec<(Level, String)> = self
+            .levels()
+            .into_iter()
+            .flat_map(|level| {
+                self.instances(c, &level, person)
+                    .into_iter()
+                    .map(move |(key, _)| (level.clone(), key))
+            })
+            .collect();
+        held.sort_by_key(|(level, _)| matches!(level, Level::All));
+        held.iter()
+            .fold(BTreeSet::new(), |mut watching, (level, key)| {
+                let reaching: Vec<&Agent> = agents
+                    .iter()
+                    .filter(|a| a.binding.reaches(&a.id, c.id, level, key))
+                    .collect();
+                if !reaching.iter().any(|a| watching.contains(&a.id)) {
+                    if let Some(first) = reaching.first() {
+                        watching.insert(first.id.clone());
+                    }
+                }
+                watching
+            })
     }
 
     fn insert_flow(
@@ -1965,6 +2136,15 @@ impl Agents for Registry {
         reload_service(&service, connector, person).await;
     }
 
+    async fn watch_approvals(&self, agent: &str, person: &str, on: bool) {
+        let Some(scheduler) = self.0.registry.get(agent).and_then(|s| s.scheduler.clone()) else {
+            return;
+        };
+        scheduler
+            .keep_for(person, approvals::KEY, on.then(approvals::job))
+            .await;
+    }
+
     async fn choose(
         &self,
         agent: &str,
@@ -2102,6 +2282,25 @@ pub fn reload_skill(
     }
 }
 
+/// Once an agent is removed, the approvals it watched for the people who
+/// hold this hub are watched by another of their agents.
+pub async fn agent_removed(state: &GatewayState) {
+    let Some(connections) = INSTALLED.get() else {
+        return;
+    };
+    let Some(identities) = state.identity_store.as_ref() else {
+        return;
+    };
+    let holders = identities
+        .list(&workforce_identity::store::IdentityFilter::default())
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|i| crate::authz::is_effective_admin(i.role, i.status));
+    for holder in holders {
+        connections.rewatch(&holder.id.to_string()).await;
+    }
+}
+
 /// Connections for this `[desk]` hub, kept for the Google callback, and
 /// its routes.
 pub fn install(
@@ -2135,6 +2334,13 @@ type S = State<Arc<Routes>>;
 #[derive(Deserialize)]
 struct TokenQuery {
     token: Option<String>,
+}
+
+/// A Test the person asked for after renewing the service's approval.
+#[derive(Deserialize)]
+struct Renewal {
+    #[serde(default)]
+    renewed: bool,
 }
 
 #[derive(Deserialize)]
@@ -2447,12 +2653,15 @@ async fn test(
     State(r): S,
     h: HeaderMap,
     Query(q): Query<TokenQuery>,
+    Query(renewal): Query<Renewal>,
     Path((connector, connection)): Path<(String, String)>,
 ) -> Response {
     let person = person!(r, h, q);
-    r.connections
-        .test(&person, &connector, &connection)
-        .await
+    let tested = match renewal.renewed {
+        true => r.connections.renew(&person, &connector, &connection).await,
+        false => r.connections.test(&person, &connector, &connection).await,
+    };
+    tested
         .map(|c| Json(json!({ "connection": c })))
         .into_response()
 }

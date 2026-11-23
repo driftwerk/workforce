@@ -394,7 +394,9 @@ pub enum ChainOutcome {
         route: RouteTag,
     },
     /// No route could serve, and the person the turn is for is told how to
-    /// make one: saved as the turn's answer, with nothing to bill.
+    /// make one: saved as the turn's answer, with nothing to bill. A
+    /// turn that waits on their sign-in keeps its guard on its waiter
+    /// ([`connect::ConnectWaiter`]).
     Notice { text: String },
 }
 
@@ -642,7 +644,51 @@ impl TurnChain {
             let resolved = service.resolved.snapshot();
             (resolved.effort_level(), resolved.fast)
         };
-        let routes = Box::pin(self.run_routes(service, turn));
+        let kept = crate::monitor::scope::kept_guard(turn.session);
+        let keeper = crate::monitor::scope::TurnKeeper::new(
+            Arc::clone(&service.sessions),
+            turn.session.id.clone(),
+        );
+        // Dropped unfinished (stopped, timed out, its client gone), the
+        // turn's kept guard is cleared; cut off by a shutdown it is left for
+        // the turn a restart resumes.
+        let dropped = keeper.on_drop(crate::shutdown::in_progress);
+        let keeps = keeper.keeper();
+        // Every route runs under the turn's guard, made and armed from what
+        // started the turn as a runner's turn is: a CLI engine's round is
+        // guarded as the runner's loop is. A guard kept for the session (a
+        // turn resumed) or the caller's is the one it arms.
+        let started = turn
+            .prior
+            .iter()
+            .cloned()
+            .chain(std::iter::once(workforce_agent::llm::types::LlmMessage {
+                role: workforce_agent::llm::types::Role::User,
+                content: turn.task.clone(),
+            }))
+            .collect::<Vec<_>>();
+        let guard = workforce_agent::runner::with_content_guard(
+            kept,
+            workforce_agent::runner::with_guard_keeper(Some(Arc::clone(&keeps)), async {
+                workforce_agent::runner::guard_for_turn(&started, &service.tools)
+            }),
+        )
+        .await;
+        // A conversation that read the person's bank keeps nothing of any
+        // turn of it ([`workforce_agent::personal`]), from its first call.
+        // The routes are boxed before the layers nest them, which would
+        // otherwise overflow a worker thread's stack.
+        let read_personal = turn.session.read_personal();
+        let routes = Box::pin(workforce_agent::personal::scoped(
+            read_personal,
+            workforce_agent::runner::with_guard_keeper(
+                Some(keeps),
+                workforce_agent::runner::with_content_guard(
+                    Some(Arc::clone(&guard)),
+                    Box::pin(self.run_routes(service, turn)),
+                ),
+            ),
+        ));
         // A person's own route alone: what the turn finds missing or tells
         // them to connect is their own login, never a shared one.
         let routes: std::pin::Pin<
@@ -651,11 +697,16 @@ impl TurnChain {
             true => Box::pin(crate::subscription::personal_logins_only(routes)),
             false => routes,
         };
-        workforce_agent::llm::provider::with_effort_override(
+        let outcome = workforce_agent::llm::provider::with_effort_override(
             effort,
             workforce_agent::llm::provider::with_fast_mode(fast, routes),
         )
-        .await
+        .await;
+        // The turn's end is what it keeps: no write of its keeper lands
+        // after it.
+        keeper.finish().await;
+        dropped.disarm();
+        outcome
     }
 
     async fn run_routes(&self, service: &AgentService, turn: TurnRun<'_>) -> Result<ChainOutcome> {

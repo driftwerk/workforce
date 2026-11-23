@@ -172,6 +172,7 @@ async fn tell_unanswered(agent: String, reply: Reply, why: String) {
         username: None,
         icon_url: None,
         blocks: None,
+        outside: false,
     };
     if let Err(e) = surface.send_message(&notice).await {
         warn!(agent = %agent, channel = %reply.channel, error = %e, "Telling a Slack sender their message wasn't answered failed");

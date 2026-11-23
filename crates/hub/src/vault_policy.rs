@@ -275,7 +275,7 @@ const ADDRESS_FIELDS: &[(&str, &[&str])] = &[
 /// The connectors Desk's Connections keeps, whose paths the agent vault
 /// tools never rename, copy or move there.
 const CONNECTION_CONNECTORS: &[&str] = &[
-    "github", "google", "email", "jira", "linear", "slack", "datadog", "metabase",
+    "github", "google", "email", "jira", "linear", "slack", "datadog", "metabase", "bank",
 ];
 
 /// `path` below `skills/`, however its case, slashes or `.` segments are

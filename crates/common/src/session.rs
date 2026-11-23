@@ -561,6 +561,15 @@ pub const LEFT_SCOPE_KEY: &str = "desk_scope_left";
 /// code writes it, and it follows the conversation's rollovers.
 pub const DESK_BOSS_KEY: &str = "desk_boss";
 
+/// The metadata key a turn's guard is kept under while the turn is
+/// unfinished ([`Session::turn_content_scope`]).
+pub const TURN_CONTENT_SCOPE: &str = "turn_content_scope";
+
+/// The session metadata key a session carries for good once a turn of it
+/// read a person's private connector (their bank), and its successors with
+/// it: none of it is remembered, learned from or read elsewhere.
+pub const PERSONAL_READ_KEY: &str = "personal_read";
+
 /// A conversation session between a user and an agent.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Session {
@@ -977,6 +986,18 @@ impl Session {
         self.metadata.get(LEFT_SCOPE_KEY).is_some()
     }
 
+    /// Whether a turn of this session, or of one it continues, read a
+    /// person's private connector ([`PERSONAL_READ_KEY`]).
+    pub fn read_personal(&self) -> bool {
+        self.metadata.get(PERSONAL_READ_KEY).is_some()
+    }
+
+    /// Mark this session as having read a person's private connector.
+    pub fn mark_read_personal(&mut self) {
+        self.metadata_object_mut()
+            .insert(PERSONAL_READ_KEY.into(), serde_json::Value::Bool(true));
+    }
+
     /// Whether this session is never read in its agent's other
     /// conversations: [left behind](Self::left_behind) by a boss, or a Desk
     /// group's boss conversation on a boss hub, whose talk is that group's.
@@ -1039,7 +1060,8 @@ impl Session {
 
     /// The thread's next position: same conversation identity and label,
     /// `seq + 1`, nothing carried but a Desk boss conversation's link
-    /// ([`DESK_BOSS_KEY`]). A rollover additionally records the
+    /// ([`DESK_BOSS_KEY`]) and having read a person's private connector
+    /// ([`PERSONAL_READ_KEY`]). A rollover additionally records the
     /// carry-over with [`Self::set_prev_session_id`].
     pub fn successor(&self) -> Session {
         let mut next = Session::new(&self.channel, &self.owner, &self.agent_id);
@@ -1051,6 +1073,9 @@ impl Session {
             next.metadata_object_mut()
                 .insert(DESK_BOSS_KEY.into(), boss.clone());
             next.context_type = self.context_type.clone();
+        }
+        if self.read_personal() {
+            next.mark_read_personal();
         }
         next
     }
@@ -1202,6 +1227,39 @@ impl Session {
     pub fn set_tool_whitelist(&mut self, tools: &[String]) {
         self.metadata_object_mut()
             .insert("tool_whitelist".into(), serde_json::json!(tools));
+    }
+
+    /// The guard scope a run that owns this session ran under, kept so a
+    /// turn resumed here later runs under it again.
+    pub fn content_scope(&self) -> Option<&serde_json::Value> {
+        self.metadata.get("content_scope")
+    }
+
+    pub fn set_content_scope(&mut self, scope: serde_json::Value) {
+        self.metadata_object_mut()
+            .insert("content_scope".into(), scope);
+    }
+
+    /// The guard of the turn on this session that has not finished, as it
+    /// was when the turn stopped: kept while a call waits on someone's
+    /// answer or after a restart cut the turn off, and gone once a turn
+    /// finishes.
+    pub fn turn_content_scope(&self) -> Option<&serde_json::Value> {
+        self.metadata.get(TURN_CONTENT_SCOPE)
+    }
+
+    pub fn set_turn_content_scope(&mut self, scope: Option<serde_json::Value>) {
+        match scope {
+            Some(scope) => {
+                self.metadata_object_mut()
+                    .insert(TURN_CONTENT_SCOPE.into(), scope);
+            }
+            None => {
+                if let Some(metadata) = self.metadata.as_object_mut() {
+                    metadata.remove(TURN_CONTENT_SCOPE);
+                }
+            }
+        }
     }
 
     /// True between a rollover's sync seal+mint and its async carry-over
@@ -6656,6 +6714,18 @@ mod tests {
         assert!(next.messages.is_empty());
         assert_eq!(next.model_override, None);
         assert!(!next.is_sealed());
+        assert!(!next.read_personal());
+    }
+
+    #[test]
+    fn having_read_the_person_s_bank_follows_every_successor_and_a_save() {
+        let mut current = Session::new("desk", "u1", "kat");
+        assert!(!current.read_personal());
+        current.mark_read_personal();
+        let next = current.successor().successor();
+        assert!(next.read_personal());
+        let saved: Session = serde_json::from_value(serde_json::to_value(&next).unwrap()).unwrap();
+        assert!(saved.read_personal());
     }
 
     /// `reopen` models a process restart between resets: a file store must

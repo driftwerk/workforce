@@ -132,31 +132,6 @@ impl DeskStore {
             .is_some())
     }
 
-    /// The group each of `sessions` was in when a boss's close removed it,
-    /// as its newest such decision keeps it: none for one removed from no
-    /// group, and those no boss removed left out.
-    pub async fn removed_groups(
-        &self,
-        sessions: &[Uuid],
-    ) -> Result<std::collections::HashMap<Uuid, Option<String>>> {
-        if sessions.is_empty() {
-            return Ok(Default::default());
-        }
-        let client = self.pool().get().await?;
-        client
-            .query(
-                "SELECT DISTINCT ON (session) session, action->'removed'->>'group' \
-                 FROM boss_decisions WHERE session = ANY($1) AND action->>'kind' = 'reopen' \
-                 AND action->'removed' IS NOT NULL \
-                 ORDER BY session, at DESC",
-                &[&sessions],
-            )
-            .await?
-            .iter()
-            .map(|r| Ok((r.try_get(0)?, r.try_get(1)?)))
-            .collect()
-    }
-
     /// How many needs `boss` handled since `since`, over every decision in
     /// that time (never a page of them).
     pub async fn decisions_handled(&self, boss: &str, since: DateTime<Utc>) -> Result<Handled> {

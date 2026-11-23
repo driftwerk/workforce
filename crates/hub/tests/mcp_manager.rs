@@ -97,6 +97,7 @@ fn pat_config(server_uri: &str) -> McpServerConfig {
         workspace: None,
         env: None,
         default: false,
+        external: false,
     }
 }
 
@@ -540,6 +541,7 @@ async fn hydrate_registers_binding_user_server_via_enrolled_token() {
         workspace: None,
         env: None,
         default: false,
+        external: false,
     };
     let record = workforce_mcp_store::McpServerRecord::new(
         "test-agent",
@@ -704,6 +706,7 @@ async fn authorize_start_returns_url_and_persists_state_for_oauth() {
         workspace: None,
         env: None,
         default: false,
+        external: false,
     };
     // Persist as if we'd already called install (and got a
     // NeedsCredentials response).
@@ -760,6 +763,7 @@ async fn install_oauth_without_creds_returns_needs_credentials() {
         workspace: None,
         env: None,
         default: false,
+        external: false,
     };
     let manager = f.manager("test-agent");
     let report = manager
@@ -804,6 +808,7 @@ async fn server_statuses_reports_installed_but_unauthorised_as_needs_auth() {
         workspace: Some("harbor".to_string()),
         env: Some("staging".to_string()),
         default: false,
+        external: false,
     };
     let manager = f.manager("test-agent");
     // OAuth install with no client creds → store row persisted, spawn fails →
@@ -930,6 +935,7 @@ async fn authorize_complete_persists_tokens_and_spawns_server() {
         workspace: None,
         env: None,
         default: false,
+        external: false,
     };
     // Persist the install (as if `install` had returned NeedsCredentials).
     let cfg_value = serde_json::to_value(&cfg).unwrap();
@@ -1061,6 +1067,7 @@ async fn set_tool_filter_hot_swaps_oauth_server_without_reauth() {
         workspace: None,
         env: None,
         default: false,
+        external: false,
     };
     let record = workforce_mcp_store::McpServerRecord::new(
         "test-agent",

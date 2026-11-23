@@ -155,7 +155,7 @@ const CLAIMS: &[(&str, &str, &str, Claim)] = &[
         "desk",
         "access_activity",
         "decided_by",
-        NotPersonal("how a call was decided: rule, grant, session, person or classifier"),
+        NotPersonal("how a call was decided: rule, grant, session, person, classifier or on its own"),
     ),
     ("desk", "access_activity", "person", By(C::DeskActivity)),
     (
@@ -169,6 +169,12 @@ const CLAIMS: &[(&str, &str, &str, Claim)] = &[
         "access_grants",
         "person",
         NotPersonal("`you`, the one person of the Desk whose own hub this is"),
+    ),
+    (
+        "desk",
+        "access_on_its_own",
+        "scope",
+        NotPersonal("what an agent's level covers: a whole kind of action, or one folder, host or site"),
     ),
     (
         "desk",
@@ -456,12 +462,19 @@ const CLAIMS: &[(&str, &str, &str, Claim)] = &[
     ("hub", "owners", "person", By(C::DecisionRecords)),
     ("hub", "daily", "person", By(C::DecisionRecords)),
     ("hub", "identity_pictures", "identity_id", By(C::Pictures)),
+    ("hub", "bulk_jobs", "owner", By(C::MailJobs)),
     ("hub", "intents", "person", By(C::KnowHow)),
     ("hub", "provenance", "person", By(C::KnowHow)),
     ("hub", "records", "person", By(C::DecisionRecords)),
     ("hub", "interventions", "person", By(C::DecisionRecords)),
     ("hub", "interventions", "actor", By(C::DecisionRecords)),
     ("hub", "pending_approvals", "requester_id", By(C::Approvals)),
+    (
+        "hub",
+        "pending_approvals",
+        "content_scope",
+        NotPersonal("the content guard the asking turn ran under, erased with its row"),
+    ),
     ("hub", "turns", "owner", By(C::Signals)),
     (
         "hub",

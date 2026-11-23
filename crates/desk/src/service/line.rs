@@ -244,6 +244,24 @@ impl Desk {
             .map(|b| Party::manager(&b.agent, &b.name))
     }
 
+    /// The boss session `me` reaches as "desk": the one served from a grant
+    /// that runs it, while that boss takes its line ([`crew::Crew::answers_for`]);
+    /// else its scope's ([`Self::line_overseer`]).
+    fn session_overseer(&self, me: &SessionView) -> Option<Party> {
+        let crew = self
+            .0
+            .line_crew
+            .lock()
+            .as_ref()
+            .and_then(std::sync::Weak::upgrade);
+        self.running_boss(me.id)
+            .filter(|b| {
+                crate::grant::is_served(b) && crew.as_ref().is_some_and(|c| c.answers_for(b, me.id))
+            })
+            .map(|b| Party::manager(&b, &self.boss_name(&b)))
+            .or_else(|| self.line_overseer(me.group.as_ref().map(|g| g.id.as_str())))
+    }
+
     /// The group a line message is its session's: its sender's when that
     /// is a session, else its recipient's.
     pub(super) fn line_group(&self, m: &LineMessage) -> Option<String> {
@@ -740,7 +758,7 @@ impl Desk {
                     Target::Person => hop.min(crate::rooms::MAX_HOPS),
                     Target::Overseer | Target::Session(_) => hop,
                 };
-                let overseer = self.line_overseer(me.group.as_ref().map(|g| g.id.as_str()));
+                let overseer = self.session_overseer(me);
                 let recipient = line::reach(
                     me,
                     &to,
@@ -781,7 +799,7 @@ impl Desk {
                         // anything is said of it.
                         if let Sender::Overseer(by) = &from {
                             let group = them.group.as_ref().map(|g| g.id.as_str());
-                            if !self.boss_reaches(&by.party.id, group) {
+                            if !self.boss_reaches(&by.party.id, group, Some(id)) {
                                 return Err(Refusal::NoSuchSession(id.to_string()).into());
                             }
                             // Taken back by the person: no boss writes to
@@ -1100,7 +1118,11 @@ impl Desk {
             Sender::Overseer(b)
                 if question.to.kind == PartyKind::Manager
                     && question.to.id == b.party.id
-                    && self.boss_reaches(&b.party.id, question.group.as_deref()) =>
+                    && self.boss_reaches(
+                        &b.party.id,
+                        question.group.as_deref(),
+                        question.from_session(),
+                    ) =>
             {
                 if let Some(asker) = question.from_session() {
                     self.boss_holds(asker, Some(b))?;
@@ -1422,7 +1444,7 @@ impl Desk {
                             })
                         })
                         .collect();
-                let desk = match self.line_overseer(me.group.as_ref().map(|g| g.id.as_str())) {
+                let desk = match self.session_overseer(me) {
                     Some(o) => format!("{}, the person's overseer: to \"desk\"", o.name),
                     None => "No overseer answers here: \"desk\" reaches the person".into(),
                 };
@@ -1580,6 +1602,18 @@ impl Desk {
             .ok()
             .flatten()
             .is_some_and(|q| q.asked == Some(Asked::Dismissed))
+    }
+
+    /// Whether any session's call still waits on one of its questions.
+    pub fn asks_waited_on(&self) -> bool {
+        let now = Instant::now();
+        self.0
+            .state
+            .lock()
+            .lines
+            .waiting
+            .values()
+            .any(|until| *until > now)
     }
 
     /// Whether a tool call still waits on the question `ask`.

@@ -510,6 +510,8 @@ pub async fn asked(
         ttl,
         // A linked engine's ask: nothing resumes on it.
         chat: false,
+        origin: None,
+        content_scope: None,
     };
     if let Err(e) = store.insert_core(
         &core,
@@ -560,6 +562,7 @@ pub async fn asked(
             username: None,
             icon_url: None,
             blocks: Some(blocks(&asked, live, hub, &request)),
+            outside: false,
         })
         .await;
     match sent {
@@ -799,6 +802,7 @@ async fn rewrite(
             blocks: Some(vec![
                 json!({"type": "section", "text": {"type": "mrkdwn", "text": text}}),
             ]),
+            outside: false,
         };
         if let Err(e) = surface.update_message(dm, ts, &out).await {
             tracing::warn!(error = %e, "an ask's card couldn't be rewritten");
@@ -1025,6 +1029,8 @@ mod tests {
             created_at: Utc::now(),
             expires_at: Utc::now(),
             chat: false,
+            origin: None,
+            content_scope: None,
         };
         let anywhere = row(json!(["allow", "deny", "stop"]));
         assert_eq!(refuses(&anywhere, PermissionChoice::AllowOnce), None);

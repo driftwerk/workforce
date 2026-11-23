@@ -35,6 +35,10 @@ pub const SYSTEM_OWNER: &str = "__system__";
 /// auto-disable). Never a share grantee, so it does not taint auto-runs.
 pub const SYSTEM_EDITOR: &str = "system";
 
+/// What sharing a definition that was saved in a conversation that read
+/// the person's bank is told.
+pub const READ_PERSONAL_STAYS_PRIVATE: &str = "This was saved in a conversation that read the person's bank, so it stays private to them: it can't be shared with a team or everyone.";
+
 /// `def_revisions.kind` for agent identity files (`ref_id` =
 /// `{agent_id}/{filename}`); the operative file stays on disk.
 pub const KIND_IDENTITY_FILE: &str = "identity_file";
@@ -69,6 +73,9 @@ pub struct EditContext<'a> {
     pub edited_via: &'a str,
     /// Source revision number when `edited_via == "restore"`.
     pub restored_from: Option<i32>,
+    /// Made in a conversation that read the person's bank: the row is
+    /// marked, for good, in the same write ([`READ_PERSONAL_STAYS_PRIVATE`]).
+    pub read_personal: bool,
 }
 
 impl<'a> EditContext<'a> {
@@ -77,7 +84,15 @@ impl<'a> EditContext<'a> {
             edited_by,
             edited_via,
             restored_from: None,
+            read_personal: false,
         }
+    }
+
+    /// This edit, marked as made in a conversation that read the person's
+    /// bank when `read` is.
+    pub fn read_personal(mut self, read: bool) -> Self {
+        self.read_personal |= read;
+        self
     }
 
     /// A restore edit: inserts a NEW revision (history is never rewritten)
@@ -87,6 +102,7 @@ impl<'a> EditContext<'a> {
             edited_by,
             edited_via: "restore",
             restored_from: Some(from),
+            read_personal: false,
         }
     }
 }
@@ -382,6 +398,9 @@ pub enum TransferFailed {
     NotFound,
     /// The target already owns a definition of `(kind, id)`.
     Occupied,
+    /// It was saved in a conversation that read the person's bank, so it
+    /// stays theirs ([`READ_PERSONAL_STAYS_PRIVATE`]).
+    ReadPersonal,
     Storage(eyre::Report),
 }
 
@@ -390,6 +409,7 @@ impl std::fmt::Display for TransferFailed {
         match self {
             Self::NotFound => f.write_str("no such definition under that owner"),
             Self::Occupied => f.write_str("the new owner already holds a definition of that name"),
+            Self::ReadPersonal => f.write_str(READ_PERSONAL_STAYS_PRIVATE),
             Self::Storage(e) => write!(f, "{e}"),
         }
     }
@@ -439,6 +459,26 @@ const MONITOR_SATELLITES: [&str; 4] = [
 const DEF_ROW_FOR_UPDATE: &str = "SELECT 1 FROM workflow_defs \
                                   WHERE id = $1 AND kind = $2 AND owner_identity_id = $3 \
                                   FOR UPDATE";
+
+/// [`DEF_ROW_FOR_UPDATE`], with whether the row is marked as saved in a
+/// conversation that read the person's bank.
+const DEF_ROW_FOR_UPDATE_MARKED: &str = "SELECT read_personal FROM workflow_defs \
+                                         WHERE id = $1 AND kind = $2 AND owner_identity_id = $3 \
+                                         FOR UPDATE";
+
+/// Whether one row is marked as saved in a conversation that read the
+/// person's bank, locked for the rest of `tx`.
+async fn read_personal_for_update(
+    tx: &tokio_postgres::Transaction<'_>,
+    kind: &str,
+    id: &str,
+    owner: &str,
+) -> Result<bool> {
+    Ok(tx
+        .query_opt(DEF_ROW_FOR_UPDATE_MARKED, &[&id, &kind, &owner])
+        .await?
+        .is_some_and(|r| r.get::<_, bool>("read_personal")))
+}
 
 const LIST_DEFS: &str = "SELECT id, toml_source, owner_identity_id, visibility, \
                                 last_modified_by, run_as_identity_id \
@@ -758,6 +798,8 @@ impl WorkflowStore {
     }
 
     /// Insert or update a definition owned by `owner` (`None` = system),
+    /// refused ([`READ_PERSONAL_STAYS_PRIVATE`]) when it would share one
+    /// marked ([`EditContext::read_personal`]) with a team or everyone,
     /// recording a revision (and `last_modified_by`) in the same transaction.
     pub async fn save(
         &self,
@@ -770,37 +812,49 @@ impl WorkflowStore {
         run_as: RunAsWrite,
         edit: EditContext<'_>,
     ) -> Result<()> {
+        // A row marked in this very save is never shared by it either.
+        if edit.read_personal && visibility != Visibility::Private {
+            return Err(eyre::eyre!(READ_PERSONAL_STAYS_PRIVATE));
+        }
         let now = Utc::now();
         let (set_run_as, run_as_value) = run_as.column_write();
         let mut conn = self.pool.get().await?;
         let tx = conn.transaction().await?;
-        tx.execute(
-            "INSERT INTO workflow_defs \
+        let saved = tx
+            .execute(
+                "INSERT INTO workflow_defs \
              (id, agent_id, kind, toml_source, parsed_json, owner_identity_id, visibility, \
-              last_modified_by, created_at, updated_at, run_as_identity_id) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $9, $11) \
+              last_modified_by, created_at, updated_at, run_as_identity_id, read_personal) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $9, $11, $12) \
              ON CONFLICT (id, kind, owner_identity_id) DO UPDATE \
              SET kind = EXCLUDED.kind, toml_source = EXCLUDED.toml_source, \
                  parsed_json = EXCLUDED.parsed_json, visibility = EXCLUDED.visibility, \
                  last_modified_by = EXCLUDED.last_modified_by, \
                  updated_at = EXCLUDED.updated_at, \
                  run_as_identity_id = CASE WHEN $10 THEN $11 \
-                                      ELSE workflow_defs.run_as_identity_id END",
-            &[
-                &id,
-                &GLOBAL_AGENT,
-                &kind,
-                &toml_source,
-                &parsed_json,
-                &owner_column(owner),
-                &visibility.as_str(),
-                &edit.edited_by,
-                &now,
-                &set_run_as,
-                &run_as_value,
-            ],
-        )
-        .await?;
+                                      ELSE workflow_defs.run_as_identity_id END, \
+                 read_personal = workflow_defs.read_personal OR EXCLUDED.read_personal \
+             WHERE NOT ((workflow_defs.read_personal OR EXCLUDED.read_personal) \
+                        AND EXCLUDED.visibility <> 'private')",
+                &[
+                    &id,
+                    &GLOBAL_AGENT,
+                    &kind,
+                    &toml_source,
+                    &parsed_json,
+                    &owner_column(owner),
+                    &visibility.as_str(),
+                    &edit.edited_by,
+                    &now,
+                    &set_run_as,
+                    &run_as_value,
+                    &edit.read_personal,
+                ],
+            )
+            .await?;
+        if saved == 0 {
+            return Err(eyre::eyre!(READ_PERSONAL_STAYS_PRIVATE));
+        }
         record_revision_in(
             &tx,
             kind,
@@ -1219,11 +1273,29 @@ impl WorkflowStore {
         let n = conn
             .execute(
                 "UPDATE workflow_defs SET visibility = $4, updated_at = $5 \
-                 WHERE kind = $1 AND id = $2 AND owner_identity_id = $3",
+                 WHERE kind = $1 AND id = $2 AND owner_identity_id = $3 \
+                   AND (NOT read_personal OR $4 = 'private')",
                 &[&kind, &id, &owner, &visibility.as_str(), &Utc::now()],
             )
             .await?;
+        if n == 0 && self.read_personal(kind, id, Some(owner)).await? {
+            return Err(eyre::eyre!(READ_PERSONAL_STAYS_PRIVATE));
+        }
         Ok(n > 0)
+    }
+
+    /// Whether one definition was saved in a conversation that read the
+    /// person's bank.
+    pub async fn read_personal(&self, kind: &str, id: &str, owner: Option<&str>) -> Result<bool> {
+        let conn = self.pool.get().await?;
+        let row = conn
+            .query_opt(
+                "SELECT read_personal FROM workflow_defs \
+                 WHERE kind = $1 AND id = $2 AND owner_identity_id = $3",
+                &[&kind, &id, &owner_column(owner)],
+            )
+            .await?;
+        Ok(row.is_some_and(|r| r.get::<_, bool>("read_personal")))
     }
 
     /// Every grantee of one definition, ordered for a stable UI.
@@ -1271,6 +1343,9 @@ impl WorkflowStore {
         let now = Utc::now();
         let mut conn = self.pool.get().await?;
         let tx = conn.transaction().await?;
+        if !deduped.is_empty() && read_personal_for_update(&tx, kind, def_id, owner).await? {
+            return Err(eyre::eyre!(READ_PERSONAL_STAYS_PRIVATE));
+        }
         tx.execute(
             "DELETE FROM def_shares WHERE kind = $1 AND def_id = $2 AND owner_identity_id = $3",
             &[&kind, &def_id, &owner],
@@ -1430,12 +1505,14 @@ impl WorkflowStore {
         let mut conn = self.pool.get().await?;
         let tx = conn.transaction().await?;
 
-        if tx
-            .query_opt(DEF_ROW_FOR_UPDATE, &[&id, &kind, &from])
+        let Some(row) = tx
+            .query_opt(DEF_ROW_FOR_UPDATE_MARKED, &[&id, &kind, &from])
             .await?
-            .is_none()
-        {
+        else {
             return Err(TransferFailed::NotFound);
+        };
+        if row.get::<_, bool>("read_personal") {
+            return Err(TransferFailed::ReadPersonal);
         }
         if tx
             .query_opt(DEF_ROW_FOR_UPDATE, &[&id, &kind, &to])
@@ -2662,6 +2739,61 @@ mod tests {
             Some(&shared),
             &AliceTeam
         ));
+    }
+
+    /// The store holds the rule itself: a save marked as made after reading
+    /// the person's bank is never a team or global one, new row or old, and
+    /// a private one marks the row for good.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_save_made_after_reading_the_bank_is_private_or_nothing() {
+        with_store(|s| async move {
+            let marked = || edit("agent_tool", Some("alice")).read_personal(true);
+            let save = |visibility: Visibility, edit: EditContext<'static>| {
+                let s = Arc::clone(&s);
+                async move {
+                    s.save(
+                        "triage",
+                        "workflow",
+                        "x",
+                        None,
+                        Some("alice"),
+                        visibility,
+                        RunAsWrite::Unchanged,
+                        edit,
+                    )
+                    .await
+                }
+            };
+            for visibility in [Visibility::Team, Visibility::Global] {
+                let refused = save(visibility, marked()).await.unwrap_err();
+                assert_eq!(refused.to_string(), READ_PERSONAL_STAYS_PRIVATE);
+            }
+            assert!(s
+                .get("triage", "workflow", Some("alice"))
+                .await
+                .unwrap()
+                .is_none());
+
+            save(Visibility::Private, marked()).await.unwrap();
+            assert!(s
+                .read_personal("workflow", "triage", Some("alice"))
+                .await
+                .unwrap());
+            let later = save(Visibility::Team, edit("web", Some("alice")))
+                .await
+                .unwrap_err();
+            assert_eq!(later.to_string(), READ_PERSONAL_STAYS_PRIVATE);
+            save(Visibility::Private, edit("web", Some("alice")))
+                .await
+                .unwrap();
+            assert!(
+                s.read_personal("workflow", "triage", Some("alice"))
+                    .await
+                    .unwrap(),
+                "never cleared"
+            );
+        })
+        .await;
     }
 
     #[tokio::test(flavor = "multi_thread")]

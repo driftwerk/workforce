@@ -1224,6 +1224,7 @@ pub const ACTION_DISPATCH_TOOLS: &[&str] = &[
     "email.mark",
     "email.rules",
     "email.setup",
+    "email.sort_rules",
     "google.setup",
     "jobs",
     "know_how",

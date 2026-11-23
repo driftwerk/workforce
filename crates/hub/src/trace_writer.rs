@@ -302,10 +302,27 @@ struct TraceEnvelope<'a, T: Serialize> {
     data: &'a T,
 }
 
-/// Writes trace data as JSONL files to the local filesystem.
+/// Writes trace data as JSONL files to the local filesystem: one file for
+/// the agent, which every run of it writes to.
+///
+/// A run that read a person's private connector (their bank: its session
+/// had, it called one, or it read back a conversation that had) leaves no
+/// line in it ([`workforce_agent::personal`]). So that none of such a run
+/// is kept, a run's lines are held until it ends and written together
+/// then. A run that ends without a footer (an error, a dropped turn) is
+/// written as far as it got once it is gone, unless it read the bank, so
+/// nothing is held past its run. Other runs, and lines written outside any
+/// run, are untouched.
 pub struct JsonlTraceWriter {
+    lines: Arc<Lines>,
+}
+
+/// The file, and the lines each running run holds for it.
+struct Lines {
     /// The opened file handle, protected by a mutex for thread safety.
     file: Mutex<std::io::BufWriter<fs::File>>,
+    /// Each running run's lines, by [`workforce_agent::personal::run_key`].
+    held: Mutex<std::collections::HashMap<usize, Vec<String>>>,
 }
 
 impl JsonlTraceWriter {
@@ -337,22 +354,104 @@ impl JsonlTraceWriter {
         );
 
         Ok(Self {
-            file: Mutex::new(writer),
+            lines: Arc::new(Lines {
+                file: Mutex::new(writer),
+                held: Mutex::default(),
+            }),
         })
     }
 
-    /// Write a single JSON line with a type discriminator.
-    fn write_line<T: Serialize>(&self, type_name: &str, data: &T) -> Result<()> {
-        let envelope = TraceEnvelope {
+    /// One line, as written.
+    fn line<T: Serialize>(type_name: &str, data: &T) -> Result<String> {
+        Ok(serde_json::to_string(&TraceEnvelope {
             r#type: type_name,
             data,
+        })?)
+    }
+
+    /// Takes a line of the run in hand: held until it ends, dropped with
+    /// the rest of it once it has read the bank. `start` begins the run's
+    /// lines afresh; `end` writes them out.
+    fn take(&self, line: String, start: bool, end: bool) -> Result<()> {
+        let Some(run) = workforce_agent::personal::run_key() else {
+            return self.lines.write(&[line]);
         };
-        let json = serde_json::to_string(&envelope)?;
+        let mut held = self.lines.held()?;
+        if workforce_agent::personal::read() {
+            held.remove(&run);
+            return Ok(());
+        }
+        if start {
+            held.remove(&run);
+        }
+        let fresh = !held.contains_key(&run);
+        // A footer with nothing before it closes nothing.
+        if fresh && end {
+            return Ok(());
+        }
+        held.entry(run).or_default().push(line);
+        if end {
+            let lines = held.remove(&run).unwrap_or_default();
+            drop(held);
+            return self.lines.write(&lines);
+        }
+        drop(held);
+        // However the run ends, what it still holds goes then. Told once
+        // the hold is let go, so the run's end never waits on it here.
+        if fresh {
+            let kept = Arc::downgrade(&self.lines);
+            workforce_agent::personal::on_end(move |read| {
+                if let Some(kept) = kept.upgrade() {
+                    kept.ended(run, read);
+                }
+            });
+        }
+        Ok(())
+    }
+
+    /// How many runs hold lines now.
+    #[cfg(test)]
+    fn holding(&self) -> usize {
+        self.lines.held().map_or(0, |held| held.len())
+    }
+}
+
+impl Lines {
+    fn held(
+        &self,
+    ) -> Result<std::sync::MutexGuard<'_, std::collections::HashMap<usize, Vec<String>>>> {
+        self.held
+            .lock()
+            .map_err(|e| eyre::eyre!("Trace hold mutex poisoned: {}", e))
+    }
+
+    /// `run` is over without a footer: what it held is written, unless it
+    /// read the bank.
+    fn ended(&self, run: usize, read: bool) {
+        let Ok(mut held) = self.held() else {
+            return;
+        };
+        let Some(lines) = held.remove(&run) else {
+            return;
+        };
+        drop(held);
+        if read {
+            return;
+        }
+        if let Err(e) = self.write(&lines) {
+            tracing::warn!(error = %e, "Failed to write an unfinished run's trace");
+        }
+    }
+
+    /// Writes `lines` together, so no other run's come between them.
+    fn write(&self, lines: &[String]) -> Result<()> {
         let mut file = self
             .file
             .lock()
             .map_err(|e| eyre::eyre!("Trace file mutex poisoned: {}", e))?;
-        writeln!(file, "{}", json)?;
+        for line in lines {
+            writeln!(file, "{}", line)?;
+        }
         file.flush()?;
         Ok(())
     }
@@ -360,15 +459,15 @@ impl JsonlTraceWriter {
 
 impl TraceWriter for JsonlTraceWriter {
     fn write_header(&self, header: &TraceHeader) -> Result<()> {
-        self.write_line("header", header)
+        self.take(Self::line("header", header)?, true, false)
     }
 
     fn write_round(&self, round: &TraceRound) -> Result<()> {
-        self.write_line("round", round)
+        self.take(Self::line("round", round)?, false, false)
     }
 
     fn write_footer(&self, footer: &TraceFooter) -> Result<()> {
-        self.write_line("footer", footer)
+        self.take(Self::line("footer", footer)?, false, true)
     }
 }
 
@@ -425,6 +524,183 @@ mod tests {
             .unwrap();
         let trace = fs::read_dir(day.path()).unwrap().next().unwrap().unwrap();
         assert_eq!(other_bits(&trace.path()), 0);
+    }
+
+    fn round(tool: &str, output: serde_json::Value) -> TraceRound {
+        let mut r: TraceRound = serde_json::from_value(serde_json::json!({
+            "round": 1, "input": [], "response": [], "tool_results": [],
+            "model": "m", "stop_reason": "tool_use", "input_tokens": 0,
+            "output_tokens": 0, "cache_read_tokens": 0, "cache_creation_tokens": 0
+        }))
+        .unwrap();
+        r.tool_results
+            .push(workforce_agent::trace::ToolResultTrace {
+                tool_use_id: "t".into(),
+                tool_name: tool.into(),
+                input: serde_json::json!({}),
+                output,
+                success: true,
+                duration_ms: 1,
+            });
+        r
+    }
+
+    fn header(session: &str) -> TraceHeader {
+        serde_json::from_value(serde_json::json!({
+            "trace_id": session, "agent_id": "kat", "session_id": session,
+            "workflow_id": null, "step_id": null, "task_type": null,
+            "model": "m", "system_prompt": "", "tools": [],
+            "started_at": "2026-11-22T09:00:00Z"
+        }))
+        .unwrap()
+    }
+
+    fn footer() -> TraceFooter {
+        TraceFooter {
+            outcome: workforce_agent::trace::TraceOutcome::Success,
+            completed_at: chrono::Utc::now(),
+            total_rounds: 1,
+            total_input_tokens: 0,
+            total_output_tokens: 0,
+            total_duration_ms: 1,
+        }
+    }
+
+    /// A run of `session`'s, as the runner makes one: its tools run as
+    /// calls are made, then its round is traced.
+    async fn run(
+        writer: &JsonlTraceWriter,
+        session: &str,
+        read: bool,
+        calls: &[(&str, serde_json::Value)],
+    ) {
+        workforce_agent::personal::scoped(read, async {
+            writer.write_header(&header(session)).unwrap();
+            for (tool, output) in calls {
+                workforce_agent::personal::calling(tool);
+                workforce_agent::personal::answered(output);
+                tokio::task::yield_now().await;
+                writer.write_round(&round(tool, output.clone())).unwrap();
+            }
+            writer.write_footer(&footer()).unwrap();
+        })
+        .await;
+    }
+
+    fn traced(base: &std::path::Path) -> Vec<String> {
+        walk(base)
+            .iter()
+            .flat_map(|f| {
+                fs::read_to_string(f)
+                    .unwrap()
+                    .lines()
+                    .map(str::to_string)
+                    .collect::<Vec<_>>()
+            })
+            .filter(|l| l.contains("\"header\""))
+            .map(|l| {
+                serde_json::from_str::<serde_json::Value>(&l).unwrap()["session_id"]
+                    .as_str()
+                    .unwrap()
+                    .to_string()
+            })
+            .collect()
+    }
+
+    /// The agent's one file is shared by every run: a run that read the
+    /// bank leaves none of its lines, and everyone else's stay, whole.
+    #[tokio::test]
+    async fn only_a_run_that_read_the_person_s_bank_goes_untraced() {
+        let base = tempfile::tempdir().unwrap();
+        let writer = JsonlTraceWriter::new(base.path(), "kat").unwrap();
+        let linear = || ("linear.issue_get", serde_json::json!("DW-1"));
+        let bank = || ("bank.transactions", serde_json::json!("£12.30 at Tesco"));
+        let (ann, bob) = ([linear(), bank(), linear()], [linear(), linear()]);
+        tokio::join!(
+            run(&writer, "ann-banks", false, &ann),
+            run(&writer, "bob", false, &bob),
+        );
+        run(&writer, "ann-later", true, &[linear()]).await;
+        run(
+            &writer,
+            "ann-reads-back",
+            false,
+            &[(
+                "sessions.read",
+                serde_json::json!({"personal_read": true, "messages": []}),
+            )],
+        )
+        .await;
+        run(&writer, "carl", false, &[linear()]).await;
+
+        assert_eq!(traced(base.path()), ["bob", "carl"]);
+        let all: String = walk(base.path())
+            .iter()
+            .map(|f| fs::read_to_string(f).unwrap())
+            .collect();
+        assert!(!all.contains("Tesco"));
+        assert_eq!(all.lines().count(), 4 + 3, "bob's run whole, and carl's");
+    }
+
+    /// A run that errors before its footer: what it got to is written
+    /// once it is gone, and nothing is held after it; one that read the
+    /// bank leaves nothing, and is held no longer either. A run whose
+    /// failure the runner closes with an `Error` footer is traced whole.
+    #[tokio::test]
+    async fn a_run_that_errors_is_traced_as_far_as_it_got_unless_it_read_the_bank() {
+        let base = tempfile::tempdir().unwrap();
+        let writer = JsonlTraceWriter::new(base.path(), "kat").unwrap();
+        let held = &writer;
+        let errs = move |session: &'static str, tool: &'static str| {
+            let writer = held;
+            workforce_agent::personal::scoped(false, async move {
+                writer.write_header(&header(session)).unwrap();
+                workforce_agent::personal::calling(tool);
+                writer
+                    .write_round(&round(tool, serde_json::json!("£12.30 at Tesco")))
+                    .unwrap();
+                assert_eq!(writer.holding(), usize::from(!tool.starts_with("bank.")));
+            })
+        };
+        errs("ann-errs", "linear.issue_get").await;
+        assert_eq!(writer.holding(), 0, "nothing held past its run");
+        assert_eq!(traced(base.path()), ["ann-errs"]);
+
+        errs("ann-banks-and-errs", "bank.transactions").await;
+        assert_eq!(writer.holding(), 0);
+        assert_eq!(traced(base.path()), ["ann-errs"]);
+
+        workforce_agent::personal::scoped(false, async {
+            writer.write_header(&header("bob-errs")).unwrap();
+            writer
+                .write_footer(&TraceFooter {
+                    outcome: workforce_agent::trace::TraceOutcome::Error("boom".into()),
+                    ..footer()
+                })
+                .unwrap();
+            // A second close (cancelled, then failed) closes nothing.
+            writer.write_footer(&footer()).unwrap();
+        })
+        .await;
+        let all: String = walk(base.path())
+            .iter()
+            .map(|f| fs::read_to_string(f).unwrap())
+            .collect();
+        assert_eq!(traced(base.path()), ["ann-errs", "bob-errs"]);
+        assert_eq!(all.lines().count(), 2 + 2, "ann's two lines, bob's two");
+        assert!(all.contains("boom"));
+    }
+
+    fn walk(dir: &std::path::Path) -> Vec<PathBuf> {
+        fs::read_dir(dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .flat_map(|e| match e.path().is_dir() {
+                true => walk(&e.path()),
+                false => vec![e.path()],
+            })
+            .collect()
     }
 
     fn day_name(n: i64) -> String {

@@ -242,6 +242,15 @@ impl Tool for MemoryTool {
             input.visibility = Some("private".into());
         }
 
+        // A conversation that read the person's bank, or a turn that has
+        // read it so far, keeps nothing of it.
+        if input.action == "remember" && workforce_agent::personal::read() {
+            return Ok(ToolResult::failure(
+                PERSONAL_KEPT_NOTHING,
+                start.elapsed().as_millis() as u64,
+            ));
+        }
+
         match input.action.as_str() {
             "remember" => self.handle_remember(input, start).await,
             "recall" => self.handle_recall(input, start).await,
@@ -261,6 +270,10 @@ impl Tool for MemoryTool {
         }
     }
 }
+
+/// What a write of memory or notes is told in a conversation that read the
+/// person's bank.
+pub(crate) const PERSONAL_KEPT_NOTHING: &str = "Nothing is remembered from a conversation that read the person's bank: it stays in this conversation alone.";
 
 /// Failure result for the `MemoryTool` handlers when no `CURRENT_USER_ID`
 /// is in scope. Centralises the message and timing so every handler
@@ -854,13 +867,21 @@ impl MemoryTool {
             Some(s) => Arc::clone(s),
             None => Arc::new(JsonlSessionStore::new(&self.workspace)?),
         };
-        let session_owned = matches!(
-            sessions.get(&session_id),
-            Ok(Some(ref s)) if s.owner == identity_id,
-        );
+        let source = sessions.get(&session_id).ok().flatten();
+        let session_owned = source.as_ref().is_some_and(|s| s.owner == identity_id);
         if !session_owned {
             return Ok(ToolResult::failure(
                 format!("Memory '{id}' not found"),
+                duration(),
+            ));
+        }
+        if source.is_some_and(|s| s.read_personal()) {
+            return Ok(ToolResult::success(
+                serde_json::json!({
+                    "memory_id": id,
+                    "has_source": false,
+                    "message": "Its conversation read the person's bank, so it isn't shown."
+                }),
                 duration(),
             ));
         }
@@ -1519,6 +1540,82 @@ mod tests {
 
             assert!(result.success);
             assert_eq!(result.output["has_source"], false);
+        })
+        .await;
+    }
+
+    /// A turn that has read the person's bank, or any turn of a conversation
+    /// that had, remembers nothing; recalling still works.
+    #[tokio::test]
+    async fn a_turn_that_read_the_bank_remembers_nothing() {
+        let store: Arc<dyn MemoryStore> = Arc::new(InMemoryStore::new());
+        let dir = tempfile::tempdir().unwrap();
+        let tool = MemoryTool::new(
+            Arc::clone(&store),
+            AgentId::new("a"),
+            dir.path().to_path_buf(),
+        );
+        let remember = || {
+            tool.execute(serde_json::json!({
+                "action": "remember",
+                "content": "spent £40 at Tesco",
+                "layer": "semantic"
+            }))
+        };
+        with_test_user(|| async {
+            let kept = workforce_agent::personal::scoped(false, async {
+                let before = remember().await.unwrap();
+                workforce_agent::personal::calling("bank.transactions");
+                let after = remember().await.unwrap();
+                let recall = tool
+                    .execute(serde_json::json!({ "action": "recall", "query": "Tesco" }))
+                    .await
+                    .unwrap();
+                (before.success, after, recall.success)
+            })
+            .await;
+            assert!(kept.0, "before the bank call, as ever");
+            assert!(!kept.1.success);
+            assert_eq!(kept.1.error.as_deref(), Some(PERSONAL_KEPT_NOTHING));
+            assert!(kept.2);
+            let flagged = workforce_agent::personal::scoped(true, remember())
+                .await
+                .unwrap();
+            assert!(!flagged.success, "a later turn of the conversation");
+        })
+        .await;
+    }
+
+    /// The passage behind a memory is never fetched from a conversation that
+    /// read the person's bank.
+    #[tokio::test]
+    async fn fetch_source_never_shows_a_conversation_that_read_the_bank() {
+        use workforce_common::session::{InMemorySessionStore, Session, SessionStore};
+        let sessions: Arc<dyn SessionStore> = Arc::new(InMemorySessionStore::new());
+        let mut banked = Session::new("desk", "test-user", "a");
+        banked.mark_read_personal();
+        sessions.save(&banked).unwrap();
+        let store: Arc<dyn MemoryStore> = Arc::new(InMemoryStore::new());
+        let dir = tempfile::tempdir().unwrap();
+        let tool = MemoryTool::new(
+            Arc::clone(&store),
+            AgentId::new("a"),
+            dir.path().to_path_buf(),
+        )
+        .with_sessions(sessions);
+        let mem =
+            workforce_memory::types::Memory::new("x", MemoryLayer::Episodic, AgentId::new("a"))
+                .with_identity_id("test-user")
+                .with_source_session(banked.id.clone(), vec!["m1".into()]);
+        let id = store.remember(mem).await.unwrap();
+        with_test_user(|| async {
+            let result = tool
+                .execute(serde_json::json!({ "action": "fetch_source", "memory_id": id.0 }))
+                .await
+                .unwrap();
+            assert!(result.success);
+            assert_eq!(result.output["has_source"], false);
+            assert!(result.output.get("passage").is_none());
         })
         .await;
     }

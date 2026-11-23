@@ -393,6 +393,14 @@ pub trait MonitorHost: Send + Sync {
         owner: Option<&str>,
         edit: EditContext<'_>,
     ) -> eyre::Result<()>;
+    /// Pause or resume a monitor; a resume starts it from now.
+    async fn set_enabled(
+        &self,
+        id: &str,
+        owner: Option<&str>,
+        enabled: bool,
+        edit: EditContext<'_>,
+    ) -> eyre::Result<MonitorDefinition>;
     /// What a save or resume of `def` does about the events it missed.
     async fn apply_catch_up_policy(
         &self,
@@ -488,6 +496,15 @@ pub trait SchedulerHost: Send + Sync {
         schedule: Schedule,
         payload: JobPayload,
     ) -> Result<String, String>;
+    /// Keep the hub's own job `key` (a stable marker, not its name) for
+    /// `person` while `job` is given, and remove it once it isn't. Whether
+    /// anything changed.
+    async fn keep_for(
+        &self,
+        person: &str,
+        key: &str,
+        job: Option<crate::hub_core::schedules::HubJob>,
+    ) -> bool;
     async fn update_job_run_as(&self, job_id: &str, identity_id: Option<String>) -> bool;
     async fn update_job_identity(&self, job_id: &str, identity_id: Option<String>) -> bool;
     async fn update_job_bill_to(&self, job_id: &str, identity_id: Option<String>) -> bool;

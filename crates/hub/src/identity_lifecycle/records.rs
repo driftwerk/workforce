@@ -1029,6 +1029,56 @@ impl Holding for DeskActivity {
     }
 }
 
+/// The bulk mail jobs kept so they can be carried on and undone (two weeks
+/// after they last changed): a merge hands them to the one merged into, a
+/// delete erases them.
+pub struct MailJobs;
+
+#[async_trait]
+impl Holding for MailJobs {
+    async fn owners(&self, _cx: &Context<'_>) -> Result<Owners> {
+        let Some(journal) = crate::email_journal::installed() else {
+            return Ok(Owners::default());
+        };
+        Ok(Owners::counted(journal.people().await?))
+    }
+
+    async fn held(&self, _cx: &Context<'_>, who: &Person) -> Result<Tally> {
+        let Some(journal) = crate::email_journal::installed() else {
+            return Ok(Tally::default());
+        };
+        Ok(Tally::counted(journal.held(&who.names).await?))
+    }
+
+    async fn merge(
+        &self,
+        cx: &Context<'_>,
+        from: &Person,
+        into: &Person,
+        apply: bool,
+    ) -> Result<Tally> {
+        let tally = self.held(cx, from).await?;
+        if let Some(journal) = crate::email_journal::installed().filter(|_| apply) {
+            journal.reassign(&from.names, &into.key()).await?;
+        }
+        Ok(tally)
+    }
+
+    async fn delete(
+        &self,
+        cx: &Context<'_>,
+        who: &Person,
+        _: Option<&Person>,
+        apply: bool,
+    ) -> Result<Tally> {
+        let tally = self.held(cx, who).await?;
+        if let Some(journal) = crate::email_journal::installed().filter(|_| apply) {
+            journal.erase(&who.names).await?;
+        }
+        Ok(tally)
+    }
+}
+
 /// The person's pictures: the one they chose and their Slack picture. A
 /// merge keeps the target's chosen picture when both chose one; the Slack
 /// picture is fetched again for whoever is linked to Slack.
