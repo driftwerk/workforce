@@ -595,7 +595,7 @@ impl CrewHub {
         let session = finished_session(event)?;
         let v = self.desk.view(session).ok()?;
         let reply = self.desk.reply(session).map(|r| r.text).or(v.last_reply)?;
-        (crew::one_line(&reply, usize::MAX) != reply.trim()).then(|| {
+        says_more(&reply).then(|| {
             format!(" (its reply says more: read it with crew.history, session_id {session})")
         })
     }
@@ -1399,6 +1399,12 @@ impl CrewHub {
 }
 
 /// The session whose turn `event` says ended, when it does.
+/// Whether `reply` says more than its turn's end does: its first sentence,
+/// as long as that says it ([`crew::ANSWER_CHARS`]).
+fn says_more(reply: &str) -> bool {
+    crew::one_line(reply, crew::ANSWER_CHARS) != reply.trim()
+}
+
 pub(super) fn finished_session(event: &Event) -> Option<uuid::Uuid> {
     let subject = event.subject.as_ref()?;
     (event.kind == Kind::Finished && subject.kind == PartyKind::Session)
@@ -1689,6 +1695,26 @@ pub(super) fn wake_loop(
                 }));
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod says_more_tests {
+    use super::*;
+
+    #[test]
+    fn a_reply_says_more_than_its_turns_end_past_its_first_sentence_or_its_length() {
+        assert!(!says_more(" All green. "));
+        assert!(says_more("All green. The flaky test passed twice."));
+        let long = format!(
+            "Checked {} and all of them pass.",
+            "every module ".repeat(12)
+        );
+        assert!(long.chars().count() > crew::ANSWER_CHARS);
+        assert!(
+            says_more(&long),
+            "one sentence, cut where the turn's end says it"
+        );
     }
 }
 

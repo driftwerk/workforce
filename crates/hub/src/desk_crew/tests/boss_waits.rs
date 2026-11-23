@@ -914,6 +914,19 @@ async fn a_message_given_up_on_unheard_is_said_by_the_minutes_look_once() {
         })
         .await;
         assert!(woken[0].contains(&id.to_string()), "{woken:?}");
+        let waiting = async || {
+            let kept = d
+                .store()
+                .state("hub.crew.unreceived")
+                .await
+                .unwrap()
+                .unwrap();
+            kept.value["waiting"].get(id.to_string()).is_some()
+        };
+        eventually("what it was told kept over a restart", async || {
+            waiting().await.then_some(())
+        })
+        .await;
         d.store().line_went_in(id).await.unwrap().unwrap();
         eventually("the boss told it arrived", async || {
             Some(super::stalls::woken_by(&llm, "arrived after all").await).filter(|w| !w.is_empty())
@@ -932,6 +945,7 @@ async fn a_message_given_up_on_unheard_is_said_by_the_minutes_look_once() {
                 .len(),
             1
         );
+        assert!(!waiting().await, "let go once told it arrived");
     })
     .await;
 }

@@ -1405,7 +1405,9 @@ impl CrewHub {
                     if let Ok(Some(a)) = store.assignment_of_line(m.id).await {
                         self.never_went_in(&a).await;
                     }
-                    self.unreceived(m, told);
+                    if self.unreceived(m, told) {
+                        self.keep_unreceived(told).await;
+                    }
                 }
                 _ => {}
             }
@@ -1447,9 +1449,10 @@ impl CrewHub {
 
     /// The boss's `m` was never shown to have gone into its session: the
     /// boss is told, once (`told` keeps who was), as it isn't put in again.
-    fn unreceived(self: &Arc<Self>, m: &LineMessage, told: &mut Unreceived) {
-        if told.said.insert(m.id, false).is_some() {
-            return;
+    /// Whether it was told now.
+    fn unreceived(self: &Arc<Self>, m: &LineMessage, told: &mut Unreceived) -> bool {
+        if m.updated_at < told.since || told.waiting.insert(m.id, m.updated_at).is_some() {
+            return false;
         }
         self.said_of_message(
             m,
@@ -1458,6 +1461,7 @@ impl CrewHub {
              last reply (crew.history) before resending, and send it again only if it still \
              matters.",
         );
+        true
     }
 
     /// The boss's `m`, given up on, went in after all: the order it carries,
@@ -1493,40 +1497,81 @@ impl CrewHub {
                      session, so don't send it again."
                 .to_string(),
         };
-        if told.said.get(&m.id) == Some(&false) {
-            told.said.insert(m.id, true);
+        if told.waiting.remove(&m.id).is_some() {
             self.said_of_message(m, "received", &then);
+            self.keep_unreceived(told).await;
         }
     }
 
     /// The boss's messages given up on since `told` was kept, and those
     /// given up on that went in since: each said once, whatever events
-    /// were missed.
+    /// were missed. One not in after [`LATE_FOR`] is no longer watched.
     async fn unreceived_look(self: &Arc<Self>, told: &mut Unreceived) {
         let store = self.desk.store();
+        let now = Utc::now();
+        let mut changed = false;
         match store.line_unreceived_since(told.since).await {
             Ok(gone) => {
                 for m in gone.iter().filter(|m| m.from.kind == PartyKind::Manager) {
-                    self.unreceived(m, told);
+                    changed |= self.unreceived(m, told);
                 }
+                let newest = gone.last().map_or(told.since, |m| m.updated_at);
+                let since = told.since.max(newest.min(now - SETTLED));
+                changed |= since != told.since;
+                told.since = since;
             }
             Err(e) => {
                 tracing::warn!(error = %format!("{e:#}"), "couldn't read messages given up on")
             }
         }
-        let waiting: Vec<Uuid> = told
-            .said
-            .iter()
-            .filter(|(_, late)| !**late)
-            .map(|(id, _)| *id)
-            .collect();
-        for id in waiting {
-            if let Ok(Some(mut m)) = store.line_message(id).await {
-                if m.delivery == Delivery::Delivered {
+        let waiting: Vec<(Uuid, DateTime<Utc>)> =
+            told.waiting.iter().map(|(id, at)| (*id, *at)).collect();
+        for (id, at) in waiting {
+            let Ok(row) = store.line_message(id).await else {
+                continue;
+            };
+            match row {
+                Some(mut m) if m.delivery == Delivery::Delivered => {
                     m.late = true;
                     self.assignment_heard(&m, told).await;
                 }
+                Some(m)
+                    if m.delivery == Delivery::Unreceived
+                        && (at >= told.since || now - at < LATE_FOR) => {}
+                _ => changed |= told.waiting.remove(&id).is_some(),
             }
+        }
+        if changed {
+            self.keep_unreceived(told).await;
+        }
+    }
+
+    /// What the boss was told of its messages given up on, kept over a
+    /// restart: none given up on longer ago than [`LATE_FOR`] is said now.
+    async fn kept_unreceived(&self) -> Unreceived {
+        match self.desk.store().state(UNRECEIVED).await {
+            Ok(Some(e)) => serde_json::from_value(e.value).map_or_else(
+                |e| {
+                    tracing::warn!(error = %e, "what the boss was told of messages given up on couldn't be read: from now");
+                    Unreceived::from(Utc::now())
+                },
+                |kept: Unreceived| Unreceived {
+                    since: kept.since.max(Utc::now() - LATE_FOR),
+                    ..kept
+                },
+            ),
+            Ok(None) => Unreceived::from(Utc::now()),
+            Err(e) => {
+                tracing::warn!(error = %format!("{e:#}"), "reading what the boss was told of messages given up on failed: from now");
+                Unreceived::from(Utc::now())
+            }
+        }
+    }
+
+    async fn keep_unreceived(&self, told: &Unreceived) {
+        let value = serde_json::to_value(told).unwrap_or_default();
+        if let Err(e) = self.desk.store().put_state(UNRECEIVED, &value).await {
+            tracing::warn!(error = %format!("{e:#}"), "keeping what the boss was told of messages given up on failed");
         }
     }
 
@@ -2046,12 +2091,31 @@ impl CrewHub {
     }
 }
 
-/// The boss's messages given up on since the loop started, each with
-/// whether its boss was told it went in after all: what is said of them,
-/// once.
+/// The state key what the boss was told of its messages given up on is
+/// kept under.
+const UNRECEIVED: &str = "hub.crew.unreceived";
+/// How long a message given up on is watched for going in after all.
+const LATE_FOR: chrono::TimeDelta = chrono::TimeDelta::days(1);
+/// How far behind now the look's mark stays, for a row given up on that
+/// was committed after a later one.
+const SETTLED: chrono::TimeDelta = chrono::TimeDelta::minutes(1);
+
+/// The boss's messages given up on: those since `since` are yet to be read,
+/// and `waiting` are those it was told of (each with when it was given up
+/// on), until each goes in after all and that is told, or it is let go.
+#[derive(serde::Serialize, serde::Deserialize)]
 pub(super) struct Unreceived {
     since: DateTime<Utc>,
-    said: HashMap<Uuid, bool>,
+    waiting: HashMap<Uuid, DateTime<Utc>>,
+}
+
+impl From<DateTime<Utc>> for Unreceived {
+    fn from(since: DateTime<Utc>) -> Self {
+        Self {
+            since,
+            waiting: HashMap::new(),
+        }
+    }
 }
 
 /// Keeps the assignments up to date with what happens on the lines, and
@@ -2067,10 +2131,7 @@ pub(super) fn assignments_loop(
         let mut every = tokio::time::interval(crew.timing.minute);
         every.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let mut raised: HashSet<Uuid> = HashSet::new();
-        let mut told = Unreceived {
-            since: Utc::now(),
-            said: HashMap::new(),
-        };
+        let mut told = crew.kept_unreceived().await;
         let mut pruned = Utc::now();
         loop {
             tokio::select! {

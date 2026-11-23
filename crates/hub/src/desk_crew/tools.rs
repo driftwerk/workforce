@@ -582,7 +582,7 @@ impl CrewTool {
         let said = json!({
             "name": v.label(), "hub_name": v.name, "group": v.group.as_ref().map(|g| g.name.clone()),
             "goal": v.goal, "cwd": v.cwd,
-            "last_prompt": v.last_prompt, "last_reply": crew.desk.reply_read(&v, from, turn),
+            "last_prompt": v.last_prompt, "last_reply": crew.desk.reply_read(&v, from, turn.as_deref()),
             "pending": v.pending.as_ref().map(super::decide::pending_for_boss), "terminal": terminal,
         });
         Ok(json!({
@@ -1163,13 +1163,13 @@ fn dm_text(agent: &str, id: &str, text: &str) -> String {
 
 /// Where crew.history reads a session's reply from: its `reply_from`, and
 /// the `turn` that reply ended.
-pub(super) fn reply_asked(input: &Value) -> (usize, Option<u64>) {
+pub(super) fn reply_asked(input: &Value) -> (usize, Option<String>) {
     (
         input["reply_from"]
             .as_u64()
             .and_then(|f| usize::try_from(f).ok())
             .unwrap_or_default(),
-        input["turn"].as_u64(),
+        input["turn"].as_str().map(str::to_string),
     )
 }
 
@@ -1320,8 +1320,8 @@ pub(crate) fn schema(name: &str, engines: impl Fn() -> Vec<&'static str>) -> Val
             "session_id": session_schema(),
             "message_id": { "type": "string", "description": "A message on a session's Desk line, by its full id: read it whole" },
             "dm_id": { "type": "string", "description": "With agent_id: one message of its Desk DM, by its id, read whole, as a cut one says" },
-            "reply_from": { "type": "integer", "minimum": 0, "description": "With session_id: read its reply on from this character, as a cut reply says" },
-            "turn": { "type": "integer", "minimum": 1, "description": "With reply_from: the turn the cut reply said, so a reply replaced since isn't read on" },
+            "reply_from": { "type": "integer", "minimum": 0, "maximum": workforce_desk::crew::REPLY_FROM_MAX, "description": "With session_id: read its reply on from this character, as a cut reply says" },
+            "turn": { "type": "string", "description": "With reply_from: the turn the cut reply said, so a reply replaced since isn't read on" },
             "limit": { "type": "integer", "minimum": 1, "maximum": 100 }
         }}),
         "crew.account" => json!({ "type": "object", "properties": {

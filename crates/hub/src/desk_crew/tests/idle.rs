@@ -253,13 +253,11 @@ async fn left_to_person(d: &Desk, since: chrono::DateTime<chrono::Utc>, id: uuid
         .count()
 }
 
-/// At Act fully no job guard holds a next step back: one that looks like
-/// it can't be taken back and says no job goes to the session at once,
-/// with no full turn to declare its job and nothing left to the person.
-/// A turn's end with a long reply: the call that judges it reads its first
-/// part and is told how to read on, never a silently cut reply.
+/// A turn's end with a long reply: the call that judges it, which has no
+/// tools, reads its first part and is told there is more, never a reply
+/// silently cut or a tool it can't call.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_long_reply_is_judged_on_its_first_part_and_says_how_to_read_on() {
+async fn a_long_reply_is_judged_on_its_first_part_and_says_there_is_more() {
     with_test_pool(workforce_desk::store::build_pool, |pool| async move {
         let dir = tempfile::tempdir().unwrap();
         let base = std::fs::canonicalize(dir.path()).unwrap();
@@ -292,11 +290,53 @@ async fn a_long_reply_is_judged_on_its_first_part_and_says_how_to_read_on() {
             "past the card's 600 characters"
         );
         assert!(!call.contains("Module 250 checked"), "one part of it");
-        assert!(call.contains("reply_from: 3000, turn: 1"), "how to read on");
+        assert!(
+            call.contains(
+                "[cut: 3000 of 6020 characters shown; the rest isn't shown to this call]"
+            ),
+            "that there is more"
+        );
+        assert!(!call.contains("reply_from"), "no tool it can't call");
     })
     .await;
 }
 
+/// An orchestrator boss hears of a turn's end with its reply's first page,
+/// and how to read on, never a reply silently cut.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_orchestrator_hears_a_long_replys_first_page_and_how_to_read_on() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(dir.path()).unwrap();
+        let (_overseer, crew, d, _llm) = overseeing(&base, pool, "ok", &theirs(), &[]).await;
+        let s = new_session(&d, &base, "harbor").await;
+        let url = hook_url(&base, s.id).await;
+        let checked: String = (0..700)
+            .map(|i| format!(" Module {i:03} checked."))
+            .collect();
+        ends(&url, &format!("Audited the modules.{checked}")).await;
+        let v = eventually("its reply heard", async || {
+            d.view(s.id).ok().filter(|v| v.last_reply.is_some())
+        })
+        .await;
+        let notice = crew.turn_end_notice(&v).await;
+        assert!(
+            notice.contains("Module 380 checked"),
+            "past what was cut before"
+        );
+        assert!(!notice.contains("Module 600 checked"), "one page of it");
+        let turn = d.reply(s.id).unwrap().turn;
+        assert!(
+            notice.contains(&format!("reply_from: 8000, turn: {turn}")),
+            "how to read on: {notice}"
+        );
+    })
+    .await;
+}
+
+/// At Act fully no job guard holds a next step back: one that looks like
+/// it can't be taken back and says no job goes to the session at once,
+/// with no full turn to declare its job and nothing left to the person.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_next_step_that_says_no_job_goes_at_once_at_act_fully() {
     with_test_pool(workforce_desk::store::build_pool, |pool| async move {

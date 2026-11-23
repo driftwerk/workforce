@@ -2182,8 +2182,8 @@ impl Desk {
     }
 
     /// Whether `session`'s transcript (Claude Code's, or Codex's rollout)
-    /// holds the marker of `row`, read whole: `None` when it has none, or
-    /// it can't be read.
+    /// holds the marker of `row`, read whole: `None` when it has none, it
+    /// can't be read, or it is too long to read whole.
     async fn marker_in_transcript(&self, session: Uuid, row: Uuid) -> Option<bool> {
         let path = self.record(session).ok()?.transcript?;
         let mark = line::marker(row);
@@ -2194,6 +2194,7 @@ impl Desk {
         .ok()?
         .inspect_err(|e| tracing::warn!(%session, error = %e, "couldn't read a session's transcript for a marker"))
         .ok()
+        .flatten()
     }
 
     /// Desk's plugin says what became of a message it was handed: submitted
