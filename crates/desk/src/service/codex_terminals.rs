@@ -334,6 +334,9 @@ impl Desk {
                         .as_ref()
                         .is_none_or(|p| r.last_reply.as_ref() == Some(p))
             });
+        // Heard whole even when its card is as it was: after a restart, Desk
+        // holds no reply whole until its tail is read.
+        let heard = self.reply_heard(id, tail.said.as_deref(), tail.last_reply.clone());
         if !unchanged {
             self.change(id, |r, l| {
                 if ended_anew || state != SessionState::Asking {
@@ -348,7 +351,7 @@ impl Desk {
                 r.state = state;
                 // A tail that misses them keeps what was known.
                 r.last_prompt = tail.last_prompt.or(r.last_prompt.take());
-                r.last_reply = tail.last_reply.or(r.last_reply.take());
+                r.last_reply = heard.or(r.last_reply.take());
             });
         }
     }

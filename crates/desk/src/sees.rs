@@ -49,13 +49,33 @@ pub fn last_rows(text: &str) -> String {
     rows[rows.len().saturating_sub(MAX_ROWS)..].join("\n")
 }
 
-/// `text` cut to `max` characters, said so.
+/// What a served result cut to [`MAX_CHARS`] says to read the rest.
+const ASK_LESS: &str = "; ask for less to read the rest: a reply on from a later character \
+     (crew.history reply_from), one line message whole (crew.history message_id), or a \
+     transcript's page before this one (crew.inside before)";
+
+/// `text` cut to `max` characters, said so, with how much.
 pub fn capped(text: &str, max: usize) -> String {
-    if text.chars().count() <= max {
+    cut(text, max, "")
+}
+
+/// A served result cut to [`MAX_CHARS`], said so, with how much and how to
+/// ask for less.
+pub fn capped_result(text: &str) -> String {
+    cut(text, MAX_CHARS, ASK_LESS)
+}
+
+fn cut(text: &str, max: usize, then: &str) -> String {
+    let total = text.chars().count();
+    if total <= max {
         return text.to_string();
     }
-    let kept: String = text.chars().take(max.saturating_sub(40)).collect();
-    format!("{kept}\n[cut: more than {max} characters]")
+    let room = max.saturating_sub(60 + then.chars().count());
+    let kept: String = text.chars().take(room).collect();
+    format!(
+        "{kept}\n[cut: {} of {total} characters shown{then}]",
+        kept.chars().count()
+    )
 }
 
 /// `r` with its words and what it was read from left out, short of
@@ -161,8 +181,17 @@ mod tests {
         let long = "x".repeat(MAX_CHARS + 10);
         let c = capped(&long, MAX_CHARS);
         assert!(c.chars().count() <= MAX_CHARS + 1);
-        assert!(c.contains("[cut:"));
+        assert!(c.ends_with(&format!(
+            "[cut: {} of {} characters shown]",
+            MAX_CHARS - 60,
+            MAX_CHARS + 10
+        )));
         assert_eq!(capped("short", MAX_CHARS), "short");
+        let served = capped_result(&long);
+        assert!(served.chars().count() <= MAX_CHARS);
+        assert!(served.contains("ask for less to read the rest"));
+        assert!(served.contains("reply_from") && served.contains("message_id"));
+        assert!(served.contains("crew.inside before"));
     }
 
     fn seen() -> Glance {

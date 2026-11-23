@@ -1117,6 +1117,118 @@ pub fn clip(text: &str, max: usize) -> String {
     format!("{}…", cut.trim_end())
 }
 
+/// A session's last reply as Desk heard it whole, and which of its turn
+/// ends it is, told by its words: a boss reading it page by page reads one
+/// reply, over a restart too.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Reply {
+    pub text: String,
+    pub turn: String,
+}
+
+impl Reply {
+    pub fn of(text: &str) -> Self {
+        use sha2::Digest;
+        let text = text.trim().to_string();
+        let turn = sha2::Sha256::digest(text.as_bytes())[..4]
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        Self { text, turn }
+    }
+}
+
+/// Whether the call a reply is shown to can read what isn't shown of it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReadOn {
+    /// With crew.history and crew.inside: it is told how.
+    Tools,
+    /// A call without tools: it is told only that there is more.
+    Not,
+}
+
+/// The most of a reply one read gives its boss.
+pub const REPLY_PAGE: usize = 8_000;
+
+/// The most of a reply a session's card keeps, and a line turn shows.
+pub const REPLY_KEPT: usize = crate::transcript::REPLY_MAX;
+
+/// The most a read of a reply may start from.
+pub const REPLY_FROM_MAX: usize = 100_000_000;
+
+/// What a boss reads of a session's last reply: from character `from`, at
+/// most `most` characters, whole or a page that says what else there is
+/// (`on`). With none heard whole (Desk restarted since, or the session ran
+/// in another terminal), its kept start (`preview`) is all of it when it
+/// wasn't cut, and otherwise all there is here: the rest is in its
+/// transcript (`transcript`), or nowhere Desk keeps.
+pub fn reply_for_boss(
+    whole: Option<&Reply>,
+    preview: Option<&str>,
+    transcript: bool,
+    from: usize,
+    most: usize,
+    on: ReadOn,
+) -> Option<String> {
+    let whole = whole.cloned().or_else(|| {
+        preview
+            .filter(|p| !crate::transcript::clipped(p))
+            .map(Reply::of)
+    });
+    if let Some(r) = whole {
+        return Some(page_of(&r, from, most, on));
+    }
+    let p = preview?;
+    let rest = match (on, transcript) {
+        (ReadOn::Not, _) => {
+            return Some(format!(
+            "{p}\n[cut: only its first {REPLY_KEPT} characters are kept; the rest isn't shown to \
+             this call]"
+        ))
+        }
+        (ReadOn::Tools, true) => {
+            "Read it whole in its transcript with crew.inside (session_id, facet: transcript)."
+        }
+        (ReadOn::Tools, false) => "Desk keeps no transcript of it.",
+    };
+    Some(match from {
+        0 => format!("{p}\n[cut: only its first {REPLY_KEPT} characters are kept here. {rest}]"),
+        _ => format!(
+            "[Desk keeps only the first {REPLY_KEPT} characters of its reply, not the whole of it \
+             (Desk restarted since, or the session ran in another terminal), so it can't be read on \
+             from {from} here. {rest}]"
+        ),
+    })
+}
+
+/// The page of `r` from character `from`, at most `most` long, saying what
+/// else there is.
+fn page_of(r: &Reply, from: usize, most: usize, on: ReadOn) -> String {
+    let total = r.text.chars().count();
+    let page: String = r.text.chars().skip(from).take(most).collect();
+    let end = from.saturating_add(most).min(total);
+    match (from, end < total) {
+        (0, false) => page,
+        _ if from >= total => format!("[its reply has {total} characters: none from {from}.]"),
+        (_, true) => match on {
+            ReadOn::Tools => format!(
+                "{page}\n[cut: characters {}–{end} of {total} shown. Read on with crew.history \
+                 (session_id, reply_from: {end}, turn: {}).]",
+                from + 1,
+                r.turn
+            ),
+            ReadOn::Not => format!(
+                "{page}\n[cut: {} of {total} characters shown; the rest isn't shown to this call]",
+                end - from
+            ),
+        },
+        _ => format!(
+            "{page}\n[characters {}–{total} of {total}: the end of its reply.]",
+            from + 1
+        ),
+    }
+}
+
 /// The last `max` characters of `text`.
 pub fn tail_chars(text: &str, max: usize) -> &str {
     let skip = text.chars().count().saturating_sub(max);
@@ -1299,8 +1411,8 @@ pub fn hit_limit(reply: &str) -> bool {
         .any(|p| r.contains(p))
 }
 
-/// How long an answer's line is kept.
-const ANSWER_CHARS: usize = 120;
+/// The most of a reply's first sentence a turn's end says.
+pub const ANSWER_CHARS: usize = 120;
 
 /// What a turn's answer (or, as `Err`, its failure) means: how it ended,
 /// its first line, and the question it leaves the person.
@@ -1439,6 +1551,130 @@ mod tests {
         assert_eq!(options_in(vague, vague), None);
         let open = "What should the release notes say?";
         assert_eq!(options_in(open, open), None);
+    }
+
+    /// What a page of a reply holds of it, its note left out.
+    fn shown_of(read: &str) -> &str {
+        read.split_once("\n[").map_or(read, |(page, _)| page)
+    }
+
+    #[test]
+    fn a_reply_reaches_its_boss_whole_or_in_pages_that_say_how_to_read_on() {
+        let text: String = (0..2_000)
+            .map(|i| format!("Step {i:04} checked.\n"))
+            .collect();
+        let whole = Reply::of(&text);
+        let text = whole.text.clone();
+        let preview = crate::transcript::clip(&text);
+        let read = |from| {
+            reply_for_boss(
+                Some(&whole),
+                Some(&preview),
+                true,
+                from,
+                REPLY_PAGE,
+                ReadOn::Tools,
+            )
+        };
+        let first = read(0).unwrap();
+        assert!(first.ends_with(&format!(
+            "[cut: characters 1–8000 of {} shown. Read on with crew.history (session_id, reply_from: 8000, turn: {}).]",
+            text.chars().count(),
+            whole.turn
+        )));
+        // Read on to its end, the pages are the reply.
+        let mut from = 0;
+        let mut pages = String::new();
+        loop {
+            let page = read(from).unwrap();
+            pages.push_str(shown_of(&page));
+            from += REPLY_PAGE;
+            if page.contains("the end of its reply") {
+                break;
+            }
+        }
+        assert_eq!(pages, text);
+        assert!(read(text.chars().count() + 5)
+            .unwrap()
+            .starts_with("[its reply has"));
+        assert!(read(usize::MAX).unwrap().starts_with("[its reply has"));
+        // A call without tools is told only that there is more.
+        let once = reply_for_boss(Some(&whole), None, true, 0, 3000, ReadOn::Not).unwrap();
+        assert!(once.ends_with(&format!(
+            "[cut: 3000 of {} characters shown; the rest isn't shown to this call]",
+            text.chars().count()
+        )));
+        // A short one is whole, said as it is.
+        let short = Reply::of("All green.");
+        assert_eq!(
+            reply_for_boss(
+                Some(&short),
+                Some("All green."),
+                true,
+                0,
+                REPLY_PAGE,
+                ReadOn::Tools
+            )
+            .as_deref(),
+            Some("All green.")
+        );
+        // The same words are the same turn's; others another's.
+        assert_eq!(Reply::of(" All green.\n").turn, short.turn);
+        assert_ne!(Reply::of("All red.").turn, short.turn);
+    }
+
+    #[test]
+    fn a_reply_not_heard_whole_is_its_kept_start_and_says_where_the_rest_is() {
+        let text: String = (0..200).map(|i| format!("Step {i:03} checked. ")).collect();
+        let preview = crate::transcript::clip(&text);
+        let read = |transcript, from, on| {
+            reply_for_boss(None, Some(&preview), transcript, from, REPLY_PAGE, on).unwrap()
+        };
+        let kept = read(true, 0, ReadOn::Tools);
+        assert!(kept.starts_with(&preview));
+        assert!(kept.contains("crew.inside (session_id, facet: transcript)"));
+        assert!(read(false, 0, ReadOn::Tools).contains("Desk keeps no transcript of it"));
+        let once = read(true, 0, ReadOn::Not);
+        assert!(once.ends_with("the rest isn't shown to this call]"));
+        assert!(
+            !once.contains("crew."),
+            "no tool named to a call without them"
+        );
+        // Read on, it says it can't, and where the rest is.
+        let on = read(true, 600, ReadOn::Tools);
+        assert!(
+            on.starts_with("[Desk keeps only the first 600 characters"),
+            "{on}"
+        );
+        assert!(on.contains("can't be read on from 600"));
+        assert!(on.contains("crew.inside"));
+        // A kept start that wasn't cut is the whole reply, read on as one.
+        let short = "Fixed the race. Tests pass.";
+        assert_eq!(
+            reply_for_boss(None, Some(short), false, 0, REPLY_PAGE, ReadOn::Tools).as_deref(),
+            Some(short)
+        );
+        let rest = reply_for_boss(None, Some(short), false, 10, REPLY_PAGE, ReadOn::Tools).unwrap();
+        assert!(
+            rest.starts_with("race. Tests pass.\n[characters 11–27 of 27"),
+            "{rest}"
+        );
+        assert_eq!(
+            reply_for_boss(None, None, true, 0, REPLY_PAGE, ReadOn::Tools),
+            None
+        );
+    }
+
+    #[test]
+    fn a_page_cuts_between_characters_never_inside_one() {
+        let text = "é".repeat(REPLY_PAGE + 3);
+        let r = Reply::of(&text);
+        let first = reply_for_boss(Some(&r), None, false, 0, REPLY_PAGE, ReadOn::Tools).unwrap();
+        assert_eq!(shown_of(&first), "é".repeat(REPLY_PAGE));
+        let rest =
+            reply_for_boss(Some(&r), None, false, REPLY_PAGE, REPLY_PAGE, ReadOn::Tools).unwrap();
+        assert_eq!(shown_of(&rest), "ééé");
+        assert!(rest.contains(&format!("characters 8001–8003 of {}", REPLY_PAGE + 3)));
     }
 
     #[test]

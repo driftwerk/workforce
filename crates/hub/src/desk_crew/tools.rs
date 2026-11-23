@@ -474,7 +474,7 @@ impl CrewTool {
                 if let Some(session) = input["session_id"].as_str() {
                     let id = session_id(session)?;
                     crew.session_seen(id, seen)?;
-                    return self.session_said(crew, id);
+                    return self.session_said(crew, id, input);
                 }
                 let agent = input["agent_id"]
                     .as_str()
@@ -558,13 +558,19 @@ impl CrewTool {
 
     /// Session `id`'s last prompt, reply, pending request and screen: what
     /// crew.history gives of it, and crew.account when it keeps no account.
-    fn session_said(&self, crew: &Arc<CrewHub>, id: uuid::Uuid) -> Result<Value, String> {
+    fn session_said(
+        &self,
+        crew: &Arc<CrewHub>,
+        id: uuid::Uuid,
+        input: &Value,
+    ) -> Result<Value, String> {
         let v = crew.desk.view(id).map_err(|_| crew.not_ours(&self.scope))?;
         let terminal = crew.desk.terminal_text(id, 3000).ok();
+        let (from, turn) = reply_asked(input);
         let said = json!({
-            "name": v.label(), "hub_name": v.name, "group": v.group.map(|g| g.name),
+            "name": v.label(), "hub_name": v.name, "group": v.group.as_ref().map(|g| g.name.clone()),
             "goal": v.goal, "cwd": v.cwd,
-            "last_prompt": v.last_prompt, "last_reply": v.last_reply,
+            "last_prompt": v.last_prompt, "last_reply": crew.desk.reply_read(&v, from, turn.as_deref()),
             "pending": v.pending.as_ref().map(super::decide::pending_for_boss), "terminal": terminal,
         });
         Ok(json!({
@@ -614,7 +620,7 @@ impl CrewTool {
                 out
             }
             None => {
-                let mut out = self.session_said(crew, id)?;
+                let mut out = self.session_said(crew, id, &Value::Null)?;
                 out["note"] = json!(
                     "Desk keeps no account of it yet: this is its last prompt, reply and screen."
                 );
@@ -1136,6 +1142,18 @@ impl CrewTool {
 /// `crew.ask_session`: the last resort, after the boss looked itself.
 pub(super) const ASK_SESSION_DESCRIPTION: &str = "Last resort: ask a session (session_id) about its work, as Desk's status question on its line, without derailing it. Look first: crew.inside (its processes, transcript and workspace) and crew.account answer most questions now. One that is working gets the question only once its turn ends, so a session stuck in a long tool call (a build queue, a hung command) won't answer: look inside it instead. It asks for words only and never changes what the session does; to have it wait, hold or change course, tell it so with crew.nudge.";
 
+/// Where crew.history reads a session's reply from: its `reply_from`, and
+/// the `turn` that reply ended.
+pub(super) fn reply_asked(input: &Value) -> (usize, Option<String>) {
+    (
+        input["reply_from"]
+            .as_u64()
+            .and_then(|f| usize::try_from(f).ok())
+            .unwrap_or_default(),
+        input["turn"].as_str().map(str::to_string),
+    )
+}
+
 /// What crew.account says when a session's account and conversation don't
 /// answer the boss's question.
 pub(super) const NOT_IN_RECORD: &str = "Its account and recent conversation don't say. Search its transcript (crew.inside, facet transcript, query); ask the session (crew.ask_session) only if that can't answer.";
@@ -1184,7 +1202,7 @@ pub(crate) fn describe(name: &str) -> &'static str {
             "crew.activity" => "What happened on the crew, newest first: turns started and finished, questions, requests, failures, and what you and the person did. Filter to one agent or session with subject_id.",
             "crew.account" => "What one session (session_id) is for, who asked, its plan, what it has done (with its PRs, tickets, commits and deploys), what it is doing now, what it waits on, what comes next and the choices it made: its running account, brought up to date first when it is stale, with the time it is as of. Read it before you say anything of a session. With question, also the answer its own recent conversation gives to something the account doesn't say (which key, which file, what error).",
             "crew.ask_session" => ASK_SESSION_DESCRIPTION,
-            "crew.history" => "The recent messages of one agent's Desk DM with the person (agent_id), one session's last prompt, reply, pending request and terminal (session_id), or one message on a session's Desk line, whole (message_id: when what you were shown of it says it was cut short).",
+            "crew.history" => "The recent messages of one agent's Desk DM with the person (agent_id), one session's last prompt, reply, pending request and terminal (session_id; a reply too long for one read says so and is read on with reply_from and turn), or one message on a session's Desk line, whole (message_id: when what you were shown of it says it was cut short).",
             "crew.nudge" => "Send a short message to an agent's DM (agent_id) or to a session on its Desk line (session_id): a check-in, a hint, a correction. A session gets it once its turn ends, or, with urgent, with its next tool call's result (crew.interrupt stops a turn now). With reply_to (a question's message id), it is your answer to what that session asked you.",
             "crew.escalate" => "Give a question a session asked you on its Desk line to the person (message_id): say why in reason, offer answers in options, and draft one in draft if you can. Use it for anything that pushes, deletes, deploys, spends, sends to people or changes scope, and whenever you are unsure; at Act fully, only for what the person's own orders and preferences don't cover (they are the rule, both ways).",
             "crew.approve" => "Allow a session's pending request (session_id, approval_id from crew.overview).",
@@ -1282,6 +1300,8 @@ pub(crate) fn schema(name: &str, engines: impl Fn() -> Vec<&'static str>) -> Val
             "agent_id": { "type": "string" },
             "session_id": session_schema(),
             "message_id": { "type": "string", "description": "A message on a session's Desk line, by its full id: read it whole" },
+            "reply_from": { "type": "integer", "minimum": 0, "maximum": workforce_desk::crew::REPLY_FROM_MAX, "description": "With session_id: read its reply on from this character, as a cut reply says" },
+            "turn": { "type": "string", "description": "With reply_from: the turn the cut reply said, so a reply replaced since isn't read on" },
             "limit": { "type": "integer", "minimum": 1, "maximum": 100 }
         }}),
         "crew.account" => json!({ "type": "object", "properties": {

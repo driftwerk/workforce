@@ -571,7 +571,12 @@ impl CrewHub {
                 },
                 event.text
             ),
-            false => format!("{} {}", who(subject), event.text),
+            false => format!(
+                "{} {}{}",
+                who(subject),
+                event.text,
+                self.reply_says_more(event).unwrap_or_default()
+            ),
         };
         wanted.then(|| Trigger {
             line,
@@ -581,6 +586,17 @@ impl CrewHub {
             group: event.group.clone(),
             handed: None,
             routine: false,
+        })
+    }
+
+    /// What a turn's end `event`, which says its reply's first sentence,
+    /// adds when the reply says more: where to read it.
+    fn reply_says_more(&self, event: &Event) -> Option<String> {
+        let session = finished_session(event)?;
+        let v = self.desk.view(session).ok()?;
+        let reply = self.desk.reply(session).map(|r| r.text).or(v.last_reply)?;
+        says_more(&reply).then(|| {
+            format!(" (its reply says more: read it with crew.history, session_id {session})")
         })
     }
 
@@ -1384,6 +1400,12 @@ impl CrewHub {
     }
 }
 
+/// Whether `reply` says more than its turn's end does: its first sentence,
+/// as long as that says it ([`crew::ANSWER_CHARS`]).
+fn says_more(reply: &str) -> bool {
+    crew::one_line(reply, crew::ANSWER_CHARS) != reply.trim()
+}
+
 /// The session whose turn `event` says ended, when it does.
 pub(super) fn finished_session(event: &Event) -> Option<uuid::Uuid> {
     let subject = event.subject.as_ref()?;
@@ -1675,6 +1697,26 @@ pub(super) fn wake_loop(
                 }));
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod says_more_tests {
+    use super::*;
+
+    #[test]
+    fn a_reply_says_more_than_its_turns_end_past_its_first_sentence_or_its_length() {
+        assert!(!says_more(" All green. "));
+        assert!(says_more("All green. The flaky test passed twice."));
+        let long = format!(
+            "Checked {} and all of them pass.",
+            "every module ".repeat(12)
+        );
+        assert!(long.chars().count() > crew::ANSWER_CHARS);
+        assert!(
+            says_more(&long),
+            "one sentence, cut where the turn's end says it"
+        );
     }
 }
 

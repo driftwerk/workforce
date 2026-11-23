@@ -525,18 +525,15 @@ fn watch_notice(w: &Watch, read: Option<&Value>) -> String {
 }
 
 impl CrewHub {
-    /// What the boss is told of `view`'s turn ending.
+    /// What the boss is told of `view`'s turn ending: its reply's first
+    /// page, and how to read on.
     pub(super) async fn turn_end_notice(&self, view: &SessionView) -> String {
-        let said = view
-            .last_reply
-            .as_deref()
+        use workforce_desk::crew::{ReadOn, REPLY_PAGE};
+        let said = self
+            .desk
+            .reply_for_boss(view, 0, REPLY_PAGE, ReadOn::Tools)
             .filter(|r| !r.trim().is_empty())
-            .map(|r| {
-                reported(
-                    &workforce_desk::crew::clip(r, 3000),
-                    &format!("{}'s last reply", view.label()),
-                )
-            })
+            .map(|r| reported(&r, &format!("{}'s last reply", view.label())))
             .unwrap_or_else(|| "(it said nothing)".into());
         let line = format!(
             "{} (session_id {}) finished its turn, for: {}. It said: {said}",

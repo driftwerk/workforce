@@ -10,7 +10,8 @@ use serde_json::Value;
 use crate::asking::Denied;
 
 const TAIL_BYTES: u64 = 512 * 1024;
-const REPLY_MAX: usize = 600;
+/// The most of a reply a session card keeps.
+pub const REPLY_MAX: usize = 600;
 
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Tail {
@@ -387,6 +388,11 @@ pub fn engine_acted(path: &Path, codex: bool) -> std::io::Result<bool> {
                         && matches!(p["role"].as_str(), Some("user" | "developer" | "system")))
             }
         }))
+}
+
+/// Whether `s`, as [`clip`] gave it, was cut.
+pub fn clipped(s: &str) -> bool {
+    s.ends_with('…') && s.chars().count() == REPLY_MAX + 1
 }
 
 pub fn clip(s: &str) -> String {
