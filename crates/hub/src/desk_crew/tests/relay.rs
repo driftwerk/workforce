@@ -1670,6 +1670,15 @@ async fn a_machine_sessions_inside_is_read_there_judged_here_and_an_older_desk_i
 
         let since = chrono::Utc::now() - chrono::Duration::hours(3);
         let seen: Arc<parking_lot::Mutex<Vec<RelayCall>>> = Arc::default();
+        // What was asked of `machine` for crew.inside: the relay carries
+        // other calls on their own times too (its work taken, each minute).
+        let asked_inside = |machine: &str| -> Vec<RelayCall> {
+            seen.lock()
+                .iter()
+                .filter(|c| c.machine == machine && c.tool == super::super::inside::NAME)
+                .cloned()
+                .collect()
+        };
         let _poller = {
             let (crew, seen) = (Arc::clone(&crew), Arc::clone(&seen));
             tokio::spawn(async move {
@@ -1708,7 +1717,10 @@ async fn a_machine_sessions_inside_is_read_there_judged_here_and_an_older_desk_i
         let said = r.output["glance"].as_str().unwrap();
         assert!(said.starts_with("<<<EXTERNAL_UNTRUSTED_CONTENT_"), "{said}");
         assert!(said.contains("Stall: has waited 3 h for a build slot"), "{said}");
-        assert_eq!(seen.lock().last().unwrap().input["session_id"], json!(remote.to_string()));
+        assert_eq!(
+            asked_inside("devbox").last().unwrap().input["session_id"],
+            json!(remote.to_string())
+        );
 
         // A page is fenced field by field, and what is fenced is still JSON.
         let r = inside(json!({"session_id": session, "facet": "transcript"})).await;
@@ -1727,10 +1739,11 @@ async fn a_machine_sessions_inside_is_read_there_judged_here_and_an_older_desk_i
         let r = inside(json!({"session_id": format!("oldbox/{old}")})).await;
         let older = r.error.unwrap();
         assert!(older.starts_with("oldbox runs an older Desk"), "{older}");
-        let asked = seen.lock().len();
+        let asked = asked_inside("oldbox").len();
+        assert!(asked >= 1, "its refusal came from asking it");
         let r = inside(json!({"session_id": format!("oldbox/{old}")})).await;
         assert_eq!(r.error.as_deref(), Some(older.as_str()));
-        assert_eq!(seen.lock().len(), asked, "not asked again");
+        assert_eq!(asked_inside("oldbox").len(), asked, "not asked again");
     })
     .await;
 }
