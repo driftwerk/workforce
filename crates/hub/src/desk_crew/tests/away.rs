@@ -67,13 +67,26 @@ const SECOND_MINUTES: Timing = Timing {
 
 /// Pings typing in the boss's DM every 20 ms for `for_ms`.
 fn type_for(crew: &Arc<CrewHub>, for_ms: u64) -> tokio::task::JoinHandle<()> {
-    let until = std::time::Instant::now() + Duration::from_millis(for_ms);
+    let stop = CancellationToken::new();
+    let typing = type_until(crew, stop.clone());
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(for_ms)).await;
+        stop.cancel();
+        typing.await.unwrap();
+    })
+}
+
+/// Pings typing in the boss's DM every 20 ms until `stop`.
+fn type_until(crew: &Arc<CrewHub>, stop: CancellationToken) -> tokio::task::JoinHandle<()> {
     assert!(crew.typing_in("desk"));
     let crew = Arc::clone(crew);
     tokio::spawn(async move {
-        while std::time::Instant::now() < until {
+        while !stop.is_cancelled() {
             assert!(crew.typing_in("desk"));
-            tokio::time::sleep(Duration::from_millis(20)).await;
+            tokio::select! {
+                () = stop.cancelled() => {}
+                () = tokio::time::sleep(Duration::from_millis(20)) => {}
+            }
         }
     })
 }
@@ -222,8 +235,10 @@ async fn a_needs_you_waits_only_for_typing_and_the_cap() {
 async fn a_held_needs_you_goes_only_while_open_and_survives_a_restart() {
     with_test_pool(workforce_desk::store::build_pool, |pool| async move {
         let dir = tempfile::tempdir().unwrap();
-        let (overseer, crew, d, _llm) = overseeing(dir.path(), pool, "ok", ACT, &[]).await;
-        let typing = type_for(&crew, 150);
+        let (overseer, crew, d, _llm) =
+            overseeing_at(dir.path(), pool, "ok", ACT, &[], SECOND_MINUTES).await;
+        let stop = CancellationToken::new();
+        let typing = type_until(&crew, stop.clone());
         let r = ask(&crew, "Which key should staging use?").await;
         assert!(r.success, "{:?}", r.error);
         let store = d.store();
@@ -237,14 +252,18 @@ async fn a_held_needs_you_goes_only_while_open_and_survives_a_restart() {
             .item_close(item.id, ClosedBy::Person, "Staging.")
             .await
             .unwrap();
+        stop.cancel();
         typing.await.unwrap();
-        tokio::time::sleep(Duration::from_millis(400)).await;
+        eventually("its hold over", async || {
+            store
+                .cards_due(chrono::Utc::now() + chrono::Duration::hours(1))
+                .await
+                .unwrap()
+                .is_empty()
+                .then_some(())
+        })
+        .await;
         assert!(needs_you(&overseer).is_empty(), "settled: no card");
-        assert!(store
-            .cards_due(chrono::Utc::now())
-            .await
-            .unwrap()
-            .is_empty());
 
         // A card held when the hub went down, its item still open.
         let r = ask(&crew, "Which region for the demo?").await;
@@ -267,7 +286,13 @@ async fn a_held_needs_you_goes_only_while_open_and_survives_a_restart() {
             post_by: chrono::Utc::now() - chrono::Duration::seconds(1),
         };
         store.card_hold(&held).await.unwrap();
+        // The crew's own look posts due cards too: whichever posts it, it
+        // goes once.
         crew.post_due_cards().await;
+        eventually("posted after the restart", async || {
+            (needs_you(&overseer).len() == 2).then_some(())
+        })
+        .await;
         crew.post_due_cards().await;
         assert_eq!(
             needs_you(&overseer).len(),
@@ -275,20 +300,22 @@ async fn a_held_needs_you_goes_only_while_open_and_survives_a_restart() {
             "posted once after the restart"
         );
 
-        // Taken by a post still under way: left to it.
+        // Taken by a post still under way: left to it. Not yet due, so no
+        // look of the crew's takes it first.
         let mut taken = held.clone();
         taken.id = uuid::Uuid::new_v4();
+        taken.post_by = chrono::Utc::now() + chrono::Duration::hours(1);
         store.card_hold(&taken).await.unwrap();
         assert!(store.card_take(taken.id).await.unwrap());
-        crew.post_due_cards().await;
+        assert!(!crew.post_held(taken.clone(), true).await);
         assert_eq!(needs_you(&overseer).len(), 2, "left to the post under way");
         // A post that went out before the hub died, its row not yet
         // forgotten: found in the DM by its request, forgotten, not posted
         // again.
         let mut went = held.clone();
         went.id = uuid::Uuid::new_v4();
-        store.card_hold(&went).await.unwrap();
         assert!(crew.post_held(went.clone(), false).await);
+        store.card_hold(&went).await.unwrap();
         assert_eq!(needs_you(&overseer).len(), 3);
         crew.post_due_cards().await;
         assert_eq!(needs_you(&overseer).len(), 3, "not posted twice");

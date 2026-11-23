@@ -2658,12 +2658,12 @@ async fn engine_slot_survives_lost_cas() {
     };
     turn.set_engine_slot(SLOT, &slot);
 
-    crate::serve::persist_turn_owned_metadata(&hub.service.sessions, &turn);
+    crate::serve::save_turn(&hub.service.sessions, &mut turn, ..0).unwrap();
 
     assert_eq!(
         hub.session(ALICE).engine_slot(SLOT),
         Some(slot),
-        "the slot is written even when the turn's own save was lost"
+        "the slot is written even when the turn's save lost CAS"
     );
 }
 

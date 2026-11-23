@@ -18,14 +18,16 @@ fn at(rfc3339: &str) -> DateTime<Utc> {
         .with_timezone(&Utc)
 }
 
-/// Mimic one hub turn: append user+assistant messages, save, and archive
-/// exactly the slice the turn added (serve.rs slices from the pre-turn
-/// length, which is what keeps carry-overs live-only and out of archives).
+/// Mimic one hub turn: append user+assistant messages, save refreshing the
+/// session's revision as a turn does (so its next save replaces rather than
+/// merges), and archive exactly the slice the turn added (serve.rs slices
+/// from the pre-turn length, which is what keeps carry-overs live-only and
+/// out of archives).
 fn run_turn(store: &JsonlSessionStore, session: &mut Session, user: &str, assistant: &str) {
     let archive_base = session.messages.len();
     session.add_user_message(user, None);
     session.add_assistant_message(assistant, 5);
-    store.save(session).expect("save turn");
+    store.save_refreshing(session).expect("save turn");
     for msg in &session.messages[archive_base..] {
         store
             .append_to_archive(&session.id, msg)
@@ -56,7 +58,7 @@ fn dormant_conversation_resumes_dated_and_scrollback_stays_clean() {
     );
     run_turn(&store, &mut may, "thanks, also check the CI", "CI is green");
     backdate(&mut may, at("2026-05-25T18:00:00Z"));
-    store.save(&may).unwrap();
+    store.save_refreshing(&mut may).unwrap();
     let may_id = may.id.clone();
 
     // July: resume after 47 dormant days — exactly the prod incident shape.
