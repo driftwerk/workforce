@@ -398,6 +398,11 @@ pub trait StreamGrammar: Default + Send + 'static {
     fn thread(&self) -> Option<String> {
         None
     }
+
+    /// The CLI compacted its transcript during the stream.
+    fn compacted(&self) -> bool {
+        false
+    }
 }
 
 /// A CLI run the transport carries: the command, its stdin, its wall clock,
@@ -464,7 +469,8 @@ pub struct ClaudeCodeResult {
     pub cache_creation_tokens: u64,
     pub cache_read_tokens: u64,
     /// What the round's last model call read, cached or not: how big its
-    /// transcript had grown. 0 when the CLI reported no call.
+    /// transcript had grown. 0 when the CLI reported no call. Codex reports
+    /// neither this nor `compacted`.
     pub context_tokens: u64,
     /// The CLI compacted its transcript during the round.
     pub compacted: bool,
@@ -575,6 +581,7 @@ pub struct Interrupted {
     program: String,
     pub spent: TokenUsage,
     pub thread: Option<String>,
+    pub compacted: bool,
 }
 
 impl Interrupted {
@@ -583,6 +590,7 @@ impl Interrupted {
             program,
             spent: capture.spent(),
             thread: capture.thread(),
+            compacted: capture.compacted(),
         }
     }
 }
@@ -800,6 +808,10 @@ impl StreamGrammar for StreamCapture {
             .iter()
             .map(|(_, usage)| usage.clone())
             .fold(TokenUsage::default(), std::ops::Add::add)
+    }
+
+    fn compacted(&self) -> bool {
+        self.compacted
     }
 }
 

@@ -680,8 +680,9 @@ impl AgentTurnRig {
             let (end, seen) = Box::pin(round.run(&input, inbox.as_mut(), &mut pending)).await?;
             produced |= seen.produced();
             let result = match end {
-                RoundEnd::Stopped(spent) => {
+                RoundEnd::Stopped { spent, compacted } => {
                     tally.spend(spent);
+                    tally.compacted |= compacted;
                     produced = true;
                     transcript.resume |= transcript.keeps();
                     input = RoundInput::of(

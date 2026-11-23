@@ -55,8 +55,12 @@ impl Seen {
 pub(super) enum RoundEnd {
     Finished(Box<ClaudeCodeResult>),
     /// The person asked the turn to stop and the round was cut short, having
-    /// spent this much.
-    Stopped(TokenUsage),
+    /// spent `spent`, the CLI having compacted its transcript on the way when
+    /// `compacted`.
+    Stopped {
+        spent: TokenUsage,
+        compacted: bool,
+    },
 }
 
 /// A round's input: its content blocks, and the round's turn cap.
@@ -156,14 +160,16 @@ impl Round<'_> {
         match outcome {
             Ok(result) => Ok((RoundEnd::Finished(Box::new(result)), seen)),
             Err(e) if self.turn.cancel.is_cancelled() => Err(e),
-            Err(e) if stopped => Ok((
-                RoundEnd::Stopped(
-                    e.downcast_ref::<Interrupted>()
-                        .map(|interrupted| interrupted.spent.clone())
-                        .unwrap_or_default(),
-                ),
-                seen,
-            )),
+            Err(e) if stopped => {
+                let cut = e.downcast_ref::<Interrupted>();
+                Ok((
+                    RoundEnd::Stopped {
+                        spent: cut.map(|c| c.spent.clone()).unwrap_or_default(),
+                        compacted: cut.is_some_and(|c| c.compacted),
+                    },
+                    seen,
+                ))
+            }
             Err(e) => Ok((
                 RoundEnd::Finished(Box::new(ClaudeCodeResult {
                     text: format!("{e:#}"),

@@ -5173,3 +5173,61 @@ async fn a_crew_conversation_the_cli_compacted_mid_turn_is_given_everything_agai
         "the transcript only has its own summary of it now"
     );
 }
+
+#[tokio::test]
+async fn a_crew_round_the_person_stopped_after_the_cli_compacted_is_given_everything_again() {
+    let hub = hub(claude_first).await;
+    hub.claude_login(ALICE);
+    hub.claude.reply(Some(1), &read(60_000));
+    hub.claude.script(
+        Some(2),
+        &format!(
+            "{}sleep 60\n",
+            print(&[
+                json!({
+                    "type": "system",
+                    "subtype": "compact_boundary",
+                    "compact_metadata": { "trigger": "auto", "pre_tokens": 110_000 },
+                }),
+                assistant("msg-2", "Working on it."),
+            ])
+        ),
+    );
+    hub.claude.reply(Some(3), &read(65_000));
+    hub.claude.reply(Some(4), &read(70_000));
+    hub.wake(CREW, "one").await;
+    let (tx, rx) = mpsc::channel(8);
+    let running = hub.claude.started(2);
+    let stop = tokio::spawn(async move {
+        running.await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        tx.send(InjectedMessage::SteerStop {
+            text: "stop".into(),
+            user: ALICE.into(),
+        })
+        .await
+        .unwrap();
+        tx
+    });
+
+    let (_, stopped) = hub
+        .stream_at(
+            (CREW, None, None),
+            ALICE,
+            &format!("{}\n\ntwo", standing()),
+            Some(rx),
+            None,
+        )
+        .await;
+    drop(stop.await);
+    stopped.unwrap();
+    hub.wake(CREW, "three").await;
+
+    let calls = hub.claude.calls();
+    assert_eq!(calls.len(), 4);
+    assert!(calls[3].has("--resume"));
+    assert!(
+        calls[3].text().contains(&standing()),
+        "the stopped round's compaction left the transcript only its own summary"
+    );
+}
