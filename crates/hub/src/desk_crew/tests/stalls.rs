@@ -644,8 +644,10 @@ async fn a_message_that_never_reaches_a_session_wakes_its_boss_once() {
     with_test_pool(workforce_desk::store::build_pool, |pool| async move {
         let dir = tempfile::tempdir().unwrap();
         // Gone quiet after the person's prompt stops holding it theirs (10
-        // min) and its stall is said: then never said.
-        let (_overseer, crew, d, llm) = overseeing(
+        // min) and its stall is said: then never said. A minute is 300 ms,
+        // so a stall is 1.5 s, past any pause a loaded runner puts between
+        // the busy session's calls.
+        let (_overseer, crew, d, llm) = overseeing_at(
             dir.path(),
             pool,
             "I'll read its history.",
@@ -653,6 +655,10 @@ async fn a_message_that_never_reaches_a_session_wakes_its_boss_once() {
              updates = { enabled = false }\nwork = { stall_minutes = 5 }\n\
              wake = { quiet_minutes = 15 }\n",
             &[],
+            Timing {
+                minute: std::time::Duration::from_millis(300),
+                ..FAST
+            },
         )
         .await;
         let working = |name: &'static str, prompt: &'static str| {
@@ -686,14 +692,16 @@ async fn a_message_that_never_reaches_a_session_wakes_its_boss_once() {
         // At work from before it is told anything, so it is never quiet past
         // its message.
         let progress = tokio::spawn(async move {
+            let mut every = tokio::time::interval(std::time::Duration::from_millis(100));
+            every.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
+                every.tick().await;
                 hook(
                     &busy_url,
                     json!({"hook_event_name": "PreToolUse", "tool_name": "Bash",
                     "tool_input": {"command": "systemctl stop legacy-worker"}}),
                 )
                 .await;
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
             }
         });
         let tell = async |s: uuid::Uuid, message: &str| {
@@ -745,7 +753,7 @@ async fn a_message_that_never_reaches_a_session_wakes_its_boss_once() {
             steered_said.contains("with its next tool call, and hasn't made one"),
             "{steered_said}"
         );
-        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        tokio::time::sleep(std::time::Duration::from_secs(6)).await;
         progress.abort();
         assert!(
             told_of(&llm, busy.id).await.is_empty(),

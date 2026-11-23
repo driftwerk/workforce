@@ -1810,14 +1810,18 @@ async fn a_stopped_turn_keeps_what_was_sent_into_it() {
         .await
         .unwrap();
     // Sent while the run waits on the model.
-    while server
-        .received_requests()
-        .await
-        .unwrap_or_default()
-        .is_empty()
-    {
-        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-    }
+    tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        while server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .is_empty()
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("the run never asked the model");
     assert!(service
         .live_turns
         .apply(
