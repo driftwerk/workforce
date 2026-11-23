@@ -128,6 +128,9 @@ pub use scopes::Boss;
 mod finish;
 #[cfg(test)]
 mod scopes_tests;
+mod sight;
+#[cfg(test)]
+mod sight_tests;
 mod terminals;
 mod transition;
 mod unread;
@@ -141,6 +144,9 @@ pub use grants::{GrantView, GrantWritten, GrantsView, Native, Paused};
 pub(crate) use groups::put_layout_in;
 pub use groups::{
     local_agent_item, session_item, Group, Import, Imported, Layout, Ungrouped, UNGROUPED,
+};
+pub use sight::{
+    ProcessRow, ProcessTree, Processes, RecordInfo, Sample, SightOptions, Transcript, TranscriptAsk,
 };
 
 pub use breaker::{
@@ -197,6 +203,8 @@ pub struct Options {
     /// Whether this is a machine's hub, and how long grants last
     /// (`[desk.bosses]`).
     pub bosses: crate::grant::BossOptions,
+    /// How Desk samples what runs in its sessions.
+    pub sight: SightOptions,
 }
 
 #[cfg(test)]
@@ -709,6 +717,8 @@ impl Drop for CodexLink {
 
 #[derive(Default)]
 struct State {
+    /// What Desk last saw inside each working session ([`sight`]).
+    sight: HashMap<Uuid, sight::Sample>,
     /// The permission mode each Claude Code session last said it runs in
     /// ([`crate::mode`]).
     modes_seen: HashMap<Uuid, crate::mode::Mode>,
@@ -1224,6 +1234,8 @@ struct Inner {
     /// Held while a grant is written: one at a time, from reading the copy
     /// to keeping it.
     grant_write: tokio::sync::Mutex<()>,
+    /// What runs in the working sessions, sampled ([`sight`]).
+    sight: sight::SightRun,
 }
 
 #[derive(Clone)]
@@ -2014,6 +2026,7 @@ impl Desk {
             projects_root: Mutex::new(None),
             grants: Mutex::default(),
             grant_write: tokio::sync::Mutex::new(()),
+            sight: Default::default(),
         }));
         desk.scopes_follow(&desk.layout());
         desk.scopes_load().await;
@@ -2486,6 +2499,7 @@ impl Desk {
         view.mode = live.and(state.modes_started.get(&r.id).copied());
         view.waits_on_you = Self::waits_on_you(state, &view);
         view.boss_has = Self::boss_has(state, &view);
+        view.waits = Self::waits_in(state, r.id);
         view
     }
 
@@ -3049,14 +3063,14 @@ impl Desk {
     /// How many of a session's background processes `table` lists running:
     /// Claude Code's tool shells; for Codex, what its app-server started in
     /// the turn and left running, each once whatever it runs under it.
-    fn running(table: &[procs::Proc], look: &Look) -> usize {
+    fn running<P: AsRef<procs::Proc>>(table: &[P], look: &Look) -> usize {
         match (look.engine, &look.baseline) {
             (Engine::Claude, _) => procs::under(table, look.root)
                 .into_iter()
-                .filter(|p| procs::is_tool_shell(p))
+                .filter(|p| procs::is_tool_shell(p.as_ref()))
                 .count(),
             (Engine::Codex, Some(before)) => procs::children(table, look.root)
-                .filter(|p| !before.contains(&p.pid))
+                .filter(|p| !before.contains(&p.as_ref().pid))
                 .count(),
             (Engine::Codex, None) => 0,
             (
@@ -3081,31 +3095,45 @@ impl Desk {
     /// Looks at what runs under each of `ids` whose turn is done and that
     /// has background work, or may have it unreported.
     async fn look_at_background(&self, ids: &[Uuid]) {
-        let due: Vec<(Uuid, Look)> = {
-            let st = self.0.state.lock();
-            ids.iter()
-                .filter(|id| {
-                    st.records.get(id).is_some_and(|r| {
-                        matches!(r.state, SessionState::Done | SessionState::Asking)
-                    }) && st.live.get(id).is_some_and(|l| l.background.worth_a_look())
-                })
-                .filter_map(|id| Some((*id, Self::look_of(&st, *id)?)))
-                .collect()
-        };
+        let due = self.background_due(ids);
         if due.is_empty() {
             return;
         }
-        let Some(table) = procs::table().await else {
-            return;
-        };
+        if let Some(table) = procs::table().await {
+            self.background_looked(due, &table);
+        }
+    }
+
+    /// Those of `ids` whose turn is done and that have background work, or
+    /// may have it unreported, and where it runs.
+    fn background_due(&self, ids: &[Uuid]) -> Vec<(Uuid, Look)> {
+        let st = self.0.state.lock();
+        ids.iter()
+            .filter(|id| {
+                st.records
+                    .get(id)
+                    .is_some_and(|r| matches!(r.state, SessionState::Done | SessionState::Asking))
+                    && st.live.get(id).is_some_and(|l| l.background.worth_a_look())
+            })
+            .filter_map(|id| Some((*id, Self::look_of(&st, *id)?)))
+            .collect()
+    }
+
+    /// Records what of `due`'s background work `table` lists running.
+    fn background_looked<P: AsRef<procs::Proc>>(&self, due: Vec<(Uuid, Look)>, table: &[P]) {
+        let unseen = self.shell_unseen();
         for (id, look) in due {
-            let running = Self::running(&table, &look);
+            let running = Self::running(table, &look);
             let now = Utc::now();
             let looked = {
                 let st = self.0.state.lock();
+                let found = st.sight.get(&id).map(|s| &s.found);
                 st.live
                     .get(&id)
-                    .map(|l| (l.background.clone().looked(running, now), &l.background))
+                    .map(|l| {
+                        let after = l.background.clone().looked(running, found, now, unseen);
+                        (after, &l.background)
+                    })
                     .filter(|(after, before)| after != *before)
                     .map(|(after, _)| after)
             };
@@ -3119,14 +3147,21 @@ impl Desk {
         }
     }
 
-    /// Looks at every session's background work every [`LOOK_EVERY`],
-    /// until the desk stops.
+    /// Looks at every session's background work every [`LOOK_EVERY`], and
+    /// samples the working ones every [`SightOptions::every`] in the same
+    /// listing, until the desk stops.
     async fn watch_background(self) {
         let mut tick = tokio::time::interval(LOOK_EVERY);
+        let mut sampled: Option<std::time::Instant> = None;
         loop {
             tokio::select! {
                 _ = self.0.cancel.cancelled() => return,
                 _ = tick.tick() => {}
+            }
+            if sampled.is_none_or(|at| at.elapsed() >= self.0.opts.sight.every) {
+                sampled = Some(std::time::Instant::now());
+                self.sight_pass().await;
+                continue;
             }
             let ids: Vec<Uuid> = self.0.state.lock().live.keys().copied().collect();
             self.look_at_background(&ids).await;
@@ -5170,10 +5205,11 @@ impl Desk {
         }
     }
 
-    /// The end of what the terminal shows, as plain text.
+    /// The end of what the terminal shows, as plain text: its whole lines in
+    /// the last `max_chars`.
     pub fn terminal_text(&self, id: Uuid, max_chars: usize) -> Result<String, DeskError> {
         let text = crate::pty::plain_text(self.attach(id)?.text().as_bytes());
-        Ok(crew::tail_chars(&text, max_chars).to_string())
+        Ok(crew::tail_lines(&text, max_chars).to_string())
     }
 
     pub fn rooms(&self) -> Vec<Room> {
@@ -7026,6 +7062,8 @@ impl Desk {
                 .is_none_or(|s| !crate::limit::says_plan_limit(s));
         let reader = unsure.then(|| self.reader()).flatten();
         let running = self.running_now(id).await;
+        let found = self.0.state.lock().sight.get(&id).map(|s| s.found.clone());
+        let unseen = self.shell_unseen();
         // A refusal whose words aren't the plan's, on an account whose
         // readings show a window full: the plan's limit after all.
         let failure = failure.map(|f| self.cross_checked(id, f));
@@ -7104,7 +7142,7 @@ impl Desk {
                     (true, None) => std::mem::take(&mut l.background),
                     (_, background) => std::mem::take(&mut l.background).reported(background, now),
                 }
-                .looked_if(running, now);
+                .looked_if(running, found.as_ref(), now, unseen);
             }
         });
         if let (Some(reader), Some(end), Some(reply)) = (reader, read, said_whole) {
@@ -7975,6 +8013,7 @@ impl Desk {
                 CodexEvent::Idle => self.running_now(id).await,
                 _ => None,
             };
+            let unseen = self.shell_unseen();
             let tail = match &event {
                 CodexEvent::Idle => {
                     let rollout = self
@@ -8094,8 +8133,12 @@ impl Desk {
                             l.pending = None;
                             l.codex_asks.clear();
                             l.codex_question = None;
-                            l.background =
-                                std::mem::take(&mut l.background).looked_if(running, Utc::now());
+                            l.background = std::mem::take(&mut l.background).looked_if(
+                                running,
+                                None,
+                                Utc::now(),
+                                unseen,
+                            );
                         }
                     }
                     CodexEvent::Prompt(p) => {
@@ -8755,6 +8798,7 @@ mod tests {
             line_reach: crate::line::Reach::Group,
             memory: Default::default(),
             bosses: Default::default(),
+            sight: Default::default(),
         }
     }
 
@@ -10322,7 +10366,13 @@ mod tests {
             let logged = Arc::new(Logged::default());
             let d = Desk::start(
                 DeskStore::from_pool(pool),
-                options(dir.path()).with_program(Engine::Claude, shell_cli(dir.path())),
+                Options {
+                    sight: SightOptions {
+                        shell_unseen: Duration::ZERO,
+                        ..SightOptions::default()
+                    },
+                    ..options(dir.path()).with_program(Engine::Claude, shell_cli(dir.path()))
+                },
                 Floor {
                     turns: Some(logged.clone()),
                     plans: None,
@@ -11587,6 +11637,7 @@ mod tests {
                     line_reach: crate::line::Reach::Group,
                     memory: Default::default(),
                     bosses: Default::default(),
+                    sight: Default::default(),
                     ..options(dir.path())
                 },
                 Default::default(),
@@ -11631,6 +11682,7 @@ mod tests {
                     line_reach: crate::line::Reach::Group,
                     memory: Default::default(),
                     bosses: Default::default(),
+                    sight: Default::default(),
                     ..options(dir.path())
                 },
                 Default::default(),
@@ -11710,6 +11762,7 @@ mod tests {
                     line_reach: crate::line::Reach::Group,
                     memory: Default::default(),
                     bosses: Default::default(),
+                    sight: Default::default(),
                     ..options(dir.path())
                 },
                 Floor {
@@ -11775,6 +11828,7 @@ mod tests {
                     line_reach: crate::line::Reach::Group,
                     memory: Default::default(),
                     bosses: Default::default(),
+                    sight: Default::default(),
                     ..options(dir.path())
                 },
                 Floor {

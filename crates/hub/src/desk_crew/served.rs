@@ -48,7 +48,12 @@ use super::watcher::reported;
 use super::CrewHub;
 
 /// The reading tools served.
-pub const SERVED_READ: [&str; 3] = ["crew.overview", "crew.activity", "crew.history"];
+pub const SERVED_READ: [&str; 4] = [
+    "crew.overview",
+    "crew.activity",
+    "crew.history",
+    super::inside::NAME,
+];
 /// The acting tools served.
 pub const SERVED_ACT: [&str; 10] = [
     "crew.nudge",
@@ -939,7 +944,7 @@ impl CrewHub {
         (g.members.contains(&id) || g.born.contains(&id)) && self.desk.view(id).is_ok()
     }
 
-    fn not_in_grant(&self, g: &Grant) -> String {
+    pub(super) fn not_in_grant(&self, g: &Grant) -> String {
         workforce_desk::scope::not_ours(Some(&g.name))
     }
 
@@ -1085,6 +1090,7 @@ impl CrewHub {
                 }
                 Ok(json!({ "session": reported(&said.to_string(), "the session") }))
             }
+            super::inside::NAME => self.served_inside(input, g).await,
             _ => Err("not a reading tool".into()),
         }
     }

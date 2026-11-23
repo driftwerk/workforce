@@ -24,16 +24,20 @@ use crate::gateway::GatewayState;
 use crate::serve::AgentService;
 use crate::serve::Compose as _;
 
-const FAST: Timing = Timing {
+pub(super) const FAST: Timing = Timing {
     tick: Duration::from_millis(50),
     coalesce: Duration::from_millis(150),
     minute: Duration::from_millis(100),
 };
 
-const PERSON: &str = "person-1";
+pub(super) const PERSON: &str = "person-1";
 
 /// An agent `id` whose model answers everything with `reply`.
-async fn agent(dir: &Path, id: &str, reply: &str) -> (Arc<AgentService>, wiremock::MockServer) {
+pub(super) async fn agent(
+    dir: &Path,
+    id: &str,
+    reply: &str,
+) -> (Arc<AgentService>, wiremock::MockServer) {
     agent_calling(dir, id, reply, &[]).await
 }
 
@@ -200,7 +204,7 @@ fn all_at_once(toml: &str) -> String {
 }
 
 /// A gateway serving `agents`, each knowing the registry.
-fn hub(agents: &[Arc<AgentService>]) -> Arc<GatewayState> {
+pub(super) fn hub(agents: &[Arc<AgentService>]) -> Arc<GatewayState> {
     let fixture = crate::remote_mcp::testing::fixture(false);
     let map: HashMap<String, Arc<AgentService>> = agents
         .iter()
@@ -261,7 +265,48 @@ async fn desk_running(
     claude: PathBuf,
     codex: PathBuf,
 ) -> Desk {
-    desk_as(pool, dir, floor, claude, codex, Default::default()).await
+    desk_as(
+        pool,
+        dir,
+        floor,
+        claude,
+        codex,
+        Default::default(),
+        Default::default(),
+    )
+    .await
+}
+
+/// A desk whose Claude Code is `claude`, looked inside of only when a test
+/// asks (`sight_pass`): what its sessions print read under a redactor, its
+/// tasks' output under `dir`'s `tasks`, and any two looks far enough apart
+/// to tell a still tree.
+pub(crate) async fn sighted_desk(
+    pool: workforce_postgres::PostgresPool,
+    dir: &Path,
+    claude: PathBuf,
+) -> Desk {
+    let floor = workforce_desk::Floor {
+        redactor: Some(Arc::new(inside::Hides)),
+        ..Default::default()
+    };
+    let sight = workforce_desk::SightOptions {
+        task_root: dir.join("tasks"),
+        every: Duration::from_secs(3600),
+        settled: Duration::ZERO,
+        shown_after: Duration::ZERO,
+        ..Default::default()
+    };
+    desk_as(
+        pool,
+        dir,
+        floor,
+        claude,
+        not_installed(dir),
+        Default::default(),
+        sight,
+    )
+    .await
 }
 
 /// A desk on one of the person's machines: its groups are its grants.
@@ -271,7 +316,16 @@ pub(crate) async fn machine_desk(pool: workforce_postgres::PostgresPool, dir: &P
         machine: true,
         ..Default::default()
     };
-    desk_as(pool, dir, Default::default(), cli.clone(), cli, bosses).await
+    desk_as(
+        pool,
+        dir,
+        Default::default(),
+        cli.clone(),
+        cli,
+        bosses,
+        Default::default(),
+    )
+    .await
 }
 
 async fn desk_as(
@@ -281,6 +335,7 @@ async fn desk_as(
     claude: PathBuf,
     codex: PathBuf,
     bosses: workforce_desk::grant::BossOptions,
+    sight: workforce_desk::SightOptions,
 ) -> Desk {
     Desk::start(
         DeskStore::with_pool(pool).await.unwrap(),
@@ -301,6 +356,7 @@ async fn desk_as(
             line_reach: workforce_desk::line::Reach::Group,
             memory: Default::default(),
             bosses,
+            sight,
         },
         floor,
         CancellationToken::new(),
@@ -889,12 +945,24 @@ async fn overseeing_at(
     crew_agents: &[Arc<AgentService>],
     timing: Timing,
 ) -> (Arc<AgentService>, Arc<CrewHub>, Desk, wiremock::MockServer) {
+    let d = desk(pool, dir).await;
+    overseeing_on(dir, d, reply, oversight, crew_agents, timing).await
+}
+
+/// [`overseeing_at`] over the desk `d`.
+async fn overseeing_on(
+    dir: &Path,
+    d: Desk,
+    reply: &str,
+    oversight: &str,
+    crew_agents: &[Arc<AgentService>],
+    timing: Timing,
+) -> (Arc<AgentService>, Arc<CrewHub>, Desk, wiremock::MockServer) {
     let (overseer, llm) = agent(dir, "desk", reply).await;
     write_config(&overseer, oversight);
     let mut all = vec![Arc::clone(&overseer)];
     all.extend(crew_agents.iter().cloned());
     let state = hub(&all);
-    let d = desk(pool, dir).await;
     let crew = CrewHub::start(state, d.clone(), timing, CancellationToken::new());
     let dm = overseer
         .sessions
@@ -1805,13 +1873,13 @@ async fn what_the_crew_tools_read_is_fenced_as_data() {
                 read("crew.account", json!({"session_id": s.id.to_string()})).await,
             ),
         ] {
-            let opens = out.find("<<<EXTERNAL_UNTRUSTED_CONTENT_");
             let said = out.find(SAID);
-            let closes = out.find("<<</EXTERNAL_UNTRUSTED_CONTENT_");
-            assert!(
-                matches!((opens, said, closes), (Some(o), Some(m), Some(c)) if o < m && m < c),
-                "{what}: {out}"
-            );
+            let opens = said.and_then(|m| out[..m].rfind("<<<EXTERNAL_UNTRUSTED_CONTENT_"));
+            let closes = said.and_then(|m| out[m..].find("<<</EXTERNAL_UNTRUSTED_CONTENT_"));
+            let between = opens
+                .zip(said)
+                .is_some_and(|(o, m)| !out[o..m].contains("<<</EXTERNAL_UNTRUSTED_CONTENT_"));
+            assert!(closes.is_some() && between, "{what}: {out}");
         }
     })
     .await;
@@ -1994,6 +2062,7 @@ mod assignments;
 mod terminal_asks;
 
 mod idle;
+mod inside;
 
 mod closing;
 

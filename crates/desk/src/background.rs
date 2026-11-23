@@ -145,6 +145,19 @@ fn clipped(label: &str) -> String {
 /// running, before it is taken to have died without saying so.
 pub const AGENT_QUIET: Duration = Duration::minutes(10);
 
+/// How many looks in a row must find fewer shells running than the CLI
+/// reported before those not found are taken to have ended: one look can
+/// come before a shell's process starts.
+pub const MISSED_LOOKS: u32 = 3;
+
+/// Looks in a row that found fewer shells running than the CLI reported:
+/// how many, and since when.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Missed {
+    looks: u32,
+    first: DateTime<Utc>,
+}
+
 /// What a session has running in the background.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Background {
@@ -155,6 +168,9 @@ pub struct Background {
     reported: bool,
     /// Shells seen running under the session at the last look.
     shells: Option<usize>,
+    /// The looks since the CLI's report that found fewer of its shells
+    /// running than it reported.
+    missed: Option<Missed>,
     /// Since when the session has had some.
     since: Option<DateTime<Utc>>,
     /// Run again after a restart: what its last process had running,
@@ -172,12 +188,19 @@ impl Background {
             .filter(|t| t.kind == TaskKind::Agent)
             .count();
         let reported = self.tasks.len() - agents;
-        let shells = match (self.reported, self.shells) {
-            (true, Some(seen)) => reported.min(seen),
-            (true, None) => reported,
-            (false, seen) => seen.unwrap_or(0),
+        let shells = match self.reported {
+            true => reported,
+            false => self.shells.unwrap_or(0),
         };
         agents + shells
+    }
+
+    /// The ids of the shells known running.
+    pub fn shells(&self) -> impl Iterator<Item = &str> {
+        self.tasks
+            .iter()
+            .filter(|(_, t)| t.kind == TaskKind::Shell)
+            .map(|(id, _)| id.as_str())
     }
 
     /// As the floor shows it, while there is any.
@@ -231,6 +254,7 @@ impl Background {
     /// a resumed CLI can report what it no longer runs.
     pub fn reported(mut self, tasks: Option<Vec<Reported>>, now: DateTime<Utc>) -> Self {
         self.shells = None;
+        self.missed = None;
         match tasks {
             Some(tasks) => {
                 let heard = std::mem::take(&mut self.tasks);
@@ -296,20 +320,55 @@ impl Background {
     }
 
     /// A look at the session's processes found `shells` running: a
-    /// sub-agent unheard past [`AGENT_QUIET`] with none running died.
-    pub fn looked(mut self, shells: usize, now: DateTime<Utc>) -> Self {
+    /// sub-agent unheard past [`AGENT_QUIET`] with none running died, and
+    /// the reported shells it didn't find ended once [`MISSED_LOOKS`] looks
+    /// in a row over at least `unseen` missed them, and are never counted
+    /// again. Those ended are the shells not `found` in a process of their
+    /// own, where Desk's sampler says, then those heard of first.
+    pub fn looked(
+        mut self,
+        shells: usize,
+        found: Option<&BTreeSet<String>>,
+        now: DateTime<Utc>,
+        unseen: Duration,
+    ) -> Self {
+        let unfound = self.shells().count().saturating_sub(shells);
+        let missed = (self.reported && unfound > 0).then(|| {
+            let (looks, first) = self.missed.map_or((1, now), |m| (m.looks + 1, m.first));
+            Missed { looks, first }
+        });
+        let gone = missed.is_some_and(|m| m.looks >= MISSED_LOOKS && now - m.first >= unseen);
+        self.missed = missed.filter(|_| !gone);
+        if gone {
+            let mut ended: Vec<(bool, DateTime<Utc>, String)> = self
+                .tasks
+                .iter()
+                .filter(|(_, t)| t.kind == TaskKind::Shell)
+                .map(|(id, t)| (found.is_some_and(|f| f.contains(id)), t.heard, id.clone()))
+                .collect();
+            ended.sort();
+            ended.into_iter().take(unfound).for_each(|(.., id)| {
+                self.tasks.remove(&id);
+            });
+        }
         self.shells = Some(shells);
         if shells == 0 {
             self.tasks
-                .retain(|_, t| t.kind != TaskKind::Agent || now - t.heard < AGENT_QUIET);
+                .retain(|_, t| t.kind == TaskKind::Shell || now - t.heard < AGENT_QUIET);
         }
         self.dated(now)
     }
 
     /// [`Self::looked`], when there was a look.
-    pub fn looked_if(self, shells: Option<usize>, now: DateTime<Utc>) -> Self {
+    pub fn looked_if(
+        self,
+        shells: Option<usize>,
+        found: Option<&BTreeSet<String>>,
+        now: DateTime<Utc>,
+        unseen: Duration,
+    ) -> Self {
         match shells {
-            Some(shells) => self.looked(shells, now),
+            Some(shells) => self.looked(shells, found, now, unseen),
             None => self,
         }
     }
@@ -330,6 +389,8 @@ mod tests {
             .to_utc()
             + Duration::minutes(minutes)
     }
+
+    const UNSEEN: Duration = Duration::minutes(2);
 
     fn tasks(list: &[(&str, TaskKind)]) -> Option<Vec<Reported>> {
         Some(list.iter().map(|(id, k)| Reported::new(id, *k)).collect())
@@ -421,29 +482,126 @@ mod tests {
     #[test]
     fn a_shell_counts_while_its_process_runs() {
         let b = Background::default().reported(tasks(&[("s1", TaskKind::Shell)]), at(0));
-        assert_eq!(b.clone().looked(1, at(1)).count(), 1);
-        assert_eq!(
-            b.clone().looked(0, at(1)).count(),
-            0,
-            "it ended without a word"
-        );
+        assert_eq!(b.clone().looked(1, None, at(1), UNSEEN).count(), 1);
         let unreported = Background::default().reported(None, at(0));
         assert!(
             unreported.worth_a_look(),
             "a CLI that reports nothing is looked at"
         );
         assert_eq!(
-            unreported.looked(2, at(1)).count(),
+            unreported.looked(2, None, at(1), UNSEEN).count(),
             2,
             "its shells are counted by process"
         );
     }
 
     #[test]
+    fn a_reported_shell_is_kept_until_looks_in_a_row_miss_it_past_the_grace() {
+        let b = Background::default().reported(tasks(&[("s1", TaskKind::Shell)]), at(0));
+        let missed = b.clone().looked(0, None, at(0), UNSEEN);
+        assert_eq!(missed.count(), 1, "one look can come before it starts");
+        assert!(missed.worth_a_look() && missed.view().is_some());
+        assert_eq!(missed.shells().collect::<Vec<_>>(), ["s1"]);
+        let missed = missed
+            .looked(0, None, at(1), UNSEEN)
+            .looked(0, None, at(1), UNSEEN);
+        assert_eq!(
+            missed.count(),
+            1,
+            "missed three times, but within the grace"
+        );
+        let found = missed.clone().looked(1, None, at(1), UNSEEN);
+        assert_eq!(found.count(), 1);
+        let after = found
+            .looked(0, None, at(2), UNSEEN)
+            .looked(0, None, at(3), UNSEEN);
+        assert_eq!(
+            after.clone().looked(0, None, at(3), UNSEEN).count(),
+            1,
+            "found again, its misses count anew"
+        );
+        let gone = after.looked(0, None, at(4), UNSEEN);
+        assert_eq!(
+            (gone.count(), gone.view()),
+            (0, None),
+            "missed long enough: it ended"
+        );
+        assert_eq!(gone.shells().count(), 0);
+        assert!(!gone.worth_a_look());
+        let quick = b
+            .clone()
+            .looked(0, None, at(0), UNSEEN)
+            .looked(0, None, at(3), UNSEEN);
+        assert_eq!(quick.count(), 1, "two looks are never enough");
+        let reported_again = missed
+            .reported(tasks(&[("s1", TaskKind::Shell)]), at(1))
+            .looked(0, None, at(5), UNSEEN);
+        assert_eq!(
+            reported_again.count(),
+            1,
+            "the CLI says it runs: looked at anew"
+        );
+        let ended = b.reported(tasks(&[]), at(1));
+        assert_eq!(ended.count(), 0, "the CLI's own report ends it at once");
+    }
+
+    #[test]
+    fn a_shell_written_off_beside_one_that_runs_is_the_one_not_found_and_never_counted_again() {
+        let b = Background::default()
+            .reported(tasks(&[("s1", TaskKind::Shell)]), at(0))
+            .reported(
+                tasks(&[("s1", TaskKind::Shell), ("s2", TaskKind::Shell)]),
+                at(1),
+            );
+        let found = BTreeSet::from(["s1".to_string()]);
+        let looks = |b: Background, found: Option<&BTreeSet<String>>| {
+            let missed = b
+                .looked(1, found, at(1), UNSEEN)
+                .looked(1, found, at(2), UNSEEN);
+            assert_eq!(missed.count(), 2, "within the grace");
+            missed.looked(1, found, at(3), UNSEEN)
+        };
+        let gone = looks(b.clone(), Some(&found));
+        assert_eq!(gone.count(), 1, "missed long enough: one ended");
+        assert_eq!(
+            gone.shells().collect::<Vec<_>>(),
+            ["s1"],
+            "the later one, found in no process, while the earlier runs on"
+        );
+        let call = gone.clone().looked(2, Some(&found), at(4), UNSEEN);
+        assert_eq!(
+            call.count(),
+            1,
+            "a foreground call's shell never brings it back"
+        );
+        assert_eq!(call.looked(1, Some(&found), at(5), UNSEEN).count(), 1);
+        assert_eq!(
+            gone.looked(0, Some(&found), at(9), UNSEEN).count(),
+            1,
+            "one look again"
+        );
+        assert_eq!(
+            looks(b, None).shells().collect::<Vec<_>>(),
+            ["s2"],
+            "with nothing found, the one heard of first"
+        );
+    }
+
+    #[test]
+    fn its_shells_are_the_running_pieces_that_are_shells() {
+        let b = Background::default().reported(
+            tasks(&[("s1", TaskKind::Shell), ("a1", TaskKind::Agent)]),
+            at(0),
+        );
+        assert_eq!(b.shells().collect::<Vec<_>>(), ["s1"]);
+        assert_eq!(b.ended("s1", at(1)).shells().count(), 0);
+    }
+
+    #[test]
     fn a_turns_report_is_newer_than_the_last_look() {
         let b = Background::default()
             .reported(tasks(&[("s1", TaskKind::Shell)]), at(0))
-            .looked(0, at(1))
+            .looked(0, None, at(1), UNSEEN)
             .reported(tasks(&[("s2", TaskKind::Shell)]), at(2));
         assert_eq!(
             b.count(),
@@ -456,22 +614,26 @@ mod tests {
     fn a_sub_agent_unheard_with_nothing_running_has_died() {
         let b = Background::default().reported(tasks(&[("a1", TaskKind::Agent)]), at(0));
         assert_eq!(
-            b.clone().looked(0, at(9)).count(),
+            b.clone().looked(0, None, at(9), UNSEEN).count(),
             1,
             "still within its quiet"
         );
         assert_eq!(
-            b.clone().looked(1, at(30)).count(),
+            b.clone().looked(1, None, at(30), UNSEEN).count(),
             1,
             "a shell of its still runs"
         );
         let heard = b.clone().heard("a1", at(8));
         assert_eq!(
-            heard.clone().looked(0, at(15)).count(),
+            heard.clone().looked(0, None, at(15), UNSEEN).count(),
             1,
             "heard from lately"
         );
-        assert_eq!(heard.looked(0, at(19)).count(), 0, "it died without a stop");
+        assert_eq!(
+            heard.looked(0, None, at(19), UNSEEN).count(),
+            0,
+            "it died without a stop"
+        );
     }
 
     #[test]
@@ -483,7 +645,7 @@ mod tests {
         assert_eq!(
             b.clone()
                 .started("t2", TaskKind::Agent, at(9))
-                .looked(0, at(15))
+                .looked(0, None, at(15), UNSEEN)
                 .count(),
             1,
             "heard working lately"
