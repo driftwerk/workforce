@@ -84,6 +84,9 @@ const ACTIVE_SECS: u64 = 1;
 /// and a record both keep whole seconds.
 pub const SKEW: Duration = Duration::seconds(2);
 
+/// The tool whose calls run in a shell of their own.
+pub const SHELL_TOOL: &str = "Bash";
+
 fn said() -> &'static [(Wait, Regex, &'static str)] {
     static SAID_RE: OnceLock<Vec<(Wait, Regex, &'static str)>> = OnceLock::new();
     SAID_RE.get_or_init(|| {
@@ -149,17 +152,20 @@ pub fn said_after(
 /// to two, as `tree` was listed from `listed` on. Each background shell
 /// (`shells`, by id and when its output file was born) is placed in one
 /// started within a second after its file's birth and at most [`SKEW`]
-/// before it; the open call, in one started at most [`SKEW`] before it,
-/// however long after (it may wait on the person's approval first). All
-/// are ranked together in the whole seconds `ps` keeps of a run: the
-/// nearest first, one started before ahead of one after. Those as near in
-/// the same second are paired in order, the latest of them with the
-/// latest started, so a shell started that second before them all (a
-/// sub-agent's) is the one left. One with none placed waits in no process
-/// Desk knows.
+/// before it; so is the open call, when it is a Bash call, by its own
+/// output file's birth (`call_born`), and with none yet by when it began, in
+/// one started at most [`SKEW`] before that, however long after (it may
+/// wait on the person's approval first). A call of any other tool runs in
+/// no shell of its own. All are ranked together in the whole seconds `ps`
+/// keeps of a run: the nearest first, one started before ahead of one
+/// after. Those as near in the same second are paired in order, the latest
+/// of them with the latest started, so a shell started that second before
+/// them all (a sub-agent's) is the one left. One with none placed waits in
+/// no process Desk knows.
 pub fn placed<'a>(
     tree: &[&'a Stat],
     call: Option<&OpenCall>,
+    call_born: Option<DateTime<Utc>>,
     shells: &[(&str, DateTime<Utc>)],
     listed: DateTime<Utc>,
 ) -> HashMap<String, &'a Stat> {
@@ -175,7 +181,13 @@ pub fn placed<'a>(
     // after it, in seconds before it.
     let mut items: Vec<(&str, DateTime<Utc>, i64)> =
         shells.iter().map(|&(id, made)| (id, made, -1)).collect();
-    items.extend(call.map(|c| (c.id.as_str(), c.since, i64::MIN)));
+    items.extend(
+        call.filter(|c| c.tool == SHELL_TOOL)
+            .map(|c| match call_born {
+                Some(born) => (c.id.as_str(), born, -1),
+                None => (c.id.as_str(), c.since, i64::MIN),
+            }),
+    );
     items.sort_by_key(|&(id, at, _)| (at, id));
     let fits = |low: i64, before: i64| (low..=SKEW.num_seconds()).contains(&before);
     let mut levels: Vec<(i64, i64)> = items
@@ -630,7 +642,7 @@ mod tests {
         let call = bash_call(11);
         let said = said.and_then(|line| appeared(&call, line, 10));
         let open_call = said.as_ref().map(|_| &call);
-        let placed = placed(&tree, open_call, &[], now());
+        let placed = placed(&tree, open_call, None, &[], now());
         classify(&Evidence {
             tree: &tree,
             open_call,
@@ -779,7 +791,7 @@ mod tests {
             since: born(61),
         };
         let pids = |shells: &[(&str, DateTime<Utc>)], call| {
-            let mut pids: Vec<(String, u32)> = placed(&tree, call, shells, now())
+            let mut pids: Vec<(String, u32)> = placed(&tree, call, None, shells, now())
                 .into_iter()
                 .map(|(id, s)| (id, s.proc.pid))
                 .collect();
@@ -816,7 +828,7 @@ mod tests {
         let at = |ms: i64| now() - Duration::milliseconds(ms);
         let pids = |all: &[Stat], shells: &[(&str, DateTime<Utc>)], call: Option<&OpenCall>| {
             let tree = work(all, 100, Engine::Claude, None);
-            let mut pids: Vec<(String, u32)> = placed(&tree, call, shells, now())
+            let mut pids: Vec<(String, u32)> = placed(&tree, call, None, shells, now())
                 .into_iter()
                 .map(|(id, s)| (id, s.proc.pid))
                 .collect();
@@ -877,6 +889,45 @@ mod tests {
     }
 
     #[test]
+    fn a_call_waiting_on_approval_is_placed_by_its_own_files_birth_and_one_of_another_tool_in_none()
+    {
+        let at = |ms: i64| now() - Duration::milliseconds(ms);
+        let call = |tool: &str| OpenCall {
+            id: "f1".into(),
+            tool: tool.into(),
+            input: String::new(),
+            since: at(305_000),
+        };
+        // Asked at T0, it waits on the person; a sub-agent's shell S starts
+        // at T1, and its own F at T2, its output file born with it.
+        let all = shells(&[(110, 303, 0), (120, 300, 0)]);
+        let tree = work(&all, 100, Engine::Claude, None);
+        let pids = |call: &OpenCall, born| {
+            let mut pids: Vec<(String, u32)> = placed(&tree, Some(call), born, &[], now())
+                .into_iter()
+                .map(|(id, s)| (id, s.proc.pid))
+                .collect();
+            pids.sort();
+            pids
+        };
+        let bash = call("Bash");
+        assert_eq!(
+            pids(&bash, Some(at(300_300))),
+            [("f1".to_string(), 120)],
+            "its own, not the sub-agent's started nearer when it was asked"
+        );
+        assert_eq!(
+            pids(&bash, None),
+            [("f1".to_string(), 110)],
+            "with no file of its own yet, the first started since it"
+        );
+        assert!(
+            pids(&call("WebFetch"), None).is_empty(),
+            "a call of another tool takes no shell"
+        );
+    }
+
+    #[test]
     fn a_background_shells_held_wait_ends_once_its_own_shell_works_again() {
         let born = |ran: i64| now() - Duration::seconds(ran);
         let before = shells(&[(110, 300, 0), (120, 299, 0)]);
@@ -885,7 +936,13 @@ mod tests {
         let then = |a: u64, b: u64| {
             let all = shells(&[(110, 300, a), (120, 299, b)]);
             let tree = work(&all, 100, Engine::Claude, None);
-            let placed = placed(&tree, None, &[("b1", born(300)), ("b2", born(299))], now());
+            let placed = placed(
+                &tree,
+                None,
+                None,
+                &[("b1", born(300)), ("b2", born(299))],
+                now(),
+            );
             let busy = placed
                 .get("b1")
                 .is_some_and(|head| active(&prev, &subtree(&tree, head)));
@@ -927,7 +984,7 @@ mod tests {
             tree: &tree,
             open_call: Some(&call),
             said: said.as_slice(),
-            placed: &placed(&tree, Some(&call), &[], now()),
+            placed: &placed(&tree, Some(&call), None, &[], now()),
             active_at: now(),
             now: now(),
             poll: Duration::minutes(10),
@@ -941,7 +998,7 @@ mod tests {
             ..call
         };
         assert_eq!(
-            placed(&tree, Some(&later), &[], now()).get("toolu_1"),
+            placed(&tree, Some(&later), None, &[], now()).get("toolu_1"),
             None,
             "no shell started since"
         );
