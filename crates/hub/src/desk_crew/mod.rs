@@ -336,6 +336,9 @@ pub struct CrewHub {
     /// Whether the plans' machine sessions were read since the hub started:
     /// until then no plan grant is said ([`machine_grants`]).
     plans_watched: std::sync::atomic::AtomicBool,
+    /// Done once the line loop has taken up what waited on the line when it
+    /// started: what is kept after that reaches it as Desk's events.
+    line_taken_up: CancellationToken,
     /// Since when Desk has asked for machines' Ungrouped grants, and when
     /// it last did: it carries them.
     ungrouped_asked: Mutex<Option<machine_grants::Asked>>,
@@ -835,6 +838,7 @@ impl CrewHub {
             machine_seen: Mutex::default(),
             machine_plans: Mutex::default(),
             plans_watched: std::sync::atomic::AtomicBool::new(false),
+            line_taken_up: CancellationToken::new(),
             ungrouped_asked: Mutex::default(),
             main_missing: Mutex::default(),
             machine_known: Mutex::default(),

@@ -683,6 +683,19 @@ async fn a_message_that_never_reaches_a_session_wakes_its_boss_once() {
             "tool_input": {"command": "./audit --all"}}),
         )
         .await;
+        // At work from before it is told anything, so it is never quiet past
+        // its message.
+        let progress = tokio::spawn(async move {
+            loop {
+                hook(
+                    &busy_url,
+                    json!({"hook_event_name": "PreToolUse", "tool_name": "Bash",
+                    "tool_input": {"command": "systemctl stop legacy-worker"}}),
+                )
+                .await;
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+        });
         let tell = async |s: uuid::Uuid, message: &str| {
             crew.perform(
                 &Action::Nudge {
@@ -714,17 +727,6 @@ async fn a_message_that_never_reaches_a_session_wakes_its_boss_once() {
             into_turn.waiting,
             Some(workforce_desk::line::Wait::NextCall)
         );
-        let progress = tokio::spawn(async move {
-            loop {
-                hook(
-                    &busy_url,
-                    json!({"hook_event_name": "PreToolUse", "tool_name": "Bash",
-                    "tool_input": {"command": "systemctl stop legacy-worker"}}),
-                )
-                .await;
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-            }
-        });
         let woken = async |s: uuid::Uuid| {
             eventually("the boss woken", async || {
                 told_of(&llm, s).await.into_iter().next()

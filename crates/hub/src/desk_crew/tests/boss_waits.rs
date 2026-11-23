@@ -646,10 +646,13 @@ async fn reports_waiting_when_the_hub_stopped_are_taken_by_a_turn_when_it_starts
     with_test_pool(workforce_desk::store::build_pool, |pool| async move {
         let dir = tempfile::tempdir().unwrap();
         let (overseer, crew, d, s) = paced_session(5, "Noted.", pool, dir.path()).await;
+        // The crew's own loop has read what waited when it started, so only
+        // the loop below can take what is kept now.
+        crew.line_taken_up.cancelled().await;
         let report = kept_report(&d, s, "Step 14 done: the old DNS records are gone.").await;
         // Kept straight in the store, no event: the hub starting again, a
-        // line loop of its own reads what waits (the crew's has read
-        // already), stopped however the test ends.
+        // line loop of its own reads what waits, stopped however the test
+        // ends.
         let cancel = tokio_util::sync::CancellationToken::new();
         let _stop = cancel.clone().drop_guard();
         tokio::spawn(super::super::line::line_loop(Arc::clone(&crew), cancel));

@@ -1066,6 +1066,7 @@ pub(super) fn line_loop(
                 .or_insert_with(Gathered::new)
                 .take(kept);
         }
+        crew.line_taken_up.cancel();
         // The waiting reports of a turn that didn't run, given back.
         let (give_back, mut given_back) =
             tokio::sync::mpsc::unbounded_channel::<(Uuid, Vec<LineMessage>)>();

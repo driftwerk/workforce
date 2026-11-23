@@ -1772,7 +1772,7 @@ async fn a_stopped_turn_keeps_what_was_sent_into_it() {
         .sessions
         .get_or_create(DESK_CHANNEL, "identity-1", service.agent_id.as_str())
         .unwrap();
-    let (_live, inbox) = service
+    let (live, inbox) = service
         .begin_live_turn(
             &session.id,
             workforce_agent::tools::approval::SelfServe::Answerable,
@@ -1809,15 +1809,13 @@ async fn a_stopped_turn_keeps_what_was_sent_into_it() {
         )
         .await
         .unwrap();
-    for _ in 0..200 {
-        if !server
-            .received_requests()
-            .await
-            .unwrap_or_default()
-            .is_empty()
-        {
-            break;
-        }
+    // Sent while the run waits on the model.
+    while server
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .is_empty()
+    {
         tokio::time::sleep(std::time::Duration::from_millis(25)).await;
     }
     assert!(service
@@ -1837,14 +1835,8 @@ async fn a_stopped_turn_keeps_what_was_sent_into_it() {
         .applied());
     handle.abort();
     let _ = handle.await;
-    let mut read = Vec::new();
-    for _ in 0..100 {
-        read = read_back(&service, "identity-1");
-        if read.len() == 2 {
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-    }
+    live.follow_ups_kept().await;
+    let read = read_back(&service, "identity-1");
     assert_eq!(
         read.iter()
             .map(|(t, id, _, _)| (t.as_str(), id.clone()))
