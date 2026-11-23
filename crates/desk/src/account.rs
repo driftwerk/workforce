@@ -468,6 +468,19 @@ fn safe(s: &str, max: usize) -> String {
     defanged(&clip(&flat(s), max))
 }
 
+/// [`safe`] for what a session said, which says when it was cut: a reader
+/// never takes part of a reply for the whole of it.
+fn spoken(s: &str, max: usize) -> String {
+    let total = flat(s).chars().count();
+    match total > max {
+        true => format!(
+            "{} [cut: only its first {max} of {total} characters are here]",
+            safe(s, max)
+        ),
+        false => safe(s, max),
+    }
+}
+
 fn asker_of(a: Asker) -> &'static str {
     match a {
         Asker::Person => "the person",
@@ -551,11 +564,14 @@ fn record(out: &mut String, ctx: &Context, delta: &[Exchange], tail: &Tail) {
             out.push_str(&format!("Error: {}\n", safe(e, STEP_CHARS)));
         }
         if !x.answer.trim().is_empty() {
-            out.push_str(&format!("Replied: {}\n", safe(&x.answer, REPLY_CHARS)));
+            out.push_str(&format!("Replied: {}\n", spoken(&x.answer, REPLY_CHARS)));
         }
     }
-    if let Some(said) = tail.said.as_deref().filter(|s| !s.trim().is_empty()) {
-        out.push_str(&format!("\nIts latest words: {}\n", safe(said, SAID_CHARS)));
+    if let Some(latest) = tail.said.as_deref().filter(|s| !s.trim().is_empty()) {
+        out.push_str(&format!(
+            "\nIts latest words: {}\n",
+            spoken(latest, SAID_CHARS)
+        ));
     }
     if let Some(screen) = tail.screen.as_deref().filter(|s| !s.trim().is_empty()) {
         // The screen's tail keeps its lines: what is on it now is at its end.
@@ -677,7 +693,7 @@ pub fn question_prompt(
         if !x.answer.trim().is_empty() {
             one.push_str(&format!(
                 "Replied: {}\n",
-                safe(&x.answer, QUESTION_REPLY_CHARS)
+                spoken(&x.answer, QUESTION_REPLY_CHARS)
             ));
         }
         if !said.is_empty() && used + one.len() > QUESTION_CHARS {
@@ -1354,6 +1370,26 @@ mod tests {
         );
         assert!(p.contains("EXTERNAL_UNTRUSTED_CONTENT_n0nce"));
         assert!(p.len() < 40_000);
+    }
+
+    #[test]
+    fn a_reply_cut_for_the_record_says_how_much_is_there() {
+        let long = "checked ".repeat(400);
+        let p = prompt(
+            &Account::new(Uuid::nil(), "me", at(0)),
+            &Context::default(),
+            &[x("a", 0, &long, 0), x("b", 1, "Done.", 0)],
+            &Tail::default(),
+            "n0nce",
+        );
+        let total = flat(&long).chars().count();
+        assert!(
+            p.contains(&format!(
+                "[cut: only its first {REPLY_CHARS} of {total} characters are here]"
+            )),
+            "{p}"
+        );
+        assert!(p.contains("Replied: Done.\n"), "a whole one says nothing");
     }
 
     #[test]
