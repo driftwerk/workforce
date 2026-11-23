@@ -4990,3 +4990,244 @@ async fn a_noted_runner_answer_closes_with_its_note_before_done() {
         .expect("done");
     assert!(note < whole && whole < done, "{events:?}");
 }
+
+/// A boss's line for a session, one of its own conversations off its DM.
+const CREW: &str = "desk:line:6f1c2a4e-0b7d-4c55-9a51-3d2e8f9b1c07";
+
+/// A passage a boss's every wake repeats, long enough to be left out.
+fn standing() -> String {
+    "Desk keeps these sessions for you and every one of them is as it was. ".repeat(8)
+}
+
+/// A round answering "ok", its one model call having read `context` tokens.
+fn read(context: u64) -> Vec<Value> {
+    vec![
+        json!({
+            "type": "assistant",
+            "message": {
+                "id": format!("msg-{context}"),
+                "model": "claude-sonnet-4-6",
+                "role": "assistant",
+                "content": [{ "type": "text", "text": "ok" }],
+                "usage": {
+                    "input_tokens": 10,
+                    "cache_read_input_tokens": context - 10,
+                    "cache_creation_input_tokens": 0,
+                    "output_tokens": 5,
+                },
+            },
+        }),
+        result("ok"),
+    ]
+}
+
+impl Hub {
+    /// A wake on `channel` saying the standing passage, then `news`.
+    async fn wake(&self, channel: &str, news: &str) {
+        let (_, ran) = self
+            .stream_at(
+                (channel, None, None),
+                ALICE,
+                &format!("{}\n\n{news}", standing()),
+                None,
+                None,
+            )
+            .await;
+        ran.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn a_crew_conversation_is_not_given_again_what_its_transcript_holds() {
+    let hub = hub(claude_first).await;
+    hub.claude_login(ALICE);
+    hub.claude.reply(Some(1), &read(40_000));
+    hub.claude.reply(Some(2), &read(30_000));
+    hub.claude.reply(Some(3), &read(35_000));
+
+    hub.wake(CREW, "wake one").await;
+    hub.wake(CREW, "wake two").await;
+    hub.wake(CREW, "wake three").await;
+
+    let calls = hub.claude.calls();
+    assert!(
+        calls[0].text().contains(&standing()),
+        "a fresh transcript gets it whole"
+    );
+    let second = calls[1].text();
+    assert!(calls[1].has("--resume"));
+    assert!(!second.contains(&standing()), "{second}");
+    assert!(second.contains("[Unchanged since it was given earlier in this conversation:"));
+    assert!(second.ends_with("wake two"), "{second}");
+    assert!(
+        calls[2].text().contains(&standing()),
+        "the CLI compacted its transcript (its context fell), so all of it is given again"
+    );
+}
+
+#[tokio::test]
+async fn the_person_s_own_conversation_is_always_given_everything() {
+    let hub = hub(claude_first).await;
+    hub.claude_login(ALICE);
+    hub.claude.reply(None, &read(40_000));
+
+    hub.wake("web", "one").await;
+    hub.wake("web", "two").await;
+
+    let second = &hub.claude.calls()[1];
+    assert!(second.has("--resume"));
+    assert!(second.text().contains(&standing()));
+}
+
+#[tokio::test]
+async fn a_crew_conversation_starts_afresh_once_it_outgrew_its_cap_and_the_person_s_never_does() {
+    let hub = hub(claude_first).await;
+    hub.claude_login(ALICE);
+    hub.claude.reply(None, &read(250_000));
+
+    hub.wake(CREW, "one").await;
+    hub.wake(CREW, "two").await;
+    hub.wake("web", "one").await;
+    hub.wake("web", "two").await;
+
+    let calls = hub.claude.calls();
+    assert!(!calls[1].has("--resume"), "the crew transcript is replaced");
+    assert_ne!(calls[0].flag("--session-id"), calls[1].flag("--session-id"));
+    assert!(
+        calls[1].text().contains(&standing()),
+        "a fresh one gets everything"
+    );
+    assert!(
+        calls[3].has("--resume"),
+        "the person's thread is kept whatever its size"
+    );
+}
+
+#[tokio::test]
+async fn a_crew_conversation_grows_by_its_news_alone_over_a_night_of_wakes() {
+    let hub = hub(claude_first).await;
+    hub.claude_login(ALICE);
+    for n in 1..=52u64 {
+        hub.claude
+            .reply(Some(n as usize), &read(20_000 + n * 1_000));
+    }
+
+    for n in 1..=52 {
+        hub.wake(CREW, &format!("wake {n}")).await;
+    }
+
+    let calls = hub.claude.calls();
+    assert_eq!(calls.len(), 52);
+    let fresh = RotationPolicy::default().turns as usize;
+    let given_whole: Vec<usize> = calls
+        .iter()
+        .enumerate()
+        .filter(|(_, call)| call.text().contains(&standing()))
+        .map(|(n, _)| n)
+        .collect();
+    assert_eq!(
+        given_whole,
+        [0, fresh],
+        "only a fresh transcript carries the standing passage: the first, and the one its turn count started"
+    );
+    assert!(calls
+        .iter()
+        .enumerate()
+        .all(|(n, call)| call.has("--resume") != given_whole.contains(&n)));
+    assert!(
+        calls
+            .iter()
+            .filter(|call| call.has("--resume"))
+            .all(|call| !call.text().contains("[CONVERSATION SO FAR")),
+        "a resumed transcript is never caught up on what it holds"
+    );
+}
+
+#[tokio::test]
+async fn a_crew_conversation_the_cli_compacted_mid_turn_is_given_everything_again() {
+    let hub = hub(claude_first).await;
+    hub.claude_login(ALICE);
+    hub.claude.reply(Some(1), &read(60_000));
+    let compacted_then_grew: Vec<Value> = std::iter::once(json!({
+        "type": "system",
+        "subtype": "compact_boundary",
+        "compact_metadata": { "trigger": "auto", "pre_tokens": 110_000 },
+    }))
+    .chain(read(65_000))
+    .collect();
+    hub.claude.reply(Some(2), &compacted_then_grew);
+    hub.claude.reply(Some(3), &read(70_000));
+
+    hub.wake(CREW, "one").await;
+    hub.wake(CREW, "two").await;
+    hub.wake(CREW, "three").await;
+
+    let calls = hub.claude.calls();
+    assert!(
+        !calls[1].text().contains(&standing()),
+        "held before the compaction"
+    );
+    assert!(calls[2].has("--resume"));
+    assert!(
+        calls[2].text().contains(&standing()),
+        "the transcript only has its own summary of it now"
+    );
+}
+
+#[tokio::test]
+async fn a_crew_round_the_person_stopped_after_the_cli_compacted_is_given_everything_again() {
+    let hub = hub(claude_first).await;
+    hub.claude_login(ALICE);
+    hub.claude.reply(Some(1), &read(60_000));
+    hub.claude.script(
+        Some(2),
+        &format!(
+            "{}sleep 60\n",
+            print(&[
+                json!({
+                    "type": "system",
+                    "subtype": "compact_boundary",
+                    "compact_metadata": { "trigger": "auto", "pre_tokens": 110_000 },
+                }),
+                assistant("msg-2", "Working on it."),
+            ])
+        ),
+    );
+    hub.claude.reply(Some(3), &read(65_000));
+    hub.claude.reply(Some(4), &read(70_000));
+    hub.wake(CREW, "one").await;
+    let (tx, rx) = mpsc::channel(8);
+    let running = hub.claude.started(2);
+    let stop = tokio::spawn(async move {
+        running.await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        tx.send(InjectedMessage::SteerStop {
+            text: "stop".into(),
+            user: ALICE.into(),
+        })
+        .await
+        .unwrap();
+        tx
+    });
+
+    let (_, stopped) = hub
+        .stream_at(
+            (CREW, None, None),
+            ALICE,
+            &format!("{}\n\ntwo", standing()),
+            Some(rx),
+            None,
+        )
+        .await;
+    drop(stop.await);
+    stopped.unwrap();
+    hub.wake(CREW, "three").await;
+
+    let calls = hub.claude.calls();
+    assert_eq!(calls.len(), 4);
+    assert!(calls[3].has("--resume"));
+    assert!(
+        calls[3].text().contains(&standing()),
+        "the stopped round's compaction left the transcript only its own summary"
+    );
+}
