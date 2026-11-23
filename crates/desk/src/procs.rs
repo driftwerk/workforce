@@ -107,11 +107,14 @@ pub fn parse_etime(etime: &str) -> Option<u64> {
         .map(|p| p.parse().ok())
         .collect::<Option<_>>()?;
     let secs = match parts[..] {
-        [m, s] => m * 60 + s,
-        [h, m, s] => h * 3600 + m * 60 + s,
+        [m, s] => m.checked_mul(60)?.checked_add(s)?,
+        [h, m, s] => h
+            .checked_mul(3600)?
+            .checked_add(m.checked_mul(60)?)?
+            .checked_add(s)?,
         _ => return None,
     };
-    Some(days * 86_400 + secs)
+    days.checked_mul(86_400)?.checked_add(secs)
 }
 
 /// The processes under `root`, however deep, each once.
@@ -343,7 +346,8 @@ pub async fn started_at(pid: u32) -> Option<chrono::DateTime<chrono::Utc>> {
         let out = tokio::time::timeout(PS_WAIT, run).await.ok()?.ok()?;
         let ran =
             parse_etime(&String::from_utf8_lossy(&out.stdout)).filter(|_| out.status.success())?;
-        Some(chrono::Utc::now() - chrono::Duration::seconds(i64::try_from(ran).ok()?))
+        let ran = chrono::Duration::try_seconds(i64::try_from(ran).ok()?)?;
+        chrono::Utc::now().checked_sub_signed(ran)
     }
 }
 
@@ -493,6 +497,12 @@ mod tests {
     #[test]
     fn elapsed_and_cpu_times_are_read_in_every_form_ps_prints() {
         assert_eq!(parse_etime("00:07"), Some(7));
+        assert_eq!(
+            parse_etime("106751991167-07:12:55"),
+            Some(9_223_372_036_854_775)
+        ); // wrapped round, as ps can say
+        assert_eq!(parse_etime("213503982334602-00:00:00"), None, "past a u64");
+        assert_eq!(parse_etime("1:18446744073709551615"), None);
         assert_eq!(parse_etime("12:07"), Some(727));
         assert_eq!(parse_etime("01:02:03"), Some(3723));
         assert_eq!(parse_etime("2-01:02:03"), Some(2 * 86_400 + 3723));
