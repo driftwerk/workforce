@@ -70,7 +70,7 @@ use crate::serve::{
     answer_is_code_shaped, build_prior_messages_reading, data_claim_grounding_skip,
     end_turn_record, infer_task_type, is_person, is_workflow_step_session,
     persist_turn_owned_metadata, prompt_privacy, prompt_visibility, record_round_cap_continuation,
-    render_shared_visibility_block, render_slack_identity_block, reply_only,
+    render_shared_visibility_block, render_slack_identity_block, reply_only, save_turn,
     select_visible_other_sessions, session_owner_for_turn, stop_turn_record, worker_tool_patterns,
     AgentService, IsolatedRoute, IsolatedRun, MessageProgress, PromptPrivacy, RunAuthor,
     SharedReplay, Skip, TurnInbox, TurnOutcome, CLAIM_GROUNDING_MIN_RESPONSE,
@@ -852,8 +852,7 @@ pub(crate) fn save_notice_turn(
     if session.is_shared_conversation() {
         session.attribute_messages_from(archive_base, user);
     }
-    service.sessions.save_refreshing(session)?;
-    persist_turn_owned_metadata(&service.sessions, session);
+    save_turn(&service.sessions, session)?;
     for msg in session.messages.get(archive_from..).unwrap_or_default() {
         if let Err(e) = service.sessions.append_to_archive(&session.id, msg) {
             warn!(error = %e, "Failed to append to session archive");
@@ -5911,12 +5910,11 @@ pub(crate) async fn stream_admitted(
                 }
                 record_round_cap_continuation(&mut session, &result);
                 crate::monitor::scope::keep_turn(&mut session, &result);
-                sessions.save_refreshing(&mut session)?;
+                // A save that lost CAS keeps what is stored, metadata too;
+                // the turn's own keys then get a narrow write that cannot
+                // lose.
+                save_turn(&sessions, &mut session)?;
                 turn_journal.clear();
-                // The save above may have lost CAS, which discards the
-                // metadata it carried; these keys are the turn's own, so
-                // they get a narrow write that cannot lose.
-                persist_turn_owned_metadata(&sessions, &session);
                 // After the transcript, never before: a crash in between
                 // leaves a record whose answer is already saved, which the
                 // sweep skips — the reverse order would lose the answer

@@ -93,7 +93,39 @@ pub fn persist_turn_owned_metadata(
     sessions: &Arc<dyn workforce_common::session::SessionStore>,
     session: &workforce_common::session::Session,
 ) {
-    let (patch, remove) = TURN_OWNED_METADATA.into_iter().fold(
+    persist_owned(sessions, &session.id, turn_owned(session));
+}
+
+/// Saves the turn's `session` and refreshes it from what is stored, then
+/// writes its own metadata back over that, in it and in the store: a save
+/// merged into another write takes on the stored metadata, which isn't the
+/// turn's for these keys.
+pub fn save_turn(
+    sessions: &Arc<dyn workforce_common::session::SessionStore>,
+    session: &mut workforce_common::session::Session,
+) -> eyre::Result<()> {
+    let owned = turn_owned(session);
+    sessions.save_refreshing(session)?;
+    let metadata = session.metadata_object_mut();
+    owned.0.iter().for_each(|(key, value)| {
+        metadata.insert(key.clone(), value.clone());
+    });
+    owned.1.iter().for_each(|key| {
+        metadata.remove(*key);
+    });
+    persist_owned(sessions, &session.id, owned);
+    Ok(())
+}
+
+type OwnedMetadata = (
+    serde_json::Map<String, serde_json::Value>,
+    Vec<&'static str>,
+);
+
+/// The turn's own metadata keys in `session`: those it holds, and those it
+/// doesn't, to remove.
+fn turn_owned(session: &workforce_common::session::Session) -> OwnedMetadata {
+    TURN_OWNED_METADATA.into_iter().fold(
         (serde_json::Map::new(), Vec::new()),
         |(mut patch, mut remove), key| {
             match session.metadata.get(key) {
@@ -104,9 +136,16 @@ pub fn persist_turn_owned_metadata(
             }
             (patch, remove)
         },
-    );
-    if let Err(e) = sessions.merge_metadata(&session.id, patch, &remove) {
-        tracing::warn!(error = %e, session_id = %session.id, "Failed to persist turn metadata");
+    )
+}
+
+fn persist_owned(
+    sessions: &Arc<dyn workforce_common::session::SessionStore>,
+    session_id: &str,
+    (patch, remove): OwnedMetadata,
+) {
+    if let Err(e) = sessions.merge_metadata(session_id, patch, &remove) {
+        tracing::warn!(error = %e, session_id = %session_id, "Failed to persist turn metadata");
     }
 }
 
@@ -3800,6 +3839,40 @@ pub mod tests {
     }
 
     #[test]
+    fn a_turns_save_merged_into_another_write_keeps_its_own_metadata_and_the_others_message() {
+        use workforce_common::session::{JsonlSessionStore, SessionStore};
+        let dir = tempfile::tempdir().unwrap();
+        let sessions: Arc<dyn SessionStore> = Arc::new(JsonlSessionStore::new(dir.path()).unwrap());
+        let mut turn = sessions.get_or_create("c", "o", "a").unwrap();
+        turn.add_user_message("asked", None);
+        sessions.save_refreshing(&mut turn).unwrap();
+
+        let mut other = sessions.get(&turn.id).unwrap().unwrap();
+        let notice = other.add_assistant_message("the session closed", 2);
+        sessions.save(&other).unwrap();
+        turn.metadata_object_mut()
+            .insert("observed_input_tokens".into(), serde_json::json!(4242));
+        save_turn(&sessions, &mut turn).unwrap();
+        assert_eq!(
+            turn.metadata.get("observed_input_tokens"),
+            Some(&serde_json::json!(4242))
+        );
+        let answer = turn.add_assistant_message("answered", 2);
+        sessions.save(&turn).unwrap();
+
+        let stored = sessions.get(&turn.id).unwrap().unwrap();
+        assert_eq!(
+            stored.metadata.get("observed_input_tokens"),
+            Some(&serde_json::json!(4242))
+        );
+        let ids: Vec<&str> = stored.messages.iter().map(|m| m.id.as_str()).collect();
+        assert!(
+            ids.contains(&notice.as_str()) && ids.contains(&answer.as_str()),
+            "{ids:?}"
+        );
+    }
+
+    #[test]
     fn turn_owned_metadata_patches_what_is_present_and_removes_what_is_not() {
         let mut session = Session::new("test", "user", "agent");
         session.metadata = serde_json::json!({
@@ -3807,18 +3880,7 @@ pub mod tests {
             "estimate_calibration": 1.5,
             "channel_name": "DM with Kings",
         });
-        let (patch, remove) = TURN_OWNED_METADATA.into_iter().fold(
-            (serde_json::Map::new(), Vec::new()),
-            |(mut patch, mut remove), key| {
-                match session.metadata.get(key) {
-                    Some(value) => {
-                        patch.insert(key.to_string(), value.clone());
-                    }
-                    None => remove.push(key),
-                }
-                (patch, remove)
-            },
-        );
+        let (patch, remove) = turn_owned(&session);
         assert_eq!(patch.len(), 2);
         assert_eq!(
             patch.get("observed_input_tokens"),

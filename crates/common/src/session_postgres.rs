@@ -697,13 +697,12 @@ impl SessionStore for PostgresSessionStore {
     }
 
     fn save(&self, session: &Session) -> Result<()> {
-        self.save_returning_revision(session).map(|_| ())
+        self.save_returning_revision(session).map(drop)
     }
 
     fn save_refreshing(&self, session: &mut Session) -> Result<()> {
-        let revision = self.save_returning_revision(session)?;
-        session.loaded_revision = Some(revision);
-        session.mark_read();
+        let (revision, merged) = self.save_returning_revision(session)?;
+        session.refreshed(revision, merged);
         Ok(())
     }
 
@@ -2547,7 +2546,7 @@ impl PostgresSessionStore {
     /// The shared body of `save`/`save_refreshing`: persist the session and
     /// return the row's post-write revision so callers can refresh their CAS
     /// baseline without a follow-up read.
-    fn save_returning_revision(&self, session: &Session) -> Result<i64> {
+    fn save_returning_revision(&self, session: &Session) -> Result<(i64, Option<Session>)> {
         let session = session.clone();
         self.block_on(async move {
             let mut conn = self.pool.get().await?;
@@ -2590,6 +2589,7 @@ impl PostgresSessionStore {
                     row.compaction_history.clone(),
                 )
             };
+            let mut kept = None;
             let (
                 messages,
                 count,
@@ -2626,6 +2626,14 @@ impl PostgresSessionStore {
                     let total: i64 = merged.iter().map(|m| i64::from(m.tokens)).sum();
                     let count = merged.len() as i32;
                     let json = serde_json::to_value(&merged).context("encode merged messages")?;
+                    kept = Some(Session {
+                        messages: merged,
+                        metadata: cur.get(7),
+                        compaction_history: serde_json::from_value(cur.get(8))
+                            .context("decode stored compaction history")?,
+                        total_tokens: total as u64,
+                        ..session.clone()
+                    });
                     (
                         json,
                         count,
@@ -2688,7 +2696,7 @@ impl PostgresSessionStore {
                 .await?;
             let revision: i64 = saved.get(0);
             tx.commit().await?;
-            Ok(revision)
+            Ok((revision, kept))
         })
     }
 
@@ -3993,6 +4001,51 @@ pub(crate) mod tests {
             assert!(!serde_json::to_string(&got.messages)
                 .unwrap()
                 .contains(secret));
+        })
+        .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_merged_refreshing_save_keeps_what_it_merged_and_what_was_cut_through_the_next_save()
+    {
+        with_store(|store| async move {
+            let s: Arc<dyn SessionStore> = store;
+            let ids = |id: &str| -> Vec<String> {
+                s.get(id)
+                    .unwrap()
+                    .unwrap()
+                    .messages
+                    .into_iter()
+                    .map(|m| m.id)
+                    .collect()
+            };
+            let mut turn = s.get_or_create("cli", "u", "agent-a").unwrap();
+            let asked = turn.add_user_message("asked", None);
+            let cut = turn.add_user_message("retry from here", None);
+            s.save_refreshing(&mut turn).unwrap();
+
+            let mut other = s.get(&turn.id).unwrap().unwrap();
+            let notice = other.add_assistant_message("the session closed", 2);
+            s.save(&other).unwrap();
+            let first = turn.add_assistant_message("first", 2);
+            s.save_refreshing(&mut turn).unwrap();
+            let second = turn.add_assistant_message("second", 2);
+            s.save(&turn).unwrap();
+            assert_eq!(
+                ids(&turn.id),
+                [asked.as_str(), &cut, &notice, &first, &second]
+            );
+
+            let mut turn = s.get_or_create("cli", "v", "agent-a").unwrap();
+            let kept = turn.add_user_message("keep this", None);
+            let cut = turn.add_user_message("retry from here", None);
+            s.save_refreshing(&mut turn).unwrap();
+            s.truncate_from_message(&turn.id, &cut).unwrap();
+            let first = turn.add_assistant_message("first", 2);
+            s.save_refreshing(&mut turn).unwrap();
+            let second = turn.add_assistant_message("second", 2);
+            s.save(&turn).unwrap();
+            assert_eq!(ids(&turn.id), [kept.as_str(), &first, &second]);
         })
         .await;
     }

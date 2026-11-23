@@ -625,7 +625,25 @@ pub struct Session {
     /// what is stored adds only those it added since, so none another write
     /// took out comes back. Never serialised, never persisted.
     #[serde(skip, default)]
-    pub read_message_ids: std::sync::Arc<HashSet<String>>,
+    pub read_message_ids: ReadIds,
+}
+
+/// The ids of the messages a session was read with, shown by their count.
+#[derive(Clone, Default)]
+pub struct ReadIds(std::sync::Arc<HashSet<String>>);
+
+impl std::ops::Deref for ReadIds {
+    type Target = HashSet<String>;
+
+    fn deref(&self) -> &HashSet<String> {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for ReadIds {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} read", self.0.len())
+    }
 }
 
 /// Session types.
@@ -977,8 +995,20 @@ impl Session {
 
     /// Notes the messages it holds as those it was read with.
     pub(crate) fn mark_read(&mut self) {
-        self.read_message_ids =
-            std::sync::Arc::new(self.messages.iter().map(|m| m.id.clone()).collect());
+        self.read_message_ids = ReadIds(std::sync::Arc::new(
+            self.messages.iter().map(|m| m.id.clone()).collect(),
+        ));
+    }
+
+    /// Takes on its save at `revision`: what was stored, when the save merged
+    /// into another write (`merged`), so what it saves next is resolved from
+    /// there rather than replacing it.
+    pub(crate) fn refreshed(&mut self, revision: i64, merged: Option<Session>) {
+        if let Some(stored) = merged {
+            *self = stored;
+        }
+        self.loaded_revision = Some(revision);
+        self.mark_read();
     }
 
     /// The metadata as an object, made one when it isn't yet.
@@ -4583,25 +4613,24 @@ impl JsonlSessionStore {
     /// at the revision stored; otherwise (another write landed since, or it
     /// is a shell) [`merged`] into the stored session, so no message either
     /// wrote is lost and none a write took out comes back. The revision it
-    /// is stored at.
-    fn save_returning_revision(&self, session: &Session) -> eyre::Result<i64> {
+    /// is stored at, and what was stored when a full session was merged.
+    fn save_returning_revision(&self, session: &Session) -> eyre::Result<(i64, Option<Session>)> {
         self.exclusively(&session.id, || {
             self.hydrate_in_cache(&session.id)?;
             let stored = self.cached(&session.id)?;
             let revision = next_revision(stored.as_ref().and_then(|s| s.loaded_revision));
-            let mut saved = match stored {
-                Some(stored)
-                    if session.cached_message_count.is_some()
-                        || session.loaded_revision != stored.loaded_revision =>
-                {
-                    merged(stored, session)
+            let shell = session.cached_message_count.is_some();
+            let (mut saved, was_merged) = match stored {
+                Some(stored) if shell || session.loaded_revision != stored.loaded_revision => {
+                    (merged(stored, session), !shell)
                 }
-                _ => session.clone(),
+                _ => (session.clone(), false),
             };
             saved.loaded_revision = Some(revision);
             self.write_to_disk(&saved)?;
+            let kept = was_merged.then(|| saved.clone());
             self.keep_cached(saved)?;
-            Ok(revision)
+            Ok((revision, kept))
         })
     }
 
@@ -5057,8 +5086,8 @@ impl SessionStore for JsonlSessionStore {
     }
 
     fn save_refreshing(&self, session: &mut Session) -> eyre::Result<()> {
-        session.loaded_revision = Some(self.save_returning_revision(session)?);
-        session.mark_read();
+        let (revision, merged) = self.save_returning_revision(session)?;
+        session.refreshed(revision, merged);
         Ok(())
     }
 
@@ -6773,6 +6802,60 @@ mod tests {
         assert_eq!(
             ids(&reopened.get(&session.id).unwrap().unwrap()),
             [kept.as_str(), reply.as_str()]
+        );
+    }
+
+    #[test]
+    fn a_merged_refreshing_save_keeps_what_it_merged_and_what_was_cut_through_the_next_save() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = JsonlSessionStore::new(dir.path()).unwrap();
+        let mut turn = store.get_or_create("c", "o", "a").unwrap();
+        let kept = turn.add_user_message("keep this", None);
+        let cut = turn.add_user_message("retry from here", None);
+        store.save_refreshing(&mut turn).unwrap();
+
+        let mut other = store.get(&turn.id).unwrap().unwrap();
+        let notice = other.add_assistant_message("the session closed", 2);
+        store.save(&other).unwrap();
+        store.truncate_from_message(&turn.id, &cut).unwrap();
+        let first = turn.add_assistant_message("first", 2);
+        store.save_refreshing(&mut turn).unwrap();
+        let second = turn.add_assistant_message("second", 2);
+        store.save(&turn).unwrap();
+
+        let reopened = JsonlSessionStore::new(dir.path()).unwrap();
+        assert_eq!(
+            ids(&reopened.get(&turn.id).unwrap().unwrap()),
+            [kept.as_str(), first.as_str(), second.as_str()],
+            "{notice} was cut with what followed {cut}"
+        );
+    }
+
+    #[test]
+    fn a_merged_refreshing_save_keeps_another_writers_message_through_the_next_save() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = JsonlSessionStore::new(dir.path()).unwrap();
+        let mut turn = store.get_or_create("c", "o", "a").unwrap();
+        let asked = turn.add_user_message("asked", None);
+        store.save_refreshing(&mut turn).unwrap();
+
+        let mut other = store.get(&turn.id).unwrap().unwrap();
+        let notice = other.add_assistant_message("the session closed", 2);
+        store.save(&other).unwrap();
+        let first = turn.add_assistant_message("first", 2);
+        store.save_refreshing(&mut turn).unwrap();
+        let second = turn.add_assistant_message("second", 2);
+        store.save(&turn).unwrap();
+
+        let reopened = JsonlSessionStore::new(dir.path()).unwrap();
+        assert_eq!(
+            ids(&reopened.get(&turn.id).unwrap().unwrap()),
+            [
+                asked.as_str(),
+                notice.as_str(),
+                first.as_str(),
+                second.as_str()
+            ]
         );
     }
 
