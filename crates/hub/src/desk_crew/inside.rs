@@ -23,7 +23,7 @@ use workforce_desk::sight::{self, Glance, PullGlance, Thresholds, WorkspaceGlanc
 use workforce_desk::{Processes, TranscriptAsk};
 
 use super::github_seen::{Pull, Seen, Unseen};
-use super::served::{unserved, ServedStatus};
+use super::served::ServedStatus;
 use super::tools::Bound;
 use super::watcher::reported;
 use super::workspace::{self, Workspace};
@@ -596,7 +596,7 @@ impl CrewHub {
             .relay(machine, grant, NAME, input, agent, &ceiling)
             .await?;
         match a.status {
-            ServedStatus::Refused if a.body["error"] == unserved(NAME).as_str() => {
+            ServedStatus::Refused if super::relay::older(machine, NAME, &a).is_some() => {
                 self.machine_sight
                     .lock()
                     .older

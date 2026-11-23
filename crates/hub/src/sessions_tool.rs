@@ -19,7 +19,9 @@ use async_trait::async_trait;
 use eyre::Result;
 use serde::Deserialize;
 use workforce_agent::tools::{Tool, ToolResult};
-use workforce_common::session::{SessionSearchResult, SessionStore, TranscriptEntry};
+use workforce_common::session::{
+    SessionSearchResult, SessionStore, TranscriptEntry, PERSONAL_READ_KEY,
+};
 
 /// Hard cap on result count regardless of caller-supplied `limit`. Keeps a
 /// noisy query from blowing up the agent's context window.
@@ -59,10 +61,16 @@ struct SessionsInput {
 
 /// Whether the caller may read a session.
 enum Scope {
-    Visible,
-    /// An eval's turns are never a source: one question's answer must not be
-    /// found by the next, nor by the person's own chats.
-    Eval,
+    /// One of theirs; `personal` when it read their bank, which marks the
+    /// turn that reads it back ([`PERSONAL_READ_KEY`]).
+    Visible {
+        personal: bool,
+    },
+    /// Never a source: an eval's turns (one question's answer must not be
+    /// found by the next, nor by the person's own chats), a conversation
+    /// left behind, and one that read the person's bank where the bank
+    /// can't be read either.
+    Hidden,
     OtherUser,
     Missing,
 }
@@ -178,11 +186,16 @@ impl SessionsTool {
         // matches. The counters drive the audit log below.
         let mut suppressed_other_user = 0usize;
         let mut suppressed_missing = 0usize;
+        let mut personal = std::collections::HashSet::new();
         let owned: Vec<SessionSearchResult> = raw
             .into_iter()
             .filter(|r| match self.scope(&r.session_id, &identity_id) {
-                Scope::Visible => true,
-                Scope::Eval => false,
+                Scope::Visible { personal: true } => {
+                    personal.insert(r.session_id.clone());
+                    true
+                }
+                Scope::Visible { personal: false } => true,
+                Scope::Hidden => false,
                 Scope::OtherUser => {
                     suppressed_other_user += 1;
                     false
@@ -203,6 +216,7 @@ impl SessionsTool {
             );
         }
 
+        let read_personal = visible.iter().any(|r| personal.contains(&r.session_id));
         let results_json: Vec<serde_json::Value> = visible
             .iter()
             .map(|r| {
@@ -225,6 +239,7 @@ impl SessionsTool {
                 "results": results_json,
                 "suppressed_other_user": suppressed_other_user,
                 "suppressed_missing": suppressed_missing,
+                PERSONAL_READ_KEY: read_personal,
             }),
             start.elapsed().as_millis() as u64,
         ))
@@ -246,17 +261,19 @@ impl SessionsTool {
                 start.elapsed().as_millis() as u64,
             );
         };
-        let entry = match self.scope(&session_id, &identity_id) {
+        let (entry, personal) = match self.scope(&session_id, &identity_id) {
             // A turn's failure is no one's words: not read back as said.
-            Scope::Visible => self
-                .sessions
-                .read_archive_message(&session_id, &message_id)
-                .map(|entry| entry.filter(|e| !e.is_failure())),
-            Scope::Eval | Scope::OtherUser | Scope::Missing => Ok(None),
+            Scope::Visible { personal } => (
+                self.sessions
+                    .read_archive_message(&session_id, &message_id)
+                    .map(|entry| entry.filter(|e| !e.is_failure())),
+                personal,
+            ),
+            Scope::Hidden | Scope::OtherUser | Scope::Missing => (Ok(None), false),
         };
         let elapsed = start.elapsed().as_millis() as u64;
         match entry {
-            Ok(Some(entry)) => ToolResult::success(read_result(&entry), elapsed),
+            Ok(Some(entry)) => ToolResult::success(read_result(&entry, personal), elapsed),
             Ok(None) => ToolResult::failure(
                 format!("No message '{message_id}' in session '{session_id}'"),
                 elapsed,
@@ -267,13 +284,19 @@ impl SessionsTool {
 
     /// The one scope rule both actions apply: the caller's own sessions,
     /// never an eval's, nor one a boss left behind in a scope it no longer
-    /// oversees.
+    /// oversees, nor one that read the person's bank where the bank itself
+    /// may not be read.
     fn scope(&self, session_id: &str, identity_id: &str) -> Scope {
         match self.sessions.get(session_id) {
-            Ok(Some(s)) if crate::turn_extraction::is_eval_channel(&s.channel) => Scope::Eval,
+            Ok(Some(s)) if crate::turn_extraction::is_eval_channel(&s.channel) => Scope::Hidden,
             // Had while a boss in a scope it has left: that scope's.
-            Ok(Some(s)) if crate::memory_fence::left_behind(&s) => Scope::Eval,
-            Ok(Some(s)) if s.owner == identity_id => Scope::Visible,
+            Ok(Some(s)) if crate::memory_fence::left_behind(&s) => Scope::Hidden,
+            Ok(Some(s)) if s.read_personal() && !crate::personal_access::may_read() => {
+                Scope::Hidden
+            }
+            Ok(Some(s)) if s.owner == identity_id => Scope::Visible {
+                personal: s.read_personal(),
+            },
             Ok(Some(_)) => Scope::OtherUser,
             _ => Scope::Missing,
         }
@@ -294,7 +317,7 @@ fn scoped_identity(action: &str, start: Instant) -> Result<String, ToolResult> {
     })
 }
 
-fn read_result(entry: &TranscriptEntry) -> serde_json::Value {
+fn read_result(entry: &TranscriptEntry, personal: bool) -> serde_json::Value {
     serde_json::json!({
         "action": "read",
         "session_id": entry.session_id,
@@ -302,6 +325,7 @@ fn read_result(entry: &TranscriptEntry) -> serde_json::Value {
         "role": entry.role,
         "content": entry.content,
         "timestamp": entry.timestamp.to_rfc3339(),
+        PERSONAL_READ_KEY: personal,
     })
 }
 
@@ -384,6 +408,43 @@ mod tests {
             .filter_map(|r| r["session_id"].as_str())
             .collect();
         assert_eq!(found, [chatted.as_str()]);
+    }
+
+    /// A conversation that read the person's bank is found only where the
+    /// bank itself may be read, and finding it says so.
+    #[tokio::test]
+    async fn a_conversation_that_read_the_bank_is_found_only_where_the_bank_is_read() {
+        use workforce_common::channels::desk::{DeskPlace, DeskScope, DeskTarget};
+        let store = Arc::new(InMemorySessionStore::new());
+        let banked = seed_session(store.as_ref(), "user-A", "Tesco 12.30");
+        let mut marked = store.get(&banked).unwrap().unwrap();
+        marked.mark_read_personal();
+        store.save(&marked).unwrap();
+        let tool = SessionsTool::new(store.clone());
+        let search = || async {
+            tool.execute(serde_json::json!({"action": "search", "query": "Tesco"}))
+                .await
+                .expect("execute")
+                .output
+        };
+        let off_desk = CURRENT_USER_ID.scope("user-A".to_string(), search()).await;
+        assert_eq!(off_desk["count"], 0, "{off_desk}");
+        assert_eq!(off_desk[PERSONAL_READ_KEY], false);
+
+        let desk = DeskScope {
+            target: DeskTarget::of_turn(&DeskPlace::Dm { thread: None }, "desk", None, false),
+            owner: "user-A".into(),
+            attended: true,
+            relayed: false,
+        };
+        let on_desk = CURRENT_USER_ID
+            .scope(
+                "user-A".to_string(),
+                workforce_agent::runner::with_desk(Some(desk), search()),
+            )
+            .await;
+        assert_eq!(on_desk["count"], 1, "{on_desk}");
+        assert_eq!(on_desk[PERSONAL_READ_KEY], true);
     }
 
     #[tokio::test]

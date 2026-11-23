@@ -49,7 +49,7 @@ use std::time::Instant;
 
 use async_trait::async_trait;
 use eyre::Result;
-use workforce_agent::tools::{SurfaceEffect, Tool, ToolDefinition, ToolResult};
+use workforce_agent::tools::{Tool, ToolDefinition, ToolResult};
 use workforce_common::oversight::{Level, Oversight, WorkStyle};
 use workforce_core::computer::Effect;
 
@@ -164,7 +164,11 @@ impl Held {
         }
         matches!(
             name,
-            "filesystem.write" | "filesystem.edit" | "filesystem.delete" | "fs.remove"
+            "filesystem.write"
+                | "filesystem.edit"
+                | "filesystem.delete"
+                | "filesystem.trash"
+                | "fs.remove"
         )
         .then_some(Self::Files)
     }
@@ -249,6 +253,7 @@ impl Bounds {
                 Effect::Exec { .. }
                 | Effect::Write { .. }
                 | Effect::Delete { .. }
+                | Effect::Trash { .. }
                 | Effect::Move { .. } => true,
                 Effect::Session { .. } | Effect::Connector { .. } | Effect::Unknown => {
                     held.is_some()
@@ -273,7 +278,7 @@ impl Bounds {
             }
             (Some(Held::Shell), _) => Some(Doing::Command),
             (_, Effect::None | Effect::Read { .. }) => None,
-            (_, Effect::Write { paths } | Effect::Delete { paths }) => {
+            (_, Effect::Write { paths } | Effect::Delete { paths } | Effect::Trash { paths }) => {
                 touches(&paths.iter().collect::<Vec<_>>()).then_some(Doing::Code)
             }
             (_, Effect::Move { from, to }) => {
@@ -429,13 +434,7 @@ impl Tool for SessionsOnly {
         self.inner.approval_notice()
     }
 
-    fn surface_effect(&self, input: &serde_json::Value) -> Option<SurfaceEffect> {
-        self.inner.surface_effect(input)
-    }
-
-    fn effect(&self, input: &serde_json::Value) -> Effect {
-        self.inner.effect(input)
-    }
+    workforce_agent::delegate_call_facts!(inner);
 
     async fn collect(
         &self,

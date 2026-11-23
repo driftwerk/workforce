@@ -243,6 +243,7 @@ async fn echo_message(
         username: None,
         icon_url: None,
         blocks: None,
+        outside: false,
     };
     if let Err(e) = surface.send_message(&reply).await {
         warn!(error = %e, "Teams echo reply failed");

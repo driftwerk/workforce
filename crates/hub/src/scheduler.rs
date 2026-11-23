@@ -35,11 +35,30 @@ fn named_channel(job: &ScheduledJob) -> Option<&str> {
 
 /// The Desk conversation `job` was made in, which its output goes to unless
 /// it names a Slack channel of its own.
-fn desk_target(job: &ScheduledJob) -> Option<&workforce_common::channels::desk::DeskTarget> {
+pub(crate) fn desk_target(
+    job: &ScheduledJob,
+) -> Option<&workforce_common::channels::desk::DeskTarget> {
     job.deliver_to
         .as_ref()
         .and_then(DeliveryTarget::desk_target)
         .filter(|_| named_channel(job).is_none())
+}
+
+/// The id of the hub's own job `key` for `person`: its stable marker, so a
+/// rename by the person never loses it, nor makes a second.
+fn hub_job_id(key: &str, person: &str) -> String {
+    format!("hub:{key}:{person}")
+}
+
+/// Why `job` may not stand as it is: one that reads the person's bank
+/// answers only in their own Desk conversation and holds nothing beside it
+/// but reads ([`crate::personal_access::job_refusal`]), however it was made
+/// (the scheduler tool, the REST endpoints, a hub's own).
+fn personal_refusal(job: &ScheduledJob) -> Option<&'static str> {
+    let JobPayload::AgentTurn { tools, .. } = &job.payload else {
+        return None;
+    };
+    crate::personal_access::job_refusal(tools.as_deref().unwrap_or_default(), desk_target(job))
 }
 
 /// Whether `job`'s output goes to the Desk conversation it was made in.
@@ -151,6 +170,10 @@ fn creator_of(payer: Payer, agent_id: &str) -> Option<String> {
 fn is_owned(creator: Option<&str>) -> bool {
     creator.is_some_and(|c| !c.starts_with("system:"))
 }
+
+/// The origin a run of a job that isn't its person's own ([`is_own`])
+/// carries.
+pub(crate) const ON_BEHALF_ORIGIN: &str = "scheduler-on-behalf";
 
 /// Whether a job is its run-as person's own: they created it to run as
 /// themselves and nobody else has changed it since
@@ -520,6 +543,9 @@ impl Scheduler {
             plan_hourly_limit: None,
         };
 
+        if let Some(why) = personal_refusal(&job) {
+            return Err(why.to_string());
+        }
         let id = job.id.clone();
         info!(job_id = %id, name = name, deliver_to = ?job.deliver_to, next_run = ?job.next_run, "Job added");
         let mut jobs = self.jobs.write().await;
@@ -594,6 +620,13 @@ impl Scheduler {
             if is_owned(existing.creator_identity_id.as_deref()) {
                 validate_schedule(&schedule, self.min_interval_secs(), &now, self.default_tz)?;
             }
+            let refused = personal_refusal(&ScheduledJob {
+                payload: payload.clone(),
+                ..existing.clone()
+            });
+            if let Some(why) = refused {
+                return Err(why.to_string());
+            }
             existing.description = description.map(str::to_string);
             existing.payload = payload;
             // Re-arm only when the cadence actually changed. Recomputing on an
@@ -623,6 +656,69 @@ impl Scheduler {
         drop(jobs);
         self.add_job_reporting(name, description, schedule, payload, None)
             .await
+    }
+
+    /// Keep the hub's own job `key` for `person` while `job` is given: added
+    /// once, theirs and uncapped, and left as it is while it stands; removed
+    /// once `job` isn't given. Whether anything changed.
+    pub async fn keep_for(
+        &self,
+        person: &str,
+        key: &str,
+        job: Option<crate::hub_core::schedules::HubJob>,
+    ) -> bool {
+        let id = hub_job_id(key, person);
+        let mut jobs = self.jobs.write().await;
+        let held: Vec<String> = jobs
+            .iter()
+            .filter(|j| j.id == id)
+            .map(|j| j.id.clone())
+            .collect();
+        match (held.is_empty(), job) {
+            (false, Some(_)) | (true, None) => false,
+            (false, None) => {
+                jobs.retain(|j| !held.contains(&j.id));
+                self.persist_change(&jobs, crate::scheduler_store::JobChange::Removed(&held))
+                    .await;
+                info!(key, "Hub job removed");
+                true
+            }
+            (true, Some(job)) => {
+                let now = Utc::now();
+                let kept = ScheduledJob {
+                    id,
+                    name: job.name,
+                    description: Some(job.description),
+                    next_run: next_run_time(&job.schedule, &now, self.default_tz),
+                    schedule: job.schedule,
+                    payload: job.payload,
+                    enabled: true,
+                    created_at: now,
+                    last_run: None,
+                    run_count: 0,
+                    is_reminder: false,
+                    delivery_failures: 0,
+                    creator_identity_id: Some(person.to_string()),
+                    run_as_identity_id: None,
+                    bill_to_identity_id: None,
+                    visibility: Some(crate::hub_core::schedules::VISIBILITY_PRIVATE.to_string()),
+                    max_runs: None,
+                    budget_usd: None,
+                    expires_at: None,
+                    deliver_to: Some(job.deliver_to),
+                    edited_by: None,
+                    paused_by_suspension: false,
+                    paused_by_plan: false,
+                    plan_resumed_at: None,
+                    plan_hourly_limit: None,
+                };
+                info!(job_id = %kept.id, key, "Hub job added");
+                jobs.push(kept.clone());
+                self.persist_change(&jobs, crate::scheduler_store::JobChange::Upserted(&kept))
+                    .await;
+                true
+            }
+        }
     }
 
     /// Remove every persisted WorkflowStart job from this scheduler.
@@ -864,6 +960,11 @@ impl Scheduler {
         };
         self.check_edit(&asked_of, &edit, &now)
             .map_err(EditRefused::Invalid)?;
+        let mut edited = asked_of.clone();
+        edit.clone().apply(&mut edited, &now, self.default_tz);
+        if let Some(why) = personal_refusal(&edited) {
+            return Err(EditRefused::Invalid(why.to_string()));
+        }
         if !edit.confirmed {
             if let Some(cost) = self.confirmation_for(&asked_of, &edit).await {
                 return Err(EditRefused::NeedsConfirmation(cost));
@@ -1813,6 +1914,7 @@ impl Scheduler {
                             username: None,
                             icon_url: None,
                             blocks: None,
+                            outside: false,
                         })
                         .await
                     {
@@ -1847,6 +1949,7 @@ impl Scheduler {
                         icon_url: None,
 
                         blocks: None,
+                        outside: false,
                     })
                     .await
                 {
@@ -1898,6 +2001,7 @@ impl Scheduler {
                         username: None,
                         icon_url: None,
                         blocks: None,
+                        outside: false,
                     })
                     .await
                 {
@@ -1947,19 +2051,16 @@ impl Scheduler {
     /// Execute a job and return a run record, answering to the Desk
     /// conversation it was made in, unattended, when it was made in one.
     async fn execute_job(&self, job: &ScheduledJob) -> JobRunRecord {
-        let desk = job
-            .deliver_to
-            .as_ref()
-            .and_then(DeliveryTarget::desk_target)
-            .zip(job.owner())
-            .map(
-                |(target, owner)| workforce_common::channels::desk::DeskScope {
-                    target: target.clone(),
-                    owner: owner.to_string(),
-                    attended: false,
-                    relayed: false,
-                },
-            );
+        // Only where it answers in Desk: a job naming a channel answers
+        // there, and isn't the Desk conversation's work.
+        let desk = desk_target(job).zip(job.owner()).map(|(target, owner)| {
+            workforce_common::channels::desk::DeskScope {
+                target: target.clone(),
+                owner: owner.to_string(),
+                attended: false,
+                relayed: false,
+            }
+        });
         let run = workforce_agent::runner::with_desk(desk, self.execute_job_as(job));
         // An agent's turn on a schedule is background work: the plan guard
         // holds it while the person's plan is nearly full, and counts what
@@ -2219,6 +2320,12 @@ impl Scheduler {
                         ),
                     ),
                 );
+                // Whether the run read outside content: what it answers is
+                // then posted marked so.
+                let armed = workforce_agent::security::monitor::Armed::new();
+                let turn = workforce_agent::runner::with_guard_keeper(Some(armed.keeper()), turn);
+                let turn =
+                    descending_from((!is_own(job)).then(|| ON_BEHALF_ORIGIN.to_string()), turn);
                 let process_result = match run_capped(turn, run_minutes).await {
                     Some(result) => result,
                     // Cut off, as a skip: a long run is not a failing job.
@@ -2340,7 +2447,10 @@ impl Scheduler {
                         info!(job_id = %job.id, name = %job.name, "Agent job executed");
                         // A stopped run's reason is the scheduler's to deliver
                         // whoever owns delivery: the agent posted no result.
-                        let agent_owns_delivery = *agent_owns_delivery && answered;
+                        // An answer of nothing to say is no one's to deliver.
+                        let agent_owns_delivery = answered
+                            && (*agent_owns_delivery
+                                || crate::hub_core::schedules::says_nothing(&response));
                         // A job asked from a voice bridge answers on it, and one
                         // made in Desk in its conversation; the Slack DM below
                         // stays the voice fallback. Self-delivering jobs already
@@ -2379,6 +2489,7 @@ impl Scheduler {
                                             icon_url: None,
 
                                             blocks: None,
+                                            outside: armed.is_armed(),
                                         })
                                         .await
                                     {
@@ -2908,6 +3019,15 @@ impl crate::hosts::SchedulerHost for Scheduler {
         Scheduler::upsert_job(self, name, description, schedule, payload).await
     }
 
+    async fn keep_for(
+        &self,
+        person: &str,
+        key: &str,
+        job: Option<crate::hub_core::schedules::HubJob>,
+    ) -> bool {
+        Scheduler::keep_for(self, person, key, job).await
+    }
+
     async fn update_job_run_as(&self, job_id: &str, identity_id: Option<String>) -> bool {
         Scheduler::update_job_run_as(self, job_id, identity_id).await
     }
@@ -3128,6 +3248,59 @@ mod tests {
 
     async fn test_scheduler() -> Arc<Scheduler> {
         Arc::new(Scheduler::new(test_service().await))
+    }
+
+    /// The hub's own job for a person is added once, theirs, uncapped and
+    /// answering in their Desk, and removed once it isn't wanted; another
+    /// person's is a job of its own.
+    #[tokio::test]
+    async fn a_hub_job_is_kept_once_for_its_person_uncapped_and_removed_when_unwanted() {
+        let sched = test_scheduler().await;
+        let job = crate::desk_connections::approvals::job;
+        assert!(sched.keep_for("ann", "watch", Some(job())).await);
+        assert!(
+            !sched.keep_for("ann", "watch", Some(job())).await,
+            "kept once"
+        );
+        assert!(sched.keep_for("bob", "watch", Some(job())).await);
+        let jobs = sched.list_jobs().await;
+        let ann = jobs.iter().find(|j| j.owner() == Some("ann")).unwrap();
+        assert_eq!(jobs.len(), 2);
+        assert_eq!(
+            (ann.max_runs, ann.budget_usd, ann.expires_at),
+            (None, None, None)
+        );
+        assert!(desk_target(ann).is_some() && ann.next_run.is_some());
+        let renamed = JobEdit {
+            name: Some("My bank reminder".into()),
+            ..JobEdit::default()
+        };
+        sched.update_job(&ann.id, renamed, "ann").await.unwrap();
+        assert!(
+            !sched.keep_for("ann", "watch", Some(job())).await,
+            "a rename is still the same job"
+        );
+        assert!(sched.keep_for("ann", "watch", None).await);
+        assert!(!sched.keep_for("ann", "watch", None).await);
+        let left = sched.list_jobs().await;
+        assert_eq!(left.len(), 1);
+        assert_eq!(left[0].owner(), Some("bob"));
+    }
+
+    #[test]
+    fn an_answer_of_nothing_to_say_is_delivered_nowhere() {
+        use crate::hub_core::schedules::says_nothing;
+        for quiet in [
+            "NOTHING_TO_SAY",
+            " `NOTHING_TO_SAY`\n",
+            "**NOTHING_TO_SAY.**",
+        ] {
+            assert!(says_nothing(quiet), "{quiet}");
+        }
+        assert!(!says_nothing(
+            "NatWest's approval lapses about 3 Feb. NOTHING_TO_SAY"
+        ));
+        assert!(!says_nothing(""));
     }
 
     /// The creator a reminder added inside a turn run as `principal`, and
@@ -6605,6 +6778,92 @@ mod tests {
         )
         .await
         .unwrap()
+    }
+
+    /// A bank job is refused up front however it is made or changed (the
+    /// REST POST and PUT included): it answers only in the person's own
+    /// Desk DM, and holds nothing but the bank's own tools.
+    #[tokio::test]
+    async fn a_bank_job_is_refused_up_front_by_every_path_that_makes_or_changes_it() {
+        use workforce_common::channels::desk::{DeskPlace, DeskScope, DeskTarget};
+        let sched = test_scheduler().await;
+        let with_tools = |tools: &[&str]| JobPayload::AgentTurn {
+            message: "check my spending".into(),
+            channel: None,
+            channel_id: None,
+            thread_id: None,
+            model: None,
+            user_id: None,
+            max_rounds: None,
+            agent_owns_delivery: false,
+            tools: Some(tools.iter().map(|t| t.to_string()).collect()),
+        };
+        let dm = || DeskScope {
+            target: DeskTarget::of_turn(&DeskPlace::Dm { thread: None }, "desk", None, false),
+            owner: "ann".into(),
+            attended: true,
+            relayed: false,
+        };
+        let post = |scope: Option<DeskScope>, tools: &'static [&'static str]| {
+            let sched = Arc::clone(&sched);
+            let payload = with_tools(tools);
+            async move {
+                workforce_agent::runner::with_desk(
+                    scope,
+                    sched.add_job_owned("spend", None, hourly(), payload, Some("ann".into()), None),
+                )
+                .await
+            }
+        };
+        assert_eq!(
+            post(Some(dm()), &["bank", "messaging.send"]).await,
+            Err(crate::personal_access::ONLY_BANK.to_string())
+        );
+        assert_eq!(
+            post(None, &["bank"]).await,
+            Err(crate::personal_access::JOB_OFF_DESK.to_string())
+        );
+        assert_eq!(
+            post(Some(desk_thread()), &["bank"]).await,
+            Err(crate::personal_access::JOB_OFF_DESK.to_string()),
+            "never a room"
+        );
+        assert_eq!(
+            post(Some(dm()), &["bank", "linear.issue_get"]).await,
+            Err(crate::personal_access::ONLY_BANK.to_string()),
+            "not even a read of another service"
+        );
+        let id = post(Some(dm()), &["bank", "bank.balances"]).await.unwrap();
+
+        let put = |tools: &[&str]| JobEdit {
+            tools: Some(tools.iter().map(|t| t.to_string()).collect()),
+            confirmed: true,
+            ..JobEdit::default()
+        };
+        let refused = sched
+            .update_job(&id, put(&["bank", "messaging.send"]), "ann")
+            .await;
+        assert!(matches!(
+            refused,
+            Err(EditRefused::Invalid(ref why)) if why == crate::personal_access::ONLY_BANK
+        ));
+        let kept = sched.get_job(&id).await.unwrap();
+        assert!(matches!(
+            &kept.payload,
+            JobPayload::AgentTurn { tools: Some(t), .. } if t == &["bank", "bank.balances"]
+        ));
+        let off_bank = sched.update_job(&id, put(&["messaging.send"]), "ann").await;
+        assert!(matches!(off_bank, Ok(Some(_))), "without the bank, as ever");
+
+        let plain = post(None, &["linear"]).await;
+        assert!(plain.is_ok());
+        let banked = sched
+            .update_job(&plain.unwrap(), put(&["bank"]), "ann")
+            .await;
+        assert!(matches!(
+            banked,
+            Err(EditRefused::Invalid(ref why)) if why == crate::personal_access::JOB_OFF_DESK
+        ));
     }
 
     /// A job the hub registers from code, such as a workflow's schedule

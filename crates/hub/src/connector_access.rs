@@ -209,6 +209,7 @@ mod tests {
         "email.get_attachment",
         "email.search",
         "email.contacts",
+        "email.unsubscribe_lists",
         "jira.search",
         "jira.get_issue",
         "jira.list_comments",
@@ -306,6 +307,10 @@ mod tests {
         "freeagent.users_list",
         "freeagent.profit_and_loss_summary",
         "freeagent.workspaces",
+        "bank.workspaces",
+        "bank.accounts",
+        "bank.balances",
+        "bank.transactions",
     ];
 
     fn registered(connector: &str) -> Vec<&'static str> {

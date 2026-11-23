@@ -219,6 +219,7 @@ fn primary(connector: &str) -> Option<&'static str> {
         "slack" => "slack.bot_token",
         "datadog" => "skills/datadog/api_key",
         "metabase" => "skills/metabase/api_key",
+        "bank" => "skills/bank/api_key",
         "freeagent" => "skills/freeagent/workspaces/default/refresh_token",
         _ => return None,
     })

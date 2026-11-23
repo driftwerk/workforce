@@ -260,6 +260,27 @@ impl DeskStore {
         rows.iter().map(event).collect()
     }
 
+    /// The first `limit` events about the subjects in `ids` from `since` on,
+    /// oldest first, but those in `skip`: a reader that skips what it read
+    /// misses none and reads none twice, however many share a time.
+    pub async fn events_from(
+        &self,
+        since: DateTime<Utc>,
+        skip: &[String],
+        ids: &[String],
+        limit: i64,
+    ) -> Result<Vec<Event>> {
+        let client = self.pool().get().await?;
+        let rows = client
+            .query(
+                "SELECT * FROM activity WHERE subject ->> 'id' = ANY($2) \
+                 AND at >= $1 AND NOT (id = ANY($4)) ORDER BY at, id LIMIT $3",
+                &[&since, &ids, &limit, &skip],
+            )
+            .await?;
+        rows.iter().map(event).collect()
+    }
+
     /// The events of the subjects in `ids` that can be open needs, oldest
     /// first: the "Needs you" of each request in `approvals`, and each
     /// subject's latest question, however old.
@@ -745,6 +766,56 @@ mod tests {
                 serde_json::to_value(&placed).unwrap()["place"],
                 serde_json::json!({ "kind": "room", "room": room, "thread": null })
             );
+        })
+        .await;
+    }
+
+    /// A reader that skips what it read misses none and reads none twice:
+    /// the oldest come first, however many share a time.
+    #[tokio::test]
+    async fn events_from_a_time_on_are_the_oldest_and_none_skipped_is_read_again() {
+        with_test_pool(build_pool, |pool| async move {
+            DeskStore::migrate(&pool).await.unwrap();
+            let store = DeskStore::from_pool(pool);
+            let (scout, other) = (
+                Party::agent("scout", "Scout"),
+                Party::agent("other", "Other"),
+            );
+            let from = Utc::now() - chrono::Duration::minutes(1);
+            for (i, subject) in [&scout, &scout, &other, &scout, &scout]
+                .into_iter()
+                .enumerate()
+            {
+                let mut e = Event::new(
+                    Kind::Nudged,
+                    scout.clone(),
+                    Some(subject.clone()),
+                    format!("event {i}"),
+                );
+                // Events 0 to 2 share a time.
+                e.at = from + chrono::Duration::seconds(i.saturating_sub(2) as i64);
+                store.add_event(&e).await.unwrap();
+            }
+            let ids = ["scout".to_string()];
+            let texts = |es: &[Event]| es.iter().map(|e| e.text.clone()).collect::<Vec<_>>();
+            let first = store.events_from(from, &[], &ids, 1).await.unwrap();
+            assert_eq!(first.len(), 1);
+            let mut skip: Vec<String> = first.iter().map(|e| e.id.clone()).collect();
+            let next = store.events_from(from, &skip, &ids, 3).await.unwrap();
+            let mut read = texts(&first);
+            read.extend(texts(&next));
+            read.sort();
+            assert_eq!(
+                read,
+                ["event 0", "event 1", "event 3", "event 4"],
+                "each once"
+            );
+            skip.extend(next.iter().map(|e| e.id.clone()));
+            assert!(store
+                .events_from(from, &skip, &ids, 3)
+                .await
+                .unwrap()
+                .is_empty());
         })
         .await;
     }

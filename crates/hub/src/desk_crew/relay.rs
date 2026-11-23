@@ -80,7 +80,9 @@ pub struct RelayCall {
     /// The overseer's own level and switches here: the machine decides at
     /// no more than these and its grant's.
     pub level: workforce_common::oversight::Level,
-    pub act: workforce_common::oversight::Act,
+    /// Its switches, and whether it takes on every session
+    /// ([`super::served::Ceiling::relayed_act`]).
+    pub act: Value,
     /// How long, in milliseconds as it is taken, this hub still waits for
     /// its answer: Desk's native side sends nothing it can't carry in that
     /// time, so a call the boss was told may not have been done is never
@@ -246,7 +248,7 @@ impl CrewHub {
             .key(),
             link_id: RELAY_LINK,
             level: ceiling.level,
-            act: ceiling.act,
+            act: ceiling.relayed_act(),
             left_ms: 0,
         };
         // Too large to carry: never queued, so nothing of it is done.
@@ -256,7 +258,12 @@ impl CrewHub {
             )));
         }
         match self.relay.send(call, wait).await {
-            Ok(answer) => Ok(answer),
+            Ok(answer) => {
+                self.machine_reached
+                    .lock()
+                    .insert(machine.to_string(), std::time::Instant::now());
+                Ok(answer)
+            }
             // Desk took it: it may have been done there. Not to be sent
             // again as new.
             Err(Unsent::Taken) if tool == "desk.run" => Err(MachineRefused::Unknown(format!(
@@ -267,6 +274,11 @@ impl CrewHub {
             ))),
             Err(Unsent::NotPolling | Unsent::Full | Unsent::NotTaken) => Err(unreached()),
         }
+    }
+
+    /// When `machine` last answered a call, of any kind.
+    pub(crate) fn machine_reached(&self, machine: &str) -> Option<std::time::Instant> {
+        self.machine_reached.lock().get(machine).copied()
     }
 
     /// Whether Desk's native side relays now: it asked for calls lately.
@@ -286,6 +298,16 @@ impl CrewHub {
     pub(crate) fn relay_answer(&self, id: Uuid, answer: RelayAnswer) -> bool {
         self.relay.answer(id, answer)
     }
+}
+
+/// What a machine's refusal of `tool` means when it is one an older Desk
+/// there doesn't serve: that Desk there needs updating.
+pub(crate) fn older(machine: &str, tool: &str, answer: &RelayAnswer) -> Option<String> {
+    (answer.status == ServedStatus::Refused
+        && answer.body["error"].as_str() == Some(&super::served::not_served(tool)))
+    .then(|| {
+        format!("Desk on {machine} is older and can't do {tool} yet: tell the person to update Desk there.")
+    })
 }
 
 /// The machine's parts of an overview, beside this Mac's: each machine's
@@ -344,11 +366,13 @@ pub(crate) struct TokenQuery {
 }
 
 /// What Desk asks the machines' grants with: `plans=1` from one that
-/// carries plans' grants.
+/// carries plans' grants, `ungrouped=1` from one that carries machines'
+/// Ungrouped grants.
 #[derive(Deserialize)]
 struct GrantsQuery {
     token: Option<String>,
     plans: Option<String>,
+    ungrouped: Option<String>,
 }
 
 /// Why a request isn't Desk's native side's, when it isn't: only the hub's
@@ -485,15 +509,14 @@ async fn served(State(s): S, h: HeaderMap, Query(q): Query<TokenQuery>, body: By
     if !workforce_desk::grant::group_id_ok(&r.group) {
         return bad("that can't be a group");
     }
-    let ceiling = super::served::Ceiling {
-        level,
-        act: super::served::act_of(&r.act),
-    };
+    let ceiling = super::served::Ceiling::of(level, &r.act);
     // The home taking its boss's decisions at Act fully, and answering
     // them ([`super::relayed_decide`]): the Mac hub's own calls, never a
     // crew tool's.
     use super::relayed_decide::{DECIDED, TAKE};
+    use super::relayed_work::WORK_TAKE;
     let (status, body) = match r.tool.as_str() {
+        WORK_TAKE => s.crew.work_take(&boss, &r.group, &r.input).await,
         TAKE => {
             s.crew
                 .take_relayed(&boss, &r.group, &r.input, &ceiling)
@@ -526,7 +549,8 @@ async fn served(State(s): S, h: HeaderMap, Query(q): Query<TokenQuery>, body: By
 /// native side to carry to them.
 async fn machine_grants(State(s): S, h: HeaderMap, Query(q): Query<GrantsQuery>) -> Response {
     native!(s, h, q.token.as_deref());
-    match s.crew.machine_grants(q.plans.as_deref() == Some("1")) {
+    let said = |f: &Option<String>| f.as_deref() == Some("1");
+    match s.crew.machine_grants(said(&q.plans), said(&q.ungrouped)) {
         Some(w) => Json(w).into_response(),
         // Not known yet: Desk writes nothing, and deletes nothing, until it is.
         None => (
