@@ -256,6 +256,47 @@ async fn left_to_person(d: &Desk, since: chrono::DateTime<chrono::Utc>, id: uuid
 /// At Act fully no job guard holds a next step back: one that looks like
 /// it can't be taken back and says no job goes to the session at once,
 /// with no full turn to declare its job and nothing left to the person.
+/// A turn's end with a long reply: the call that judges it reads its first
+/// part and is told how to read on, never a silently cut reply.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_long_reply_is_judged_on_its_first_part_and_says_how_to_read_on() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(dir.path()).unwrap();
+        let (_overseer, crew, d, llm) = overseeing(&base, pool, "ok", &theirs(), &[]).await;
+        crew.focused_turn_ends();
+        d.boss_bounds_with(workforce_desk::charge::Bounds {
+            home: base.clone(),
+            ..Default::default()
+        });
+        decides(&llm, "Audited the modules", "DONE: the audit is done").await;
+        eventually("Desk to know it is unbound", async || {
+            d.boss_unbound("desk").then_some(())
+        })
+        .await;
+        let s = new_session(&d, &base, "harbor").await;
+        let url = hook_url(&base, s.id).await;
+        let checked: String = (0..300)
+            .map(|i| format!(" Module {i:03} checked."))
+            .collect();
+        ends(&url, &format!("Audited the modules.{checked}")).await;
+        let call = eventually("the turn's end judged", async || {
+            calls_about(&llm, "Audited the modules")
+                .await
+                .into_iter()
+                .next()
+        })
+        .await;
+        assert!(
+            call.contains("Module 100 checked"),
+            "past the card's 600 characters"
+        );
+        assert!(!call.contains("Module 250 checked"), "one part of it");
+        assert!(call.contains("reply_from: 3000, turn: 1"), "how to read on");
+    })
+    .await;
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_next_step_that_says_no_job_goes_at_once_at_act_fully() {
     with_test_pool(workforce_desk::store::build_pool, |pool| async move {

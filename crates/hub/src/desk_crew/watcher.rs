@@ -571,7 +571,12 @@ impl CrewHub {
                 },
                 event.text
             ),
-            false => format!("{} {}", who(subject), event.text),
+            false => format!(
+                "{} {}{}",
+                who(subject),
+                event.text,
+                self.reply_says_more(event).unwrap_or_default()
+            ),
         };
         wanted.then(|| Trigger {
             line,
@@ -581,6 +586,17 @@ impl CrewHub {
             group: event.group.clone(),
             handed: None,
             routine: false,
+        })
+    }
+
+    /// What a turn's end `event`, which says its reply's first sentence,
+    /// adds when the reply says more: where to read it.
+    fn reply_says_more(&self, event: &Event) -> Option<String> {
+        let session = finished_session(event)?;
+        let v = self.desk.view(session).ok()?;
+        let reply = self.desk.reply(session).map(|r| r.text).or(v.last_reply)?;
+        (crew::one_line(&reply, usize::MAX) != reply.trim()).then(|| {
+            format!(" (its reply says more: read it with crew.history, session_id {session})")
         })
     }
 

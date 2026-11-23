@@ -790,6 +790,9 @@ struct State {
     /// What each session's process had running when it ended, and when:
     /// told to it, by name where known, when it runs again.
     cut_off: HashMap<Uuid, CutOff>,
+    /// Each session's last reply as Desk heard it whole (its card keeps a
+    /// clipped one): what its boss reads.
+    replies: HashMap<Uuid, crew::Reply>,
     /// Sessions run again after a restart that stopped work of theirs,
     /// until the turn that looks at it ends: what they are on now, and what
     /// was stopped, which a process ending before it is told again.
@@ -3406,6 +3409,51 @@ impl Desk {
             .ok_or(DeskError::NotFound)
     }
 
+    /// `reply`, the turn `id` just ended on, heard whole.
+    fn replied(&self, id: Uuid, reply: &str) {
+        let mut st = self.0.state.lock();
+        let turn = st.replies.get(&id).map_or(1, |r| r.turn + 1);
+        st.replies.insert(
+            id,
+            crew::Reply {
+                text: reply.trim().to_string(),
+                turn,
+            },
+        );
+    }
+
+    /// `id`'s last reply as Desk heard it whole, if it did.
+    pub fn reply(&self, id: Uuid) -> Option<crew::Reply> {
+        self.0.state.lock().replies.get(&id).cloned()
+    }
+
+    /// What `v`'s boss reads of its last reply, from character `from`, at
+    /// most `most` characters ([`crew::reply_for_boss`]).
+    pub fn reply_for_boss(&self, v: &SessionView, from: usize, most: usize) -> Option<String> {
+        crew::reply_for_boss(
+            self.reply(v.id).as_ref(),
+            v.last_reply.as_deref(),
+            self.record(v.id).is_ok_and(|r| r.transcript.is_some()),
+            from,
+            most,
+        )
+    }
+
+    /// A page of `v`'s last reply, as crew.history reads it: from character
+    /// `from` of the turn `turn` ended, which a later turn's reply replaced
+    /// is said to be gone, never read on in the new one.
+    pub fn reply_read(&self, v: &SessionView, from: usize, turn: Option<u64>) -> Option<String> {
+        let now = self.reply(v.id).map(|r| r.turn);
+        match turn.filter(|t| now != Some(*t)) {
+            Some(_) => Some(
+                "[its reply changed since you began reading it: a later turn ended. Read the new \
+                 one from the start (reply_from: 0).]"
+                    .into(),
+            ),
+            None => self.reply_for_boss(v, from, crew::REPLY_PAGE),
+        }
+    }
+
     pub fn view(&self, id: Uuid) -> Result<SessionView, DeskError> {
         let st = self.0.state.lock();
         st.records
@@ -4402,6 +4450,7 @@ impl Desk {
             st.working_noted.remove(&id);
             st.acted.remove(&id);
             st.cut_off.remove(&id);
+            st.replies.remove(&id);
             st.restarted.remove(&id);
             st.exited.remove(&id);
             st.deps.remove(&id);
@@ -7107,6 +7156,9 @@ impl Desk {
                 .contains_key(&id)
                 .then(|| Self::raw_running(&st, id))
         };
+        if let Some(reply) = &said {
+            self.replied(id, reply);
+        }
         self.change(id, |r, mut l| {
             // The person spoke while it was read: that answers it.
             let asked = asked.filter(|_| l.as_ref().is_some_and(|l| l.prompts == prompts));
@@ -8063,6 +8115,9 @@ impl Desk {
             // are in control of it.
             let for_boss = matches!(&event, CodexEvent::Question { asks: Some(_), .. })
                 && self.holds_dialog_for_boss(id);
+            if let CodexEvent::Reply(text) = &event {
+                self.replied(id, text);
+            }
             self.change(id, |r, mut l| {
                 r.cli_session_id.get_or_insert_with(|| thread.clone());
                 match event {
@@ -12054,6 +12109,78 @@ mod tests {
             let v = d.view(s.id).unwrap();
             assert_eq!((v.state, v.asked), (SessionState::Done, None));
             assert!(logs(&logged, |ops| last_question(ops) == Some((Outcome::Finished, None))).await);
+        })
+        .await;
+    }
+
+    /// A turn's long reply: its card keeps its start, its boss reads it
+    /// whole, page by page; a later turn's reply replaces it, and reading
+    /// on in the old one says so.
+    #[tokio::test]
+    async fn a_long_reply_is_kept_whole_for_its_boss_and_read_on_in_pages() {
+        with_test_pool(build_pool, |pool| async move {
+            let dir = tempfile::tempdir().unwrap();
+            let d = desk(pool, dir.path()).await;
+            let s = new_session(&d, dir.path()).await;
+            let report: String = (0..1_500)
+                .map(|i| format!("Checked module {i:04}: no change needed.\n"))
+                .collect();
+            post(
+                &d,
+                s.id,
+                json!({"hook_event_name": "UserPromptSubmit", "prompt": "audit the modules"}),
+            )
+            .await;
+            post(
+                &d,
+                s.id,
+                json!({"hook_event_name": "Stop", "last_assistant_message": report}),
+            )
+            .await;
+            let v = d.view(s.id).unwrap();
+            assert_eq!(
+                v.last_reply,
+                Some(transcript::clip(&report)),
+                "its card keeps its start"
+            );
+            let mut from = 0;
+            let mut read = String::new();
+            loop {
+                let page = d
+                    .reply_read(&v, from, Some(1).filter(|_| from > 0))
+                    .unwrap();
+                let (said, note) = page.split_once("\n[").unwrap();
+                read.push_str(said);
+                if note.contains("the end of its reply") {
+                    break;
+                }
+                assert!(
+                    note.contains(&format!("reply_from: {}, turn: 1", from + crew::REPLY_PAGE)),
+                    "{note}"
+                );
+                from += crew::REPLY_PAGE;
+            }
+            assert_eq!(read, report.trim());
+
+            post(
+                &d,
+                s.id,
+                json!({"hook_event_name": "UserPromptSubmit", "prompt": "and the tests?"}),
+            )
+            .await;
+            post(
+                &d,
+                s.id,
+                json!({"hook_event_name": "Stop", "last_assistant_message": "All green."}),
+            )
+            .await;
+            let v = d.view(s.id).unwrap();
+            assert!(d
+                .reply_read(&v, crew::REPLY_PAGE, Some(1))
+                .unwrap()
+                .contains("its reply changed since you began reading it"));
+            assert_eq!(d.reply_read(&v, 0, None).as_deref(), Some("All green."));
+            assert_eq!(d.reply(s.id).map(|r| r.turn), Some(2));
         })
         .await;
     }

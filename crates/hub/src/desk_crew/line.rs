@@ -770,7 +770,12 @@ impl CrewHub {
                 "folder": v.cwd,
                 "goal": v.goal,
                 "state": v.state,
-                "last_reply": v.last_reply.as_deref().map(|r| crew::clip(r, 1500)),
+                // A turn's end brings its reply's first page; a line turn its
+                // start, and the way to read on.
+                "last_reply": self.desk.reply_for_boss(&v, 0, match ended.is_empty() {
+                    true => crew::REPLY_KEPT,
+                    false => crew::REPLY_PAGE,
+                }),
             })),
             Err(_) => format!("session {session}"),
         };

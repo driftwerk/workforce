@@ -49,13 +49,17 @@ pub fn last_rows(text: &str) -> String {
     rows[rows.len().saturating_sub(MAX_ROWS)..].join("\n")
 }
 
-/// `text` cut to `max` characters, said so.
+/// `text` cut to `max` characters, said so, with how much.
 pub fn capped(text: &str, max: usize) -> String {
-    if text.chars().count() <= max {
+    let total = text.chars().count();
+    if total <= max {
         return text.to_string();
     }
-    let kept: String = text.chars().take(max.saturating_sub(40)).collect();
-    format!("{kept}\n[cut: more than {max} characters]")
+    let kept: String = text.chars().take(max.saturating_sub(60)).collect();
+    format!(
+        "{kept}\n[cut: {} of {total} characters shown]",
+        kept.chars().count()
+    )
 }
 
 /// `r` with its words and what it was read from left out, short of
@@ -161,7 +165,11 @@ mod tests {
         let long = "x".repeat(MAX_CHARS + 10);
         let c = capped(&long, MAX_CHARS);
         assert!(c.chars().count() <= MAX_CHARS + 1);
-        assert!(c.contains("[cut:"));
+        assert!(c.ends_with(&format!(
+            "[cut: {} of {} characters shown]",
+            MAX_CHARS - 60,
+            MAX_CHARS + 10
+        )));
         assert_eq!(capped("short", MAX_CHARS), "short");
     }
 

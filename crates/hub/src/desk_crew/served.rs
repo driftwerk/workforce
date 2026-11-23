@@ -1075,8 +1075,9 @@ impl CrewHub {
                     "name": v.label(), "goal": v.goal, "cwd": v.cwd, "state": v.state,
                 });
                 if shows(Part::Reply) {
+                    let (from, turn) = super::tools::reply_asked(input);
                     said["last_prompt"] = json!(v.last_prompt);
-                    said["last_reply"] = json!(v.last_reply);
+                    said["last_reply"] = json!(self.desk.reply_read(&v, from, turn));
                 }
                 if shows(Part::Question) {
                     said["pending"] = json!(v.pending);

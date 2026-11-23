@@ -620,11 +620,12 @@ impl CrewHub {
                     wheel: c.wheel,
                     goal: v.goal.clone(),
                     folder: v.cwd.clone(),
-                    last_reply: v
-                        .last_reply
-                        .as_deref()
-                        .filter(|_| replies)
-                        .map(|r| workforce_desk::crew::clip(r, 1500)),
+                    last_reply: replies
+                        .then(|| {
+                            self.desk
+                                .reply_for_boss(v, 0, workforce_desk::crew::REPLY_PAGE)
+                        })
+                        .flatten(),
                     answered: answered.contains(&c.session),
                     item,
                 };
