@@ -134,6 +134,27 @@ mod tests {
         assert_eq!(effect("google.chat.messages_list", json!({})), None);
     }
 
+    #[test]
+    fn a_tool_that_returns_what_someone_wrote_says_so() {
+        let tools = build_all(context());
+        let outside: HashSet<&str> = tools
+            .iter()
+            .filter(|t| t.reads_outside_content())
+            .map(|t| t.name())
+            .collect();
+        assert_eq!(
+            outside,
+            HashSet::from_iter(
+                crate::adapters::google::tool_helpers::OUTSIDE_READS
+                    .iter()
+                    .copied()
+            ),
+            "every listed read is a real tool"
+        );
+        assert!(outside.contains("google.calendar.event_get"));
+        assert!(!outside.contains("google.calendar.create"));
+    }
+
     /// Regression: the `tool_names()` enumeration on the parent
     /// `adapters::google` module must list every tool that `build_all()`
     /// actually registers, plus `google.setup`. Drift here breaks the

@@ -9,6 +9,7 @@ pub mod export;
 pub mod ffmpeg;
 pub mod llm;
 pub mod model_router;
+pub mod personal;
 pub mod rollover;
 pub mod runner;
 pub mod security;

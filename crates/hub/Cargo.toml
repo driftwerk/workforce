@@ -21,7 +21,7 @@ workforce-decide = { path = "../decide" }
 workforce-orchestrator = { path = "../orchestrator" }
 workforce-memory = { path = "../memory" }
 workforce-lessons = { path = "../lessons" }
-workforce-skills = { path = "../skills", features = ["slack", "teams", "github", "google", "linear", "jira", "datadog", "metabase", "hubspot", "notion", "browser", "obscura", "email", "postmark", "sendgrid", "xero", "freeagent", "spotify"] }
+workforce-skills = { path = "../skills", features = ["slack", "teams", "github", "google", "linear", "jira", "datadog", "bank", "metabase", "hubspot", "notion", "browser", "obscura", "email", "postmark", "sendgrid", "xero", "freeagent", "spotify"] }
 workforce-distributed = { path = "../distributed" }
 workforce-games = { path = "../games" }
 workforce-desk = { path = "../desk", optional = true }

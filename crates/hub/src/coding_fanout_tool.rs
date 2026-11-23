@@ -977,6 +977,7 @@ impl Executor {
             username: None,
             icon_url: None,
             blocks: None,
+            outside: false,
         };
         let mut posted = Vec::new();
         for surface in self.service.surface_registry.read().await.all() {

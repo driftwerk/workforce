@@ -89,11 +89,15 @@ pub const DENIED_TOOL_PREFIXES: &[&str] = &[
     "jobs",
 ];
 
-/// Whether `tool` falls in a family that can never be granted to a skill.
+/// Whether `tool` falls in a family that can never be granted to a skill:
+/// one of [`DENIED_TOOL_PREFIXES`], or a person's private connector's
+/// ([`PERSONAL`](workforce_common::connector_binding::PERSONAL)).
 pub fn is_denied_tool(tool: &str) -> bool {
     DENIED_TOOL_PREFIXES
         .iter()
         .any(|p| tool == p.trim_end_matches('.') || tool.starts_with(p))
+        || workforce_common::connector_binding::is_personal(tool)
+        || workforce_common::connector_binding::PERSONAL.contains(&tool)
 }
 
 /// A tool declared in the manifest.
@@ -741,6 +745,7 @@ allowed_hosts = []
             "exec.run",
             "workflow",
             "system.logs",
+            "bank.transactions",
         ] {
             let toml = PERMISSIONED_SKILL.replace("slack.post_message", denied);
             let err = SkillManifest::from_toml(&toml)
@@ -778,6 +783,9 @@ allowed_hosts = []
         assert!(is_denied_tool("settings"));
         assert!(is_denied_tool("wasm_skill.install"));
         assert!(!is_denied_tool("slack.post_message"));
+        assert!(is_denied_tool("bank"));
+        assert!(is_denied_tool("bank.transactions"));
+        assert!(!is_denied_tool("banking.x"));
         assert!(!is_denied_tool("http.request"));
     }
 

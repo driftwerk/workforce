@@ -454,6 +454,35 @@ impl DeskStore {
             .collect()
     }
 
+    /// Each question still open to a party whose id starts with `prefix`,
+    /// by its id, that party's and the session's that asked it (none when
+    /// no session did): no more of it read.
+    pub async fn line_open_asks_to(
+        &self,
+        prefix: &str,
+    ) -> Result<Vec<(Uuid, String, Option<Uuid>)>> {
+        let client = self.pool().get().await?;
+        client
+            .query(
+                "SELECT id, recipient ->> 'id' AS party, \
+                 CASE WHEN sender ->> 'kind' = 'session' THEN sender ->> 'id' END AS asker \
+                 FROM line_messages WHERE kind = 'ask' AND asked = 'open' \
+                 AND left(recipient ->> 'id', length($1)) = $1 ORDER BY at",
+                &[&prefix],
+            )
+            .await?
+            .iter()
+            .map(|r| {
+                let asker: Option<String> = r.try_get("asker")?;
+                Ok((
+                    r.try_get("id")?,
+                    r.try_get("party")?,
+                    asker.and_then(|a| a.parse().ok()),
+                ))
+            })
+            .collect()
+    }
+
     /// The asker stopped waiting for the answer to `ask` and went on
     /// without it. With `on_you`, only a question waiting on the person
     /// moves (asked of them, or given to them); else any still open. One
@@ -960,6 +989,32 @@ mod tests {
                 "a second copy changes nothing"
             );
             assert!(s.line_inbox(&to.to_string()).await.unwrap().is_empty());
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn the_questions_open_to_a_kind_of_party_are_said_with_who_asked_them() {
+        with_test_pool(crate::store::build_pool, |pool| async move {
+            let s = DeskStore::with_pool(pool).await.unwrap();
+            let session = Uuid::new_v4();
+            let asker = session_party(session);
+            let home = ask(asker.clone(), Party::manager("home/desk", "Desk"));
+            let mut given = ask(asker.clone(), Party::manager("home/desk", "Desk"));
+            given.asked = Some(Asked::Escalated);
+            let here = ask(asker, Party::manager("homer", "Homer"));
+            let boss = ask(
+                Party::manager("mia", "Mia"),
+                Party::manager("home/desk", "Desk"),
+            );
+            for m in [&home, &given, &here, &boss] {
+                s.put_line(m).await.unwrap();
+            }
+            let to = "home/desk".to_string();
+            assert_eq!(
+                s.line_open_asks_to("home/").await.unwrap(),
+                [(home.id, to.clone(), Some(session)), (boss.id, to, None)]
+            );
         })
         .await;
     }

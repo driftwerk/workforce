@@ -14,7 +14,7 @@ use eyre::Result;
 use serde::Deserialize;
 
 use workforce_agent::tools::{Tool, ToolResult};
-use workforce_orchestrator::monitor::{MonitorDefinition, MonitorKey};
+use workforce_orchestrator::monitor::{MonitorDefinition, MonitorKey, MonitorMeta};
 use workforce_orchestrator::workflow_store::{EditContext, KIND_MONITOR};
 
 use crate::authz::{always_admin, IsAdminFn};
@@ -403,6 +403,14 @@ impl MonitorTool {
         }
     }
 
+    /// The monitors this turn may see that read mail, with their owners.
+    pub(crate) async fn mail_monitors(&self) -> Vec<(MonitorMeta, Option<String>)> {
+        let scope =
+            DefListing::for_turn(&self.write_auth, self.runtime.def_store(), KIND_MONITOR).await;
+        let summaries = self.list_visible(&scope).await;
+        super::sort_rule::mail_monitors(&*self.runtime, summaries).await
+    }
+
     async fn summary(&self, id: &str, owner: Option<&str>) -> Option<MonitorSummary> {
         match &self.engine {
             Some(engine) => engine.summary_of(id, owner).await,
@@ -656,32 +664,22 @@ impl MonitorTool {
             Err(refused) => return Ok(refused),
         };
         let owner = grant.owner;
-        let result = self
-            .runtime
-            .set_definition_enabled(
-                &id,
-                owner.as_deref(),
-                enabled,
-                EditContext::new(&self.edited_via(), grant.actor.as_deref()),
-            )
-            .await;
+        let via = self.edited_via();
+        let edit = EditContext::new(&via, grant.actor.as_deref());
+        let result = match &self.engine {
+            Some(engine) => {
+                engine
+                    .set_enabled(&id, owner.as_deref(), enabled, edit)
+                    .await
+            }
+            None => self
+                .runtime
+                .set_definition_enabled(&id, owner.as_deref(), enabled, edit)
+                .await
+                .map(|(_, def)| def),
+        };
         match result {
-            Ok((was_enabled, def)) => {
-                // A disabled→enabled resume starts this monitor from now — the
-                // paused gap is the owner's decision, and no other monitor on
-                // the channel is affected.
-                if let Some(engine) = &self.engine {
-                    let mut previous = def.clone();
-                    previous.monitor.enabled = was_enabled;
-                    engine
-                        .apply_catch_up_policy(
-                            &MonitorKey::new(&id, owner.as_deref()),
-                            &def,
-                            Some(&previous),
-                        )
-                        .await;
-                    engine.reconcile_personas().await;
-                }
+            Ok(_) => {
                 let mut output = serde_json::json!({ "monitor_id": id, "enabled": enabled });
                 merge(&mut output, self.watch_report(&id, owner.as_deref()).await);
                 Ok(ToolResult::success(
@@ -852,6 +850,7 @@ input = { gmail_id = "{{id}}", subject = "{{json:/snippet}}" }
 # prompt = "Summarise this and tell the user what changed."
 # deliver_to = "@U123"             # channel id or @user DM
 # surface = "slack"                # as for notify
+# tools = ["email.move"]           # optional: anything beyond reading and posting to deliver_to
 # --- tell the person in Desk (only on a hub that runs Desk; a server hub refuses it) ---
 # type = "notify"                  # or agent_task, whose answer is what they read
 # surface = "desk"

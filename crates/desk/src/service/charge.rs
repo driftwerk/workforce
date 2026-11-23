@@ -1668,16 +1668,25 @@ impl Desk {
         )
         .await;
         // What it asked its boss and still waits on is the person's now: no
-        // boss answers it.
-        if by.party.kind == PartyKind::You {
-            self.asks_to_person(id, &c_boss).await;
+        // boss answers it. So too when a served boss is let go, by Desk (its
+        // grant no longer live) or by itself: its home answers it no more.
+        let why = match by.party.kind {
+            PartyKind::You => Some("You took this session back, so its question is yours."),
+            PartyKind::Desk if served => {
+                Some("Its boss no longer runs this session, so its question is yours.")
+            }
+            _ if served => Some("Its boss let this session go, so its question is yours."),
+            _ => None,
+        };
+        if let Some(why) = why {
+            self.asks_to_person(id, &c_boss, by, why).await;
         }
         Ok(shown)
     }
 
     /// Gives the person every question `id` asked `boss` on its line that
-    /// still waits: they took the session back, so no boss answers it.
-    async fn asks_to_person(&self, id: Uuid, boss: &str) {
+    /// still waits, `by` saying `why`: no boss answers it now.
+    async fn asks_to_person(&self, id: Uuid, boss: &str, by: &By, why: &str) {
         let asks = match self.0.store.line_open_asks(Some(boss)).await {
             Ok(asks) => asks,
             Err(e) => {
@@ -1690,11 +1699,11 @@ impl Desk {
             .filter(|a| a.from_session() == Some(id) && a.asked == Some(crate::line::Asked::Open))
         {
             let why = crate::line::Escalation {
-                why: "You took this session back, so its question is yours.".into(),
+                why: why.into(),
                 options: Vec::new(),
                 draft: None,
             };
-            if let Err(e) = self.line_escalate(ask.id, &By::you(), why).await {
+            if let Err(e) = self.line_escalate(ask.id, by, why).await {
                 tracing::info!(session = %id, error = %e, "a released session's question wasn't given to the person");
             }
         }

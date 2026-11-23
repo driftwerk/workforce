@@ -538,30 +538,9 @@ mod tests {
 
     fn ctx(agent: Option<&str>, id: Option<&str>) -> SessionContext {
         SessionContext {
-            key: None,
             id: id.map(String::from),
-            user_id: None,
-            billing_identity: None,
-            platform_user_id: None,
-            channel_id: None,
-            thread_id: None,
             agent_id: agent.map(String::from),
-            workspace_id: None,
-            voice_channel: None,
-            automated_origin: None,
-            chat: false,
-            memory_fence: None,
-            active_mcp_envs: Default::default(),
-            active_environment: None,
-            active_skill_instances: Default::default(),
-            artifact_ttl: None,
-            artifact_store: None,
-            last_user_comm: None,
-            artifact_scope: None,
-            secret_policy: None,
-            served: None,
-            desk: None,
-            work: None,
+            ..SessionContext::default()
         }
     }
 

@@ -88,6 +88,40 @@ pub enum EmailError {
         /// Error detail.
         detail: String,
     },
+    /// The connection to the IMAP server dropped before a command's answer.
+    Disconnected {
+        /// The command that was in flight.
+        operation: String,
+        /// What the connection said as it went.
+        detail: String,
+    },
+}
+
+impl EmailError {
+    /// Whether the server stopped answering rather than refused: what was
+    /// sent may or may not have been done, and a fresh connection can carry
+    /// on from it.
+    pub fn is_transient(&self) -> bool {
+        matches!(
+            self,
+            Self::Timeout { .. } | Self::SessionExpired { .. } | Self::Disconnected { .. }
+        )
+    }
+
+    /// This error as a call reports it: the server's words fenced as
+    /// outside content.
+    pub fn fenced(&self) -> String {
+        server_said(&self.to_string())
+    }
+}
+
+/// `text`, a mail server's words, fenced as outside content.
+pub fn server_said(text: &str) -> String {
+    workforce_agent::security::external_content::wrap_external_content(
+        text,
+        "what the mail server said",
+    )
+    .wrapped_content
 }
 
 impl fmt::Display for EmailError {
@@ -171,17 +205,30 @@ impl fmt::Display for EmailError {
             Self::MoveFailure { detail } => {
                 write!(f, "Failed to move messages: {detail}")
             }
+            Self::Disconnected { operation, detail } => {
+                write!(
+                    f,
+                    "The connection to the mail server dropped during {operation} ({detail})"
+                )
+            }
         }
     }
 }
 
 impl std::error::Error for EmailError {}
 
-/// Convert an `async_imap::error::Error` into our `EmailError`.
-#[cfg(feature = "email")]
-#[allow(dead_code)] // Will be used by tools in DW-381+
-pub(crate) fn from_imap_error(err: async_imap::error::Error) -> EmailError {
-    EmailError::Imap(err.to_string())
+/// `err`, from the IMAP command `what`: a dropped connection told apart
+/// from what the server answered.
+pub(crate) fn from_imap_error(what: &str, err: async_imap::error::Error) -> EmailError {
+    match err {
+        async_imap::error::Error::Io(_) | async_imap::error::Error::ConnectionLost => {
+            EmailError::Disconnected {
+                operation: what.to_string(),
+                detail: err.to_string(),
+            }
+        }
+        other => EmailError::Imap(format!("{what} failed: {other}")),
+    }
 }
 
 #[cfg(test)]
@@ -379,6 +426,20 @@ mod tests {
             err.to_string(),
             "Folder 'NonExistent' not found. Available folders: INBOX, Sent, Trash"
         );
+    }
+
+    #[test]
+    fn a_dropped_connection_is_transient_and_an_answer_is_not() {
+        let lost = from_imap_error("UID MOVE", async_imap::error::Error::ConnectionLost);
+        assert!(lost.is_transient(), "{lost}");
+        assert!(lost.to_string().contains("during UID MOVE"));
+        let refused = from_imap_error(
+            "UID MOVE",
+            async_imap::error::Error::No("over quota".into()),
+        );
+        assert!(!refused.is_transient());
+        assert!(refused.to_string().contains("over quota"));
+        assert!(refused.fenced().contains("<<<EXTERNAL_UNTRUSTED_CONTENT_"));
     }
 
     #[test]

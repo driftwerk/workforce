@@ -110,6 +110,7 @@ impl ChannelSurface for PinnedSurface {
             thread_id: None,
             files: vec![],
             bot_id: None,
+            outside: false,
         }])
     }
 }

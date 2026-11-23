@@ -82,6 +82,8 @@ pub use workforce_hub_core::def_write_auth;
 pub mod desk_floor;
 pub mod edge_memory_move;
 pub mod effective_settings;
+#[cfg(feature = "postgres")]
+pub mod email_journal;
 pub mod embeddings;
 pub mod endpoint_cmd;
 pub mod engagement_tool;
@@ -355,6 +357,7 @@ pub use workforce_hub_core::user_config;
 pub mod user_discovery;
 pub use hub_core::vault_audit;
 pub use workforce_hub_core::vault;
+pub mod personal_access;
 pub mod reconfigure;
 pub mod vault_copy;
 pub mod vault_policy;

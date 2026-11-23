@@ -325,7 +325,9 @@ impl PlaybookRuntime {
                     owner,
                     visibility,
                     RunAsWrite::Unchanged,
-                    edit,
+                    // A save in a turn that read the bank marks the row, in
+                    // the same write.
+                    edit.read_personal(workforce_agent::personal::read()),
                 )
                 .await?;
         } else if owner.is_some() {
@@ -1085,6 +1087,7 @@ async fn post_returning(
                 username: None,
                 icon_url: None,
                 blocks: None,
+                outside: false,
             })
             .await
         {
@@ -1119,6 +1122,7 @@ fn card_outbound(
             status,
             button_rows,
         )),
+        outside: false,
     }
 }
 

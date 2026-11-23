@@ -113,11 +113,13 @@ pub fn scan_experiential_sessions(
         .list_since(agent_id, cutoff, SESSION_SCAN_CAP)?
         .into_iter()
         // Nor a conversation kept apart: a Desk group's boss conversation,
-        // or one a boss left behind, is its group's alone.
+        // or one a boss left behind, is its group's alone; nor one that read
+        // the person's bank.
         .filter(|s| {
             !s.is_shared_conversation()
                 && !crate::turn_extraction::is_eval_channel(&s.channel)
                 && !s.kept_apart()
+                && !s.read_personal()
         })
         .collect();
     if recent.is_empty() {
@@ -380,6 +382,11 @@ mod tests {
         left.add_assistant_message("left a", 100);
         left.metadata = serde_json::json!({ "desk_scope_left": "desk-group:acme" });
         store.save(&left).unwrap();
+        let mut banked = Session::new("desk", "owner", "a");
+        banked.add_user_message("bank q", None);
+        banked.add_assistant_message("bank a", 100);
+        banked.mark_read_personal();
+        store.save(&banked).unwrap();
         let turns = scan_experiential_sessions(&store, dir.path(), "a", 3600, Utc::now()).unwrap();
         let users: Vec<&str> = turns.iter().map(|t| t.user.as_str()).collect();
         assert_eq!(users, ["q1"]);

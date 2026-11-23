@@ -162,6 +162,7 @@ async fn an_unanswered_question_went_ahead_and_a_later_answer_comes_as_a_message
             .unwrap()
             .iter()
             .any(|m| m.id == ask && m.asked == Some(Asked::Lapsed)));
+        assert!(!d.asks_waited_on(), "it went ahead");
         // The plugin asks again while a longer wait has time left.
         let result = d
             .line_call(
@@ -179,6 +180,7 @@ async fn an_unanswered_question_went_ahead_and_a_later_answer_comes_as_a_message
             Some(Asked::Open),
             "still waited on"
         );
+        assert!(d.asks_waited_on());
         // The person may still answer the one it went ahead on.
         let answer = d
             .line_answer(ask, Sender::Person, "Yes".into())
