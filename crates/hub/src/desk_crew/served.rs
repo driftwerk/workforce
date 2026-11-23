@@ -396,7 +396,7 @@ pub(super) fn cleaned(v: &mut Value) -> usize {
     match v {
         Value::String(s) => {
             let hidden = crate::redact::hide_secrets(s);
-            let capped = sees::capped(&hidden, sees::MAX_CHARS);
+            let capped = sees::capped_result(&hidden);
             let changed = capped != *s;
             *s = capped;
             usize::from(changed)
@@ -1077,7 +1077,7 @@ impl CrewHub {
                 if shows(Part::Reply) {
                     let (from, turn) = super::tools::reply_asked(input);
                     said["last_prompt"] = json!(v.last_prompt);
-                    said["last_reply"] = json!(self.desk.reply_read(&v, from, turn));
+                    said["last_reply"] = json!(self.desk.reply_read(&v, from, turn.as_deref()));
                 }
                 if shows(Part::Question) {
                     said["pending"] = json!(v.pending);

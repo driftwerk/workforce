@@ -1292,3 +1292,73 @@ async fn a_session_its_grants_boss_is_still_starting_is_never_let_go() {
     })
     .await;
 }
+
+/// A served boss that sees replies reads a long one whole, page by page,
+/// as a boss here does.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_served_boss_reads_a_long_reply_on_page_by_page() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (_desk, crew, d, _llm) = overseeing(
+            dir.path(),
+            pool,
+            "ok",
+            "[oversight]\nenabled = true\nlevel = \"act\"\n",
+            &[],
+        )
+        .await;
+        d.boss_bounds_with(workforce_desk::charge::Bounds {
+            home: dir.path().to_path_buf(),
+            ..Default::default()
+        });
+        let mine = new_session(&d, dir.path(), "acme-web").await;
+        let item = workforce_desk::session_item(mine.id);
+        d.change_layout(|l| l.create("acme", "Acme", std::slice::from_ref(&item), None))
+            .await
+            .unwrap();
+        let (code, out) = native(
+            &d,
+            "PUT",
+            "/api/desk/grants/acme",
+            grant(&[mine.id], dir.path(), "act", "replies"),
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK, "{out}");
+        let report: String = (0..700).map(|i| format!("Step {i:04} checked. ")).collect();
+        let url = hook_url(dir.path(), mine.id).await;
+        hook(
+            &url,
+            json!({"hook_event_name": "Stop", "last_assistant_message": report}),
+        )
+        .await;
+        let turn = eventually("its reply heard whole", async || {
+            d.reply(mine.id).map(|r| r.turn)
+        })
+        .await;
+        let read = |input: Value| {
+            let crew = Arc::clone(&crew);
+            async move {
+                let r = serve(&crew, allan(), "crew.history", input).await;
+                assert_eq!(r.status, ServedStatus::Ok, "{:?}", r.body);
+                r.body["session"].as_str().unwrap().to_string()
+            }
+        };
+        let first = read(json!({"session_id": mine.id})).await;
+        assert!(first.contains("Step 0400 checked"), "past its card's start");
+        assert!(!first.contains("Step 0500 checked"), "one page");
+        assert!(
+            first.contains(&format!("reply_from: 8000, turn: {turn}")),
+            "{first}"
+        );
+        let rest = read(json!({"session_id": mine.id, "reply_from": 8000, "turn": turn})).await;
+        assert!(rest.contains("Step 0699 checked"), "{rest}");
+        assert!(rest.contains("the end of its reply"), "{rest}");
+        let stale =
+            read(json!({"session_id": mine.id, "reply_from": 8000, "turn": "00000000"})).await;
+        assert!(
+            stale.contains("its reply changed since you began reading it"),
+            "{stale}"
+        );
+    })
+    .await;
+}
