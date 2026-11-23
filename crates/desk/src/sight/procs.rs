@@ -145,21 +145,18 @@ pub fn said_after(
     })
 }
 
-/// How much later than it started `ps` can put a process's start: it
-/// keeps whole seconds of its run.
-const PS_ROUNDS: Duration = Duration::seconds(1);
-
 /// The tool shell each output is written from, by its id, no process given
-/// to two: each background shell (`shells`, by id and when its output file
-/// was born), in the order they were born, has the one started nearest its
-/// file's birth, at most [`SKEW`] before it and never after it but for
-/// what `ps` rounds; then the open call has the first left of those
-/// started since it. One with none matched waits in no process Desk knows.
+/// to two, as `tree` was listed at `listed`: each background shell
+/// (`shells`, by id and when its output file was born), in the order they
+/// were born, has the one started nearest its file's birth, never after it
+/// and at most [`SKEW`] before, in the whole seconds `ps` keeps of a run;
+/// then the open call has the first left of those started since it. One
+/// with none placed waits in no process Desk knows.
 pub fn placed<'a>(
     tree: &[&'a Stat],
     call: Option<&OpenCall>,
     shells: &[(&str, DateTime<Utc>)],
-    now: DateTime<Utc>,
+    listed: DateTime<Utc>,
 ) -> HashMap<String, &'a Stat> {
     let tools: Vec<&Stat> = tree
         .iter()
@@ -174,12 +171,19 @@ pub fn placed<'a>(
     let placed = born
         .into_iter()
         .fold(HashMap::new(), |mut placed, (id, made)| {
+            let age = (listed - made).num_milliseconds().div_euclid(1000);
             let nearest = tools
                 .iter()
                 .copied()
                 .filter(|s| free(&placed, s))
-                .filter(|s| (made - SKEW..=made + PS_ROUNDS).contains(&started(now, s)))
-                .min_by_key(|s| ((started(now, s) - made).abs(), s.proc.pid));
+                .filter_map(|s| {
+                    let before = i64::try_from(s.elapsed_secs).ok()? - age;
+                    (0..=SKEW.num_seconds())
+                        .contains(&before)
+                        .then_some((before, s))
+                })
+                .min_by_key(|(before, s)| (*before, s.proc.pid))
+                .map(|(_, s)| s);
             if let Some(s) = nearest {
                 placed.insert(id.to_string(), s);
             }
@@ -190,7 +194,7 @@ pub fn placed<'a>(
             .iter()
             .copied()
             .filter(|s| free(&placed, s))
-            .filter(|s| started(now, s) >= c.since - SKEW)
+            .filter(|s| started(listed, s) >= c.since - SKEW)
             .max_by_key(|s| (s.elapsed_secs, std::cmp::Reverse(s.proc.pid)));
         if let Some(s) = first {
             placed.insert(c.id.clone(), s);
