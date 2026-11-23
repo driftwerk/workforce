@@ -32,7 +32,7 @@
 //!   reversible and old, closed from the session's account with
 //!   `close_from_accounts`, and what a restart left being sent settled.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
@@ -41,7 +41,7 @@ use tokio::sync::broadcast::error::RecvError;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 use workforce_desk::assignment::{self, short, Assignment, AssignmentState, Job, Rule, Target};
-use workforce_desk::assignment_store::Reserved;
+use workforce_desk::assignment_store::{Reserved, Restored, NEVER_WENT_IN};
 use workforce_desk::crew::{self, By, Event, Kind, Party, PartyKind};
 use workforce_desk::line::{Delivery, LineKind, LineMessage};
 use workforce_desk::model::{DeskEvent, SessionState};
@@ -1383,30 +1383,30 @@ impl CrewHub {
     /// `m` came on a line: what it says of the assignments it carries or
     /// answers. Anything missed here (a lagged event) the minute's look
     /// reads from the line.
-    async fn assignment_heard(self: &Arc<Self>, m: &LineMessage) {
+    async fn assignment_heard(self: &Arc<Self>, m: &LineMessage, told: &mut Unreceived) {
         let store = self.desk.store();
         // Its own message: delivered, or never.
         if m.from.kind == PartyKind::Manager {
             match m.delivery {
                 Delivery::Delivered => {
+                    if m.late {
+                        self.received_late(m, told).await;
+                    }
                     let _ = store
                         .assignment_delivered(m.id, m.delivered_at.unwrap_or(m.updated_at))
                         .await;
-                    if m.late {
-                        self.received_late(m);
-                    }
                 }
                 Delivery::Withdrawn | Delivery::Refused => {
                     if let Ok(Some(a)) = store.assignment_of_line(m.id).await {
                         self.never_went_in(&a).await;
                     }
                 }
-                // Said once: as its assignment closes, or, carrying none,
-                // as it was given up on.
-                Delivery::Unreceived => match store.assignment_of_line(m.id).await {
-                    Ok(Some(a)) => self.never_went_in(&a).await,
-                    _ => self.unreceived(m),
-                },
+                Delivery::Unreceived => {
+                    if let Ok(Some(a)) = store.assignment_of_line(m.id).await {
+                        self.never_went_in(&a).await;
+                    }
+                    self.unreceived(m, told);
+                }
                 _ => {}
             }
             return;
@@ -1446,25 +1446,88 @@ impl CrewHub {
     }
 
     /// The boss's `m` was never shown to have gone into its session: the
-    /// boss is told, as it isn't put in again.
-    fn unreceived(self: &Arc<Self>, m: &LineMessage) {
+    /// boss is told, once (`told` keeps who was), as it isn't put in again.
+    fn unreceived(self: &Arc<Self>, m: &LineMessage, told: &mut Unreceived) {
+        if told.said.insert(m.id, false).is_some() {
+            return;
+        }
         self.said_of_message(
             m,
             "may never have received",
-            "Desk tried twice and it never showed in the session, so it won't put it in again. \
-             Check its last reply (crew.history) before resending, and send it again only if it \
-             still matters.",
+            "Desk couldn't show it reached the session, so it won't put it in again. Check its \
+             last reply (crew.history) before resending, and send it again only if it still \
+             matters.",
         );
     }
 
-    /// The boss's `m`, said never to have been received, went in after all.
-    fn received_late(self: &Arc<Self>, m: &LineMessage) {
-        self.said_of_message(
-            m,
-            "received",
-            "it arrived after all, after Desk had said it never showed in the session, so don't \
-             send it again.",
-        );
+    /// The boss's `m`, given up on, went in after all: the order it carries,
+    /// cancelled then, stands again unless another holds its job now. The
+    /// boss told it never arrived is told it did, once.
+    async fn received_late(self: &Arc<Self>, m: &LineMessage, told: &mut Unreceived) {
+        let restored = match self.desk.store().assignment_restore(m.id).await {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!(message = %m.id, error = %format!("{e:#}"), "an order that arrived after all couldn't be restored");
+                None
+            }
+        };
+        let then = match &restored {
+            Some(Restored::Back(a)) => {
+                self.note_assignment(
+                    Kind::Assigned,
+                    &Party::manager(&a.boss, &a.boss),
+                    a,
+                    format!("restored {}: its message went in after all", short(a.id)),
+                );
+                "it arrived after all, after Desk had said it couldn't show it reached the \
+                 session, so its order stands again: don't send it again."
+                    .to_string()
+            }
+            Some(Restored::Taken { holder, .. }) => format!(
+                "it arrived after all, after Desk had said it couldn't show it reached the \
+                 session, but {} holds its job now, so the order isn't restored: re-assign it if \
+                 it should still go to this session.",
+                self.holder_name(holder)
+            ),
+            None => "it arrived after all, after Desk had said it couldn't show it reached the \
+                     session, so don't send it again."
+                .to_string(),
+        };
+        if told.said.get(&m.id) == Some(&false) {
+            told.said.insert(m.id, true);
+            self.said_of_message(m, "received", &then);
+        }
+    }
+
+    /// The boss's messages given up on since `told` was kept, and those
+    /// given up on that went in since: each said once, whatever events
+    /// were missed.
+    async fn unreceived_look(self: &Arc<Self>, told: &mut Unreceived) {
+        let store = self.desk.store();
+        match store.line_unreceived_since(told.since).await {
+            Ok(gone) => {
+                for m in gone.iter().filter(|m| m.from.kind == PartyKind::Manager) {
+                    self.unreceived(m, told);
+                }
+            }
+            Err(e) => {
+                tracing::warn!(error = %format!("{e:#}"), "couldn't read messages given up on")
+            }
+        }
+        let waiting: Vec<Uuid> = told
+            .said
+            .iter()
+            .filter(|(_, late)| !**late)
+            .map(|(id, _)| *id)
+            .collect();
+        for id in waiting {
+            if let Ok(Some(mut m)) = store.line_message(id).await {
+                if m.delivery == Delivery::Delivered {
+                    m.late = true;
+                    self.assignment_heard(&m, told).await;
+                }
+            }
+        }
     }
 
     /// Wakes the boss that sent `m` with what its session `did` with it,
@@ -1489,29 +1552,21 @@ impl CrewHub {
     }
 
     /// `a`'s line message was withdrawn, refused, or never shown to have
-    /// gone in: it holds nothing. Given up on, its boss is told as it
-    /// closes, once.
-    async fn never_went_in(self: &Arc<Self>, a: &Assignment) {
-        let why = "its message never went in";
-        let store = self.desk.store();
-        let Ok(Some(a)) = store
+    /// gone in: it holds nothing.
+    async fn never_went_in(&self, a: &Assignment) {
+        let why = NEVER_WENT_IN;
+        if let Ok(Some(a)) = self
+            .desk
+            .store()
             .assignment_close(a.id, AssignmentState::Cancelled, "desk", why)
             .await
-        else {
-            return;
-        };
-        self.note_assignment(
-            Kind::AssignmentClosed,
-            &Party::manager(&a.boss, &a.boss),
-            &a,
-            format!("cancelled {}: {why}", short(a.id)),
-        );
-        let line = match a.line_message {
-            Some(id) => store.line_message(id).await.ok().flatten(),
-            None => None,
-        };
-        if let Some(m) = line.filter(|m| m.delivery == Delivery::Unreceived) {
-            self.unreceived(&m);
+        {
+            self.note_assignment(
+                Kind::AssignmentClosed,
+                &Party::manager(&a.boss, &a.boss),
+                &a,
+                format!("cancelled {}: {why}", short(a.id)),
+            );
         }
     }
 
@@ -1991,6 +2046,14 @@ impl CrewHub {
     }
 }
 
+/// The boss's messages given up on since the loop started, each with
+/// whether its boss was told it went in after all: what is said of them,
+/// once.
+pub(super) struct Unreceived {
+    since: DateTime<Utc>,
+    said: HashMap<Uuid, bool>,
+}
+
 /// Keeps the assignments up to date with what happens on the lines, and
 /// looks at them every crew minute. First settles what a restart left
 /// being sent. Events missed (lagged) are read from the line at once.
@@ -2004,20 +2067,28 @@ pub(super) fn assignments_loop(
         let mut every = tokio::time::interval(crew.timing.minute);
         every.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let mut raised: HashSet<Uuid> = HashSet::new();
+        let mut told = Unreceived {
+            since: Utc::now(),
+            said: HashMap::new(),
+        };
         let mut pruned = Utc::now();
         loop {
             tokio::select! {
                 () = cancel.cancelled() => return,
                 received = events.recv() => match received {
                     Ok(DeskEvent::Line { message, removed: false }) => {
-                        crew.assignment_heard(&message).await;
+                        crew.assignment_heard(&message, &mut told).await;
                     }
-                    Err(RecvError::Lagged(_)) => crew.assignments_look(&mut raised).await,
+                    Err(RecvError::Lagged(_)) => {
+                        crew.assignments_look(&mut raised).await;
+                        crew.unreceived_look(&mut told).await;
+                    }
                     Ok(_) => {}
                     Err(RecvError::Closed) => return,
                 },
                 _ = every.tick() => {
                     crew.assignments_look(&mut raised).await;
+                    crew.unreceived_look(&mut told).await;
                     // Once a day, closed rows a month old are let go.
                     if Utc::now() - pruned >= chrono::TimeDelta::days(1) {
                         pruned = Utc::now();

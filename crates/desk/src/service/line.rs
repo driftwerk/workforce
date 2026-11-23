@@ -1368,7 +1368,7 @@ impl Desk {
             }),
             None if m.delivery == Delivery::Unreceived => json!({
                 "pending": format!(
-                    "Your question never showed in {}'s session: Desk tried twice, so it is withdrawn. Check its last reply before you ask again, and otherwise go on with your own judgement.",
+                    "Desk couldn't show your question reached {}'s session, so it is withdrawn. Check its last reply before you ask again, and otherwise go on with your own judgement.",
                     m.to.name
                 ),
                 "id": m.id,
@@ -2170,10 +2170,13 @@ impl Desk {
                 tracing::warn!(message = %m.id, %session, handed_at = ?m.handed_at, "a message handed to a session never went in: it goes again once");
             }
             self.line_requeued(back).await;
-        } else if let Some(gone) = self.0.store.line_unreceived(m.id, now).await? {
-            tracing::warn!(message = %m.id, %session, handed_at = ?m.handed_at, transcript = ?shown, "a message handed to a session was never shown to have gone in: it isn't put in again");
-            self.line_announce(&gone);
-            self.line_tell_sender(&gone).await;
+        } else {
+            let twice = self.0.state.lock().lines.retried.contains(&m.id);
+            if let Some(gone) = self.0.store.line_unreceived(m.id, now).await? {
+                tracing::warn!(message = %m.id, %session, handed_at = ?m.handed_at, transcript = ?shown, twice, "a message handed to a session was never shown to have gone in: it isn't put in again");
+                self.line_announce(&gone);
+                self.line_tell_sender(&gone, twice).await;
+            }
         }
         Ok(())
     }
@@ -2259,14 +2262,15 @@ impl Desk {
         self.line_delivered_into(id, &m);
         if m.late {
             tracing::info!(message = %m.id, session = %id, "a message given up on went in after all");
-            self.line_tell_sender(&m).await;
+            self.line_tell_sender(&m, false).await;
         }
         Ok(Some(m))
     }
 
-    /// What `m`'s sender, a session, is told of it: given up on, or in
-    /// after all once it was (a boss hears of it on its line's event).
-    async fn line_tell_sender(&self, m: &LineMessage) {
+    /// What `m`'s sender, a session, is told of it: given up on (after it
+    /// went `twice`, or at once), or in after all once it was (a boss hears
+    /// of it from its crew).
+    async fn line_tell_sender(&self, m: &LineMessage, twice: bool) {
         let Some(sender) = m.from_session() else {
             return;
         };
@@ -2278,8 +2282,12 @@ impl Desk {
                     true => ("question", ", and your question is withdrawn", "ask again"),
                     false => ("message", "", "send it again"),
                 };
+                let why = match twice {
+                    true => "Desk tried twice and it never showed in the session",
+                    false => "Desk couldn't show it reached the session",
+                };
                 format!(
-                    "Your {noun} to {to} (“{what}”) may never have reached it: Desk tried twice and it never showed in the session, so it won't put it in again{withdrawn}. Check its last reply before you {again}."
+                    "Your {noun} to {to} (“{what}”) may never have reached it: {why}, so it won't put it in again{withdrawn}. Check its last reply before you {again}."
                 )
             }
             (_, true) => format!(
