@@ -2,7 +2,7 @@
 //! for what a session card shows when its terminal isn't attached: the last
 //! prompt, the last reply, and Claude Code's own title for the conversation.
 
-use std::io::{BufRead, Read, Seek, SeekFrom};
+use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 
 use serde_json::Value;
@@ -37,16 +37,38 @@ pub struct Tail {
     pending_login: Option<(String, chrono::DateTime<chrono::Utc>)>,
 }
 
-/// Whether `needle` is anywhere in the file at `path`, read whole a line at
-/// a time (what a long turn wrote since can be more than its tail).
+/// The most of a transcript [`mentions`] reads.
+const MENTIONS_MAX: u64 = 512 * 1024 * 1024;
+
+/// Whether `needle` is anywhere in the regular file at `path`, read whole
+/// (what a long turn wrote since can be more than its tail), a chunk at a
+/// time and at most [`MENTIONS_MAX`] of it: a path that is no file (a
+/// device, a pipe) is refused, never read.
 pub fn mentions(path: &Path, needle: &str) -> std::io::Result<bool> {
+    let file = std::fs::File::open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "not a regular file",
+        ));
+    }
     let needle = needle.as_bytes();
-    for line in std::io::BufReader::new(std::fs::File::open(path)?).split(b'\n') {
-        if line?.windows(needle.len()).any(|w| w == needle) {
+    let keep = needle.len().saturating_sub(1);
+    let mut file = file.take(MENTIONS_MAX);
+    let mut buf = vec![0u8; 64 * 1024 + keep];
+    let mut carried = 0;
+    loop {
+        let read = file.read(&mut buf[carried..])?;
+        if read == 0 {
+            return Ok(false);
+        }
+        let filled = carried + read;
+        if buf[..filled].windows(needle.len()).any(|w| w == needle) {
             return Ok(true);
         }
+        carried = keep.min(filled);
+        buf.copy_within(filled - carried..filled, 0);
     }
-    Ok(false)
 }
 
 /// The whole lines of the end of a transcript.
@@ -379,6 +401,19 @@ pub fn clip(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_mention_is_found_across_chunks_and_a_path_that_is_no_file_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.jsonl");
+        let mark = "[Desk m:0a1b2c3d]";
+        let pad = "x".repeat(64 * 1024 + 11);
+        std::fs::write(&path, format!("{pad}{mark}\n")).unwrap();
+        assert!(mentions(&path, mark).unwrap(), "across a chunk's end");
+        assert!(!mentions(&path, "[Desk m:ffffffff]").unwrap());
+        assert!(mentions(dir.path(), mark).is_err(), "a folder");
+        assert!(mentions(Path::new("/dev/zero"), mark).is_err(), "a device");
+    }
     use std::io::Write;
 
     #[test]

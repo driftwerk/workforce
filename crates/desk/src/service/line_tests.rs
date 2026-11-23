@@ -3922,7 +3922,7 @@ async fn a_sessions_question_given_up_on_is_withdrawn_and_its_asker_told() {
                     .find(|m| m.to_session() == Some(a) && m.text.contains(says))
             }
         };
-        let note = told("Desk tried twice and it never showed in the session")
+        let note = told("Desk couldn't show it reached the session")
             .await
             .expect("its asker told");
         assert!(

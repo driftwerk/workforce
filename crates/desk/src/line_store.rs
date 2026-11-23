@@ -434,6 +434,24 @@ impl DeskStore {
             .transpose()
     }
 
+    /// The rows given up on ([`crate::line::Delivery::Unreceived`]) since
+    /// `since`, oldest first.
+    pub async fn line_unreceived_since(&self, since: DateTime<Utc>) -> Result<Vec<LineMessage>> {
+        let client = self.pool().get().await?;
+        client
+            .query(
+                &format!(
+                    "SELECT {COLUMNS} FROM line_messages WHERE delivery = 'unreceived' \
+                     AND updated_at >= $1 ORDER BY updated_at"
+                ),
+                &[&since],
+            )
+            .await?
+            .iter()
+            .map(message)
+            .collect()
+    }
+
     /// Puts handed rows back in the queue: one the plugin dropped (`id`, no
     /// `before`), or those handed before `before` (a plugin that died
     /// between taking and submitting one): one handed again since is left

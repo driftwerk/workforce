@@ -875,3 +875,63 @@ async fn a_message_never_received_wakes_its_boss_once_and_again_when_it_arrives(
     })
     .await;
 }
+
+/// A boss's message given up on, and its arriving after all, whose words
+/// on the line were never heard: the minute's look says each once.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_message_given_up_on_unheard_is_said_by_the_minutes_look_once() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (overseer, crew, d, llm) =
+            overseeing_at(dir.path(), pool, "Noted.", &paced_config(50), &[], FAST).await;
+        let s = new_session(&d, dir.path(), "Legacy removal").await.id;
+        d.take_on(
+            s,
+            &workforce_desk::crew::Party::manager("desk", &super::super::name_of(&overseer)),
+            workforce_desk::charge::How::Handed,
+            &Default::default(),
+            &By::you(),
+        )
+        .await
+        .unwrap();
+        crew.perform(
+            &nudge(s, "Open the PR for the ledger fix.", None),
+            crew.by_overseer("It should open it.").unwrap(),
+        )
+        .await
+        .unwrap();
+        let next = eventually("the message on its line", async || {
+            d.line_next(s, std::time::Duration::from_millis(200)).await
+        })
+        .await;
+        let id: uuid::Uuid = serde_json::from_value(next["id"].clone()).unwrap();
+        // Given up on, then in after all, straight in the store: no word.
+        let later = chrono::Utc::now() + chrono::Duration::minutes(5);
+        d.store().line_unreceived(id, later).await.unwrap().unwrap();
+        let woken = eventually("the boss woken", async || {
+            Some(super::stalls::woken_by(&llm, "may never have received").await)
+                .filter(|w| !w.is_empty())
+        })
+        .await;
+        assert!(woken[0].contains(&id.to_string()), "{woken:?}");
+        d.store().line_went_in(id).await.unwrap().unwrap();
+        eventually("the boss told it arrived", async || {
+            Some(super::stalls::woken_by(&llm, "arrived after all").await).filter(|w| !w.is_empty())
+        })
+        .await;
+        tokio::time::sleep(FAST.minute * 3).await;
+        assert_eq!(
+            super::stalls::woken_by(&llm, "may never have received")
+                .await
+                .len(),
+            1
+        );
+        assert_eq!(
+            super::stalls::woken_by(&llm, "arrived after all")
+                .await
+                .len(),
+            1
+        );
+    })
+    .await;
+}
