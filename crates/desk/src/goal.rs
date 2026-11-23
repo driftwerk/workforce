@@ -641,6 +641,9 @@ pub enum NotSaid {
     /// Found, but only in a message older than it may be, the newest of
     /// them written at this time.
     TooOld(DateTime<Utc>),
+    /// Only part of a reply, for an answer: a part can say other than the
+    /// whole does ("No — yes, I see why, but not now").
+    NotWhole,
     /// In none of their messages, word for word.
     NotFound,
 }
@@ -692,19 +695,26 @@ pub fn said_by(
     let (least_words, least_chars) = said.floor();
     let short = quoted.len() < least_words || quoted.join(" ").chars().count() < least_chars;
     let mut found = None;
-    let mut too_short = false;
+    let (mut too_short, mut not_whole) = (false, false);
     for (at, text) in messages {
         let words = compared_words(text);
         let whole = words == quoted;
         let part = words.windows(quoted.len()).any(|w| w == quoted.as_slice());
-        let counts = (whole && said.whole_counts()) || (part && !short);
-        too_short |= part && !counts && *at > since;
+        // An answer is the whole reply, however short: never a part of it.
+        let counts = match said {
+            Said::Answering => whole,
+            _ => (whole && said.whole_counts()) || (part && !short),
+        };
+        let newer = part && !counts && *at > since;
+        not_whole |= newer && said == Said::Answering;
+        too_short |= newer && said != Said::Answering;
         if counts {
             found = found.max(Some(*at));
         }
     }
     match found {
         Some(at) if at > since => Ok(at),
+        _ if not_whole => Err(NotSaid::NotWhole),
         _ if too_short => Err(NotSaid::TooShort {
             words: least_words,
             chars: least_chars,
@@ -712,6 +722,15 @@ pub fn said_by(
         Some(at) => Err(NotSaid::TooOld(at)),
         None => Err(NotSaid::NotFound),
     }
+}
+
+/// Whether the person's message `text` says enough to stand on its own,
+/// as an unprompted change must ([`Said::Changing`]'s floor): a shorter one
+/// ("ok", "yes go ahead") only answers what was said just before it.
+pub fn stands_alone(text: &str) -> bool {
+    let words = compared_words(text);
+    let (least_words, least_chars) = Said::Changing.floor();
+    words.len() >= least_words && words.join(" ").chars().count() >= least_chars
 }
 
 /// Whether the person's message `text` holds `goal` in their own words:
@@ -745,6 +764,19 @@ pub fn same_proposal(asked: &Proposal, applying: &Proposal) -> bool {
     goal(asked) == goal(applying)
         && asked.result == applying.result
         && asked.met.is_some() == applying.met.is_some()
+}
+
+/// Whether a plan whose goal is `goal`, measured by `result`, holds all
+/// that `asked` proposed: the person approving it on the plan's card
+/// settles that question.
+pub fn approved_covers(asked: &Proposal, goal: &str, result: Option<&GoalResult>) -> bool {
+    !asked.is_empty()
+        && asked.met.is_none()
+        && asked
+            .goal
+            .as_deref()
+            .is_none_or(|g| normalise(g) == normalise(goal))
+        && asked.result.as_ref().is_none_or(|r| Some(r) == result)
 }
 
 /// How soon after the person's turn the boss's message to a session is

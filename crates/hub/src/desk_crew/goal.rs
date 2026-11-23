@@ -69,6 +69,9 @@ pub(super) fn not_said(quote: &str, why: NotSaid, said: Said) -> String {
         (NotSaid::TooShort { words, chars }, _) => format!(
             "“{q}” is only part of a longer message of the person's: quote their whole message, or at least {words} words and {chars} characters of it, exactly as they wrote it."
         ),
+        (NotSaid::NotWhole, _) => format!(
+            "“{q}” is only part of the person's reply: their answer is their whole message, which may say otherwise around it. Quote the whole message, exactly as they wrote it, however short."
+        ),
         (NotSaid::TooOld(at), Said::Answering) => format!(
             "The person wrote “{q}” before your question ({}): their answer is what they reply after it, on its buttons or in your DM. Wait for their reply, then pass it.",
             at.format("%Y-%m-%d %H:%M UTC")
@@ -600,19 +603,33 @@ impl CrewHub {
 
     /// When the person agreed in `quote`, word for word in one of their
     /// messages of the last day.
+    ///
+    /// A short message ("ok", "yes go ahead") agrees only to what the boss
+    /// said last: one written before the boss's newest DM message answers
+    /// something earlier, and counts for nothing now.
     pub(super) fn agreed_at(
         &self,
         service: &AgentService,
         quote: &str,
     ) -> Result<DateTime<Utc>, String> {
         let now = crew::now();
-        goal::said_by(
-            &self.person_words(service, now - WORDS_LOOKED),
-            quote,
-            now - AGREED_WITHIN,
-            Said::Agreeing,
-        )
-        .map_err(|e| not_said(quote, e, Said::Agreeing))
+        let since = now - AGREED_WITHIN;
+        let last = self.person(Some(service)).and_then(|person| {
+            super::orchestrator::boss_last_said(service, &person, MESSAGES_READ)
+        });
+        let (now_words, earlier): (Vec<_>, Vec<_>) = self
+            .person_words(service, now - WORDS_LOOKED)
+            .into_iter()
+            .partition(|(at, text)| goal::stands_alone(text) || last.is_none_or(|l| *at > l));
+        goal::said_by(&now_words, quote, since, Said::Agreeing).map_err(|e| {
+            match goal::said_by(&earlier, quote, since, Said::Agreeing) {
+                Ok(_) => format!(
+                    "The person's “{}” came before your last message in your DM, so it answered something earlier, not this. Ask them in your DM whether they agree to the goal, then quote their reply.",
+                    crew::one_line(quote, 120)
+                ),
+                Err(_) => not_said(quote, e, Said::Agreeing),
+            }
+        })
     }
 
     /// The person's word for `applying`, a change to plan `p`'s goal, in

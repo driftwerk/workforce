@@ -709,6 +709,36 @@ pub(super) fn person_messages(
         .collect()
 }
 
+/// When `service` last wrote in its DM with `person`, among its `look`
+/// newest messages there.
+pub(super) fn boss_last_said(
+    service: &AgentService,
+    person: &str,
+    look: usize,
+) -> Option<DateTime<Utc>> {
+    use workforce_desk::conversations::Author;
+    let speaker = workforce_desk::Speaker::agent(service.agent_id.as_str(), &name_of(service));
+    match crate::desk_conversations::page(
+        service.sessions.as_ref(),
+        &speaker,
+        person,
+        workforce_common::channels::DESK_CHANNEL,
+        workforce_desk::Cursor::Newest,
+        look,
+    ) {
+        Ok(page) => page
+            .messages
+            .into_iter()
+            .filter(|m| m.from == Author::Agent && !m.text.trim().is_empty())
+            .map(|m| m.at)
+            .max(),
+        Err(e) => {
+            tracing::info!(error = %e, "the boss's DM couldn't be read");
+            None
+        }
+    }
+}
+
 /// The threads read for the person's words, at most: the ones last
 /// written to.
 const THREADS_READ: usize = 20;
@@ -724,7 +754,9 @@ pub(super) fn person_thread_messages(
 ) -> Vec<(DateTime<Utc>, String)> {
     use workforce_desk::conversations::{Author, SpeakerKind};
     let store = service.sessions.as_ref();
-    let mut threads: Vec<_> = match store.list_for_owner(person, 2_000) {
+    // Threads' channels are `desk:thread:<message id>`, all under one prefix.
+    let threads_on = workforce_core::desk::DESK_THREAD_PREFIX.trim_end_matches(':');
+    let mut threads: Vec<_> = match store.list_for_owner_on(person, threads_on, 2_000) {
         Ok(all) => all
             .into_iter()
             .filter(|s| {

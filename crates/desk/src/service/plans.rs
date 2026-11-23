@@ -2240,7 +2240,39 @@ impl Desk {
                 Err(e)
             }
             Ok(false) => self.plan_detail(p).await,
-            Ok(true) => self.plan_saved(&p).await,
+            Ok(true) => {
+                let detail = self.plan_saved(&p).await?;
+                if by.party.kind == PartyKind::You {
+                    self.asks_approved(&detail.summary.plan).await;
+                }
+                Ok(detail)
+            }
+        }
+    }
+
+    /// The boss's questions about plan `p`'s goal that its revision the
+    /// person just approved on its card holds: settled by that, so none
+    /// stays open in their list or applies again.
+    async fn asks_approved(&self, p: &Plan) {
+        let asks = match self.0.store.goal_asks(p.id).await {
+            Ok(a) => a,
+            Err(e) => {
+                tracing::warn!(plan = %p.id, error = %e, "a plan's goal questions weren't read on its approval");
+                return;
+            }
+        };
+        for a in asks
+            .into_iter()
+            .filter(|a| goal::approved_covers(&a.proposal, &p.goal, p.result.as_ref()))
+        {
+            if let Err(e) = self
+                .0
+                .store
+                .ask_settled(a.item, "You approved it on the plan's card.")
+                .await
+            {
+                tracing::warn!(plan = %p.id, error = %e, "a goal question wasn't settled on the plan's approval");
+            }
         }
     }
 
