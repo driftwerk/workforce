@@ -759,13 +759,7 @@ impl Desk {
                     .is_ok_and(|x| x.boss.is_some_and(|b| b.party_id() == boss))
             });
             if !live {
-                if let Err(e) = self
-                    .release(
-                        id,
-                        &crate::crew::By::desk("Its boss's grant is no longer live."),
-                    )
-                    .await
-                {
+                if let Err(e) = self.release(id, &crate::crew::By::grant_not_live()).await {
                     tracing::info!(%id, error = %e, "a session wasn't let go by its served boss");
                 }
             }

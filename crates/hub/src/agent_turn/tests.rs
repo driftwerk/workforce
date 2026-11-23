@@ -2658,12 +2658,12 @@ async fn engine_slot_survives_lost_cas() {
     };
     turn.set_engine_slot(SLOT, &slot);
 
-    crate::serve::persist_turn_owned_metadata(&hub.service.sessions, &turn);
+    crate::serve::save_turn(&hub.service.sessions, &mut turn, ..0).unwrap();
 
     assert_eq!(
         hub.session(ALICE).engine_slot(SLOT),
         Some(slot),
-        "the slot is written even when the turn's own save was lost"
+        "the slot is written even when the turn's save lost CAS"
     );
 }
 
@@ -5062,6 +5062,56 @@ async fn a_crew_conversation_is_not_given_again_what_its_transcript_holds() {
     assert!(
         calls[2].text().contains(&standing()),
         "the CLI compacted its transcript (its context fell), so all of it is given again"
+    );
+}
+
+#[tokio::test]
+async fn a_crew_conversation_is_given_its_goals_whole_every_turn() {
+    let hub = hub(claude_first).await;
+    hub.claude_login(ALICE);
+    hub.claude.reply(Some(1), &read(40_000));
+    hub.claude.reply(Some(2), &read(30_000));
+    let goals = format!(
+        "{} The goals you agreed with the person.\n- “Upgrade the gateway” · unmet\nDesk's goal facts, newest first:\n- 23:18 fact: The gateway is upgraded on staging. {}",
+        workforce_core::desk::GOALS_MARKER,
+        "It is checked. ".repeat(20)
+    );
+
+    hub.wake(CREW, &format!("{goals}\n\nwake one")).await;
+    hub.wake(CREW, &format!("{goals}\n\nwake two")).await;
+
+    let second = hub.claude.calls()[1].text();
+    assert!(hub.claude.calls()[1].has("--resume"));
+    assert!(!second.contains(&standing()), "the rest is held");
+    assert!(
+        second.contains("The gateway is upgraded on staging."),
+        "{second}"
+    );
+}
+
+/// "Gateway upgrade": a fact the boss recorded is in the opening of the
+/// fresh thread a crew conversation starts once it outgrew its cap.
+#[tokio::test]
+async fn a_crew_conversation_s_fresh_thread_after_a_rotation_opens_with_its_goals() {
+    let hub = hub(claude_first).await;
+    hub.claude_login(ALICE);
+    hub.claude.reply(None, &read(250_000));
+    let goals = format!(
+        "{} The goals you agreed with the person.\n- “Upgrade the gateway” · unmet\nDesk's goal facts, newest first:\n- 23:18 fact: The gateway is upgraded on staging.",
+        workforce_core::desk::GOALS_MARKER
+    );
+
+    hub.wake(CREW, &format!("{goals}\n\nwake one")).await;
+    hub.wake(CREW, &format!("{goals}\n\nwake two")).await;
+
+    let calls = hub.claude.calls();
+    assert!(!calls[1].has("--resume"), "the crew transcript is replaced");
+    assert!(
+        calls[1]
+            .text()
+            .contains("23:18 fact: The gateway is upgraded on staging."),
+        "{}",
+        calls[1].text()
     );
 }
 

@@ -63,6 +63,8 @@ async fn running(d: &Desk, folder: &Path, n: usize) -> (uuid::Uuid, Vec<SessionV
                 engine: Engine::Claude,
                 group: None,
                 budget: None,
+                result: None,
+                goal_ticket: None,
             },
             &Party::manager("desk", "Desk"),
             &By::manager("desk", "Desk", "Sam asked for M8."),
@@ -138,15 +140,26 @@ async fn ticket(d: &Desk, id: uuid::Uuid, key: &str) -> workforce_desk::PlanTick
         .unwrap()
 }
 
-/// How many of the boss's turns were asked with every one of `words`.
+/// How many of the boss's turns were woken with every one of `words`: in
+/// what each was given, not in the history a later turn carries.
 async fn asked_with(llm: &wiremock::MockServer, words: &[&str]) -> usize {
     llm.received_requests()
         .await
         .unwrap_or_default()
         .iter()
-        .filter(|r| {
-            let body = String::from_utf8_lossy(&r.body);
-            words.iter().all(|w| body.contains(w))
+        .filter_map(|r| serde_json::from_slice::<Value>(&r.body).ok())
+        .filter_map(|b| {
+            b["messages"]
+                .as_array()?
+                .iter()
+                .rfind(|m| m["role"] == "user")
+                .map(|m| m["content"].to_string())
+        })
+        .filter(|asked| {
+            asked
+                .rsplit("END SYSTEM CONTEXT")
+                .next()
+                .is_some_and(|given| words.iter().all(|w| given.contains(w)))
         })
         .count()
 }

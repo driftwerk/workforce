@@ -101,6 +101,9 @@ pub struct CompactionEngine {
     memory_writer: Option<Arc<dyn MemoryWriter>>,
     cost_tracker: Option<Arc<CostTracker>>,
     agent_id: Option<String>,
+    /// Flushes held for [`Self::write_held_flushes`] rather than written as
+    /// they are made; none when they are written at once.
+    held_flushes: Option<parking_lot::Mutex<Vec<(String, &'static str)>>>,
 }
 
 /// The ambient identity for cost attribution, when a user is in scope.
@@ -123,6 +126,7 @@ impl CompactionEngine {
             memory_writer: None,
             cost_tracker: None,
             agent_id: None,
+            held_flushes: None,
         }
     }
 
@@ -142,6 +146,27 @@ impl CompactionEngine {
             memory_writer: Some(memory_writer),
             cost_tracker: None,
             agent_id: None,
+            held_flushes: None,
+        }
+    }
+
+    /// Holds what its compactions flush to memory until
+    /// [`Self::write_held_flushes`]: for a compaction whose session may not
+    /// take it, so a compaction that never lands writes nothing.
+    pub fn holding_flushes(mut self) -> Self {
+        self.held_flushes = Some(parking_lot::Mutex::new(Vec::new()));
+        self
+    }
+
+    /// Writes the flushes held since the last call, in the order made.
+    pub async fn write_held_flushes(&self, session: &Session) {
+        let held = self
+            .held_flushes
+            .as_ref()
+            .map(|held| std::mem::take(&mut *held.lock()))
+            .unwrap_or_default();
+        for (text, label) in held {
+            self.write_flush(session, &text, label).await;
         }
     }
 
@@ -562,6 +587,31 @@ impl CompactionEngine {
         Ok(text)
     }
 
+    /// Writes one flush to daily notes through the memory writer.
+    async fn write_flush(&self, session: &Session, text: &str, label: &str) {
+        let Some(writer) = &self.memory_writer else {
+            warn!(
+                session_id = %session.id,
+                "Memory flush generated output but no writer configured — discarding"
+            );
+            return;
+        };
+        match writer.write_flush(text, label).await {
+            Ok(()) => info!(
+                session_id = %session.id,
+                chars = text.len(),
+                label,
+                "Memory flush persisted to daily notes"
+            ),
+            Err(e) => warn!(
+                session_id = %session.id,
+                error = %e,
+                label,
+                "Failed to persist memory flush output"
+            ),
+        }
+    }
+
     /// Persist the result of a memory flush call via the configured `MemoryWriter`.
     ///
     /// Shared helper used by `compact_full`, adaptive, emergency, and manual paths.
@@ -570,33 +620,13 @@ impl CompactionEngine {
         &self,
         session: &Session,
         flush_result: Result<String>,
-        label: &str,
+        label: &'static str,
     ) {
         match flush_result {
-            Ok(text) if !text.is_empty() => {
-                if let Some(ref writer) = self.memory_writer {
-                    if let Err(e) = writer.write_flush(&text, label).await {
-                        warn!(
-                            session_id = %session.id,
-                            error = %e,
-                            label,
-                            "Failed to persist memory flush output"
-                        );
-                    } else {
-                        info!(
-                            session_id = %session.id,
-                            chars = text.len(),
-                            label,
-                            "Memory flush persisted to daily notes"
-                        );
-                    }
-                } else {
-                    warn!(
-                        session_id = %session.id,
-                        "Memory flush generated output but no writer configured — discarding"
-                    );
-                }
-            }
+            Ok(text) if !text.is_empty() => match &self.held_flushes {
+                Some(held) => held.lock().push((text, label)),
+                None => self.write_flush(session, &text, label).await,
+            },
             Ok(_) => {} // empty flush, nothing to persist
             Err(e) => {
                 warn!(

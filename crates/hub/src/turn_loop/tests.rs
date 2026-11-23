@@ -1744,6 +1744,122 @@ async fn a_turn_that_compacts_still_archives_its_question() {
     );
 }
 
+/// A turn answered by a notice archives its own answer once, after another
+/// writer saved and archived its notice while the turn ran.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_notice_turn_archives_its_answer_once_beside_anothers_notice() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut config = workforce_common::settings::WorkforceConfig::default();
+    config.hub.data_dir = tmp.path().to_string_lossy().to_string();
+    config.memory.db_path = tmp.path().join("memory.db").to_string_lossy().into_owned();
+    config.llm.provider = "ollama".into();
+    config.llm.api_key = Some("http://127.0.0.1:9".into());
+    config.llm.default_model = "mock".into();
+    let service = AgentService::from_config(config, None).await.unwrap();
+    let sessions = std::sync::Arc::clone(&service.sessions);
+    let mut turn = sessions
+        .get_or_create("cli", "identity-1", service.agent_id.as_str())
+        .unwrap();
+    let asked = turn.add_user_message("is the deploy done?", None);
+    sessions.save_refreshing(&mut turn).unwrap();
+    sessions
+        .append_to_archive(&turn.id, turn.messages.last().unwrap())
+        .unwrap();
+
+    let mut other = sessions.get(&turn.id).unwrap().unwrap();
+    other.add_assistant_message("the session closed", 2);
+    sessions.save(&other).unwrap();
+    sessions
+        .append_to_archive(&turn.id, other.messages.last().unwrap())
+        .unwrap();
+    let from = turn.messages.len();
+    crate::turn_loop::save_notice_turn(&service, &mut turn, 0, from, "identity-1", "It is.", None)
+        .unwrap();
+
+    let archived: Vec<(String, String)> = sessions
+        .read_archive_page(&turn.id, None, 50)
+        .unwrap()
+        .messages
+        .into_iter()
+        .map(|m| (m.id, m.content))
+        .collect();
+    let ids: std::collections::HashSet<&str> = archived.iter().map(|(id, _)| id.as_str()).collect();
+    assert_eq!(ids.len(), archived.len(), "each once: {archived:?}");
+    assert_eq!(archived.len(), 3, "{archived:?}");
+    assert!(ids.contains(asked.as_str()));
+    assert!(
+        archived.iter().any(|(_, text)| text == "It is."),
+        "{archived:?}"
+    );
+}
+
+/// What a turn learns from is its own messages, as its save kept them: never
+/// another write's that the save merged in among them.
+#[test]
+fn a_turn_learns_from_its_own_messages_when_its_save_merged() {
+    use workforce_common::session::{JsonlSessionStore, SessionStore};
+    let tmp = tempfile::tempdir().unwrap();
+    let sessions: std::sync::Arc<dyn SessionStore> =
+        std::sync::Arc::new(JsonlSessionStore::new(tmp.path()).unwrap());
+    let mut turn = sessions.get_or_create("cli", "u", "agent-a").unwrap();
+    let base = turn.messages.len();
+    let asked = turn.add_user_message("I take my tea black", None);
+    turn.add_tool_message(
+        "notes.read",
+        &serde_json::json!({}),
+        &serde_json::json!("nothing"),
+        true,
+        1,
+        None,
+    );
+    let said = turn.add_assistant_message("Noted: black.", 3);
+
+    let mut other = sessions.get(&turn.id).unwrap().unwrap();
+    let notice = other.add_assistant_message("the session closed", 2);
+    sessions.save(&other).unwrap();
+    let answered = super::save_turn(&sessions, &mut turn, base..).unwrap();
+
+    let learned: Vec<&str> = super::spoken(&answered)
+        .into_iter()
+        .map(|m| m.id.as_str())
+        .collect();
+    assert_eq!(learned, [asked.as_str(), said.as_str()]);
+    assert!(
+        turn.messages[base..].iter().any(|m| m.id == notice),
+        "by position, the turn would have been read with the notice"
+    );
+}
+
+/// So too for a streamed turn, whose question was saved before it ran and
+/// its answer after: another write's notice merged in between is never
+/// learned as the person's.
+#[test]
+fn a_streamed_turn_learns_from_its_question_and_answer_when_its_save_merged() {
+    use workforce_common::session::{JsonlSessionStore, SessionStore};
+    let tmp = tempfile::tempdir().unwrap();
+    let sessions: std::sync::Arc<dyn SessionStore> =
+        std::sync::Arc::new(JsonlSessionStore::new(tmp.path()).unwrap());
+    let mut turn = sessions.get_or_create("cli", "u", "agent-a").unwrap();
+    let base = turn.messages.len();
+    let asked = turn.add_user_message("I take my tea black", None);
+    let question = super::save_refreshing_archiving(&sessions, &mut turn, base..).unwrap();
+    let archived_upto = turn.messages.len();
+
+    let mut other = sessions.get(&turn.id).unwrap().unwrap();
+    let notice = other.add_assistant_message("the session closed", 2);
+    sessions.save(&other).unwrap();
+    let said = turn.add_assistant_message("Noted: black.", 3);
+    let answered = super::save_turn(&sessions, &mut turn, archived_upto..).unwrap();
+
+    let held = super::held_of(&turn, &question, &answered);
+    let learned: Vec<&str> = super::spoken(&held)
+        .into_iter()
+        .map(|m| m.id.as_str())
+        .collect();
+    assert_eq!(learned, [asked.as_str(), said.as_str()]);
+    assert!(turn.messages.iter().any(|m| m.id == notice));
+}
+
 /// A follow-up sent now into a turn that is then stopped is still the
 /// person's: kept, as said, once the turn's task is gone.
 #[tokio::test(flavor = "multi_thread")]
@@ -1772,7 +1888,7 @@ async fn a_stopped_turn_keeps_what_was_sent_into_it() {
         .sessions
         .get_or_create(DESK_CHANNEL, "identity-1", service.agent_id.as_str())
         .unwrap();
-    let (_live, inbox) = service
+    let (live, inbox) = service
         .begin_live_turn(
             &session.id,
             workforce_agent::tools::approval::SelfServe::Answerable,
@@ -1809,17 +1925,19 @@ async fn a_stopped_turn_keeps_what_was_sent_into_it() {
         )
         .await
         .unwrap();
-    for _ in 0..200 {
-        if !server
+    // Sent while the run waits on the model.
+    tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        while server
             .received_requests()
             .await
             .unwrap_or_default()
             .is_empty()
         {
-            break;
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
         }
-        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-    }
+    })
+    .await
+    .expect("the run never asked the model");
     assert!(service
         .live_turns
         .apply(
@@ -1837,14 +1955,8 @@ async fn a_stopped_turn_keeps_what_was_sent_into_it() {
         .applied());
     handle.abort();
     let _ = handle.await;
-    let mut read = Vec::new();
-    for _ in 0..100 {
-        read = read_back(&service, "identity-1");
-        if read.len() == 2 {
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-    }
+    live.follow_ups_kept().await;
+    let read = read_back(&service, "identity-1");
     assert_eq!(
         read.iter()
             .map(|(t, id, _, _)| (t.as_str(), id.clone()))
