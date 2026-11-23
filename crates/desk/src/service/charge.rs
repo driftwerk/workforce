@@ -83,6 +83,21 @@ pub(crate) struct Charges {
     /// sessions a boss runs or who drives them: every boss's message to a
     /// session waits, and nothing is taken on.
     loaded: bool,
+    /// The sessions starting in a boss's charge that aren't yet where they
+    /// belong (their group, their grant): what holds them isn't said yet.
+    placing: HashSet<Uuid>,
+}
+
+/// [`Desk::charge_placing_until_dropped`].
+pub(super) struct Placing<'a> {
+    desk: &'a Desk,
+    id: Uuid,
+}
+
+impl Drop for Placing<'_> {
+    fn drop(&mut self) {
+        self.desk.0.state.lock().charges.placing.remove(&self.id);
+    }
 }
 
 /// A charge as Desk shows it: its boss by name, and who has the wheel now.
@@ -1554,6 +1569,19 @@ impl Desk {
         st.charges.names.insert(boss.id.clone(), boss.name.clone());
         let c = Charge::new(id, &boss.id, How::Started, group.map(str::to_string));
         st.charges.rows.insert(id, c);
+        st.charges.placing.insert(id);
+    }
+
+    /// Holds `id`, reserved as it started, as placing until dropped: once
+    /// it is where it belongs, or never will be, its start cut off too.
+    pub(super) fn charge_placing_until_dropped(&self, id: Uuid) -> Placing<'_> {
+        Placing { desk: self, id }
+    }
+
+    /// Whether `id` starts in its boss's charge and isn't yet in its group
+    /// and grant: no one judges what holds it until it is.
+    pub fn charge_placing(&self, id: Uuid) -> bool {
+        self.0.state.lock().charges.placing.contains(&id)
     }
 
     /// Forgets `id`'s charge: it never ran. Desk is told it is let go, as

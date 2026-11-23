@@ -212,12 +212,29 @@ impl Desk {
     /// [`Self::bound_groups`] at once, in memory: whether any is new, and so
     /// is to be kept.
     pub fn bound_groups_now(&self, groups: impl IntoIterator<Item = String>) -> bool {
+        self.bind(groups, None)
+    }
+
+    /// [`Self::bound_groups_now`] for `groups` as the configs read from
+    /// `read` on name them: one the person opened since was read before
+    /// their word, and stays open.
+    pub fn bound_groups_read(
+        &self,
+        groups: impl IntoIterator<Item = String>,
+        read: DateTime<Utc>,
+    ) -> bool {
+        self.bind(groups, Some(read))
+    }
+
+    fn bind(&self, groups: impl IntoIterator<Item = String>, read: Option<DateTime<Utc>>) -> bool {
         let mut s = self.0.scopes.lock();
-        let mut added = false;
-        for g in groups {
-            added |= s.bounded.insert(g);
-        }
-        added
+        let bound: Vec<String> = groups
+            .into_iter()
+            .filter(|g| read.is_none_or(|r| s.opened.get(g).is_none_or(|at| *at < r)))
+            .collect();
+        bound
+            .into_iter()
+            .fold(false, |added, g| s.bounded.insert(g) | added)
     }
 
     /// Takes the boss off `group` through the hub's crew, before the group

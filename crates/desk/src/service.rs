@@ -3754,7 +3754,9 @@ impl Desk {
             }
         }
         // Where it belongs, before it can do or spend anything.
+        let placing = self.charge_placing_until_dropped(id);
         let mut placed = self.start_placed(id, group.as_deref(), boss).await;
+        drop(placing);
         // A session named before it starts (a plan's) is written down
         // before its process is: after a stop between the two, its id is
         // known, and the process the holder kept for it is adopted rather

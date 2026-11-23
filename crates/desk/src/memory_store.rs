@@ -739,8 +739,15 @@ impl DeskStore {
         session: Uuid,
         limit: i64,
     ) -> Result<(Vec<KeptExchange>, MemoryCounts)> {
-        let client = self.pool().get().await?;
-        let rows = client
+        let mut client = self.pool().get().await?;
+        // One snapshot: a harvest writing meanwhile is in both or neither.
+        let tx = client
+            .build_transaction()
+            .isolation_level(tokio_postgres::IsolationLevel::RepeatableRead)
+            .read_only(true)
+            .start()
+            .await?;
+        let rows = tx
             .query(
                 "SELECT * FROM (SELECT seq, at, ended, asker, ask, answer, steps, files, \
                    commands, errors, compaction, redacted FROM memory_exchanges \
@@ -767,7 +774,7 @@ impl DeskStore {
                 })
             })
             .collect::<Result<Vec<_>>>()?;
-        let c = client
+        let c = tx
             .query_one(
                 "SELECT COUNT(*), COUNT(*) FILTER (WHERE ended IS NULL), \
                    COUNT(*) FILTER (WHERE compaction), COALESCE(SUM(redacted), 0)::int8, \
@@ -776,6 +783,7 @@ impl DeskStore {
                 &[&session],
             )
             .await?;
+        tx.commit().await?;
         Ok((
             exchanges,
             MemoryCounts {

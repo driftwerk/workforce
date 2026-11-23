@@ -330,7 +330,12 @@ impl CrewHub {
         self.unbossed
             .lock()
             .retain(|session, _| charges.iter().any(|c| c.session == *session));
-        for c in charges {
+        // One still starting isn't in its group or grant yet: judged once
+        // it is.
+        for c in charges
+            .into_iter()
+            .filter(|c| !self.desk.charge_placing(c.session))
+        {
             let group = self
                 .desk
                 .view(c.session)
