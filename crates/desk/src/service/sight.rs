@@ -725,13 +725,16 @@ impl Desk {
             return;
         }
         let table = procs::stats().await;
+        let listed = Utc::now();
         self.0.sight.reads.fetch_add(1, Ordering::Relaxed);
         if let Some(table) = &table {
             self.background_looked(background, table);
         }
         let mut samples = HashMap::new();
         for d in due {
-            let sample = self.sampled(d.prev.as_ref(), &d, table.as_deref()).await;
+            let sample = self
+                .sampled(d.prev.as_ref(), &d, table.as_deref().map(|t| (t, listed)))
+                .await;
             samples.insert(d.id, sample);
         }
         self.shells_ended(&samples);
@@ -780,12 +783,18 @@ impl Desk {
         changed.into_iter().for_each(|id| self.publish(id));
     }
 
-    /// One session's sample now, from `table` and its files, after `prev`.
-    async fn sampled(&self, prev: Option<&Sample>, d: &Due, table: Option<&[Stat]>) -> Sample {
+    /// One session's sample now, from `table` (listed when it says) and its
+    /// files, after `prev`.
+    async fn sampled(
+        &self,
+        prev: Option<&Sample>,
+        d: &Due,
+        table: Option<(&[Stat], DateTime<Utc>)>,
+    ) -> Sample {
         let now = Utc::now();
         let redactor = self.0.ledger.redactor.clone();
         let tree: Vec<Stat> = table
-            .map(|all| {
+            .map(|(all, _)| {
                 sight_procs::work(all, d.root, d.record.engine, d.baseline.as_ref())
                     .into_iter()
                     .cloned()
@@ -843,7 +852,8 @@ impl Desk {
             .iter()
             .filter_map(|(id, t)| Some((id.as_str(), t.born?)))
             .collect();
-        let placed = sight_procs::placed(&refs, files.open_call.as_ref(), &born, now);
+        let listed = table.map_or(now, |(_, at)| at);
+        let placed = sight_procs::placed(&refs, files.open_call.as_ref(), &born, listed);
         let busy = |id: &str| {
             prev.zip(placed.get(id)).is_some_and(|(p, head)| {
                 sight_procs::active(&p.runs, &sight_procs::subtree(&refs, head))
