@@ -33,6 +33,7 @@ mod assignments;
 mod away;
 mod board;
 mod cadence_tool;
+mod checkpoint;
 mod closing;
 pub(crate) mod context;
 pub(crate) mod decide;
@@ -326,6 +327,8 @@ pub struct CrewHub {
     plan_watch: Mutex<plan_watch::Watch>,
     /// What the goal checks keep between looks ([`goal_check`]).
     goal_checks: Mutex<goal_check::GoalChecks>,
+    /// Finished runs' jobs as GitHub said them, for goals' CI parts.
+    jobs_read: measure::JobsRead,
     /// What failed to start, for its plan's next turn.
     plan_failures: Mutex<Vec<(uuid::Uuid, String)>>,
     /// What its boss is told of how a ticket started, when it isn't as
@@ -839,6 +842,7 @@ impl CrewHub {
             plan_failed: Mutex::default(),
             plan_watch: Mutex::default(),
             goal_checks: Mutex::default(),
+            jobs_read: measure::JobsRead::default(),
             plan_failures: Mutex::default(),
             plan_notes: Mutex::default(),
             plan_waiting: Mutex::default(),

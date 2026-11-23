@@ -2777,7 +2777,7 @@ impl CrewHub {
             Kind::Finished => {
                 let session: Uuid = event.subject.as_ref()?.id.parse().ok()?;
                 let (plan, ..) = self.plan_ticket_of(session).await?;
-                self.pull_goal(plan);
+                self.pull_goal(plan, super::goal_check::Pulled::TurnEnded);
                 None
             }
             _ => None,

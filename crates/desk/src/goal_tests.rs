@@ -779,3 +779,76 @@ fn a_checkpoint_shows_only_new_evidence_of_the_goal_s_own_work() {
         Err(NotShown::Missing(b))
     );
 }
+
+#[test]
+fn a_goal_wakes_its_boss_once_a_spell_of_its_leading_stall_with_every_part() {
+    let stall = |part, since, spell| Stall {
+        part,
+        since: at(since),
+        spell,
+    };
+    let mut said = GoalSaid::default();
+    // The judged part stalled from agreement, CI from its first reading.
+    let first = [stall(1, 0, 0)];
+    assert!(wakes(&first, &said));
+    said.tell(&first);
+    assert!(!wakes(&first, &said), "once a spell");
+    let both = [stall(0, 3, 0), stall(1, 0, 0)];
+    assert!(!wakes(&both, &said), "CI crossing its first window rides the next wake");
+    let next = [stall(0, 3, 0), stall(1, 0, 1)];
+    assert_eq!(leading(&next), Some(&next[1]));
+    assert!(wakes(&next, &said));
+    said.tell(&next);
+    assert!(!wakes(&[stall(0, 3, 1), stall(1, 0, 1)], &said), "CI's spell 1 waits for the leader's");
+    // The judged part shown: CI leads, at a spell already said.
+    assert!(!wakes(&[stall(0, 3, 0)], &said));
+    assert!(wakes(&[stall(0, 3, 1)], &said));
+    // A stall that began again starts its spells again.
+    assert!(wakes(&[stall(1, 40, 0)], &said));
+    assert!(!wakes(&[], &said));
+    // Ties lead by the longest stuck.
+    let tie = [stall(0, 5, 2), stall(1, 1, 2)];
+    assert_eq!(leading(&tie), Some(&tie[1]));
+}
+
+#[test]
+fn the_messages_said_to_have_waited_are_kept_to_the_newest() {
+    let mut said = GoalSaid::default();
+    let ids: Vec<Uuid> = (0..UNDELIVERED_KEPT + 3).map(|_| Uuid::new_v4()).collect();
+    for id in &ids {
+        said.undelivered_told(*id);
+    }
+    assert_eq!(said.undelivered, ids[3..]);
+}
+
+#[test]
+fn what_a_goal_names_is_said_in_a_steady_order_and_none_takes_any_work() {
+    let r = result(vec![
+        ci_minutes(5.0, 3),
+        Measure::ChecksGreen {
+            repo: "acme/web".into(),
+            pr: PrPick::Number(7),
+        },
+        Measure::PrMerged {
+            repo: "acme/api".into(),
+            pr: PrPick::Head("fix/ci".into()),
+        },
+        judged(),
+    ]);
+    let refs = GoalRefs::of(&r, &[]);
+    assert!(!refs.is_empty());
+    assert_eq!(
+        refs.words(),
+        "fix/ci of acme/api, main of acme/api, PR #7 of acme/web"
+    );
+    let refs = GoalRefs::of(&result(vec![judged()]), &[]);
+    assert!(refs.is_empty());
+    let e = Evidence::Commit {
+        repo: "acme/api".into(),
+        sha: "d05e8a4".into(),
+    };
+    assert_eq!(
+        checkpoint_shows(std::slice::from_ref(&e), &[Found::Unplaced], &[]),
+        Err(NotShown::Unplaced(e))
+    );
+}

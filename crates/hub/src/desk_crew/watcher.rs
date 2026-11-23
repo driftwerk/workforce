@@ -64,8 +64,8 @@ const UNBOUND_QUIET_MINUTES: u32 = 3;
 /// its look found something.
 const UNBOUND_SWEEP_MINUTES: u32 = 2;
 /// How often, in minutes, an unbound overseer sweeps its scope whatever was
-/// found, while it has open goals or running plans: the net under the
-/// deterministic looks.
+/// found, while it keeps work (open goals, running plans or sessions): the
+/// net under the deterministic looks, its hour counted from Desk's start.
 const UNBOUND_SWEEP_NET_MINUTES: u32 = 60;
 /// What a check-in tried again is marked with: tried again once only.
 const RETRIED: &str = "(again, as the last check-in didn't run) ";
@@ -80,18 +80,19 @@ pub(super) enum Sweep {
 }
 
 /// Whether an unbound overseer that last swept `swept` ago (never, none)
-/// sweeps now, `found` whether its look found anything: with what it
-/// found at most every [`UNBOUND_SWEEP_MINUTES`], else as the net every
+/// sweeps now, `found` whether its look found anything, its net last cast
+/// `netted` ago: with what it found at most every
+/// [`UNBOUND_SWEEP_MINUTES`], else as the net every
 /// [`UNBOUND_SWEEP_NET_MINUTES`]; never for nothing found sooner.
 pub(super) fn sweep_due(
     found: bool,
     swept: Option<std::time::Duration>,
+    netted: std::time::Duration,
     minute: std::time::Duration,
 ) -> Option<Sweep> {
-    let past = |m: u32| swept.is_none_or(|s| s >= minute * m);
     match (
-        found && past(UNBOUND_SWEEP_MINUTES),
-        past(UNBOUND_SWEEP_NET_MINUTES),
+        found && swept.is_none_or(|s| s >= minute * UNBOUND_SWEEP_MINUTES),
+        netted >= minute * UNBOUND_SWEEP_NET_MINUTES,
     ) {
         (true, _) => Some(Sweep::Found),
         (false, true) => Some(Sweep::Net),
@@ -688,6 +689,10 @@ impl CrewHub {
         let mut holding = HashSet::new();
         let mut out = Vec::new();
         let waiting = self.waiting_from(overseer).await;
+        let on_goals = match waiting.is_empty() {
+            true => HashSet::new(),
+            false => self.goal_checked_sessions().await,
+        };
         let away = self.machine_items(overseer);
         for item in overview.items.iter().chain(&away) {
             if item.id == overseer {
@@ -727,7 +732,7 @@ impl CrewHub {
             });
             // Said once a stall, instead of its quiet from then on. A goal's
             // session is its goal check's to say ([`super::goal_check`]).
-            let waits = match self.on_goal(&item.id) {
+            let waits = match on_goals.contains(&item.id) {
                 true => &[][..],
                 false => waiting.get(&item.id).map(Vec::as_slice).unwrap_or_default(),
             };
@@ -1448,6 +1453,8 @@ struct Waking {
     told: Option<DateTime<Utc>>,
     /// When it, unbound, last swept its scope.
     swept: Option<Instant>,
+    /// When its net was last cast, swept or not.
+    netted: Option<Instant>,
 }
 
 /// Turns what happens into the overseers' check-ins: each event, and each
@@ -1475,6 +1482,7 @@ pub(super) fn wake_loop(
         // The ready tickets nobody has, so that one that becomes so wakes it.
         let mut ready_seen = HashMap::new();
         let mut ready_dirty = false;
+        let started = Instant::now();
         crew.ready_unhanded(&mut ready_seen, |_| None).await;
         loop {
             // What was found, by the overseer it is for.
@@ -1547,6 +1555,7 @@ pub(super) fn wake_loop(
                         let w = waking.entry(id.clone()).or_default();
                         w.noted = noted;
                         let swept = w.swept;
+                        let netted = [w.netted, swept].into_iter().flatten().fold(started, Instant::max);
                         let looked_found = !at.is_empty();
                         found.extend(at.into_iter().map(|mut t| {
                             t.routine = true;
@@ -1557,9 +1566,14 @@ pub(super) fn wake_loop(
                         // Running on notices, only once they have been quiet a
                         // while: the net under them.
                         let noticed = crew.orchestrates(&id) && crew.noticed_lately(&id);
-                        let sweeps = match sweep_due(looked_found, swept.map(|at| at.elapsed()), crew.timing.minute) {
+                        let sweeps = match sweep_due(looked_found, swept.map(|at| at.elapsed()), netted.elapsed(), crew.timing.minute) {
                             Some(Sweep::Found) => true,
-                            Some(Sweep::Net) => crew.keeps_work(&id).await,
+                            Some(Sweep::Net) => {
+                                if let Some(w) = waking.get_mut(&id) {
+                                    w.netted = Some(Instant::now());
+                                }
+                                crew.keeps_work(&id, o).await
+                            }
                             None => false,
                         };
                         if sweeps && !noticed && crew.unbound(o) {
@@ -1878,17 +1892,17 @@ mod budget_tests {
     #[test]
     fn an_unbound_sweep_comes_with_what_was_found_and_as_an_hourly_net() {
         let minute = std::time::Duration::from_secs(60);
-        let ago = |m: u64| Some(minute * m as u32);
-        assert_eq!(sweep_due(false, ago(1), minute), None, "nothing found");
-        assert_eq!(sweep_due(false, ago(59), minute), None);
-        assert_eq!(
-            sweep_due(true, ago(1), minute),
-            None,
-            "not twice in two minutes"
-        );
-        assert_eq!(sweep_due(true, ago(2), minute), Some(Sweep::Found));
-        assert_eq!(sweep_due(false, ago(60), minute), Some(Sweep::Net));
-        assert_eq!(sweep_due(false, None, minute), Some(Sweep::Net));
-        assert_eq!(sweep_due(true, None, minute), Some(Sweep::Found));
+        let ago = |m: u32| minute * m;
+        let due = |found, swept: Option<u32>, netted| {
+            sweep_due(found, swept.map(ago), ago(netted), minute)
+        };
+        assert_eq!(due(false, Some(1), 1), None, "nothing found");
+        assert_eq!(due(false, Some(59), 59), None);
+        assert_eq!(due(true, Some(1), 1), None, "not twice in two minutes");
+        assert_eq!(due(true, Some(2), 2), Some(Sweep::Found));
+        assert_eq!(due(false, Some(60), 60), Some(Sweep::Net));
+        assert_eq!(due(false, None, 0), None, "not as Desk starts");
+        assert_eq!(due(false, None, 60), Some(Sweep::Net));
+        assert_eq!(due(true, None, 0), Some(Sweep::Found));
     }
 }

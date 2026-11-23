@@ -7,7 +7,7 @@
 //! Everything here is pure: the hub reads the measures and the person's
 //! messages, and this module decides what they come to.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -141,6 +141,21 @@ pub struct Reading {
     pub words: String,
     pub evidence: Vec<Evidence>,
     pub failed: Option<String>,
+}
+
+impl Reading {
+    /// Part `part` not read at `at`, for `why`.
+    pub fn failed(part: u16, at: DateTime<Utc>, why: &str) -> Self {
+        Self {
+            at,
+            part,
+            value: None,
+            met: false,
+            words: String::new(),
+            evidence: Vec::new(),
+            failed: Some(crate::crew::one_line(why, 300)),
+        }
+    }
 }
 
 text_enum!(FactKind {
@@ -638,6 +653,90 @@ impl GoalRefs {
             .filter(move |(r, _)| *r == repo)
             .map(|(_, b)| b.as_str())
     }
+
+    /// Whether the goal names nothing on GitHub: any work shown there is
+    /// taken as its own.
+    pub fn is_empty(&self) -> bool {
+        self.branches.is_empty() && self.pulls.is_empty()
+    }
+
+    /// What the goal names, in words, in a steady order: "main of
+    /// acme/api, PR #12 of acme/api".
+    pub fn words(&self) -> String {
+        let mut branches: Vec<_> = self.branches.iter().collect();
+        branches.sort();
+        let mut pulls: Vec<_> = self.pulls.iter().collect();
+        pulls.sort();
+        branches
+            .into_iter()
+            .map(|(repo, b)| format!("{b} of {repo}"))
+            .chain(pulls.into_iter().map(|(repo, n)| format!("PR #{n} of {repo}")))
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+}
+
+/// What a goal's boss was told of it already, kept with its plan so that
+/// nothing is said twice, a restart between or not.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GoalSaid {
+    /// Each part's stall, by when it began, and the furthest spell of it
+    /// said.
+    #[serde(default)]
+    pub spells: BTreeMap<u16, (DateTime<Utc>, u32)>,
+    /// Each part's run of failed reads said, by when it began.
+    #[serde(default)]
+    pub failing: BTreeMap<u16, DateTime<Utc>>,
+    /// The boss's messages it was told hadn't gone in, newest last.
+    #[serde(default)]
+    pub undelivered: Vec<Uuid>,
+    /// The stall, by when it began, and its spell, the person's roundup was
+    /// last given a note of.
+    #[serde(default)]
+    pub noted: Option<(DateTime<Utc>, u32)>,
+}
+
+/// The most of the boss's undelivered messages remembered as said.
+pub const UNDELIVERED_KEPT: usize = 50;
+
+impl GoalSaid {
+    /// Whether `s`, or a later spell of the same stall, was said.
+    pub fn told(&self, s: &Stall) -> bool {
+        self.spells
+            .get(&s.part)
+            .is_some_and(|(since, spell)| *since == s.since && *spell >= s.spell)
+    }
+
+    /// Notes each of `stalls` as said.
+    pub fn tell(&mut self, stalls: &[Stall]) {
+        for s in stalls {
+            if !self.told(s) {
+                self.spells.insert(s.part, (s.since, s.spell));
+            }
+        }
+    }
+
+    /// Notes the boss's message `id` as said to have waited.
+    pub fn undelivered_told(&mut self, id: Uuid) {
+        self.undelivered.push(id);
+        let over = self.undelivered.len().saturating_sub(UNDELIVERED_KEPT);
+        self.undelivered.drain(..over);
+    }
+}
+
+/// The stall leading `stalls`: the furthest in its spells, the longest
+/// stuck of those.
+pub fn leading(stalls: &[Stall]) -> Option<&Stall> {
+    stalls
+        .iter()
+        .max_by(|a, b| a.spell.cmp(&b.spell).then(b.since.cmp(&a.since)))
+}
+
+/// Whether a goal stalled as `stalls`, its boss told `said`, wakes it now:
+/// once each spell of the leading stall, with every part stalled then, so
+/// that parts stalled from different times never wake it apart.
+pub fn wakes(stalls: &[Stall], said: &GoalSaid) -> bool {
+    leading(stalls).is_some_and(|s| !said.told(s))
 }
 
 /// What Desk found of one piece of a checkpoint's evidence.
@@ -650,6 +749,9 @@ pub enum Found {
     OffGoal,
     /// It isn't there as it says, or couldn't be looked up.
     Missing,
+    /// It may be there, but Desk can't look up where the goal's work is to
+    /// place it.
+    Unplaced,
 }
 
 /// Why a checkpoint isn't accepted toward its judged part.
@@ -661,6 +763,8 @@ pub enum NotShown {
     Missing(Evidence),
     /// This piece of it is other work than the goal's.
     OffGoal(Evidence),
+    /// This piece of it can't be placed on the goal's work.
+    Unplaced(Evidence),
     /// Every piece was shown toward the part already.
     NothingNew,
 }
@@ -682,6 +786,7 @@ pub fn checkpoint_shows(
             Found::OnGoal => {}
             Found::OffGoal => return Err(NotShown::OffGoal(e.clone())),
             Found::Missing => return Err(NotShown::Missing(e.clone())),
+            Found::Unplaced => return Err(NotShown::Unplaced(e.clone())),
         }
     }
     if found.len() < evidence.len() {

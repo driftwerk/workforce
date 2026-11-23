@@ -57,6 +57,17 @@ pub(super) async fn boss_on(
     oversight: &str,
     gh: &wiremock::MockServer,
 ) -> (Arc<AgentService>, Arc<CrewHub>, Desk, wiremock::MockServer) {
+    boss_until(dir, pool, oversight, gh, CancellationToken::new()).await
+}
+
+/// [`boss_on`], its crew running until `stop`.
+pub(super) async fn boss_until(
+    dir: &Path,
+    pool: workforce_postgres::PostgresPool,
+    oversight: &str,
+    gh: &wiremock::MockServer,
+    stop: CancellationToken,
+) -> (Arc<AgentService>, Arc<CrewHub>, Desk, wiremock::MockServer) {
     let uri = gh.uri();
     let (overseer, llm) = agent_configured(dir, "desk", "ok", &[], |c| {
         c.github.base_url = uri;
@@ -93,7 +104,7 @@ pub(super) async fn boss_on(
             .then_some(())
     })
     .await;
-    let crew = CrewHub::start(state, d.clone(), FAST, CancellationToken::new());
+    let crew = CrewHub::start(state, d.clone(), FAST, stop);
     eventually("the plan tools", async || {
         overseer.tools.has("crew.plan").then_some(())
     })

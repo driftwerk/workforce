@@ -60,14 +60,7 @@ const STOPPED_KEY: &str = "plan-stopped:";
 /// What the watchdog did, once each, by what it was about.
 #[derive(Default)]
 pub(crate) struct Watch {
-    pub(super) done: HashSet<String>,
-}
-
-impl Watch {
-    /// Notes `key` as done: true the first time.
-    pub(crate) fn said(&mut self, key: String) -> bool {
-        self.done.insert(key)
-    }
+    done: HashSet<String>,
 }
 
 /// Where one of a plan's tickets stands, as the watchdog reads it.
@@ -206,6 +199,11 @@ impl CrewHub {
             if p.paused.is_some() {
                 continue;
             }
+            // Met while it was paused: closed now it runs again.
+            if let Some(m) = &p.met {
+                self.close_met(p.id, &m.why);
+                continue;
+            }
             let Some((service, o)) = self.overseer_named(&p.boss) else {
                 continue;
             };
@@ -220,7 +218,7 @@ impl CrewHub {
             };
             self.watch_plan(&service, &o, &detail).await;
         }
-        self.check_goals().await;
+        self.spawn_goal_checks();
     }
 
     /// Whether `session` is `boss`'s to look after: in its charge, started

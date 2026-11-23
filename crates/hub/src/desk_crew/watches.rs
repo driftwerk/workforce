@@ -326,7 +326,7 @@ impl CrewHub {
                             Ok(Some(ended)) => {
                                 self.watch_reads.lock().insert(w.id, outcome.1);
                                 if let Some(plan) = ended.plan {
-                                    self.pull_goal(plan);
+                                    self.pull_goal(plan, super::goal_check::Pulled::Measured);
                                 }
                             }
                             // Ended meanwhile (the boss ended it).

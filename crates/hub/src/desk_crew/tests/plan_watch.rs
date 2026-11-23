@@ -814,8 +814,8 @@ async fn what_closing_a_session_leaves_is_read_for_the_person_as_its_boss_reads_
 /// branch all night, the boss's checkpoint from those commits is refused as
 /// off the goal, CI stays at 22 minutes, and the boss arms no watch. The
 /// hub reads it alone and wakes the boss at the stall window, at twice and
-/// at four times it, each part on its own and once a spell; the person's
-/// roundup says one note at four times, and nothing else is said to them.
+/// at four times it, once a spell with both parts; the person's roundup
+/// says one note at four times, and nothing else is said to them.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_night_of_22_november() {
     with_test_pool(workforce_desk::store::build_pool, |pool| async move {
@@ -841,7 +841,8 @@ async fn the_night_of_22_november() {
             .unwrap()
             .is_empty());
 
-        // Its checkpoint from those commits is refused as off the goal.
+        // Its checkpoint from those commits is refused as off the goal, and
+        // says what it would take.
         let r = run(
             &overseer,
             "crew.plan_update",
@@ -851,50 +852,29 @@ async fn the_night_of_22_november() {
         )
         .await;
         assert!(!r.success, "{r:?}");
+        let refused = r.error.unwrap_or_default();
         assert!(
-            r.error.as_deref().unwrap_or_default().contains("isn't the goal's own work"),
-            "{r:?}"
+            refused.contains("isn't on the goal's work (main of acme/mantis)")
+                && refused.contains("open a pull request from its branch"),
+            "{refused}"
         );
 
-        // Woken at the window, at twice it and at four times it, each part
-        // on its own; the roundup is given a note at four times.
-        // The spells each part's boss wake was claimed for, in order.
-        let spells = |part: u16| {
-            let key = format!("goal-stall:{id}:{part}:");
-            let mut s: Vec<u32> = crew
-                .plan_watch
-                .lock()
-                .done
-                .iter()
-                .filter_map(|k| k.strip_prefix(&key)?.rsplit(':').next()?.parse().ok())
-                .collect();
-            s.sort_unstable();
-            s
-        };
-        // The judged part stalls from when the goal was agreed, the CI part
-        // from its first reading: each reaches its third spell on its own.
-        eventually("each part's third spell", async || {
-            (spells(0).contains(&2) && spells(1).contains(&2)).then_some(())
+        // Woken once at the window, at twice it and at four times it, each
+        // time with both parts; the roundup is given one note at four times.
+        let turns = async || asked_with(&llm, &[STALLED]).await;
+        eventually("the third spell's turn", async || {
+            (turns().await >= 3).then_some(())
         })
         .await;
         let noted_by = chrono::Utc::now();
-        for part in [0, 1] {
-            assert_eq!(spells(part)[..3], [0, 1, 2], "part {part} at 1×, 2× and 4× once each");
-        }
+        assert_eq!(turns().await, 3, "once a spell");
+        assert!(asked_with(&llm, &[STALLED, CI, "22 minutes", "only the services"]).await >= 2);
         let notes = crew.goal_notes("desk", noted_by);
-        // One note a plan a spell, from its third.
-        assert!((1..=2).contains(&notes.len()), "{notes:?}");
-        assert!(
-            notes.iter().all(|n| n.starts_with("No progress on “Mantis CI")),
-            "{notes:?}"
-        );
-        eventually("its third spell's turn", async || {
-            (asked_with(&llm, &[STALLED, CI, "22 minutes"]).await > 0).then_some(())
-        })
-        .await;
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        assert!(notes[0].starts_with("No progress on “Mantis CI"), "{notes:?}");
         // Nothing more within the spell: the next is at eight times.
-        tokio::time::sleep(Duration::from_millis(300)).await;
-        assert!(spells(0).len() <= 4 && spells(1).len() <= 4, "once a spell");
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        assert_eq!(turns().await, 3, "nothing more within the spell");
 
         // No checkpoint moved the judged part, and the person was told
         // nothing until their roundup, which says the note once.

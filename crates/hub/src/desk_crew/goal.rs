@@ -23,9 +23,11 @@ use super::measure;
 use super::CrewHub;
 use crate::serve::AgentService;
 
-/// The longest one goal's reading may take: GitHub slow never holds up a
-/// plan turn or the watchdog's other looks.
+/// The longest one part's reading may take: GitHub slow never holds up a
+/// plan turn or the goal checks.
 const READ_FOR: std::time::Duration = std::time::Duration::from_secs(30);
+/// Why a part read longer than [`READ_FOR`] failed.
+const SLOW: &str = "GitHub took over 30 s to answer";
 
 /// How far back the person's words agreeing a goal are looked for.
 const AGREED_WITHIN: Duration = Duration::hours(24);
@@ -760,7 +762,13 @@ impl CrewHub {
             let mut out = Vec::new();
             for (i, part) in r.parts.iter().enumerate().filter(|(_, p)| p.measured()) {
                 let n = u16::try_from(i).unwrap_or_default();
-                out.push((i, measure::read(&access, part, n, agreed_at, at).await));
+                let read = measure::read(&access, &self.jobs_read, part, n, agreed_at, at);
+                // GitHub slow is a failed reading: backed off and counted as
+                // any other, the parts read before it kept.
+                let read = tokio::time::timeout(READ_FOR, read)
+                    .await
+                    .unwrap_or_else(|_| Ok(Reading::failed(n, at, SLOW)));
+                out.push((i, read));
             }
             out
         })
@@ -794,8 +802,7 @@ impl CrewHub {
 
     /// Plan `p`'s measured parts read now as the person and kept: the plan
     /// fresh, none when it isn't read (no goal agreed, met already, not
-    /// running or paused, nothing measured, or GitHub slower than
-    /// [`READ_FOR`]: nothing is kept then).
+    /// running or paused, or nothing measured).
     pub(super) async fn read_kept(
         &self,
         service: &AgentService,
@@ -813,24 +820,15 @@ impl CrewHub {
         }
         let agreed_at = plan.agreed_at.unwrap_or(plan.created_at);
         let at = crew::now();
-        let Ok(read) = tokio::time::timeout(READ_FOR, self.read_parts(service, r, agreed_at)).await
-        else {
-            tracing::info!(plan = %plan.id, "a goal's reading took too long; it is read again next time");
-            return None;
-        };
-        let readings: Vec<Reading> = read
+        let readings: Vec<Reading> = self
+            .read_parts(service, r, agreed_at)
+            .await
             .into_iter()
             .map(|(i, read)| match read {
                 Ok(reading) => reading,
-                Err(measure::Unreadable(why)) => Reading {
-                    at,
-                    part: u16::try_from(i).unwrap_or_default(),
-                    value: None,
-                    met: false,
-                    words: String::new(),
-                    evidence: Vec::new(),
-                    failed: Some(crew::one_line(&why, 300)),
-                },
+                Err(measure::Unreadable(why)) => {
+                    Reading::failed(u16::try_from(i).unwrap_or_default(), at, &why)
+                }
             })
             .collect();
         self.keep_readings(plan.id, r, &readings).await;
@@ -883,7 +881,8 @@ impl CrewHub {
 
     /// Plan `id`'s goal met as `met` says: kept once, its ticket moved to
     /// Done by Desk, and its closing turn, which finishes it, run after on
-    /// its own as any plan turn is: never inside the call that met it.
+    /// its own as any plan turn is: never inside the call that met it, and
+    /// only once a plan paused runs again.
     pub(super) async fn goal_met(&self, id: Uuid, met: Met) -> Result<(), String> {
         let why = met.why.clone();
         let first = self
@@ -891,12 +890,15 @@ impl CrewHub {
             .goal_met(id, &met)
             .await
             .map_err(|e| format!("The goal couldn't be marked met: {e}"))?;
-        if first {
-            let crew = self.me();
-            tokio::spawn(async move {
-                crew.plan_turn(id, vec![format!("The goal is met: {why}")])
-                    .await;
-            });
+        // Paused, its closing turn waits for it to run again: the
+        // watchdog's next look then.
+        let running = self
+            .desk
+            .plan(id)
+            .await
+            .is_ok_and(|p| p.summary.plan.state == workforce_desk::plan::PlanState::Running);
+        if first && running {
+            self.close_met(id, &why);
         }
         Ok(())
     }

@@ -7,7 +7,7 @@ use eyre::{Context, Result};
 use tokio_postgres::Row;
 use uuid::Uuid;
 
-use crate::goal::{Fact, FactKind, Met, Reading};
+use crate::goal::{Fact, FactKind, GoalSaid, Met, Reading};
 use crate::plan::Plan;
 use crate::plan_store::PLAN;
 use crate::store::DeskStore;
@@ -171,6 +171,31 @@ impl DeskStore {
         Ok(n == 1)
     }
 
+    /// What plan `plan`'s boss was told of its goal by the hub's checks:
+    /// nothing for a plan there isn't.
+    pub async fn goal_said(&self, plan: Uuid) -> Result<GoalSaid> {
+        let client = self.pool().get().await?;
+        let row = client
+            .query_opt("SELECT goal_said FROM plans WHERE id = $1", &[&plan])
+            .await?;
+        Ok(match row {
+            Some(r) => serde_json::from_value(r.try_get(0)?).context("a goal's said")?,
+            None => GoalSaid::default(),
+        })
+    }
+
+    /// Keeps `said` as what plan `plan`'s boss was told of its goal.
+    pub async fn keep_goal_said(&self, plan: Uuid, said: &GoalSaid) -> Result<()> {
+        let client = self.pool().get().await?;
+        client
+            .execute(
+                "UPDATE plans SET goal_said = $2 WHERE id = $1",
+                &[&plan, &serde_json::to_value(said)?],
+            )
+            .await?;
+        Ok(())
+    }
+
     /// Notes that plan `plan`'s goal was said back to the person at `at`.
     pub async fn set_read_back(&self, plan: Uuid, at: DateTime<Utc>) -> Result<()> {
         let client = self.pool().get().await?;
@@ -320,6 +345,36 @@ mod tests {
             assert!(
                 !s.mark_met(new_plan(&b).id, &met).await.unwrap(),
                 "no such plan"
+            );
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn what_a_goal_s_boss_was_told_is_kept_with_its_plan() {
+        with_test_pool(crate::store::build_pool, |pool| async move {
+            let s = DeskStore::with_pool(pool).await.unwrap();
+            let b = board(&s).await;
+            let p = new_plan(&b);
+            s.put_plan(&p).await.unwrap();
+            assert_eq!(s.goal_said(p.id).await.unwrap(), GoalSaid::default());
+            let at = crate::crew::now();
+            let mut said = GoalSaid::default();
+            said.spells.insert(1, (at, 2));
+            said.failing.insert(0, at);
+            said.undelivered_told(Uuid::new_v4());
+            said.noted = Some((at, 2));
+            s.keep_goal_said(p.id, &said).await.unwrap();
+            assert_eq!(s.goal_said(p.id).await.unwrap(), said);
+            s.put_plan(&p).await.unwrap();
+            assert_eq!(
+                s.goal_said(p.id).await.unwrap(),
+                said,
+                "a plan written again keeps it"
+            );
+            assert_eq!(
+                s.goal_said(Uuid::new_v4()).await.unwrap(),
+                GoalSaid::default()
             );
         })
         .await;
