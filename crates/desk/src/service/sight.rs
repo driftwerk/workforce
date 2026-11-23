@@ -998,7 +998,20 @@ impl Desk {
             .collect();
         let listed = table.map_or(now, |(_, at)| at);
         let call_born = files.call_output.as_ref().and_then(|(_, t)| t.born);
-        let placed = sight_procs::placed(&refs, files.open_call.as_ref(), call_born, &born, listed);
+        let ended: Vec<&str> = files
+            .shells
+            .iter()
+            .filter(|(_, t)| t.ended)
+            .map(|(id, _)| id.as_str())
+            .collect();
+        let placed = sight_procs::placed(
+            &refs,
+            files.open_call.as_ref(),
+            call_born,
+            &born,
+            &ended,
+            listed,
+        );
         mark_over(
             files.call_output.iter_mut().chain(&mut files.shells),
             &placed,
@@ -1788,6 +1801,7 @@ mod tests {
             &[&s, &f],
             Some(&call),
             Some(to_utc(at(1030))),
+            &[],
             &[],
             to_utc(at(1035)),
         );

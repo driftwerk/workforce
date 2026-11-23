@@ -160,13 +160,15 @@ pub fn said_after(
 /// keeps of a run: the nearest first, one started before ahead of one
 /// after. Those as near in the same second are paired in order, the latest
 /// of them with the latest started, so a shell started that second before
-/// them all (a sub-agent's) is the one left. One with none placed waits in
-/// no process Desk knows.
+/// them all (a sub-agent's) is the one left; and with fewer shells than
+/// them, one whose output's last line says it ended (`ended`) is the one
+/// without. One with none placed waits in no process Desk knows.
 pub fn placed<'a>(
     tree: &[&'a Stat],
     call: Option<&OpenCall>,
     call_born: Option<DateTime<Utc>>,
     shells: &[(&str, DateTime<Utc>)],
+    ended: &[&str],
     listed: DateTime<Utc>,
 ) -> HashMap<String, &'a Stat> {
     let tools: Vec<&Stat> = tree
@@ -222,10 +224,14 @@ pub fn placed<'a>(
                 .collect();
             started.sort_by_key(|s| s.proc.pid);
             let k = waiting.len().min(started.len());
-            for (id, s) in waiting[waiting.len() - k..]
-                .iter()
-                .zip(&started[started.len() - k..])
-            {
+            // Short of shells, those whose output says they ended are the
+            // ones left, then the earliest.
+            let mut kept: Vec<usize> = (0..waiting.len()).collect();
+            kept.sort_by_key(|&i| (!ended.contains(&waiting[i]), i));
+            let mut kept = kept.split_off(waiting.len() - k);
+            kept.sort_unstable();
+            for (i, s) in kept.into_iter().zip(&started[started.len() - k..]) {
+                let id = waiting[i];
                 placed.insert(id.to_string(), *s);
             }
             placed
@@ -642,7 +648,7 @@ mod tests {
         let call = bash_call(11);
         let said = said.and_then(|line| appeared(&call, line, 10));
         let open_call = said.as_ref().map(|_| &call);
-        let placed = placed(&tree, open_call, None, &[], now());
+        let placed = placed(&tree, open_call, None, &[], &[], now());
         classify(&Evidence {
             tree: &tree,
             open_call,
@@ -791,7 +797,7 @@ mod tests {
             since: born(61),
         };
         let pids = |shells: &[(&str, DateTime<Utc>)], call| {
-            let mut pids: Vec<(String, u32)> = placed(&tree, call, None, shells, now())
+            let mut pids: Vec<(String, u32)> = placed(&tree, call, None, shells, &[], now())
                 .into_iter()
                 .map(|(id, s)| (id, s.proc.pid))
                 .collect();
@@ -828,7 +834,7 @@ mod tests {
         let at = |ms: i64| now() - Duration::milliseconds(ms);
         let pids = |all: &[Stat], shells: &[(&str, DateTime<Utc>)], call: Option<&OpenCall>| {
             let tree = work(all, 100, Engine::Claude, None);
-            let mut pids: Vec<(String, u32)> = placed(&tree, call, None, shells, now())
+            let mut pids: Vec<(String, u32)> = placed(&tree, call, None, shells, &[], now())
                 .into_iter()
                 .map(|(id, s)| (id, s.proc.pid))
                 .collect();
@@ -889,6 +895,53 @@ mod tests {
     }
 
     #[test]
+    fn twins_of_one_second_one_ended_the_live_one_keeps_its_shell_and_is_never_written_off() {
+        use crate::background::{Background, Reported, TaskKind};
+        use std::collections::BTreeSet;
+        let at = |ms: i64| now() - Duration::milliseconds(ms);
+        // b2 then b1 start in the same second; b1 exits at once, its
+        // output's last line its end.
+        let live = shells(&[(120, 300, 0)]);
+        let tree = work(&live, 100, Engine::Claude, None);
+        let twins = [("b2", at(300_600)), ("b1", at(300_200))];
+        let placed_with = |ended: &[&str]| {
+            let mut pids: Vec<(String, u32)> = placed(&tree, None, None, &twins, ended, now())
+                .into_iter()
+                .map(|(id, s)| (id, s.proc.pid))
+                .collect();
+            pids.sort();
+            pids
+        };
+        assert_eq!(
+            placed_with(&[]),
+            [("b1".to_string(), 120)],
+            "by birth alone, the one born last"
+        );
+        assert_eq!(
+            placed_with(&["b1"]),
+            [("b2".to_string(), 120)],
+            "the live one keeps its shell; the ended one is over"
+        );
+        let found: BTreeSet<String> = placed_with(&["b1"]).into_iter().map(|(id, _)| id).collect();
+        let t0 = now();
+        let shell = |id| Reported::new(id, TaskKind::Shell);
+        let b = Background::default().reported(Some(vec![shell("b2"), shell("b1")]), t0);
+        let gone = (1..=4).fold(b, |b, s| {
+            b.looked(
+                1,
+                Some(&found),
+                t0 + Duration::seconds(s * 60),
+                Duration::zero(),
+            )
+        });
+        assert_eq!(
+            gone.shells().collect::<Vec<_>>(),
+            ["b2"],
+            "the write-off takes the ended one, never the live one"
+        );
+    }
+
+    #[test]
     fn a_call_waiting_on_approval_is_placed_by_its_own_files_birth_and_one_of_another_tool_in_none()
     {
         let at = |ms: i64| now() - Duration::milliseconds(ms);
@@ -903,7 +956,7 @@ mod tests {
         let all = shells(&[(110, 303, 0), (120, 300, 0)]);
         let tree = work(&all, 100, Engine::Claude, None);
         let pids = |call: &OpenCall, born| {
-            let mut pids: Vec<(String, u32)> = placed(&tree, Some(call), born, &[], now())
+            let mut pids: Vec<(String, u32)> = placed(&tree, Some(call), born, &[], &[], now())
                 .into_iter()
                 .map(|(id, s)| (id, s.proc.pid))
                 .collect();
@@ -941,6 +994,7 @@ mod tests {
                 None,
                 None,
                 &[("b1", born(300)), ("b2", born(299))],
+                &[],
                 now(),
             );
             let busy = placed
@@ -984,7 +1038,7 @@ mod tests {
             tree: &tree,
             open_call: Some(&call),
             said: said.as_slice(),
-            placed: &placed(&tree, Some(&call), None, &[], now()),
+            placed: &placed(&tree, Some(&call), None, &[], &[], now()),
             active_at: now(),
             now: now(),
             poll: Duration::minutes(10),
@@ -998,7 +1052,7 @@ mod tests {
             ..call
         };
         assert_eq!(
-            placed(&tree, Some(&later), None, &[], now()).get("toolu_1"),
+            placed(&tree, Some(&later), None, &[], &[], now()).get("toolu_1"),
             None,
             "no shell started since"
         );
