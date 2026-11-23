@@ -51,7 +51,7 @@ You can connect multiple Google accounts by specifying different workspace names
 }
 ```
 
-Then use the `account` parameter in any Google tool to specify which workspace to use.
+Then use the `workspace` parameter in any Google tool to specify which account to use.
 
 ## Available tools
 
@@ -128,12 +128,12 @@ When using multiple Google accounts, specify which account to use:
 ```json
 {
   "calendar_id": "primary",
-  "account": "work",
+  "workspace": "work",
   "time_min": "2024-01-01T00:00:00Z"
 }
 ```
 
-Omit the `account` parameter to use your default workspace.
+Omit the `workspace` parameter to use your default account. (`account` is still accepted as an older name for `workspace`.) The `google.workspaces` tool lists the accounts you can use.
 
 ## Related tools
 
