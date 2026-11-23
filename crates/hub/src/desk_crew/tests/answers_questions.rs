@@ -607,7 +607,10 @@ async fn at_act_the_boss_that_runs_it_answers_a_session_whose_turn_ended_on_a_qu
             )
             .await
             .unwrap();
-        assert!(!said.contains(';'), "nothing holds it, so nothing is said to: {said}");
+        assert!(
+            said.contains(": queued, not yet delivered; it goes in next."),
+            "nothing holds it, so nothing is said to: {said}"
+        );
         let thread = d.line_thread(s.id, None, None).await.unwrap();
         assert!(
             thread.iter().all(|m| !m.text.starts_with("Yes, drop")),
@@ -678,8 +681,8 @@ async fn a_bosss_message_to_a_session_asking_the_person_is_said_to_wait_on_their
             .await
             .unwrap();
         assert!(
-            said.ends_with(
-                "its turn ended asking the person something, so it gets it once they answer"
+            said.contains(
+                ": queued, not yet delivered; its turn ended asking the person something, so it gets it once they answer."
             ),
             "{said}"
         );

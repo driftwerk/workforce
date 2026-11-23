@@ -280,6 +280,12 @@ pub enum Wait {
     /// Sent now into its running turn: it reads it with its next tool
     /// call's result (or, if the turn ends first, at the idle).
     NextCall,
+    /// Its session's own call waits on it, the answer to what it asked:
+    /// that call takes it as its result.
+    Awaited,
+    /// One handed to Desk's plugin before it hasn't been said to have gone
+    /// in yet: one goes at a time, in the order they were sent.
+    Behind,
 }
 
 impl Wait {
@@ -288,7 +294,13 @@ impl Wait {
     pub fn on_purpose(self) -> bool {
         match self {
             Self::Typing | Self::Paused | Self::PersonDriving | Self::ModeEnding => true,
-            Self::Stopped | Self::Working | Self::Asking | Self::Dialog | Self::NextCall => false,
+            Self::Stopped
+            | Self::Working
+            | Self::Asking
+            | Self::Dialog
+            | Self::NextCall
+            | Self::Awaited
+            | Self::Behind => false,
         }
     }
 }
@@ -343,6 +355,9 @@ pub struct LineMessage {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub group: Option<String>,
     pub delivered_at: Option<DateTime<Utc>>,
+    /// When Desk's plugin was handed it, if it was.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub handed_at: Option<DateTime<Utc>>,
     pub updated_at: DateTime<Utc>,
     /// Why it waits, while it is queued or held (not stored).
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -379,6 +394,7 @@ impl LineMessage {
             question: None,
             group: None,
             delivered_at: None,
+            handed_at: None,
             updated_at: at,
             waiting: None,
             actions: Vec::new(),

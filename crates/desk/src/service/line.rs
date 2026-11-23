@@ -59,6 +59,21 @@ pub(crate) struct Lines {
     /// them (or, for a stop its boss lifts, their boss does): each a need
     /// of the person's on the Floor, said once.
     stalled: HashMap<Uuid, Stalled>,
+    /// Why each session's waiting rows were last kept from its Desk plugin,
+    /// by row: each new reason is logged once.
+    skipped: HashMap<Uuid, HashMap<Uuid, Wait>>,
+}
+
+/// A session's line as one look at it reads it: what [`Desk::line_hold`]
+/// judges each of its waiting rows by.
+pub(super) struct LineAt {
+    view: SessionView,
+    /// The person typed in its terminal since their last prompt.
+    typed: bool,
+    /// Desk's plugin was heard from in it.
+    plugin: bool,
+    /// The row handed to Desk's plugin that it hasn't said went in.
+    ahead: Option<Uuid>,
 }
 
 /// A session the loop guard stopped.
@@ -1840,48 +1855,123 @@ impl Desk {
     }
 
     async fn line_next_now(&self, caller: Uuid) -> Result<Option<Value>, LineError> {
-        let view = self.view(caller)?;
-        // Inside a turn, or behind a dialog, Desk keeps what waits (see
-        // [`line::deliverable`]).
-        if !view.live || self.in_a_turn(&view) || view.pending.is_some() {
-            return Ok(None);
-        }
         let inbox = self.0.store.line_inbox(&caller.to_string()).await?;
-        // One on its way at a time: the order they were sent in holds.
-        if inbox.iter().any(|m| m.delivery == Delivery::Handed) {
-            return Ok(None);
-        }
-        for m in inbox {
-            if self.waited_on(&m)
-                || self.line_gate(&view, &m).is_some()
-                || self.steer_reserved(caller, &m)
-            {
+        let at = self.line_at(self.view(caller)?, &inbox);
+        let mut kept = HashMap::new();
+        let mut next = None;
+        for m in inbox.iter().filter(|m| m.delivery != Delivery::Handed) {
+            if let Some(why) = self.line_hold(&at, m) {
+                kept.insert(m.id, why);
                 continue;
             }
             // Decided before the person's own words there: never handed in.
-            if self.line_overtaken(&m).await {
+            if self.line_overtaken(m).await {
                 continue;
             }
-            if let Some(taken) = self.0.store.line_take(m.id, Delivery::Handed).await? {
-                after_take(caller);
-                if !self.still_goes_in(caller, &taken) {
-                    self.put_back(caller, &taken, Delivery::Handed).await?;
-                    continue;
-                }
-                self.line_announce(&taken);
-                return Ok(Some(
-                    json!({ "id": taken.id, "text": self.rendered(&taken).await }),
-                ));
+            let Some(taken) = self.0.store.line_take(m.id, Delivery::Handed).await? else {
+                continue;
+            };
+            after_take(caller);
+            if !self.still_goes_in(caller, &taken) {
+                self.put_back(caller, &taken, Delivery::Handed).await?;
+                continue;
             }
+            self.line_announce(&taken);
+            next = Some(json!({ "id": taken.id, "text": self.rendered(&taken).await }));
+            break;
         }
-        Ok(None)
+        self.line_kept(caller, kept);
+        Ok(next)
+    }
+
+    /// `id`'s rows kept from Desk's plugin this look, each with why: a
+    /// reason not logged for its row before is, once.
+    fn line_kept(&self, id: Uuid, kept: HashMap<Uuid, Wait>) {
+        let new: Vec<(Uuid, Wait)> = {
+            let mut st = self.0.state.lock();
+            let before = st.lines.skipped.remove(&id).unwrap_or_default();
+            let new = kept
+                .iter()
+                .filter(|(row, why)| before.get(row) != Some(why))
+                .map(|(row, why)| (*row, *why))
+                .collect();
+            if !kept.is_empty() {
+                st.lines.skipped.insert(id, kept);
+            }
+            new
+        };
+        for (row, why) in new {
+            tracing::warn!(session = %id, message = %row, waiting = ?why, "a message wasn't handed to Desk's plugin: it waits");
+        }
+    }
+
+    /// `view`'s line as `inbox` (what waits for it) has it now.
+    pub(super) fn line_at(&self, view: SessionView, inbox: &[LineMessage]) -> LineAt {
+        LineAt {
+            typed: self.typed_since_idle(view.id),
+            plugin: self.plugin_heard(view.id),
+            ahead: inbox
+                .iter()
+                .find(|m| m.delivery == Delivery::Handed)
+                .map(|m| m.id),
+            view,
+        }
+    }
+
+    /// Why `m` doesn't go into its session now, as its line `at` reads:
+    /// the one gate Desk's plugin is handed by, the pump types in by and
+    /// the thread says why by, so whatever is kept says why. None for a
+    /// row that goes in now, or isn't waiting.
+    pub(super) fn line_hold(&self, at: &LineAt, m: &LineMessage) -> Option<Wait> {
+        match m.delivery {
+            Delivery::Held => Some(Wait::Stopped),
+            Delivery::Queued => self.queued_hold(at, m),
+            Delivery::Handed
+            | Delivery::Delivered
+            | Delivery::Refused
+            | Delivery::Withdrawn
+            | Delivery::Noted => None,
+        }
+    }
+
+    fn queued_hold(&self, at: &LineAt, m: &LineMessage) -> Option<Wait> {
+        let view = &at.view;
+        if self.waited_on(m) {
+            return Some(Wait::Awaited);
+        }
+        if self.steered(view.id, m.id) {
+            return Some(Wait::NextCall);
+        }
+        if view.pending.is_some() {
+            return Some(Wait::Dialog);
+        }
+        if self.steer_reserved(view.id, m) {
+            return Some(Wait::NextCall);
+        }
+        match line::deliverable(view, at.typed, at.plugin) {
+            // A turn Esc ended: the plugin takes it now.
+            Err(Wait::Working)
+                if at.plugin && view.caps.line == Deliver::Submit && !self.in_a_turn(view) =>
+            {
+                self.line_gate(view, m)
+            }
+            // The person at its wheel holds its boss's words past the
+            // turn they wait on.
+            Err(Wait::Working) if self.line_gate(view, m) == Some(Wait::PersonDriving) => {
+                Some(Wait::PersonDriving)
+            }
+            Err(why) => Some(why),
+            Ok(_) => self.line_gate(view, m),
+        }
+        // One on its way at a time: the order they were sent in holds.
+        .or_else(|| at.ahead.filter(|ahead| *ahead != m.id).map(|_| Wait::Behind))
     }
 
     /// Hand-offs Desk's plugin never said went in, handed before `before`
     /// ([`HANDED_FOR`] ago), back in the queue (the plugin died between
-    /// taking and submitting one). Not one to a session still in a turn:
-    /// Claude Code holds it behind that turn and submits it as the turn
-    /// ends, so handed again it would go in twice.
+    /// taking and submitting one, or its submit went nowhere). Not one a
+    /// session's turn may still hold ([`Self::turn_holds`]): handed again,
+    /// it would go in twice.
     pub(super) async fn line_requeue_stale(&self, before: DateTime<Utc>) {
         let stale = match self.0.store.line_handed_before(before).await {
             Ok(stale) => stale,
@@ -1890,18 +1980,16 @@ impl Desk {
                 return;
             }
         };
-        for m in stale {
-            let held = m
-                .to_session()
-                .and_then(|s| self.view(s).ok())
-                .is_some_and(|v| self.in_a_turn(&v));
-            if held {
-                continue;
-            }
+        for m in stale.iter().filter(|m| !self.turn_holds(m)) {
             // Still handed from then: one dropped and handed again since
             // is the new hand-off's.
             match self.0.store.line_requeue(Some(m.id), Some(before)).await {
-                Ok(back) => self.line_requeued(back).await,
+                Ok(back) => {
+                    if !back.is_empty() {
+                        tracing::warn!(message = %m.id, session = ?m.to_session(), handed_at = ?m.handed_at, "Desk's plugin never said a message it was handed went in: it goes again");
+                    }
+                    self.line_requeued(back).await
+                }
                 Err(e) => {
                     tracing::warn!(id = %m.id, error = %e, "couldn't requeue a stale line hand-off")
                 }
@@ -1909,8 +1997,28 @@ impl Desk {
         }
     }
 
+    /// Whether the turn `m`'s session is in may still hold the hand-off
+    /// `m`: Claude Code keeps a prompt submitted mid-turn behind that turn
+    /// and submits it as the turn ends. A turn that ended since it was
+    /// handed, without its marker coming back, didn't: it was lost.
+    fn turn_holds(&self, m: &LineMessage) -> bool {
+        let Some(view) = m.to_session().and_then(|s| self.view(s).ok()) else {
+            return false;
+        };
+        let ended = self
+            .0
+            .state
+            .lock()
+            .live
+            .get(&view.id)
+            .and_then(|l| l.ended_at);
+        self.in_a_turn(&view) && ended.is_none_or(|end| m.handed_at.is_some_and(|h| end <= h))
+    }
+
     /// Desk's plugin says what became of a message it was handed: in the
-    /// session (`ok`), or dropped (the person interrupted), to go again.
+    /// session (`ok`), or dropped (the person interrupted), to go again
+    /// unless its marker came back in a prompt, which put it in already
+    /// ([`Self::line_heard`]).
     pub async fn line_ack(&self, caller: Uuid, id: Uuid, ok: bool) -> Result<(), LineError> {
         let m = self
             .0
@@ -1925,17 +2033,27 @@ impl Desk {
             }
         } else {
             let back = self.0.store.line_requeue(Some(m.id), None).await?;
+            if !back.is_empty() {
+                tracing::info!(session = %caller, message = %m.id, "Desk's plugin dropped a message before it went in: it goes again");
+            }
             self.line_requeued(back).await;
         }
         Ok(())
     }
 
     /// A line message's marker came back in a prompt `id` started: it is
-    /// in, at its hop.
+    /// in, at its hop, and delivered, whatever Desk's plugin says of it
+    /// after (a turn interrupted as it began drops the submit, though the
+    /// session has the prompt).
     pub(super) async fn line_heard(&self, id: Uuid, mark: &str) {
-        match self.0.store.line_marked(&id.to_string(), mark).await {
-            Ok(Some(m)) => self.run_heard(id, &m),
-            Ok(None) => {}
+        let went_in = match self.0.store.line_marked(&id.to_string(), mark).await {
+            Ok(Some(m)) => self.0.store.line_went_in(m.id).await.map(|d| d.ok_or(m)),
+            Ok(None) => return,
+            Err(e) => Err(e),
+        };
+        match went_in {
+            Ok(Ok(m)) => self.line_delivered_into(id, &m),
+            Ok(Err(m)) => self.run_heard(id, &m),
             Err(e) => {
                 tracing::warn!(session = %id, error = %e, "couldn't read a line message back")
             }
@@ -1974,8 +2092,7 @@ impl Desk {
             self.0.state.lock().lines.pending.remove(&id);
             return Ok(());
         }
-        let typed = self.typed_since_idle(id);
-        let plugin = self.plugin_heard(id);
+        let at = self.line_at(view, &inbox);
         let mut typed_in = false;
         for mut m in inbox {
             // One its running turn's next tool call takes is left to it.
@@ -1986,7 +2103,7 @@ impl Desk {
             if self.line_overtaken(&m).await {
                 continue;
             }
-            let now = line::deliverable(&view, typed, plugin);
+            let now = line::deliverable(&at.view, at.typed, at.plugin);
             let held = matches!(now, Err(Wait::Stopped));
             let wanted = if held {
                 Delivery::Held
@@ -2004,7 +2121,7 @@ impl Desk {
                     None => continue,
                 }
             }
-            if now != Ok(Deliver::Paste) || typed_in || self.line_gate(&view, &m).is_some() {
+            if now != Ok(Deliver::Paste) || typed_in || self.line_hold(&at, &m).is_some() {
                 continue;
             }
             let Some(taken) = self.0.store.line_take(m.id, Delivery::Delivered).await? else {
@@ -2196,6 +2313,7 @@ impl Desk {
         st.lines.spoke.remove(&id);
         st.lines.pending.remove(&id);
         st.lines.plugin.remove(&id);
+        st.lines.skipped.remove(&id);
         st.lines
             .for_you
             .retain(|_, m| m.from_session() != Some(id) && m.to_session() != Some(id));
@@ -2210,13 +2328,13 @@ impl Desk {
     /// its running turn waits on that), or none while Desk holds any of them
     /// on purpose, whatever its turn ([`Wait::on_purpose`]).
     pub fn rows_wait(&self, view: &SessionView, rows: &[LineMessage]) -> Option<Vec<Option<Wait>>> {
-        let (typed, plugin) = (self.typed_since_idle(view.id), self.plugin_heard(view.id));
         let in_turn = self.in_a_turn(view);
+        let at = self.line_at(view.clone(), rows);
         let waits: Vec<Option<Wait>> = rows
             .iter()
             .map(|m| match m.delivery {
                 Delivery::Handed if in_turn => Some(Wait::Working),
-                _ => self.line_waits_in(view, typed, plugin, m),
+                _ => self.line_hold(&at, m),
             })
             .collect();
         let on_purpose = rows
@@ -2235,9 +2353,7 @@ impl Desk {
         before: Option<DateTime<Utc>>,
         limit: Option<i64>,
     ) -> Result<Vec<LineMessage>, DeskError> {
-        let view = self.view(id)?;
-        let typed = self.typed_since_idle(id);
-        let plugin = self.plugin_heard(id);
+        let at = self.line_at_now(id).await?;
         let mut rows = self
             .0
             .store
@@ -2245,51 +2361,29 @@ impl Desk {
             .await?;
         rows.reverse();
         for m in rows.iter_mut().filter(|m| m.to_session() == Some(id)) {
-            m.waiting = self.line_waits_in(&view, typed, plugin, m);
-            m.actions = self.line_actions(&view, m);
+            m.waiting = self.line_hold(&at, m);
+            m.actions = self.line_actions(&at.view, m);
         }
         Ok(rows)
     }
 
-    /// Why `m`, sent to a session, waits now: none once it has gone.
-    pub fn line_waits(&self, m: &LineMessage) -> Option<Wait> {
-        let id = m.to_session()?;
-        let view = self.view(id).ok()?;
-        self.line_waits_in(&view, self.typed_since_idle(id), self.plugin_heard(id), m)
+    /// Session `id`'s line, read now.
+    async fn line_at_now(&self, id: Uuid) -> Result<LineAt, DeskError> {
+        let view = self.view(id)?;
+        let inbox = self.0.store.line_inbox(&id.to_string()).await?;
+        Ok(self.line_at(view, &inbox))
     }
 
-    fn line_waits_in(
-        &self,
-        view: &SessionView,
-        typed: bool,
-        plugin: bool,
-        m: &LineMessage,
-    ) -> Option<Wait> {
-        match m.delivery {
-            Delivery::Held => Some(Wait::Stopped),
-            Delivery::Queued if self.steered(view.id, m.id) => Some(Wait::NextCall),
-            Delivery::Queued if view.pending.is_some() => Some(Wait::Dialog),
-            Delivery::Queued => match line::deliverable(view, typed, plugin) {
-                // A turn Esc ended: the plugin takes it now.
-                Err(Wait::Working)
-                    if plugin && view.caps.line == Deliver::Submit && !self.in_a_turn(view) =>
-                {
-                    self.line_gate(view, m)
-                }
-                // The person at its wheel holds its boss's words past the
-                // turn they wait on.
-                Err(Wait::Working) if self.line_gate(view, m) == Some(Wait::PersonDriving) => {
-                    Some(Wait::PersonDriving)
-                }
-                Err(why) => Some(why),
-                Ok(_) => self.line_gate(view, m),
-            },
-            Delivery::Handed
-            | Delivery::Delivered
-            | Delivery::Refused
-            | Delivery::Withdrawn
-            | Delivery::Noted => None,
-        }
+    /// Why `m`, sent to a session, waits now: none once it has gone.
+    pub async fn line_waits(&self, m: &LineMessage) -> Option<Wait> {
+        let at = match self.line_at_now(m.to_session()?).await {
+            Ok(at) => at,
+            Err(e) => {
+                tracing::warn!(message = %m.id, error = %e, "couldn't read why a message waits");
+                return None;
+            }
+        };
+        self.line_hold(&at, m)
     }
 
     /// What the person can do now with `m`, to `view`, while it waits.

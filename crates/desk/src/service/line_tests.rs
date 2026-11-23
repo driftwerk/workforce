@@ -1042,7 +1042,8 @@ async fn held(d: &Desk, dir: &Path) -> Uuid {
 }
 
 /// What Desk's breaker holds is held on purpose in the turn a message's
-/// own prompt starts too, though its thread says it waits on that turn.
+/// own prompt starts too, though its thread says what follows it waits on
+/// that turn.
 #[tokio::test]
 async fn a_breakers_hold_is_on_purpose_whatever_the_turn() {
     with_test_pool(build_pool, |pool| async move {
@@ -1062,10 +1063,18 @@ async fn a_breakers_hold_is_on_purpose_whatever_the_turn() {
             "prompt": format!("The desk plugin sent a message: {} x", line::marker(told.id))}),
         )
         .await;
+        assert_eq!(row(&d, told.id).await.delivery, Delivery::Delivered);
+        let then = d
+            .line_send(
+                Sender::Overseer(By::manager("sarah", "Sarah", "And the tests.")),
+                tell(id, "then the tests"),
+            )
+            .await
+            .unwrap();
         let view = d.view(id).unwrap();
         assert_eq!(view.state, SessionState::Working);
         let thread = d.line_thread(id, None, None).await.unwrap();
-        let row = thread.into_iter().find(|m| m.id == told.id).unwrap();
+        let row = thread.into_iter().find(|m| m.id == then.id).unwrap();
         assert_eq!(row.waiting, Some(Wait::Working));
         assert_eq!(d.rows_wait(&view, &[row]), None);
         assert!(Wait::Paused.on_purpose() && !Wait::Working.on_purpose());
@@ -1268,7 +1277,10 @@ async fn what_its_running_boss_said_before_the_turn_ended_on_a_question_is_not_i
             .await
             .unwrap();
         ends_asking(&d, s.id, "Should I switch reads to the replica?", false).await;
-        assert_eq!(d.line_waits(&row(&d, earlier.id).await), Some(Wait::Asking));
+        assert_eq!(
+            d.line_waits(&row(&d, earlier.id).await).await,
+            Some(Wait::Asking)
+        );
         assert_eq!(d.line_next(s.id, Duration::from_millis(300)).await, None);
         assert_eq!(row(&d, earlier.id).await.delivery, Delivery::Queued);
         // What it says once it has read the question goes in.
@@ -1320,7 +1332,10 @@ async fn a_tell_its_running_boss_queued_before_a_restart_is_not_its_answer_after
         };
         restart(None);
         assert!(d.asked_mark(s.id).is_some(), "it still asks");
-        assert_eq!(d.line_waits(&row(&d, earlier.id).await), Some(Wait::Asking));
+        assert_eq!(
+            d.line_waits(&row(&d, earlier.id).await).await,
+            Some(Wait::Asking)
+        );
         assert_eq!(d.line_next(s.id, Duration::from_millis(300)).await, None);
         // Taken back, a session counts what it asks as asked then.
         restart(Some(chrono::Utc::now()));
@@ -1481,7 +1496,7 @@ async fn an_answer_the_person_took_the_wheel_from_as_it_was_taken_waits_for_them
             Delivery::Queued,
             "back in the queue, not withdrawn"
         );
-        assert_eq!(d.line_waits(&kept), Some(Wait::PersonDriving));
+        assert_eq!(d.line_waits(&kept).await, Some(Wait::PersonDriving));
         assert!(
             d.0.state.lock().lines.answers.contains_key(&sent.id),
             "still the answer to that question"
@@ -1579,14 +1594,14 @@ async fn what_its_running_boss_said_waits_while_its_reply_is_read_for_a_question
         .await;
         let v = d.view(s.id).unwrap();
         assert!(v.reading && v.state == SessionState::Done, "read still");
-        assert_eq!(d.line_waits(&row(&d, earlier.id).await), Some(Wait::Working));
+        assert_eq!(d.line_waits(&row(&d, earlier.id).await).await, Some(Wait::Working));
         assert_eq!(d.line_next(s.id, Duration::from_millis(300)).await, None);
         // Read as a question: the boss answers it, its Tell does not.
         reader.0.notify_one();
         until(|| d.view(s.id).is_ok_and(|v| v.state == SessionState::Asking)).await;
         assert_eq!(d.line_next(s.id, Duration::from_millis(300)).await, None);
         assert_eq!(row(&d, earlier.id).await.delivery, Delivery::Queued);
-        assert_eq!(d.line_waits(&row(&d, earlier.id).await), Some(Wait::Asking));
+        assert_eq!(d.line_waits(&row(&d, earlier.id).await).await, Some(Wait::Asking));
         drop(crew);
     })
     .await;
@@ -1621,7 +1636,10 @@ async fn a_dialog_on_its_screen_holds_what_waits_at_its_prompt_too() {
             .line_post(s.id, "Yes, switch them.".into(), When::Queue)
             .await
             .unwrap();
-        assert_eq!(d.line_waits(&row(&d, sent.id).await), Some(Wait::Dialog));
+        assert_eq!(
+            d.line_waits(&row(&d, sent.id).await).await,
+            Some(Wait::Dialog)
+        );
         assert_eq!(d.line_next(s.id, Duration::from_millis(300)).await, None);
         assert_eq!(row(&d, sent.id).await.delivery, Delivery::Queued);
     })
@@ -3352,6 +3370,186 @@ async fn a_turn_esc_ended_as_it_wrote_lets_what_desk_kept_go_once_it_is_at_its_p
         .await;
         let next = waiting.await.unwrap().expect("handed at its prompt");
         assert_eq!(next["id"], json!(m.id));
+    })
+    .await;
+}
+
+/// The prompt Desk's plugin submits for a message it was handed, as
+/// Claude Code's prompt hook hears it.
+async fn submitted(d: &Desk, s: Uuid, next: &Value) {
+    let text = next["text"].as_str().unwrap();
+    hook(
+        d,
+        s,
+        json!({"hook_event_name": "UserPromptSubmit", "prompt": format!("The desk plugin sent a message: {text}")}),
+    )
+    .await;
+}
+
+/// A turn of its own (a background task's notice) begins and ends.
+async fn noticed_turn(d: &Desk, s: Uuid) {
+    hook(
+        d,
+        s,
+        json!({"hook_event_name": "UserPromptSubmit", "prompt": "<task-notification>\n<task-id>a1</task-id>\n</task-notification>"}),
+    )
+    .await;
+    hook(
+        d,
+        s,
+        json!({"hook_event_name": "Stop", "last_assistant_message": "The production pin PR is open."}),
+    )
+    .await;
+}
+
+fn sarah() -> By {
+    By::manager("sarah", "Sarah", "It should open the PR.")
+}
+
+async fn waiting(d: &Desk, s: Uuid, id: Uuid) -> Option<Wait> {
+    d.line_thread(s, None, None)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|r| r.id == id)
+        .unwrap()
+        .waiting
+}
+
+/// The hand-off went in (its prompt hook carried its marker), the
+/// turn it began was interrupted at once, and the plugin said it dropped
+/// it. The session has it: it is never handed again, and what is sent
+/// after goes in.
+#[tokio::test]
+async fn a_hand_off_interrupted_as_it_went_in_is_in_once_and_what_follows_goes_in() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(pool, dir.path()).await;
+        let s = new_session(&d, dir.path()).await;
+        idle(&d, s.id).await;
+        let s = s.id;
+        let m = d
+            .line_send(
+                Sender::Overseer(sarah()),
+                tell(s, "Open the prod pin PR now."),
+            )
+            .await
+            .unwrap();
+        let next = d.line_next(s, Duration::from_secs(1)).await.unwrap();
+        assert_eq!(next["id"], json!(m.id));
+        submitted(&d, s, &next).await;
+        assert_eq!(
+            row(&d, m.id).await.delivery,
+            Delivery::Delivered,
+            "in as its prompt"
+        );
+        d.line_ack(s, m.id, false).await.unwrap();
+        assert_eq!(
+            row(&d, m.id).await.delivery,
+            Delivery::Delivered,
+            "a drop after it went in sends nothing again"
+        );
+        noticed_turn(&d, s).await;
+        let n = d
+            .line_send(Sender::Overseer(sarah()), tell(s, "Where is the PR?"))
+            .await
+            .unwrap();
+        let next = d.line_next(s, Duration::from_secs(1)).await.unwrap();
+        assert_eq!(
+            next["id"],
+            json!(n.id),
+            "the next one, never the first again"
+        );
+        submitted(&d, s, &next).await;
+        d.line_ack(s, n.id, true).await.unwrap();
+        assert!(d.line_next(s, Duration::from_millis(200)).await.is_none());
+    })
+    .await;
+}
+
+/// The plugin's drop can reach the hub before the prompt hook that shows
+/// the message went in: put back first, it is in all the same, and never
+/// handed again.
+#[tokio::test]
+async fn a_drop_said_before_its_prompt_was_heard_still_leaves_it_in_once() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(pool, dir.path()).await;
+        let s = new_session(&d, dir.path()).await;
+        idle(&d, s.id).await;
+        let s = s.id;
+        let m = d
+            .line_send(
+                Sender::Overseer(sarah()),
+                tell(s, "Open the prod pin PR now."),
+            )
+            .await
+            .unwrap();
+        let next = d.line_next(s, Duration::from_secs(1)).await.unwrap();
+        d.line_ack(s, m.id, false).await.unwrap();
+        assert_eq!(row(&d, m.id).await.delivery, Delivery::Queued);
+        submitted(&d, s, &next).await;
+        assert_eq!(row(&d, m.id).await.delivery, Delivery::Delivered);
+        noticed_turn(&d, s).await;
+        assert!(d.line_next(s, Duration::from_millis(200)).await.is_none());
+    })
+    .await;
+}
+
+/// A hand-off the plugin never says went in holds what follows, which
+/// says why. Lost (a turn began and ended since without it), it goes again
+/// at once, even while another turn runs, and the rest after it.
+#[tokio::test]
+async fn what_waits_behind_a_lost_hand_off_says_so_and_it_goes_again_even_in_a_turn() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(pool, dir.path()).await;
+        let s = new_session(&d, dir.path()).await;
+        idle(&d, s.id).await;
+        let s = s.id;
+        let m = d
+            .line_send(Sender::Overseer(sarah()), tell(s, "Open the prod pin PR now."))
+            .await
+            .unwrap();
+        let next = d.line_next(s, Duration::from_secs(1)).await.unwrap();
+        assert_eq!(next["id"], json!(m.id));
+        let n = d
+            .line_send(Sender::Overseer(sarah()), tell(s, "Where is the PR?"))
+            .await
+            .unwrap();
+        assert!(d.line_next(s, Duration::from_millis(200)).await.is_none());
+        assert_eq!(waiting(&d, s, n.id).await, Some(Wait::Behind));
+        assert_eq!(d.line_waits(&row(&d, n.id).await).await, Some(Wait::Behind));
+        // A turn of its own runs and ends without it, then another begins.
+        noticed_turn(&d, s).await;
+        hook(
+            &d,
+            s,
+            json!({"hook_event_name": "UserPromptSubmit", "prompt": "<task-notification>\n<task-id>a2</task-id>\n</task-notification>"}),
+        )
+        .await;
+        assert_eq!(d.view(s).unwrap().state, SessionState::Working);
+        hand_offs_gone_stale(&d).await;
+        assert_eq!(row(&d, m.id).await.delivery, Delivery::Queued, "lost: again");
+        assert_eq!(waiting(&d, s, m.id).await, Some(Wait::Working));
+        hook(
+            &d,
+            s,
+            json!({"hook_event_name": "Stop", "last_assistant_message": "Checked."}),
+        )
+        .await;
+        let again = d.line_next(s, Duration::from_secs(1)).await.unwrap();
+        assert_eq!(again["id"], json!(m.id), "in the order they were sent");
+        submitted(&d, s, &again).await;
+        d.line_ack(s, m.id, true).await.unwrap();
+        hook(
+            &d,
+            s,
+            json!({"hook_event_name": "Stop", "last_assistant_message": "Opened it."}),
+        )
+        .await;
+        let then = d.line_next(s, Duration::from_secs(1)).await.unwrap();
+        assert_eq!(then["id"], json!(n.id));
     })
     .await;
 }

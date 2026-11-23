@@ -186,7 +186,7 @@ async fn an_urgent_order_the_person_took_the_wheel_from_as_its_call_took_it_wait
         assert!(d.line_next(s, Duration::from_millis(300)).await.is_none());
         let kept = row(&d, m.id).await;
         assert_eq!(kept.delivery, Delivery::Queued);
-        assert_eq!(d.line_waits(&kept), Some(line::Wait::PersonDriving));
+        assert_eq!(d.line_waits(&kept).await, Some(line::Wait::PersonDriving));
     })
     .await;
 }
