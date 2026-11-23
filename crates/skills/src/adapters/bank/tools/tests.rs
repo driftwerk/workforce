@@ -4,7 +4,7 @@ use std::sync::Mutex;
 use serde_json::Number;
 
 use super::*;
-use crate::adapters::bank::model::{Account, Balance, Connection, Page};
+use crate::adapters::bank::model::{Account, Balance, Connection, Page, CONSENT_DAYS};
 
 /// A bank of `pages` of transactions, rate limited after `budget` reads.
 struct Fake {
@@ -109,7 +109,7 @@ impl BankProvider for Fake {
         })
     }
     fn consented_at(&self) -> Option<chrono::DateTime<Utc>> {
-        Some(Utc::now() - chrono::Duration::days(83))
+        Some(Utc::now() - chrono::Duration::days(CONSENT_DAYS - 7))
     }
 }
 

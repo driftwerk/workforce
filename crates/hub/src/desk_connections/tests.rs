@@ -3862,7 +3862,7 @@ async fn a_lapsed_bank_is_refused_and_only_the_persons_renewal_moves_its_approva
         .await;
     assert!(
         format!("{:?}", lapsed.unwrap_err())
-            .contains("BankSync says Revolut's approval has lapsed"),
+            .contains("BankSync says this bank's approval has lapsed"),
         "a bank BankSync says needs reconnecting is refused, and told to try again"
     );
 
