@@ -29,6 +29,7 @@ libc = "0.2"
 nix = { version = "0.31", features = ["user"] }
 portable-pty = "0.9"
 refinery = { workspace = true }
+regex = { workspace = true }
 reqwest = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true, features = ["raw_value"] }

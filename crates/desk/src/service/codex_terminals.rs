@@ -68,7 +68,7 @@ async fn age(pid: u32) -> Option<Duration> {
         .await
         .ok()?;
     let text = String::from_utf8_lossy(&out.stdout);
-    session::parse_etime(&text).map(Duration::from_secs)
+    procs::parse_etime(&text).map(Duration::from_secs)
 }
 
 impl Desk {

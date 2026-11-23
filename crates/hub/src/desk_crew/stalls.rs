@@ -38,6 +38,7 @@ use workforce_desk::decision::DecisionKind;
 use workforce_desk::model::SessionState;
 use workforce_desk::open_item::{ClosedBy, NewItem, OpenItem, OpenKind, OpenState};
 use workforce_desk::open_item_store::Opened;
+use workforce_desk::sight::StallKind;
 use workforce_desk::update_write::{self as write, Mover, Said, Work};
 
 use super::updates::{Batch, Changed};
@@ -383,7 +384,23 @@ impl CrewHub {
         now: DateTime<Utc>,
     ) -> Option<Mover> {
         let sid = view.id;
-        let waiting_on = changed.and_then(|c| c.waiting_on.as_deref());
+        // What Desk sees inside it: what a wait waits on is what it waits
+        // on, and red CI or a session that is still is the boss's to move.
+        let seen = self.stall_kept(view, o);
+        let queued = seen
+            .as_ref()
+            .filter(|(_, s)| s.kind == StallKind::Queued)
+            .map(|(g, s)| {
+                let words = g.reading.words.as_str();
+                format!(
+                    "{} (waited {})",
+                    words.strip_prefix("waiting for ").unwrap_or(words),
+                    workforce_desk::sight::lasted(now - s.since)
+                )
+            });
+        let waiting_on = queued
+            .as_deref()
+            .or_else(|| changed.and_then(|c| c.waiting_on.as_deref()));
         // 2. The person's already: their open question about it.
         if let Some(i) = b.open.iter().find(|i| {
             matches!(i.kind, OpenKind::Ask | OpenKind::Confirm | OpenKind::Todo)
@@ -416,7 +433,12 @@ impl CrewHub {
         let on_boss = waiting_on.is_some_and(|w| names_boss(w, &boss_name))
             || self.waits_on_boss_line(boss, sid).await;
         // 4. Its session is on it, waiting on nothing.
-        if view.live && view.state == SessionState::Working && waiting_on.is_none() && !on_boss {
+        if view.live
+            && view.state == SessionState::Working
+            && waiting_on.is_none()
+            && !on_boss
+            && seen.is_none()
+        {
             let doing = changed.map(|c| c.doing.trim()).unwrap_or_default();
             return Some(Mover::Boss {
                 doing: match doing {
@@ -505,18 +527,35 @@ impl CrewHub {
                 )
                 .await;
         }
-        let handed = self.hand_stall(
-            boss,
-            sid,
+        let red = seen.as_ref().and_then(|(g, s)| {
+            let pr = g.workspace.as_ref()?.pr.as_ref()?;
+            (s.kind == StallKind::CiRed).then(|| {
+                format!(
+                    "{}'s PR #{} failed CI ({}) and nothing is fixing it. Look (crew.inside, \
+                     crew.github_ci) and move it.",
+                    view.label(),
+                    pr.number,
+                    pr.failed.join(", ")
+                )
+            })
+        });
+        let line = red.unwrap_or_else(|| {
             format!(
                 "Your update tells the person {} is blocked, and nobody moves it: {}. Move it \
                      now: unblock it, hand it on, or, only if just the person can, ask them with \
                      crew.ask_person. Before saying anything is missing, check your orders, your \
-                     DM with them, its line, its ticket and its plan.",
+                     DM with them, its line, its ticket and its plan.{}",
                 view.label(),
-                workforce_desk::crew::one_line(all, 300)
-            ),
-        );
+                workforce_desk::crew::one_line(all, 300),
+                seen.as_ref()
+                    .map(|(g, _)| format!(
+                        " What Desk sees inside it: {}",
+                        g.line(self.desk.timezone(), now)
+                    ))
+                    .unwrap_or_default()
+            )
+        });
+        let handed = self.hand_stall(boss, sid, line);
         Some(Mover::Boss {
             doing: self.doing(
                 handed,

@@ -12102,6 +12102,7 @@ dependencies = [
  "parking_lot",
  "portable-pty",
  "refinery",
+ "regex",
  "reqwest 0.12.28",
  "serde",
  "serde_json",

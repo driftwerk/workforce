@@ -354,6 +354,18 @@ impl Desk {
         if !matches!(r.engine, Engine::Claude | Engine::Codex) {
             return Err(Why::Skip(crate::memory::NO_RECORD.into()));
         }
+        self.kept_out(r, records, true).await
+    }
+
+    /// Whether the person keeps `r`'s conversation out of Desk: the hub's
+    /// own work, a session or group with memory off, an excluded folder, a
+    /// forgotten conversation, and, where `paused` counts, memory paused.
+    pub(super) async fn kept_out(
+        &self,
+        r: &SessionRecord,
+        records: &[PathBuf],
+        paused: bool,
+    ) -> Result<(), Why> {
         let group = self
             .group_of_member(&session_item(r.id))
             .filter(|g| g != UNGROUPED);
@@ -392,7 +404,7 @@ impl Desk {
             group: group.as_deref(),
         };
         let switches = Switches {
-            paused: facts.paused,
+            paused: paused && facts.paused,
             groups_off: &groups_off,
             exclude: &self.0.opts.memory.exclude,
             home: home.as_deref(),
@@ -1020,7 +1032,7 @@ impl Desk {
 }
 
 /// Why a session's conversation isn't harvested now.
-enum Why {
+pub(super) enum Why {
     /// Its offset holds: nothing it says is lost.
     Hold(String),
     /// Never to be remembered.

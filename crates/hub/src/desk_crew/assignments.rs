@@ -557,7 +557,7 @@ impl CrewHub {
         };
         match rule {
             Rule::SameSession => format!(
-                "Not sent: {name} already has this job ({id}, delivered {}). Saying it again can start it twice. Ask it where it stands (crew.ask_session); to change what it does, send with replaces: \"{id}\", and it is told to check first.",
+                "Not sent: {name} already has this job ({id}, delivered {}). Saying it again can start it twice. See where it stands (crew.inside; crew.ask_session only if that can't tell); to change what it does, send with replaces: \"{id}\", and it is told to check first.",
                 h.delivered_at.map_or_else(|| "already".into(), at)
             ),
             Rule::Held => format!(
@@ -815,7 +815,7 @@ impl CrewHub {
                 )
                 .await;
             return Err(format!(
-                "Not sent: {} may have started {} already, and Desk couldn't hold your order until it stands down. Ask it where it stands (crew.ask_session), then send again.",
+                "Not sent: {} may have started {} already, and Desk couldn't hold your order until it stands down. See where it stands (crew.inside; crew.ask_session only if that can't tell), then send again.",
                 self.holder_name(old),
                 old.about()
             ));
