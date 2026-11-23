@@ -82,9 +82,11 @@ pub(crate) fn undo_of(action: &Action, done: &Done, before: &Before) -> (Undo, O
                 };
                 match delivery {
                     Delivery::Queued | Delivery::Held => (Undo::Withdraw, Some(plan)),
-                    Delivery::Handed | Delivery::Delivered | Delivery::Noted => {
-                        (Undo::Correct, Some(plan))
-                    }
+                    // In, or maybe in: what is said next corrects it.
+                    Delivery::Handed
+                    | Delivery::Delivered
+                    | Delivery::Noted
+                    | Delivery::Unreceived => (Undo::Correct, Some(plan)),
                     // It never goes in: nothing to take back.
                     Delivery::Refused | Delivery::Withdrawn => (Undo::None, None),
                 }
@@ -771,7 +773,10 @@ impl CrewHub {
                 if !now.as_ref().is_some_and(|m| {
                     matches!(
                         m.delivery,
-                        Delivery::Handed | Delivery::Delivered | Delivery::Noted
+                        Delivery::Handed
+                            | Delivery::Delivered
+                            | Delivery::Noted
+                            | Delivery::Unreceived
                     )
                 }) {
                     return Ok(format!(

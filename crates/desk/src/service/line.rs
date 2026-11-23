@@ -62,6 +62,13 @@ pub(crate) struct Lines {
     /// Why each session's waiting rows were last kept from its Desk plugin,
     /// by row: each new reason is logged once.
     skipped: HashMap<Uuid, HashMap<Uuid, Wait>>,
+    /// When each hand-off was said to have gone in (by Desk's plugin, or
+    /// typed in), by row, its marker not yet back: it is in only once that
+    /// comes ([`Desk::line_heard`]).
+    acked: HashMap<Uuid, DateTime<Utc>>,
+    /// The rows that went again once their marker never came back: a
+    /// second miss gives up on them ([`Delivery::Unreceived`]).
+    retried: HashSet<Uuid>,
 }
 
 /// A session's line as one look at it reads it: what [`Desk::line_hold`]
@@ -178,6 +185,10 @@ fn draft_bytes(text: &str) -> Vec<u8> {
 /// session has it before it is queued again (the plugin died between
 /// taking and submitting it).
 const HANDED_FOR: chrono::Duration = chrono::Duration::minutes(2);
+/// How long a hand-off said to have gone in waits for its marker to come
+/// back in its session's prompt, outside a turn that holds it, before it
+/// is taken as lost: an idle session's prompt hook says it within a second.
+const MARK_WITHIN: chrono::Duration = chrono::Duration::minutes(1);
 /// How often stale hand-offs and waiting messages are looked at.
 const PUMP_EVERY: Duration = Duration::from_secs(30);
 /// How many thread rows a page holds at most.
@@ -1683,7 +1694,12 @@ impl Desk {
 
     pub(super) fn line_delivered_into(&self, id: Uuid, m: &LineMessage) {
         self.run_heard(id, m);
-        self.0.state.lock().lines.answers.remove(&m.id);
+        {
+            let mut st = self.0.state.lock();
+            st.lines.answers.remove(&m.id);
+            st.lines.acked.remove(&m.id);
+            st.lines.retried.remove(&m.id);
+        }
         self.line_announce(m);
     }
 
@@ -1834,7 +1850,25 @@ impl Desk {
         taken: &LineMessage,
         how: Delivery,
     ) -> Result<bool, LineError> {
-        let back = match how {
+        let Some(back) = self.untake(id, taken, how).await? else {
+            return Ok(false);
+        };
+        if self.line_overtaken(&back).await {
+            return Ok(true);
+        }
+        self.line_announce(&back);
+        Ok(false)
+    }
+
+    /// `taken` (`how`) for session `id` back in the queue, as it now is:
+    /// `None` when it moved on since.
+    async fn untake(
+        &self,
+        id: Uuid,
+        taken: &LineMessage,
+        how: Delivery,
+    ) -> Result<Option<LineMessage>, LineError> {
+        Ok(match how {
             Delivery::Handed => self
                 .0
                 .store
@@ -1843,15 +1877,7 @@ impl Desk {
                 .into_iter()
                 .next(),
             _ => self.0.store.line_untake(taken.id, &id.to_string()).await?,
-        };
-        let Some(back) = back else {
-            return Ok(false);
-        };
-        if self.line_overtaken(&back).await {
-            return Ok(true);
-        }
-        self.line_announce(&back);
-        Ok(false)
+        })
     }
 
     async fn line_next_now(&self, caller: Uuid) -> Result<Option<Value>, LineError> {
@@ -1930,7 +1956,8 @@ impl Desk {
             | Delivery::Delivered
             | Delivery::Refused
             | Delivery::Withdrawn
-            | Delivery::Noted => None,
+            | Delivery::Noted
+            | Delivery::Unreceived => None,
         }
     }
 
@@ -1967,34 +1994,64 @@ impl Desk {
         .or_else(|| at.ahead.filter(|ahead| *ahead != m.id).map(|_| Wait::Behind))
     }
 
-    /// Hand-offs Desk's plugin never said went in, handed before `before`
-    /// ([`HANDED_FOR`] ago), back in the queue (the plugin died between
-    /// taking and submitting one, or its submit went nowhere). Not one a
-    /// session's turn may still hold ([`Self::turn_holds`]): handed again,
-    /// it would go in twice.
-    pub(super) async fn line_requeue_stale(&self, before: DateTime<Utc>) {
-        let stale = match self.0.store.line_handed_before(before).await {
-            Ok(stale) => stale,
+    /// Hand-offs never shown to have gone in by `now`, lost: their marker
+    /// didn't come back within [`MARK_WITHIN`] of their being said to have
+    /// gone in, or nothing was said of them in [`HANDED_FOR`] (the plugin
+    /// died between taking and submitting one). Not one a session's turn
+    /// may still hold ([`Self::turn_holds`]): handed again, it would go in
+    /// twice. A lost one goes again once, then is given up on.
+    pub(super) async fn line_requeue_stale(&self, now: DateTime<Utc>) {
+        let handed = match self.0.store.line_handed_before(now).await {
+            Ok(handed) => handed,
             Err(e) => {
-                tracing::warn!(error = %e, "couldn't read stale line hand-offs");
+                tracing::warn!(error = %e, "couldn't read line hand-offs");
                 return;
             }
         };
-        for m in stale.iter().filter(|m| !self.turn_holds(m)) {
-            // Still handed from then: one dropped and handed again since
-            // is the new hand-off's.
-            match self.0.store.line_requeue(Some(m.id), Some(before)).await {
-                Ok(back) => {
-                    if !back.is_empty() {
-                        tracing::warn!(message = %m.id, session = ?m.to_session(), handed_at = ?m.handed_at, "Desk's plugin never said a message it was handed went in: it goes again");
-                    }
-                    self.line_requeued(back).await
-                }
-                Err(e) => {
-                    tracing::warn!(id = %m.id, error = %e, "couldn't requeue a stale line hand-off")
-                }
+        let acked = {
+            let mut st = self.0.state.lock();
+            st.lines
+                .acked
+                .retain(|id, _| handed.iter().any(|m| m.id == *id));
+            st.lines.acked.clone()
+        };
+        let lost = handed.iter().filter(|m| {
+            let due = match acked.get(&m.id) {
+                Some(at) => Some(*at + MARK_WITHIN),
+                None => m.handed_at.map(|h| h + HANDED_FOR),
+            };
+            due.is_none_or(|due| due < now) && !self.turn_holds(m)
+        });
+        for m in lost {
+            if let Err(e) = self.line_lost(m, now).await {
+                tracing::warn!(id = %m.id, error = %e, "couldn't put back a lost line hand-off");
             }
         }
+    }
+
+    /// `m`, handed before `now` and never shown to have gone in: queued to
+    /// go again the first time, given up on and its sender told the next.
+    /// Still handed from then: one dropped and handed again since is the
+    /// new hand-off's.
+    async fn line_lost(&self, m: &LineMessage, now: DateTime<Utc>) -> Result<(), LineError> {
+        let first = {
+            let mut st = self.0.state.lock();
+            st.lines.acked.remove(&m.id);
+            st.lines.retried.insert(m.id)
+        };
+        let session = m.to_session();
+        if first {
+            let back = self.0.store.line_requeue(Some(m.id), Some(now)).await?;
+            if !back.is_empty() {
+                tracing::warn!(message = %m.id, ?session, handed_at = ?m.handed_at, "a message handed to a session was never shown to have gone in: it goes again once");
+            }
+            self.line_requeued(back).await;
+        } else if let Some(gone) = self.0.store.line_unreceived(m.id, now).await? {
+            self.0.state.lock().lines.retried.remove(&m.id);
+            tracing::warn!(message = %m.id, ?session, handed_at = ?m.handed_at, "a message went into a session twice and was never shown to have: it isn't put in again");
+            self.line_announce(&gone);
+        }
+        Ok(())
     }
 
     /// Whether the turn `m`'s session is in may still hold the hand-off
@@ -2015,10 +2072,12 @@ impl Desk {
         self.in_a_turn(&view) && ended.is_none_or(|end| m.handed_at.is_some_and(|h| end <= h))
     }
 
-    /// Desk's plugin says what became of a message it was handed: in the
-    /// session (`ok`), or dropped (the person interrupted), to go again
-    /// unless its marker came back in a prompt, which put it in already
-    /// ([`Self::line_heard`]).
+    /// Desk's plugin says what became of a message it was handed: submitted
+    /// (`ok`), or dropped (the person interrupted), to go again unless its
+    /// marker came back in a prompt, which put it in already
+    /// ([`Self::line_heard`]). Submitted, it is in only once that marker
+    /// comes back: a submit can go nowhere. One that carries none is taken
+    /// as in.
     pub async fn line_ack(&self, caller: Uuid, id: Uuid, ok: bool) -> Result<(), LineError> {
         let m = self
             .0
@@ -2027,7 +2086,11 @@ impl Desk {
             .await?
             .filter(|m| m.to_session() == Some(caller))
             .ok_or(DeskError::NotFound)?;
-        if ok {
+        if ok && line::marked(&m) {
+            if m.delivery == Delivery::Handed {
+                self.0.state.lock().lines.acked.insert(m.id, Utc::now());
+            }
+        } else if ok {
             if let Some(m) = self.0.store.line_ack(m.id).await? {
                 self.line_delivered_into(caller, &m);
             }
@@ -2124,7 +2187,13 @@ impl Desk {
             if now != Ok(Deliver::Paste) || typed_in || self.line_hold(&at, &m).is_some() {
                 continue;
             }
-            let Some(taken) = self.0.store.line_take(m.id, Delivery::Delivered).await? else {
+            // In once its marker comes back in the prompt it starts, as a
+            // hand-off to Desk's plugin is.
+            let how = match line::marked(&m) {
+                true => Delivery::Handed,
+                false => Delivery::Delivered,
+            };
+            let Some(taken) = self.0.store.line_take(m.id, how).await? else {
                 continue;
             };
             after_take(id);
@@ -2132,18 +2201,26 @@ impl Desk {
             // What moved while it was taken (its question passed, the
             // person took the wheel) keeps it out.
             if !self.still_goes_in(id, &taken) {
-                self.put_back(id, &taken, Delivery::Delivered).await?;
+                self.put_back(id, &taken, how).await?;
                 continue;
+            }
+            if how == Delivery::Handed {
+                self.line_announce(&taken);
             }
             if let Err(e) = self.type_prompt(id, &text, Self::typed_by(&taken).as_ref()) {
                 // Not typed in: it waits on.
-                if let Some(back) = self.0.store.line_untake(taken.id, &id.to_string()).await? {
+                if let Some(back) = self.untake(id, &taken, how).await? {
                     self.line_announce(&back);
                 }
                 tracing::debug!(session = %id, error = %e, "a line message couldn't be typed in");
                 continue;
             }
-            self.line_delivered_into(id, &taken);
+            match how {
+                Delivery::Handed => {
+                    self.0.state.lock().lines.acked.insert(taken.id, Utc::now());
+                }
+                _ => self.line_delivered_into(id, &taken),
+            }
             typed_in = true;
         }
         Ok(())
@@ -2214,7 +2291,7 @@ impl Desk {
             tokio::select! {
                 _ = self.0.cancel.cancelled() => return,
                 _ = tick.tick() => {
-                    self.line_requeue_stale(Utc::now() - HANDED_FOR).await;
+                    self.line_requeue_stale(Utc::now()).await;
                     self.line_pump_pending().await;
                     self.line_sweep_waits().await;
                 }

@@ -349,8 +349,9 @@ impl DeskStore {
             .transpose()
     }
 
-    /// Desk's plugin says the session has the handed row. `None` when it
-    /// wasn't handed (a second copy that already ran).
+    /// The handed row is in its session, on the word of what took it (one
+    /// that carries no marker to show it). `None` when it wasn't handed (a
+    /// second copy that already ran).
     pub async fn line_ack(&self, id: Uuid) -> Result<Option<LineMessage>> {
         let client = self.pool().get().await?;
         client
@@ -369,16 +370,16 @@ impl DeskStore {
 
     /// The row whose marker came back in a prompt its session started: in
     /// the session, whatever Desk's plugin says of it, whether it was
-    /// still handed or put back in the queue since. `None` when it had
-    /// gone already, or never will.
+    /// still handed, put back in the queue since, or given up on. `None`
+    /// when it had gone already, or never will.
     pub async fn line_went_in(&self, id: Uuid) -> Result<Option<LineMessage>> {
         let client = self.pool().get().await?;
         client
             .query_opt(
                 &format!(
                     "UPDATE line_messages SET delivery = 'delivered', delivered_at = now(), \
-                     updated_at = now() WHERE id = $1 AND delivery IN ('queued', 'handed', 'held') \
-                     RETURNING {COLUMNS}"
+                     updated_at = now() WHERE id = $1 \
+                     AND delivery IN ('queued', 'handed', 'held', 'unreceived') RETURNING {COLUMNS}"
                 ),
                 &[&id],
             )
@@ -404,6 +405,28 @@ impl DeskStore {
             .iter()
             .map(message)
             .collect()
+    }
+
+    /// Gives up on the row handed before `before`: it went in and was never
+    /// shown to have. `None` when it isn't handed from then.
+    pub async fn line_unreceived(
+        &self,
+        id: Uuid,
+        before: DateTime<Utc>,
+    ) -> Result<Option<LineMessage>> {
+        let client = self.pool().get().await?;
+        client
+            .query_opt(
+                &format!(
+                    "UPDATE line_messages SET delivery = 'unreceived', updated_at = now() \
+                     WHERE id = $1 AND delivery = 'handed' AND handed_at < $2 RETURNING {COLUMNS}"
+                ),
+                &[&id, &before],
+            )
+            .await?
+            .as_ref()
+            .map(message)
+            .transpose()
     }
 
     /// Puts handed rows back in the queue: one the plugin dropped (`id`, no

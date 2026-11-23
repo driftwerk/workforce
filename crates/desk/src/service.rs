@@ -8850,6 +8850,16 @@ mod tests {
         d.hook(id, &t, body.to_string().as_bytes()).await.unwrap()
     }
 
+    /// `next`, handed to Desk's plugin in `id`, went in: its marker came
+    /// back in the prompt it started, and the plugin said it submitted it.
+    pub(super) async fn went_in(d: &Desk, id: Uuid, next: &Value) {
+        if let Some(mark) = crate::line::is_delivery(next["text"].as_str().unwrap()) {
+            d.line_heard(id, &mark).await;
+        }
+        let m = serde_json::from_value(next["id"].clone()).unwrap();
+        d.line_ack(id, m, true).await.unwrap();
+    }
+
     #[test]
     fn a_codex_turns_background_is_what_its_app_server_started_in_it() {
         let table = procs::parse(

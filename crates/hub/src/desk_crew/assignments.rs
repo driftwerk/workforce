@@ -1349,8 +1349,13 @@ impl CrewHub {
             }
         }
     }
-    /// Wakes `boss` with `line` about `session`.
+    /// Wakes `boss` with `line` about `session`'s assignment.
     fn wake_for(self: &Arc<Self>, boss: &str, session: Uuid, line: String) {
+        self.wake_about(boss, session, format!("assignment:{session}"), line);
+    }
+
+    /// Wakes `boss` with `line` about `session`, raised as `about`.
+    fn wake_about(self: &Arc<Self>, boss: &str, session: Uuid, about: String, line: String) {
         let Some((service, o)) = self.overseer_named(boss) else {
             tracing::info!(%boss, line, "an assignment's news has no boss here to wake");
             return;
@@ -1364,7 +1369,7 @@ impl CrewHub {
             line,
             approvals: Vec::new(),
             hop: 0,
-            about: Some(format!("assignment:{session}")),
+            about: Some(about),
             group,
             handed: None,
             routine: false,
@@ -1388,7 +1393,10 @@ impl CrewHub {
                         .assignment_delivered(m.id, m.delivered_at.unwrap_or(m.updated_at))
                         .await;
                 }
-                Delivery::Withdrawn | Delivery::Refused => {
+                Delivery::Withdrawn | Delivery::Refused | Delivery::Unreceived => {
+                    if m.delivery == Delivery::Unreceived {
+                        self.unreceived(m);
+                    }
                     if let Ok(Some(a)) = store.assignment_of_line(m.id).await {
                         self.never_went_in(&a).await;
                     }
@@ -1432,6 +1440,28 @@ impl CrewHub {
     }
 
     /// `a`'s line message was withdrawn or refused: it holds nothing.
+    /// The boss's `m` went into its session twice and was never shown to
+    /// have: the boss is told, as it isn't put in again.
+    pub(super) fn unreceived(self: &Arc<Self>, m: &LineMessage) {
+        let Some(session) = m.to_session() else {
+            return;
+        };
+        let at = m.at.with_timezone(&self.desk.timezone()).format("%H:%M");
+        self.wake_about(
+            &m.from.id,
+            session,
+            format!("unreceived:{}", m.id),
+            format!(
+                "{} never received your message of {at} (“{}”, message_id {}): it went in twice and \
+                 never showed in the session either time, so Desk won't put it in again. Read where \
+                 it stands (crew.history), and send it again if it still matters.",
+                self.session_name(session),
+                crew::words(&m.text, 20),
+                m.id,
+            ),
+        );
+    }
+
     async fn never_went_in(&self, a: &Assignment) {
         let why = "its message never went in";
         if let Ok(Some(a)) = self

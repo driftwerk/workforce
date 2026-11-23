@@ -14,7 +14,7 @@ use workforce_postgres::test_support::with_test_pool;
 
 use super::breaker::Steer;
 use super::line::Sender;
-use super::tests::{desk, new_session, post};
+use super::tests::{desk, new_session, post, went_in};
 use super::{Desk, Rules};
 use crate::crew::{By, Crew, CrewAgent, Overseer, Suggestion};
 use crate::line::{self, Delivery, LineMessage, Rushed, Send, Target, Unsteerable, Urgency, When};
@@ -206,7 +206,7 @@ async fn an_urgent_order_no_call_took_goes_in_at_the_idle_exactly_once() {
             .expect("the idle takes it");
         assert_eq!(handed["id"], json!(m.id));
         assert_eq!(row(&d, m.id).await.delivery, Delivery::Handed);
-        d.line_ack(s, m.id, true).await.unwrap();
+        went_in(&d, s, &handed).await;
         assert_eq!(row(&d, m.id).await.delivery, Delivery::Delivered);
         // The next turn's first call doesn't carry it a second time.
         post(&d, s, prompt()).await;
@@ -551,15 +551,14 @@ async fn an_escalating_stand_down_not_read_in_time_interrupts_its_turn_and_goes_
         );
         assert_eq!(d.view(s).unwrap().state, SessionState::Done, "interrupted");
         // The idle after it takes what waited, in order, one at a time.
-        let mut handed = Vec::new();
+        let mut handed: Vec<Uuid> = Vec::new();
         for _ in 0..3 {
             let next = d
                 .line_next(s, Duration::from_secs(5))
                 .await
                 .expect("at the idle");
-            let id: Uuid = serde_json::from_value(next["id"].clone()).unwrap();
-            d.line_ack(s, id, true).await.unwrap();
-            handed.push(id);
+            went_in(&d, s, &next).await;
+            handed.push(serde_json::from_value(next["id"].clone()).unwrap());
         }
         assert_eq!(handed, vec![plain.id, soft.id, hard.id]);
         assert!(

@@ -578,8 +578,20 @@ async fn a_question_behind_reports_waiting_for_the_next_hour_is_answered_at_once
 async fn every_report_in_rounds_with_the_boss_that_runs_it_reaches_its_turn() {
     with_test_pool(workforce_desk::store::build_pool, |pool| async move {
         let dir = tempfile::tempdir().unwrap();
-        let (overseer, crew, d, s) = paced_session(50, "Noted.", pool, dir.path()).await;
+        let (overseer, crew, d, llm) =
+            overseeing_at(dir.path(), pool, "Noted.", &paced_config(50), &[], FAST).await;
+        let s = new_session(&d, dir.path(), "Legacy removal").await.id;
+        d.take_on(
+            s,
+            &workforce_desk::crew::Party::manager("desk", &super::super::name_of(&overseer)),
+            workforce_desk::charge::How::Handed,
+            &Default::default(),
+            &By::you(),
+        )
+        .await
+        .unwrap();
         let rounds = usize::try_from(workforce_desk::rooms::MAX_HOPS).unwrap() * 3;
+        let url = hook_url(dir.path(), s).await;
         for round in 1..=rounds {
             let sent = d
                 .line_call(
@@ -591,8 +603,12 @@ async fn every_report_in_rounds_with_the_boss_that_runs_it_reaches_its_turn() {
                 .await
                 .unwrap_or_else(|e| panic!("report {round} refused: {e}"));
             let report: uuid::Uuid = serde_json::from_value(sent["id"].clone()).unwrap();
+            // Its turn, which the boss's last answer started, ends.
+            hook(&url, json!({"hook_event_name": "Stop", "last_assistant_message": format!("Step {round} done.")})).await;
             eventually("its report taken by a turn", async || {
-                (line_turns(&overseer, s) == round).then_some(())
+                let taken = d.store().line_message(report).await.ok()??.delivery == Delivery::Delivered;
+                let waits = d.store().line_waiting_for_bosses().await.ok()?;
+                (taken && waits.is_empty()).then_some(())
             })
             .await;
             let hop = d.store().line_message(report).await.unwrap().unwrap().hop;
@@ -610,16 +626,24 @@ async fn every_report_in_rounds_with_the_boss_that_runs_it_reaches_its_turn() {
             })
             .await;
             let id: uuid::Uuid = serde_json::from_value(next["id"].clone()).unwrap();
+            let text = next["text"].as_str().unwrap();
+            hook(
+                &url,
+                json!({"hook_event_name": "UserPromptSubmit", "prompt": format!("The desk plugin sent a message: {text}")}),
+            )
+            .await;
             d.line_ack(s, id, true).await.unwrap();
         }
-        let channel = super::super::line::line_channel(s);
-        let line = overseer.sessions.find(&channel, PERSON).unwrap().unwrap();
-        assert!(
-            line.messages
+        let last = format!("Step {rounds} done.");
+        eventually("the last report in the boss's turn", async || {
+            llm.received_requests()
+                .await
+                .unwrap_or_default()
                 .iter()
-                .any(|m| m.content.contains(&format!("Step {rounds} done."))),
-            "the last report reached its turn"
-        );
+                .any(|r| String::from_utf8_lossy(&r.body).contains(&last))
+                .then_some(())
+        })
+        .await;
     })
     .await;
 }
@@ -767,6 +791,48 @@ async fn reports_waiting_go_as_soon_as_the_hours_turns_are_raised() {
         // Taken, it starts no turn again.
         tokio::time::sleep(super::super::line::GATHER * 2).await;
         assert_eq!(line_turns(&overseer, s), 2);
+    })
+    .await;
+}
+
+/// The boss's message went into its session twice and was never shown to
+/// have: the boss is woken once to say so, naming the message.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_message_never_received_wakes_its_boss_once() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (overseer, crew, d, llm) =
+            overseeing_at(dir.path(), pool, "Noted.", &paced_config(50), &[], FAST).await;
+        let s = new_session(&d, dir.path(), "Legacy removal").await;
+        d.take_on(
+            s.id,
+            &workforce_desk::crew::Party::manager("desk", &super::super::name_of(&overseer)),
+            workforce_desk::charge::How::Handed,
+            &Default::default(),
+            &By::you(),
+        )
+        .await
+        .unwrap();
+        let by = crew.by_overseer("It should open the PR.").unwrap();
+        let mut m = workforce_desk::line::LineMessage::new(
+            by.party,
+            workforce_desk::crew::Party::session(&s),
+            LineKind::Tell,
+            "Open the PR for the ledger fix.".into(),
+            1,
+        );
+        m.delivery = Delivery::Unreceived;
+        crew.unreceived(&m);
+        let woken = eventually("the boss woken", async || {
+            Some(super::stalls::woken_by(&llm, "never received").await).filter(|w| !w.is_empty())
+        })
+        .await;
+        assert_eq!(woken.len(), 1, "{woken:?}");
+        assert!(woken[0].contains(&m.id.to_string()), "{woken:?}");
+        assert!(
+            woken[0].contains("Open the PR for the ledger fix."),
+            "{woken:?}"
+        );
     })
     .await;
 }

@@ -26,7 +26,8 @@ text_enum!(LineKind {
 text_enum!(Delivery {
     // Waiting for the recipient to be able to take it.
     Queued => "queued",
-    // Desk's plugin took it; delivered once it says the session has it.
+    // Handed to Desk's plugin, or typed in: delivered once the session is
+    // shown to have it (its marker came back in a prompt, see [`marked`]).
     Handed => "handed",
     Delivered => "delivered",
     // The recipient isn't running; it goes out when it runs again.
@@ -38,6 +39,9 @@ text_enum!(Delivery {
     Withdrawn => "withdrawn",
     // Shown in the thread only, never typed into the session.
     Noted => "noted",
+    // Never shown to have gone in: it went in twice, and its marker never
+    // came back either time. Its sender is told; it isn't put in again.
+    Unreceived => "unreceived",
 });
 
 text_enum!(Asked {
@@ -1126,6 +1130,12 @@ pub fn steering(
 
 /// What a message from another session, or Desk, opens with: how a hook
 /// tells it from the person's own words.
+/// Whether `msg` goes in carrying its [`marker`], which its session's
+/// prompt brings back as it goes in: all but the person's own words.
+pub fn marked(msg: &LineMessage) -> bool {
+    msg.from.kind != PartyKind::You
+}
+
 pub fn marker(id: Uuid) -> String {
     format!("[Desk m:{}]", &id.simple().to_string()[..MARK])
 }
@@ -1375,7 +1385,7 @@ pub fn render(msg: &LineMessage, question: Option<&str>) -> String {
 fn render_raw(msg: &LineMessage, question: Option<&str>) -> String {
     // The person's own words: what they write goes in as written, and an
     // answer says what it answers.
-    if msg.from.kind == PartyKind::You {
+    if !marked(msg) {
         return match (msg.kind, question) {
             (LineKind::Answer, Some(q)) => format!(
                 "Earlier you asked me “{}” and went ahead without my answer. My answer: {}",
