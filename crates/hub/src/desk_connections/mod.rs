@@ -502,6 +502,16 @@ pub fn key_at(tier: VaultSource, person: &str, path: &str) -> String {
     }
 }
 
+/// `fields` that are `c`'s secrets: what a service's words are scrubbed of.
+/// The rest (a site, an email, a bank's name) is the person's to read.
+fn secrets_of(c: &Connector, fields: &BTreeMap<String, String>) -> BTreeMap<String, String> {
+    fields
+        .iter()
+        .filter(|(name, _)| c.fields.iter().any(|f| f.secret && f.name == name.as_str()))
+        .map(|(name, value)| (name.clone(), value.clone()))
+        .collect()
+}
+
 /// `text` with every value in `fields` and anything shaped like a secret
 /// taken out.
 fn scrub(text: &str, fields: &BTreeMap<String, String>) -> String {
@@ -1331,12 +1341,13 @@ impl Connections {
         Ok(self.view(c, conn, tier, person, checked, &self.agents.all()))
     }
 
-    /// Runs `c`'s Test on `fields`, its words scrubbed of them.
+    /// Runs `c`'s Test on `fields`, its words scrubbed of its secrets.
     async fn check(&self, c: &Connector, person: &str, fields: &BTreeMap<String, String>) -> Found {
+        let secrets = secrets_of(c, fields);
         match self.services.check(c.id, person, fields).await {
             Found::Works { account } => Found::Works { account },
-            Found::Refused(e) => Found::Refused(scrub(&e, fields)),
-            Found::Failed(e) => Found::Failed(scrub(&e, fields)),
+            Found::Refused(e) => Found::Refused(scrub(&e, &secrets)),
+            Found::Failed(e) => Found::Failed(scrub(&e, &secrets)),
         }
     }
 

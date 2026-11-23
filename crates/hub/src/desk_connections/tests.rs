@@ -258,7 +258,8 @@ async fn services(github: Arc<Github>) -> Services {
                 Json(json!({ "success": true, "data": [
                     { "id": "bnk_nw", "name": "NatWest", "connectionStatus": { "connected": true } },
                     { "id": "bnk_rev", "name": "Revolut", "connectionStatus": { "connected": false } },
-                    { "id": "bnk_st", "name": "Starling" }
+                    { "id": "bnk_st", "name": "Starling" },
+                    { "id": "bnk_bk", "name": "Bank", "connectionStatus": { "connected": false } }
                 ] }))
             }),
         )
@@ -269,6 +270,7 @@ async fn services(github: Arc<Github>) -> Services {
                 let data = match id.as_str() {
                     "bnk_nw" => json!({ "id": id, "name": "NatWest", "connectionStatus": { "connected": true } }),
                     "bnk_st" => json!({ "id": id, "name": "Starling" }),
+                    "bnk_bk" => json!({ "id": id, "name": "Bank", "connectionStatus": { "connected": false } }),
                     _ => json!({ "id": id, "name": "Revolut", "connectionStatus": { "connected": false } }),
                 };
                 Json(json!({ "success": true, "data": data }))
@@ -2975,6 +2977,16 @@ mod setups {
                 tool: "browser.get_content".into(),
             },
         );
+        // Stamped on context nobody typed: a repository's code, other
+        // agents' lines in a room.
+        give("in_context", GOOD, SecretSource::Unknown);
+        give(
+            "a_colleagues",
+            GOOD,
+            SecretSource::SlashCommand {
+                user: "4f1c2d3e-0000-4000-8000-000000000002".into(),
+            },
+        );
         let _installed = GlobalCache::install(Arc::clone(&cache));
         let (h, s) = setups().await;
         let allan = caller("allan");
@@ -2989,7 +3001,13 @@ mod setups {
         );
         assert!(refused("api_key", "[[secret:linear_key]] and more").contains("cmd: secret"));
         assert!(refused("api_key", "[[secret:nobody_sent]]").contains("holds no such secret"));
-        assert!(refused("api_key", "[[secret:scraped]]").contains("not handed over"));
+        assert!(
+            refused("api_key", "[[secret:scraped]]").contains("wasn't handed over by the person")
+        );
+        assert!(refused("api_key", "[[secret:in_context]]")
+            .contains("wasn't handed over by the person"));
+        assert!(refused("api_key", "[[secret:a_colleagues]]")
+            .contains("Someone else in this conversation"));
         assert!(
             refused("api_key", "[[secret:not_a_key]]").contains("doesn't look like a Linear key")
         );
@@ -3025,6 +3043,49 @@ mod setups {
         assert!(keys(&h.allan).iter().any(|k| k.ends_with("/api_key")));
         let everything = format!("{said} {:?}", s.views(SARAH, None));
         assert!(!everything.contains(GOOD));
+    }
+
+    /// The person makes the key in their own window and sends it in a later
+    /// turn: the agent marks the key step waiting, the turn ends and the
+    /// setup stays, its card asking for the key; it arrives, and the same
+    /// setup connects.
+    #[tokio::test]
+    async fn a_key_the_person_sends_in_a_later_turn_finishes_the_same_setup() {
+        use crate::secret_cache::{testing::GlobalCache, InMemorySecretCache};
+        use workforce_common::secret_marker::{MarkerId, SecretCache, SecretSource};
+        let cache: Arc<dyn SecretCache> = Arc::new(InMemorySecretCache::with_defaults());
+        let _installed = GlobalCache::install(Arc::clone(&cache));
+        let (h, s) = setups().await;
+        let allan = caller("allan");
+        let started = s.start(&allan, "linear", None, None, false).await.unwrap();
+        s.step(&allan, &started.id, "key", StepState::Waiting, None)
+            .unwrap();
+        s.turn_ended("s-allan");
+        let card = card_shows(&s, &started.id, NowKind::Step).await;
+        assert_eq!(
+            card.ended, None,
+            "a turn's end spares a setup waiting on the person"
+        );
+        assert!(card.now.detail.unwrap().contains("cmd: secret linear_key"));
+        // Next turn: the person sent it.
+        cache.capture_named(
+            "desk:allan",
+            &MarkerId::named("linear_key").unwrap(),
+            Secret::new(GOOD.into()),
+            SecretSource::SlashCommand { user: SARAH.into() },
+        );
+        let again = s.start(&allan, "linear", None, None, false).await.unwrap();
+        assert_eq!(again.id, started.id, "the same setup carries on");
+        let kept = s
+            .keep_given(&allan, &started.id, "api_key", "[[secret:linear_key]]")
+            .unwrap();
+        s.finish_when_ready(&allan, &kept);
+        let said = s
+            .wait(&allan, &started.id, Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert_eq!(said["onFor"], json!("Allan"), "{said}");
+        assert!(keys(&h.allan).iter().any(|k| k.ends_with("/api_key")));
     }
 
     /// A key bound to the site it was read off (Metabase's) is only ever
@@ -3067,10 +3128,9 @@ mod setups {
         assert!(s.stop_for("someone-else", &carded.id).is_err());
         let view = s.stop_for(SARAH, &carded.id).unwrap();
         assert_eq!(view.ended, Some(Ended::Stopped));
-        assert_eq!(
-            s.stop_for(SARAH, &carded.id).unwrap().ended,
-            Some(Ended::Stopped),
-            "stopping it again changes nothing"
+        assert!(
+            s.stop_for(SARAH, &carded.id).is_err(),
+            "a stopped setup is gone from its card"
         );
 
         *h.github.outcome.lock().unwrap() = "pending";
@@ -3825,6 +3885,35 @@ async fn a_bank_connects_only_on_a_key_that_reads_and_says_when_its_approval_lap
     );
 }
 
+/// A check's words are scrubbed of the connection's secrets alone: a bank
+/// the person named "Bank" is said by its name, and BankSync's own stays.
+#[tokio::test]
+async fn a_lapse_names_the_bank_and_leaves_banksyncs_name_whole() {
+    let h = hub().await;
+    let refused =
+        h.c.connect(
+            SARAH,
+            "bank",
+            Some("Bank"),
+            "agent",
+            Some("allan"),
+            bank(BS_GOOD, "Bank"),
+        )
+        .await
+        .unwrap_err();
+    let said = format!("{refused:?}");
+    assert!(
+        said.contains(
+            "BankSync says Bank's approval has lapsed: the person reconnects it in BankSync"
+        ),
+        "{said}"
+    );
+    assert!(
+        !said.contains("[secret]") && !said.contains(BS_GOOD),
+        "{said}"
+    );
+}
+
 /// The settings case of DW-744: BankSync's detail of a bank need not say
 /// anything of its connection. One whose accounts BankSync serves connects,
 /// and Reconnect on it works.
@@ -3862,7 +3951,7 @@ async fn a_lapsed_bank_is_refused_and_only_the_persons_renewal_moves_its_approva
         .await;
     assert!(
         format!("{:?}", lapsed.unwrap_err())
-            .contains("BankSync says this bank's approval has lapsed"),
+            .contains("BankSync says Revolut's approval has lapsed"),
         "a bank BankSync says needs reconnecting is refused, and told to try again"
     );
 

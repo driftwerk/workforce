@@ -210,9 +210,9 @@ async fn what_banksync_refuses_is_said_as_what_to_do() {
     }
 }
 
-/// A lapse is only what BankSync's own answer calls one: its 409
-/// `reauth_required`, or its JSON 503 "consent required". Another 409 (a
-/// paging restart) or a bare 503 is BankSync not answering.
+/// A lapse is only what BankSync's own answer calls one, on a 409 or a 503:
+/// `code: reauth_required` or `recovery.action: reconnect`. Another 409 (a
+/// paging restart) or 503 (the provider down) is BankSync not answering.
 #[tokio::test]
 async fn only_banksyncs_own_word_is_a_lapse() {
     for (status, body, expected) in [
@@ -229,8 +229,14 @@ async fn only_banksyncs_own_word_is_a_lapse() {
         ),
         (
             503,
-            json!({"success": false, "error": "Bank consent required"}),
+            json!({"success": false, "error": "Bank consent required (reconnect in the app)",
+                   "recovery": {"action": "reconnect"}}),
             BankError::NeedsReconnect,
+        ),
+        (
+            503,
+            json!({"success": false, "error": "Provider temporarily unavailable"}),
+            BankError::Unavailable(Some(503)),
         ),
     ] {
         let server = serve(&["banks:read"]).await;
@@ -243,9 +249,10 @@ async fn only_banksyncs_own_word_is_a_lapse() {
     }
 }
 
-/// BankSync's detail of a bank may say nothing of its connection, or be
-/// out of date: the bank is connected unless BankSync refuses its accounts
-/// as needing reconnecting.
+/// BankSync's detail of a bank may say nothing of its connection: then the
+/// bank is connected unless BankSync refuses its accounts as needing
+/// reconnecting. What the detail does say stands, whatever a (perhaps
+/// cached) accounts read answers.
 #[tokio::test]
 async fn a_bank_is_lapsed_only_when_banksync_says_so() {
     let silent = json!({
@@ -266,7 +273,7 @@ async fn a_bank_is_lapsed_only_when_banksync_says_so() {
         (
             bank("bnk_nw", "NatWest", false),
             ResponseTemplate::new(200).set_body_json(accounts()),
-            true,
+            false,
         ),
         (
             silent,
@@ -276,8 +283,10 @@ async fn a_bank_is_lapsed_only_when_banksync_says_so() {
             false,
         ),
         (
-            bank("bnk_nw", "NatWest", false),
-            ResponseTemplate::new(503).set_body_json(json!({"success": false, "error": "Consent"})),
+            json!({"status": "error", "id": "bnk_nw", "name": "NatWest"}),
+            ResponseTemplate::new(503).set_body_json(
+                json!({"success": false, "error": "Consent", "recovery": {"action": "reconnect"}}),
+            ),
             false,
         ),
     ] {
@@ -301,8 +310,9 @@ async fn a_bank_is_lapsed_only_when_banksync_says_so() {
     Mock::given(method("GET"))
         .and(path("/banks/bnk_nw"))
         .respond_with(
-            ResponseTemplate::new(200)
-                .set_body_json(json!({"success": true, "data": bank("bnk_nw", "NatWest", false)})),
+            ResponseTemplate::new(200).set_body_json(
+                json!({"success": true, "data": {"id": "bnk_nw", "name": "NatWest"}}),
+            ),
         )
         .mount(&server)
         .await;

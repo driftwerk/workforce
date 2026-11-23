@@ -5,8 +5,12 @@ use chrono::{DateTime, Duration, NaiveDate, Utc};
 use serde::Serialize;
 use serde_json::Number;
 
-/// How long a bank's approval lasts under UK and EU open banking, as
-/// BankSync says: 180 days.
+/// About how long a bank's approval lasts, an estimate: BankSync never says
+/// a consent's end over its API. Its UK page (banksync.io, "UK open banking
+/// access lasts 180 days") and its EU banks' ("again at least every 180
+/// days", Delegated Regulation (EU) 2022/2360 Art. 10a) say 180 days; its
+/// consents guide says UK banks "typically use a 90-day reconfirmation
+/// cycle". Only a reminder is drawn from it: a lapse is what BankSync says.
 pub const CONSENT_DAYS: i64 = 180;
 
 /// The days before an approval lapses on which the person is reminded.

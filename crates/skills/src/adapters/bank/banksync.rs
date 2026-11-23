@@ -340,16 +340,16 @@ fn bank_named(banks: &Value, named: &str) -> Result<String, BankError> {
 }
 
 /// What a refused read means. A lapse is only what BankSync's own answer
-/// says is one: a `409` whose `code` is `reauth_required`, or its `503`
-/// "consent required" (its JSON error, never a bare outage).
+/// says is one, on a `409` or a `503`: its `code` is `reauth_required`, or
+/// its `recovery.action` is `reconnect`. Any other (a paging restart, the
+/// provider being down) is BankSync not answering.
 fn refusal(status: u16, body: &Value) -> BankError {
-    let says = body["success"] == Value::Bool(false);
+    let lapsed = body["code"] == "reauth_required" || body["recovery"]["action"] == "reconnect";
     match status {
         401 => BankError::Revoked,
         403 => BankError::ScopeMissing,
         404 => BankError::NotFound("bank or account"),
-        409 if body["code"] == "reauth_required" => BankError::NeedsReconnect,
-        503 if says => BankError::NeedsReconnect,
+        409 | 503 if lapsed => BankError::NeedsReconnect,
         400 => BankError::Invalid("BankSync refused the request as asked.".into()),
         s => BankError::Unavailable(Some(s)),
     }
@@ -394,9 +394,7 @@ fn number(v: &Value) -> Option<Number> {
 }
 
 /// A bank as BankSync's detail of it says. Connected only where it says so
-/// (`connectionStatus.connected`, else its `status`): where it says
-/// nothing, or something else, [`BankSync::connection`] asks for the bank's
-/// accounts to know.
+/// (`connectionStatus.connected`, else its `status`).
 pub fn connection_of(bank: &Value) -> Connection {
     let status = &bank["connectionStatus"];
     Connection {
@@ -407,6 +405,11 @@ pub fn connection_of(bank: &Value) -> Connection {
         status: text(&status["status"]).or_else(|| text(&bank["status"])),
         history: text(&bank["historyReadiness"]["state"]),
     }
+}
+
+/// Whether BankSync's detail of a bank says outright whether it's connected.
+fn says_its_connection(bank: &Value) -> bool {
+    bank["connectionStatus"]["connected"].is_boolean()
 }
 
 pub fn account_of(a: &Value) -> Account {
@@ -468,15 +471,16 @@ pub fn page_of(body: &Value) -> Page {
 
 #[async_trait]
 impl BankProvider for BankSync {
-    /// The bank, connected unless BankSync says its approval lapsed. Its
-    /// detail's status may be missing or out of date, so one that doesn't
-    /// say it's connected is asked for its accounts: BankSync serving them
-    /// is connected, and refusing them as needing reconnecting is a lapse.
+    /// The bank as BankSync says it is. Its detail may say nothing of its
+    /// connection (`connectionStatus` is optional), and then the bank's
+    /// accounts tell: BankSync serving them is connected, refusing them as
+    /// needing reconnecting is a lapse. What the detail does say stands: an
+    /// accounts read may come from BankSync's cache, so never outweighs it.
     async fn connection(&self) -> Result<Connection, BankError> {
         let (key, ws, id) = self.bank().await?;
         let bank = self.get(&key, &ws, &format!("/banks/{id}"), &[]).await?;
         let said = connection_of(&bank["data"]);
-        if said.connected {
+        if said.connected || says_its_connection(&bank["data"]) {
             return Ok(said);
         }
         match self

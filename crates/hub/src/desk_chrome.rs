@@ -91,6 +91,10 @@ pub struct ProfileView {
     pub state: &'static str,
     pub connected: bool,
     pub chosen: bool,
+    /// Where its extension, connected now, is older than this hub needs.
+    pub outdated: Option<Outdated>,
+    /// Chrome's page for Desk's extension, where it is reloaded by hand.
+    pub reload_at: Option<String>,
 }
 
 /// Where a call's answer goes: its value, or what the extension said.
@@ -100,9 +104,10 @@ type Answer = oneshot::Sender<std::result::Result<Value, String>>;
 struct Conn {
     out: mpsc::UnboundedSender<String>,
     waiting: Arc<parking_lot::Mutex<HashMap<u64, Answer>>>,
-    /// The extension's revision, as its hello said: 1 for one older than
-    /// revisions.
-    revision: u64,
+    /// Where its extension is older than this hub needs, as its hello said.
+    outdated: Option<Outdated>,
+    /// Its extension's id, as Desk Helper said it from Chrome's origin.
+    extension: Option<String>,
 }
 
 /// The hub's end of Desk's extension.
@@ -203,15 +208,30 @@ impl Chrome {
             .lock()
             .iter()
             .filter(|p| p.confirmed || asking.contains(&p.id))
-            .map(|p| ProfileView {
-                id: p.id.clone(),
-                label: p.label.clone(),
-                version: p.version.clone(),
-                state: if p.confirmed { "confirmed" } else { "pending" },
-                connected: live.contains_key(&p.id) || asking.contains(&p.id),
-                chosen: p.chosen,
+            .map(|p| {
+                let conn = live.get(&p.id);
+                let outdated = conn.and_then(|c| c.outdated);
+                ProfileView {
+                    id: p.id.clone(),
+                    label: p.label.clone(),
+                    version: p.version.clone(),
+                    state: if p.confirmed { "confirmed" } else { "pending" },
+                    connected: conn.is_some() || asking.contains(&p.id),
+                    chosen: p.chosen,
+                    outdated,
+                    reload_at: (outdated == Some(Outdated::Reload))
+                        .then(|| extensions_page(conn.and_then(|c| c.extension.as_deref()))),
+                }
             })
             .collect()
+    }
+
+    /// Where the extension Desk uses is older than this hub needs, with
+    /// Chrome's page for it.
+    pub fn outdated(&self) -> Option<(Outdated, String)> {
+        let conn = self.chosen_conn()?;
+        conn.outdated
+            .map(|o| (o, extensions_page(conn.extension.as_deref())))
     }
 
     /// Whether the profile Desk uses is connected now.
@@ -423,7 +443,11 @@ impl Chrome {
         let conn = Arc::new(Conn {
             out,
             waiting: Default::default(),
-            revision: hello["revision"].as_u64().unwrap_or(1),
+            outdated: Outdated::of(hello["revision"].as_u64().unwrap_or(1)),
+            extension: hello["extension"]
+                .as_str()
+                .filter(|id| is_extension_id(id))
+                .map(str::to_string),
         });
         self.live.lock().insert(id.clone(), Arc::clone(&conn));
         info!(profile = %id, %version, "Desk's Chrome extension connected");
@@ -561,8 +585,8 @@ impl ExtensionLink for Chrome {
         let conn = self
             .chosen_conn()
             .ok_or_else(|| eyre!(browser::NOT_CONNECTED))?;
-        if conn.revision < SELF_UPDATING && !matches!(cmd, "close" | "stop") {
-            return Err(eyre!(OUTDATED));
+        if let Some(outdated) = conn.outdated.filter(|_| !matches!(cmd, "close" | "stop")) {
+            return Err(eyre!(outdated.said()));
         }
         let id = self.next.fetch_add(1, Ordering::Relaxed);
         let mut call = args.clone();
@@ -596,14 +620,56 @@ impl ExtensionLink for Chrome {
     }
 }
 
+/// The revision of Desk's extension this hub needs: from it on, a page step
+/// Chrome didn't run is never answered as done.
+pub const REVISION: u64 = 3;
+
 /// The first revision of Desk's extension that brings itself up to date
 /// after a Desk install. One older keeps running the build Chrome first
-/// loaded, whose answers this hub can't trust (a click it never made said as
-/// made), until the person reloads it once.
+/// loaded until the person reloads it once.
 pub const SELF_UPDATING: u64 = 2;
 
-/// What a call on an extension older than [`SELF_UPDATING`] is told.
-pub const OUTDATED: &str = "Desk's extension in the person's Chrome is an old build that can't update itself, so Desk didn't use it. Ask them to reload it once: in Chrome open chrome://extensions and press the reload arrow on Desk's card. From then on it keeps itself up to date.";
+/// Where an extension older than [`REVISION`] stands: answers of an older
+/// build aren't trusted (a click it never made said as made).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Outdated {
+    /// It brings itself up to date, in a moment.
+    Updating,
+    /// It can't: the person reloads it once.
+    Reload,
+}
+
+impl Outdated {
+    fn of(revision: u64) -> Option<Self> {
+        match revision {
+            r if r >= REVISION => None,
+            r if r >= SELF_UPDATING => Some(Self::Updating),
+            _ => Some(Self::Reload),
+        }
+    }
+
+    /// What a browser call on it is told.
+    pub fn said(self) -> &'static str {
+        match self {
+            Self::Updating => "Desk's extension in the person's Chrome is updating itself to the build this Desk needs, so nothing was done: try again in a moment.",
+            Self::Reload => "Desk's extension in the person's Chrome is an old build that can't update itself, so Desk didn't use it. The setup's card and Settings → Browser ask the person to reload it once, and open Chrome's page for it: wait while they do (connections.wait), then try again.",
+        }
+    }
+}
+
+/// Whether `id` is shaped like a Chrome extension id: 32 letters a to p.
+fn is_extension_id(id: &str) -> bool {
+    id.len() == 32 && id.bytes().all(|b| (b'a'..=b'p').contains(&b))
+}
+
+/// Chrome's page for extension `id`, else for every extension.
+fn extensions_page(id: Option<&str>) -> String {
+    match id {
+        Some(id) => format!("chrome://extensions/?id={id}"),
+        None => "chrome://extensions/".into(),
+    }
+}
 
 /// What a call in someone else's turn is told.
 pub const OTHERS_TURN: &str = "The browser is the person's own Chrome, signed in as them: it is used only in a turn of theirs.";

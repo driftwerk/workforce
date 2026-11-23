@@ -194,6 +194,21 @@ impl SecretSource {
     pub fn is_tool_scraped(&self) -> bool {
         matches!(self, SecretSource::ToolResult { .. })
     }
+
+    /// Who handed this value over, where a person did it themselves: their
+    /// message, slash command or voice. A value scraped from a tool's answer,
+    /// or [`SecretSource::Unknown`] (stamped on context no person typed
+    /// too: a repository's code, other agents' lines), names nobody.
+    pub fn handed_over_by(&self) -> Option<&str> {
+        match self {
+            SecretSource::Slack { user, .. }
+            | SecretSource::WebGateway { user }
+            | SecretSource::Voice { user }
+            | SecretSource::NatsChat { user }
+            | SecretSource::SlashCommand { user } => Some(user),
+            SecretSource::ToolResult { .. } | SecretSource::Unknown => None,
+        }
+    }
 }
 
 /// Metadata returned to the caller of [`tokenize_secrets`] so it can
@@ -538,6 +553,33 @@ pub fn redact_known_secrets(session_key: &str, text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_a_persons_own_hand_over_names_them() {
+        let user = || "u1".to_string();
+        for source in [
+            SecretSource::SlashCommand { user: user() },
+            SecretSource::WebGateway { user: user() },
+            SecretSource::Voice { user: user() },
+            SecretSource::NatsChat { user: user() },
+            SecretSource::Slack {
+                workspace_id: "T1".into(),
+                channel: "C1".into(),
+                message_ts: "1".into(),
+                user: user(),
+            },
+        ] {
+            assert_eq!(source.handed_over_by(), Some("u1"), "{source:?}");
+        }
+        assert_eq!(SecretSource::Unknown.handed_over_by(), None);
+        assert_eq!(
+            SecretSource::ToolResult {
+                tool: "web.fetch".into()
+            }
+            .handed_over_by(),
+            None
+        );
+    }
 
     #[test]
     fn marker_id_is_32_lowercase_hex() {
