@@ -4467,7 +4467,7 @@ pub(crate) fn discarded_metadata_keys(
         .chain(stored.keys())
         .filter(|key| incoming.get(*key) != stored.get(*key))
         .cloned()
-        .collect::<std::collections::BTreeSet<_>>()
+        .collect::<BTreeSet<_>>()
         .into_iter()
         .collect()
 }
