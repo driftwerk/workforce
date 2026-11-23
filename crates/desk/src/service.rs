@@ -3486,8 +3486,8 @@ impl Desk {
                 .into(),
             ),
             (Some(t), Some(r)) if r.turn != t => Some(
-                "[its reply changed since you began reading it: a later turn ended. Read the new \
-                 one from the start (reply_from: 0).]"
+                "[its reply changed since you began reading it. Read the new one from the start \
+                 (reply_from: 0).]"
                     .into(),
             ),
             _ => self.reply_for_boss(v, from, crew::REPLY_PAGE, crew::ReadOn::Tools),
@@ -12244,10 +12244,13 @@ mod tests {
             )
             .await;
             let v = d.view(s.id).unwrap();
-            assert!(d
-                .reply_read(&v, crew::REPLY_PAGE, Some(&turn))
-                .unwrap()
-                .contains("its reply changed since you began reading it"));
+            assert_eq!(
+                d.reply_read(&v, crew::REPLY_PAGE, Some(&turn)).as_deref(),
+                Some(
+                    "[its reply changed since you began reading it. Read the new one from the \
+                     start (reply_from: 0).]"
+                )
+            );
             assert_eq!(d.reply_read(&v, 0, None).as_deref(), Some("All green."));
             assert_eq!(
                 d.reply(s.id).map(|r| r.turn),

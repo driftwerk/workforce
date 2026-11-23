@@ -1398,13 +1398,13 @@ impl CrewHub {
     }
 }
 
-/// The session whose turn `event` says ended, when it does.
 /// Whether `reply` says more than its turn's end does: its first sentence,
 /// as long as that says it ([`crew::ANSWER_CHARS`]).
 fn says_more(reply: &str) -> bool {
     crew::one_line(reply, crew::ANSWER_CHARS) != reply.trim()
 }
 
+/// The session whose turn `event` says ended, when it does.
 pub(super) fn finished_session(event: &Event) -> Option<uuid::Uuid> {
     let subject = event.subject.as_ref()?;
     (event.kind == Kind::Finished && subject.kind == PartyKind::Session)

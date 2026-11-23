@@ -1411,7 +1411,6 @@ pub fn hit_limit(reply: &str) -> bool {
         .any(|p| r.contains(p))
 }
 
-/// How long an answer's line is kept.
 /// The most of a reply's first sentence a turn's end says.
 pub const ANSWER_CHARS: usize = 120;
 
