@@ -362,6 +362,11 @@ fn pointed_at(name: &str, mine: Option<&str>, other: &Client, dir: &Path) -> Vec
             json!({ "item_id": uuid::Uuid::new_v4().to_string(), "why": "Settled." }),
             false,
         )],
+        "crew.inside" => ["glance", "transcript", "processes", "workspace", "logs"]
+            .iter()
+            .map(|facet| (json!({ "session_id": s, "facet": facet }), true))
+            .chain([(json!({ "session_id": "*" }), false)])
+            .collect(),
         "crew.account" => vec![
             (json!({ "session_id": s }), true),
             (json!({ "session_id": s, "question": "Which key?" }), true),

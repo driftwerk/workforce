@@ -48,7 +48,7 @@ pub(crate) const STALE: &str = "Not sent: since you decided this,";
 /// spent.
 /// Opens the crew block while it holds (`super::context::block`): accounts
 /// said plainly read like fresh ones, and are never to be taken for them.
-pub(super) const NOTES_SPENT: &str = "Sessions' summaries are written plainly from their last words for the rest of today: the day's metered cheap calls are spent (`[oversight.updates] cheap_calls_per_day`). They may be out of date: check a session (crew.account, crew.ask_session) before you say anything has or hasn't happened.";
+pub(super) const NOTES_SPENT: &str = "Sessions' summaries are written plainly from their last words for the rest of today: the day's metered cheap calls are spent (`[oversight.updates] cheap_calls_per_day`). They may be out of date: check a session (crew.inside, crew.account; crew.ask_session only when they can't tell) before you say anything has or hasn't happened.";
 
 /// How long a turn's basis is kept, at most, when its end isn't seen.
 const BASIS_KEPT: chrono::TimeDelta = chrono::TimeDelta::hours(6);

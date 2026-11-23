@@ -13,7 +13,7 @@ use serde_json::Value;
 
 use super::record::Asker;
 
-fn time(v: &Value, pointer: &str) -> Option<DateTime<Utc>> {
+pub(crate) fn time(v: &Value, pointer: &str) -> Option<DateTime<Utc>> {
     v.pointer(pointer)
         .and_then(Value::as_str)
         .and_then(|t| DateTime::parse_from_rfc3339(t).ok())

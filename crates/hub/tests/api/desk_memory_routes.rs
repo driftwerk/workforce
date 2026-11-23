@@ -98,6 +98,7 @@ async fn start(pool: &PostgresPool, dir: &Path) -> (Desk, CancellationToken, Soc
             line_reach: workforce_desk::line::Reach::Group,
             memory: Default::default(),
             bosses: Default::default(),
+            sight: Default::default(),
         },
         Floor {
             redactor: Some(Arc::new(HubRedactor)),

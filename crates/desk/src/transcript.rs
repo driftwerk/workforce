@@ -37,13 +37,18 @@ pub struct Tail {
 }
 
 /// The whole lines of the end of a transcript.
-fn tail_lines(path: &Path) -> std::io::Result<String> {
+pub(crate) fn tail_lines(path: &Path) -> std::io::Result<String> {
+    tail_of(path, TAIL_BYTES)
+}
+
+/// The whole lines in the last `most` bytes of `path`.
+pub(crate) fn tail_of(path: &Path, most: u64) -> std::io::Result<String> {
     let mut file = std::fs::File::open(path)?;
     let len = file.metadata()?.len();
-    let start = len.saturating_sub(TAIL_BYTES);
+    let start = len.saturating_sub(most);
     file.seek(SeekFrom::Start(start))?;
     let mut raw = Vec::new();
-    file.take(TAIL_BYTES).read_to_end(&mut raw)?;
+    file.take(most).read_to_end(&mut raw)?;
     let buf = String::from_utf8_lossy(&raw);
     // Starting mid-file means the first line is partial.
     Ok(buf

@@ -114,6 +114,15 @@ fn split(repo: &str) -> Result<(&str, &str), String> {
     goal::github_repo(repo).ok_or_else(|| format!("{NOT_THERE} repository named {repo}."))
 }
 
+/// What each of `calls` answered as the person, or why not, in the boss's
+/// words.
+async fn calls(access: &GithubAccess<'_>, calls: Vec<(&str, Value)>) -> Result<Vec<Value>, String> {
+    github::calls_as_person(access, calls)
+        .await
+        .map(|(_, answered)| answered)
+        .map_err(|e| e.to_string())
+}
+
 async fn read_ci(
     access: &GithubAccess<'_>,
     repo: &str,
@@ -123,7 +132,7 @@ async fn read_ci(
     agreed_at: DateTime<Utc>,
 ) -> Result<Found, String> {
     let (owner, name) = split(repo)?;
-    let (_, listed) = github::calls_as_person(
+    let listed = calls(
         access,
         vec![(
             "github.workflow_runs",
@@ -150,7 +159,7 @@ async fn read_ci(
                     )
                 })
                 .collect();
-            github::calls_as_person(access, calls).await?.1
+            self::calls(access, calls).await?
         }
         _ => Vec::new(),
     };
@@ -296,7 +305,7 @@ async fn read_pull(
     let number = match pr {
         PrPick::Number(n) => *n,
         PrPick::Head(head) => {
-            let (_, found) = github::calls_as_person(
+            let found = calls(
                 access,
                 vec![(
                     "github.list_pulls",
@@ -311,7 +320,7 @@ async fn read_pull(
             }
         }
     };
-    let (_, got) = github::calls_as_person(
+    let got = calls(
         access,
         vec![(
             "github.get_pull",

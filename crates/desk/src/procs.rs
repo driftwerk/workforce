@@ -22,6 +22,31 @@ impl Proc {
     }
 }
 
+impl AsRef<Proc> for Proc {
+    fn as_ref(&self) -> &Proc {
+        self
+    }
+}
+
+/// One process with what `ps` says of its run: its state, whether it is in
+/// its terminal's foreground, how long it has run and used the CPU, and its
+/// resident memory.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Stat {
+    pub proc: Proc,
+    pub state: char,
+    pub foreground: bool,
+    pub elapsed_secs: u64,
+    pub cpu_secs: u64,
+    pub rss_kb: u64,
+}
+
+impl AsRef<Proc> for Stat {
+    fn as_ref(&self) -> &Proc {
+        &self.proc
+    }
+}
+
 /// Every process, from `ps -A -ww -o pid=,ppid=,args=`.
 pub fn parse(listing: &str) -> Vec<Proc> {
     listing
@@ -39,20 +64,74 @@ pub fn parse(listing: &str) -> Vec<Proc> {
         .collect()
 }
 
+/// Every process with its run, from
+/// `ps -A -ww -o pid=,ppid=,stat=,etime=,time=,rss=,args=`.
+pub fn parse_stats(listing: &str) -> Vec<Stat> {
+    listing
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split_whitespace();
+            let pid = fields.next()?.parse().ok()?;
+            let ppid = fields.next()?.parse().ok()?;
+            let stat = fields.next()?;
+            let elapsed_secs = parse_etime(fields.next()?)?;
+            let cpu_secs = parse_etime(fields.next()?)?;
+            let rss_kb = fields.next()?.parse().ok()?;
+            Some(Stat {
+                proc: Proc {
+                    pid,
+                    ppid,
+                    args: fields.collect::<Vec<_>>().join(" "),
+                },
+                state: stat.chars().next()?,
+                foreground: stat.contains('+'),
+                elapsed_secs,
+                cpu_secs,
+                rss_kb,
+            })
+        })
+        .collect()
+}
+
+/// Seconds from `ps`'s `etime` or `time` (`[[dd-]hh:]mm:ss`, macOS's
+/// `time` with hundredths after its seconds, which are dropped).
+pub fn parse_etime(etime: &str) -> Option<u64> {
+    let etime = etime.trim();
+    let whole = etime.split_once('.').map_or(etime, |(w, _)| w);
+    let (days, rest) = match whole.split_once('-') {
+        Some((d, r)) => (d.parse::<u64>().ok()?, r),
+        None => (0, whole),
+    };
+    let parts: Vec<u64> = rest
+        .split(':')
+        .map(|p| p.parse().ok())
+        .collect::<Option<_>>()?;
+    let secs = match parts[..] {
+        [m, s] => m.checked_mul(60)?.checked_add(s)?,
+        [h, m, s] => h
+            .checked_mul(3600)?
+            .checked_add(m.checked_mul(60)?)?
+            .checked_add(s)?,
+        _ => return None,
+    };
+    days.checked_mul(86_400)?.checked_add(secs)
+}
+
 /// The processes under `root`, however deep, each once.
-pub fn under(all: &[Proc], root: u32) -> Vec<&Proc> {
-    let mut children: HashMap<u32, Vec<&Proc>> = HashMap::new();
+pub fn under<P: AsRef<Proc>>(all: &[P], root: u32) -> Vec<&P> {
+    let mut children: HashMap<u32, Vec<&P>> = HashMap::new();
     all.iter()
-        .filter(|p| p.pid != p.ppid)
-        .for_each(|p| children.entry(p.ppid).or_default().push(p));
+        .filter(|p| p.as_ref().pid != p.as_ref().ppid)
+        .for_each(|p| children.entry(p.as_ref().ppid).or_default().push(p));
     let mut seen = HashSet::from([root]);
     let mut found = Vec::new();
     let mut next = vec![root];
     while let Some(pid) = next.pop() {
         for child in children.get(&pid).into_iter().flatten() {
-            if seen.insert(child.pid) {
+            let pid = child.as_ref().pid;
+            if seen.insert(pid) {
                 found.push(*child);
-                next.push(child.pid);
+                next.push(pid);
             }
         }
     }
@@ -60,9 +139,11 @@ pub fn under(all: &[Proc], root: u32) -> Vec<&Proc> {
 }
 
 /// The processes `parent` started itself.
-pub fn children(all: &[Proc], parent: u32) -> impl Iterator<Item = &Proc> {
-    all.iter()
-        .filter(move |p| p.ppid == parent && p.pid != parent)
+pub fn children<P: AsRef<Proc>>(all: &[P], parent: u32) -> impl Iterator<Item = &P> {
+    all.iter().filter(move |p| {
+        let p = p.as_ref();
+        p.ppid == parent && p.pid != parent
+    })
 }
 
 /// What runs in a terminal whose shell is `root`, by program: the shell,
@@ -105,6 +186,25 @@ pub async fn table() -> Option<Vec<Proc>> {
     out.status
         .success()
         .then(|| parse(&String::from_utf8_lossy(&out.stdout)))
+}
+
+/// Reads the listing with each process's run now; `None` when `ps` can't
+/// be run.
+pub async fn stats() -> Option<Vec<Stat>> {
+    let out = tokio::process::Command::new("ps")
+        .args([
+            "-A",
+            "-ww",
+            "-o",
+            "pid=,ppid=,stat=,etime=,time=,rss=,args=",
+        ])
+        .kill_on_drop(true)
+        .output()
+        .await
+        .ok()?;
+    out.status
+        .success()
+        .then(|| parse_stats(&String::from_utf8_lossy(&out.stdout)))
 }
 
 /// The processes in process group `group`, as `ps` lists them now.
@@ -244,9 +344,10 @@ pub async fn started_at(pid: u32) -> Option<chrono::DateTime<chrono::Utc>> {
             .kill_on_drop(true)
             .output();
         let out = tokio::time::timeout(PS_WAIT, run).await.ok()?.ok()?;
-        let ran = crate::codex_session::parse_etime(&String::from_utf8_lossy(&out.stdout))
-            .filter(|_| out.status.success())?;
-        Some(chrono::Utc::now() - chrono::Duration::seconds(i64::try_from(ran).ok()?))
+        let ran =
+            parse_etime(&String::from_utf8_lossy(&out.stdout)).filter(|_| out.status.success())?;
+        let ran = chrono::Duration::try_seconds(i64::try_from(ran).ok()?)?;
+        chrono::Utc::now().checked_sub_signed(ran)
     }
 }
 
@@ -391,6 +492,61 @@ mod tests {
         let all = parse("100 1 claude\n101 100 sh\n100 101 sh\n");
         assert_eq!(under(&all, 100).len(), 1);
         assert_eq!(programs(&all, 100), ["claude", "sh"]);
+    }
+
+    #[test]
+    fn elapsed_and_cpu_times_are_read_in_every_form_ps_prints() {
+        assert_eq!(parse_etime("00:07"), Some(7));
+        assert_eq!(
+            parse_etime("106751991167-07:12:55"),
+            Some(9_223_372_036_854_775)
+        ); // wrapped round, as ps can say
+        assert_eq!(parse_etime("213503982334602-00:00:00"), None, "past a u64");
+        assert_eq!(parse_etime("1:18446744073709551615"), None);
+        assert_eq!(parse_etime("12:07"), Some(727));
+        assert_eq!(parse_etime("01:02:03"), Some(3723));
+        assert_eq!(parse_etime("2-01:02:03"), Some(2 * 86_400 + 3723));
+        assert_eq!(parse_etime("0:03.41"), Some(3));
+        assert_eq!(parse_etime("125:30.12"), Some(125 * 60 + 30));
+        assert_eq!(parse_etime("1-02:03:04.50"), Some(86_400 + 7384));
+        assert_eq!(parse_etime("soon"), None);
+        assert_eq!(parse_etime("1:2:3:4"), None);
+        assert_eq!(parse_etime(""), None);
+    }
+
+    #[test]
+    fn a_wide_listing_keeps_spaces_in_args_and_skips_a_bad_line() {
+        let all = parse_stats(
+            "  1     0 Ss   10-00:00:00 1:02.50  9000 /sbin/launchd\n\
+             100     1 S+      02:50:00   0:03   212000 sh -c sleep 600; echo  done\n\
+             101   100 R       01:00   125:30.12  64 cargo test\n\
+             102   100 S       junk 0:01 10 broken\n",
+        );
+        assert_eq!(all.len(), 3);
+        assert_eq!(all[1].proc.args, "sh -c sleep 600; echo done");
+        assert_eq!(all[1].state, 'S');
+        assert!(all[1].foreground);
+        assert!(!all[2].foreground);
+        assert_eq!(all[1].elapsed_secs, 10_200);
+        assert_eq!(all[1].cpu_secs, 3);
+        assert_eq!(all[2].cpu_secs, 7530);
+        assert_eq!(all[1].rss_kb, 212_000);
+        assert_eq!(all[0].elapsed_secs, 864_000);
+        assert_eq!(
+            under(&all, 1)
+                .iter()
+                .map(|s| s.proc.pid)
+                .collect::<Vec<_>>()
+                .len(),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn this_machines_listing_with_runs_is_read_whole() {
+        let all = stats().await.expect("ps runs");
+        let me = std::process::id();
+        assert!(all.iter().any(|s| s.proc.pid == me));
     }
 
     #[tokio::test]

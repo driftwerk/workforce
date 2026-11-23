@@ -89,6 +89,7 @@ async fn desk(pool: workforce_postgres::PostgresPool, dir: &std::path::Path) -> 
             line_reach: workforce_desk::line::Reach::Group,
             memory: Default::default(),
             bosses: Default::default(),
+            sight: Default::default(),
         },
         Default::default(),
         tokio_util::sync::CancellationToken::new(),

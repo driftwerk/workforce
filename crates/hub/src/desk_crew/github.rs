@@ -21,6 +21,7 @@ use std::sync::Arc;
 
 use serde_json::{json, Value};
 use workforce_agent::tools::registry::ToolRegistry;
+use workforce_agent::tools::RateLimitedError;
 use workforce_common::settings::WorkforceConfig;
 
 use crate::vault::Vault;
@@ -153,6 +154,51 @@ pub(crate) fn pr_title(
     }
 }
 
+/// Why GitHub couldn't be read as the person.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum GithubError {
+    /// No key for this person, GitHub off for the boss, or a key GitHub
+    /// refuses ([`NOT_CONNECTED`]).
+    NotConnected,
+    /// GitHub refused it for its rate limit: not before `retry_after`, when
+    /// it says. `said` is what the boss is told.
+    RateLimited {
+        retry_after: Option<std::time::Duration>,
+        said: String,
+    },
+    /// Anything else, in the words the boss is told.
+    Other(String),
+}
+
+impl std::fmt::Display for GithubError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotConnected => f.write_str(NOT_CONNECTED),
+            Self::RateLimited { said, .. } | Self::Other(said) => f.write_str(said),
+        }
+    }
+}
+
+impl From<&str> for GithubError {
+    fn from(said: &str) -> Self {
+        Self::Other(said.to_string())
+    }
+}
+
+impl GithubError {
+    /// A failed call's error as the boss is told it, a rate limit kept apart.
+    fn of(error: &str, limited: Option<Option<u64>>) -> Self {
+        match (refused(error), limited) {
+            (said, _) if said == NOT_CONNECTED => Self::NotConnected,
+            (said, Some(secs)) => Self::RateLimited {
+                retry_after: secs.map(std::time::Duration::from_secs),
+                said,
+            },
+            (said, None) => Self::Other(said),
+        }
+    }
+}
+
 /// Runs the boss's GitHub read `name` with `input`, as the person in scope,
 /// through the adapter as `registry`'s agent's keys are pinned.
 pub(crate) async fn read(
@@ -162,8 +208,27 @@ pub(crate) async fn read(
     registry: &ToolRegistry,
     name: &str,
     input: &Value,
-) -> Result<Value, String> {
-    let (owner, repo) = owner_repo(input)?;
+) -> Result<Value, GithubError> {
+    let got = fetch(vault, global, config, registry, name, input).await?;
+    Ok(match name {
+        PR => pull(&got),
+        BRANCH => json!({ "pulls": fenced(&got["pulls"]) }),
+        CI if got.get("jobs").is_some() => run(&got),
+        _ => json!({ "runs": fenced(&got["runs"]) }),
+    })
+}
+
+/// What [`read`] reads, as the adapter answers it: nothing fenced, for
+/// Desk's own use of it.
+pub(crate) async fn fetch(
+    vault: Option<Arc<Vault>>,
+    global: Option<Arc<Vault>>,
+    config: &WorkforceConfig,
+    registry: &ToolRegistry,
+    name: &str,
+    input: &Value,
+) -> Result<Value, GithubError> {
+    let (owner, repo) = owner_repo(input).map_err(GithubError::Other)?;
     // Planned before anything is read: what it asks is checked first.
     let calls: Vec<(&str, Value)> = match name {
         PR => {
@@ -219,12 +284,7 @@ pub(crate) async fn read(
             keep_title(&person, &owner, &repo, n, title);
         }
     }
-    Ok(match name {
-        PR => pull(&got),
-        BRANCH => json!({ "pulls": fenced(&got["pulls"]) }),
-        CI if got.get("jobs").is_some() => run(&got),
-        _ => json!({ "runs": fenced(&got["runs"]) }),
-    })
+    Ok(got)
 }
 
 /// Where a GitHub read as the person finds their keys: the agent's vault,
@@ -242,14 +302,14 @@ pub(super) struct GithubAccess<'a> {
 pub(super) async fn calls_as_person(
     access: &GithubAccess<'_>,
     calls: Vec<(&str, Value)>,
-) -> Result<(String, Vec<Value>), String> {
+) -> Result<(String, Vec<Value>), GithubError> {
     // The person whose turn it is; none, nobody's key is read.
     let person = workforce_agent::runner::CURRENT_USER_ID
         .try_with(Clone::clone)
         .ok()
         .filter(|p| !p.is_empty() && p != workforce_agent::runner::SYSTEM_USER_ID);
     let (Some(person), Some(vault)) = (person, access.vault.clone()) else {
-        return Err(NOT_CONNECTED.into());
+        return Err(GithubError::NotConnected);
     };
     let skill = workforce_agent::runner::CURRENT_USER_ID.sync_scope(person.clone(), || {
         crate::skill_loader::github_skill_for(
@@ -260,7 +320,7 @@ pub(super) async fn calls_as_person(
         )
     });
     let Ok(skill) = skill else {
-        return Err(NOT_CONNECTED.into());
+        return Err(GithubError::NotConnected);
     };
     let tools = skill.tools();
     let mut out = Vec::new();
@@ -269,13 +329,19 @@ pub(super) async fn calls_as_person(
         let tool = tools
             .iter()
             .find(|t| t.name() == call)
-            .ok_or(NOT_CONNECTED)?;
-        let r = tool
-            .execute(args)
-            .await
-            .map_err(|e| refused(&format!("{e:#}")))?;
+            .ok_or(GithubError::NotConnected)?;
+        let r = tool.execute(args).await.map_err(|e| {
+            let limited = e
+                .chain()
+                .find_map(|e| e.downcast_ref::<RateLimitedError>())
+                .map(|l| l.retry_after_secs);
+            GithubError::of(&format!("{e:#}"), limited)
+        })?;
         if !r.success {
-            return Err(refused(r.error.as_deref().unwrap_or("it failed")));
+            return Err(GithubError::of(
+                r.error.as_deref().unwrap_or("it failed"),
+                r.rate_limited.map(|l| l.retry_after_secs),
+            ));
         }
         out.push(r.output);
     }
@@ -287,6 +353,16 @@ pub(super) async fn calls_as_person(
 pub(super) const NOT_FOUND: &str = "GitHub says there's no such pull request, run or repository \
     that the person's GitHub can see. Check the repo and number; if it's private, the person's \
     key may not reach it. Don't say it merged or passed.";
+
+/// A pull request's checks overall, as the boss is told them: none when
+/// they couldn't be read, `none yet` when none reported on its head.
+pub(crate) fn overall(checks: &Value) -> Option<&str> {
+    match checks["total"].as_u64() {
+        _ if checks.is_null() => None,
+        Some(0) => Some("none yet"),
+        _ => checks["overall"].as_str(),
+    }
+}
 
 /// What anyone can write on GitHub, fenced as data for the boss.
 fn fenced(v: &Value) -> Value {
@@ -413,13 +489,13 @@ fn run(r: &Value) -> Value {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use wiremock::matchers::{header, method, path, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
     use workforce_agent::runner::CURRENT_USER_ID;
 
-    struct Hub {
+    pub(in super::super) struct Hub {
         _dir: tempfile::TempDir,
         agent: Arc<Vault>,
         global: Arc<Vault>,
@@ -428,7 +504,7 @@ mod tests {
     }
 
     /// Ann and Bob each keep their own GitHub key; GitHub is `server`.
-    fn hub(server: &MockServer) -> Hub {
+    pub(in super::super) fn hub(server: &MockServer) -> Hub {
         let dir = tempfile::tempdir().unwrap();
         let agent = Arc::new(Vault::open(&dir.path().join("agent"), "k").unwrap());
         let global = Arc::new(Vault::open(&dir.path().join("global"), "k").unwrap());
@@ -463,11 +539,30 @@ mod tests {
                 Some(who) => CURRENT_USER_ID.scope(who.to_string(), call).await,
                 None => call.await,
             }
+            .map_err(|e| e.to_string())
+        }
+
+        /// What [`fetch`] reads as `who`.
+        pub(in super::super) async fn fetch(
+            &self,
+            who: &str,
+            name: &str,
+            input: Value,
+        ) -> Result<Value, GithubError> {
+            let call = fetch(
+                Some(Arc::clone(&self.agent)),
+                Some(Arc::clone(&self.global)),
+                &self.config,
+                &self.registry,
+                name,
+                &input,
+            );
+            CURRENT_USER_ID.scope(who.to_string(), call).await
         }
     }
 
     /// Nothing but reads ever reaches GitHub.
-    async fn no_writes(server: &MockServer) {
+    pub(in super::super) async fn no_writes(server: &MockServer) {
         for m in ["POST", "PUT", "PATCH", "DELETE"] {
             Mock::given(method(m))
                 .respond_with(ResponseTemplate::new(500))
@@ -715,6 +810,32 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(e, NOT_CONNECTED);
+    }
+
+    /// A rate limit is told apart, with when to try again, and the boss
+    /// is told it in the words it always was.
+    #[tokio::test]
+    async fn a_rate_limit_is_kept_apart_with_its_retry() {
+        let server = MockServer::start().await;
+        no_writes(&server).await;
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(429)
+                    .insert_header("retry-after", "120")
+                    .set_body_json(json!({"message": "API rate limit exceeded"})),
+            )
+            .mount(&server)
+            .await;
+        let h = hub(&server);
+        let input = json!({"repo": "driftwerk/workforce", "branch": "main"});
+        let e = h.fetch("ann", BRANCH, input.clone()).await.unwrap_err();
+        assert!(
+            matches!(&e, GithubError::RateLimited { retry_after: Some(d), .. } if d.as_secs() == 120),
+            "{e:?}"
+        );
+        let said = h.read(Some("ann"), BRANCH, input).await.unwrap_err();
+        assert_eq!(said, e.to_string());
+        assert!(said.starts_with("GitHub couldn't be read: "), "{said}");
     }
 
     /// The system's turn is no person's: nothing is read as anyone.

@@ -17,7 +17,7 @@ use super::watcher::reported;
 use crate::serve::AgentService;
 
 /// What every boss turn is told of the summaries it reads.
-pub(super) const CHECK_FIRST: &str = "Desk marks a summary STALE, with why, when it can't be relied on. Never tell anyone that something has or hasn't happened (a run started, a PR merged, a release went out) on the strength of a STALE summary: check it first (crew.account, crew.ask_session, or your GitHub tools) and say where you checked.";
+pub(super) const CHECK_FIRST: &str = "Desk marks a summary STALE, with why, when it can't be relied on. Never tell anyone that something has or hasn't happened (a run started, a PR merged, a release went out) on the strength of a STALE summary: check it first (crew.inside, crew.account or your GitHub tools; crew.ask_session only when they can't tell) and say where you checked.";
 
 /// The same, for a focused call (a decision, an answer, an idle step),
 /// which has no tools to check with.

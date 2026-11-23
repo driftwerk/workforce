@@ -38,6 +38,7 @@ use uuid::Uuid;
 use workforce_common::oversight::{Level, Oversight};
 use workforce_desk::board::TicketState;
 use workforce_desk::charge::How;
+use workforce_desk::crew::PartyKind;
 use workforce_desk::model::{Origin, SessionState};
 use workforce_desk::open_item::{NewItem, OpenKind};
 use workforce_desk::open_item_store::Opened;
@@ -45,7 +46,7 @@ use workforce_desk::plan::PlanState;
 use workforce_desk::{DeskError, PlanDetail, PlanTicketView};
 
 use super::actions::{Action, Gate, Target};
-use super::closing::Pull;
+use super::github_seen::Pull;
 use super::{AgentService, CrewHub};
 
 /// What a session started again is told first.
@@ -244,7 +245,13 @@ impl CrewHub {
             // One on a machine is the machine's to say: in Doing, it may be
             // at work there.
             if t.machine.is_some() || t.starting {
-                busy |= t.starting || ticket.state == TicketState::Doing;
+                let stalled = ticket
+                    .assignee
+                    .as_ref()
+                    .filter(|a| ticket.state == TicketState::Doing && a.kind == PartyKind::Session)
+                    .and_then(|a| self.stall_of(&a.id, o))
+                    .is_some_and(|seen| self.stuck_on(p, ticket.id, &key, &seen, &mut stuck));
+                busy |= !stalled && (t.starting || ticket.state == TicketState::Doing);
                 continue;
             }
             if ticket.state == TicketState::Todo && t.ticket.ready {
@@ -278,13 +285,22 @@ impl CrewHub {
                 .as_ref()
                 .map_or(ticket.state_at, |v| v.updated_at.max(ticket.state_at));
             let rested = now - since >= grace;
+            // What Desk sees inside it says it is stuck, however busy it
+            // looks.
+            let stalled = view
+                .as_ref()
+                .filter(|_| ticket.state == TicketState::Doing)
+                .and_then(|v| self.stall_of(&v.id.to_string(), o))
+                .is_some_and(|seen| self.stuck_on(p, ticket.id, &key, &seen, &mut stuck));
             // At work, whoever runs it: the plan moves.
-            if view.as_ref().is_some_and(|v| {
-                matches!(
-                    v.state,
-                    SessionState::Working | SessionState::Starting | SessionState::Blocked
-                )
-            }) {
+            if !stalled
+                && view.as_ref().is_some_and(|v| {
+                    matches!(
+                        v.state,
+                        SessionState::Working | SessionState::Starting | SessionState::Blocked
+                    )
+                })
+            {
                 busy = true;
             }
             let ours = self.bosss_ticket(boss, session, view.is_none());
@@ -292,7 +308,7 @@ impl CrewHub {
                 .as_ref()
                 .is_some_and(|v| v.live && v.state != SessionState::Closed);
             match stands(ticket.state, session, view.as_ref(), ours, rested) {
-                Stands::Busy => busy = true,
+                Stands::Busy => busy |= !stalled,
                 Stands::Fine if ticket.state == TicketState::Doing && !runs => {
                     stuck.push(format!("{key} is in Doing with no session"));
                 }
@@ -327,6 +343,33 @@ impl CrewHub {
             }
         }
         self.say_stall(boss, o, p, busy, &stuck, now).await;
+    }
+
+    /// What Desk sees inside ticket `key`'s session (`seen`: its glance and
+    /// stall), its boss's plan turn told once until the evidence changes:
+    /// whether it is stuck, then said with the plan's stall. One only to
+    /// look at isn't.
+    fn stuck_on(
+        &self,
+        p: &PlanDetail,
+        ticket: Uuid,
+        key: &str,
+        (glance, stall): &(workforce_desk::sight::Glance, workforce_desk::sight::Stall),
+        stuck: &mut Vec<String>,
+    ) -> bool {
+        let who = format!("{key}'s session");
+        let once = super::inside::evidence_key(&ticket.to_string(), glance, stall);
+        if self.plan_watch.lock().done.insert(once) {
+            self.wake_plan(
+                p.summary.plan.id,
+                super::inside::evidence_line(&who, glance, stall),
+            );
+        }
+        let stuck_by = !super::inside::only_looks(glance, stall);
+        if stuck_by {
+            stuck.push(format!("{who} {}", stall.words));
+        }
+        stuck_by
     }
 
     /// Ticket `key` is in Doing with its session gone: its boss puts it

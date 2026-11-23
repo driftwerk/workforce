@@ -1119,6 +1119,17 @@ pub fn tail_chars(text: &str, max: usize) -> &str {
         .map_or("", |(at, _)| &text[at..])
 }
 
+/// The whole lines in the last `max` characters of `text`: a line the cut
+/// splits is left out, so each line kept is as it was written.
+pub fn tail_lines(text: &str, max: usize) -> &str {
+    let tail = tail_chars(text, max);
+    let cut = &text[..text.len() - tail.len()];
+    match cut.is_empty() || cut.ends_with('\n') {
+        true => tail,
+        false => tail.split_once('\n').map_or("", |(_, rest)| rest),
+    }
+}
+
 /// The question a reply ends on, to the person: its last sentence when that
 /// asks something. Code blocks and trailing sign-offs are not questions.
 pub fn question_in(reply: &str) -> Option<String> {
@@ -1353,6 +1364,18 @@ pub fn session_state(state: SessionState) -> ItemState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_tail_of_whole_lines_never_keeps_the_line_its_cut_splits() {
+        let text = "token SECRET-abcdef\nrbuild: busy\ndone";
+        assert_eq!(tail_lines(text, 20), "rbuild: busy\ndone");
+        assert_eq!(tail_lines(text, 17), "rbuild: busy\ndone");
+        assert_eq!(tail_lines(text, 16), "done");
+        assert_eq!(tail_lines(text, 100), text);
+        assert_eq!(tail_lines("one\ntwo", 3), "two", "a cut at a line's start");
+        assert_eq!(tail_lines("one very long line", 5), "");
+        assert_eq!(tail_lines("", 5), "");
+    }
 
     #[test]
     fn an_agent_is_shown_by_its_own_name_and_never_by_its_id() {
