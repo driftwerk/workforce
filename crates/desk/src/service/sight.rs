@@ -34,6 +34,9 @@ const SCREEN_CHARS: usize = 4000;
 const BORN_KEPT: usize = 64;
 /// The most of a task output file read in one pass.
 const TASK_TAIL: u64 = 64 * 1024;
+/// How much of a task output file's end is read for whether its command
+/// ended.
+const END_TAIL: u64 = 512;
 /// The tool whose calls write their output to a task output file.
 const SHELL_TOOL: &str = sight_procs::SHELL_TOOL;
 /// The most rows a process tree shows.
@@ -214,6 +217,11 @@ struct Tracked {
     lines: Vec<String>,
     /// Whether its last line says its command ended.
     ended: bool,
+    /// Whether its command is over, as last sampled: its last line says it
+    /// ended and no shell of the process list was placed for it. A command
+    /// that prints such a line, or shows another's file, isn't over while
+    /// its own shell lives ([`mark_over`]).
+    over: bool,
 }
 
 impl Tracked {
@@ -225,6 +233,7 @@ impl Tracked {
             read_to,
             lines: Vec::new(),
             ended: false,
+            over: false,
         }
     }
 }
@@ -467,15 +476,37 @@ fn first_read(folder: &TaskFolder, path: &Path) -> Option<Tracked> {
     Some(Tracked::from(path.to_path_buf(), meta.created().ok(), from))
 }
 
-/// Whether the output file at `path` says its command ended.
+/// Whether the output file at `path` says its command ended, by its last
+/// line in its last [`END_TAIL`] bytes.
 fn has_ended(path: &Path) -> bool {
-    read_on(Tracked::from(path.to_path_buf(), None, 0), None)
-        .0
-        .ended
+    let mut raw = Vec::new();
+    let read = std::fs::File::open(path).and_then(|mut f| {
+        let len = f.metadata()?.len();
+        f.seek(SeekFrom::Start(len.saturating_sub(END_TAIL)))?;
+        f.read_to_end(&mut raw)
+    });
+    read.is_ok()
+        && String::from_utf8_lossy(&raw)
+            .lines()
+            .rev()
+            .find(|l| !l.trim().is_empty())
+            .is_some_and(says_ended)
+}
+
+/// Marks each of `outputs` over whose last line says its command ended
+/// while no shell is `placed` for it; one whose shell lives isn't, and one
+/// never placed in a shell goes by its line alone.
+fn mark_over<'a>(
+    outputs: impl IntoIterator<Item = &'a mut Output>,
+    placed: &HashMap<String, &Stat>,
+) {
+    for (id, t) in outputs {
+        t.over = t.ended && !placed.contains_key(id.as_str());
+    }
 }
 
 /// The output file open call `c` writes to: the one it was read from
-/// before (`held`) while that hasn't ended, its own not ending while it is
+/// before (`held`) while that isn't over, its own not ending while it is
 /// open (one that has was another call's, taken while `c` waited on the
 /// person), else [`call_file`]'s.
 fn call_output_of(
@@ -485,7 +516,7 @@ fn call_output_of(
     shells: &[PathBuf],
     held: Option<Tracked>,
 ) -> Option<Tracked> {
-    held.filter(|t| !t.ended)
+    held.filter(|t| !t.over)
         .or_else(|| call_file(c, claims, folder, shells))
 }
 
@@ -508,10 +539,12 @@ fn call_file(
             .filter(|(id, _)| *id != call.id)
             .map(|(id, since)| (id.as_str(), *since)),
     );
+    let earliest = calls.clone().map(|(_, since)| since).min()?;
     let free: Vec<&(PathBuf, SystemTime)> = folder
         .born
         .iter()
-        .filter(|(p, _)| !shells.contains(p) && !has_ended(p))
+        .filter(|(p, made)| to_utc(*made) >= earliest - sight_procs::SKEW && !shells.contains(p))
+        .filter(|(p, _)| !has_ended(p))
         .collect();
     let mut pairs: Vec<(chrono::Duration, &str, &PathBuf)> = calls
         .flat_map(|(id, since)| {
@@ -599,17 +632,26 @@ fn read_files(
             .find(|(held, _)| held == id)
             .map(|(_, t)| t.clone())
     };
+    // A file read before is read on from where it was, whatever it was
+    // read for: its old lines are never new again.
+    let known = |t: Tracked| {
+        prev.into_iter()
+            .flat_map(|p| p.call_output.iter().chain(&p.shells))
+            .find(|(_, k)| k.path == t.path)
+            .map_or(t, |(_, k)| k.clone())
+    };
     let call_output = open_call
         .as_ref()
         .filter(|c| c.tool == SHELL_TOOL)
         .and_then(|c| {
             let t = call_output_of(c, &claims, &folder, &shell_paths, held(&c.id))?;
+            let t = known(t);
             Some((c.id.clone(), t))
         });
     let shells: Vec<Output> = shells
         .into_iter()
         .filter_map(|(id, path)| {
-            let t = held(id).or_else(|| first_read(&folder, &path))?;
+            let t = held(id).or_else(|| first_read(&folder, &path).map(known))?;
             Some((id.clone(), t))
         })
         .collect();
@@ -822,7 +864,7 @@ impl Desk {
             let ended: Vec<&str> = s
                 .shells
                 .iter()
-                .filter(|(_, t)| t.ended)
+                .filter(|(_, t)| t.over)
                 .map(|(shell, _)| shell.as_str())
                 .collect();
             if !ended.is_empty() {
@@ -876,7 +918,7 @@ impl Desk {
                     .collect()
             })
             .unwrap_or_default();
-        let files = {
+        let mut files = {
             let desk = self.clone();
             let record = d.record.clone();
             let shells = d.shells.clone();
@@ -930,6 +972,10 @@ impl Desk {
         let listed = table.map_or(now, |(_, at)| at);
         let call_born = files.call_output.as_ref().and_then(|(_, t)| t.born);
         let placed = sight_procs::placed(&refs, files.open_call.as_ref(), call_born, &born, listed);
+        mark_over(
+            files.call_output.iter_mut().chain(&mut files.shells),
+            &placed,
+        );
         let busy = |id: &str| {
             prev.zip(placed.get(id)).is_some_and(|(p, head)| {
                 sight_procs::active(&p.runs, &sight_procs::subtree(&refs, head))
@@ -1343,10 +1389,13 @@ mod tests {
         std::fs::write(&sub, "ok\n[exited with code 0]\n").unwrap();
         assert!(call_output_of(&call, &main_only, &sub_open, &[], None).is_none());
         let taken = read_on(first_read(&sub_open, &sub).unwrap(), None).0;
-        assert!(taken.ended);
+        let mut taken = [(call.id.clone(), taken)];
+        mark_over(taken.iter_mut(), &HashMap::new());
+        let [(_, taken)] = taken;
+        assert!(taken.over, "its shell gone with it");
         assert!(
             call_output_of(&call, &main_only, &sub_open, &[], Some(taken)).is_none(),
-            "one held that ended is let go"
+            "one held that is over is let go"
         );
         // T2: approved, its own shell starts and its file is made.
         let wait = "rbuild: all 3 build slots are busy; waiting for one";
@@ -1386,6 +1435,95 @@ mod tests {
             Some(120),
             "its own shell"
         );
+    }
+
+    /// A tool shell `pid`, run `ran` seconds.
+    fn tool_shell(pid: u32, ran: u64) -> Stat {
+        Stat {
+            proc: procs::Proc {
+                pid,
+                ppid: 1,
+                args: "/bin/zsh -c source /h/.claude/shell-snapshots/snapshot-zsh-1.sh && eval 'x'"
+                    .into(),
+            },
+            state: 'S',
+            foreground: false,
+            elapsed_secs: ran,
+            cpu_secs: 0,
+            rss_kb: 1000,
+        }
+    }
+
+    #[test]
+    fn a_call_that_prints_an_end_and_works_on_keeps_its_file_until_its_shell_is_gone() {
+        let dir = tempfile::tempdir().unwrap();
+        let at = |s| SystemTime::UNIX_EPOCH + Duration::from_secs(s);
+        let own = dir.path().join("f1.output");
+        let call = OpenCall {
+            id: "toolu_main".into(),
+            tool: "Bash".into(),
+            input: String::new(),
+            since: to_utc(at(1000)),
+        };
+        let claims = [("toolu_main".to_string(), call.since)];
+        let folder = TaskFolder {
+            path: dir.path().to_path_buf(),
+            first: at(0),
+            changed: at(0),
+            names: HashSet::new(),
+            born: vec![(own.clone(), at(1000))],
+        };
+        let shell = tool_shell(120, 30);
+        let lives = HashMap::from([("toolu_main".to_string(), &shell)]);
+        let redactor = redactor_for_tests();
+        let pass = |held: Option<Tracked>, placed: &HashMap<String, &Stat>| {
+            let t = call_output_of(&call, &claims, &folder, &[], held)?;
+            let (t, new) = read_on(t, Some(redactor.as_ref()));
+            let mut out = [("toolu_main".to_string(), t)];
+            mark_over(out.iter_mut(), placed);
+            let [(_, t)] = out;
+            Some((t, new))
+        };
+        std::fs::write(&own, "working\n").unwrap();
+        let (t, _) = pass(None, &lives).unwrap();
+        // Its command prints an end, as `echo` or `tail` of another's file
+        // would, and works on.
+        std::fs::write(&own, "working\n[exited with code 0]\n").unwrap();
+        let (t, _) = pass(Some(t), &lives).unwrap();
+        assert!(t.ended && !t.over, "its shell lives: not over");
+        std::fs::write(&own, "working\n[exited with code 0]\nstill going\n").unwrap();
+        let (t, new) = pass(Some(t), &lives).unwrap();
+        assert_eq!(t.path, own, "its file kept");
+        assert_eq!(new, ["still going"], "none of its old lines new again");
+        // It truly ends: its line last and its shell gone.
+        std::fs::write(
+            &own,
+            "working\n[exited with code 0]\nstill going\n[exited with code 0]\n",
+        )
+        .unwrap();
+        let (t, _) = pass(Some(t), &lives).unwrap();
+        assert!(!t.over);
+        let (t, _) = pass(Some(t), &HashMap::new()).unwrap();
+        assert!(t.over, "over once its shell is gone");
+        assert!(pass(Some(t), &HashMap::new()).is_none(), "and let go");
+    }
+
+    #[test]
+    fn a_background_shell_that_prints_an_end_is_over_only_once_its_process_is_gone() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("b1.output");
+        std::fs::write(&path, "cat other.output\n[exited with code 0]\n").unwrap();
+        let (t, _) = read_on(unread(&path), None);
+        assert!(t.ended);
+        let shell = tool_shell(110, 30);
+        let mut shells = vec![("b1".to_string(), t)];
+        mark_over(&mut shells, &HashMap::from([("b1".to_string(), &shell)]));
+        assert!(!shells[0].1.over, "still counted while its process lives");
+        mark_over(&mut shells, &HashMap::new());
+        assert!(shells[0].1.over, "a real end, its process gone");
+        let mut never_placed = vec![("b2".to_string(), read_on(unread(&path), None).0)];
+        mark_over(&mut never_placed, &HashMap::new());
+        assert!(never_placed[0].1.over, "one never placed goes by its line");
     }
 
     #[test]
