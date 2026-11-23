@@ -6810,11 +6810,20 @@ async fn a_long_agent_message_is_listed_cut_and_read_whole_by_its_id() {
         .await;
         let history = overseer.tools.get("crew.history").unwrap();
         let listed = history.execute(json!({"agent_id": "scout"})).await.unwrap();
-        let shown = listed.output["messages"].to_string();
+        let shown = listed.output["messages"].as_str().unwrap();
         assert!(shown.contains("Module 010 checked"), "{shown}");
         assert!(!shown.contains("Module 250 checked"), "{shown}");
         let id = dm.messages.last().unwrap().id.clone();
-        assert!(shown.contains(&format!("dm_id: {id}")), "{shown}");
+        assert!(
+            shown.contains(&format!(
+                "[cut: its first 1499 of 5999 characters shown. Read it whole with crew.history (agent_id: scout, dm_id: {id}).]"
+            )),
+            "{shown}"
+        );
+        assert!(
+            !shown.contains(&dm.messages[0].id) && !shown.contains("\"id\""),
+            "only a cut message is named, by its note: {shown}"
+        );
         let whole = history
             .execute(json!({"agent_id": "scout", "dm_id": id}))
             .await

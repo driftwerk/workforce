@@ -495,7 +495,7 @@ impl CrewTool {
                 )
                 .map_err(|e| e.to_string())?;
                 crate::desk_conversations::with_authors(&crew.desk, &mut page).await;
-                let said = |m: &workforce_desk::conversations::Said, text: String| json!({ "id": m.id, "from": m.from, "author": m.author, "text": text, "at": m.at });
+                let said = |m: &workforce_desk::conversations::Said, text: String| json!({ "from": m.from, "author": m.author, "text": text, "at": m.at });
                 let messages = match dm {
                     Some(dm) => {
                         let m = page.messages.iter().find(|m| m.id == dm).ok_or(
@@ -1164,10 +1164,13 @@ const DM_LOOKBACK: usize = 100;
 fn dm_text(agent: &str, id: &str, text: &str) -> String {
     let total = text.trim().chars().count();
     match total > DM_CHARS {
-        true => format!(
-            "{}\n[cut: its first {DM_CHARS} of {total} characters shown. Read it whole with crew.history (agent_id: {agent}, dm_id: {id}).]",
-            crew::clip(text, DM_CHARS)
-        ),
+        true => {
+            let kept = crew::clip(text, DM_CHARS);
+            format!(
+                "{kept}\n[cut: its first {} of {total} characters shown. Read it whole with crew.history (agent_id: {agent}, dm_id: {id}).]",
+                kept.trim_end_matches('…').chars().count()
+            )
+        }
         false => text.to_string(),
     }
 }

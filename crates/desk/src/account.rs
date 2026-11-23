@@ -471,13 +471,16 @@ fn safe(s: &str, max: usize) -> String {
 /// [`safe`] for what a session said, which says when it was cut: a reader
 /// never takes part of a reply for the whole of it.
 fn spoken(s: &str, max: usize) -> String {
-    let total = flat(s).chars().count();
+    let s = flat(s);
+    let total = s.chars().count();
+    let kept = clip(&s, max);
     match total > max {
         true => format!(
-            "{} [cut: only its first {max} of {total} characters are here]",
-            safe(s, max)
+            "{} [cut: only its first {} of {total} characters are here]",
+            defanged(&kept),
+            kept.trim_end_matches('…').chars().count()
         ),
-        false => safe(s, max),
+        false => defanged(&kept),
     }
 }
 
@@ -1382,11 +1385,9 @@ mod tests {
             &Tail::default(),
             "n0nce",
         );
-        let total = flat(&long).chars().count();
+        assert_eq!(REPLY_CHARS, 1500);
         assert!(
-            p.contains(&format!(
-                "[cut: only its first {REPLY_CHARS} of {total} characters are here]"
-            )),
+            p.contains("[cut: only its first 1500 of 3199 characters are here]"),
             "{p}"
         );
         assert!(p.contains("Replied: Done.\n"), "a whole one says nothing");
