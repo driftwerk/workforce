@@ -1462,7 +1462,7 @@ async fn said_only(llm: &wiremock::MockServer, marker: &str, times: usize) {
 }
 
 /// `usd` spent by `session` now on a paid key, and the budgets counted again.
-async fn spent(d: &Desk, session: uuid::Uuid, usd: f64) {
+pub(super) async fn spent(d: &Desk, session: uuid::Uuid, usd: f64) {
     use workforce_desk::ledger::{Billing, Priced, Spend, Tokens};
     use workforce_desk::ledger_store::Kept;
     d.store()

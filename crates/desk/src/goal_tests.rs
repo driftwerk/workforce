@@ -800,12 +800,18 @@ fn a_goal_wakes_its_boss_once_a_spell_of_its_leading_stall_with_every_part() {
     said.tell(&first);
     assert!(!wakes(&first, &said), "once a spell");
     let both = [stall(0, 3, 0), stall(1, 0, 0)];
-    assert!(!wakes(&both, &said), "CI crossing its first window rides the next wake");
+    assert!(
+        !wakes(&both, &said),
+        "CI crossing its first window rides the next wake"
+    );
     let next = [stall(0, 3, 0), stall(1, 0, 1)];
     assert_eq!(leading(&next), Some(&next[1]));
     assert!(wakes(&next, &said));
     said.tell(&next);
-    assert!(!wakes(&[stall(0, 3, 1), stall(1, 0, 1)], &said), "CI's spell 1 waits for the leader's");
+    assert!(
+        !wakes(&[stall(0, 3, 1), stall(1, 0, 1)], &said),
+        "CI's spell 1 waits for the leader's"
+    );
     // The judged part shown: CI leads, at a spell already said.
     assert!(!wakes(&[stall(0, 3, 0)], &said));
     assert!(wakes(&[stall(0, 3, 1)], &said));

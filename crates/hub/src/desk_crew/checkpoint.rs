@@ -161,7 +161,10 @@ async fn found_on_goal(
 ) -> Vec<Found> {
     let pull = |repo: &str, n: u64| {
         goal::github_repo(repo).map(|(owner, name)| {
-            ("github.get_pull", json!({ "owner": owner, "repo": name, "number": n }))
+            (
+                "github.get_pull",
+                json!({ "owner": owner, "repo": name, "number": n }),
+            )
         })
     };
     let mut goal_pulls: Vec<(String, u64)> = refs.pulls.iter().cloned().collect();
@@ -406,8 +409,9 @@ mod tests {
             .starts_with("Desk can't look up the goal's branch to place Commit d05e8a4"));
         assert!(not_shown_line(&NotShown::Missing(commit), &refs)
             .contains("isn't on GitHub as it says"));
-        assert!(not_shown_line(&NotShown::NothingNew, &refs)
-            .contains("shown toward this part already"));
+        assert!(
+            not_shown_line(&NotShown::NothingNew, &refs).contains("shown toward this part already")
+        );
         let none = GoalRefs::default();
         assert_eq!(
             not_shown_line(&NotShown::Nothing, &none),

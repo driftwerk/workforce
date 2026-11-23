@@ -17,7 +17,7 @@ use workforce_desk::crew::Party;
 use workforce_desk::goal::{GoalResult, Measure, Per, Want};
 use workforce_desk::line::{LineKind, LineMessage};
 use workforce_desk::model::SessionView;
-use workforce_desk::plan::{Draft, DraftTicket, Paused, PlanState};
+use workforce_desk::plan::{Draft, DraftTicket, Paused, PlanBudget, PlanState};
 use workforce_desk::{NewBoard, NewPlan, NewTicket};
 
 /// Act, watching, with a stall window of `minutes` crew minutes (a tenth of
@@ -55,8 +55,10 @@ async fn mantis_reads(
     gh.reset().await;
     let stamp = |m: i64| (from + chrono::Duration::minutes(m)).to_rfc3339();
     let conclusion = if minutes <= 5 { "success" } else { "failure" };
+    // New runs when CI changes: a finished run's jobs never do.
     let runs: Vec<Value> = [9u64, 8, 7]
         .iter()
+        .map(|id| id + 100 * minutes.unsigned_abs())
         .enumerate()
         .map(|(i, id)| {
             let start = 30 * (2 - i as i64);
@@ -124,6 +126,16 @@ pub(super) async fn goal_running(
     folder: &Path,
     r: GoalResult,
 ) -> (uuid::Uuid, SessionView) {
+    goal_capped(d, folder, r, None).await
+}
+
+/// [`goal_running`], capped at `budget`.
+async fn goal_capped(
+    d: &Desk,
+    folder: &Path,
+    r: GoalResult,
+    budget: Option<PlanBudget>,
+) -> (uuid::Uuid, SessionView) {
     let board = d
         .create_board(NewBoard {
             name: "Mantis".into(),
@@ -162,7 +174,7 @@ pub(super) async fn goal_running(
                 parallel: None,
                 engine: Engine::Claude,
                 group: None,
-                budget: None,
+                budget,
                 result: Some(r),
                 goal_ticket: None,
             },
@@ -248,7 +260,10 @@ async fn a_met_reading_closes_the_goal_and_ends_its_plans_watches_without_a_word
         let met = p.summary.plan.met.clone().expect("met");
         assert!(met.why.starts_with("it reads met:"), "{met:?}");
         let ticket = p.summary.plan.goal_ticket.expect("its ticket");
-        assert_eq!(d.ticket(ticket).await.unwrap().ticket.state, TicketState::Done);
+        assert_eq!(
+            d.ticket(ticket).await.unwrap().ticket.state,
+            TicketState::Done
+        );
         assert_eq!(asked_after(&llm, CLOSING, 800).await, 1, "one closing turn");
         assert!(d
             .store()
@@ -280,10 +295,19 @@ async fn a_goal_met_while_the_person_paused_it_is_closed_once_they_resume_it() {
             d.plan(id).await.ok()?.summary.plan.met.map(|_| ())
         })
         .await;
-        assert_eq!(asked_after(&llm, CLOSING, 800).await, 0, "no turn while paused");
-        assert_eq!(d.plan(id).await.unwrap().summary.plan.state, PlanState::Paused);
+        assert_eq!(
+            asked_after(&llm, CLOSING, 800).await,
+            0,
+            "no turn while paused"
+        );
+        assert_eq!(
+            d.plan(id).await.unwrap().summary.plan.state,
+            PlanState::Paused
+        );
 
-        d.resume_plan(id, &[Paused::Person], &By::you()).await.unwrap();
+        d.resume_plan(id, &[Paused::Person], &By::you())
+            .await
+            .unwrap();
         eventually("closed once it runs", async || {
             (d.plan(id).await.ok()?.summary.plan.state == PlanState::Done).then_some(())
         })
@@ -300,7 +324,9 @@ async fn a_goal_the_person_paused_is_read_and_wakes_no_one_one_paused_for_budget
         let base = std::fs::canonicalize(dir.path()).unwrap();
         let gh = mantis(chrono::Utc::now(), 22, "diverged").await;
         let (_, crew, d, llm) = boss_on(&base, pool, &checking(5), &gh).await;
-        let (id, s) = goal_running(&d, &base, fast_ci(false)).await;
+        d.count_budgets_in(chrono_tz::UTC);
+        let budget = PlanBudget::usd(10.0);
+        let (id, s) = goal_capped(&d, &base, fast_ci(false), Some(budget)).await;
         turn_ends(&d, &base, &s, "Done for now.").await;
         d.pause_plan(id, Paused::Person, &By::you()).await.unwrap();
         eventually("the paused goal read", async || {
@@ -317,13 +343,12 @@ async fn a_goal_the_person_paused_is_read_and_wakes_no_one_one_paused_for_budget
         d.resume_plan(id, &[Paused::Person], &By::you())
             .await
             .unwrap();
-        d.pause_plan(
-            id,
-            Paused::Budget,
-            &By::desk("Its budget is at its warning."),
-        )
-        .await
-        .unwrap();
+        super::plans::spent(&d, s.id, 8.5).await;
+        eventually("paused at its budget's warning", async || {
+            let p = d.plan(id).await.ok()?.summary.plan;
+            (p.paused == Some(Paused::Budget)).then_some(())
+        })
+        .await;
         eventually("a budget pause woken, said as one", async || {
             (asked_with(&llm, &[STALLED, CI, "paused at its budget"]).await > 0).then_some(())
         })
@@ -356,7 +381,10 @@ async fn a_boss_message_held_from_a_goals_session_wakes_its_boss_once() {
         })
         .await;
         assert_eq!(asked_after(&llm, &undelivered, 1000).await, 1, "told once");
-        assert!(crew.goal_checked_sessions().await.contains(&s.id.to_string()));
+        assert!(crew
+            .goal_checked_sessions()
+            .await
+            .contains(&s.id.to_string()));
     })
     .await;
 }
@@ -370,7 +398,10 @@ async fn a_part_read_failing_six_times_in_a_row_wakes_its_boss_once() {
         mantis_reads(&gh, chrono::Utc::now(), 22, "ahead", 503).await;
         let (_, _, d, llm) = boss_on(&base, pool, &checking(1440), &gh).await;
         let (id, _) = goal_running(&d, &base, fast_ci(false)).await;
-        let failing = ["Desk can't read the goal's CI on main of acme/mantis", "reads in a row"];
+        let failing = [
+            "Desk can't read the goal's CI on main of acme/mantis",
+            "reads in a row",
+        ];
         eventually("six reads failed", async || {
             let p = d.plan(id).await.ok()?.goal?;
             (p.parts.first()?.failing >= 6).then_some(())
@@ -385,7 +416,11 @@ async fn a_part_read_failing_six_times_in_a_row_wakes_its_boss_once() {
             (p.parts.first()?.failing >= 7).then_some(())
         })
         .await;
-        assert_eq!(asked_after(&llm, &failing, 300).await, 1, "once a run of failures");
+        assert_eq!(
+            asked_after(&llm, &failing, 300).await,
+            1,
+            "once a run of failures"
+        );
         assert_eq!(asked_with(&llm, &[STALLED]).await, 0);
     })
     .await;
@@ -431,7 +466,9 @@ async fn a_goal_whose_session_is_gone_still_stalls() {
         let gh = mantis(chrono::Utc::now(), 22, "diverged").await;
         let (_, _, d, llm) = boss_on(&base, pool, &checking(5), &gh).await;
         let (_, s) = goal_running(&d, &base, fast_ci(false)).await;
-        d.remove(s.id, workforce_desk::Removal::default()).await.unwrap();
+        d.remove(s.id, workforce_desk::Removal::default())
+            .await
+            .unwrap();
         eventually("its boss woken: the session gone", async || {
             (asked_with(&llm, &[STALLED, CI]).await > 0).then_some(())
         })
@@ -447,14 +484,16 @@ async fn what_a_goals_boss_was_told_is_told_once_across_a_restart() {
         let base = std::fs::canonicalize(dir.path()).unwrap();
         let gh = mantis(chrono::Utc::now(), 22, "diverged").await;
         let stop = CancellationToken::new();
-        let (overseer, _, d, llm) =
-            boss_until(&base, pool, &checking(20), &gh, stop.clone()).await;
+        let (overseer, _, d, llm) = boss_until(&base, pool, &checking(20), &gh, stop.clone()).await;
         let (id, _) = goal_running(&d, &base, fast_ci(false)).await;
         eventually("its first spell said", async || {
             (asked_with(&llm, &[STALLED, CI]).await > 0).then_some(())
         })
         .await;
-        let read = d.plan(id).await.unwrap().goal.unwrap().parts[0].newest.clone().unwrap();
+        let read = d.plan(id).await.unwrap().goal.unwrap().parts[0]
+            .newest
+            .clone()
+            .unwrap();
         stop.cancel();
         let _crew = CrewHub::start(
             hub(std::slice::from_ref(&overseer)),

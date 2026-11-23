@@ -670,7 +670,11 @@ impl GoalRefs {
         branches
             .into_iter()
             .map(|(repo, b)| format!("{b} of {repo}"))
-            .chain(pulls.into_iter().map(|(repo, n)| format!("PR #{n} of {repo}")))
+            .chain(
+                pulls
+                    .into_iter()
+                    .map(|(repo, n)| format!("PR #{n} of {repo}")),
+            )
             .collect::<Vec<_>>()
             .join(", ")
     }

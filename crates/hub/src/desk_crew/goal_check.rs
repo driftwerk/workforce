@@ -408,7 +408,9 @@ impl CrewHub {
     ) -> Option<Looked> {
         let detail = self.desk.plan(id).await.ok()?;
         let sessions = plan_sessions(&detail);
-        let lines = self.goal_lines(service, o, detail.clone(), &sessions, waiting).await;
+        let lines = self
+            .goal_lines(service, o, detail.clone(), &sessions, waiting)
+            .await;
         Some(Looked {
             boss: detail.summary.plan.boss,
             plan: id,
@@ -460,7 +462,12 @@ impl CrewHub {
             }
         };
         let window = minute * o.work.stall_minutes as i32;
-        let stalls = goal::stalls(&progress, plan.agreed_at.unwrap_or(plan.created_at), now, window);
+        let stalls = goal::stalls(
+            &progress,
+            plan.agreed_at.unwrap_or(plan.created_at),
+            now,
+            window,
+        );
         let mut told = said.clone();
         let mut lines = self.stall_lines(o, &detail, &stalls, sessions, now, &mut told);
         lines.extend(self.undelivered_lines(plan, sessions, waiting, window, now, &mut told));
@@ -531,7 +538,12 @@ impl CrewHub {
             .filter_map(|(n, p)| {
                 let why = p.newest.as_ref().and_then(|r| r.failed.as_deref());
                 let since = p.failing_since.or(p.newest.as_ref().map(|r| r.at))?;
-                let line = failing_line(plan.id, &r.parts[n], p.failing, why.unwrap_or("it couldn't be read"));
+                let line = failing_line(
+                    plan.id,
+                    &r.parts[n],
+                    p.failing,
+                    why.unwrap_or("it couldn't be read"),
+                );
                 Some((u16::try_from(n).ok()?, since, line))
             })
             .collect();
@@ -547,7 +559,15 @@ impl CrewHub {
                         told.failing.insert(s.part, *since);
                         line.clone()
                     }
-                    None => stall_line(&plan.goal, &r.parts[n], &progress.parts[n], now - s.since, tz, &seen, &refs),
+                    None => stall_line(
+                        &plan.goal,
+                        &r.parts[n],
+                        &progress.parts[n],
+                        now - s.since,
+                        tz,
+                        &seen,
+                        &refs,
+                    ),
                 });
             }
             told.tell(stalls);
@@ -606,7 +626,9 @@ impl CrewHub {
                     return None;
                 }
                 let why = match session.split_once('/') {
-                    Some((machine, _)) => format!("it runs on {machine}, where Desk can't see why it waits"),
+                    Some((machine, _)) => {
+                        format!("it runs on {machine}, where Desk can't see why it waits")
+                    }
                     None => {
                         let local: Uuid = session.parse().ok()?;
                         if self.taken_back(local) {
@@ -806,11 +828,20 @@ mod tests {
         assert!(due(None, false, None, at(0), m), "never read");
         assert!(!due(Some(at(0)), false, None, at(9), m));
         assert!(due(Some(at(0)), false, None, at(10), m));
-        assert!(!due(Some(at(0)), false, moved, at(0), m), "not within a minute");
+        assert!(
+            !due(Some(at(0)), false, moved, at(0), m),
+            "not within a minute"
+        );
         assert!(due(Some(at(0)), false, moved, at(1), m));
-        assert!(!due(Some(at(0)), false, turn, at(4), m), "a turn's end waits longer");
+        assert!(
+            !due(Some(at(0)), false, turn, at(4), m),
+            "a turn's end waits longer"
+        );
         assert!(due(Some(at(0)), false, turn, at(5), m));
-        assert!(!due(Some(at(0)), true, moved, at(4), m), "backing off a failed read");
+        assert!(
+            !due(Some(at(0)), true, moved, at(4), m),
+            "backing off a failed read"
+        );
         assert!(due(Some(at(0)), true, moved, at(5), m));
         assert!(due(Some(at(0)), true, None, at(10), m));
     }
@@ -892,7 +923,10 @@ mod tests {
             "{line}"
         );
         let line = stalled(&GoalRefs::default());
-        assert!(line.contains("citing the pull request, commits or runs on GitHub"), "{line}");
+        assert!(
+            line.contains("citing the pull request, commits or runs on GitHub"),
+            "{line}"
+        );
     }
 
     #[test]

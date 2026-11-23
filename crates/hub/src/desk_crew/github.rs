@@ -328,9 +328,7 @@ pub(super) async fn each_as_person(
 }
 
 /// The person in scope and GitHub's tools as their key reaches them.
-fn person_tools(
-    access: &GithubAccess<'_>,
-) -> Result<(String, Vec<Arc<dyn Tool>>), GithubError> {
+fn person_tools(access: &GithubAccess<'_>) -> Result<(String, Vec<Arc<dyn Tool>>), GithubError> {
     // The person whose turn it is; none, nobody's key is read.
     let person = workforce_agent::runner::CURRENT_USER_ID
         .try_with(Clone::clone)
