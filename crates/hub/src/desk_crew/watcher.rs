@@ -89,7 +89,10 @@ pub(super) fn sweep_due(
     minute: std::time::Duration,
 ) -> Option<Sweep> {
     let past = |m: u32| swept.is_none_or(|s| s >= minute * m);
-    match (found && past(UNBOUND_SWEEP_MINUTES), past(UNBOUND_SWEEP_NET_MINUTES)) {
+    match (
+        found && past(UNBOUND_SWEEP_MINUTES),
+        past(UNBOUND_SWEEP_NET_MINUTES),
+    ) {
         (true, _) => Some(Sweep::Found),
         (false, true) => Some(Sweep::Net),
         (false, false) => None,
@@ -1876,7 +1879,11 @@ mod budget_tests {
         let ago = |m: u64| Some(minute * m as u32);
         assert_eq!(sweep_due(false, ago(1), minute), None, "nothing found");
         assert_eq!(sweep_due(false, ago(59), minute), None);
-        assert_eq!(sweep_due(true, ago(1), minute), None, "not twice in two minutes");
+        assert_eq!(
+            sweep_due(true, ago(1), minute),
+            None,
+            "not twice in two minutes"
+        );
         assert_eq!(sweep_due(true, ago(2), minute), Some(Sweep::Found));
         assert_eq!(sweep_due(false, ago(60), minute), Some(Sweep::Net));
         assert_eq!(sweep_due(false, None, minute), Some(Sweep::Net));

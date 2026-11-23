@@ -31,10 +31,10 @@ use std::sync::Arc;
 use std::time::Duration as StdDuration;
 
 use chrono::{DateTime, Duration, Utc};
+use serde_json::{json, Value};
 use uuid::Uuid;
 use workforce_common::oversight::{Level, Oversight};
 use workforce_desk::crew::{self, PartyKind};
-use serde_json::{json, Value};
 use workforce_desk::goal::{
     self, Evidence, FactKind, Found, GoalRefs, Measure, NotShown, PartProgress, Progress, Stall,
 };
@@ -309,7 +309,8 @@ impl CrewHub {
                 let w = self.waiting_from(&p.boss).await;
                 waiting.insert(p.boss.clone(), w);
             }
-            self.check_goal(&service, &o, detail, &waiting[&p.boss]).await;
+            self.check_goal(&service, &o, detail, &waiting[&p.boss])
+                .await;
         }
         let mut c = self.goal_checks.lock();
         c.pulled.retain(|plan| open.contains(plan));
@@ -381,11 +382,19 @@ impl CrewHub {
             return;
         }
         let window = minute * o.work.stall_minutes as i32;
-        let stalls = goal::stalls(&progress, plan.agreed_at.unwrap_or(plan.created_at), now, window);
+        let stalls = goal::stalls(
+            &progress,
+            plan.agreed_at.unwrap_or(plan.created_at),
+            now,
+            window,
+        );
         let sessions = plan_sessions(&detail);
         let mut lines = self.stall_lines(o, &detail, &r, &progress, &stalls, &sessions, now);
         lines.extend(self.undelivered_lines(id, &sessions, waiting, window, now));
-        if let Some(note) = self.goal_note(service, &detail, &stalls, &sessions, now).await {
+        if let Some(note) = self
+            .goal_note(service, &detail, &stalls, &sessions, now)
+            .await
+        {
             let mut c = self.goal_checks.lock();
             let notes = c.notes.entry(plan.boss.clone()).or_default();
             notes.push(note);
@@ -426,7 +435,10 @@ impl CrewHub {
                         .as_ref()
                         .and_then(|r| r.failed.as_deref())
                         .unwrap_or("it couldn't be read");
-                    (p.failing_since, failing_line(id, &r.parts[n], p.failing, why))
+                    (
+                        p.failing_since,
+                        failing_line(id, &r.parts[n], p.failing, why),
+                    )
                 })
         };
         let mut said = self.plan_watch_said();
@@ -434,29 +446,33 @@ impl CrewHub {
         for (n, part) in r.parts.iter().enumerate() {
             let stall = stalls.iter().find(|s| usize::from(s.part) == n);
             let line = match (stall, failing(n)) {
-                (Some(s), Some((_, line))) => {
-                    said(format!("goal-stall:{id}:{n}:{}:{}", s.since.timestamp_millis(), s.spell))
-                        .then_some(line)
-                }
+                (Some(s), Some((_, line))) => said(format!(
+                    "goal-stall:{id}:{n}:{}:{}",
+                    s.since.timestamp_millis(),
+                    s.spell
+                ))
+                .then_some(line),
                 (None, Some((since, line))) => said(format!(
                     "goal-failing:{id}:{n}:{}",
                     since.map(|s| s.timestamp_millis()).unwrap_or_default()
                 ))
                 .then_some(line),
-                (Some(s), None) => {
-                    said(format!("goal-stall:{id}:{n}:{}:{}", s.since.timestamp_millis(), s.spell))
-                        .then(|| {
-                            let seen = self.seen_of(sessions, o, tz, now);
-                            stall_line(
-                                &detail.summary.plan.goal,
-                                part,
-                                &progress.parts[n],
-                                now - s.since,
-                                tz,
-                                &seen,
-                            )
-                        })
-                }
+                (Some(s), None) => said(format!(
+                    "goal-stall:{id}:{n}:{}:{}",
+                    s.since.timestamp_millis(),
+                    s.spell
+                ))
+                .then(|| {
+                    let seen = self.seen_of(sessions, o, tz, now);
+                    stall_line(
+                        &detail.summary.plan.goal,
+                        part,
+                        &progress.parts[n],
+                        now - s.since,
+                        tz,
+                        &seen,
+                    )
+                }),
                 (None, None) => None,
             };
             out.extend(line);
@@ -503,7 +519,11 @@ impl CrewHub {
                 if now - oldest.at < window {
                     return None;
                 }
-                let why = match session.parse::<Uuid>().ok().and_then(|s| self.desk.view(s).ok()) {
+                let why = match session
+                    .parse::<Uuid>()
+                    .ok()
+                    .and_then(|s| self.desk.view(s).ok())
+                {
                     Some(v) => self.why_waiting(&v, &waiting[session])?.0,
                     None => "Desk can't reach it to put it in".to_string(),
                 };
@@ -528,7 +548,12 @@ impl CrewHub {
             .iter()
             .filter(|s| s.spell >= NOTE_SPELL)
             .min_by_key(|s| s.since)?;
-        let key = format!("goal-note:{}:{}:{}", plan.id, s.since.timestamp_millis(), s.spell);
+        let key = format!(
+            "goal-note:{}:{}:{}",
+            plan.id,
+            s.since.timestamp_millis(),
+            s.spell
+        );
         if !self.plan_watch_said()(key) {
             return None;
         }
@@ -728,7 +753,10 @@ async fn found_of(access: &GithubAccess<'_>, refs: &GoalRefs, e: &Evidence) -> F
         )
         .await
         .and_then(|got| got["run"]["head_branch"].as_str().map(str::to_string))
-        .map_or(Found::Missing, |branch| on(refs.names_branch(repo, &branch))),
+        .map_or(
+            Found::Missing,
+            |branch| on(refs.names_branch(repo, &branch)),
+        ),
         Evidence::Commit { sha, .. } if !is_sha(sha) => Found::Missing,
         Evidence::Commit { sha, .. } => {
             let mut answered = false;
@@ -784,9 +812,15 @@ mod tests {
         assert!(due(None, false, false, at(0), m), "never read");
         assert!(!due(Some(at(0)), false, false, at(9), m));
         assert!(due(Some(at(0)), false, false, at(10), m));
-        assert!(!due(Some(at(0)), false, true, at(0), m), "not within a minute");
+        assert!(
+            !due(Some(at(0)), false, true, at(0), m),
+            "not within a minute"
+        );
         assert!(due(Some(at(0)), false, true, at(1), m));
-        assert!(!due(Some(at(0)), true, true, at(4), m), "backing off a failed read");
+        assert!(
+            !due(Some(at(0)), true, true, at(4), m),
+            "backing off a failed read"
+        );
         assert!(due(Some(at(0)), true, true, at(5), m));
         assert!(due(Some(at(0)), true, false, at(10), m));
     }
@@ -846,7 +880,14 @@ mod tests {
         let judged = Measure::Judged {
             evidence: "only the touched services run".into(),
         };
-        let line = stall_line("g", &judged, &PartProgress::default(), Duration::minutes(30), tz, &[]);
+        let line = stall_line(
+            "g",
+            &judged,
+            &PartProgress::default(),
+            Duration::minutes(30),
+            tz,
+            &[],
+        );
         assert!(line.contains("nothing shown toward it yet"), "{line}");
         assert!(line.contains("none of its tickets has a session"), "{line}");
         assert!(line.contains("crew.plan_update checkpoint"), "{line}");
@@ -857,7 +898,18 @@ mod tests {
         for ok in ["main", "fix/ci-cache", "release-1.2", "d05e8a4", "MAN_768"] {
             assert!(plain_ref(ok), "{ok}");
         }
-        for not in ["", "../main", "main?per_page=1", "a#b", "-x", "/main", "main/", "a..b", "a b", "main."] {
+        for not in [
+            "",
+            "../main",
+            "main?per_page=1",
+            "a#b",
+            "-x",
+            "/main",
+            "main/",
+            "a..b",
+            "a b",
+            "main.",
+        ] {
             assert!(!plain_ref(not), "{not}");
         }
         assert!(is_sha("d05e8a4") && is_sha(&"a".repeat(40)));
@@ -871,7 +923,10 @@ mod tests {
             sha: "d05e8a4c0ffee".into(),
         };
         let line = not_shown_line(&NotShown::OffGoal(commit.clone()));
-        assert!(line.starts_with("Commit d05e8a4 of acme/mantis isn't the goal's own work"), "{line}");
+        assert!(
+            line.starts_with("Commit d05e8a4 of acme/mantis isn't the goal's own work"),
+            "{line}"
+        );
         assert!(not_shown_line(&NotShown::Missing(commit)).contains("isn't on GitHub as it says"));
         assert!(not_shown_line(&NotShown::NothingNew).contains("shown toward this part already"));
         assert!(not_shown_line(&NotShown::Nothing).contains("(evidence)"));
@@ -881,10 +936,17 @@ mod tests {
     fn the_other_lines_say_why_and_what_to_do_in_one_go() {
         let plan = Uuid::nil();
         let line = failing_line(plan, &ci(), 6, "GitHub answered 502");
-        assert!(line.contains("(6 reads in a row): GitHub answered 502"), "{line}");
+        assert!(
+            line.contains("(6 reads in a row): GitHub answered 502"),
+            "{line}"
+        );
         assert!(line.contains(&format!("plan_id {plan}, repair")), "{line}");
         assert_eq!(
-            undelivered_line("MAN-768's session", Duration::minutes(45), "its turn hasn't ended"),
+            undelivered_line(
+                "MAN-768's session",
+                Duration::minutes(45),
+                "its turn hasn't ended"
+            ),
             "Your message to MAN-768's session hasn't gone in for 45 min (its turn hasn't ended). \
              It may not have its instructions: move what holds it, or tell the person."
         );

@@ -101,7 +101,11 @@ pub(super) async fn boss_on(
     (overseer, crew, d, llm)
 }
 
-pub(super) async fn run(boss: &AgentService, tool: &str, input: Value) -> workforce_agent::tools::ToolResult {
+pub(super) async fn run(
+    boss: &AgentService,
+    tool: &str,
+    input: Value,
+) -> workforce_agent::tools::ToolResult {
     boss.tools.get(tool).unwrap().execute(input).await.unwrap()
 }
 

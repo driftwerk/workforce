@@ -32,7 +32,11 @@ const STALLED: &str = "No progress toward";
 /// GitHub as the person's key reads it: acme/mantis's main has three
 /// finished runs of CI since `from`, each job of each taking `minutes`;
 /// a commit compared with a branch is `compared` to it.
-async fn mantis(from: chrono::DateTime<chrono::Utc>, minutes: i64, compared: &str) -> wiremock::MockServer {
+async fn mantis(
+    from: chrono::DateTime<chrono::Utc>,
+    minutes: i64,
+    compared: &str,
+) -> wiremock::MockServer {
     use wiremock::matchers::{method, path, path_regex};
     use wiremock::{Mock, MockServer, ResponseTemplate};
     let gh = MockServer::start().await;
@@ -60,9 +64,11 @@ async fn mantis(from: chrono::DateTime<chrono::Utc>, minutes: i64, compared: &st
         .await;
     Mock::given(method("GET"))
         .and(path_regex(r"^/repos/acme/mantis/actions/runs/[0-9]+/jobs$"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "total_count": 1, "jobs": [{
+        .respond_with(ResponseTemplate::new(200).set_body_json(
+            json!({ "total_count": 1, "jobs": [{
             "id": 1, "name": "test", "status": "completed", "conclusion": conclusion,
-            "started_at": stamp(0), "completed_at": stamp(minutes), "steps": [] }] })))
+            "started_at": stamp(0), "completed_at": stamp(minutes), "steps": [] }] }),
+        ))
         .mount(&gh)
         .await;
     Mock::given(method("GET"))
@@ -128,33 +134,29 @@ async fn goal_running(d: &Desk, folder: &Path, r: GoalResult) -> (uuid::Uuid, Se
     let id = p.summary.plan.id;
     d.approve_plan(id, 1, &By::you()).await.unwrap();
     let s = eventually("its ticket's session", async || {
-        let held = d.plan(id).await.ok()?.tickets.first()?.ticket.ticket.session()?;
+        let held = d
+            .plan(id)
+            .await
+            .ok()?
+            .tickets
+            .first()?
+            .ticket
+            .ticket
+            .session()?;
         d.view(held).ok()
     })
     .await;
     (id, s)
 }
 
-/// The distinct stall lines the boss's plan turns were given so far that
-/// name `part`: a turn's request carries the plan's earlier turns too.
+/// How many of the boss's plan turns were woken with a stall of `part`:
+/// each wake is one turn, and the boss here answers each in one go.
 async fn stalls_said(llm: &wiremock::MockServer, part: &str) -> usize {
-    llm.received_requests()
-        .await
-        .unwrap_or_default()
-        .iter()
-        .flat_map(|r| {
-            let body = String::from_utf8_lossy(&r.body).into_owned();
-            body.split(STALLED)
-                .skip(1)
-                .filter_map(|l| l.split_once(". What Desk sees").map(|(l, _)| l.to_string()))
-                .collect::<Vec<_>>()
-        })
-        .filter(|l| l.contains(part))
-        .collect::<std::collections::HashSet<_>>()
-        .len()
+    asked_with(llm, &[STALLED, part]).await
 }
 
 const CI: &str = "on CI on main of acme/mantis";
+const JUDGED: &str = "on “only the services";
 
 #[tokio::test(flavor = "multi_thread")]
 async fn the_night_of_22_november() {
@@ -204,8 +206,12 @@ async fn the_night_of_22_november() {
             (!n.is_empty()).then_some(n)
         })
         .await;
+        eventually("its third spell's turn", async || {
+            (stalls_said(&llm, CI).await >= 3).then_some(())
+        })
+        .await;
         assert_eq!(stalls_said(&llm, CI).await, 3, "once a spell, never again within one");
-        assert_eq!(stalls_said(&llm, "on “only the services").await, 3);
+        assert_eq!(stalls_said(&llm, JUDGED).await, 3, "both parts in each wake");
         assert!(asked_with(&llm, &[CI, "22 minutes"]).await > 0);
         assert_eq!(notes.len(), 1, "{notes:?}");
         assert!(notes[0].starts_with("No progress on “Mantis CI"), "{notes:?}");
@@ -289,13 +295,23 @@ async fn a_goal_the_person_paused_is_read_and_wakes_no_one_one_paused_for_budget
         })
         .await;
         tokio::time::sleep(Duration::from_millis(1500)).await;
-        assert_eq!(stalls_said(&llm, CI).await, 0, "the person's pause wakes no one");
+        assert_eq!(
+            stalls_said(&llm, CI).await,
+            0,
+            "the person's pause wakes no one"
+        );
         assert!(crew.goal_notes("desk", chrono::Utc::now()).is_empty());
 
-        d.resume_plan(id, &[Paused::Person], &By::you()).await.unwrap();
-        d.pause_plan(id, Paused::Budget, &By::desk("Its budget is at its warning."))
+        d.resume_plan(id, &[Paused::Person], &By::you())
             .await
             .unwrap();
+        d.pause_plan(
+            id,
+            Paused::Budget,
+            &By::desk("Its budget is at its warning."),
+        )
+        .await
+        .unwrap();
         eventually("a budget pause woken", async || {
             (stalls_said(&llm, CI).await > 0).then_some(())
         })
@@ -332,7 +348,11 @@ async fn a_boss_message_held_from_a_goals_session_wakes_its_boss_once() {
             .await
             .unwrap_or_default()
             .iter()
-            .map(|r| String::from_utf8_lossy(&r.body).matches("hasn't gone in").count())
+            .map(|r| {
+                String::from_utf8_lossy(&r.body)
+                    .matches("hasn't gone in")
+                    .count()
+            })
             .max()
             .unwrap_or_default();
         assert_eq!(said, 1);

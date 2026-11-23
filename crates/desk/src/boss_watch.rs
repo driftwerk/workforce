@@ -491,16 +491,16 @@ mod tests {
                 ));
             }
             assert_eq!(
-                store.watches_end_plan(plan, "its goal is met").await.unwrap(),
+                store
+                    .watches_end_plan(plan, "its goal is met")
+                    .await
+                    .unwrap(),
                 2
             );
             let open = store.watches_open("desk", "sam").await.unwrap();
             assert_eq!(open.iter().map(|w| w.plan).collect::<Vec<_>>(), [None]);
             assert!(store.watches_undelivered().await.unwrap().is_empty());
-            assert_eq!(
-                store.watches_end_plan(plan, "again").await.unwrap(),
-                0
-            );
+            assert_eq!(store.watches_end_plan(plan, "again").await.unwrap(), 0);
         })
         .await;
     }

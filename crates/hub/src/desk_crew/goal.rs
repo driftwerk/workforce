@@ -469,7 +469,10 @@ impl CrewHub {
         }
         let mut recorded = recorded_of(input, result_to.as_ref().or(p.result.as_ref()))?;
         if let Some(r) = result_to.as_ref().or(p.result.as_ref()) {
-            for c in recorded.iter_mut().filter(|c| c.kind == FactKind::Checkpoint) {
+            for c in recorded
+                .iter_mut()
+                .filter(|c| c.kind == FactKind::Checkpoint)
+            {
                 let part = c.part.unwrap_or_default();
                 self.checkpoint_shown(&b.service, detail, r, part, &c.evidence)
                     .await?;
@@ -775,7 +778,11 @@ impl CrewHub {
             return Some(fresh);
         }
         let id = fresh.summary.plan.id;
-        if let Err(e) = self.desk.goal_met(id, &met_by_reading(r, progress, crew::now())).await {
+        if let Err(e) = self
+            .desk
+            .goal_met(id, &met_by_reading(r, progress, crew::now()))
+            .await
+        {
             tracing::warn!(plan = %id, error = %e, "a goal read met wasn't kept met");
         }
         self.desk.plan(id).await.ok()
@@ -784,7 +791,11 @@ impl CrewHub {
     /// Plan `p`'s measured parts read now as the person and kept: the plan
     /// fresh, none when it isn't read (no goal agreed, met already, not
     /// running or paused, or nothing measured).
-    pub(super) async fn read_kept(&self, service: &AgentService, p: &PlanDetail) -> Option<PlanDetail> {
+    pub(super) async fn read_kept(
+        &self,
+        service: &AgentService,
+        p: &PlanDetail,
+    ) -> Option<PlanDetail> {
         use workforce_desk::plan::PlanState;
         let plan = &p.summary.plan;
         let r = plan.result.as_ref()?;

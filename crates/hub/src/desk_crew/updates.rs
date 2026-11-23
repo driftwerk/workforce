@@ -1199,11 +1199,12 @@ impl CrewHub {
         }
         // A goal with no progress for spells on end: worth knowing, never
         // sent on its own.
-        lines.extend(
-            self.goal_notes(boss, now)
-                .into_iter()
-                .map(|text| (SectionKey::WorthKnowing, Said::line(EventKind::Problem, text))),
-        );
+        lines.extend(self.goal_notes(boss, now).into_iter().map(|text| {
+            (
+                SectionKey::WorthKnowing,
+                Said::line(EventKind::Problem, text),
+            )
+        }));
         let runs = told
             .routine
             .iter()

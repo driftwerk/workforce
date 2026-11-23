@@ -273,7 +273,7 @@ async fn with_switches_off_and_a_list_of_repositories_act_fully_is_unbound_all_t
 /// sweeps its scope every few minutes while there is anything in it; at
 /// Act, neither.
 #[tokio::test(flavor = "multi_thread")]
-async fn unbound_sweeps_its_scope_with_what_its_look_found_and_never_for_nothing() {
+async fn unbound_wakes_at_once_for_what_waits_and_sweeps_only_while_it_keeps_work() {
     with_test_pool(workforce_desk::store::build_pool, |pool| async move {
         let dir = tempfile::tempdir().unwrap();
         let base = std::fs::canonicalize(dir.path()).unwrap();
@@ -299,9 +299,11 @@ async fn unbound_sweeps_its_scope_with_what_its_look_found_and_never_for_nothing
             "needs you",
         );
         assert!(crew.trigger_for(&waits, "desk", &o).is_some());
-        // Its look finds a session asking: the sweep comes with it.
-        let url = hook_url(&base, web.id).await;
-        super::answers_questions::asks(&url, "Ship it?").await;
+        // A plan running: the net sweeps its scope.
+        let p = super::plans::proposed(&d, &base, 1).await;
+        d.approve_plan(p.summary.plan.id, 1, &By::you())
+            .await
+            .unwrap();
         let swept = eventually("a sweep", async || {
             let c = d.store().latest_check_in("desk").await.unwrap()?;
             c.prompt.contains("Regular sweep").then_some(c)

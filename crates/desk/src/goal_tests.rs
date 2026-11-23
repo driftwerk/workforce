@@ -617,8 +617,17 @@ fn each_part_stalls_on_its_own_since_it_last_came_nearer() {
     let r = result(vec![ci_minutes(5.0, 1), judged()]);
     let window = Duration::minutes(30);
     // CI stuck at 22 minutes all night; the judged part shown at 60.
-    let readings = [reading(0, 0, Some(22.0), false), reading(50, 0, Some(22.0), false)];
-    let facts = [fact(60, FactKind::Checkpoint, Some(1), true, "only api ran")];
+    let readings = [
+        reading(0, 0, Some(22.0), false),
+        reading(50, 0, Some(22.0), false),
+    ];
+    let facts = [fact(
+        60,
+        FactKind::Checkpoint,
+        Some(1),
+        true,
+        "only api ran",
+    )];
     let p = progress(&r, &readings, &facts);
     assert_eq!(
         stalls(&p, at(-10), at(70), window),
@@ -645,7 +654,10 @@ fn each_part_stalls_on_its_own_since_it_last_came_nearer() {
         ]
     );
     // Better CI resets only its own part.
-    let better = [reading(0, 0, Some(22.0), false), reading(80, 0, Some(9.0), false)];
+    let better = [
+        reading(0, 0, Some(22.0), false),
+        reading(80, 0, Some(9.0), false),
+    ];
     let p = progress(&r, &better, &facts);
     assert_eq!(
         stalls(&p, at(-10), at(100), window),
@@ -715,7 +727,10 @@ fn a_goal_names_its_branches_and_pull_requests_and_those_its_heads_found() {
     assert!(!refs.names_branch("acme/api", "spike"));
     assert!(refs.names_pull("acme/api", 12));
     assert!(refs.names_pull("acme/web", 7));
-    assert!(!refs.names_pull("acme/api", 99), "a CI part's evidence names no PR of the goal");
+    assert!(
+        !refs.names_pull("acme/api", 99),
+        "a CI part's evidence names no PR of the goal"
+    );
     let mut branches: Vec<&str> = refs.branches_of("acme/api").collect();
     branches.sort_unstable();
     assert_eq!(branches, vec!["fix-ci", "main"]);
@@ -731,24 +746,32 @@ fn a_checkpoint_shows_only_new_evidence_of_the_goal_s_own_work() {
     let (a, b) = (commit("aaaa111"), commit("bbbb222"));
     assert_eq!(checkpoint_shows(&[], &[], &[]), Err(NotShown::Nothing));
     assert_eq!(
-        checkpoint_shows(&[a.clone()], &[Found::OnGoal], &[]),
+        checkpoint_shows(std::slice::from_ref(&a), &[Found::OnGoal], &[]),
         Ok(())
     );
     assert_eq!(
-        checkpoint_shows(&[a.clone(), b.clone()], &[Found::OnGoal, Found::OffGoal], &[]),
+        checkpoint_shows(
+            &[a.clone(), b.clone()],
+            &[Found::OnGoal, Found::OffGoal],
+            &[]
+        ),
         Err(NotShown::OffGoal(b.clone())),
         "22 Nov: a commit on another branch doesn't count"
     );
     assert_eq!(
-        checkpoint_shows(&[b.clone()], &[Found::Missing], &[]),
+        checkpoint_shows(std::slice::from_ref(&b), &[Found::Missing], &[]),
         Err(NotShown::Missing(b.clone()))
     );
     assert_eq!(
-        checkpoint_shows(&[a.clone()], &[Found::OnGoal], &[&a]),
+        checkpoint_shows(std::slice::from_ref(&a), &[Found::OnGoal], &[&a]),
         Err(NotShown::NothingNew)
     );
     assert_eq!(
-        checkpoint_shows(&[a.clone(), b.clone()], &[Found::OnGoal, Found::OnGoal], &[&a]),
+        checkpoint_shows(
+            &[a.clone(), b.clone()],
+            &[Found::OnGoal, Found::OnGoal],
+            &[&a]
+        ),
         Ok(())
     );
     assert_eq!(
