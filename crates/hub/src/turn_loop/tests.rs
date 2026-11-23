@@ -1793,6 +1793,43 @@ async fn a_notice_turn_archives_its_answer_once_beside_anothers_notice() {
     );
 }
 
+/// What a turn learns from is its own messages, as its save kept them: never
+/// another write's that the save merged in among them.
+#[test]
+fn a_turn_learns_from_its_own_messages_when_its_save_merged() {
+    use workforce_common::session::{JsonlSessionStore, SessionStore};
+    let tmp = tempfile::tempdir().unwrap();
+    let sessions: std::sync::Arc<dyn SessionStore> =
+        std::sync::Arc::new(JsonlSessionStore::new(tmp.path()).unwrap());
+    let mut turn = sessions.get_or_create("cli", "u", "agent-a").unwrap();
+    let base = turn.messages.len();
+    let asked = turn.add_user_message("I take my tea black", None);
+    turn.add_tool_message(
+        "notes.read",
+        &serde_json::json!({}),
+        &serde_json::json!("nothing"),
+        true,
+        1,
+        None,
+    );
+    let said = turn.add_assistant_message("Noted: black.", 3);
+
+    let mut other = sessions.get(&turn.id).unwrap().unwrap();
+    let notice = other.add_assistant_message("the session closed", 2);
+    sessions.save(&other).unwrap();
+    let answered = super::save_turn(&sessions, &mut turn, base..).unwrap();
+
+    let learned: Vec<&str> = super::spoken(&answered)
+        .into_iter()
+        .map(|m| m.id.as_str())
+        .collect();
+    assert_eq!(learned, [asked.as_str(), said.as_str()]);
+    assert!(
+        turn.messages[base..].iter().any(|m| m.id == notice),
+        "by position, the turn would have been read with the notice"
+    );
+}
+
 /// A follow-up sent now into a turn that is then stopped is still the
 /// person's: kept, as said, once the turn's task is gone.
 #[tokio::test(flavor = "multi_thread")]

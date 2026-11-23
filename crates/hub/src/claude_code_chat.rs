@@ -229,11 +229,15 @@ fn adopt_thread_session(
         return Ok(session);
     }
     if owner != legacy_user {
-        if let Some(mut session) = sessions.find(session_key, legacy_user)? {
-            session.owner = owner.to_string();
-            session.label = Some(format!("{session_key}:{owner}"));
-            sessions.save(&session)?;
-            return Ok(session);
+        if let Some(legacy) = sessions.find(session_key, legacy_user)? {
+            sessions.set_session_owner(
+                &legacy.id,
+                owner,
+                Some(format!("{session_key}:{owner}")),
+            )?;
+            return sessions
+                .get(&legacy.id)?
+                .ok_or_else(|| eyre!("session {} vanished while adopted", legacy.id));
         }
     }
     sessions
@@ -4995,6 +4999,24 @@ mod tests {
             1,
             "no twin ever created"
         );
+    }
+
+    #[test]
+    fn an_adopted_thread_stays_the_canonical_owners_through_a_save_read_before_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = workforce_common::session::JsonlSessionStore::new(dir.path()).unwrap();
+        let legacy = cc_session(&store, RAW);
+        let mut mid_turn = store.get(&legacy.id).unwrap().unwrap();
+
+        let adopted = adopt_thread_session(&store, THREAD, CANON, RAW).unwrap();
+        mid_turn.add_user_message("still going", None);
+        store.save(&mid_turn).unwrap();
+
+        assert_eq!(adopted.owner, CANON);
+        let found = store.find(THREAD, CANON).unwrap().unwrap();
+        assert_eq!(found.id, legacy.id);
+        assert_eq!(found.messages.len(), 1, "the save still lands");
+        assert!(store.find(THREAD, RAW).unwrap().is_none());
     }
 
     #[test]

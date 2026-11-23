@@ -2951,10 +2951,20 @@ pub(crate) fn note_surfaced_lessons(
     }
 }
 
+/// What was said in `turn`: its tool entries left out, so tool chatter
+/// never reaches a memory excerpt.
+pub(crate) fn spoken(
+    turn: &[workforce_common::session::SessionMessage],
+) -> Vec<&workforce_common::session::SessionMessage> {
+    turn.iter()
+        .filter(|m| !matches!(m.role, workforce_common::session::MessageRole::Tool))
+        .collect()
+}
+
 pub(crate) fn spawn_turn_extraction(
     service: &AgentService,
     session: &workforce_common::session::Session,
-    archive_base: usize,
+    turn: &[workforce_common::session::SessionMessage],
     effective_message: &str,
     response: &str,
     principal: &str,
@@ -2984,15 +2994,7 @@ pub(crate) fn spawn_turn_extraction(
         return;
     }
 
-    // Slice the turn from `archive_base` (pre-turn length) and skip tool
-    // entries so tool-chatter doesn't end up in the memory excerpt.
-    let turn_messages: Vec<&workforce_common::session::SessionMessage> = session
-        .messages
-        .get(archive_base..)
-        .unwrap_or_default()
-        .iter()
-        .filter(|m| !matches!(m.role, workforce_common::session::MessageRole::Tool))
-        .collect();
+    let turn_messages = spoken(turn);
     let turn_message_ids: Vec<String> = turn_messages.iter().map(|m| m.id.clone()).collect();
     let pm_event_time = turn_messages.iter().map(|m| m.timestamp).max();
     let user_turn = turn_messages
@@ -3737,6 +3739,10 @@ pub(crate) async fn process_admitted(
             }
         } else {
             // YELLOW ZONE: fast prune only, defer full compaction
+            // A write landing before this copy is saved keeps the stored
+            // messages, so the prune is lost; nothing else is: it only
+            // shortens outputs the stored ones still hold whole, and the next
+            // turn prunes them again, under the same handles.
             if let Err(e) = compaction_engine.compact_pruning_only(&mut session) {
                 tracing::warn!(error = %e, "Pruning failed, continuing");
             }
@@ -4000,7 +4006,7 @@ pub(crate) async fn process_admitted(
     spawn_turn_extraction(
         service,
         &session,
-        archive_base,
+        &answered,
         &effective_message,
         &result.response,
         principal,
@@ -4042,7 +4048,7 @@ pub(crate) async fn process_admitted(
                 sessions: &service.sessions,
             },
             &mut session,
-            archive_base,
+            &answered,
             &effective_message,
             &result.response,
         );
@@ -4077,17 +4083,20 @@ pub(crate) async fn process_admitted(
             )
             .with_cost_tracker(bg_cost_tracker, bg_agent_id.to_string());
             match engine.compact_if_needed(&mut fresh, bg_reserved).await {
-                Ok(true) => {
-                    if let Err(e) = bg_sessions.save(&fresh) {
-                        tracing::warn!(error = %e, "Background compaction (sync): save failed");
-                    } else {
-                        tracing::info!(
-                            session_id = %bg_session_id,
-                            tokens = fresh.estimated_total_tokens(),
-                            "Background compaction complete (sync path)"
-                        );
+                Ok(true) => match bg_sessions.save_if_current(&fresh) {
+                    Ok(true) => tracing::info!(
+                        session_id = %bg_session_id,
+                        tokens = fresh.estimated_total_tokens(),
+                        "Background compaction complete (sync path)"
+                    ),
+                    Ok(false) => tracing::info!(
+                        session_id = %bg_session_id,
+                        "Background compaction (sync) left for the next turn: the session moved on"
+                    ),
+                    Err(e) => {
+                        tracing::warn!(error = %e, "Background compaction (sync): save failed")
                     }
-                }
+                },
                 Ok(false) => {}
                 Err(e) => {
                     tracing::warn!(error = %e, "Background compaction (sync) failed");
@@ -5328,6 +5337,10 @@ pub(crate) async fn stream_admitted(
             let _ = progress_tx.send(ProgressEvent::CompactEnd).await;
         } else {
             // YELLOW ZONE: above threshold but below urgent — fast prune only, defer full compaction
+            // A write landing before this copy is saved keeps the stored
+            // messages, so the prune is lost; nothing else is: it only
+            // shortens outputs the stored ones still hold whole, and the next
+            // turn prunes them again, under the same handles.
             if let Err(e) = compaction_engine.compact_pruning_only(&mut session) {
                 tracing::warn!(error = %e, "Pruning failed, continuing");
             }
@@ -5389,8 +5402,8 @@ pub(crate) async fn stream_admitted(
     // archived when it was saved.
     let archived_upto = session.messages.len();
     if held.is_none() {
-        for msg in asked {
-            if let Err(e) = service.sessions.append_to_archive(&session.id, &msg) {
+        for msg in &asked {
+            if let Err(e) = service.sessions.append_to_archive(&session.id, msg) {
                 warn!(error = %e, "Failed to archive the turn's question");
             }
         }
@@ -5531,6 +5544,7 @@ pub(crate) async fn stream_admitted(
     let ls_sessions = Arc::clone(&service.sessions);
 
     let archive_base_for_task = archive_base;
+    let asked_for_task = asked;
     let heard_for_task = heard;
     let kh_question = message.to_string();
     let session_key_for_task = channel.to_string();
@@ -6000,9 +6014,10 @@ pub(crate) async fn stream_admitted(
                 // Fire-and-forget post-turn extraction (passive memory +
                 // DM-only relationship capture), shared with
                 // `process_message` via `spawn_turn_extraction`.
+                let turn = [asked_for_task.as_slice(), answered.as_slice()].concat();
                 spawn_turn_extraction(&me,
                     &session,
-                    archive_base_for_task,
+                    &turn,
                     &effective_message,
                     &result.response,
                     &rel_principal_for_task,
@@ -6031,7 +6046,7 @@ pub(crate) async fn stream_admitted(
                             sessions: &ls_sessions,
                         },
                         &mut session,
-                        archive_base_for_task,
+                        &turn,
                         &effective_message,
                         &result.response,
                     );
@@ -6082,20 +6097,21 @@ pub(crate) async fn stream_admitted(
                             )
                             .with_cost_tracker(bg_cost_tracker2, bg_agent_id2.to_string());
                             match engine.compact_if_needed(&mut fresh, bg_reserved).await {
-                                Ok(true) => {
-                                    if let Err(e) = bg_sessions.save(&fresh) {
-                                        tracing::warn!(
-                                            error = %e,
-                                            "Background compaction: failed to save session"
-                                        );
-                                    } else {
-                                        tracing::info!(
-                                            session_id = %bg_session_id,
-                                            tokens = fresh.estimated_total_tokens(),
-                                            "Background compaction complete"
-                                        );
-                                    }
-                                }
+                                Ok(true) => match bg_sessions.save_if_current(&fresh) {
+                                    Ok(true) => tracing::info!(
+                                        session_id = %bg_session_id,
+                                        tokens = fresh.estimated_total_tokens(),
+                                        "Background compaction complete"
+                                    ),
+                                    Ok(false) => tracing::info!(
+                                        session_id = %bg_session_id,
+                                        "Background compaction left for the next turn: the session moved on"
+                                    ),
+                                    Err(e) => tracing::warn!(
+                                        error = %e,
+                                        "Background compaction: failed to save session"
+                                    ),
+                                },
                                 Ok(false) => {
                                     tracing::info!(
                                         session_id = %bg_session_id,

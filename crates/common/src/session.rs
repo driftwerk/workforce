@@ -2974,6 +2974,16 @@ pub trait SessionStore: Send + Sync {
         self.save_refreshing(session)
     }
 
+    /// Saves `session` as it is only when nothing was written to it since it
+    /// was read (its revision is still the stored one); otherwise leaves the
+    /// stored session alone. Whether it saved. For a rewrite that is only
+    /// right against what it read, such as a compaction, which is then run
+    /// again from the next read. The default saves: the in-memory store
+    /// keeps no revisions.
+    fn save_if_current(&self, session: &Session) -> eyre::Result<bool> {
+        self.save(session).map(|()| true)
+    }
+
     /// Claim the fleet-wide right to run a turn for `session_id`, valid for
     /// `ttl_secs`. Re-entrant: the claiming process wins again (renewal passes
     /// the same `claim_id`; a newer local turn passes a fresh one), and a
@@ -3261,6 +3271,15 @@ pub trait SessionStore: Send + Sync {
 
     /// Update the session label. Pass `None` to clear the label.
     fn set_session_label(&self, session_id: &str, label: Option<String>) -> eyre::Result<()>;
+
+    /// Gives one session to `owner`, under `label`, in one write that bumps
+    /// its revision: a save read before it can't undo it.
+    fn set_session_owner(
+        &self,
+        session_id: &str,
+        owner: &str,
+        label: Option<String>,
+    ) -> eyre::Result<()>;
 
     /// Get context window usage for a session.
     fn get_context_usage(&self, session_id: &str) -> eyre::Result<SessionContextUsage>;
@@ -4004,6 +4023,25 @@ impl SessionStore for InMemorySessionStore {
         let session = sessions
             .get_mut(session_id)
             .ok_or_else(|| eyre::eyre!("Session not found: {session_id}"))?;
+        session.label = label;
+        session.updated_at = chrono::Utc::now();
+        Ok(())
+    }
+
+    fn set_session_owner(
+        &self,
+        session_id: &str,
+        owner: &str,
+        label: Option<String>,
+    ) -> eyre::Result<()> {
+        let mut sessions = self
+            .sessions
+            .lock()
+            .map_err(|e| eyre::eyre!("Lock poisoned: {}", e))?;
+        let session = sessions
+            .get_mut(session_id)
+            .ok_or_else(|| eyre::eyre!("Session not found: {session_id}"))?;
+        session.owner = owner.to_string();
         session.label = label;
         session.updated_at = chrono::Utc::now();
         Ok(())
@@ -5153,6 +5191,23 @@ impl SessionStore for JsonlSessionStore {
         Ok(())
     }
 
+    fn save_if_current(&self, session: &Session) -> eyre::Result<bool> {
+        self.exclusively(&session.id, || {
+            self.hydrate_in_cache(&session.id)?;
+            let current = self
+                .cached(&session.id)?
+                .is_some_and(|stored| stored.loaded_revision == session.loaded_revision);
+            if !current || session.cached_message_count.is_some() {
+                return Ok(false);
+            }
+            let mut saved = session.clone();
+            saved.loaded_revision = Some(next_revision(session.loaded_revision));
+            self.write_to_disk(&saved)?;
+            self.keep_cached(saved)?;
+            Ok(true)
+        })
+    }
+
     fn begin_turn(
         &self,
         session_id: &str,
@@ -5438,6 +5493,20 @@ impl SessionStore for JsonlSessionStore {
         self.hydrate_in_cache(session_id)?;
         self.change_existing(session_id, |session| {
             session.model_override = model;
+            session.updated_at = chrono::Utc::now();
+        })
+    }
+
+    fn set_session_owner(
+        &self,
+        session_id: &str,
+        owner: &str,
+        label: Option<String>,
+    ) -> eyre::Result<()> {
+        self.hydrate_in_cache(session_id)?;
+        self.change_existing(session_id, |session| {
+            session.owner = owner.to_string();
+            session.label = label;
             session.updated_at = chrono::Utc::now();
         })
     }
@@ -6196,6 +6265,77 @@ pub(crate) fn assert_reassign_owner_contract(store: &dyn SessionStore) {
         .reassign_owner("alice", "bob", "tag")
         .unwrap()
         .is_empty());
+}
+
+/// A rewrite saved only over what it read: one read before another write,
+/// or a shell, leaves the stored session as that write left it.
+#[cfg(test)]
+pub(crate) fn assert_save_if_current_contract(store: &dyn SessionStore) {
+    let texts = |session: &Session| -> Vec<String> {
+        session.messages.iter().map(|m| m.content.clone()).collect()
+    };
+    let mut session = store.get_or_create("c", "o", "agent-a").unwrap();
+    session.add_user_message("first", None);
+    session.add_user_message("second", None);
+    store.save_refreshing(&mut session).unwrap();
+
+    let mut cut = store.get(&session.id).unwrap().unwrap();
+    cut.messages.remove(0);
+    assert!(store.save_if_current(&cut).unwrap());
+    let stored = store.get(&session.id).unwrap().unwrap();
+    assert_eq!(texts(&stored), ["second"]);
+    assert!(stored.loaded_revision > cut.loaded_revision);
+
+    let mut late = store.get(&session.id).unwrap().unwrap();
+    let mut other = store.get(&session.id).unwrap().unwrap();
+    other.add_user_message("meanwhile", None);
+    store.save(&other).unwrap();
+    late.messages.clear();
+    assert!(!store.save_if_current(&late).unwrap());
+    assert_eq!(
+        texts(&store.get(&session.id).unwrap().unwrap()),
+        ["second", "meanwhile"]
+    );
+
+    let mut shell = store.get(&session.id).unwrap().unwrap();
+    shell.cached_message_count = Some(shell.messages.len());
+    shell.messages.clear();
+    assert!(!store.save_if_current(&shell).unwrap());
+    assert_eq!(
+        texts(&store.get(&session.id).unwrap().unwrap()),
+        ["second", "meanwhile"]
+    );
+}
+
+/// A session given to another owner stays theirs through a save read
+/// before it was given.
+#[cfg(test)]
+pub(crate) fn assert_set_session_owner_contract(store: &dyn SessionStore) {
+    let mut session = store.get_or_create("thread", "raw", "agent-a").unwrap();
+    session.add_user_message("hello", None);
+    store.save_refreshing(&mut session).unwrap();
+    let mut before = store.get(&session.id).unwrap().unwrap();
+
+    store
+        .set_session_owner(&session.id, "canon", Some("thread:canon".into()))
+        .unwrap();
+    let given = store.get(&session.id).unwrap().unwrap();
+    assert_eq!(given.owner, "canon");
+    assert_eq!(given.label.as_deref(), Some("thread:canon"));
+    assert_eq!(
+        store.find("thread", "canon").unwrap().unwrap().id,
+        session.id
+    );
+    assert!(store.find("thread", "raw").unwrap().is_none());
+
+    before.add_user_message("later", None);
+    store.save(&before).unwrap();
+    let kept = store.get(&session.id).unwrap().unwrap();
+    assert_eq!(kept.owner, "canon");
+    assert_eq!(kept.messages.len(), 2, "the later message still lands");
+    assert!(store
+        .set_session_owner("00000000-0000-0000-0000-000000000000", "canon", None)
+        .is_err());
 }
 
 /// Every owner is counted once per session it holds, sealed ones included.
@@ -6995,6 +7135,18 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             assert_search_archive_contract(&JsonlSessionStore::new(dir.path()).unwrap(), archive);
         }
+    }
+
+    #[test]
+    fn the_file_store_saves_a_rewrite_only_over_what_it_read() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_save_if_current_contract(&JsonlSessionStore::new(dir.path()).unwrap());
+    }
+
+    #[test]
+    fn a_session_given_to_another_owner_stays_theirs() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_set_session_owner_contract(&JsonlSessionStore::new(dir.path()).unwrap());
     }
 
     #[test]

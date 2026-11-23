@@ -710,6 +710,47 @@ impl SessionStore for PostgresSessionStore {
         Ok(())
     }
 
+    fn save_if_current(&self, session: &Session) -> Result<bool> {
+        let (Some(revision), None) = (session.loaded_revision, session.cached_message_count) else {
+            return Ok(false);
+        };
+        let row = SessionRow::from_session(session)?;
+        self.block_on(async move {
+            let mut conn = self.pool.get().await?;
+            let scoped = self.scope(&mut conn).await?;
+            let n = scoped
+                .execute(
+                    "UPDATE sessions SET label = $1, kind = $2, context_type = $3, updated_at = $4,
+                         total_tokens = $5, message_count = $6, model_override = $7,
+                         compaction_history = $8, metadata = $9, messages = $10, sealed = $11,
+                         seq = $12, prev_session_id = $13, revision = revision + 1
+                     WHERE id = $14 AND agent_id = $15 AND tenant_id = $16 AND revision = $17",
+                    &[
+                        &session.label,
+                        &kind_to_str(&session.kind),
+                        &session.context_type.as_ref().map(context_type_to_str),
+                        &session.updated_at,
+                        &row.total_tokens,
+                        &row.message_count,
+                        &session.model_override,
+                        &row.compaction_history,
+                        &row.metadata,
+                        &row.messages,
+                        &row.sealed,
+                        &row.seq,
+                        &row.prev_session_id,
+                        &row.id,
+                        &self.agent_id,
+                        &self.tenant_id(),
+                        &revision,
+                    ],
+                )
+                .await?;
+            scoped.finish().await?;
+            Ok(n == 1)
+        })
+    }
+
     /// Writes the promoted columns only, and deliberately does not bump
     /// `revision`: nothing else reads or writes them, so they sit outside the
     /// versioned set and bumping would manufacture CAS misses for the very
@@ -1577,6 +1618,40 @@ impl SessionStore for PostgresSessionStore {
                          revision = revision + 1
                      WHERE id = $3 AND agent_id = $4 AND tenant_id = $5",
                     &[&model, &Utc::now(), &id, &self.agent_id, &self.tenant_id()],
+                )
+                .await?;
+            scoped.finish().await?;
+            if n == 0 {
+                eyre::bail!("Session not found: {session_id}");
+            }
+            Ok(())
+        })
+    }
+
+    fn set_session_owner(
+        &self,
+        session_id: &str,
+        owner: &str,
+        label: Option<String>,
+    ) -> Result<()> {
+        let id = parse_uuid(session_id)?;
+        let owner = owner.to_string();
+        self.block_on(async move {
+            let mut conn = self.pool.get().await?;
+            let scoped = self.scope(&mut conn).await?;
+            let n = scoped
+                .execute(
+                    "UPDATE sessions SET owner = $1, label = $2, updated_at = $3,
+                         revision = revision + 1
+                     WHERE id = $4 AND agent_id = $5 AND tenant_id = $6",
+                    &[
+                        &owner,
+                        &label,
+                        &Utc::now(),
+                        &id,
+                        &self.agent_id,
+                        &self.tenant_id(),
+                    ],
                 )
                 .await?;
             scoped.finish().await?;
@@ -2967,6 +3042,22 @@ pub(crate) mod tests {
                 .await
                 .expect("construct store (runs migrations)");
             test(store).await;
+        })
+        .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_rewrite_is_saved_only_over_what_it_read() {
+        with_store(|store| async move {
+            crate::session::assert_save_if_current_contract(store.as_ref());
+        })
+        .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_session_given_to_another_owner_stays_theirs() {
+        with_store(|store| async move {
+            crate::session::assert_set_session_owner_contract(store.as_ref());
         })
         .await;
     }
