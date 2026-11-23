@@ -145,29 +145,58 @@ pub fn said_after(
     })
 }
 
-/// The tool shell an open call or a background shell started at `since`
-/// runs in: the first of `tree`'s started at or after it.
-pub fn shell_since<'a>(
+/// How much later than it started `ps` can put a process's start: it
+/// keeps whole seconds of its run.
+const PS_ROUNDS: Duration = Duration::seconds(1);
+
+/// The tool shell each output is written from, by its id, no process given
+/// to two: each background shell (`shells`, by id and when its output file
+/// was born), in the order they were born, has the one started nearest its
+/// file's birth, at most [`SKEW`] before it and never after it but for
+/// what `ps` rounds; then the open call has the first left of those
+/// started since it. One with none matched waits in no process Desk knows.
+pub fn placed<'a>(
     tree: &[&'a Stat],
-    since: DateTime<Utc>,
+    call: Option<&OpenCall>,
+    shells: &[(&str, DateTime<Utc>)],
     now: DateTime<Utc>,
-) -> Option<&'a Stat> {
-    tree.iter()
+) -> HashMap<String, &'a Stat> {
+    let tools: Vec<&Stat> = tree
+        .iter()
         .copied()
         .filter(|s| procs::is_tool_shell(&s.proc))
-        .filter(|s| started(now, s) >= since - SKEW)
-        .max_by_key(|s| (s.elapsed_secs, std::cmp::Reverse(s.proc.pid)))
-}
-
-/// Whether the tool shell started at `since` ([`shell_since`]) or anything
-/// under it used the CPU since `prev`.
-pub fn shell_busy(
-    prev: &HashMap<u32, (u64, u64)>,
-    tree: &[&Stat],
-    since: DateTime<Utc>,
-    now: DateTime<Utc>,
-) -> bool {
-    shell_since(tree, since, now).is_some_and(|shell| active(prev, &subtree(tree, shell)))
+        .collect();
+    let free = |placed: &HashMap<String, &Stat>, s: &Stat| {
+        !placed.values().any(|p| p.proc.pid == s.proc.pid)
+    };
+    let mut born = shells.to_vec();
+    born.sort_by_key(|(id, made)| (*made, *id));
+    let placed = born
+        .into_iter()
+        .fold(HashMap::new(), |mut placed, (id, made)| {
+            let nearest = tools
+                .iter()
+                .copied()
+                .filter(|s| free(&placed, s))
+                .filter(|s| (made - SKEW..=made + PS_ROUNDS).contains(&started(now, s)))
+                .min_by_key(|s| ((started(now, s) - made).abs(), s.proc.pid));
+            if let Some(s) = nearest {
+                placed.insert(id.to_string(), s);
+            }
+            placed
+        });
+    call.into_iter().fold(placed, |mut placed, c| {
+        let first = tools
+            .iter()
+            .copied()
+            .filter(|s| free(&placed, s))
+            .filter(|s| started(now, s) >= c.since - SKEW)
+            .max_by_key(|s| (s.elapsed_secs, std::cmp::Reverse(s.proc.pid)));
+        if let Some(s) = first {
+            placed.insert(c.id.clone(), s);
+        }
+        placed
+    })
 }
 
 /// `head` and every process of `tree` under it.
@@ -282,6 +311,8 @@ pub struct Evidence<'a> {
     /// What the open call's and its background shells' own output says
     /// each waits on.
     pub said: &'a [Said],
+    /// The tool shell each of those is written from ([`placed`]).
+    pub placed: &'a HashMap<String, &'a Stat>,
     /// When its processes last used the CPU.
     pub active_at: DateTime<Utc>,
     pub now: DateTime<Utc>,
@@ -332,7 +363,7 @@ impl Evidence<'_> {
 /// that matches.
 pub fn classify(e: &Evidence<'_>) -> Reading {
     let below: Vec<&Stat> = e.tree.iter().skip(1).copied().collect();
-    said_rule(e, &below)
+    said_rule(e)
         .or_else(|| lock_rule(e, &below))
         .or_else(|| sleep_rule(e, &below))
         .or_else(|| input_rule(e, &below))
@@ -343,7 +374,7 @@ pub fn classify(e: &Evidence<'_>) -> Reading {
 }
 
 /// The open call's own wait, else its background shells' longest.
-fn said_rule(e: &Evidence<'_>, below: &[&Stat]) -> Option<Reading> {
+fn said_rule(e: &Evidence<'_>) -> Option<Reading> {
     let own = e
         .open_call
         .and_then(|c| Some((e.said.iter().find(|s| s.call == c.id)?, Some(c))));
@@ -354,9 +385,7 @@ fn said_rule(e: &Evidence<'_>, below: &[&Stat]) -> Option<Reading> {
         since: said.since,
         by: call.map(|c| c.tool.clone()),
         on: None,
-        pid: call
-            .and_then(|c| shell_since(below, c.since, e.now))
-            .map(|s| s.proc.pid),
+        pid: e.placed.get(&said.call).map(|s| s.proc.pid),
         call: Some(said.call.clone()),
     })
 }
@@ -579,10 +608,13 @@ mod tests {
         let tree = work(all, 100, Engine::Claude, None);
         let call = bash_call(11);
         let said = said.and_then(|line| appeared(&call, line, 10));
+        let open_call = said.as_ref().map(|_| &call);
+        let placed = placed(&tree, open_call, &[], now());
         classify(&Evidence {
             tree: &tree,
-            open_call: said.as_ref().map(|_| &call),
+            open_call,
             said: said.as_slice(),
+            placed: &placed,
             active_at: now() - Duration::minutes(active_ago),
             now: now(),
             poll: Duration::minutes(10),
@@ -692,43 +724,95 @@ mod tests {
         assert_eq!((other.call.as_str(), other.since), ("t2", at(8)));
     }
 
+    /// A Claude session's tool shells, each `(pid, ran, cpu)` with a
+    /// `cargo build` under it using the same CPU.
+    fn shells(each: &[(u32, u64, u64)]) -> Vec<Stat> {
+        claude(
+            each.iter()
+                .flat_map(|&(pid, ran, cpu)| {
+                    [
+                        Stat {
+                            elapsed_secs: ran,
+                            ..stat(pid, 100, SHELL)
+                        },
+                        Stat {
+                            elapsed_secs: ran,
+                            cpu_secs: cpu,
+                            ..stat(pid + 1, pid, "cargo build")
+                        },
+                    ]
+                })
+                .collect(),
+        )
+    }
+
+    #[test]
+    fn each_output_is_placed_in_a_shell_of_its_own() {
+        let born = |ran: i64| now() - Duration::seconds(ran);
+        let all = shells(&[(110, 300, 0), (120, 299, 0), (130, 60, 0)]);
+        let tree = work(&all, 100, Engine::Claude, None);
+        let call = OpenCall {
+            id: "t1".into(),
+            tool: "Bash".into(),
+            input: String::new(),
+            since: born(61),
+        };
+        let pids = |shells: &[(&str, DateTime<Utc>)], call| {
+            let mut pids: Vec<(String, u32)> = placed(&tree, call, shells, now())
+                .into_iter()
+                .map(|(id, s)| (id, s.proc.pid))
+                .collect();
+            pids.sort();
+            pids
+        };
+        let both = [("b2", born(299)), ("b1", born(300))];
+        assert_eq!(
+            pids(&both, Some(&call)),
+            [("b1".into(), 110), ("b2".into(), 120), ("t1".into(), 130)],
+            "launched a second apart, each its own"
+        );
+        assert_eq!(
+            pids(
+                &[("b1", born(300)), ("b2", born(299) + Duration::seconds(30))],
+                None
+            ),
+            [("b1".to_string(), 110)],
+            "one whose process is gone is placed in none started after it"
+        );
+        let early = OpenCall {
+            since: born(400),
+            ..call.clone()
+        };
+        assert_eq!(
+            pids(&both, Some(&early)),
+            [("b1".into(), 110), ("b2".into(), 120), ("t1".into(), 130)],
+            "the open call never takes a background shell's"
+        );
+    }
+
     #[test]
     fn a_background_shells_held_wait_ends_once_its_own_shell_works_again() {
-        let made = now() - Duration::minutes(5);
-        let tree = |own: u64, other: u64| {
-            claude(vec![
-                Stat {
-                    elapsed_secs: 300,
-                    ..stat(103, 100, SHELL)
-                },
-                Stat {
-                    elapsed_secs: 299,
-                    cpu_secs: own,
-                    ..stat(104, 103, "cargo build")
-                },
-                Stat {
-                    elapsed_secs: 60,
-                    cpu_secs: other,
-                    ..stat(105, 100, SHELL)
-                },
-            ])
-        };
-        let prev = runs(&work(&tree(0, 0), 100, Engine::Claude, None));
-        let held = said_after(None, "b9", &[BUSY.to_string()], made, false);
-        let then = |own, other| {
-            let all = tree(own, other);
-            let work = work(&all, 100, Engine::Claude, None);
-            let busy = shell_busy(&prev, &work, made, now());
-            said_after(held.clone(), "b9", &[], now(), busy)
+        let born = |ran: i64| now() - Duration::seconds(ran);
+        let before = shells(&[(110, 300, 0), (120, 299, 0)]);
+        let prev = runs(&work(&before, 100, Engine::Claude, None));
+        let held = said_after(None, "b1", &[BUSY.to_string()], born(300), false);
+        let then = |a: u64, b: u64| {
+            let all = shells(&[(110, 300, a), (120, 299, b)]);
+            let tree = work(&all, 100, Engine::Claude, None);
+            let placed = placed(&tree, None, &[("b1", born(300)), ("b2", born(299))], now());
+            let busy = placed
+                .get("b1")
+                .is_some_and(|head| active(&prev, &subtree(&tree, head)));
+            said_after(held.clone(), "b1", &[], now(), busy)
         };
         assert!(held.is_some());
         assert_eq!(then(0, 0), held, "its shell still idle");
-        assert_eq!(then(3, 0), None, "its own shell works again");
         assert_eq!(
-            then(0, 3),
-            held,
-            "a later call's shell working is not its own"
+            then(3, 0),
+            None,
+            "its own shell works again, its twin launched a second later idle"
         );
+        assert_eq!(then(0, 3), held, "its twin working is not its own");
     }
 
     #[test]
@@ -757,6 +841,7 @@ mod tests {
             tree: &tree,
             open_call: Some(&call),
             said: said.as_slice(),
+            placed: &placed(&tree, Some(&call), &[], now()),
             active_at: now(),
             now: now(),
             poll: Duration::minutes(10),
@@ -770,7 +855,7 @@ mod tests {
             ..call
         };
         assert_eq!(
-            shell_since(&tree, later.since, now()),
+            placed(&tree, Some(&later), &[], now()).get("toolu_1"),
             None,
             "no shell started since"
         );
@@ -811,6 +896,7 @@ mod tests {
                 tree: &tree,
                 open_call,
                 said,
+                placed: &HashMap::new(),
                 active_at: now(),
                 now: now(),
                 poll: Duration::minutes(10),
@@ -989,6 +1075,7 @@ mod tests {
             tree: &tree,
             open_call: Some(&call),
             said: &[],
+            placed: &HashMap::new(),
             active_at: now(),
             now: now(),
             poll: Duration::minutes(10),
