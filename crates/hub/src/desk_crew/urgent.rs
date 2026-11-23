@@ -10,7 +10,7 @@
 use serde_json::json;
 use uuid::Uuid;
 use workforce_desk::crew;
-use workforce_desk::line::{Rushed, TurnMark, Urgency, URGENT_PER_SESSION, URGENT_WINDOW};
+use workforce_desk::line::{TurnMark, Urgency, URGENT_PER_SESSION, URGENT_WINDOW};
 use workforce_desk::model::DeskEvent;
 
 use super::actions::{Action, Gate};
@@ -34,14 +34,6 @@ pub(crate) fn description() -> String {
 pub(crate) fn of(order: &Order, sender: &workforce_desk::LineSender) -> Option<Urgency> {
     (order.urgent && matches!(sender, workforce_desk::LineSender::Overseer(_)))
         .then_some(Urgency::Order)
-}
-
-/// What the boss is told of an urgent nudge to `name`, when its words aren't
-/// the usual ones for its delivery.
-pub(crate) fn told(name: &str, rushed: Option<Rushed>) -> Option<String> {
-    rushed
-        .and_then(Rushed::said)
-        .map(|said| format!("told {name}; {said}"))
 }
 
 /// The stand-down an interrupt is for, as a suggestion to interrupt

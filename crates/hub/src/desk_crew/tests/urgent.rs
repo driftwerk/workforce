@@ -35,6 +35,14 @@ async fn working(d: &Desk, base: &Path, name: &str) -> (uuid::Uuid, String) {
     (s.id, url)
 }
 
+/// Whether a nudge's result says `did` and that it is queued, not yet
+/// delivered, waiting on `why`.
+fn queued(out: &Value, did: &str, why: &str) -> bool {
+    out["done"]
+        .as_str()
+        .is_some_and(|d| d.starts_with(&format!("{did}: queued, not yet delivered; {why}.")))
+}
+
 fn done() -> Value {
     json!({"hook_event_name": "PostToolUse", "tool_name": "Bash",
         "tool_input": {"command": "gh run watch 4411"}})
@@ -97,8 +105,12 @@ async fn an_urgent_nudge_is_read_with_the_next_tool_call_and_the_boss_is_told_ho
             true,
         )
         .await;
-        assert_eq!(
-            out["done"], "told release-prep; it reads it with its next tool call's result",
+        assert!(
+            queued(
+                &out,
+                "told release-prep",
+                "it reads it with its next tool call's result"
+            ),
             "{out}"
         );
         let said = hook(&url, done()).await;
@@ -113,8 +125,8 @@ async fn an_urgent_nudge_is_read_with_the_next_tool_call_and_the_boss_is_told_ho
 
         // Without urgent, as before: at its turn's end.
         let out = nudge(&overseer, s, "Then write the release notes.", false).await;
-        assert_eq!(
-            out["done"], "told release-prep; it gets it once its turn ends",
+        assert!(
+            queued(&out, "told release-prep", "it gets it once its turn ends"),
             "{out}"
         );
         assert_eq!(hook(&url, done()).await, json!({}));
@@ -140,9 +152,12 @@ async fn an_urgent_nudge_a_session_cant_take_mid_turn_or_past_the_limit_waits_an
         )
         .await;
         let out = nudge(&overseer, s, "Stop: don't start release 4.", true).await;
-        assert_eq!(
-            out["done"],
-            "told user-flip; a dialog in its terminal waits on an answer: it gets it once that is answered and its turn ends",
+        assert!(
+            queued(
+                &out,
+                "told user-flip",
+                "a dialog in its terminal waits on an answer: it gets it once that is answered and its turn ends"
+            ),
             "{out}"
         );
 
@@ -153,9 +168,12 @@ async fn an_urgent_nudge_a_session_cant_take_mid_turn_or_past_the_limit_waits_an
             assert!(out["done"].as_str().unwrap().contains("next tool call"), "{i}: {out}");
         }
         let out = nudge(&overseer, t, "Correction 3: use the staging DB.", true).await;
-        assert_eq!(
-            out["done"],
-            "told second-batch; it gets it once its turn ends: it was sent 3 urgent orders in the last 10 minutes, so this one queues",
+        assert!(
+            queued(
+                &out,
+                "told second-batch",
+                "it gets it once its turn ends: it was sent 3 urgent orders in the last 10 minutes, so this one queues"
+            ),
             "{out}"
         );
     })
@@ -446,8 +464,10 @@ async fn a_relayed_urgent_nudge_keeps_its_urgency_as_the_machine_performs_it() {
             .perform_with(&nudge_action(s, "Don't dispatch release 4."), by, &order)
             .await
             .unwrap();
-        assert_eq!(
-            said, "told acme-api; it reads it with its next tool call's result",
+        assert!(
+            said.starts_with(
+                "told acme-api: queued, not yet delivered; it reads it with its next tool call's result."
+            ),
             "{said}"
         );
         let row = d

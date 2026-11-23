@@ -5,7 +5,7 @@
 //! they are reminded until it is answered; and settled anywhere, it is
 //! closed and said so in one line.
 
-use workforce_desk::line::{Delivery, LineKind};
+use workforce_desk::line::LineKind;
 use workforce_desk::open_item::{ClosedBy, OpenItem, OpenState};
 
 use super::super::actions::{Action, Target};
@@ -268,7 +268,7 @@ async fn a_held_sessions_holding_reply_after_its_wait_is_the_persons_leaves_it_o
             .into_iter()
             .rfind(|m| m.text.contains("until I answer"))
             .unwrap();
-        let _ = d.store().line_take(hold.id, Delivery::Delivered).await;
+        let _ = d.store().line_went_in(hold.id).await;
         // Desk looks before the session replies: the person has it.
         crew.look_for_silent_waits().await;
         let wait = the_wait(&d, s.id).await;
@@ -331,7 +331,7 @@ async fn a_bosss_hold_is_the_persons_at_once_and_its_decision_closes_it() {
             .into_iter()
             .rfind(|m| m.text.contains("until I answer"))
             .unwrap();
-        let _ = d.store().line_take(hold.id, Delivery::Delivered).await;
+        let _ = d.store().line_went_in(hold.id).await;
         // It says it holds, in words that ask nothing: it waits all the same.
         d.line_call(
             s.id,
@@ -380,7 +380,7 @@ async fn a_bosss_hold_is_the_persons_at_once_and_its_decision_closes_it() {
             .into_iter()
             .rfind(|m| m.text.starts_with("Decision: (b)"))
             .expect("the decision is sent, never a repeat of the hold");
-        let _ = d.store().line_take(decided.id, Delivery::Delivered).await;
+        let _ = d.store().line_went_in(decided.id).await;
         let done = closed(&d, wait.id).await;
         assert_eq!(done.closed_by, Some(ClosedBy::Boss));
         let ack = eventually("the one line", async || {
@@ -422,7 +422,7 @@ async fn a_bosss_own_hold_is_no_pop_up_for_the_person() {
             .into_iter()
             .rfind(|m| m.text.contains("until I answer"))
             .unwrap();
-        let _ = d.store().line_take(hold.id, Delivery::Delivered).await;
+        let _ = d.store().line_went_in(hold.id).await;
         tokio::time::sleep(std::time::Duration::from_millis(1_500)).await;
         crew.look_at_items().await;
         let open = d.store().items_not_closed(Some("desk")).await.unwrap();
