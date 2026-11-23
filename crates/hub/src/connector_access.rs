@@ -209,6 +209,7 @@ mod tests {
         "email.get_attachment",
         "email.search",
         "email.contacts",
+        "email.unsubscribe_lists",
         "jira.search",
         "jira.get_issue",
         "jira.list_comments",

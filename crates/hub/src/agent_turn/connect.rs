@@ -78,6 +78,10 @@ pub struct ConnectWaiter {
     pub session_id: String,
     pub message_id: String,
     pub principal: TurnPrincipal,
+    /// The guard of the turn that waits, when it read outside content: the
+    /// rerun runs under it, whatever the session's other turns did since.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_scope: Option<serde_json::Value>,
 }
 
 /// The logins of the person's own that a sign-in would make serve the call,
@@ -217,6 +221,7 @@ fn waiter_of(agent_id: &str, session: &Session, person: Uuid) -> Option<serde_js
         session_id: session.id.clone(),
         message_id: message.id.clone(),
         principal,
+        content_scope: crate::monitor::scope::paused_scope(),
     })
     .ok()
 }

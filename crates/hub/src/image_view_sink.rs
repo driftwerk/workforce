@@ -351,6 +351,7 @@ mod tests {
                 thread_id: None,
                 files: vec![self.file.clone()],
                 bot_id: None,
+                outside: false,
             }])
         }
 

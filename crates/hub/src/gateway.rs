@@ -825,7 +825,12 @@ pub fn router(state: Arc<GatewayState>) -> Router {
         // Channel monitor CRUD endpoints
         .route("/api/monitors/export", get(monitor_export))
         .route("/api/monitors", get(monitor_list))
+        .route("/api/monitors/sort-rules", get(monitor_sort_rules))
         .route("/api/monitors/{id}/source", get(monitor_get_source))
+        .route(
+            "/api/monitors/{id}/enabled",
+            axum::routing::put(monitor_enabled_put),
+        )
         .route(
             "/api/monitors/{id}",
             axum::routing::put(monitor_put).delete(monitor_delete),
@@ -3555,6 +3560,8 @@ pub(crate) async fn forward_local_progress(
                 "compact_start",
                 String::new(),
             )),
+            // Desk shows no previews of links: nothing to mark.
+            ProgressEvent::OutsideContent { .. } => None,
             ProgressEvent::CompactEnd => Some(BroadcastMessage::new(
                 sid.clone(),
                 "compact_end",
@@ -5824,14 +5831,7 @@ fn is_conversational_channel(channel: &str) -> bool {
 
 /// Identity files that can be read/written via the API. HEARTBEAT.md is the
 /// agent's check-in list, which Desk edits beside the others.
-const ALLOWED_IDENTITY_FILES: &[&str] = &[
-    "SOUL.md",
-    "AGENTS.md",
-    "TOOLS.md",
-    "IDENTITY.md",
-    "WELCOME.md",
-    "HEARTBEAT.md",
-];
+const ALLOWED_IDENTITY_FILES: &[&str] = workforce_agent::security::monitor::IDENTITY_FILES;
 
 /// Helper: resolve an agent service by ID, returning an appropriate error.
 pub(crate) fn resolve_agent(
@@ -6140,30 +6140,44 @@ async fn get_agent_mentions(
 /// `GET /api/agents/{id}/tools` — Agent tools with full JSON schemas.
 async fn get_agent_tools(
     Path(id): Path<String>,
-    Query(query): Query<WsQuery>,
+    Query(query): Query<AgentToolsQuery>,
     headers: axum::http::HeaderMap,
     State(state): State<Arc<GatewayState>>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
     let service = authorise_agent_read(&state, &headers, query.token.as_deref(), &id).await?;
-
-    let defs = service.tools.definitions();
-
-    let tools: Vec<serde_json::Value> = defs
-        .iter()
-        .map(|d| {
-            serde_json::json!({
-                "name": d.name,
-                "description": d.description,
-                "input_schema": d.input_schema,
-            })
-        })
-        .collect();
+    let tools = tools_listed(&service.tools.definitions(), query.names);
 
     Ok(Json(serde_json::json!({
         "agent_id": id,
         "total": tools.len(),
         "tools": tools,
     })))
+}
+
+#[derive(Debug, Deserialize)]
+struct AgentToolsQuery {
+    token: Option<String>,
+    /// Only each tool's name: what a client asking whether the agent has a
+    /// tool needs, without every schema.
+    #[serde(default)]
+    names: bool,
+}
+
+/// The agent's tools as `GET /api/agents/{id}/tools` lists them.
+fn tools_listed(
+    defs: &[workforce_agent::tools::ToolDefinition],
+    names: bool,
+) -> Vec<serde_json::Value> {
+    defs.iter()
+        .map(|d| match names {
+            true => serde_json::json!({ "name": d.name }),
+            false => serde_json::json!({
+                "name": d.name,
+                "description": d.description,
+                "input_schema": d.input_schema,
+            }),
+        })
+        .collect()
 }
 
 /// `GET /api/agents/{id}/identity/{filename}` — Read an identity file.
@@ -7232,7 +7246,8 @@ async fn list_tools(
 
 #[cfg(test)]
 mod tool_union_tests {
-    use super::{dedup_tools_by_name, tool_provenance};
+    use super::{dedup_tools_by_name, tool_provenance, tools_listed};
+
     use workforce_agent::tools::ToolDefinition;
 
     fn td(name: &str, description: &str) -> ToolDefinition {
@@ -7241,6 +7256,19 @@ mod tool_union_tests {
             description: description.to_string(),
             input_schema: serde_json::json!({}),
         }
+    }
+
+    #[test]
+    fn an_agents_tools_are_listed_whole_or_by_name_alone() {
+        let defs = [td("email.inbox", "Read the inbox")];
+        assert_eq!(
+            tools_listed(&defs, true),
+            vec![serde_json::json!({ "name": "email.inbox" })]
+        );
+        assert_eq!(
+            tools_listed(&defs, false)[0]["description"],
+            "Read the inbox"
+        );
     }
 
     #[test]
@@ -11851,6 +11879,80 @@ async fn monitor_list(
     .await;
     let defs = monitor_engine(&state)?.list_visible(&listing).await;
     Ok(Json(serde_json::json!({ "monitors": defs })))
+}
+
+/// The caller's own mail sort rules, in words, each with the other
+/// monitors that watch the mail it takes: never a colleague's, though an
+/// administrator may see their monitors.
+async fn monitor_sort_rules(
+    Query(query): Query<WsQuery>,
+    headers: axum::http::HeaderMap,
+    State(state): State<Arc<GatewayState>>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let caller = resolve_caller_context(&state, &headers, query.token.as_deref()).await;
+    if !caller.is_authenticated() {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+    let listing = caller_listing(
+        &state,
+        &caller,
+        workforce_orchestrator::workflow_store::KIND_MONITOR,
+    )
+    .await;
+    let engine = monitor_engine(&state)?;
+    let monitors = crate::monitor::sort_rule::mail_monitors(
+        engine.definitions(),
+        engine.list_visible(&listing).await,
+    )
+    .await;
+    let rules = caller.identity_id.as_deref().map_or_else(Vec::new, |me| {
+        crate::monitor::sort_rule::rules_in(&monitors, me)
+    });
+    Ok(Json(serde_json::json!({ "rules": rules })))
+}
+
+#[derive(serde::Deserialize)]
+struct EnabledBody {
+    enabled: bool,
+}
+
+/// Pause or resume a monitor.
+async fn monitor_enabled_put(
+    Path(id): Path<String>,
+    Query(query): Query<DefRefQuery>,
+    headers: axum::http::HeaderMap,
+    State(state): State<Arc<GatewayState>>,
+    Json(body): Json<EnabledBody>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let ctx = resolve_def_write(
+        &state,
+        &headers,
+        query.token.as_deref(),
+        workforce_orchestrator::workflow_store::KIND_MONITOR,
+        &id,
+        query.owner.as_deref(),
+        crate::def_write_auth::DefOp::Save,
+    )
+    .await?;
+    let engine =
+        monitor_engine(&state).map_err(|s| (s, "monitor engine unavailable".to_string()))?;
+    if engine
+        .definitions()
+        .stored_definition(&id, ctx.owner.as_deref())
+        .await
+        .is_none()
+    {
+        return Err((StatusCode::NOT_FOUND, format!("Unknown monitor '{id}'.")));
+    }
+    let edit =
+        workforce_orchestrator::workflow_store::EditContext::new("web", ctx.actor.as_deref());
+    engine
+        .set_enabled(&id, ctx.owner.as_deref(), body.enabled, edit)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
+    Ok(Json(
+        serde_json::json!({ "monitor_id": id, "enabled": body.enabled }),
+    ))
 }
 
 async fn monitor_get_source(

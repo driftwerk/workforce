@@ -28,13 +28,16 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use serde_json::{json, Value};
-use workforce_agent::runner::CURRENT_AGENT_ID;
+use workforce_agent::runner::{CURRENT_AGENT_ID, CURRENT_AUTOMATED_ORIGIN};
 use workforce_agent::tools::access::ToolAccessSnapshot;
 use workforce_agent::tools::dispatch::{execute_gated, unattended_refusal, GateOutcome, ToolGates};
 use workforce_agent::tools::registry::ToolRegistry;
 use workforce_common::session::TurnPrincipal;
 use workforce_policy::engine::PolicyEngine;
 use workforce_wasm_runtime::manifest::is_denied_tool;
+
+/// What a tool a monitor calls is told it descends from.
+const MONITOR_ORIGIN: &str = "monitor";
 
 /// How a monitor's missing tool is loaded: the agent's own path to it.
 const ENABLE_SKILL: &str = "system.enable_skill";
@@ -129,6 +132,11 @@ pub trait ToolInvoke: Send + Sync {
     /// nothing, so a monitor that failed for a missing tool can be polled
     /// again as soon as it registers.
     fn has(&self, tool: &str) -> bool;
+
+    /// The tools loaded on the agent now; none where the invoker can't say.
+    fn loaded(&self) -> Vec<String> {
+        Vec::new()
+    }
 
     async fn invoke(&self, call: ToolCall<'_>) -> Result<Value, InvokeError>;
 }
@@ -366,7 +374,10 @@ impl GovernedInvoker {
         let run = CURRENT_AGENT_ID
             .scope(
                 gates.agent_id.as_str().to_string(),
-                execute_gated(&self.tools, &(self.access)(), tool, &input, exec_input),
+                CURRENT_AUTOMATED_ORIGIN.scope(
+                    MONITOR_ORIGIN.to_string(),
+                    execute_gated(&self.tools, &(self.access)(), tool, &input, exec_input),
+                ),
             )
             .await;
         if let Some(reason) = run.deny_reason {
@@ -400,6 +411,10 @@ impl ToolInvoke for GovernedInvoker {
 
     fn has(&self, tool: &str) -> bool {
         self.tools.get(tool).is_some()
+    }
+
+    fn loaded(&self) -> Vec<String> {
+        self.tools.names()
     }
 
     async fn invoke(&self, call: ToolCall<'_>) -> Result<Value, InvokeError> {
@@ -489,6 +504,7 @@ mod tests {
                 surface_allows: None,
                 computer_gate: None,
                 arguments: ArgumentValidation::Off,
+                content_guard: None,
             }),
             Arc::new(ToolAccessSnapshot::default),
             None,
@@ -528,6 +544,7 @@ mod tests {
                 surface_allows: None,
                 computer_gate: None,
                 arguments: ArgumentValidation::Off,
+                content_guard: None,
             }),
             Arc::new(move || ToolAccessSnapshot::new(blocked.clone())),
             None,
@@ -789,6 +806,7 @@ mod tests {
                 surface_allows: None,
                 computer_gate: None,
                 arguments: ArgumentValidation::Off,
+                content_guard: None,
             }),
             Arc::new(ToolAccessSnapshot::default),
             Some(load),

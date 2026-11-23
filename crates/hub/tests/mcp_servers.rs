@@ -62,6 +62,7 @@ fn config_for(server_uri: &str) -> WorkforceConfig {
             workspace: None,
             env: None,
             default: false,
+            external: false,
         },
     );
     config.mcp.servers = servers;

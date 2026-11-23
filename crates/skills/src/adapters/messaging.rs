@@ -21,6 +21,17 @@ use crate::adapters::messaging_routing::{
 };
 use crate::adapters::utils::{coerce_to_u64, decode_upload_content};
 
+/// The messaging tools that only look.
+pub const READS: &[&str] = &[
+    "messaging.read",
+    "messaging.read_thread",
+    "messaging.channel_info",
+    "messaging.member_info",
+    "messaging.whoami",
+    "messaging.list_pins",
+    "messaging.emoji_list",
+];
+
 const DEDUP_WINDOW: Duration = Duration::from_secs(10);
 
 async fn resolve_for_channel(
@@ -79,12 +90,17 @@ async fn resolve_for_workspace(
         .ok_or_else(|| eyre::eyre!("no {platform} surface registered for this agent"))
 }
 
+/// A message read from a channel, its words fenced as outside content:
+/// whoever wrote them, they are not the person's instruction.
 fn channel_message_to_json(m: &ChannelMessage) -> serde_json::Value {
     serde_json::json!({
         "user": m.user,
         "user_name": m.user_name,
         "channel_name": m.channel_name,
-        "text": m.text,
+        "text": crate::adapters::utils::wrap_field(
+            Some(&serde_json::Value::String(m.text.clone())),
+            "a channel message",
+        ),
         "timestamp": m.timestamp,
         "message_id": m.message_id,
         "thread_id": m.thread_id,
@@ -245,6 +261,9 @@ impl Tool for MessagingSendTool {
             username: None,
             icon_url: None,
             blocks: None,
+            // A turn that read outside content may be posting it on.
+            outside: workforce_agent::runner::caller_content_guard()
+                .is_some_and(|guard| guard.armed().is_some()),
         };
 
         let surface = resolve_for_channel(&self.surfaces, &input, channel).await?;
@@ -300,6 +319,10 @@ impl MessagingReadTool {
 impl Tool for MessagingReadTool {
     fn name(&self) -> &str {
         "messaging.read"
+    }
+
+    fn reads_outside_content(&self) -> bool {
+        true
     }
 
     fn surface_effect(&self, _input: &serde_json::Value) -> Option<SurfaceEffect> {
@@ -669,6 +692,10 @@ impl Tool for MessagingReadThreadTool {
         "messaging.read_thread"
     }
 
+    fn reads_outside_content(&self) -> bool {
+        true
+    }
+
     fn surface_effect(&self, _input: &serde_json::Value) -> Option<SurfaceEffect> {
         Some(SurfaceEffect::Reads)
     }
@@ -955,6 +982,10 @@ impl Tool for MessagingListPinsTool {
         "messaging.list_pins"
     }
 
+    fn reads_outside_content(&self) -> bool {
+        true
+    }
+
     fn surface_effect(&self, _input: &serde_json::Value) -> Option<SurfaceEffect> {
         Some(SurfaceEffect::Reads)
     }
@@ -1049,6 +1080,10 @@ impl MessagingMemberInfoTool {
 impl Tool for MessagingMemberInfoTool {
     fn name(&self) -> &str {
         "messaging.member_info"
+    }
+
+    fn reads_outside_content(&self) -> bool {
+        true
     }
 
     fn surface_effect(&self, _input: &serde_json::Value) -> Option<SurfaceEffect> {
@@ -1610,6 +1645,10 @@ impl Tool for MessagingChannelInfoTool {
         "messaging.channel_info"
     }
 
+    fn reads_outside_content(&self) -> bool {
+        true
+    }
+
     fn surface_effect(&self, _input: &serde_json::Value) -> Option<SurfaceEffect> {
         Some(SurfaceEffect::Reads)
     }
@@ -1755,6 +1794,7 @@ mod tests {
                 thread_id: None,
                 files: vec![],
                 bot_id: None,
+                outside: false,
             }])
         }
 
@@ -1784,6 +1824,7 @@ mod tests {
                     thread_id: Some(thread_ts.to_string()),
                     files: vec![],
                     bot_id: None,
+                    outside: false,
                 },
                 ChannelMessage {
                     channel: channel.to_string(),
@@ -1796,6 +1837,7 @@ mod tests {
                     thread_id: Some(thread_ts.to_string()),
                     files: vec![],
                     bot_id: None,
+                    outside: false,
                 },
             ])
         }
@@ -2294,8 +2336,12 @@ mod tests {
         assert_eq!(result.output["thread_id"], "100.001");
         assert_eq!(result.output["count"], 2);
         let messages = result.output["messages"].as_array().unwrap();
-        assert_eq!(messages[0]["text"], "parent message");
-        assert_eq!(messages[1]["text"], "reply");
+        // What each says is fenced as outside content.
+        for (message, said) in messages.iter().zip(["parent message", "reply"]) {
+            let text = message["text"].as_str().unwrap();
+            assert!(text.starts_with(workforce_agent::security::monitor::FENCE_MARK));
+            assert!(text.contains(said), "{text}");
+        }
     }
 
     #[tokio::test]

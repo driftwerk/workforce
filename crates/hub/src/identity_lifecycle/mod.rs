@@ -96,6 +96,8 @@ pub enum Category {
     Skills,
     GameTallies,
     Pictures,
+    /// Bulk mail jobs kept so they can be carried on and undone.
+    MailJobs,
     Signals,
     /// What agents did on the person's computer through Desk, and the
     /// browser screenshots that activity names.
@@ -107,7 +109,7 @@ pub enum Category {
 }
 
 impl Category {
-    pub const ALL: [Category; 35] = [
+    pub const ALL: [Category; 36] = [
         Self::IdentityRecord,
         Self::RemoteMcpTokens,
         Self::Devices,
@@ -137,6 +139,7 @@ impl Category {
         Self::Skills,
         Self::GameTallies,
         Self::Pictures,
+        Self::MailJobs,
         Self::Signals,
         Self::DeskActivity,
         Self::CostLedger,
@@ -182,7 +185,7 @@ impl Category {
             ),
             Self::Skills => (M::Move, D::Transfer),
             Self::Signals | Self::DeskActivity => (M::Move, D::Erase),
-            Self::Pictures => (M::Move, D::Erase),
+            Self::Pictures | Self::MailJobs => (M::Move, D::Erase),
             Self::CostLedger => (M::Move, D::Keep),
             Self::AuditRecords => (M::Keep, D::Keep),
             Self::ConfigReferences => (M::Report, D::Report),
@@ -198,6 +201,7 @@ impl Category {
             | Self::TrainingCorpora
             | Self::GameTallies
             | Self::Pictures
+            | Self::MailJobs
             | Self::Signals
             | Self::DeskActivity
             | Self::CostLedger => OrphanRule::Personal,
@@ -252,6 +256,7 @@ impl Category {
             | Self::Skills
             | Self::GameTallies
             | Self::Pictures
+            | Self::MailJobs
             | Self::Signals
             | Self::DeskActivity
             | Self::CostLedger
@@ -298,6 +303,7 @@ impl Category {
             Self::Skills => "skills",
             Self::GameTallies => "game_tallies",
             Self::Pictures => "pictures",
+            Self::MailJobs => "mail_jobs",
             Self::Signals => "signals",
             Self::DeskActivity => "desk_activity",
             Self::CostLedger => "cost_ledger",
@@ -880,6 +886,7 @@ pub fn pausable(category: Category) -> Option<&'static dyn Pausable> {
         | Category::Skills
         | Category::GameTallies
         | Category::Pictures
+        | Category::MailJobs
         | Category::Signals
         | Category::DeskActivity
         | Category::CostLedger
@@ -915,6 +922,7 @@ pub fn holding(category: Category) -> &'static dyn Holding {
         Category::PersonalFiles => &conversations::PersonalFiles,
         Category::GameTallies => &conversations::GameTallies,
         Category::Pictures => &records::Pictures,
+        Category::MailJobs => &records::MailJobs,
         Category::Signals => &conversations::Signals,
         Category::DeskActivity => &records::DeskActivity,
         Category::CostLedger => &conversations::CostLedger,

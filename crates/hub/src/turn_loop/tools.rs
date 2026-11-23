@@ -26,11 +26,7 @@ pub(crate) fn survives_exclusive_filter(name: &str) -> bool {
         || name == workforce_agent::spill::RETRIEVE_TOOL_NAME
 }
 
-/// Whether `name` is the tool `entry` names, or one under its namespace.
-pub(crate) fn names_tool(entry: &str, name: &str) -> bool {
-    name.strip_prefix(entry)
-        .is_some_and(|rest| rest.is_empty() || rest.starts_with('.'))
-}
+pub(crate) use workforce_agent::runner::names_tool;
 
 /// Whether an exclusive surface for `whitelist` keeps `name`.
 fn whitelisted(whitelist: &[String], name: &str) -> bool {
@@ -117,6 +113,7 @@ pub(crate) fn stamp_tool_whitelist(session: &mut Session) {
         workforce_agent::runner::tool_whitelist().filter(|whitelist| whitelist.owns_session)
     {
         session.set_tool_whitelist(&whitelist.tools);
+        crate::monitor::scope::keep(session);
     }
 }
 
@@ -431,6 +428,59 @@ pub(crate) mod tests {
         expected.sort();
         assert_eq!(sorted(kept.names()), expected);
         assert_eq!(source.len(), 11, "the source registry is untouched");
+    }
+
+    #[test]
+    fn a_monitors_turn_is_offered_its_reads_and_delivery_and_nothing_else() {
+        let source = registry(&[
+            "email.read",
+            "email.search",
+            "email.send",
+            "email.forward",
+            "email.move",
+            "email.rules",
+            "messaging.read",
+            "messaging.send",
+            "vault.get",
+            "exec.run",
+            "monitor",
+            "scheduler",
+            "system.enable_skill",
+            "tool.describe",
+            "program_run",
+            "web.fetch",
+        ]);
+        let delivery = crate::monitor::scope::Delivery::Posts {
+            surface: "slack",
+            dest: "C1",
+            deliver_to: "#ops",
+        };
+        let offered = |named: &[String]| {
+            let tools = crate::monitor::scope::turn_tools(&delivery, named);
+            sorted(exclusive_registry(&source, &tools).names())
+                .into_iter()
+                .filter(|name| !RETRIEVAL.contains(&name.as_str()))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            offered(&[]),
+            [
+                "email.read",
+                "email.search",
+                "messaging.read",
+                "messaging.send"
+            ]
+        );
+        assert_eq!(
+            offered(&["email.move".into()]),
+            [
+                "email.move",
+                "email.read",
+                "email.search",
+                "messaging.read",
+                "messaging.send"
+            ]
+        );
     }
 
     #[test]

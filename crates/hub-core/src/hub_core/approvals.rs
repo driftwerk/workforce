@@ -63,6 +63,10 @@ pub struct PendingApproval {
     /// turn resumed on its decision carries too. `None` where it carried
     /// none, and for rows written before this was recorded.
     pub origin: Option<String>,
+    /// The guard of the turn that asked, armed by outside content it read:
+    /// the turn resumed on the decision runs under it. `None` when it read
+    /// none, and for rows written before this was kept.
+    pub content_scope: Option<serde_json::Value>,
 }
 
 impl PendingApproval {

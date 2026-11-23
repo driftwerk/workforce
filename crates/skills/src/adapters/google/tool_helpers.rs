@@ -32,6 +32,27 @@ pub struct GoogleTool {
     effect: Option<EffectFn>,
 }
 
+/// The Google tools that return what someone else wrote (a message, an
+/// event's description, a shared document): a turn that reads one is
+/// guarded from then on.
+pub const OUTSIDE_READS: &[&str] = &[
+    "google.gmail.search",
+    "google.gmail.get",
+    "google.gmail.attachment",
+    "google.gmail.thread_get",
+    "google.gmail.history",
+    "google.chat.messages_list",
+    "google.chat.threads_list",
+    "google.calendar.events",
+    "google.calendar.event_get",
+    "google.calendar.search",
+    "google.docs.cat",
+    "google.drive.download",
+    "google.drive.comments_list",
+    "google.sheets.get",
+    "google.slides.read_slide",
+];
+
 impl GoogleTool {
     pub fn new(
         name: impl Into<String>,
@@ -71,6 +92,10 @@ impl Tool for GoogleTool {
 
     fn surface_effect(&self, input: &serde_json::Value) -> Option<SurfaceEffect> {
         self.effect.map(|effect| effect(input))
+    }
+
+    fn reads_outside_content(&self) -> bool {
+        OUTSIDE_READS.contains(&self.name.as_str())
     }
 
     async fn execute(&self, input: serde_json::Value) -> Result<ToolResult> {

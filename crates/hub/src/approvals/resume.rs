@@ -93,44 +93,63 @@ pub async fn launch_resume(
         true => crate::boss_links::wake::ORIGIN.to_string(),
         false => row.origin.clone().unwrap_or_default(),
     };
+    // Whether the resumed turn read outside content: its answer is then
+    // posted marked so.
+    let armed = workforce_agent::security::monitor::Armed::new();
+    // The asking turn's guard, kept on its row: the continuation runs under
+    // it, whatever the session's other turns did meanwhile.
+    let kept = row
+        .content_scope
+        .as_ref()
+        .map(|kept| crate::monitor::scope::guard_of(kept, &row.request_id));
+    if let Some(guard) = &kept {
+        guard.kept_by(armed.keeper());
+    }
     let result = workforce_agent::runner::CURRENT_AUTOMATED_ORIGIN
-        .scope(origin, async {
-            match outcome {
-                ApprovalOutcome::Approved => {
-                    let pre = PreExecutedTool {
-                        tool_name: row.tool_name.clone(),
-                        tool_input: row.tool_input.clone(),
-                    };
-                    with_desk(
-                        desk,
-                        CURRENT_CHANNEL_ID.scope(
-                            channel_id.clone(),
-                            CURRENT_THREAD_ID.scope(
-                                thread_id.clone(),
-                                CURRENT_PREEXECUTE.scope(pre, run_turn(svc, row, &directive)),
-                            ),
-                        ),
-                    )
-                    .await
-                }
-                ApprovalOutcome::Denied | ApprovalOutcome::Expired => {
-                    with_desk(
-                        desk,
-                        CURRENT_CHANNEL_ID.scope(
-                            channel_id.clone(),
-                            CURRENT_THREAD_ID
-                                .scope(thread_id.clone(), run_turn(svc, row, &directive)),
-                        ),
-                    )
-                    .await
-                }
-            }
-        })
+        .scope(
+            origin,
+            workforce_agent::runner::with_content_guard(
+                kept,
+                workforce_agent::runner::with_guard_keeper(Some(armed.keeper()), async {
+                    match outcome {
+                        ApprovalOutcome::Approved => {
+                            let pre = PreExecutedTool {
+                                tool_name: row.tool_name.clone(),
+                                tool_input: row.tool_input.clone(),
+                            };
+                            with_desk(
+                                desk,
+                                CURRENT_CHANNEL_ID.scope(
+                                    channel_id.clone(),
+                                    CURRENT_THREAD_ID.scope(
+                                        thread_id.clone(),
+                                        CURRENT_PREEXECUTE
+                                            .scope(pre, run_turn(svc, row, &directive)),
+                                    ),
+                                ),
+                            )
+                            .await
+                        }
+                        ApprovalOutcome::Denied | ApprovalOutcome::Expired => {
+                            with_desk(
+                                desk,
+                                CURRENT_CHANNEL_ID.scope(
+                                    channel_id.clone(),
+                                    CURRENT_THREAD_ID
+                                        .scope(thread_id.clone(), run_turn(svc, row, &directive)),
+                                ),
+                            )
+                            .await
+                        }
+                    }
+                }),
+            ),
+        )
         .await;
 
     match result {
         Ok(response) if !response.trim().is_empty() => {
-            deliver(svc, row, &response).await;
+            deliver(svc, row, &response, armed.is_armed()).await;
         }
         Ok(_) => {}
         Err(e) => {
@@ -193,10 +212,11 @@ fn directive_for(row: &PendingApproval, outcome: ApprovalOutcome, resolver: &str
     }
 }
 
-/// Deliver the resumed turn's final text to the original conversation:
+/// Deliver the resumed turn's `response` to the original conversation:
 /// its Slack thread, mirroring the scheduler's surface fan-out, else the
-/// Desk conversation it answers to.
-async fn deliver(svc: &Arc<AgentService>, row: &PendingApproval, response: &str) {
+/// Desk conversation it answers to. `outside` when that turn read outside
+/// content, so the post is marked so.
+async fn deliver(svc: &Arc<AgentService>, row: &PendingApproval, response: &str, outside: bool) {
     let Some(channel) = row.channel_id.clone().filter(|c| !c.is_empty()) else {
         let session = svc
             .sessions
@@ -240,6 +260,7 @@ async fn deliver(svc: &Arc<AgentService>, row: &PendingApproval, response: &str)
                 username: None,
                 icon_url: None,
                 blocks: None,
+                outside,
             })
             .await
         {

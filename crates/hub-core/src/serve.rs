@@ -70,10 +70,11 @@ pub enum IsolatedRoute {
 
 /// Metadata a turn computes for itself and nothing else writes: the observed
 /// prompt size and the calibration ratio derived from it (which drive the
-/// context estimate compaction keys on), the round-cap record, and the CLI
-/// transcript its turns continue.
-const TURN_OWNED_METADATA: [&str; 5] = [
+/// context estimate compaction keys on), the round-cap record, the CLI
+/// transcript its turns continue, and its guard while it is unfinished.
+const TURN_OWNED_METADATA: [&str; 6] = [
     "observed_input_tokens",
+    workforce_common::session::TURN_CONTENT_SCOPE,
     "estimate_calibration",
     "round_cap_continuation",
     crate::hub_core::subscriptions::CliKind::ClaudeCode.slot_key(),
@@ -356,7 +357,7 @@ pub fn build_prior_messages_reading<'m>(
                 if text.trim().is_empty() {
                     continue;
                 }
-                LlmMessage::assistant(&*text)
+                LlmMessage::assistant(&*told_as_data(msg, text))
             }
             MessageRole::Tool => {
                 if shared.is_some_and(|s| msg.actor.as_deref() != Some(s.viewer.as_str())) {
@@ -375,6 +376,27 @@ pub fn build_prior_messages_reading<'m>(
     }
 
     result
+}
+
+/// What a monitor told carries what it saw, from outside: `text` fenced to
+/// be read back as data, never as the agent's own words.
+pub fn what_a_monitor_saw(text: &str) -> String {
+    workforce_agent::security::external_content::wrap_external_content(text, "what a monitor saw")
+        .wrapped_content
+}
+
+/// What a monitor told in Desk, read back as data ([`what_a_monitor_saw`]).
+fn told_as_data<'m>(
+    msg: &SessionMessage,
+    text: std::borrow::Cow<'m, str>,
+) -> std::borrow::Cow<'m, str> {
+    let by_monitor = msg.desk.as_ref().and_then(|mark| mark.delivery)
+        == Some(workforce_common::channels::desk::DeliveryKind::Monitor);
+    if by_monitor {
+        std::borrow::Cow::Owned(what_a_monitor_saw(&text))
+    } else {
+        text
+    }
 }
 
 /// Append `msg` to `result`, merging into the last entry when both are same-role text.
@@ -2817,6 +2839,9 @@ impl AgentService {
             surface_allows,
             computer_gate: self.computer_gate(),
             arguments: self.config.tools.validation.mode,
+            // The turn's guard when a guarded turn (a monitor's, a
+            // workflow step's, a resumed one) binds them.
+            content_guard: workforce_agent::runner::caller_content_guard(),
         }
     }
 
@@ -3189,6 +3214,7 @@ pub fn reply_only(response: String) -> RunResult {
         hit_round_cap: false,
         injected_user_messages: Vec::new(),
         gate_notice: None,
+        guard: None,
     }
 }
 
@@ -3752,6 +3778,7 @@ pub mod tests {
             hit_round_cap: budget_capped,
             injected_user_messages: Vec::new(),
             gate_notice: None,
+            guard: None,
         }
     }
 
@@ -3800,6 +3827,7 @@ pub mod tests {
         assert_eq!(
             remove,
             vec![
+                "turn_content_scope",
                 "round_cap_continuation",
                 "agent_engine:claude-code",
                 "agent_engine:codex"

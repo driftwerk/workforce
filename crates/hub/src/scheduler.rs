@@ -1914,6 +1914,7 @@ impl Scheduler {
                             username: None,
                             icon_url: None,
                             blocks: None,
+                            outside: false,
                         })
                         .await
                     {
@@ -1948,6 +1949,7 @@ impl Scheduler {
                         icon_url: None,
 
                         blocks: None,
+                        outside: false,
                     })
                     .await
                 {
@@ -1999,6 +2001,7 @@ impl Scheduler {
                         username: None,
                         icon_url: None,
                         blocks: None,
+                        outside: false,
                     })
                     .await
                 {
@@ -2317,6 +2320,10 @@ impl Scheduler {
                         ),
                     ),
                 );
+                // Whether the run read outside content: what it answers is
+                // then posted marked so.
+                let armed = workforce_agent::security::monitor::Armed::new();
+                let turn = workforce_agent::runner::with_guard_keeper(Some(armed.keeper()), turn);
                 let turn =
                     descending_from((!is_own(job)).then(|| ON_BEHALF_ORIGIN.to_string()), turn);
                 let process_result = match run_capped(turn, run_minutes).await {
@@ -2482,6 +2489,7 @@ impl Scheduler {
                                             icon_url: None,
 
                                             blocks: None,
+                                            outside: armed.is_armed(),
                                         })
                                         .await
                                     {

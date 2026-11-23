@@ -381,6 +381,7 @@ async fn run(pg: workforce_postgres::PostgresConfig) {
                 ttl: Duration::from_secs(3600),
                 chat: false,
                 origin: None,
+                content_scope: None,
             },
             None,
             None,
