@@ -353,9 +353,7 @@ impl CrewHub {
                     })
                 });
                 if !live {
-                    let by =
-                        By::manager(&c.boss, &c.boss_name, "Its boss's grant is no longer live.");
-                    if let Err(e) = self.desk.release(c.session, &by).await {
+                    if let Err(e) = self.desk.release(c.session, &By::grant_not_live()).await {
                         tracing::info!(session = %c.session, error = %e, "a session wasn't let go");
                     }
                 }

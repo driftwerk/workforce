@@ -1830,6 +1830,36 @@ fn a_turn_learns_from_its_own_messages_when_its_save_merged() {
     );
 }
 
+/// So too for a streamed turn, whose question was saved before it ran and
+/// its answer after: another write's notice merged in between is never
+/// learned as the person's.
+#[test]
+fn a_streamed_turn_learns_from_its_question_and_answer_when_its_save_merged() {
+    use workforce_common::session::{JsonlSessionStore, SessionStore};
+    let tmp = tempfile::tempdir().unwrap();
+    let sessions: std::sync::Arc<dyn SessionStore> =
+        std::sync::Arc::new(JsonlSessionStore::new(tmp.path()).unwrap());
+    let mut turn = sessions.get_or_create("cli", "u", "agent-a").unwrap();
+    let base = turn.messages.len();
+    let asked = turn.add_user_message("I take my tea black", None);
+    let question = super::save_refreshing_archiving(&sessions, &mut turn, base..).unwrap();
+    let archived_upto = turn.messages.len();
+
+    let mut other = sessions.get(&turn.id).unwrap().unwrap();
+    let notice = other.add_assistant_message("the session closed", 2);
+    sessions.save(&other).unwrap();
+    let said = turn.add_assistant_message("Noted: black.", 3);
+    let answered = super::save_turn(&sessions, &mut turn, archived_upto..).unwrap();
+
+    let held = super::held_of(&turn, &question, &answered);
+    let learned: Vec<&str> = super::spoken(&held)
+        .into_iter()
+        .map(|m| m.id.as_str())
+        .collect();
+    assert_eq!(learned, [asked.as_str(), said.as_str()]);
+    assert!(turn.messages.iter().any(|m| m.id == notice));
+}
+
 /// A follow-up sent now into a turn that is then stopped is still the
 /// person's: kept, as said, once the turn's task is gone.
 #[tokio::test(flavor = "multi_thread")]

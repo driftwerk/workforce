@@ -640,6 +640,46 @@ pub struct Session {
     /// took out comes back. Never serialised, never persisted.
     #[serde(skip, default)]
     pub read_message_ids: ReadIds,
+    /// The name and model it was read with: a save resolved against what is
+    /// stored takes its own only where it changed them since. None for one
+    /// never read, whose own always land. Never serialised, never persisted.
+    #[serde(skip, default)]
+    pub read_as: Option<ReadAs>,
+}
+
+/// The name and model a session was read with.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ReadAs {
+    pub label: Option<String>,
+    pub model_override: Option<String>,
+}
+
+impl Session {
+    /// Its name and model saved over `stored`'s, which another write may
+    /// have changed since it was read: each its own where it changed it
+    /// since, else the stored one.
+    pub(crate) fn named_over(
+        &self,
+        stored_label: Option<String>,
+        stored_model: Option<String>,
+    ) -> (Option<String>, Option<String>) {
+        let read = self.read_as.as_ref();
+        let own =
+            |stored: Option<String>, incoming: &Option<String>, read: Option<&Option<String>>| {
+                match read {
+                    Some(read) if read == incoming => stored,
+                    _ => incoming.clone(),
+                }
+            };
+        (
+            own(stored_label, &self.label, read.map(|r| &r.label)),
+            own(
+                stored_model,
+                &self.model_override,
+                read.map(|r| &r.model_override),
+            ),
+        )
+    }
 }
 
 /// The ids of the messages a session was read with, shown by their count.
@@ -1004,14 +1044,20 @@ impl Session {
             cached_message_count: None,
             loaded_revision: None,
             read_message_ids: Default::default(),
+            read_as: None,
         }
     }
 
-    /// Notes the messages it holds as those it was read with.
+    /// Notes the messages, name and model it holds as those it was read
+    /// with.
     pub(crate) fn mark_read(&mut self) {
         self.read_message_ids = ReadIds(std::sync::Arc::new(
             self.messages.iter().map(|m| m.id.clone()).collect(),
         ));
+        self.read_as = Some(ReadAs {
+            label: self.label.clone(),
+            model_override: self.model_override.clone(),
+        });
     }
 
     /// Takes on its save at `revision`: what was stored, when the save merged
@@ -1972,7 +2018,9 @@ impl Session {
         let replaced_messages = event.kind != CompactionKind::Pruning;
         self.compaction_history.push(event);
         if let Some(obj) = self.metadata.as_object_mut().filter(|_| replaced_messages) {
-            obj.remove("observed_input_tokens");
+            COMPACTION_OWNED_METADATA.iter().for_each(|key| {
+                obj.remove(*key);
+            });
         }
         self.updated_at = Utc::now();
     }
@@ -2954,7 +3002,11 @@ pub trait SessionStore: Send + Sync {
     /// Get or create a session for a channel/owner combination.
     fn get_or_create(&self, channel: &str, owner: &str, agent_id: &str) -> eyre::Result<Session>;
 
-    /// Save a session.
+    /// Save a session. Over a stored one another write changed since it was
+    /// read (its revision moved), or from a shell, what is stored is kept:
+    /// its messages with only the ones it added since appended, its owner,
+    /// sealing, metadata and compactions, and its name and model unless it
+    /// changed them since it read them.
     fn save(&self, session: &Session) -> eyre::Result<()>;
 
     /// Save a session and refresh its optimistic-concurrency baseline so the
@@ -2974,13 +3026,16 @@ pub trait SessionStore: Send + Sync {
         self.save_refreshing(session)
     }
 
-    /// Saves `session` as it is only when nothing was written to it since it
-    /// was read (its revision is still the stored one); otherwise leaves the
-    /// stored session alone. Whether it saved. For a rewrite that is only
-    /// right against what it read, such as a compaction, which is then run
-    /// again from the next read. The default saves: the in-memory store
-    /// keeps no revisions.
-    fn save_if_current(&self, session: &Session) -> eyre::Result<bool> {
+    /// Saves `session` only when nothing was written to it since it was read
+    /// (its revision is still the stored one), its metadata the stored
+    /// metadata but for the keys `owned`, which it has as `session` has
+    /// them: a patch landing meanwhile, which moves no revision, is kept.
+    /// Otherwise leaves the stored session alone. Whether it saved. For a
+    /// rewrite that is only right against what it read, such as a
+    /// compaction, which is then run again from the next read. The default
+    /// saves: the in-memory store keeps no revisions.
+    fn save_if_current(&self, session: &Session, owned: &[&str]) -> eyre::Result<bool> {
+        let _ = owned;
         self.save(session).map(|()| true)
     }
 
@@ -4453,6 +4508,10 @@ impl SessionMeta {
         // nothing to hydrate. `Some(0)` would just trigger a no-op
         // round-trip through `hydrate_in_cache` on first access.
         let cached_message_count = (self.message_count > 0).then_some(self.message_count);
+        let read_as = Some(ReadAs {
+            label: self.label.clone(),
+            model_override: self.model_override.clone(),
+        });
         Session {
             id: self.id,
             label: self.label,
@@ -4471,9 +4530,14 @@ impl SessionMeta {
             cached_message_count,
             loaded_revision: None,
             read_message_ids: Default::default(),
+            read_as,
         }
     }
 }
+
+/// The metadata keys a compaction writes: all of the session's metadata it
+/// saves ([`SessionStore::save_if_current`]).
+pub const COMPACTION_OWNED_METADATA: &[&str] = &["observed_input_tokens"];
 
 /// The revision a write over one stored at `stored` is kept at.
 fn next_revision(stored: Option<i64>) -> i64 {
@@ -4547,8 +4611,9 @@ pub(crate) fn owning(
 /// `incoming` saved over `stored`, which another write changed since it was
 /// read or which `incoming` holds only a shell of, as the Postgres store
 /// resolves it: [`appended`]; the stored session's sealing, place in its
-/// thread, metadata (but for incoming's keys `owned`) and compactions;
-/// incoming's own name, kind and model.
+/// thread, owner, metadata (but for incoming's keys `owned`) and
+/// compactions; its name and model but where incoming changed them since it
+/// read them ([`Session::named_over`]); incoming's kind.
 fn merged(mut stored: Session, incoming: &Session, owned: &[&str]) -> Session {
     stored.metadata = owning(
         std::mem::take(&mut stored.metadata),
@@ -4570,14 +4635,18 @@ fn merged(mut stored: Session, incoming: &Session, owned: &[&str]) -> Session {
         &incoming.messages,
         &incoming.read_message_ids,
     );
+    let (label, model_override) = incoming.named_over(
+        std::mem::take(&mut stored.label),
+        std::mem::take(&mut stored.model_override),
+    );
     Session {
         total_tokens: messages.iter().map(|m| u64::from(m.tokens)).sum(),
         messages,
-        label: incoming.label.clone(),
+        label,
         kind: incoming.kind.clone(),
         context_type: incoming.context_type.clone(),
         updated_at: incoming.updated_at,
-        model_override: incoming.model_override.clone(),
+        model_override,
         ..stored
     }
 }
@@ -5191,16 +5260,17 @@ impl SessionStore for JsonlSessionStore {
         Ok(())
     }
 
-    fn save_if_current(&self, session: &Session) -> eyre::Result<bool> {
+    fn save_if_current(&self, session: &Session, owned: &[&str]) -> eyre::Result<bool> {
         self.exclusively(&session.id, || {
             self.hydrate_in_cache(&session.id)?;
-            let current = self
+            let stored = self
                 .cached(&session.id)?
-                .is_some_and(|stored| stored.loaded_revision == session.loaded_revision);
-            if !current || session.cached_message_count.is_some() {
+                .filter(|stored| stored.loaded_revision == session.loaded_revision);
+            let (Some(stored), None) = (stored, session.cached_message_count) else {
                 return Ok(false);
-            }
+            };
             let mut saved = session.clone();
+            saved.metadata = owning(stored.metadata, &session.metadata, owned);
             saved.loaded_revision = Some(next_revision(session.loaded_revision));
             self.write_to_disk(&saved)?;
             self.keep_cached(saved)?;
@@ -6279,19 +6349,47 @@ pub(crate) fn assert_save_if_current_contract(store: &dyn SessionStore) {
     session.add_user_message("second", None);
     store.save_refreshing(&mut session).unwrap();
 
+    let patch = |key: &str| {
+        store
+            .merge_metadata(
+                &session.id,
+                serde_json::Map::from_iter([(key.to_string(), serde_json::json!(true))]),
+                &[],
+            )
+            .unwrap()
+    };
+    patch("observed_input_tokens");
     let mut cut = store.get(&session.id).unwrap().unwrap();
+    patch("read_personal");
     cut.messages.remove(0);
-    assert!(store.save_if_current(&cut).unwrap());
+    cut.record_compaction(CompactionEvent {
+        timestamp: Utc::now(),
+        messages_compacted: 1,
+        tokens_before: 2,
+        tokens_after: 1,
+        kind: CompactionKind::Summarisation,
+    });
+    assert!(store
+        .save_if_current(&cut, COMPACTION_OWNED_METADATA)
+        .unwrap());
     let stored = store.get(&session.id).unwrap().unwrap();
     assert_eq!(texts(&stored), ["second"]);
     assert!(stored.loaded_revision > cut.loaded_revision);
+    assert_eq!(
+        stored.metadata.get("read_personal"),
+        Some(&serde_json::json!(true)),
+        "a patch landing during the compaction is kept"
+    );
+    assert_eq!(stored.metadata.get("observed_input_tokens"), None);
 
     let mut late = store.get(&session.id).unwrap().unwrap();
     let mut other = store.get(&session.id).unwrap().unwrap();
     other.add_user_message("meanwhile", None);
     store.save(&other).unwrap();
     late.messages.clear();
-    assert!(!store.save_if_current(&late).unwrap());
+    assert!(!store
+        .save_if_current(&late, COMPACTION_OWNED_METADATA)
+        .unwrap());
     assert_eq!(
         texts(&store.get(&session.id).unwrap().unwrap()),
         ["second", "meanwhile"]
@@ -6300,11 +6398,48 @@ pub(crate) fn assert_save_if_current_contract(store: &dyn SessionStore) {
     let mut shell = store.get(&session.id).unwrap().unwrap();
     shell.cached_message_count = Some(shell.messages.len());
     shell.messages.clear();
-    assert!(!store.save_if_current(&shell).unwrap());
+    assert!(!store
+        .save_if_current(&shell, COMPACTION_OWNED_METADATA)
+        .unwrap());
     assert_eq!(
         texts(&store.get(&session.id).unwrap().unwrap()),
         ["second", "meanwhile"]
     );
+}
+
+/// A name or model changed since a save's copy was read is kept through
+/// that save; one the copy changed itself lands.
+#[cfg(test)]
+pub(crate) fn assert_stale_save_keeps_name_and_model_contract(store: &dyn SessionStore) {
+    let mut session = store.get_or_create("c", "o", "agent-a").unwrap();
+    session.add_user_message("hello", None);
+    store.save_refreshing(&mut session).unwrap();
+
+    let mut turn = store.get(&session.id).unwrap().unwrap();
+    let mut switched = store.get(&session.id).unwrap().unwrap();
+    switched.model_override = Some("opus".into());
+    store.save(&switched).unwrap();
+    store
+        .set_session_label(&session.id, Some("Renamed".into()))
+        .unwrap();
+    turn.add_assistant_message("answered", 1);
+    store.save(&turn).unwrap();
+    let kept = store.get(&session.id).unwrap().unwrap();
+    assert_eq!(kept.model_override.as_deref(), Some("opus"));
+    assert_eq!(kept.label.as_deref(), Some("Renamed"));
+    assert_eq!(kept.messages.len(), 2, "its message still lands");
+
+    let mut own = store.get(&session.id).unwrap().unwrap();
+    let mut other = store.get(&session.id).unwrap().unwrap();
+    other.add_user_message("meanwhile", None);
+    store.save(&other).unwrap();
+    own.model_override = Some("haiku".into());
+    own.label = None;
+    store.save(&own).unwrap();
+    let kept = store.get(&session.id).unwrap().unwrap();
+    assert_eq!(kept.model_override.as_deref(), Some("haiku"));
+    assert_eq!(kept.label, None);
+    assert_eq!(kept.messages.len(), 3);
 }
 
 /// A session given to another owner stays theirs through a save read
@@ -6332,6 +6467,7 @@ pub(crate) fn assert_set_session_owner_contract(store: &dyn SessionStore) {
     store.save(&before).unwrap();
     let kept = store.get(&session.id).unwrap().unwrap();
     assert_eq!(kept.owner, "canon");
+    assert_eq!(kept.label.as_deref(), Some("thread:canon"));
     assert_eq!(kept.messages.len(), 2, "the later message still lands");
     assert!(store
         .set_session_owner("00000000-0000-0000-0000-000000000000", "canon", None)
@@ -7141,6 +7277,14 @@ mod tests {
     fn the_file_store_saves_a_rewrite_only_over_what_it_read() {
         let dir = tempfile::tempdir().unwrap();
         assert_save_if_current_contract(&JsonlSessionStore::new(dir.path()).unwrap());
+    }
+
+    #[test]
+    fn a_stale_save_keeps_the_name_and_model_changed_since_in_the_file_store() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_stale_save_keeps_name_and_model_contract(
+            &JsonlSessionStore::new(dir.path()).unwrap(),
+        );
     }
 
     #[test]

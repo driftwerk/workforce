@@ -2951,6 +2951,68 @@ pub(crate) fn note_surfaced_lessons(
     }
 }
 
+/// Compacts `fresh` with `engine` and saves it only over what it was read
+/// from, writing what the compaction flushed to memory only once it is
+/// saved: one whose session moved on meanwhile is left, unwritten, for the
+/// next turn to compact again.
+async fn compact_read(
+    sessions: &dyn workforce_common::session::SessionStore,
+    engine: &workforce_agent::compaction::CompactionEngine,
+    mut fresh: workforce_common::session::Session,
+    reserved: workforce_common::session::ReservedContext,
+) {
+    match engine.compact_if_needed(&mut fresh, reserved).await {
+        Ok(true) => match sessions
+            .save_if_current(&fresh, workforce_common::session::COMPACTION_OWNED_METADATA)
+        {
+            Ok(true) => {
+                engine.write_held_flushes(&fresh).await;
+                tracing::info!(
+                    session_id = %fresh.id,
+                    tokens = fresh.estimated_total_tokens(),
+                    "Background compaction complete"
+                );
+            }
+            Ok(false) => tracing::info!(
+                session_id = %fresh.id,
+                "Background compaction left for the next turn: the session moved on"
+            ),
+            Err(e) => tracing::warn!(
+                session_id = %fresh.id,
+                error = %e,
+                "Background compaction: failed to save session"
+            ),
+        },
+        Ok(false) => {}
+        Err(e) => tracing::warn!(
+            session_id = %fresh.id,
+            error = %e,
+            "Background compaction failed"
+        ),
+    }
+}
+
+/// The messages of a turn whose question `asked` was saved before it ran
+/// and whose run saved `answered`, as `session` holds them now: a question
+/// truncated or redacted since is as it is now, or gone.
+pub(crate) fn held_of(
+    session: &workforce_common::session::Session,
+    asked: &[workforce_common::session::SessionMessage],
+    answered: &[workforce_common::session::SessionMessage],
+) -> Vec<workforce_common::session::SessionMessage> {
+    let ids: std::collections::HashSet<&str> = asked
+        .iter()
+        .chain(answered)
+        .map(|m| m.id.as_str())
+        .collect();
+    session
+        .messages
+        .iter()
+        .filter(|m| ids.contains(m.id.as_str()))
+        .cloned()
+        .collect()
+}
+
 /// What was said in `turn`: its tool entries left out, so tool chatter
 /// never reaches a memory excerpt.
 pub(crate) fn spoken(
@@ -4067,7 +4129,7 @@ pub(crate) async fn process_admitted(
         let bg_cost_tracker = Arc::clone(&service.cost_tracker);
         let bg_reserved = reserved;
         spawn_in_session_context(async move {
-            let mut fresh = match bg_sessions.get(&bg_session_id) {
+            let fresh = match bg_sessions.get(&bg_session_id) {
                 Ok(Some(s)) => s,
                 _ => return,
             };
@@ -4081,27 +4143,9 @@ pub(crate) async fn process_admitted(
             let engine = workforce_agent::compaction::CompactionEngine::with_memory_writer(
                 bg_config, bg_llm, bg_model, writer,
             )
-            .with_cost_tracker(bg_cost_tracker, bg_agent_id.to_string());
-            match engine.compact_if_needed(&mut fresh, bg_reserved).await {
-                Ok(true) => match bg_sessions.save_if_current(&fresh) {
-                    Ok(true) => tracing::info!(
-                        session_id = %bg_session_id,
-                        tokens = fresh.estimated_total_tokens(),
-                        "Background compaction complete (sync path)"
-                    ),
-                    Ok(false) => tracing::info!(
-                        session_id = %bg_session_id,
-                        "Background compaction (sync) left for the next turn: the session moved on"
-                    ),
-                    Err(e) => {
-                        tracing::warn!(error = %e, "Background compaction (sync): save failed")
-                    }
-                },
-                Ok(false) => {}
-                Err(e) => {
-                    tracing::warn!(error = %e, "Background compaction (sync) failed");
-                }
-            }
+            .with_cost_tracker(bg_cost_tracker, bg_agent_id.to_string())
+            .holding_flushes();
+            compact_read(bg_sessions.as_ref(), &engine, fresh, bg_reserved).await;
         });
     }
 
@@ -6014,7 +6058,7 @@ pub(crate) async fn stream_admitted(
                 // Fire-and-forget post-turn extraction (passive memory +
                 // DM-only relationship capture), shared with
                 // `process_message` via `spawn_turn_extraction`.
-                let turn = [asked_for_task.as_slice(), answered.as_slice()].concat();
+                let turn = held_of(&session, &asked_for_task, &answered);
                 spawn_turn_extraction(&me,
                     &session,
                     &turn,
@@ -6063,7 +6107,7 @@ pub(crate) async fn stream_admitted(
                         let bg_reserved = reserved;
                         spawn_in_session_context(async move {
                             // Re-load fresh session (includes the response we just saved)
-                            let mut fresh = match bg_sessions.get(&bg_session_id) {
+                            let fresh = match bg_sessions.get(&bg_session_id) {
                                 Ok(Some(s)) => s,
                                 Ok(None) => {
                                     tracing::warn!(
@@ -6095,37 +6139,10 @@ pub(crate) async fn stream_admitted(
                                 bg_model,
                                 memory_writer,
                             )
-                            .with_cost_tracker(bg_cost_tracker2, bg_agent_id2.to_string());
-                            match engine.compact_if_needed(&mut fresh, bg_reserved).await {
-                                Ok(true) => match bg_sessions.save_if_current(&fresh) {
-                                    Ok(true) => tracing::info!(
-                                        session_id = %bg_session_id,
-                                        tokens = fresh.estimated_total_tokens(),
-                                        "Background compaction complete"
-                                    ),
-                                    Ok(false) => tracing::info!(
-                                        session_id = %bg_session_id,
-                                        "Background compaction left for the next turn: the session moved on"
-                                    ),
-                                    Err(e) => tracing::warn!(
-                                        error = %e,
-                                        "Background compaction: failed to save session"
-                                    ),
-                                },
-                                Ok(false) => {
-                                    tracing::info!(
-                                        session_id = %bg_session_id,
-                                        "Background compaction: no longer needed"
-                                    );
-                                }
-                                Err(e) => {
-                                    tracing::warn!(
-                                        error = %e,
-                                        session_id = %bg_session_id,
-                                        "Background compaction failed"
-                                    );
-                                }
-                            }
+                            .with_cost_tracker(bg_cost_tracker2, bg_agent_id2.to_string())
+                            .holding_flushes();
+                            compact_read(bg_sessions.as_ref(), &engine, fresh, bg_reserved)
+                                .await;
                         });
                     }
                 }

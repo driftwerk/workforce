@@ -517,6 +517,7 @@ fn row_to_session(r: &tokio_postgres::Row) -> Result<Session> {
         cached_message_count: None,
         loaded_revision: Some(r.get::<_, i64>(15)),
         read_message_ids: Default::default(),
+        read_as: None,
     };
     session.mark_read();
     Ok(session)
@@ -531,7 +532,7 @@ fn row_to_shell(r: &tokio_postgres::Row) -> Result<Session> {
     let context_type: Option<String> = r.get(6);
     let compaction_json: serde_json::Value = r.get(11);
     let message_count: i32 = r.get(13);
-    Ok(Session {
+    let mut shell = Session {
         id: id.to_string(),
         label: r.get(1),
         channel: r.get(2),
@@ -552,7 +553,10 @@ fn row_to_shell(r: &tokio_postgres::Row) -> Result<Session> {
         cached_message_count: (message_count > 0).then_some(message_count as usize),
         loaded_revision: Some(r.get::<_, i64>(14)),
         read_message_ids: Default::default(),
-    })
+        read_as: None,
+    };
+    shell.mark_read();
+    Ok(shell)
 }
 
 /// Projection for shells — same as full, minus the heavy `messages` blob.
@@ -710,15 +714,28 @@ impl SessionStore for PostgresSessionStore {
         Ok(())
     }
 
-    fn save_if_current(&self, session: &Session) -> Result<bool> {
+    fn save_if_current(&self, session: &Session, owned: &[&str]) -> Result<bool> {
         let (Some(revision), None) = (session.loaded_revision, session.cached_message_count) else {
             return Ok(false);
         };
         let row = SessionRow::from_session(session)?;
         self.block_on(async move {
             let mut conn = self.pool.get().await?;
-            let scoped = self.scope(&mut conn).await?;
-            let n = scoped
+            let tx = conn.transaction().await?;
+            self.bind_tenant(&tx).await?;
+            let Some(stored) = tx
+                .query_opt(
+                    "SELECT metadata FROM sessions
+                     WHERE id = $1 AND agent_id = $2 AND tenant_id = $3 AND revision = $4
+                     FOR UPDATE",
+                    &[&row.id, &self.agent_id, &self.tenant_id(), &revision],
+                )
+                .await?
+            else {
+                return Ok(false);
+            };
+            let metadata = owning(stored.get(0), &row.metadata, owned);
+            let n = tx
                 .execute(
                     "UPDATE sessions SET label = $1, kind = $2, context_type = $3, updated_at = $4,
                          total_tokens = $5, message_count = $6, model_override = $7,
@@ -734,7 +751,7 @@ impl SessionStore for PostgresSessionStore {
                         &row.message_count,
                         &session.model_override,
                         &row.compaction_history,
-                        &row.metadata,
+                        &metadata,
                         &row.messages,
                         &row.sealed,
                         &row.seq,
@@ -746,7 +763,7 @@ impl SessionStore for PostgresSessionStore {
                     ],
                 )
                 .await?;
-            scoped.finish().await?;
+            tx.commit().await?;
             Ok(n == 1)
         })
     }
@@ -2642,7 +2659,7 @@ impl PostgresSessionStore {
             let existing = tx
                 .query_opt(
                     "SELECT revision, messages, message_count, total_tokens, sealed, seq, \
-                     prev_session_id, metadata, compaction_history \
+                     prev_session_id, metadata, compaction_history, label, model_override \
                      FROM sessions WHERE id = $1 AND tenant_id = $2 FOR UPDATE",
                     &[&row.id, &self.tenant_id()],
                 )
@@ -2652,14 +2669,20 @@ impl PostgresSessionStore {
             // cached_message_count) must never overwrite the stored transcript
             // — mirrors JsonlSessionStore::write_to_disk's shell guard.
             let is_shell = session.cached_message_count.is_some();
+            let (label, model_override) = match existing.as_ref() {
+                Some(cur) if is_shell || session.loaded_revision != Some(cur.get::<_, i64>(0)) => {
+                    session.named_over(cur.get(9), cur.get(10))
+                }
+                _ => (session.label.clone(), session.model_override.clone()),
+            };
 
             // Resolve the contested columns. Uncontended (revision matches)
             // applies the incoming row exactly so compaction (which reduces
             // messages) and edits land. A shell or a CAS-miss preserves the
             // stored structural columns (sealed/seq/prev_session_id/metadata/
             // compaction_history) and recomputes count/tokens from the
-            // effective message set. Scalar fields (label/model_override)
-            // always take the incoming value so renames land from shells.
+            // effective message set. The name and model are the caller's
+            // where it changed them since it read them, else the stored ones.
             let incoming = || {
                 (
                     row.messages.clone(),
@@ -2721,6 +2744,8 @@ impl PostgresSessionStore {
                     let count = merged.len() as i32;
                     let json = serde_json::to_value(&merged).context("encode merged messages")?;
                     kept = Some(Session {
+                        label: label.clone(),
+                        model_override: model_override.clone(),
                         messages: merged,
                         metadata: metadata.clone(),
                         compaction_history: serde_json::from_value(cur.get(8))
@@ -2770,14 +2795,14 @@ impl PostgresSessionStore {
                         &self.agent_id,
                         &session.channel,
                         &session.owner,
-                        &session.label,
+                        &label,
                         &kind_to_str(&session.kind),
                         &session.context_type.as_ref().map(context_type_to_str),
                         &session.created_at,
                         &session.updated_at,
                         &total_tokens,
                         &count,
-                        &session.model_override,
+                        &model_override,
                         &compaction_history,
                         &metadata,
                         &messages,
@@ -3050,6 +3075,14 @@ pub(crate) mod tests {
     async fn a_rewrite_is_saved_only_over_what_it_read() {
         with_store(|store| async move {
             crate::session::assert_save_if_current_contract(store.as_ref());
+        })
+        .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_stale_save_keeps_the_name_and_model_changed_since() {
+        with_store(|store| async move {
+            crate::session::assert_stale_save_keeps_name_and_model_contract(store.as_ref());
         })
         .await;
     }
