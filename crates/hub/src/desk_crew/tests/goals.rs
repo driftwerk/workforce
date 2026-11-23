@@ -559,7 +559,7 @@ async fn a_measured_goal_is_met_by_its_reading_in_the_plans_turn() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn an_agreed_goal_covers_work_added_toward_it_and_its_own_ticket_waits_for_the_person() {
+async fn an_agreed_goal_covers_work_added_toward_it_and_never_its_own_tickets_words() {
     with_test_pool(workforce_desk::store::build_pool, |pool| async move {
         let dir = tempfile::tempdir().unwrap();
         let base = std::fs::canonicalize(dir.path()).unwrap();
@@ -583,7 +583,8 @@ async fn an_agreed_goal_covers_work_added_toward_it_and_its_own_ticket_waits_for
         assert_eq!(r.output["applied"], true, "{r:?}");
         assert!(!d.plan(id).await.unwrap().summary.plan.awaiting());
 
-        // Its own ticket's words are the person's to change.
+        // Its own ticket is taken on from its board, so its words are never
+        // the plan's to change.
         let r = run(
             &overseer,
             "crew.plan_update",
@@ -591,9 +592,49 @@ async fn an_agreed_goal_covers_work_added_toward_it_and_its_own_ticket_waits_for
                     "tickets_edit": [{ "key": key, "body": "Only the API docs." }] }),
         )
         .await;
+        assert!(!r.success, "{r:?}");
+    })
+    .await;
+}
+
+/// A goal the person changes themselves applies on their own words, with
+/// no question of the boss's first; a goal in other words than theirs
+/// doesn't.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_goal_the_person_changes_themselves_applies_on_their_words() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(dir.path()).unwrap();
+        let gh = github().await;
+        let (overseer, _crew, d, _llm) = boss_on(&base, pool, ACTS, &gh).await;
+        let s = session_on(&overseer, &d, &base.to_string_lossy(), "Fix the docs build").await;
+        let id = agreed_plan(&overseer, &s, judged()).await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        person_says(
+            &overseer,
+            "Actually, change the goal to keep the docs build green and fast",
+        );
+        let said = "change the goal to keep the docs build green and fast";
+        let r = run(
+            &overseer,
+            "crew.plan_update",
+            json!({ "plan_id": id.to_string(), "goal": "Make the docs build quick",
+                    "person_said": said, "why": "They asked." }),
+        )
+        .await;
+        assert!(!r.success, "{r:?}");
+        assert!(r.error.unwrap().contains("set goal to what they wrote"));
+        let r = run(
+            &overseer,
+            "crew.plan_update",
+            json!({ "plan_id": id.to_string(), "goal": "Keep the docs build green and fast",
+                    "person_said": said, "why": "They asked." }),
+        )
+        .await;
         assert!(r.success, "{r:?}");
-        assert_eq!(r.output["applied"], false, "{r:?}");
-        assert!(r.output["note"].as_str().unwrap().contains("crew.ask_person with plan_id"), "{r:?}");
+        let p = d.plan(id).await.unwrap().summary.plan;
+        assert_eq!(p.goal, "Keep the docs build green and fast");
+        assert!(!p.awaiting(), "their own words approve it");
     })
     .await;
 }
