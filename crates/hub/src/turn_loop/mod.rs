@@ -68,9 +68,9 @@ use workforce_agent::runner::AgentRunner;
 use crate::hosts::TurnHost;
 use crate::serve::{
     answer_is_code_shaped, build_prior_messages_reading, data_claim_grounding_skip,
-    end_turn_record, infer_task_type, is_person, is_workflow_step_session,
-    persist_turn_owned_metadata, prompt_privacy, prompt_visibility, record_round_cap_continuation,
-    render_shared_visibility_block, render_slack_identity_block, reply_only,
+    end_turn_record, infer_task_type, is_person, is_workflow_step_session, prompt_privacy,
+    prompt_visibility, record_round_cap_continuation, render_shared_visibility_block,
+    render_slack_identity_block, reply_only, save_refreshing_archiving, save_turn,
     select_visible_other_sessions, session_owner_for_turn, stop_turn_record, worker_tool_patterns,
     AgentService, IsolatedRoute, IsolatedRun, MessageProgress, PromptPrivacy, RunAuthor,
     SharedReplay, Skip, TurnInbox, TurnOutcome, CLAIM_GROUNDING_MIN_RESPONSE,
@@ -852,10 +852,8 @@ pub(crate) fn save_notice_turn(
     if session.is_shared_conversation() {
         session.attribute_messages_from(archive_base, user);
     }
-    service.sessions.save_refreshing(session)?;
-    persist_turn_owned_metadata(&service.sessions, session);
-    for msg in session.messages.get(archive_from..).unwrap_or_default() {
-        if let Err(e) = service.sessions.append_to_archive(&session.id, msg) {
+    for msg in save_turn(&service.sessions, session, archive_from..)? {
+        if let Err(e) = service.sessions.append_to_archive(&session.id, &msg) {
             warn!(error = %e, "Failed to append to session archive");
         }
     }
@@ -2953,10 +2951,82 @@ pub(crate) fn note_surfaced_lessons(
     }
 }
 
+/// Compacts `fresh` with `engine` and saves it only over what it was read
+/// from, writing what the compaction flushed to memory only once it is
+/// saved: one whose session moved on meanwhile is left, unwritten, for the
+/// next turn to compact again.
+async fn compact_read(
+    sessions: &dyn workforce_common::session::SessionStore,
+    engine: &workforce_agent::compaction::CompactionEngine,
+    mut fresh: workforce_common::session::Session,
+    reserved: workforce_common::session::ReservedContext,
+) {
+    match engine.compact_if_needed(&mut fresh, reserved).await {
+        Ok(true) => match sessions
+            .save_if_current(&fresh, workforce_common::session::COMPACTION_OWNED_METADATA)
+        {
+            Ok(true) => {
+                engine.write_held_flushes(&fresh).await;
+                tracing::info!(
+                    session_id = %fresh.id,
+                    tokens = fresh.estimated_total_tokens(),
+                    "Background compaction complete"
+                );
+            }
+            Ok(false) => tracing::info!(
+                session_id = %fresh.id,
+                "Background compaction left for the next turn: the session moved on"
+            ),
+            Err(e) => tracing::warn!(
+                session_id = %fresh.id,
+                error = %e,
+                "Background compaction: failed to save session"
+            ),
+        },
+        Ok(false) => {}
+        Err(e) => tracing::warn!(
+            session_id = %fresh.id,
+            error = %e,
+            "Background compaction failed"
+        ),
+    }
+}
+
+/// The messages of a turn whose question `asked` was saved before it ran
+/// and whose run saved `answered`, as `session` holds them now: a question
+/// truncated or redacted since is as it is now, or gone.
+pub(crate) fn held_of(
+    session: &workforce_common::session::Session,
+    asked: &[workforce_common::session::SessionMessage],
+    answered: &[workforce_common::session::SessionMessage],
+) -> Vec<workforce_common::session::SessionMessage> {
+    let ids: std::collections::HashSet<&str> = asked
+        .iter()
+        .chain(answered)
+        .map(|m| m.id.as_str())
+        .collect();
+    session
+        .messages
+        .iter()
+        .filter(|m| ids.contains(m.id.as_str()))
+        .cloned()
+        .collect()
+}
+
+/// What was said in `turn`: its tool entries left out, so tool chatter
+/// never reaches a memory excerpt.
+pub(crate) fn spoken(
+    turn: &[workforce_common::session::SessionMessage],
+) -> Vec<&workforce_common::session::SessionMessage> {
+    turn.iter()
+        .filter(|m| !matches!(m.role, workforce_common::session::MessageRole::Tool))
+        .collect()
+}
+
 pub(crate) fn spawn_turn_extraction(
     service: &AgentService,
     session: &workforce_common::session::Session,
-    archive_base: usize,
+    turn: &[workforce_common::session::SessionMessage],
     effective_message: &str,
     response: &str,
     principal: &str,
@@ -2986,15 +3056,7 @@ pub(crate) fn spawn_turn_extraction(
         return;
     }
 
-    // Slice the turn from `archive_base` (pre-turn length) and skip tool
-    // entries so tool-chatter doesn't end up in the memory excerpt.
-    let turn_messages: Vec<&workforce_common::session::SessionMessage> = session
-        .messages
-        .get(archive_base..)
-        .unwrap_or_default()
-        .iter()
-        .filter(|m| !matches!(m.role, workforce_common::session::MessageRole::Tool))
-        .collect();
+    let turn_messages = spoken(turn);
     let turn_message_ids: Vec<String> = turn_messages.iter().map(|m| m.id.clone()).collect();
     let pm_event_time = turn_messages.iter().map(|m| m.timestamp).max();
     let user_turn = turn_messages
@@ -3739,6 +3801,10 @@ pub(crate) async fn process_admitted(
             }
         } else {
             // YELLOW ZONE: fast prune only, defer full compaction
+            // A write landing before this copy is saved keeps the stored
+            // messages, so the prune is lost; nothing else is: it only
+            // shortens outputs the stored ones still hold whole, and the next
+            // turn prunes them again, under the same handles.
             if let Err(e) = compaction_engine.compact_pruning_only(&mut session) {
                 tracing::warn!(error = %e, "Pruning failed, continuing");
             }
@@ -3987,11 +4053,10 @@ pub(crate) async fn process_admitted(
     record_round_cap_continuation(&mut session, &result);
     crate::monitor::scope::keep_turn(&mut session, &result);
     extraction::note_personal_read(&service.sessions, &mut session, &result.tool_invocations);
-    service.sessions.save(&session)?;
+    let answered = save_turn(&service.sessions, &mut session, archive_base..)?;
     turn_journal.clear();
-    persist_turn_owned_metadata(&service.sessions, &session);
 
-    for msg in session.messages.get(archive_base..).unwrap_or_default() {
+    for msg in &answered {
         if let Err(e) = service.sessions.append_to_archive(&session.id, msg) {
             warn!(error = %e, "Failed to append to session archive");
         }
@@ -4003,7 +4068,7 @@ pub(crate) async fn process_admitted(
     spawn_turn_extraction(
         service,
         &session,
-        archive_base,
+        &answered,
         &effective_message,
         &result.response,
         principal,
@@ -4045,7 +4110,7 @@ pub(crate) async fn process_admitted(
                 sessions: &service.sessions,
             },
             &mut session,
-            archive_base,
+            &answered,
             &effective_message,
             &result.response,
         );
@@ -4064,7 +4129,7 @@ pub(crate) async fn process_admitted(
         let bg_cost_tracker = Arc::clone(&service.cost_tracker);
         let bg_reserved = reserved;
         spawn_in_session_context(async move {
-            let mut fresh = match bg_sessions.get(&bg_session_id) {
+            let fresh = match bg_sessions.get(&bg_session_id) {
                 Ok(Some(s)) => s,
                 _ => return,
             };
@@ -4078,24 +4143,9 @@ pub(crate) async fn process_admitted(
             let engine = workforce_agent::compaction::CompactionEngine::with_memory_writer(
                 bg_config, bg_llm, bg_model, writer,
             )
-            .with_cost_tracker(bg_cost_tracker, bg_agent_id.to_string());
-            match engine.compact_if_needed(&mut fresh, bg_reserved).await {
-                Ok(true) => {
-                    if let Err(e) = bg_sessions.save(&fresh) {
-                        tracing::warn!(error = %e, "Background compaction (sync): save failed");
-                    } else {
-                        tracing::info!(
-                            session_id = %bg_session_id,
-                            tokens = fresh.estimated_total_tokens(),
-                            "Background compaction complete (sync path)"
-                        );
-                    }
-                }
-                Ok(false) => {}
-                Err(e) => {
-                    tracing::warn!(error = %e, "Background compaction (sync) failed");
-                }
-            }
+            .with_cost_tracker(bg_cost_tracker, bg_agent_id.to_string())
+            .holding_flushes();
+            compact_read(bg_sessions.as_ref(), &engine, fresh, bg_reserved).await;
         });
     }
 
@@ -5331,6 +5381,10 @@ pub(crate) async fn stream_admitted(
             let _ = progress_tx.send(ProgressEvent::CompactEnd).await;
         } else {
             // YELLOW ZONE: above threshold but below urgent — fast prune only, defer full compaction
+            // A write landing before this copy is saved keeps the stored
+            // messages, so the prune is lost; nothing else is: it only
+            // shortens outputs the stored ones still hold whole, and the next
+            // turn prunes them again, under the same handles.
             if let Err(e) = compaction_engine.compact_pruning_only(&mut session) {
                 tracing::warn!(error = %e, "Pruning failed, continuing");
             }
@@ -5383,7 +5437,7 @@ pub(crate) async fn stream_admitted(
     // same value is not demoted to an append-merge, which would strand the
     // turn's own metadata (lessons, round-cap continuation) at the stored
     // version.
-    service.sessions.save_refreshing(&mut session)?;
+    let asked = save_refreshing_archiving(&service.sessions, &mut session, archive_base..)?;
     // The question goes to the archive now that the transcript holds it and
     // the turn holds the session, not when the turn ends: the conversation
     // reads it whether the turn answers, fails or is stopped (which ends the
@@ -5392,11 +5446,7 @@ pub(crate) async fn stream_admitted(
     // archived when it was saved.
     let archived_upto = session.messages.len();
     if held.is_none() {
-        for msg in session
-            .messages
-            .get(archive_base..archived_upto)
-            .unwrap_or_default()
-        {
+        for msg in &asked {
             if let Err(e) = service.sessions.append_to_archive(&session.id, msg) {
                 warn!(error = %e, "Failed to archive the turn's question");
             }
@@ -5538,6 +5588,7 @@ pub(crate) async fn stream_admitted(
     let ls_sessions = Arc::clone(&service.sessions);
 
     let archive_base_for_task = archive_base;
+    let asked_for_task = asked;
     let heard_for_task = heard;
     let kh_question = message.to_string();
     let session_key_for_task = channel.to_string();
@@ -5911,12 +5962,8 @@ pub(crate) async fn stream_admitted(
                 }
                 record_round_cap_continuation(&mut session, &result);
                 crate::monitor::scope::keep_turn(&mut session, &result);
-                sessions.save_refreshing(&mut session)?;
+                let answered = save_turn(&sessions, &mut session, archived_upto..)?;
                 turn_journal.clear();
-                // The save above may have lost CAS, which discards the
-                // metadata it carried; these keys are the turn's own, so
-                // they get a narrow write that cannot lose.
-                persist_turn_owned_metadata(&sessions, &session);
                 // After the transcript, never before: a crash in between
                 // leaves a record whose answer is already saved, which the
                 // sweep skips — the reverse order would lose the answer
@@ -5924,7 +5971,7 @@ pub(crate) async fn stream_admitted(
                 end_turn_record(&sessions, &session.id, &turn_token_for_task);
 
                 // Everything after the question, which went before the run.
-                for msg in session.messages.get(archived_upto..).unwrap_or_default() {
+                for msg in &answered {
                     if let Err(e) = sessions.append_to_archive(&session.id, msg) {
                         warn!(error = %e, "Failed to append to session archive");
                     }
@@ -6011,9 +6058,10 @@ pub(crate) async fn stream_admitted(
                 // Fire-and-forget post-turn extraction (passive memory +
                 // DM-only relationship capture), shared with
                 // `process_message` via `spawn_turn_extraction`.
+                let turn = held_of(&session, &asked_for_task, &answered);
                 spawn_turn_extraction(&me,
                     &session,
-                    archive_base_for_task,
+                    &turn,
                     &effective_message,
                     &result.response,
                     &rel_principal_for_task,
@@ -6042,7 +6090,7 @@ pub(crate) async fn stream_admitted(
                             sessions: &ls_sessions,
                         },
                         &mut session,
-                        archive_base_for_task,
+                        &turn,
                         &effective_message,
                         &result.response,
                     );
@@ -6059,7 +6107,7 @@ pub(crate) async fn stream_admitted(
                         let bg_reserved = reserved;
                         spawn_in_session_context(async move {
                             // Re-load fresh session (includes the response we just saved)
-                            let mut fresh = match bg_sessions.get(&bg_session_id) {
+                            let fresh = match bg_sessions.get(&bg_session_id) {
                                 Ok(Some(s)) => s,
                                 Ok(None) => {
                                     tracing::warn!(
@@ -6091,36 +6139,10 @@ pub(crate) async fn stream_admitted(
                                 bg_model,
                                 memory_writer,
                             )
-                            .with_cost_tracker(bg_cost_tracker2, bg_agent_id2.to_string());
-                            match engine.compact_if_needed(&mut fresh, bg_reserved).await {
-                                Ok(true) => {
-                                    if let Err(e) = bg_sessions.save(&fresh) {
-                                        tracing::warn!(
-                                            error = %e,
-                                            "Background compaction: failed to save session"
-                                        );
-                                    } else {
-                                        tracing::info!(
-                                            session_id = %bg_session_id,
-                                            tokens = fresh.estimated_total_tokens(),
-                                            "Background compaction complete"
-                                        );
-                                    }
-                                }
-                                Ok(false) => {
-                                    tracing::info!(
-                                        session_id = %bg_session_id,
-                                        "Background compaction: no longer needed"
-                                    );
-                                }
-                                Err(e) => {
-                                    tracing::warn!(
-                                        error = %e,
-                                        session_id = %bg_session_id,
-                                        "Background compaction failed"
-                                    );
-                                }
-                            }
+                            .with_cost_tracker(bg_cost_tracker2, bg_agent_id2.to_string())
+                            .holding_flushes();
+                            compact_read(bg_sessions.as_ref(), &engine, fresh, bg_reserved)
+                                .await;
                         });
                     }
                 }
