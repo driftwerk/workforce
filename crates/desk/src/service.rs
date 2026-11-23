@@ -3746,15 +3746,12 @@ impl Desk {
             created_at: now,
             updated_at: now,
         };
-        {
+        let placing = {
             let mut st = self.0.state.lock();
             st.records.insert(id, record.clone());
-            if let Some(boss) = boss {
-                Self::reserve_charge(&mut st, id, boss, group.as_deref());
-            }
-        }
+            boss.map(|boss| self.reserve_charge(&mut st, id, boss, group.as_deref()))
+        };
         // Where it belongs, before it can do or spend anything.
-        let placing = self.charge_placing_until_dropped(id);
         let mut placed = self.start_placed(id, group.as_deref(), boss).await;
         drop(placing);
         // A session named before it starts (a plan's) is written down

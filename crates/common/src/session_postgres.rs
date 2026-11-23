@@ -54,14 +54,15 @@ use crate::postgres::{
     MigrationRun, MigrationRunner, MigrationSet, PostgresConfig, PostgresError, PostgresPool,
 };
 use crate::session::{
-    compute_stats, context_usage_for, coordination_score, delete_live_message, format_excerpt_rows,
-    is_searched, matches_every_term, message_to_transcript_entry, paginate_entries,
-    rank_search_results, reassigned_channel, redact_message_secrets, redact_messages_in_place,
-    replies_to, search_terms, tool_calls_for, ArchivePage, DeletedMessage, InterruptedTurn,
-    JournalEntry, MessageRole, Reassigned, RedactionStats, Session, SessionAttachment,
-    SessionContextType, SessionContextUsage, SessionExport, SessionKind, SessionMessage,
-    SessionSearchResult, SessionStats, SessionStore, SetAside, SetAsideRows, SetAsideStale,
-    ToolCallRecord, TranscriptEntry, TurnPrincipal, UnknownCursor,
+    appended, compute_stats, context_usage_for, coordination_score, delete_live_message,
+    discarded_metadata_keys, format_excerpt_rows, is_searched, matches_every_term,
+    message_to_transcript_entry, paginate_entries, rank_search_results, reassigned_channel,
+    redact_message_secrets, redact_messages_in_place, replies_to, search_terms, tool_calls_for,
+    ArchivePage, DeletedMessage, InterruptedTurn, JournalEntry, MessageRole, Reassigned,
+    RedactionStats, Session, SessionAttachment, SessionContextType, SessionContextUsage,
+    SessionExport, SessionKind, SessionMessage, SessionSearchResult, SessionStats, SessionStore,
+    SetAside, SetAsideRows, SetAsideStale, ToolCallRecord, TranscriptEntry, TurnPrincipal,
+    UnknownCursor,
 };
 
 mod embedded {
@@ -440,23 +441,6 @@ fn warn_discarded_metadata(
             "Session save: metadata not applied"
         );
     }
-}
-
-fn discarded_metadata_keys(
-    incoming: &serde_json::Value,
-    stored: &serde_json::Value,
-) -> Vec<String> {
-    let empty = serde_json::Map::new();
-    let incoming = incoming.as_object().unwrap_or(&empty);
-    let stored = stored.as_object().unwrap_or(&empty);
-    incoming
-        .keys()
-        .chain(stored.keys())
-        .filter(|key| incoming.get(*key) != stored.get(*key))
-        .cloned()
-        .collect::<std::collections::BTreeSet<_>>()
-        .into_iter()
-        .collect()
 }
 
 fn kind_to_str(kind: &SessionKind) -> &'static str {
@@ -2630,19 +2614,10 @@ impl PostgresSessionStore {
                     warn_discarded_metadata(&session, &row.metadata, cur, "stale-baseline save");
                     let stored: Vec<SessionMessage> =
                         serde_json::from_value(cur.get(1)).context("decode stored messages")?;
-                    let known: std::collections::HashSet<&str> =
-                        stored.iter().map(|m| m.id.as_str()).collect();
                     // New ids land at the end, so a summary from a
                     // CAS-losing compaction trails recent turns until the
                     // next uncontended compaction; no message is ever lost.
-                    let mut merged = stored.clone();
-                    merged.extend(
-                        session
-                            .messages
-                            .iter()
-                            .filter(|m| !known.contains(m.id.as_str()))
-                            .cloned(),
-                    );
+                    let merged = appended(stored, &session.messages, &Default::default());
                     let total: i64 = merged.iter().map(|m| i64::from(m.tokens)).sum();
                     let count = merged.len() as i32;
                     let json = serde_json::to_value(&merged).context("encode merged messages")?;

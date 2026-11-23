@@ -88,7 +88,9 @@ pub(crate) struct Charges {
     placing: HashSet<Uuid>,
 }
 
-/// [`Desk::charge_placing_until_dropped`].
+/// A session reserved in its boss's charge as it starts
+/// ([`Desk::reserve_charge`]), placing until dropped: once it is where it
+/// belongs, or never will be, its start cut off too.
 pub(super) struct Placing<'a> {
     desk: &'a Desk,
     id: Uuid,
@@ -1559,22 +1561,19 @@ impl Desk {
     /// Makes `id`, a session about to start, `boss`'s in `st`, under the
     /// same lock its record goes in with: no one ever sees it there and
     /// unrun, so a boss that takes on every session never takes this one
-    /// on as it starts. One that fails to start is forgotten with it.
+    /// on as it starts. One that fails to start is forgotten with it. It is
+    /// placing while what this returns is held.
     pub(super) fn reserve_charge(
+        &self,
         st: &mut super::State,
         id: Uuid,
         boss: &Party,
         group: Option<&str>,
-    ) {
+    ) -> Placing<'_> {
         st.charges.names.insert(boss.id.clone(), boss.name.clone());
         let c = Charge::new(id, &boss.id, How::Started, group.map(str::to_string));
         st.charges.rows.insert(id, c);
         st.charges.placing.insert(id);
-    }
-
-    /// Holds `id`, reserved as it started, as placing until dropped: once
-    /// it is where it belongs, or never will be, its start cut off too.
-    pub(super) fn charge_placing_until_dropped(&self, id: Uuid) -> Placing<'_> {
         Placing { desk: self, id }
     }
 

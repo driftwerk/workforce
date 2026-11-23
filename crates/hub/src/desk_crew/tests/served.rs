@@ -1193,3 +1193,72 @@ async fn the_person_hands_a_session_to_its_groups_grant_boss() {
     })
     .await;
 }
+
+/// A session the grant's boss starts is its from the start: the sweep that
+/// lets go of a served boss's sessions its grant no longer names leaves one
+/// still being placed in its grant to be judged once it is.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_session_its_grants_boss_is_still_starting_is_never_let_go() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let grants = pool.clone();
+        let (_desk, crew, d, _llm) = overseeing(
+            dir.path(),
+            pool,
+            "ok",
+            "[oversight]\nenabled = true\nlevel = \"act\"\n",
+            &[],
+        )
+        .await;
+        d.boss_bounds_with(workforce_desk::charge::Bounds {
+            home: dir.path().to_path_buf(),
+            ..Default::default()
+        });
+        let acme_api = dir.path().join("acme-api");
+        std::fs::create_dir_all(&acme_api).unwrap();
+        d.change_layout(|l| l.create("acme", "Acme", &[], None))
+            .await
+            .unwrap();
+        let (code, out) = native(
+            &d,
+            "PUT",
+            "/api/desk/grants/acme",
+            grant(&[], &acme_api, "act", "status"),
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK, "{out}");
+
+        // Its birth in the grant held up until the sweep has looked.
+        let mut client = grants.get().await.unwrap();
+        let held = client.transaction().await.unwrap();
+        held.execute("LOCK TABLE boss_grants IN EXCLUSIVE MODE", &[])
+            .await
+            .unwrap();
+        let starting = {
+            let crew = Arc::clone(&crew);
+            let input = json!({"folder": acme_api.to_string_lossy(), "goal": "Fix the date picker",
+                               "engine": "claude", "reason": "Next up."});
+            tokio::spawn(async move { serve(&crew, allan(), "crew.start_session", input).await })
+        };
+        let started = eventually("Allan's session placing", async || {
+            d.charges()
+                .into_iter()
+                .find(|c| c.boss == "driftwerk/allan" && d.charge_placing(c.session))
+                .map(|c| c.session)
+        })
+        .await;
+        crew.take_on_all().await;
+        assert!(d.charge_of(started).is_some_and(|c| c.live()), "kept");
+
+        held.rollback().await.unwrap();
+        let r = starting.await.unwrap();
+        assert_eq!(r.status, ServedStatus::Ok, "{:?}", r.body);
+        assert!(!d.charge_placing(started));
+        crew.take_on_all().await;
+        assert!(
+            d.charge_of(started).is_some_and(|c| c.live()),
+            "its grant names it"
+        );
+    })
+    .await;
+}

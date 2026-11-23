@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
 
@@ -2972,9 +2972,11 @@ pub trait SessionStore: Send + Sync {
     /// conversation" with a partial-unique index (Postgres), doing this as
     /// two independent `save`s transiently exposes either zero or two
     /// unsealed rows — racing a concurrent `get_or_create` or tripping the
-    /// index. The default does the two `save`s (correct for the cache-backed
-    /// file/in-memory stores, which serialise under their own lock); the
-    /// Postgres backend overrides it with a single transaction.
+    /// index. The default does the two `save`s, which suits the in-memory
+    /// store (each save replaces); the file and Postgres stores override it
+    /// and seal the stored session in place, since a save of a copy read
+    /// before its own last save would resolve against what is stored and
+    /// keep it unsealed.
     fn seal_and_insert_successor(&self, sealed: &Session, successor: &Session) -> eyre::Result<()> {
         self.save(sealed)?;
         self.save(successor)
@@ -4374,29 +4376,64 @@ fn next_revision(stored: Option<i64>) -> i64 {
     stored.map_or(0, |r| r + 1)
 }
 
+/// `stored`'s messages, then `incoming`'s that `stored` doesn't hold and no
+/// write took out (`removed`): what a save read before another write adds.
+pub(crate) fn appended(
+    stored: Vec<SessionMessage>,
+    incoming: &[SessionMessage],
+    removed: &HashSet<String>,
+) -> Vec<SessionMessage> {
+    let known: HashSet<String> = stored.iter().map(|m| m.id.clone()).collect();
+    stored
+        .into_iter()
+        .chain(
+            incoming
+                .iter()
+                .filter(|m| !known.contains(&m.id) && !removed.contains(&m.id))
+                .cloned(),
+        )
+        .collect()
+}
+
+/// The metadata keys a save resolved against the stored session doesn't
+/// apply: added, changed or removed in `incoming`.
+pub(crate) fn discarded_metadata_keys(
+    incoming: &serde_json::Value,
+    stored: &serde_json::Value,
+) -> Vec<String> {
+    let empty = serde_json::Map::new();
+    let incoming = incoming.as_object().unwrap_or(&empty);
+    let stored = stored.as_object().unwrap_or(&empty);
+    incoming
+        .keys()
+        .chain(stored.keys())
+        .filter(|key| incoming.get(*key) != stored.get(*key))
+        .cloned()
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
 /// `incoming` saved over `stored`, which another write changed since it was
-/// read, as the Postgres store resolves it: the stored messages, then
-/// incoming's the stored don't hold; the stored session's sealing, place in
-/// its thread, metadata and compactions; incoming's own name, kind and model.
-fn merged(mut stored: Session, incoming: &Session) -> Session {
-    if incoming.metadata != stored.metadata {
+/// read or which `incoming` holds only a shell of, as the Postgres store
+/// resolves it: [`appended`]; the stored session's sealing, place in its
+/// thread, metadata and compactions; incoming's own name, kind and model.
+fn merged(mut stored: Session, incoming: &Session, removed: &HashSet<String>) -> Session {
+    let discarded = discarded_metadata_keys(&incoming.metadata, &stored.metadata);
+    if !discarded.is_empty() {
         warn!(
             session_id = %incoming.id,
             baseline = ?incoming.loaded_revision,
             current = ?stored.loaded_revision,
+            discarded_metadata_keys = ?discarded,
             "Session save: metadata not applied"
         );
     }
-    let known: std::collections::HashSet<&str> =
-        stored.messages.iter().map(|m| m.id.as_str()).collect();
-    let added: Vec<SessionMessage> = incoming
-        .messages
-        .iter()
-        .filter(|m| !known.contains(m.id.as_str()))
-        .cloned()
-        .collect();
-    let mut messages = std::mem::take(&mut stored.messages);
-    messages.extend(added);
+    let messages = appended(
+        std::mem::take(&mut stored.messages),
+        &incoming.messages,
+        removed,
+    );
     Session {
         total_tokens: messages.iter().map(|m| u64::from(m.tokens)).sum(),
         messages,
@@ -4424,9 +4461,12 @@ fn merged(mut stored: Session, incoming: &Session) -> Session {
 pub struct JsonlSessionStore {
     base_dir: PathBuf,
     cache: std::sync::Mutex<HashMap<String, Session>>,
-    /// Held across each write of a session, so what one reads to resolve
-    /// against isn't changed under it.
-    writing: std::sync::Mutex<()>,
+    /// One lock per session, held across each of its writes, so what one
+    /// reads to resolve against isn't changed under it.
+    writing: std::sync::Mutex<HashMap<String, std::sync::Arc<std::sync::Mutex<()>>>>,
+    /// The message ids each session's writes took out of it: a save read
+    /// before them never brings them back.
+    removed: std::sync::Mutex<HashMap<String, HashSet<String>>>,
     instance_id: String,
 }
 
@@ -4460,7 +4500,8 @@ impl JsonlSessionStore {
         let store = Self {
             base_dir,
             cache: std::sync::Mutex::new(HashMap::new()),
-            writing: std::sync::Mutex::new(()),
+            writing: std::sync::Mutex::new(HashMap::new()),
+            removed: std::sync::Mutex::new(HashMap::new()),
             instance_id: instance_id.into(),
         };
 
@@ -4492,68 +4533,150 @@ impl JsonlSessionStore {
         stats
     }
 
-    fn write_lock(&self) -> eyre::Result<std::sync::MutexGuard<'_, ()>> {
-        self.writing
-            .lock()
-            .map_err(|e| eyre::eyre!("Lock poisoned: {e}"))
+    /// Runs `write` holding `session_id`'s write lock: one write of a
+    /// session at a time, writes of others alongside.
+    fn exclusively<T>(
+        &self,
+        session_id: &str,
+        write: impl FnOnce() -> eyre::Result<T>,
+    ) -> eyre::Result<T> {
+        let lock = std::sync::Arc::clone(
+            self.writing
+                .lock()
+                .map_err(|e| eyre::eyre!("Lock poisoned: {e}"))?
+                .entry(session_id.to_string())
+                .or_default(),
+        );
+        let _one = lock.lock().map_err(|e| eyre::eyre!("Lock poisoned: {e}"))?;
+        write()
     }
 
-    /// Saves `session` as the Postgres store does: as it is, when it was read
-    /// at the revision stored; otherwise (another write landed since) its
-    /// messages the stored session doesn't hold go after the stored ones,
-    /// and no message either wrote is lost. The revision it is stored at.
-    fn save_returning_revision(&self, session: &Session) -> eyre::Result<i64> {
-        let _one = self.write_lock()?;
-        self.hydrate_in_cache(&session.id)?;
-        let stored = self
+    fn cached(&self, session_id: &str) -> eyre::Result<Option<Session>> {
+        Ok(self
             .cache
             .lock()
             .map_err(|e| eyre::eyre!("Lock poisoned: {e}"))?
-            .get(&session.id)
-            .cloned();
-        let revision = next_revision(stored.as_ref().and_then(|s| s.loaded_revision));
-        let mut saved = match stored {
-            Some(stored)
-                if session.cached_message_count.is_none()
-                    && session.loaded_revision != stored.loaded_revision =>
-            {
-                merged(stored, session)
-            }
-            _ => session.clone(),
-        };
-        saved.loaded_revision = Some(revision);
-        self.write_to_disk(&saved)?;
+            .get(session_id)
+            .cloned())
+    }
+
+    fn keep_cached(&self, session: Session) -> eyre::Result<()> {
         self.cache
             .lock()
             .map_err(|e| eyre::eyre!("Lock poisoned: {e}"))?
-            .insert(saved.id.clone(), saved);
-        Ok(revision)
+            .insert(session.id.clone(), session);
+        Ok(())
     }
 
-    /// Changes the cached `session_id` with `change` and writes it, at its
-    /// next revision: a save read before it merges into it rather than
-    /// undoing it. Whether the session is there.
+    /// Notes the messages of `before` a write of `session_id` left out of
+    /// `after`.
+    fn note_removed(
+        &self,
+        session_id: &str,
+        before: impl IntoIterator<Item = String>,
+        after: &[SessionMessage],
+    ) -> eyre::Result<()> {
+        let kept: HashSet<&str> = after.iter().map(|m| m.id.as_str()).collect();
+        let gone: Vec<String> = before
+            .into_iter()
+            .filter(|id| !kept.contains(id.as_str()))
+            .collect();
+        if !gone.is_empty() {
+            self.removed
+                .lock()
+                .map_err(|e| eyre::eyre!("Lock poisoned: {e}"))?
+                .entry(session_id.to_string())
+                .or_default()
+                .extend(gone);
+        }
+        Ok(())
+    }
+
+    fn removed_from(&self, session_id: &str) -> eyre::Result<HashSet<String>> {
+        Ok(self
+            .removed
+            .lock()
+            .map_err(|e| eyre::eyre!("Lock poisoned: {e}"))?
+            .get(session_id)
+            .cloned()
+            .unwrap_or_default())
+    }
+
+    /// Saves `session` as the Postgres store does: as it is, when it was read
+    /// at the revision stored; otherwise (another write landed since, or it
+    /// is a shell) [`merged`] into the stored session, so no message either
+    /// wrote is lost and none a write took out comes back. The revision it
+    /// is stored at.
+    fn save_returning_revision(&self, session: &Session) -> eyre::Result<i64> {
+        self.exclusively(&session.id, || {
+            self.hydrate_in_cache(&session.id)?;
+            let stored = self.cached(&session.id)?;
+            let revision = next_revision(stored.as_ref().and_then(|s| s.loaded_revision));
+            let mut saved = match stored {
+                Some(stored)
+                    if session.cached_message_count.is_some()
+                        || session.loaded_revision != stored.loaded_revision =>
+                {
+                    merged(stored, session, &self.removed_from(&session.id)?)
+                }
+                Some(stored) => {
+                    self.note_removed(
+                        &session.id,
+                        stored.messages.into_iter().map(|m| m.id),
+                        &session.messages,
+                    )?;
+                    session.clone()
+                }
+                None => session.clone(),
+            };
+            saved.loaded_revision = Some(revision);
+            self.write_to_disk(&saved)?;
+            self.keep_cached(saved)?;
+            Ok(revision)
+        })
+    }
+
+    /// Changes the cached `session_id` with `change` under its write lock,
+    /// and writes it when `change` says it changed, at its next revision when
+    /// it `bumps`: a save read before it then merges into it rather than
+    /// undoing it. What `change` answered; none when the session isn't there.
+    fn rewrite<T>(
+        &self,
+        session_id: &str,
+        bumps: bool,
+        change: impl FnOnce(&mut Session) -> eyre::Result<(T, bool)>,
+    ) -> eyre::Result<Option<T>> {
+        self.exclusively(session_id, || {
+            let Some(mut session) = self.cached(session_id)? else {
+                return Ok(None);
+            };
+            let before: Vec<String> = session.messages.iter().map(|m| m.id.clone()).collect();
+            let (answer, changed) = change(&mut session)?;
+            if changed {
+                self.note_removed(session_id, before, &session.messages)?;
+                if bumps {
+                    session.loaded_revision = Some(next_revision(session.loaded_revision));
+                }
+                self.write_to_disk(&session)?;
+                self.keep_cached(session)?;
+            }
+            Ok(Some(answer))
+        })
+    }
+
+    /// [`Self::rewrite`], always a change, at the next revision, as the
+    /// Postgres store's `revision = revision + 1`. Whether the session is
+    /// there.
     fn change_stored(
         &self,
         session_id: &str,
         change: impl FnOnce(&mut Session),
     ) -> eyre::Result<bool> {
-        let _one = self.write_lock()?;
-        let changed = {
-            let mut cache = self
-                .cache
-                .lock()
-                .map_err(|e| eyre::eyre!("Lock poisoned: {e}"))?;
-            cache.get_mut(session_id).map(|session| {
-                change(session);
-                session.loaded_revision = Some(next_revision(session.loaded_revision));
-                session.clone()
-            })
-        };
-        match changed {
-            Some(session) => self.write_to_disk(&session).map(|()| true),
-            None => Ok(false),
-        }
+        self.rewrite(session_id, true, |session| {
+            change(session);
+            Ok(((), true))
+        })
+        .map(|done| done.is_some())
     }
 
     /// [`Self::change_stored`] of a session that must be there.
@@ -4562,10 +4685,21 @@ impl JsonlSessionStore {
         session_id: &str,
         change: impl FnOnce(&mut Session),
     ) -> eyre::Result<()> {
-        match self.change_stored(session_id, change)? {
-            true => Ok(()),
-            false => Err(eyre::eyre!("Session not found: {session_id}")),
-        }
+        self.rewrite_existing(session_id, |session| {
+            change(session);
+            Ok(((), true))
+        })
+    }
+
+    /// [`Self::rewrite`] at the next revision of a session that must be
+    /// there.
+    fn rewrite_existing<T>(
+        &self,
+        session_id: &str,
+        change: impl FnOnce(&mut Session) -> eyre::Result<(T, bool)>,
+    ) -> eyre::Result<T> {
+        self.rewrite(session_id, true, change)?
+            .ok_or_else(|| eyre::eyre!("Session not found: {session_id}"))
     }
 
     /// Path to the JSONL messages file for a session.
@@ -5092,8 +5226,9 @@ impl SessionStore for JsonlSessionStore {
         remove: &[&str],
     ) -> eyre::Result<()> {
         self.hydrate_in_cache(session_id)?;
-        self.change_stored(session_id, |session| {
+        self.rewrite(session_id, false, |session| {
             apply_metadata_patch(&mut session.metadata, patch, remove);
+            Ok(((), true))
         })
         .map(drop)
     }
@@ -5198,6 +5333,15 @@ impl SessionStore for JsonlSessionStore {
             .lock()
             .map_err(|e| eyre::eyre!("Lock poisoned: {e}"))?;
         cache.remove(session_id);
+        drop(cache);
+        self.writing
+            .lock()
+            .map_err(|e| eyre::eyre!("Lock poisoned: {e}"))?
+            .remove(session_id);
+        self.removed
+            .lock()
+            .map_err(|e| eyre::eyre!("Lock poisoned: {e}"))?
+            .remove(session_id);
         Ok(())
     }
 
@@ -5272,59 +5416,39 @@ impl SessionStore for JsonlSessionStore {
         dry_run: bool,
     ) -> eyre::Result<RedactionStats> {
         self.hydrate_in_cache(session_id)?;
-        let (mut stats, snapshot) = {
-            let mut cache = self
-                .cache
-                .lock()
-                .map_err(|e| eyre::eyre!("Lock poisoned: {e}"))?;
-            match cache.get_mut(session_id) {
-                Some(session) if dry_run => {
-                    let mut probe = session.messages.clone();
-                    (redact_messages_in_place(&mut probe), None)
-                }
-                Some(session) => {
-                    let stats = redact_messages_in_place(&mut session.messages);
-                    // Snapshot under the lock; write after releasing it
-                    // (mirrors delete_message) so disk reflects the same
-                    // in-place mutation the cache now holds.
-                    let snapshot = (stats.messages_redacted > 0).then(|| session.clone());
-                    (stats, snapshot)
-                }
-                None => (RedactionStats::default(), None),
-            }
-        };
-        if let Some(session) = snapshot {
-            self.write_to_disk(&session)?;
+        let mut stats = match dry_run {
+            true => self
+                .cached(session_id)?
+                .map(|mut session| redact_messages_in_place(&mut session.messages)),
+            false => self.rewrite(session_id, true, |session| {
+                let stats = redact_messages_in_place(&mut session.messages);
+                let changed = stats.messages_redacted > 0;
+                Ok((stats, changed))
+            })?,
         }
+        .unwrap_or_default();
         stats.archive_messages_redacted = self.redact_archive_secrets(session_id, dry_run)?;
         Ok(stats)
     }
 
     fn delete_message(&self, session_id: &str, message_id: &str) -> eyre::Result<()> {
         self.hydrate_in_cache(session_id)?;
-        let mut cache = self
-            .cache
-            .lock()
-            .map_err(|e| eyre::eyre!("Lock poisoned: {e}"))?;
-        let session = cache
-            .get_mut(session_id)
-            .ok_or_else(|| eyre::eyre!("Session not found: {session_id}"))?;
-        let before = session.messages.len();
-        let removed_tokens: u32 = session
-            .messages
-            .iter()
-            .filter(|m| m.id == message_id)
-            .map(|m| m.tokens)
-            .sum();
-        session.messages.retain(|m| m.id != message_id);
-        if session.messages.len() == before {
-            return Err(eyre::eyre!("Message not found: {message_id}"));
-        }
-        session.total_tokens = session.total_tokens.saturating_sub(removed_tokens as u64);
-        session.updated_at = chrono::Utc::now();
-        let session_clone = session.clone();
-        drop(cache);
-        self.write_to_disk(&session_clone)
+        self.rewrite_existing(session_id, |session| {
+            let before = session.messages.len();
+            let removed_tokens: u32 = session
+                .messages
+                .iter()
+                .filter(|m| m.id == message_id)
+                .map(|m| m.tokens)
+                .sum();
+            session.messages.retain(|m| m.id != message_id);
+            if session.messages.len() == before {
+                return Err(eyre::eyre!("Message not found: {message_id}"));
+            }
+            session.total_tokens = session.total_tokens.saturating_sub(removed_tokens as u64);
+            session.updated_at = chrono::Utc::now();
+            Ok(((), true))
+        })
     }
 
     fn search_sessions(&self, query: &str, limit: usize) -> eyre::Result<Vec<SessionSearchResult>> {
@@ -5389,25 +5513,17 @@ impl SessionStore for JsonlSessionStore {
 
     fn truncate_from_message(&self, session_id: &str, message_id: &str) -> eyre::Result<()> {
         self.hydrate_in_cache(session_id)?;
-        let mut cache = self
-            .cache
-            .lock()
-            .map_err(|e| eyre::eyre!("Lock poisoned: {e}"))?;
-        let session = cache
-            .get_mut(session_id)
-            .ok_or_else(|| eyre::eyre!("Session not found: {session_id}"))?;
-        let start_idx = session
-            .messages
-            .iter()
-            .position(|m| m.id == message_id)
-            .ok_or_else(|| eyre::eyre!("Message not found: {message_id}"))?;
-        let removed: Vec<_> = session.messages.drain(start_idx..).collect();
-        let removed_tokens: u32 = removed.iter().map(|m| m.tokens).sum();
-        session.total_tokens = session.total_tokens.saturating_sub(removed_tokens as u64);
-        session.updated_at = chrono::Utc::now();
-        let session_clone = session.clone();
-        drop(cache);
-        self.write_to_disk(&session_clone)
+        self.rewrite_existing(session_id, |session| {
+            let start_idx = session
+                .messages
+                .iter()
+                .position(|m| m.id == message_id)
+                .ok_or_else(|| eyre::eyre!("Message not found: {message_id}"))?;
+            let removed_tokens: u32 = session.messages.drain(start_idx..).map(|m| m.tokens).sum();
+            session.total_tokens = session.total_tokens.saturating_sub(removed_tokens as u64);
+            session.updated_at = chrono::Utc::now();
+            Ok(((), true))
+        })
     }
 
     fn delete_person_message(
@@ -5416,92 +5532,75 @@ impl SessionStore for JsonlSessionStore {
         message_id: &str,
     ) -> eyre::Result<DeletedMessage> {
         self.hydrate_in_cache(session_id)?;
-        let mut cache = self
-            .cache
-            .lock()
-            .map_err(|e| eyre::eyre!("Lock poisoned: {e}"))?;
-        let session = cache
-            .get_mut(session_id)
-            .ok_or_else(|| eyre::eyre!("Session not found: {session_id}"))?;
-        // A session from before its archive was seeded reads its live
-        // messages instead, so those alone change.
-        let path = self.archive_path(session_id);
-        let mut archived = None;
-        if path.exists() {
-            let mut rows = self.read_archive_messages(session_id)?;
-            if let Some(at) = rows.iter().position(|m| m.id == message_id) {
-                let replies = replies_to(&rows[at], &rows[at + 1..]);
-                rows.remove(at);
-                mark_answered_deleted(&mut rows, &replies);
+        self.rewrite_existing(session_id, |session| {
+            // A session from before its archive was seeded reads its live
+            // messages instead, so those alone change.
+            let path = self.archive_path(session_id);
+            let mut archived = None;
+            if path.exists() {
+                let mut rows = self.read_archive_messages(session_id)?;
+                if let Some(at) = rows.iter().position(|m| m.id == message_id) {
+                    let replies = replies_to(&rows[at], &rows[at + 1..]);
+                    rows.remove(at);
+                    mark_answered_deleted(&mut rows, &replies);
+                    let mut kept = String::new();
+                    for row in &rows {
+                        kept.push_str(&serde_json::to_string(row).map_err(|e| {
+                            eyre::eyre!("Failed to serialize archive message: {e}")
+                        })?);
+                        kept.push('\n');
+                    }
+                    atomic_write(&path, kept.as_bytes())?;
+                    archived = Some(replies);
+                }
+            }
+            let was_archived = archived.is_some();
+            let mut deleted = delete_live_message(session, message_id, archived);
+            deleted.archived = was_archived;
+            let changed = deleted.live || !deleted.replies.is_empty();
+            Ok((deleted, changed))
+        })
+    }
+
+    fn set_aside_from(&self, session_id: &str, aside: &SetAside<'_>) -> eyre::Result<SetAsideRows> {
+        self.hydrate_in_cache(session_id)?;
+        self.rewrite_existing(session_id, |session| {
+            let path = self.archive_path(session_id);
+            // A session from before its archive was seeded reads its live
+            // messages instead, so those are what is set aside.
+            let set_aside: Vec<SessionMessage> = if path.exists() {
+                let archived = self.read_archive_messages(session_id)?;
+                let from = set_aside_start(&archived, aside)?;
                 let mut kept = String::new();
-                for row in &rows {
+                for message in archived[..from].iter().chain(aside.replacement) {
                     kept.push_str(
-                        &serde_json::to_string(row)
+                        &serde_json::to_string(message)
                             .map_err(|e| eyre::eyre!("Failed to serialize archive message: {e}"))?,
                     );
                     kept.push('\n');
                 }
                 atomic_write(&path, kept.as_bytes())?;
-                archived = Some(replies);
+                archived[from..].to_vec()
+            } else {
+                let from = set_aside_start(&session.messages, aside)?;
+                session.messages[from..].to_vec()
+            };
+            let ids: Vec<String> = set_aside.iter().map(|m| m.id.clone()).collect();
+            let (removed_tokens, compacted) = cut_set_aside(&mut session.messages, &ids);
+            session.total_tokens = session.total_tokens.saturating_sub(removed_tokens);
+            if let Some(replacement) = aside.replacement {
+                session.total_tokens += u64::from(replacement.tokens);
+                session.messages.push(replacement.clone());
             }
-        }
-        let was_archived = archived.is_some();
-        let mut deleted = delete_live_message(session, message_id, archived);
-        deleted.archived = was_archived;
-        if deleted.live || !deleted.replies.is_empty() {
-            let session_clone = session.clone();
-            drop(cache);
-            self.write_to_disk(&session_clone)?;
-        }
-        Ok(deleted)
-    }
-
-    fn set_aside_from(&self, session_id: &str, aside: &SetAside<'_>) -> eyre::Result<SetAsideRows> {
-        self.hydrate_in_cache(session_id)?;
-        let mut cache = self
-            .cache
-            .lock()
-            .map_err(|e| eyre::eyre!("Lock poisoned: {e}"))?;
-        let session = cache
-            .get_mut(session_id)
-            .ok_or_else(|| eyre::eyre!("Session not found: {session_id}"))?;
-        let path = self.archive_path(session_id);
-        // A session from before its archive was seeded reads its live
-        // messages instead, so those are what is set aside.
-        let set_aside: Vec<SessionMessage> = if path.exists() {
-            let archived = self.read_archive_messages(session_id)?;
-            let from = set_aside_start(&archived, aside)?;
-            let mut kept = String::new();
-            for message in archived[..from].iter().chain(aside.replacement) {
-                kept.push_str(
-                    &serde_json::to_string(message)
-                        .map_err(|e| eyre::eyre!("Failed to serialize archive message: {e}"))?,
-                );
-                kept.push('\n');
-            }
-            atomic_write(&path, kept.as_bytes())?;
-            archived[from..].to_vec()
-        } else {
-            let from = set_aside_start(&session.messages, aside)?;
-            session.messages[from..].to_vec()
-        };
-        let ids: Vec<String> = set_aside.iter().map(|m| m.id.clone()).collect();
-        let (removed_tokens, compacted) = cut_set_aside(&mut session.messages, &ids);
-        session.total_tokens = session.total_tokens.saturating_sub(removed_tokens);
-        if let Some(replacement) = aside.replacement {
-            session.total_tokens += u64::from(replacement.tokens);
-            session.messages.push(replacement.clone());
-        }
-        session.updated_at = chrono::Utc::now();
-        let session_clone = session.clone();
-        drop(cache);
-        self.write_to_disk(&session_clone)?;
-        Ok(SetAsideRows {
-            entries: set_aside
-                .iter()
-                .map(|m| message_to_transcript_entry(session_id, m))
-                .collect(),
-            compacted,
+            session.updated_at = chrono::Utc::now();
+            let rows = SetAsideRows {
+                entries: set_aside
+                    .iter()
+                    .map(|m| message_to_transcript_entry(session_id, m))
+                    .collect(),
+                compacted,
+            };
+            Ok((rows, true))
         })
     }
 
@@ -6647,6 +6746,98 @@ mod tests {
         assert!(got.is_sealed());
         assert_eq!(ids(&got), [asked.as_str()]);
         assert_eq!(reopened.find("c", "o").unwrap().unwrap().id, successor.id);
+    }
+
+    #[test]
+    fn a_metadata_patch_between_a_read_and_a_refreshed_save_lets_its_compaction_land() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = JsonlSessionStore::new(dir.path()).unwrap();
+        let mut session = store.get_or_create("c", "o", "a").unwrap();
+        session.add_user_message("turn one", None);
+        session.add_user_message("turn two", None);
+        store.save_refreshing(&mut session).unwrap();
+
+        let mut patch = serde_json::Map::new();
+        patch.insert("personal_read".into(), serde_json::json!(true));
+        store.merge_metadata(&session.id, patch, &[]).unwrap();
+        session.messages.truncate(1);
+        let summary = session.messages[0].id.clone();
+        store.save_refreshing(&mut session).unwrap();
+
+        let reopened = JsonlSessionStore::new(dir.path()).unwrap();
+        assert_eq!(
+            ids(&reopened.get(&session.id).unwrap().unwrap()),
+            [summary.as_str()]
+        );
+    }
+
+    #[test]
+    fn a_redaction_while_a_save_was_read_stays_redacted_in_the_file_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = JsonlSessionStore::new(dir.path()).unwrap();
+        let mut session = store.get_or_create("c", "o", "a").unwrap();
+        session.add_user_message(&format!("my token is {GH_SECRET} ok"), None);
+        store.save_refreshing(&mut session).unwrap();
+
+        let stats = store.redact_secrets_in_session(&session.id, false).unwrap();
+        assert_eq!(stats.messages_redacted, 1);
+        let reply = session.add_assistant_message("noted", 2);
+        store.save(&session).unwrap();
+
+        let reopened = JsonlSessionStore::new(dir.path()).unwrap();
+        let got = reopened.get(&session.id).unwrap().unwrap();
+        assert!(!serde_json::to_string(&got.messages)
+            .unwrap()
+            .contains(GH_SECRET));
+        assert_eq!(got.messages.last().unwrap().id, reply);
+    }
+
+    #[test]
+    fn a_truncate_while_a_save_was_read_stays_truncated_in_the_file_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = JsonlSessionStore::new(dir.path()).unwrap();
+        let mut session = store.get_or_create("c", "o", "a").unwrap();
+        let kept = session.add_user_message("keep this", None);
+        let cut = session.add_user_message("retry from here", None);
+        store.save_refreshing(&mut session).unwrap();
+
+        store.truncate_from_message(&session.id, &cut).unwrap();
+        let reply = session.add_assistant_message("an answer to what was cut", 2);
+        store.save(&session).unwrap();
+
+        let reopened = JsonlSessionStore::new(dir.path()).unwrap();
+        assert_eq!(
+            ids(&reopened.get(&session.id).unwrap().unwrap()),
+            [kept.as_str(), reply.as_str()]
+        );
+    }
+
+    #[test]
+    fn a_shell_listed_before_a_rollover_never_unseals_the_file_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = JsonlSessionStore::new(dir.path()).unwrap();
+        let mut session = store.get_or_create("c", "o", "a").unwrap();
+        let asked = session.add_user_message("what was it called?", None);
+        store.save(&session).unwrap();
+        let reopened = JsonlSessionStore::new(dir.path()).unwrap();
+        let mut shell = reopened
+            .list(None, 10)
+            .unwrap()
+            .into_iter()
+            .find(|s| s.id == session.id)
+            .unwrap();
+        assert!(shell.cached_message_count.is_some(), "a shell");
+        let successor = reopened.start_fresh("c", "o", "a").unwrap();
+
+        shell.label = Some("Renamed".into());
+        reopened.save(&shell).unwrap();
+
+        let again = JsonlSessionStore::new(dir.path()).unwrap();
+        let got = again.get(&session.id).unwrap().unwrap();
+        assert!(got.is_sealed(), "still sealed");
+        assert_eq!(got.label.as_deref(), Some("Renamed"));
+        assert_eq!(ids(&got), [asked.as_str()]);
+        assert_eq!(again.find("c", "o").unwrap().unwrap().id, successor.id);
     }
 
     #[test]
