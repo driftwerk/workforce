@@ -227,7 +227,7 @@ impl BossDecision {
             (None, Some(UndoPlan::Line { .. }), Some(d)) if self.undo != Undo::None => match d {
                 Delivery::Queued | Delivery::Held => Some("undo"),
                 Delivery::Handed | Delivery::Delivered | Delivery::Noted => Some("correct"),
-                Delivery::Refused | Delivery::Withdrawn => None,
+                Delivery::Refused | Delivery::Withdrawn | Delivery::Unreceived => None,
             },
             _ => self.button(),
         };

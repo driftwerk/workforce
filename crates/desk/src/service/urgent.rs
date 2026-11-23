@@ -278,7 +278,9 @@ impl Desk {
                 | line::Wait::Stopped
                 | line::Wait::Working
                 | line::Wait::Typing
-                | line::Wait::NextCall => "It can't take this now.",
+                | line::Wait::NextCall
+                | line::Wait::Awaited
+                | line::Wait::Behind => "It can't take this now.",
             }
             .into());
         }
