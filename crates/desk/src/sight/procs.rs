@@ -177,7 +177,11 @@ pub fn placed<'a>(
         .filter(|s| procs::is_tool_shell(&s.proc))
         .collect();
     let tools = &tools;
-    let ran = |s: &Stat| i64::try_from(s.elapsed_secs).ok();
+    // A shell whose start can't be said is placed for none.
+    let ran = |s: &Stat| {
+        started(listed, s)?;
+        i64::try_from(s.elapsed_secs).ok()
+    };
     let age = |at: DateTime<Utc>| (listed - at).num_milliseconds().div_euclid(1000);
     // Each one by when it began, and the earliest its shell may start
     // after it, in seconds before it.
@@ -197,7 +201,7 @@ pub fn placed<'a>(
         .flat_map(|&(_, at, low)| {
             let a = age(at);
             tools.iter().filter_map(move |s| {
-                let before = ran(s)? - a;
+                let before = ran(s)?.checked_sub(a)?;
                 fits(low, before).then_some((before, a))
             })
         })
@@ -218,7 +222,7 @@ pub fn placed<'a>(
                 .iter()
                 .copied()
                 .filter(|s| {
-                    ran(s) == Some(a + before)
+                    ran(s).is_some_and(|r| Some(r) == a.checked_add(before))
                         && !placed.values().any(|p: &&Stat| p.proc.pid == s.proc.pid)
                 })
                 .collect();
@@ -245,8 +249,14 @@ pub fn subtree<'a>(tree: &[&'a Stat], head: &'a Stat) -> Vec<&'a Stat> {
         .collect()
 }
 
-fn started(now: DateTime<Utc>, s: &Stat) -> DateTime<Utc> {
-    now - Duration::seconds(i64::try_from(s.elapsed_secs).unwrap_or(i64::MAX / 2))
+/// When `s` started, `ps` having said how long it ran by `now`: none when
+/// that is more than a time can say, as `ps` can say of a process forked
+/// that instant, its run wrapped round.
+fn started(now: DateTime<Utc>, s: &Stat) -> Option<DateTime<Utc>> {
+    i64::try_from(s.elapsed_secs)
+        .ok()
+        .and_then(Duration::try_seconds)
+        .and_then(|ran| now.checked_sub_signed(ran))
 }
 
 /// A process's program and the arguments after it: a script's own name
@@ -360,8 +370,10 @@ pub struct Evidence<'a> {
 }
 
 impl Evidence<'_> {
+    /// When `s` started; one whose start can't be said is taken to have
+    /// started now, so nothing of it has lasted.
     fn started(&self, s: &Stat) -> DateTime<Utc> {
-        started(self.now, s)
+        started(self.now, s).unwrap_or(self.now)
     }
 
     fn parent(&self, s: &Stat) -> Option<&Stat> {
@@ -892,6 +904,28 @@ mod tests {
             [("b2".to_string(), 120)],
             "its file made a few ms before its shell started"
         );
+    }
+
+    #[test]
+    fn a_process_whose_run_is_more_than_a_time_can_say_is_never_placed_nor_a_panic() {
+        let all = shells(&[(110, u64::MAX, 0), (120, u64::MAX / 2, 0)]);
+        let tree = work(&all, 100, Engine::Claude, None);
+        let half = all.iter().find(|s| s.proc.pid == 120).unwrap();
+        assert!(started(now(), half).is_none());
+        let call = bash_call(1);
+        let placed = placed(&tree, Some(&call), None, &[("b1", now())], &[], now());
+        assert!(placed.is_empty(), "{placed:?}");
+        let said = appeared(&call, BUSY, 0);
+        let r = classify(&Evidence {
+            tree: &tree,
+            open_call: Some(&call),
+            said: said.as_slice(),
+            placed: &placed,
+            active_at: now(),
+            now: now(),
+            poll: Duration::minutes(10),
+        });
+        assert!(r.since <= now());
     }
 
     #[test]
