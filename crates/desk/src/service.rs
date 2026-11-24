@@ -4580,7 +4580,6 @@ impl Desk {
             st.restarted.remove(&id);
             st.exited.remove(&id);
             st.ended_before.remove(&id);
-            st.modes_started.remove(&id);
             st.deps.remove(&id);
             st.switch_by.remove(&id);
             st.switch_notes.remove(&id);
@@ -5871,15 +5870,15 @@ impl Desk {
         // The mode Desk keeps for it, as an overseer set it; one that
         // doesn't ask is shown on its card while it runs in it.
         let carried = self.0.state.lock().modes_carried.remove(&r.id);
-        let mode = self.mode_to_start(r.id).await.or(carried);
-        // The one that doesn't ask it last started in, as a boss kept it.
-        let left = {
+        let start_in = self.mode_to_start(r.id).await;
+        let mode = start_in.mode().or(carried);
+        {
             let mut st = self.0.state.lock();
             match mode.filter(|m| !m.asks()) {
                 Some(m) => st.modes_started.insert(r.id, m),
                 None => st.modes_started.remove(&r.id),
-            }
-        };
+            };
+        }
         // A boss served from a grant runs it: Desk's check of each call fails
         // closed. Kept with its process, so a hub that takes it back knows.
         let fail_closed = r.engine == Engine::Claude && self.served_runs(r.id);
@@ -5929,7 +5928,8 @@ impl Desk {
                 // keeps a mode for it, or it was left in one that doesn't
                 // ask: that one isn't its own, and it goes back to Codex's
                 // default.
-                let reset = left.and(thread).map(|_| crate::mode::Mode::Default);
+                let reset = (start_in == modes::StartIn::Reset && thread.is_some())
+                    .then_some(crate::mode::Mode::Default);
                 let permissions = codex::Permissions::of(mode.or(reset), r.approve_for_me);
                 let follower = self.codex_follower(thread.map(str::to_string));
                 let (follower, primed) = match thread {
@@ -6123,6 +6123,9 @@ impl Desk {
                 breaker: Default::default(),
             },
         );
+        if start_in == modes::StartIn::Reset {
+            self.reset_done(r.id).await;
+        }
         // Started afresh: on its own account again, or on the CLI's sign-in
         // as it is now.
         self.started_afresh(r.id);

@@ -6,7 +6,10 @@
 //! unbound boss's alone, on a session it runs, and lasts only as long as
 //! both hold: at any later start it is dropped, and the session starts in
 //! its own mode, unless the boss that set it is still unbound and still
-//! runs it. The person resuming it themselves drops it too.
+//! runs it. The person resuming it themselves drops it too. A dropped one
+//! is kept, marked, until the session has started again out of it: an
+//! engine that resumes a conversation in what it last ran in (Codex) is put
+//! back in its default, never left in it, whatever ends in between.
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -37,6 +40,44 @@ const STOP_WITHIN: Duration = Duration::from_secs(10);
 struct Kept {
     mode: Mode,
     boss: String,
+    /// Dropped: its session isn't to run in it again ([`StartIn::Reset`]).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    dropped: bool,
+}
+
+impl Kept {
+    /// Whether its session runs in it now.
+    fn holds(&self) -> bool {
+        !self.dropped
+    }
+
+    /// Drops it, when it doesn't ask and holds: whether it did.
+    fn drop_unasking(&mut self) -> bool {
+        let drops = self.holds() && !self.mode.asks();
+        self.dropped |= drops;
+        drops
+    }
+}
+
+/// What a session starts in, as far as Desk keeps its mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StartIn {
+    /// Its own: Desk keeps none.
+    Own,
+    /// The mode Desk keeps for it.
+    Kept(Mode),
+    /// Its engine's default: it was left in a mode that doesn't ask, since
+    /// dropped, and isn't to resume in it.
+    Reset,
+}
+
+impl StartIn {
+    pub(crate) fn mode(self) -> Option<Mode> {
+        match self {
+            Self::Kept(m) => Some(m),
+            Self::Own | Self::Reset => None,
+        }
+    }
 }
 
 /// A mode set: the session as it is now, whether it was running, the mode
@@ -99,27 +140,43 @@ impl Desk {
                 .is_some_and(|c| c.live() && c.boss == boss)
     }
 
-    /// The mode `id` starts in now, if Desk keeps one for it: one that
-    /// doesn't ask is dropped (and the session starts in its own) unless
-    /// the boss that set it is still unbound and still runs it.
-    pub(crate) async fn mode_to_start(&self, id: Uuid) -> Option<Mode> {
+    /// What `id` starts in now, as Desk keeps its mode: one that doesn't
+    /// ask is dropped (and the session reset) unless the boss that set it
+    /// is still unbound and still runs it.
+    pub(crate) async fn mode_to_start(&self, id: Uuid) -> StartIn {
         let decided = self
             .edit_modes(|modes| {
-                let Some(kept) = modes.get(&id).cloned() else {
-                    return (None, false);
+                let Some(kept) = modes.get_mut(&id) else {
+                    return (StartIn::Own, false);
                 };
+                if !kept.holds() {
+                    return (StartIn::Reset, false);
+                }
                 if kept.mode.asks() || self.unbound_runs(id, &kept.boss) {
-                    return (Some(kept.mode), false);
+                    return (StartIn::Kept(kept.mode), false);
                 }
                 tracing::info!(%id, mode = kept.mode.as_str(), "its boss is no longer unbound over it, so it starts in its own mode");
-                modes.remove(&id);
-                (None, true)
+                (StartIn::Reset, kept.drop_unasking())
             })
             .await;
         decided.unwrap_or_else(|e| {
-            tracing::warn!(%id, error = %e, "dropping a session's kept mode failed; it starts in its own mode");
-            None
+            tracing::warn!(%id, error = %e, "dropping a session's kept mode failed; it starts in its engine's default");
+            StartIn::Reset
         })
+    }
+
+    /// `id` started again out of the mode it was dropped from: nothing is
+    /// left of it.
+    pub(crate) async fn reset_done(&self, id: Uuid) {
+        let done = self
+            .edit_modes(|modes| match modes.get(&id).is_some_and(|k| !k.holds()) {
+                true => ((), modes.remove(&id).is_some()),
+                false => ((), false),
+            })
+            .await;
+        if let Err(e) = done {
+            tracing::warn!(%id, error = %e, "a session's dropped mode wasn't cleared; its next start resets it again");
+        }
     }
 
     /// Whether boss `boss` may act on `id` now, as far as its mode goes:
@@ -221,9 +278,11 @@ impl Desk {
             self.0.modes_dirty.store(false, Ordering::SeqCst);
             let dropped = self
                 .edit_modes(|modes| {
-                    let before = modes.len();
-                    modes.retain(|id, k| k.mode.asks() || self.unbound_runs(*id, &k.boss));
-                    ((), modes.len() != before)
+                    let dropped = modes
+                        .iter_mut()
+                        .filter(|(id, k)| !self.unbound_runs(**id, &k.boss))
+                        .fold(false, |any, (_, k)| k.drop_unasking() | any);
+                    ((), dropped)
                 })
                 .await;
             if let Err(e) = dropped {
@@ -231,14 +290,16 @@ impl Desk {
             }
             let kept = self.kept_modes().await;
             let running: Vec<(Uuid, Mode)> = {
-                let st = self.0.state.lock();
+                let mut st = self.0.state.lock();
+                // Stopped with its mode gone: nothing is left to restore.
                 let live: std::collections::HashSet<Uuid> = st.live.keys().copied().collect();
-                // A stopped one's is kept: its next start is put back in
-                // its own mode from it ([`Self::launch`]).
+                let held = |id: &Uuid| kept.get(id).is_some_and(Kept::holds);
+                st.modes_started
+                    .retain(|id, _| live.contains(id) || held(id));
                 st.modes_started
                     .iter()
                     .filter(|(id, m)| !m.asks() && live.contains(id))
-                    .filter(|(id, _)| !kept.contains_key(id))
+                    .filter(|(id, _)| !held(id))
                     .map(|(id, m)| (*id, *m))
                     .collect()
             };
@@ -324,12 +385,10 @@ impl Desk {
             return;
         }
         let dropped = self
-            .edit_modes(
-                |modes| match modes.get(&id).is_some_and(|k| !k.mode.asks()) {
-                    true => ((), modes.remove(&id).is_some()),
-                    false => ((), false),
-                },
-            )
+            .edit_modes(|modes| {
+                let dropped = modes.get_mut(&id).is_some_and(Kept::drop_unasking);
+                ((), dropped)
+            })
             .await;
         if let Err(e) = dropped {
             tracing::warn!(%id, error = %e, "dropping a session's kept mode failed");
@@ -398,6 +457,7 @@ impl Desk {
         let kept = Kept {
             mode,
             boss: by.party.id.clone(),
+            dropped: false,
         };
         self.edit_modes(|modes| ((), modes.insert(id, kept.clone()) != Some(kept)))
             .await?;
