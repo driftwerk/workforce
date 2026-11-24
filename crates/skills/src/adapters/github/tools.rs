@@ -2763,9 +2763,22 @@ impl Tool for GithubCompareTool {
                     })
                     .collect();
 
+                // Oldest first, and cut short past GitHub's page: its last
+                // is the head only when every commit is listed.
+                let commits = result["commits"].as_array().map_or(&[][..], Vec::as_slice);
+                let head_committed_at = match result["total_commits"].as_u64() {
+                    Some(n) if n == commits.len() as u64 => {
+                        commits.last().map_or(serde_json::Value::Null, |c| {
+                            c["commit"]["committer"]["date"].clone()
+                        })
+                    }
+                    _ => serde_json::Value::Null,
+                };
                 Ok(ToolResult::success(
                     serde_json::json!({
                         "status": result["status"],
+                        "base_sha": result["base_commit"]["sha"],
+                        "head_committed_at": head_committed_at,
                         "ahead_by": result["ahead_by"],
                         "behind_by": result["behind_by"],
                         "total_commits": result["total_commits"],

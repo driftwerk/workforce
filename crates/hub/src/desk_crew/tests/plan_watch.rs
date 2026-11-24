@@ -19,6 +19,8 @@
 //!   plan's turn once, from what Desk sees alone.
 
 use super::act_fully::repo;
+use super::goal_checks::{checking, fast_ci, goal_running, mantis, CI, STALLED};
+use super::goals::{boss_on, run};
 use super::plans::{hub_on, hub_with, started, ACTS};
 use super::stalls::{
     at_work_as, building_cli, builds_stop, looked_inside_never_asked, looked_until_woken,
@@ -95,7 +97,7 @@ async fn running(d: &Desk, folder: &Path, n: usize) -> (uuid::Uuid, Vec<SessionV
 }
 
 /// Ends `s`'s turn with `said`, as its engine would.
-async fn turn_ends(d: &Desk, base: &Path, s: &SessionView, said: &str) -> SessionView {
+pub(super) async fn turn_ends(d: &Desk, base: &Path, s: &SessionView, said: &str) -> SessionView {
     let url = hook_url(base, s.id).await;
     hook(
         &url,
@@ -142,7 +144,7 @@ async fn ticket(d: &Desk, id: uuid::Uuid, key: &str) -> workforce_desk::PlanTick
 
 /// How many of the boss's turns were woken with every one of `words`: in
 /// what each was given, not in the history a later turn carries.
-async fn asked_with(llm: &wiremock::MockServer, words: &[&str]) -> usize {
+pub(super) async fn asked_with(llm: &wiremock::MockServer, words: &[&str]) -> usize {
     llm.received_requests()
         .await
         .unwrap_or_default()
@@ -803,6 +805,94 @@ async fn what_closing_a_session_leaves_is_read_for_the_person_as_its_boss_reads_
         let c = d.closing(s.id).await.unwrap();
         assert_eq!(c.pulls, [175]);
         assert_eq!(c.changes.as_deref(), Some("1 uncommitted file"));
+    })
+    .await;
+}
+
+/// The night of 22 November replayed (DW-729): a goal of two parts, CI
+/// per job at most 5 minutes and one judged. Its session works on another
+/// branch all night, the boss's checkpoint from those commits is refused as
+/// off the goal, CI stays at 22 minutes, and the boss arms no watch. The
+/// hub reads it alone and wakes the boss at the stall window, at twice and
+/// at four times it, once a spell with both parts; the person's roundup
+/// says one note at four times, and nothing else is said to them.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_night_of_22_november() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(dir.path()).unwrap();
+        let gh = mantis(chrono::Utc::now(), 22, "diverged").await;
+        let (overseer, crew, d, llm) = boss_on(&base, pool, &checking(10), &gh).await;
+        let (id, s) = goal_running(&d, &base, fast_ci(true)).await;
+        turn_ends(&d, &base, &s, "Pushed the cache work to spike-cache.").await;
+
+        // Read with no boss turn and no watch.
+        let read = eventually("the goal read on its own", async || {
+            let p = d.plan(id).await.ok()?;
+            let part = p.goal?.parts.first()?.newest.clone()?;
+            (part.value == Some(22.0)).then_some(part)
+        })
+        .await;
+        assert!(!read.met);
+        assert!(d
+            .store()
+            .watches_open("desk", PERSON)
+            .await
+            .unwrap()
+            .is_empty());
+
+        // Its checkpoint from those commits is refused as off the goal, and
+        // says what it would take.
+        let r = run(
+            &overseer,
+            "crew.plan_update",
+            json!({ "plan_id": id.to_string(), "why": "Showing the work",
+                    "checkpoint": { "part": 2, "said": "Only api's tests ran",
+                                    "evidence": [{ "kind": "commit", "repo": "acme/mantis", "sha": "d05e8a4c0ffee" }] } }),
+        )
+        .await;
+        assert!(!r.success, "{r:?}");
+        let refused = r.error.unwrap_or_default();
+        assert!(
+            refused.contains("isn't on the goal's work (main of acme/mantis)")
+                && refused.contains("open a pull request from its branch"),
+            "{refused}"
+        );
+
+        // Woken once at the window, at twice it and at four times it, each
+        // time with both parts; the roundup is given one note at four times.
+        let turns = async || asked_with(&llm, &[STALLED]).await;
+        eventually("the third spell's turn", async || {
+            (turns().await >= 3).then_some(())
+        })
+        .await;
+        let noted_by = chrono::Utc::now();
+        assert_eq!(turns().await, 3, "once a spell");
+        assert!(asked_with(&llm, &[STALLED, CI, "22 minutes", "only the services"]).await >= 2);
+        let notes = crew.goal_notes("desk", noted_by);
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        assert!(notes[0].starts_with("No progress on “Mantis CI"), "{notes:?}");
+        // Nothing more within the spell: the next is at eight times.
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        assert_eq!(turns().await, 3, "nothing more within the spell");
+
+        // No checkpoint moved the judged part, and the person was told
+        // nothing until their roundup, which says the note once.
+        let p = d.plan(id).await.unwrap();
+        assert!(p.facts.iter().all(|f| !f.checked));
+        let said = |words: &str| super::decides_at_once::said(&overseer, &[words]);
+        assert_eq!(said(STALLED), 0);
+        assert_eq!(said("hasn't moved in"), 0);
+        assert_eq!(said("No progress on “Mantis CI"), 0);
+        assert!(crew.roundup_now("desk"));
+        eventually("the roundup says it", async || {
+            (said("No progress on “Mantis CI") > 0).then_some(())
+        })
+        .await;
+        eventually("the note let go", async || {
+            crew.goal_notes("desk", noted_by).is_empty().then_some(())
+        })
+        .await;
     })
     .await;
 }

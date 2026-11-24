@@ -1468,15 +1468,25 @@ async fn holds_its_own(pool: workforce_postgres::PostgresPool) {
     .await;
     // Each reaches its own: the main overseer under its plan's grant, Sarah
     // under Acme's.
+    // The bosses' histories alone: a group's machine glance lands whenever
+    // its watcher's look asks it.
+    let histories = || -> Vec<RelayCall> {
+        carried
+            .lock()
+            .iter()
+            .filter(|c| c.tool == "crew.history")
+            .cloned()
+            .collect()
+    };
     let r = run(&main, "crew.history", json!({"session_id": mine})).await;
     assert!(r.success, "{r:?}");
-    assert_eq!(carried.lock().last().unwrap().group, key);
+    assert_eq!(histories().last().unwrap().group, key);
     let r = run(&sarah, "crew.history", json!({"session_id": hers})).await;
     assert!(r.success, "{r:?}");
-    assert_eq!(carried.lock().last().unwrap().group, "acme");
+    assert_eq!(histories().last().unwrap().group, "acme");
     // Nothing else is sent: another boss's plan's session, one of no plan,
     // the codex one, nor the main overseer's to Sarah.
-    let before = carried.lock().len();
+    let before = histories().len();
     for (boss, s) in [
         (&main, hers.clone()),
         (&main, format!("devbox/{}", uuid::Uuid::new_v4())),
@@ -1486,7 +1496,17 @@ async fn holds_its_own(pool: workforce_postgres::PostgresPool) {
         let r = run(boss, "crew.history", json!({"session_id": s})).await;
         assert!(!r.success, "{s}: {r:?}");
     }
-    assert_eq!(carried.lock().len(), before);
+    assert_eq!(histories().len(), before);
+    // Every call carried, the glances too, went under its own boss's grant:
+    // the main overseer's under its plan's, Sarah's under Acme's.
+    for c in carried.lock().iter() {
+        let own = match c.boss.as_str() {
+            "local:desk" => key.as_str(),
+            "local:sarah" => "acme",
+            boss => panic!("{boss}: {c:?}"),
+        };
+        assert_eq!(c.group, own, "{c:?}");
+    }
     poller.abort();
 }
 

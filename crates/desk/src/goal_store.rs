@@ -7,7 +7,7 @@ use eyre::{Context, Result};
 use tokio_postgres::Row;
 use uuid::Uuid;
 
-use crate::goal::{Fact, FactKind, Met, Reading};
+use crate::goal::{Fact, FactKind, GoalSaid, Heads, Met, Reading};
 use crate::plan::Plan;
 use crate::plan_store::PLAN;
 use crate::store::DeskStore;
@@ -171,6 +171,79 @@ impl DeskStore {
         Ok(n == 1)
     }
 
+    /// What plan `plan`'s boss was told of its goal by the hub's checks:
+    /// nothing for a plan there isn't.
+    pub async fn goal_said(&self, plan: Uuid) -> Result<GoalSaid> {
+        self.plan_kept(plan, "goal_said").await
+    }
+
+    /// Keeps `said` as what plan `plan`'s boss was told of its goal.
+    pub async fn keep_goal_said(&self, plan: Uuid, said: &GoalSaid) -> Result<()> {
+        self.keep_plan_kept(plan, "goal_said", said).await
+    }
+
+    /// Where plan `plan`'s goal's branches and pull requests stood when it
+    /// was agreed or a checkpoint last moved it: none when not yet kept.
+    pub async fn goal_heads(&self, plan: Uuid) -> Result<Heads> {
+        self.plan_kept(plan, "goal_heads").await
+    }
+
+    /// Keeps `heads` with plan `plan`'s goal's, in one write: over those
+    /// kept by the same keys when `over`, else only where none is kept yet.
+    /// Those it doesn't name stay as they are.
+    pub async fn keep_goal_heads(&self, plan: Uuid, heads: &Heads, over: bool) -> Result<()> {
+        let merged = match over {
+            true => "goal_heads || $2",
+            false => "$2 || goal_heads",
+        };
+        let client = self.pool().get().await?;
+        client
+            .execute(
+                &format!("UPDATE plans SET goal_heads = {merged} WHERE id = $1"),
+                &[&plan, &serde_json::to_value(heads)?],
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// What the goal checks keep in plan `plan`'s `column`: its default
+    /// when there is no such plan.
+    async fn plan_kept<T: serde::de::DeserializeOwned + Default>(
+        &self,
+        plan: Uuid,
+        column: &'static str,
+    ) -> Result<T> {
+        let client = self.pool().get().await?;
+        let row = client
+            .query_opt(
+                &format!("SELECT {column} FROM plans WHERE id = $1"),
+                &[&plan],
+            )
+            .await?;
+        Ok(match row {
+            Some(r) => serde_json::from_value(r.try_get(0)?)
+                .with_context(|| format!("a plan's {column}"))?,
+            None => T::default(),
+        })
+    }
+
+    /// Keeps `value` in plan `plan`'s `column`.
+    async fn keep_plan_kept<T: serde::Serialize>(
+        &self,
+        plan: Uuid,
+        column: &'static str,
+        value: &T,
+    ) -> Result<()> {
+        let client = self.pool().get().await?;
+        client
+            .execute(
+                &format!("UPDATE plans SET {column} = $2 WHERE id = $1"),
+                &[&plan, &serde_json::to_value(value)?],
+            )
+            .await?;
+        Ok(())
+    }
+
     /// Notes that plan `plan`'s goal was said back to the person at `at`.
     pub async fn set_read_back(&self, plan: Uuid, at: DateTime<Utc>) -> Result<()> {
         let client = self.pool().get().await?;
@@ -321,6 +394,65 @@ mod tests {
                 !s.mark_met(new_plan(&b).id, &met).await.unwrap(),
                 "no such plan"
             );
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn what_a_goal_s_boss_was_told_is_kept_with_its_plan() {
+        with_test_pool(crate::store::build_pool, |pool| async move {
+            let s = DeskStore::with_pool(pool).await.unwrap();
+            let b = board(&s).await;
+            let p = new_plan(&b);
+            s.put_plan(&p).await.unwrap();
+            assert_eq!(s.goal_said(p.id).await.unwrap(), GoalSaid::default());
+            let at = crate::crew::now();
+            let mut said = GoalSaid::default();
+            said.spells.insert(1, (at, 2));
+            said.failing.insert(0, at);
+            said.undelivered_told(Uuid::new_v4());
+            said.noted = Some((at, 2));
+            s.keep_goal_said(p.id, &said).await.unwrap();
+            assert_eq!(s.goal_said(p.id).await.unwrap(), said);
+            s.put_plan(&p).await.unwrap();
+            assert_eq!(
+                s.goal_said(p.id).await.unwrap(),
+                said,
+                "a plan written again keeps it"
+            );
+            assert_eq!(
+                s.goal_said(Uuid::new_v4()).await.unwrap(),
+                GoalSaid::default()
+            );
+            assert!(s.goal_heads(p.id).await.unwrap().is_empty());
+            let main = crate::goal::head_key("Acme/Web", "main");
+            let pull = crate::goal::head_key("Acme/Web", "#4");
+            let kept = |pairs: &[(&String, char)]| -> Heads {
+                pairs
+                    .iter()
+                    .map(|(k, c)| ((*k).clone(), c.to_string().repeat(40)))
+                    .collect()
+            };
+            s.keep_goal_heads(p.id, &kept(&[(&main, 'a')]), false)
+                .await
+                .unwrap();
+            s.keep_goal_heads(p.id, &kept(&[(&main, 'b'), (&pull, 'c')]), false)
+                .await
+                .unwrap();
+            assert_eq!(
+                s.goal_heads(p.id).await.unwrap(),
+                kept(&[(&main, 'a'), (&pull, 'c')]),
+                "what is kept stays, what is missing is added"
+            );
+            s.keep_goal_heads(p.id, &kept(&[(&pull, 'd')]), true)
+                .await
+                .unwrap();
+            assert_eq!(
+                s.goal_heads(p.id).await.unwrap(),
+                kept(&[(&main, 'a'), (&pull, 'd')]),
+                "moved, the rest stays"
+            );
+            assert_eq!(s.goal_said(p.id).await.unwrap(), said, "each kept apart");
         })
         .await;
     }

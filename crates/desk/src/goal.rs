@@ -7,7 +7,7 @@
 //! Everything here is pure: the hub reads the measures and the person's
 //! messages, and this module decides what they come to.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -116,6 +116,18 @@ pub enum Evidence {
     Ticket { key: String },
 }
 
+impl Evidence {
+    /// The repository it is of, when it is GitHub's.
+    pub fn repo(&self) -> Option<&str> {
+        match self {
+            Self::Run { repo, .. } | Self::Pull { repo, .. } | Self::Commit { repo, .. } => {
+                Some(repo)
+            }
+            Self::Ticket { .. } => None,
+        }
+    }
+}
+
 /// One reading of a measured part: its value, none when it couldn't be
 /// read (then `failed` says why), and whether it met the part.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -129,6 +141,21 @@ pub struct Reading {
     pub words: String,
     pub evidence: Vec<Evidence>,
     pub failed: Option<String>,
+}
+
+impl Reading {
+    /// Part `part` not read at `at`, for `why`.
+    pub fn failed(part: u16, at: DateTime<Utc>, why: &str) -> Self {
+        Self {
+            at,
+            part,
+            value: None,
+            met: false,
+            words: String::new(),
+            evidence: Vec::new(),
+            failed: Some(crate::crew::one_line(why, 300)),
+        }
+    }
 }
 
 text_enum!(FactKind {
@@ -186,6 +213,8 @@ pub struct PartProgress {
     pub newest: Option<Reading>,
     /// Failed reads in a row, newest last.
     pub failing: u32,
+    /// When the first of those failed reads was taken.
+    pub failing_since: Option<DateTime<Utc>>,
 }
 
 /// How a goal stands, part by part, in its result's order.
@@ -479,9 +508,13 @@ fn measured_progress(part: &Measure, n: u16, readings: &[Reading]) -> PartProgre
     own.into_iter().fold(PartProgress::default(), |mut p, r| {
         p.newest = Some(r.clone());
         match r.value {
-            None => p.failing += 1,
+            None => {
+                p.failing_since = p.failing_since.or(Some(r.at));
+                p.failing += 1;
+            }
             Some(v) => {
                 p.failing = 0;
+                p.failing_since = None;
                 p.met = r.met;
                 let beats = p
                     .best
@@ -503,6 +536,329 @@ fn measured_progress(part: &Measure, n: u16, readings: &[Reading]) -> PartProgre
 /// Whether every part is met.
 pub fn met(p: &Progress) -> bool {
     !p.parts.is_empty() && p.parts.iter().all(|part| part.met)
+}
+
+/// A part with no progress toward its target for a spell of the window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Stall {
+    pub part: u16,
+    /// When it last came nearer, or the goal was agreed.
+    pub since: DateTime<Utc>,
+    /// Which spell of it this is: 0 from one window, 1 from two, 2 from
+    /// four, 3 from eight, then one more every eight.
+    pub spell: u32,
+}
+
+/// The spell `stalled` is in, in windows of `window`: none under one.
+pub fn spell_of(stalled: chrono::Duration, window: chrono::Duration) -> Option<u32> {
+    let window = window.num_milliseconds();
+    if window <= 0 {
+        return None;
+    }
+    match stalled.num_milliseconds() / window {
+        n if n < 1 => None,
+        n if n < 2 => Some(0),
+        n if n < 4 => Some(1),
+        n if n < 8 => Some(2),
+        n => Some(u32::try_from(n / 8 + 2).unwrap_or(u32::MAX)),
+    }
+}
+
+/// Each part of `p`, agreed at `agreed_at`, that isn't met and hasn't come
+/// nearer for at least `window` by `now`: on its own, so one part coming
+/// nearer never hides another stuck.
+pub fn stalls(
+    p: &Progress,
+    agreed_at: DateTime<Utc>,
+    now: DateTime<Utc>,
+    window: chrono::Duration,
+) -> Vec<Stall> {
+    p.parts
+        .iter()
+        .enumerate()
+        .filter(|(_, part)| !part.met)
+        .filter_map(|(i, part)| {
+            let since = part.improved_at.map_or(agreed_at, |at| at.max(agreed_at));
+            Some(Stall {
+                part: u16::try_from(i).ok()?,
+                since,
+                spell: spell_of(now - since, window)?,
+            })
+        })
+        .collect()
+}
+
+/// What a goal names on GitHub, by repository: the branches its work is
+/// on, and its pull requests by number.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GoalRefs {
+    pub branches: HashSet<(String, String)>,
+    pub pulls: HashSet<(String, u64)>,
+}
+
+impl GoalRefs {
+    /// What `r` names, with the pull requests its `readings` found by their
+    /// head branch.
+    pub fn of(r: &GoalResult, readings: &[Reading]) -> Self {
+        let key = |repo: &str| repo.trim().to_ascii_lowercase();
+        let mut refs = Self::default();
+        for (i, part) in r.parts.iter().enumerate() {
+            match part {
+                Measure::Ci { repo, branch, .. } => {
+                    refs.branches.insert((key(repo), branch.trim().to_string()));
+                }
+                Measure::PrMerged { repo, pr } | Measure::ChecksGreen { repo, pr } => {
+                    match pr {
+                        PrPick::Number(n) => {
+                            refs.pulls.insert((key(repo), *n));
+                        }
+                        PrPick::Head(head) => {
+                            refs.branches.insert((key(repo), head.trim().to_string()));
+                        }
+                    }
+                    refs.pulls.extend(
+                        readings
+                            .iter()
+                            .filter(|reading| usize::from(reading.part) == i)
+                            .flat_map(|reading| &reading.evidence)
+                            .filter_map(|e| match e {
+                                Evidence::Pull { repo, number } => Some((key(repo), *number)),
+                                _ => None,
+                            }),
+                    );
+                }
+                Measure::Judged { .. } => {}
+            }
+        }
+        refs
+    }
+
+    /// Whether pull request `number` of `repo` is one of the goal's.
+    pub fn names_pull(&self, repo: &str, number: u64) -> bool {
+        self.pulls
+            .contains(&(repo.trim().to_ascii_lowercase(), number))
+    }
+
+    /// Whether `branch` of `repo` is one the goal's work is on.
+    pub fn names_branch(&self, repo: &str, branch: &str) -> bool {
+        self.branches
+            .contains(&(repo.trim().to_ascii_lowercase(), branch.trim().to_string()))
+    }
+
+    /// The goal's branches on `repo`.
+    pub fn branches_of<'a>(&'a self, repo: &str) -> impl Iterator<Item = &'a str> {
+        let repo = repo.trim().to_ascii_lowercase();
+        self.branches
+            .iter()
+            .filter(move |(r, _)| *r == repo)
+            .map(|(_, b)| b.as_str())
+    }
+
+    /// Whether the goal names nothing on GitHub: any work shown there is
+    /// taken as its own.
+    pub fn is_empty(&self) -> bool {
+        self.branches.is_empty() && self.pulls.is_empty()
+    }
+
+    /// What the goal names, in words, in a steady order: "main of
+    /// acme/api, PR #12 of acme/api".
+    pub fn words(&self) -> String {
+        let mut branches: Vec<_> = self.branches.iter().collect();
+        branches.sort();
+        let mut pulls: Vec<_> = self.pulls.iter().collect();
+        pulls.sort();
+        branches
+            .into_iter()
+            .map(|(repo, b)| format!("{b} of {repo}"))
+            .chain(
+                pulls
+                    .into_iter()
+                    .map(|(repo, n)| format!("PR #{n} of {repo}")),
+            )
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+}
+
+/// What a goal's boss was told of it already, kept with its plan so that
+/// nothing is said twice, a restart between or not.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GoalSaid {
+    /// Each part's stall, by when it began, and the furthest spell of it
+    /// said.
+    #[serde(default)]
+    pub spells: BTreeMap<u16, (DateTime<Utc>, u32)>,
+    /// Each part's run of failed reads said, by when it began.
+    #[serde(default)]
+    pub failing: BTreeMap<u16, DateTime<Utc>>,
+    /// The boss's messages it was told hadn't gone in, newest last.
+    #[serde(default)]
+    pub undelivered: Vec<Uuid>,
+    /// The stall, by when it began, and its spell, the person's roundup was
+    /// last given a note of.
+    #[serde(default)]
+    pub noted: Option<(DateTime<Utc>, u32)>,
+}
+
+/// The most of the boss's undelivered messages remembered as said.
+pub const UNDELIVERED_KEPT: usize = 50;
+
+impl GoalSaid {
+    /// Whether `s`, or a later spell of the same stall, was said.
+    pub fn told(&self, s: &Stall) -> bool {
+        self.spells
+            .get(&s.part)
+            .is_some_and(|(since, spell)| *since == s.since && *spell >= s.spell)
+    }
+
+    /// Notes each of `stalls` as said.
+    pub fn tell(&mut self, stalls: &[Stall]) {
+        for s in stalls {
+            if !self.told(s) {
+                self.spells.insert(s.part, (s.since, s.spell));
+            }
+        }
+    }
+
+    /// Notes the boss's message `id` as said to have waited.
+    pub fn undelivered_told(&mut self, id: Uuid) {
+        self.undelivered.push(id);
+        let over = self.undelivered.len().saturating_sub(UNDELIVERED_KEPT);
+        self.undelivered.drain(..over);
+    }
+}
+
+/// Where each of a goal's branches and pull requests stood as it was
+/// agreed, by [`head_key`], and as each judged part's last checkpoint left
+/// it, by [`part_head_key`]: what work shown toward that part must come
+/// after. [`ABSENT`] for one that wasn't there then, [`UNREAD`] for one
+/// still to be read.
+pub type Heads = BTreeMap<String, String>;
+
+/// What a head GitHub says isn't there is kept as: none, so everything on
+/// it is new.
+pub const ABSENT: &str = "";
+
+/// What a head GitHub couldn't be asked for is kept as until it is read
+/// again: no head yet.
+pub const UNREAD: &str = "unread";
+
+/// What a part's head is kept by before its own key.
+const PART_HEAD: &str = "part ";
+
+/// What a head of branch `branch` of `repo` is kept by, `branch` being
+/// `#n` for pull request `n`'s.
+pub fn head_key(repo: &str, branch: &str) -> String {
+    format!("{} {branch}", repo.trim().to_ascii_lowercase())
+}
+
+/// What head `key` is kept by for judged part `part`, once a checkpoint
+/// toward it moved it.
+pub fn part_head_key(part: u16, key: &str) -> String {
+    format!("{PART_HEAD}{part}: {key}")
+}
+
+/// Whether `heads` hold where the goal's work stood as it was agreed.
+pub fn heads_agreed(heads: &Heads) -> bool {
+    heads.keys().any(|k| !k.starts_with(PART_HEAD))
+}
+
+/// Whether head `key` is still to be read for where the goal's work stood
+/// as it was agreed (`heads`): any, before that was read; one [`UNREAD`]
+/// then; none that came later.
+pub fn head_due(heads: &Heads, key: &str) -> bool {
+    !heads_agreed(heads) || heads.get(key).is_some_and(|sha| sha == UNREAD)
+}
+
+/// Where head `key` stood for judged part `part` in `heads`: as its last
+/// checkpoint left it, else as the goal was agreed.
+pub fn head_for<'a>(heads: &'a Heads, part: u16, key: &str) -> Option<&'a str> {
+    [part_head_key(part, key), key.to_string()]
+        .iter()
+        .filter_map(|k| heads.get(k))
+        .map(String::as_str)
+        .find(|sha| *sha != ABSENT && *sha != UNREAD)
+}
+
+/// The stall leading `stalls`: the furthest in its spells, the longest
+/// stuck of those.
+pub fn leading(stalls: &[Stall]) -> Option<&Stall> {
+    stalls
+        .iter()
+        .max_by(|a, b| a.spell.cmp(&b.spell).then(b.since.cmp(&a.since)))
+}
+
+/// Whether a goal stalled as `stalls`, its boss told `said`, wakes it now:
+/// once each spell of the leading stall, with every part stalled then, so
+/// that parts stalled from different times never wake it apart.
+pub fn wakes(stalls: &[Stall], said: &GoalSaid) -> bool {
+    leading(stalls).is_some_and(|s| !said.told(s))
+}
+
+/// What Desk found of one piece of a checkpoint's evidence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Found {
+    /// It is there, and part of the goal's own work: on its branches or
+    /// its pull requests.
+    OnGoal,
+    /// It is there, but other work.
+    OffGoal,
+    /// It isn't there as it says, or couldn't be looked up.
+    Missing,
+    /// It may be there, but Desk can't look up where the goal's work is to
+    /// place it.
+    Unplaced,
+    /// It is the goal's work, but from before the goal was agreed or its
+    /// part's last checkpoint.
+    Old,
+}
+
+/// Why a checkpoint isn't accepted toward its judged part.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NotShown {
+    /// It shows no evidence.
+    Nothing,
+    /// This piece of it isn't there as it says.
+    Missing(Evidence),
+    /// This piece of it is other work than the goal's.
+    OffGoal(Evidence),
+    /// This piece of it can't be placed on the goal's work.
+    Unplaced(Evidence),
+    /// This piece of it was there before the goal was agreed, or before
+    /// its part's last checkpoint.
+    Old(Evidence),
+    /// Every piece was shown toward the part already.
+    NothingNew,
+}
+
+/// Whether a checkpoint showing `evidence`, each piece as `found` says,
+/// moves its judged part on from `earlier`, what its accepted checkpoints
+/// showed: every piece there and the goal's own work, and one at least
+/// new.
+pub fn checkpoint_shows(
+    evidence: &[Evidence],
+    found: &[Found],
+    earlier: &[&Evidence],
+) -> Result<(), NotShown> {
+    if evidence.is_empty() {
+        return Err(NotShown::Nothing);
+    }
+    for (e, f) in evidence.iter().zip(found) {
+        match f {
+            Found::OnGoal => {}
+            Found::OffGoal => return Err(NotShown::OffGoal(e.clone())),
+            Found::Missing => return Err(NotShown::Missing(e.clone())),
+            Found::Unplaced => return Err(NotShown::Unplaced(e.clone())),
+            Found::Old => return Err(NotShown::Old(e.clone())),
+        }
+    }
+    if found.len() < evidence.len() {
+        return Err(NotShown::Missing(evidence[found.len()].clone()));
+    }
+    match evidence.iter().any(|e| !earlier.contains(&e)) {
+        true => Ok(()),
+        false => Err(NotShown::NothingNew),
+    }
 }
 
 /// How each part stands, in a line: "CI on main of acme/api: 22 minutes,

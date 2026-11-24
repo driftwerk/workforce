@@ -432,8 +432,13 @@ impl Desk {
     /// (`owner/name`, lowercased): what a preference scoped to a
     /// repository covers. `None` when it works in none (or it isn't here).
     pub fn repo_of_session(&self, id: Uuid) -> Option<String> {
-        let view = self.view(id).ok()?;
-        let own = charge::own_folder(std::path::Path::new(&view.cwd));
+        Self::repo_of_folder(&self.view(id).ok()?.cwd)
+    }
+
+    /// The repository `folder` here is a checkout of, as its `origin` names
+    /// it (`owner/name`, lowercased). `None` when it is none.
+    pub fn repo_of_folder(folder: &str) -> Option<String> {
+        let own = charge::own_folder(std::path::Path::new(folder));
         git_line_within(
             &own,
             &["remote", "get-url", "origin"],

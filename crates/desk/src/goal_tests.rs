@@ -602,6 +602,270 @@ fn a_long_fact_is_cut_in_the_goals_block() {
 }
 
 #[test]
+fn a_spell_backs_off_at_one_two_four_and_eight_windows_then_every_eight() {
+    let window = Duration::minutes(30);
+    let spell = |minutes: i64| spell_of(Duration::minutes(minutes), window);
+    assert_eq!(spell(29), None);
+    assert_eq!(spell(30), Some(0));
+    assert_eq!(spell(59), Some(0));
+    assert_eq!(spell(60), Some(1));
+    assert_eq!(spell(120), Some(2));
+    assert_eq!(spell(239), Some(2));
+    assert_eq!(spell(240), Some(3));
+    assert_eq!(spell(479), Some(3));
+    assert_eq!(spell(480), Some(4));
+    assert_eq!(spell(720), Some(5));
+    assert_eq!(spell_of(Duration::minutes(90), Duration::zero()), None);
+}
+
+#[test]
+fn each_part_stalls_on_its_own_since_it_last_came_nearer() {
+    let r = result(vec![ci_minutes(5.0, 1), judged()]);
+    let window = Duration::minutes(30);
+    // CI stuck at 22 minutes all night; the judged part shown at 60.
+    let readings = [
+        reading(0, 0, Some(22.0), false),
+        reading(50, 0, Some(22.0), false),
+    ];
+    let facts = [fact(
+        60,
+        FactKind::Checkpoint,
+        Some(1),
+        true,
+        "only api ran",
+    )];
+    let p = progress(&r, &readings, &facts);
+    assert_eq!(
+        stalls(&p, at(-10), at(70), window),
+        vec![Stall {
+            part: 0,
+            since: at(0),
+            spell: 1
+        }],
+        "a checkpoint on the judged part never resets the stuck CI"
+    );
+    assert_eq!(
+        stalls(&p, at(-10), at(100), window),
+        vec![
+            Stall {
+                part: 0,
+                since: at(0),
+                spell: 1
+            },
+            Stall {
+                part: 1,
+                since: at(60),
+                spell: 0
+            }
+        ]
+    );
+    // Better CI resets only its own part.
+    let better = [
+        reading(0, 0, Some(22.0), false),
+        reading(80, 0, Some(9.0), false),
+    ];
+    let p = progress(&r, &better, &facts);
+    assert_eq!(
+        stalls(&p, at(-10), at(100), window),
+        vec![Stall {
+            part: 1,
+            since: at(60),
+            spell: 0
+        }]
+    );
+    // Never read, nor shown: stalled since it was agreed.
+    let p = progress(&r, &[], &[]);
+    assert_eq!(stalls(&p, at(0), at(29), window), vec![]);
+    assert_eq!(stalls(&p, at(0), at(30), window).len(), 2);
+}
+
+#[test]
+fn a_met_part_never_stalls() {
+    let r = result(vec![ci_minutes(5.0, 1)]);
+    let p = progress(&r, &[reading(0, 0, Some(4.0), true)], &[]);
+    assert!(met(&p));
+    assert!(stalls(&p, at(0), at(600), Duration::minutes(30)).is_empty());
+}
+
+#[test]
+fn failed_reads_are_counted_in_a_row_from_the_first_and_reset_by_a_good_one() {
+    let r = result(vec![ci_minutes(5.0, 1)]);
+    let failed = [reading(10, 0, None, false), reading(20, 0, None, false)];
+    let p = progress(&r, &failed, &[]);
+    assert_eq!(p.parts[0].failing, 2);
+    assert_eq!(p.parts[0].failing_since, Some(at(10)));
+    let mut again = failed.to_vec();
+    again.push(reading(30, 0, Some(9.0), false));
+    again.push(reading(40, 0, None, false));
+    let p = progress(&r, &again, &[]);
+    assert_eq!(p.parts[0].failing, 1);
+    assert_eq!(p.parts[0].failing_since, Some(at(40)));
+}
+
+fn pull(n: u64) -> Evidence {
+    Evidence::Pull {
+        repo: "acme/api".into(),
+        number: n,
+    }
+}
+
+#[test]
+fn a_goal_names_its_branches_and_pull_requests_and_those_its_heads_found() {
+    let r = result(vec![
+        ci_minutes(5.0, 1),
+        Measure::PrMerged {
+            repo: "Acme/API".into(),
+            pr: PrPick::Head("fix-ci".into()),
+        },
+        Measure::ChecksGreen {
+            repo: "acme/web".into(),
+            pr: PrPick::Number(7),
+        },
+        judged(),
+    ]);
+    let mut found = reading(0, 1, Some(1.0), false);
+    found.evidence = vec![pull(12)];
+    let mut other = reading(0, 0, Some(9.0), false);
+    other.evidence = vec![pull(99)];
+    let refs = GoalRefs::of(&r, &[found, other]);
+    assert!(refs.names_branch("acme/api", "main"));
+    assert!(refs.names_branch("ACME/api", "fix-ci"));
+    assert!(!refs.names_branch("acme/api", "spike"));
+    assert!(refs.names_pull("acme/api", 12));
+    assert!(refs.names_pull("acme/web", 7));
+    assert!(
+        !refs.names_pull("acme/api", 99),
+        "a CI part's evidence names no PR of the goal"
+    );
+    let mut branches: Vec<&str> = refs.branches_of("acme/api").collect();
+    branches.sort_unstable();
+    assert_eq!(branches, vec!["fix-ci", "main"]);
+    assert_eq!(refs.branches_of("acme/web").count(), 0);
+}
+
+#[test]
+fn a_checkpoint_shows_only_new_evidence_of_the_goal_s_own_work() {
+    let commit = |sha: &str| Evidence::Commit {
+        repo: "acme/api".into(),
+        sha: sha.into(),
+    };
+    let (a, b) = (commit("aaaa111"), commit("bbbb222"));
+    assert_eq!(checkpoint_shows(&[], &[], &[]), Err(NotShown::Nothing));
+    assert_eq!(
+        checkpoint_shows(std::slice::from_ref(&a), &[Found::OnGoal], &[]),
+        Ok(())
+    );
+    assert_eq!(
+        checkpoint_shows(
+            &[a.clone(), b.clone()],
+            &[Found::OnGoal, Found::OffGoal],
+            &[]
+        ),
+        Err(NotShown::OffGoal(b.clone())),
+        "22 Nov: a commit on another branch doesn't count"
+    );
+    assert_eq!(
+        checkpoint_shows(std::slice::from_ref(&b), &[Found::Missing], &[]),
+        Err(NotShown::Missing(b.clone()))
+    );
+    assert_eq!(
+        checkpoint_shows(std::slice::from_ref(&a), &[Found::OnGoal], &[&a]),
+        Err(NotShown::NothingNew)
+    );
+    assert_eq!(
+        checkpoint_shows(
+            &[a.clone(), b.clone()],
+            &[Found::OnGoal, Found::OnGoal],
+            &[&a]
+        ),
+        Ok(())
+    );
+    assert_eq!(
+        checkpoint_shows(&[a.clone(), b.clone()], &[Found::OnGoal], &[]),
+        Err(NotShown::Missing(b))
+    );
+}
+
+#[test]
+fn a_goal_wakes_its_boss_once_a_spell_of_its_leading_stall_with_every_part() {
+    let stall = |part, since, spell| Stall {
+        part,
+        since: at(since),
+        spell,
+    };
+    let mut said = GoalSaid::default();
+    // The judged part stalled from agreement, CI from its first reading.
+    let first = [stall(1, 0, 0)];
+    assert!(wakes(&first, &said));
+    said.tell(&first);
+    assert!(!wakes(&first, &said), "once a spell");
+    let both = [stall(0, 3, 0), stall(1, 0, 0)];
+    assert!(
+        !wakes(&both, &said),
+        "CI crossing its first window rides the next wake"
+    );
+    let next = [stall(0, 3, 0), stall(1, 0, 1)];
+    assert_eq!(leading(&next), Some(&next[1]));
+    assert!(wakes(&next, &said));
+    said.tell(&next);
+    assert!(
+        !wakes(&[stall(0, 3, 1), stall(1, 0, 1)], &said),
+        "CI's spell 1 waits for the leader's"
+    );
+    // The judged part shown: CI leads, at a spell already said.
+    assert!(!wakes(&[stall(0, 3, 0)], &said));
+    assert!(wakes(&[stall(0, 3, 1)], &said));
+    // A stall that began again starts its spells again.
+    assert!(wakes(&[stall(1, 40, 0)], &said));
+    assert!(!wakes(&[], &said));
+    // Ties lead by the longest stuck.
+    let tie = [stall(0, 5, 2), stall(1, 1, 2)];
+    assert_eq!(leading(&tie), Some(&tie[1]));
+}
+
+#[test]
+fn the_messages_said_to_have_waited_are_kept_to_the_newest() {
+    let mut said = GoalSaid::default();
+    let ids: Vec<Uuid> = (0..UNDELIVERED_KEPT + 3).map(|_| Uuid::new_v4()).collect();
+    for id in &ids {
+        said.undelivered_told(*id);
+    }
+    assert_eq!(said.undelivered, ids[3..]);
+}
+
+#[test]
+fn what_a_goal_names_is_said_in_a_steady_order_and_none_takes_any_work() {
+    let r = result(vec![
+        ci_minutes(5.0, 3),
+        Measure::ChecksGreen {
+            repo: "acme/web".into(),
+            pr: PrPick::Number(7),
+        },
+        Measure::PrMerged {
+            repo: "acme/api".into(),
+            pr: PrPick::Head("fix/ci".into()),
+        },
+        judged(),
+    ]);
+    let refs = GoalRefs::of(&r, &[]);
+    assert!(!refs.is_empty());
+    assert_eq!(
+        refs.words(),
+        "fix/ci of acme/api, main of acme/api, PR #7 of acme/web"
+    );
+    let refs = GoalRefs::of(&result(vec![judged()]), &[]);
+    assert!(refs.is_empty());
+    let e = Evidence::Commit {
+        repo: "acme/api".into(),
+        sha: "d05e8a4".into(),
+    };
+    assert_eq!(
+        checkpoint_shows(std::slice::from_ref(&e), &[Found::Unplaced], &[]),
+        Err(NotShown::Unplaced(e))
+    );
+}
+
+#[test]
 fn only_a_message_that_stands_alone_is_more_than_an_answer_to_the_last() {
     assert!(!stands_alone("ok"));
     assert!(!stands_alone("yes go ahead"));
@@ -631,4 +895,45 @@ fn a_plan_approved_holds_what_a_question_proposed_when_it_holds_each_part() {
         "met is never approved on a card"
     );
     assert!(!covers(&Proposal::default()));
+}
+
+#[test]
+fn a_parts_head_is_where_its_last_checkpoint_left_it_else_where_it_was_agreed() {
+    let main = head_key("Acme/Web", "main");
+    let heads = Heads::from([
+        (main.clone(), "a".repeat(40)),
+        (part_head_key(1, &main), "b".repeat(40)),
+    ]);
+    assert_eq!(head_for(&heads, 1, &main), Some(&*"b".repeat(40)));
+    assert_eq!(head_for(&heads, 2, &main), Some(&*"a".repeat(40)));
+    assert_eq!(head_for(&heads, 1, &head_key("acme/web", "#4")), None);
+    assert!(heads_agreed(&heads));
+    let moved = Heads::from([(part_head_key(1, &main), "b".repeat(40))]);
+    assert!(
+        !heads_agreed(&moved),
+        "a part's alone isn't where it was agreed"
+    );
+    let unread = head_key("acme/web", "fix/x");
+    let heads = Heads::from([
+        (unread.clone(), ABSENT.to_string()),
+        (part_head_key(2, &main), ABSENT.to_string()),
+        (main.clone(), "a".repeat(40)),
+    ]);
+    assert_eq!(
+        head_for(&heads, 2, &unread),
+        None,
+        "absent: all on it is new"
+    );
+    assert_eq!(head_for(&heads, 2, &main), Some(&*"a".repeat(40)));
+
+    let pull = head_key("acme/web", "#4");
+    let heads = Heads::from([
+        (main.clone(), UNREAD.to_string()),
+        (unread.clone(), "a".repeat(40)),
+    ]);
+    assert_eq!(head_for(&heads, 1, &main), None, "not read yet: no head");
+    assert!(head_due(&heads, &main), "read again");
+    assert!(!head_due(&heads, &unread));
+    assert!(!head_due(&heads, &pull), "it came later");
+    assert!(head_due(&Heads::new(), &pull), "nothing read yet");
 }

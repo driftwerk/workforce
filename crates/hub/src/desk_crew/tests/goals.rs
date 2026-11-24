@@ -13,7 +13,7 @@ use workforce_desk::plan::PlanState;
 
 use super::plans::{judged, person_says};
 
-const ACTS: &str = "[oversight]\nenabled = true\nlevel = \"act\"\n[oversight.act]\nhand_out_work = true\nnudge = true\n";
+pub(super) const ACTS: &str = "[oversight]\nenabled = true\nlevel = \"act\"\n[oversight.act]\nhand_out_work = true\nnudge = true\n";
 
 const SUGGESTS: &str = "[oversight]\nenabled = true\nlevel = \"suggest\"\n";
 
@@ -51,11 +51,22 @@ async fn github() -> wiremock::MockServer {
 
 /// The boss at `oversight`, its GitHub `gh` with the person's own key; its
 /// DM open, its crew started.
-async fn boss_on(
+pub(super) async fn boss_on(
     dir: &Path,
     pool: workforce_postgres::PostgresPool,
     oversight: &str,
     gh: &wiremock::MockServer,
+) -> (Arc<AgentService>, Arc<CrewHub>, Desk, wiremock::MockServer) {
+    boss_until(dir, pool, oversight, gh, CancellationToken::new()).await
+}
+
+/// [`boss_on`], its crew running until `stop`.
+pub(super) async fn boss_until(
+    dir: &Path,
+    pool: workforce_postgres::PostgresPool,
+    oversight: &str,
+    gh: &wiremock::MockServer,
+    stop: CancellationToken,
 ) -> (Arc<AgentService>, Arc<CrewHub>, Desk, wiremock::MockServer) {
     let uri = gh.uri();
     let (overseer, llm) = agent_configured(dir, "desk", "ok", &[], |c| {
@@ -93,7 +104,7 @@ async fn boss_on(
             .then_some(())
     })
     .await;
-    let crew = CrewHub::start(state, d.clone(), FAST, CancellationToken::new());
+    let crew = CrewHub::start(state, d.clone(), FAST, stop);
     eventually("the plan tools", async || {
         overseer.tools.has("crew.plan").then_some(())
     })
@@ -101,7 +112,11 @@ async fn boss_on(
     (overseer, crew, d, llm)
 }
 
-async fn run(boss: &AgentService, tool: &str, input: Value) -> workforce_agent::tools::ToolResult {
+pub(super) async fn run(
+    boss: &AgentService,
+    tool: &str,
+    input: Value,
+) -> workforce_agent::tools::ToolResult {
     boss.tools.get(tool).unwrap().execute(input).await.unwrap()
 }
 

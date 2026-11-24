@@ -4,7 +4,10 @@
 //! made, through [`super::github::calls_as_person`]; what they answer is
 //! folded into a [`Reading`] by the pure parsers here.
 
+use std::collections::HashMap;
+
 use chrono::{DateTime, Duration, Utc};
+use parking_lot::Mutex;
 use serde_json::{json, Value};
 use workforce_desk::goal::{self, Evidence, Measure, Per, PrPick, Reading, Want};
 
@@ -15,6 +18,47 @@ use super::github::{self, GithubAccess};
 const SLACK: Duration = Duration::minutes(2);
 /// The most runs a CI part reads at once.
 const RUNS_READ: u64 = 10;
+
+/// The most finished runs' jobs kept.
+const JOBS_KEPT: usize = 512;
+
+/// The jobs of finished runs as GitHub said them, by repository, run and
+/// attempt: a finished attempt's jobs never change, so each is read once
+/// however often its goal is.
+#[derive(Debug, Default)]
+pub(super) struct JobsRead(Mutex<HashMap<(String, u64, DateTime<Utc>), Value>>);
+
+impl JobsRead {
+    /// Run `r` of `repo`'s jobs as kept.
+    fn kept(&self, repo: &str, r: &Run) -> Option<Value> {
+        self.0.lock().get(&Self::key(repo, r)).cloned()
+    }
+
+    /// Keeps run `r` of `repo`'s jobs, `logs` as GitHub answered them:
+    /// only what a job's minutes are read from.
+    fn keep(&self, repo: &str, r: &Run, logs: &Value) -> Value {
+        let jobs: Vec<Value> = logs["jobs"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|j| {
+                json!({ "conclusion": j["conclusion"], "started_at": j["started_at"],
+                        "completed_at": j["completed_at"] })
+            })
+            .collect();
+        let kept = json!({ "jobs": jobs });
+        let mut m = self.0.lock();
+        if m.len() >= JOBS_KEPT {
+            m.clear();
+        }
+        m.insert(Self::key(repo, r), kept.clone());
+        kept
+    }
+
+    fn key(repo: &str, r: &Run) -> (String, u64, DateTime<Utc>) {
+        (repo.trim().to_ascii_lowercase(), r.id, r.started_at)
+    }
+}
 
 /// Why a part can't be read where it says: no such repository, workflow
 /// or pull request for the person, or GitHub not connected. A goal that
@@ -27,6 +71,7 @@ pub(super) struct Unreadable(pub String);
 /// failed reading; what isn't there for the person is [`Unreadable`].
 pub(super) async fn read(
     access: &GithubAccess<'_>,
+    jobs: &JobsRead,
     part: &Measure,
     n: u16,
     agreed_at: DateTime<Utc>,
@@ -38,7 +83,10 @@ pub(super) async fn read(
             workflow,
             branch,
             want,
-        } => read_ci(access, repo, workflow.as_deref(), branch, want, agreed_at).await,
+        } => {
+            let workflow = workflow.as_deref();
+            read_ci(access, jobs, repo, workflow, branch, want, agreed_at).await
+        }
         Measure::PrMerged { repo, pr } => read_pull(access, repo, pr)
             .await
             .map(|p| pr_stage(repo, pr, p.as_ref())),
@@ -61,15 +109,7 @@ pub(super) async fn read(
             part.label()
         ))),
         Err(e) if e.starts_with(NOT_THERE) => Err(Unreadable(e)),
-        Err(e) => Ok(Reading {
-            at,
-            part: n,
-            value: None,
-            met: false,
-            words: String::new(),
-            evidence: Vec::new(),
-            failed: Some(workforce_desk::crew::one_line(&e, 300)),
-        }),
+        Err(e) => Ok(Reading::failed(n, at, &e)),
     }
 }
 
@@ -125,6 +165,7 @@ async fn calls(access: &GithubAccess<'_>, calls: Vec<(&str, Value)>) -> Result<V
 
 async fn read_ci(
     access: &GithubAccess<'_>,
+    jobs_read: &JobsRead,
     repo: &str,
     workflow: Option<&str>,
     branch: &str,
@@ -148,8 +189,12 @@ async fn read_ci(
     let runs = finished_runs(&list);
     let newest: Vec<Run> = runs.into_iter().take(usize::from(want.runs())).collect();
     let jobs = match want {
-        Want::Minutes { per: Per::Job, .. } if !newest.is_empty() => {
-            let calls = newest
+        Want::Minutes { per: Per::Job, .. } => {
+            let unread: Vec<&Run> = newest
+                .iter()
+                .filter(|r| jobs_read.kept(repo, r).is_none())
+                .collect();
+            let calls = unread
                 .iter()
                 .map(|r| {
                     (
@@ -158,7 +203,23 @@ async fn read_ci(
                     )
                 })
                 .collect();
-            self::calls(access, calls).await?
+            let read: HashMap<u64, Value> = match unread.is_empty() {
+                true => HashMap::new(),
+                false => unread
+                    .iter()
+                    .zip(self::calls(access, calls).await?)
+                    .map(|(r, logs)| (r.id, jobs_read.keep(repo, r, &logs)))
+                    .collect(),
+            };
+            newest
+                .iter()
+                .map(|r| {
+                    read.get(&r.id)
+                        .cloned()
+                        .or_else(|| jobs_read.kept(repo, r))
+                        .unwrap_or_default()
+                })
+                .collect()
         }
         _ => Vec::new(),
     };

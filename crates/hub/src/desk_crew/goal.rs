@@ -12,8 +12,8 @@ use serde_json::{json, Value};
 use uuid::Uuid;
 use workforce_desk::crew::{self, Party};
 use workforce_desk::goal::{
-    self, Evidence, Fact, FactKind, GoalResult, Measure, Met, MetBy, NotSaid, Proposal, Reading,
-    Said,
+    self, Evidence, Fact, FactKind, GoalResult, Measure, Met, MetBy, NotSaid, Progress, Proposal,
+    Reading, Said,
 };
 use workforce_desk::plan::Plan;
 use workforce_desk::PlanDetail;
@@ -22,6 +22,12 @@ use super::github::GithubAccess;
 use super::measure;
 use super::CrewHub;
 use crate::serve::AgentService;
+
+/// The longest one part's reading may take: GitHub slow never holds up a
+/// plan turn or the goal checks.
+const READ_FOR: std::time::Duration = std::time::Duration::from_secs(30);
+/// Why a part read longer than [`READ_FOR`] failed.
+const SLOW: &str = "GitHub took over 30 s to answer";
 
 /// How far back the person's words agreeing a goal are looked for.
 const AGREED_WITHIN: Duration = Duration::hours(24);
@@ -192,6 +198,15 @@ fn evidence_schema() -> Value {
     ] } })
 }
 
+/// `r` met as `progress` reads it at `at`, in its own words.
+pub(super) fn met_by_reading(r: &GoalResult, progress: &Progress, at: DateTime<Utc>) -> Met {
+    Met {
+        at,
+        by: MetBy::Result,
+        why: format!("it reads met: {}", goal::progress_line(r, progress)),
+    }
+}
+
 /// A result as a tool's input says it, checked.
 pub(super) fn result_of(v: &Value) -> Result<GoalResult, String> {
     let r: GoalResult =
@@ -270,6 +285,8 @@ pub(super) struct Recorded {
     pub said: String,
     pub evidence: Vec<Evidence>,
     pub replaces: Option<Uuid>,
+    /// A checkpoint whose evidence was found to be the goal's own new work.
+    pub shown: bool,
 }
 
 /// The facts and checkpoint a `crew.plan_update` input records, checked
@@ -308,6 +325,7 @@ pub(super) fn recorded_of(input: &Value, r: Option<&GoalResult>) -> Result<Vec<R
                     ),
                     None => None,
                 },
+                shown: false,
             });
         }
     }
@@ -332,6 +350,7 @@ pub(super) fn recorded_of(input: &Value, r: Option<&GoalResult>) -> Result<Vec<R
             said: said(c)?,
             evidence,
             replaces: None,
+            shown: false,
         });
     }
     Ok(out)
@@ -457,7 +476,19 @@ impl CrewHub {
         if repaired.is_some() && result_to.is_some() {
             return Err("Repair a part or change the result, not both.".into());
         }
-        let recorded = recorded_of(input, result_to.as_ref().or(p.result.as_ref()))?;
+        let mut recorded = recorded_of(input, result_to.as_ref().or(p.result.as_ref()))?;
+        if let Some(r) = result_to.as_ref().or(p.result.as_ref()) {
+            for c in recorded
+                .iter_mut()
+                .filter(|c| c.kind == FactKind::Checkpoint)
+            {
+                let part = c.part.unwrap_or_default();
+                c.evidence = self
+                    .checkpoint_shown(&b.service, detail, r, part, &c.evidence)
+                    .await?;
+                c.shown = true;
+            }
+        }
         let quoted = input["person_said"]
             .as_str()
             .map(str::trim)
@@ -749,18 +780,48 @@ impl CrewHub {
             let mut out = Vec::new();
             for (i, part) in r.parts.iter().enumerate().filter(|(_, p)| p.measured()) {
                 let n = u16::try_from(i).unwrap_or_default();
-                out.push((i, measure::read(&access, part, n, agreed_at, at).await));
+                let read = measure::read(&access, &self.jobs_read, part, n, agreed_at, at);
+                // GitHub slow is a failed reading: backed off and counted as
+                // any other, the parts read before it kept.
+                let read = tokio::time::timeout(READ_FOR, read)
+                    .await
+                    .unwrap_or_else(|_| Ok(Reading::failed(n, at, SLOW)));
+                out.push((i, read));
             }
             out
         })
         .await
     }
 
-    /// Plan `p`'s measured parts read again, as the person, and kept: a
-    /// part that can't be read where it says is kept as a failed reading,
-    /// never stopping what reads it. The goal is met when every part reads
-    /// met. The plan as it is after, when it has an agreed goal to read.
+    /// Plan `p`'s goal read now and kept, once it reads met kept met, as a
+    /// plan turn reads it: the plan fresh, none when it isn't read.
     pub(super) async fn goal_reread(
+        &self,
+        service: &AgentService,
+        p: &PlanDetail,
+    ) -> Option<PlanDetail> {
+        let fresh = self.read_kept(service, p).await?;
+        let (Some(r), Some(progress)) = (&fresh.summary.plan.result, &fresh.goal) else {
+            return Some(fresh);
+        };
+        if !goal::met(progress) {
+            return Some(fresh);
+        }
+        let id = fresh.summary.plan.id;
+        if let Err(e) = self
+            .desk
+            .goal_met(id, &met_by_reading(r, progress, crew::now()))
+            .await
+        {
+            tracing::warn!(plan = %id, error = %e, "a goal read met wasn't kept met");
+        }
+        self.desk.plan(id).await.ok()
+    }
+
+    /// Plan `p`'s measured parts read now as the person and kept: the plan
+    /// fresh, none when it isn't read (no goal agreed, met already, not
+    /// running or paused, or nothing measured).
+    pub(super) async fn read_kept(
         &self,
         service: &AgentService,
         p: &PlanDetail,
@@ -783,36 +844,18 @@ impl CrewHub {
             .into_iter()
             .map(|(i, read)| match read {
                 Ok(reading) => reading,
-                Err(measure::Unreadable(why)) => Reading {
-                    at,
-                    part: u16::try_from(i).unwrap_or_default(),
-                    value: None,
-                    met: false,
-                    words: String::new(),
-                    evidence: Vec::new(),
-                    failed: Some(crew::one_line(&why, 300)),
-                },
+                Err(measure::Unreadable(why)) => {
+                    Reading::failed(u16::try_from(i).unwrap_or_default(), at, &why)
+                }
             })
             .collect();
         self.keep_readings(plan.id, r, &readings).await;
-        let fresh = self.desk.plan(plan.id).await.ok()?;
-        let Some(progress) = fresh.goal.as_ref().filter(|g| goal::met(g)) else {
-            return Some(fresh);
-        };
-        let met = Met {
-            at,
-            by: MetBy::Result,
-            why: format!("it reads met: {}", goal::progress_line(r, progress)),
-        };
-        if let Err(e) = self.desk.goal_met(plan.id, &met).await {
-            tracing::warn!(plan = %plan.id, error = %e, "a goal read met wasn't kept met");
-        }
         self.desk.plan(plan.id).await.ok()
     }
 
     /// `read` run as the person `service` works for: what GitHub is read
     /// as, whoever's turn it is.
-    async fn as_person<T>(
+    pub(super) async fn as_person<T>(
         &self,
         service: &AgentService,
         read: impl std::future::Future<Output = T>,
@@ -856,7 +899,8 @@ impl CrewHub {
 
     /// Plan `id`'s goal met as `met` says: kept once, its ticket moved to
     /// Done by Desk, and its closing turn, which finishes it, run after on
-    /// its own as any plan turn is: never inside the call that met it.
+    /// its own as any plan turn is: never inside the call that met it, and
+    /// only once a plan paused runs again.
     pub(super) async fn goal_met(&self, id: Uuid, met: Met) -> Result<(), String> {
         let why = met.why.clone();
         let first = self
@@ -864,12 +908,15 @@ impl CrewHub {
             .goal_met(id, &met)
             .await
             .map_err(|e| format!("The goal couldn't be marked met: {e}"))?;
-        if first {
-            let crew = self.me();
-            tokio::spawn(async move {
-                crew.plan_turn(id, vec![format!("The goal is met: {why}")])
-                    .await;
-            });
+        // Paused, its closing turn waits for it to run again: the
+        // watchdog's next look then.
+        let running = self
+            .desk
+            .plan(id)
+            .await
+            .is_ok_and(|p| p.summary.plan.state == workforce_desk::plan::PlanState::Running);
+        if first && running {
+            self.close_met(id, &why);
         }
         Ok(())
     }
@@ -901,7 +948,7 @@ impl CrewHub {
     ) -> Result<Vec<(Uuid, bool)>, String> {
         let mut kept = Vec::with_capacity(recorded.len());
         for r in recorded {
-            let checked = self.evidence_found(service, &r.evidence).await;
+            let checked = r.shown || self.evidence_found(service, &r.evidence).await;
             let f = Fact {
                 id: Uuid::new_v4(),
                 plan,

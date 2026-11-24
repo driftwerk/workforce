@@ -21,7 +21,7 @@ use std::sync::Arc;
 
 use serde_json::{json, Value};
 use workforce_agent::tools::registry::ToolRegistry;
-use workforce_agent::tools::RateLimitedError;
+use workforce_agent::tools::{RateLimitedError, Tool};
 use workforce_common::settings::WorkforceConfig;
 
 use crate::vault::Vault;
@@ -31,11 +31,12 @@ pub(super) const BRANCH: &str = "crew.github_branch";
 pub(super) const CI: &str = "crew.github_ci";
 
 /// The GitHub adapter's tools these call: reads alone.
-pub(super) const CALLS: [&str; 4] = [
+pub(super) const CALLS: [&str; 5] = [
     "github.get_pull",
     "github.list_pulls",
     "github.workflow_runs",
     "github.workflow_run_logs",
+    "github.compare",
 ];
 
 /// What the boss is told when GitHub can't be read as the person.
@@ -303,6 +304,31 @@ pub(super) async fn calls_as_person(
     access: &GithubAccess<'_>,
     calls: Vec<(&str, Value)>,
 ) -> Result<(String, Vec<Value>), GithubError> {
+    let (person, tools) = person_tools(access)?;
+    let mut out = Vec::with_capacity(calls.len());
+    for (call, args) in calls {
+        out.push(call_one(&tools, call, args).await?);
+    }
+    Ok((person, out))
+}
+
+/// Runs `calls` as [`calls_as_person`] does, each answered or failed on its
+/// own: one GitHub hasn't got never stops the others. Refused only when
+/// GitHub can't be read as the person.
+pub(super) async fn each_as_person(
+    access: &GithubAccess<'_>,
+    calls: Vec<(&str, Value)>,
+) -> Result<Vec<Result<Value, GithubError>>, GithubError> {
+    let (_, tools) = person_tools(access)?;
+    let mut out = Vec::with_capacity(calls.len());
+    for (call, args) in calls {
+        out.push(call_one(&tools, call, args).await);
+    }
+    Ok(out)
+}
+
+/// The person in scope and GitHub's tools as their key reaches them.
+fn person_tools(access: &GithubAccess<'_>) -> Result<(String, Vec<Arc<dyn Tool>>), GithubError> {
     // The person whose turn it is; none, nobody's key is read.
     let person = workforce_agent::runner::CURRENT_USER_ID
         .try_with(Clone::clone)
@@ -322,30 +348,30 @@ pub(super) async fn calls_as_person(
     let Ok(skill) = skill else {
         return Err(GithubError::NotConnected);
     };
-    let tools = skill.tools();
-    let mut out = Vec::new();
-    for (call, args) in calls {
-        debug_assert!(CALLS.contains(&call));
-        let tool = tools
-            .iter()
-            .find(|t| t.name() == call)
-            .ok_or(GithubError::NotConnected)?;
-        let r = tool.execute(args).await.map_err(|e| {
-            let limited = e
-                .chain()
-                .find_map(|e| e.downcast_ref::<RateLimitedError>())
-                .map(|l| l.retry_after_secs);
-            GithubError::of(&format!("{e:#}"), limited)
-        })?;
-        if !r.success {
-            return Err(GithubError::of(
-                r.error.as_deref().unwrap_or("it failed"),
-                r.rate_limited.map(|l| l.retry_after_secs),
-            ));
-        }
-        out.push(r.output);
+    Ok((person, skill.tools()))
+}
+
+/// What `call`, one of [`CALLS`], answers `args` with among `tools`.
+async fn call_one(tools: &[Arc<dyn Tool>], call: &str, args: Value) -> Result<Value, GithubError> {
+    debug_assert!(CALLS.contains(&call));
+    let tool = tools
+        .iter()
+        .find(|t| t.name() == call)
+        .ok_or(GithubError::NotConnected)?;
+    let r = tool.execute(args).await.map_err(|e| {
+        let limited = e
+            .chain()
+            .find_map(|e| e.downcast_ref::<RateLimitedError>())
+            .map(|l| l.retry_after_secs);
+        GithubError::of(&format!("{e:#}"), limited)
+    })?;
+    match r.success {
+        true => Ok(r.output),
+        false => Err(GithubError::of(
+            r.error.as_deref().unwrap_or("it failed"),
+            r.rate_limited.map(|l| l.retry_after_secs),
+        )),
     }
-    Ok((person, out))
 }
 
 /// What the boss is told when GitHub answers that what was asked isn't

@@ -2729,7 +2729,8 @@ impl CrewHub {
 
     /// What `event` adds to a plan's next turn, and which plan: the person
     /// changing, approving, pausing, resuming or dropping it, or one of its
-    /// tickets' sessions failing.
+    /// tickets' sessions failing. One of them ending a turn moves its
+    /// goal's next reading forward instead.
     async fn plan_line(&self, event: &crew::Event) -> Option<(Uuid, String)> {
         match event.kind {
             Kind::PlanChanged
@@ -2769,6 +2770,14 @@ impl CrewHub {
                     return Some((plan, format!("{key}'s session failed: {}", event.text)));
                 };
                 self.hold_back_died(plan, ticket, key, session.to_string(), None, e);
+                None
+            }
+            // One of its sessions ended a turn: its goal is read again soon,
+            // and its turn told nothing.
+            Kind::Finished => {
+                let session: Uuid = event.subject.as_ref()?.id.parse().ok()?;
+                let (plan, ..) = self.plan_ticket_of(session).await?;
+                self.pull_goal(plan, super::goal_check::Pulled::TurnEnded);
                 None
             }
             _ => None,
@@ -2841,11 +2850,13 @@ impl CrewHub {
         let Ok(detail) = self.desk.plan(id).await else {
             return;
         };
+        // Finished, it has no turn left: what was gathered for it is moot.
         if matches!(
             detail.summary.plan.state,
             PlanState::Done | PlanState::Dropped
         ) {
             self.unmet_said.lock().remove(&id);
+            return;
         }
         let Some((service, o)) = self.boss_of_plan(&detail.summary.plan) else {
             return;
@@ -2910,6 +2921,9 @@ impl CrewHub {
         }
         if !closing && !self.spend_boss_turn(&service, &o) {
             return;
+        }
+        if closing {
+            self.closing_started(id);
         }
         let said: Vec<String> = lines.iter().map(|l| format!("- {l}")).collect();
         let progress = &detail.summary.progress;

@@ -502,6 +502,16 @@ impl GithubSeen {
             .map(|k| k.value.clone())
     }
 
+    /// Pull request `n` of `repo` as GitHub last said, however long ago:
+    /// nothing is read for it.
+    pub(crate) fn pull_kept(&self, repo: &str, n: u64) -> Option<Pull> {
+        self.pulls
+            .kept
+            .iter()
+            .find(|((r, m), _)| *m == n && r.eq_ignore_ascii_case(repo))
+            .map(|(_, k)| k.value.clone())
+    }
+
     /// Forgets what GitHub said of `branch` of `repo` and of its pull
     /// request: both are read anew when next asked.
     pub(crate) fn forget_branch(&mut self, repo: &str, branch: &str) {

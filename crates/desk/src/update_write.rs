@@ -195,6 +195,25 @@ pub struct Said {
     pub moves: Option<Mover>,
 }
 
+impl Said {
+    /// A line of `kind` that is its headline alone: no session, nothing
+    /// done about it.
+    pub fn line(kind: EventKind, headline: String) -> Self {
+        Self {
+            kind,
+            headline,
+            body: String::new(),
+            ids: vec![],
+            not_checked: None,
+            session: None,
+            did: vec![],
+            at: None,
+            decisions: None,
+            moves: None,
+        }
+    }
+}
+
 /// Who moves a blocked or stalled piece of work next, and what happens
 /// then: an item about one says one of these, or isn't said at all.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
