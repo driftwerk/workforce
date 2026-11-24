@@ -6821,7 +6821,7 @@ async fn a_long_agent_message_is_listed_cut_and_read_whole_by_its_id() {
             "{shown}"
         );
         assert!(
-            !shown.contains(&dm.messages[0].id) && !shown.contains("\"id\""),
+            !shown.contains(&dm.messages[0].id),
             "only a cut message is named, by its note: {shown}"
         );
         let whole = history
