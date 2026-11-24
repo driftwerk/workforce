@@ -75,7 +75,12 @@ pub(crate) struct Run {
     pub wheel: Wheel,
     pub goal: String,
     pub folder: String,
+    /// Its reply's start ([`crew::REPLY_KEPT`]), as a line turn reads it.
     pub last_reply: Option<String>,
+    /// Its reply's first page ([`crew::REPLY_PAGE`]), in the take that
+    /// hands its turn's end or request: what the turn on it reads.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reply_page: Option<String>,
     /// Whether its boss's question answerer has what it asks, there
     /// ([`super::answer`]): it isn't raised to the boss's turns.
     #[serde(default)]
@@ -578,7 +583,7 @@ impl CrewHub {
                 ReadFrom::Since(_) => None,
             })
             .max_by(|a, b| (a.at, &a.id).cmp(&(b.at, &b.id)));
-        let events = events
+        let events: Vec<Frame> = events
             .iter()
             .filter_map(|e| {
                 let run = run_of(e.subject.as_ref()?.id.parse().ok()?)?;
@@ -612,6 +617,12 @@ impl CrewHub {
                         line: super::served::request_line(g, v, p),
                         hop: 0,
                     });
+                let ends = events.iter().any(|e| e.subject == c.session) || request.is_some();
+                let reply = |most| {
+                    replies
+                        .then(|| self.desk.reply_for_boss(v, 0, most, crew::ReadOn::Tools))
+                        .flatten()
+                };
                 let run = Run {
                     id: c.session,
                     name: v.label().to_string(),
@@ -620,11 +631,8 @@ impl CrewHub {
                     wheel: c.wheel,
                     goal: v.goal.clone(),
                     folder: v.cwd.clone(),
-                    last_reply: v
-                        .last_reply
-                        .as_deref()
-                        .filter(|_| replies)
-                        .map(|r| workforce_desk::crew::clip(r, 1500)),
+                    last_reply: reply(crew::REPLY_KEPT),
+                    reply_page: ends.then(|| reply(crew::REPLY_PAGE)).flatten(),
                     answered: answered.contains(&c.session),
                     item,
                 };
@@ -686,11 +694,23 @@ impl Turned {
 struct Work {
     ended: Vec<String>,
     said: Vec<Line>,
+    /// Its reply's first page, from the take that handed what ended.
+    reply_page: Option<String>,
 }
 
 impl Work {
     fn is_empty(&self) -> bool {
         self.ended.is_empty() && self.said.is_empty()
+    }
+
+    /// What its turn reads of `run`'s reply: the first page when something
+    /// ended, as a turn here does ([`super::line::reply_most`]); its start
+    /// for what was only said.
+    fn reply<'a>(&'a self, run: &'a Run) -> Option<&'a str> {
+        match self.ended.is_empty() {
+            true => run.last_reply.as_deref(),
+            false => self.reply_page.as_deref().or(run.last_reply.as_deref()),
+        }
     }
 }
 
@@ -731,7 +751,7 @@ impl Pump {
     /// Takes in what `t` handed back: each new event, question, report and
     /// request, gathered by session for its turn.
     fn heard(&mut self, t: &Taken) {
-        let run: HashSet<Uuid> = t.sessions.iter().map(|s| s.id).collect();
+        let run: HashMap<Uuid, &Run> = t.sessions.iter().map(|s| (s.id, s)).collect();
         let open: HashSet<String> = t
             .asks
             .iter()
@@ -760,12 +780,12 @@ impl Pump {
                 .iter()
                 .filter(|r| fresh(r.id.clone(), &mut self.offered)),
         ) {
-            if run.contains(&e.subject) {
-                self.gathered
-                    .entry(e.subject)
-                    .or_default()
-                    .ended
-                    .push(e.line.clone());
+            if let Some(r) = run.get(&e.subject) {
+                let work = self.gathered.entry(e.subject).or_default();
+                work.ended.push(e.line.clone());
+                if r.reply_page.is_some() {
+                    work.reply_page.clone_from(&r.reply_page);
+                }
             }
         }
         for l in t
@@ -774,7 +794,7 @@ impl Pump {
             .chain(&t.reports)
             .filter(|l| fresh(l.said.id.to_string(), &mut self.offered))
         {
-            if run.contains(&l.session) {
+            if run.contains_key(&l.session) {
                 self.gathered
                     .entry(l.session)
                     .or_default()
@@ -791,7 +811,7 @@ impl Pump {
             self.seen.pop_front();
         }
         self.gathered
-            .retain(|s, w| run.contains(s) && !w.is_empty());
+            .retain(|s, w| run.contains_key(s) && !w.is_empty());
     }
 
     /// What is due for a turn now: each session's gathered work whose turn
@@ -956,7 +976,7 @@ impl CrewHub {
             "folder": run.folder,
             "goal": run.goal,
             "state": run.state,
-            "last_reply": run.last_reply,
+            "last_reply": work.reply(run),
         }));
         let said: Vec<Said> = work.said.iter().map(|l| l.said.clone()).collect();
         self.line_prompt_of(&named, &about, &said, &work.ended, o, false)
@@ -1336,6 +1356,7 @@ mod tests {
             goal: String::new(),
             folder: "/src".into(),
             last_reply: None,
+            reply_page: None,
             answered: false,
             item: None,
         }
@@ -1383,6 +1404,36 @@ mod tests {
             vec![report.said.id],
             "acknowledged on the next take"
         );
+    }
+
+    #[test]
+    fn a_turn_on_what_ended_reads_its_replys_first_page_and_one_on_what_was_said_its_start() {
+        let s = Uuid::new_v4();
+        let with = |page: Option<&str>| Run {
+            last_reply: Some("its start".into()),
+            reply_page: page.map(Into::into),
+            ..run(s)
+        };
+        let mut p = Pump::default();
+        // The take handing its turn's end carries the page; a later one,
+        // before its turn runs, doesn't.
+        p.heard(&Taken {
+            sessions: vec![with(Some("its first page"))],
+            events: vec![frame("e1", s)],
+            ..Taken::default()
+        });
+        p.heard(&Taken {
+            sessions: vec![with(None)],
+            reports: vec![line(s, LineKind::Tell)],
+            ..Taken::default()
+        });
+        let now = with(None);
+        assert_eq!(p.due()[0].1.reply(&now), Some("its first page"));
+        let said = Work {
+            said: vec![line(s, LineKind::Tell)],
+            ..Work::default()
+        };
+        assert_eq!(said.reply(&now), Some("its start"));
     }
 
     #[test]

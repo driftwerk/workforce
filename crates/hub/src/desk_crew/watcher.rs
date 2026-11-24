@@ -28,6 +28,7 @@ use workforce_desk::model::{DeskEvent, Origin};
 use workforce_desk::CheckIn;
 
 use super::github::CHECK_GITHUB;
+use super::goal::SAVE_GOALS;
 use super::tools::{CrewTool, ACT, READ};
 use super::{name_of, CrewHub, CHECK_IN, MAX_HOPS};
 use crate::scheduler::{JobPayload, Schedule};
@@ -274,9 +275,8 @@ fn who(p: &Party) -> String {
 }
 
 /// What a boss at Act fully, or unbound, is told of its plans: a draft for
-/// the person, started only on their word (a bound one can't approve one
-/// at all).
-pub(super) const PLAN_DRAFT: &str = "A plan you make is a draft for the person to review and approve; start one only when their own words ask you to start the work (start_now).";
+/// the person unless they agreed it, started only on their word.
+pub(super) const PLAN_DRAFT: &str = "A plan the person hasn't agreed is a draft for them to review and approve; start one only when their own words ask you to start the work (start_now).";
 
 /// What Act fully aims at: the end state an order names, with no polish
 /// before it. Worded once for [`STANDING_RULE`] and the decision prompts in
@@ -571,7 +571,12 @@ impl CrewHub {
                 },
                 event.text
             ),
-            false => format!("{} {}", who(subject), event.text),
+            false => format!(
+                "{} {}{}",
+                who(subject),
+                event.text,
+                self.reply_says_more(event).unwrap_or_default()
+            ),
         };
         wanted.then(|| Trigger {
             line,
@@ -581,6 +586,17 @@ impl CrewHub {
             group: event.group.clone(),
             handed: None,
             routine: false,
+        })
+    }
+
+    /// What a turn's end `event`, which says its reply's first sentence,
+    /// adds when the reply says more: where to read it.
+    fn reply_says_more(&self, event: &Event) -> Option<String> {
+        let session = finished_session(event)?;
+        let v = self.desk.view(session).ok()?;
+        let reply = self.desk.reply(session).map(|r| r.text).or(v.last_reply)?;
+        says_more(&reply).then(|| {
+            format!(" (its reply says more: read it with crew.history, session_id {session})")
         })
     }
 
@@ -884,8 +900,15 @@ impl CrewHub {
                 format!("it was told to read it with its next tool call, and hasn't made one: {LONG_STEP}"),
                 false,
             ),
+            Some(Wait::Behind) => (
+                "an earlier message was handed to it and was never said to have gone in, and the rest wait behind it"
+                    .to_string(),
+                false,
+            ),
             None => ("it was free to take it, and nothing took it in".to_string(), false),
-            Some(Wait::Typing | Wait::Paused | Wait::PersonDriving | Wait::ModeEnding) => {
+            Some(
+                Wait::Typing | Wait::Paused | Wait::PersonDriving | Wait::ModeEnding | Wait::Awaited,
+            ) => {
                 return None
             }
         };
@@ -942,7 +965,7 @@ impl CrewHub {
              will need your judgement. Nothing should sit idle. Check the person's preferences first and apply \
              the one that fits (a close match too: apply it and say so). With none, decide yourself; give the \
              person a question only when you truly can't, with crew.ask_person and generalizes, so their \
-             answer settles that kind of case from then on. Give a reason each time; the person reads them in Activity. Your own limits stay theirs: asked to change them, say plainly you can't and post crew.ask_oversight_change. {STANDING_RULE} {PLAN_DRAFT} {CHECK_GITHUB}",
+             answer settles that kind of case from then on. Give a reason each time; the person reads them in Activity. Your own limits stay theirs: asked to change them, say plainly you can't and post crew.ask_oversight_change. {STANDING_RULE} {PLAN_DRAFT} {SAVE_GOALS} {CHECK_GITHUB}",
             o.work.parallel, o.work.parallel
         )
     }
@@ -963,7 +986,7 @@ impl CrewHub {
     pub(super) fn level_hint(level: Level, o: &Oversight) -> String {
         let hint = match level {
             Level::Full => format!(
-                "{} {STANDING_RULE} {PLAN_DRAFT} {CHECK_GITHUB}",
+                "{} {STANDING_RULE} {PLAN_DRAFT} {SAVE_GOALS} {CHECK_GITHUB}",
                 Self::level_words(level)
             ),
             _ => format!("{} {CHECK_GITHUB}", Self::level_words(level)),
@@ -986,7 +1009,7 @@ impl CrewHub {
         let says = match level {
             _ if unbound => {
                 let work = Self::style_line(o);
-                return format!("You oversee the crew, unbound: do everything yourself with the crew.* tools. {work} {STANDING_RULE} {PLAN_DRAFT} {CHECK_FIRST} {CHECK_GITHUB}");
+                return format!("You oversee the crew, unbound: do everything yourself with the crew.* tools. {work} {STANDING_RULE} {PLAN_DRAFT} {SAVE_GOALS} {CHECK_FIRST} {CHECK_GITHUB}");
             }
             Level::Watch => "at Watch: don't act; say what you would do.",
             Level::Suggest => "at Suggest: your crew.* actions become suggestions the person accepts.",
@@ -1377,6 +1400,12 @@ impl CrewHub {
     }
 }
 
+/// Whether `reply` says more than its turn's end does: its first sentence,
+/// as long as that says it ([`crew::ANSWER_CHARS`]).
+fn says_more(reply: &str) -> bool {
+    crew::one_line(reply, crew::ANSWER_CHARS) != reply.trim()
+}
+
 /// The session whose turn `event` says ended, when it does.
 pub(super) fn finished_session(event: &Event) -> Option<uuid::Uuid> {
     let subject = event.subject.as_ref()?;
@@ -1668,6 +1697,26 @@ pub(super) fn wake_loop(
                 }));
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod says_more_tests {
+    use super::*;
+
+    #[test]
+    fn a_reply_says_more_than_its_turns_end_past_its_first_sentence_or_its_length() {
+        assert!(!says_more(" All green. "));
+        assert!(says_more("All green. The flaky test passed twice."));
+        let long = format!(
+            "Checked {} and all of them pass.",
+            "every module ".repeat(12)
+        );
+        assert!(long.chars().count() > crew::ANSWER_CHARS);
+        assert!(
+            says_more(&long),
+            "one sentence, cut where the turn's end says it"
+        );
     }
 }
 

@@ -173,11 +173,15 @@ fn passage_hash(passage: &str) -> u64 {
 }
 
 /// `text` with each long passage `holds` names standing as a line that says
-/// it is unchanged, opening with its own first words.
+/// it is unchanged, opening with its own first words. A boss's goals are
+/// given whole every time.
 fn unheld(text: &str, holds: &BTreeSet<u64>) -> String {
     passages(text)
         .map(|p| {
-            match p.chars().count() >= HELD_PASSAGE_CHARS && holds.contains(&passage_hash(p)) {
+            let held = p.chars().count() >= HELD_PASSAGE_CHARS
+                && holds.contains(&passage_hash(p))
+                && !p.contains(workforce_core::desk::GOALS_MARKER);
+            match held {
                 true => format!(
                     "[Unchanged since it was given earlier in this conversation: “{}”]",
                     truncate_with_ellipsis(p.lines().next().unwrap_or_default().trim(), 80)

@@ -10,7 +10,8 @@ use serde_json::Value;
 use crate::asking::Denied;
 
 const TAIL_BYTES: u64 = 512 * 1024;
-const REPLY_MAX: usize = 600;
+/// The most of a reply a session card keeps.
+pub const REPLY_MAX: usize = 600;
 
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Tail {
@@ -34,6 +35,46 @@ pub struct Tail {
     pub last_login: Option<(String, chrono::DateTime<chrono::Utc>)>,
     /// A `/login` whose outcome is still to come.
     pending_login: Option<(String, chrono::DateTime<chrono::Utc>)>,
+}
+
+/// The most of a transcript [`mentions`] reads.
+const MENTIONS_MAX: u64 = 512 * 1024 * 1024;
+
+/// Whether `needle` is anywhere in the regular file at `path`, read whole
+/// (what a long turn wrote since can be more than its tail) a chunk at a
+/// time: `None` when it is longer than [`MENTIONS_MAX`] and not in that
+/// much. A path that is no file (a device, a pipe) is refused, never
+/// opened.
+pub fn mentions(path: &Path, needle: &str) -> std::io::Result<Option<bool>> {
+    mentions_within(path, needle, MENTIONS_MAX)
+}
+
+fn mentions_within(path: &Path, needle: &str, most: u64) -> std::io::Result<Option<bool>> {
+    if !std::fs::metadata(path)?.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "not a regular file",
+        ));
+    }
+    let needle = needle.as_bytes();
+    let keep = needle.len().saturating_sub(1);
+    let mut file = std::fs::File::open(path)?.take(most.saturating_add(1));
+    let mut buf = vec![0u8; 64 * 1024 + keep];
+    let mut carried = 0;
+    let mut total = 0u64;
+    loop {
+        let read = file.read(&mut buf[carried..])?;
+        if read == 0 {
+            return Ok((total <= most).then_some(false));
+        }
+        total += read as u64;
+        let filled = carried + read;
+        if buf[..filled].windows(needle.len()).any(|w| w == needle) {
+            return Ok(Some(true));
+        }
+        carried = keep.min(filled);
+        buf.copy_within(filled - carried..filled, 0);
+    }
 }
 
 /// The whole lines of the end of a transcript.
@@ -349,6 +390,11 @@ pub fn engine_acted(path: &Path, codex: bool) -> std::io::Result<bool> {
         }))
 }
 
+/// Whether `s`, as [`clip`] gave it, was cut.
+pub fn clipped(s: &str) -> bool {
+    s.ends_with('…') && s.chars().count() == REPLY_MAX + 1
+}
+
 pub fn clip(s: &str) -> String {
     let s = s.trim();
     if s.chars().count() <= REPLY_MAX {
@@ -362,6 +408,42 @@ pub fn clip(s: &str) -> String {
 mod tests {
     use super::*;
     use std::io::Write;
+
+    #[test]
+    fn a_mention_is_found_across_chunks_and_a_path_that_is_no_file_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.jsonl");
+        let mark = "[Desk m:0a1b2c3d]";
+        let pad = "x".repeat(64 * 1024 + 11);
+        std::fs::write(&path, format!("{pad}{mark}\n")).unwrap();
+        assert_eq!(
+            mentions(&path, mark).unwrap(),
+            Some(true),
+            "across a chunk's end"
+        );
+        assert_eq!(mentions(&path, "[Desk m:ffffffff]").unwrap(), Some(false));
+        let len = std::fs::metadata(&path).unwrap().len();
+        let other = "[Desk m:ffffffff]";
+        assert_eq!(
+            mentions_within(&path, other, len).unwrap(),
+            Some(false),
+            "read to its end"
+        );
+        assert_eq!(
+            mentions_within(&path, other, len - 1).unwrap(),
+            None,
+            "longer than is read"
+        );
+        assert!(mentions(dir.path(), mark).is_err(), "a folder");
+        assert!(mentions(Path::new("/dev/zero"), mark).is_err(), "a device");
+        let fifo = dir.path().join("fifo");
+        let made = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap();
+        assert!(made.success());
+        assert!(mentions(&fifo, mark).is_err(), "a pipe, refused unopened");
+    }
 
     #[test]
     fn picks_the_latest_title_prompt_and_reply() {

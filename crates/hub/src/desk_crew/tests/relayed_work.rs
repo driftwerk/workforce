@@ -669,6 +669,7 @@ async fn a_machine_session_gone_quiet_is_said_in_the_check_in_as_one_here_is() {
                                     goal: "Ship the fix".into(),
                                     folder: "/src".into(),
                                     last_reply: None,
+                                    reply_page: None,
                                     answered: false,
                                     item: shown.lock().clone(),
                                 }],

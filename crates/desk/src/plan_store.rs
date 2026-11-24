@@ -16,18 +16,34 @@ use uuid::Uuid;
 
 use crate::board::{Ticket, TicketState};
 use crate::engine::{Engine, View};
+use crate::goal::{Met, MetBy};
 use crate::plan::{Change, Paused, Plan, PlanState, Revision};
 use crate::store::DeskStore;
 
-const PLAN: &str = "id, board, group_id, boss, goal, state, paused, parallel, revision, \
-                    approved_revision, created_at, updated_at, paused_why";
+pub(crate) const PLAN: &str =
+    "id, board, group_id, boss, goal, state, paused, parallel, revision, \
+                    approved_revision, created_at, updated_at, paused_why, result, agreed, \
+                    agreed_at, goal_ticket, read_back_at, met_at, met_by, met_why";
 const REVISION: &str = "plan, revision, at, made_by, change, summary, snapshot";
 
 /// The `ticket_links` kind of a session about to start for a ticket.
 pub const STARTING: &str = "starting";
 
-fn plan(row: &Row) -> Result<Plan> {
+pub(crate) fn plan(row: &Row) -> Result<Plan> {
     let paused: Option<String> = row.try_get("paused")?;
+    let result: Option<serde_json::Value> = row.try_get("result")?;
+    let met_at: Option<DateTime<Utc>> = row.try_get("met_at")?;
+    let met_by: Option<String> = row.try_get("met_by")?;
+    let met = match (met_at, met_by) {
+        (Some(at), Some(by)) => Some(Met {
+            at,
+            by: MetBy::parse(&by)?,
+            why: row
+                .try_get::<_, Option<String>>("met_why")?
+                .unwrap_or_default(),
+        }),
+        _ => None,
+    };
     Ok(Plan {
         id: row.try_get("id")?,
         board: row.try_get("board")?,
@@ -42,6 +58,15 @@ fn plan(row: &Row) -> Result<Plan> {
         approved_revision: row.try_get("approved_revision")?,
         created_at: row.try_get("created_at")?,
         updated_at: row.try_get("updated_at")?,
+        result: result
+            .map(serde_json::from_value)
+            .transpose()
+            .context("reading a plan's result")?,
+        agreed: row.try_get("agreed")?,
+        agreed_at: row.try_get("agreed_at")?,
+        goal_ticket: row.try_get("goal_ticket")?,
+        read_back_at: row.try_get("read_back_at")?,
+        met,
     })
 }
 
@@ -84,18 +109,25 @@ impl From<workforce_postgres::PostgresError> for BeginStart {
     }
 }
 
+/// Writes `p` whole, but when and how its goal was met and said back:
+/// [`DeskStore::mark_met`] and [`DeskStore::set_read_back`] write those,
+/// once, so a plan written from an older read never takes them back.
 async fn put_plan_in<C: tokio_postgres::GenericClient>(client: &C, p: &Plan) -> Result<()> {
+    let result = p.result.as_ref().map(serde_json::to_value).transpose()?;
     client
         .execute(
-            &format!(
-                "INSERT INTO plans ({PLAN}) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13) \
-                 ON CONFLICT (id) DO UPDATE SET board = EXCLUDED.board, group_id = EXCLUDED.group_id, \
-                 boss = EXCLUDED.boss, goal = EXCLUDED.goal, state = EXCLUDED.state, \
-                 paused = EXCLUDED.paused, paused_why = EXCLUDED.paused_why, \
-                 parallel = EXCLUDED.parallel, \
-                 revision = EXCLUDED.revision, approved_revision = EXCLUDED.approved_revision, \
-                 updated_at = EXCLUDED.updated_at"
-            ),
+            "INSERT INTO plans (id, board, group_id, boss, goal, state, paused, parallel, \
+             revision, approved_revision, created_at, updated_at, paused_why, result, agreed, \
+             agreed_at, goal_ticket) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17) \
+             ON CONFLICT (id) DO UPDATE SET board = EXCLUDED.board, group_id = EXCLUDED.group_id, \
+             boss = EXCLUDED.boss, goal = EXCLUDED.goal, state = EXCLUDED.state, \
+             paused = EXCLUDED.paused, paused_why = EXCLUDED.paused_why, \
+             parallel = EXCLUDED.parallel, \
+             revision = EXCLUDED.revision, approved_revision = EXCLUDED.approved_revision, \
+             updated_at = EXCLUDED.updated_at, result = EXCLUDED.result, \
+             agreed = EXCLUDED.agreed, agreed_at = EXCLUDED.agreed_at, \
+             goal_ticket = EXCLUDED.goal_ticket",
             &[
                 &p.id,
                 &p.board,
@@ -110,6 +142,10 @@ async fn put_plan_in<C: tokio_postgres::GenericClient>(client: &C, p: &Plan) -> 
                 &p.created_at,
                 &p.updated_at,
                 &p.paused_why,
+                &result,
+                &p.agreed,
+                &p.agreed_at,
+                &p.goal_ticket,
             ],
         )
         .await?;
@@ -182,19 +218,37 @@ impl From<workforce_postgres::PostgresError> for Adopt {
     }
 }
 
-/// Claims `ticket` for plan `runs.plan`, while it is [`ADOPTABLE`].
+/// A ticket a plan takes on, as it is claimed: where it runs there, the
+/// needs it is given, and the running session it stands for, when it is
+/// that session's.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Claim {
+    pub ticket: Uuid,
+    pub runs: Runs,
+    pub needs: Vec<Uuid>,
+    pub session: Option<Uuid>,
+}
+
+/// Claims `ticket` for plan `runs.plan`, while it is [`ADOPTABLE`]; or,
+/// for the running `session` it stands for, while that session has it and
+/// no other open plan does.
 async fn adopt_in<C: tokio_postgres::GenericClient>(
     client: &C,
     ticket: Uuid,
     runs: &Runs,
+    session: Option<Uuid>,
 ) -> Result<(), Adopt> {
     let n = client
         .execute(
             &format!(
                 "UPDATE tickets SET plan = $2, engine = $3, folder = $4, view = $5, machine = $6, \
                  model = $7, repo = $8, adopted = true, version = version + 1 \
-                 WHERE id = $1 AND (({ADOPTABLE}) OR (plan = $2 AND adopted AND assignee IS NULL \
-                 AND state IN ('backlog', 'todo')))"
+                 WHERE id = $1 AND CASE WHEN $9::text IS NULL \
+                 THEN ({ADOPTABLE}) OR (plan = $2 AND adopted AND assignee IS NULL \
+                   AND state IN ('backlog', 'todo')) \
+                 ELSE assignee ->> 'kind' = 'session' AND assignee ->> 'id' = $9 \
+                   AND (plan IS NULL OR plan = $2 \
+                     OR plan IN (SELECT id FROM plans WHERE state IN ('done', 'dropped'))) END"
             ),
             &[
                 &ticket,
@@ -205,6 +259,7 @@ async fn adopt_in<C: tokio_postgres::GenericClient>(
                 &runs.machine,
                 &runs.model,
                 &runs.repo,
+                &session.map(|s| s.to_string()),
             ],
         )
         .await?;
@@ -530,10 +585,17 @@ impl DeskStore {
     }
 
     /// Takes `ticket` on for the plan `runs.plan`, as it runs there, while
-    /// no one has it, it hasn't started and no open plan has it.
-    pub async fn adopt_ticket(&self, ticket: Uuid, runs: &Runs) -> Result<(), Adopt> {
+    /// no one has it, it hasn't started and no open plan has it; or, for
+    /// the running `session` it stands for, while that session has it and
+    /// no other open plan does.
+    pub async fn adopt_ticket(
+        &self,
+        ticket: Uuid,
+        runs: &Runs,
+        session: Option<Uuid>,
+    ) -> Result<(), Adopt> {
         let client = self.pool().get().await?;
-        adopt_in(&**client, ticket, runs).await
+        adopt_in(&**client, ticket, runs, session).await
     }
 
     /// Adds that `ticket` needs `needs`, as plan `plan`'s own; whether it
@@ -610,7 +672,7 @@ impl DeskStore {
         &self,
         p: &Plan,
         tickets: &mut [(Ticket, Runs)],
-        adopt: &[(Uuid, Runs, Vec<Uuid>)],
+        adopt: &[Claim],
         r: &Revision,
     ) -> Result<(), Adopt> {
         let mut client = self.pool().get().await?;
@@ -618,8 +680,8 @@ impl DeskStore {
         put_plan_in(&*tx, p).await?;
         // Each ticket it takes on, claimed as it is now: one someone took
         // meanwhile refuses the whole plan.
-        for (id, runs, _) in adopt {
-            adopt_in(&*tx, *id, runs).await?;
+        for c in adopt {
+            adopt_in(&*tx, c.ticket, &c.runs, c.session).await?;
         }
         for (t, runs) in tickets.iter_mut() {
             let row = tx
@@ -651,7 +713,7 @@ impl DeskStore {
         let needs = tickets
             .iter()
             .map(|(t, _)| (t.id, t.needs.as_slice()))
-            .chain(adopt.iter().map(|(id, _, n)| (*id, n.as_slice())));
+            .chain(adopt.iter().map(|c| (c.ticket, c.needs.as_slice())));
         for (id, list) in needs {
             for n in list {
                 // One there already (the person's, the tracker's) stays theirs.
@@ -728,7 +790,7 @@ impl DeskStore {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use workforce_postgres::test_support::with_test_pool;
 
     use super::*;
@@ -736,7 +798,7 @@ mod tests {
     use crate::crew::Party;
     use crate::plan::{Planned, Snapshot};
 
-    async fn board(s: &DeskStore) -> Board {
+    pub(crate) async fn board(s: &DeskStore) -> Board {
         let now = Utc::now();
         let b = Board {
             id: Uuid::new_v4(),
@@ -752,7 +814,7 @@ mod tests {
         b
     }
 
-    async fn ticket(s: &DeskStore, b: &Board, title: &str) -> Ticket {
+    pub(crate) async fn ticket(s: &DeskStore, b: &Board, title: &str) -> Ticket {
         let now = Utc::now();
         let mut t = Ticket {
             id: Uuid::new_v4(),
@@ -780,7 +842,7 @@ mod tests {
         t
     }
 
-    fn new_plan(b: &Board) -> Plan {
+    pub(crate) fn new_plan(b: &Board) -> Plan {
         let now = crate::crew::now();
         Plan {
             id: Uuid::new_v4(),
@@ -796,6 +858,12 @@ mod tests {
             approved_revision: None,
             created_at: now,
             updated_at: now,
+            result: None,
+            agreed: None,
+            agreed_at: None,
+            read_back_at: None,
+            goal_ticket: None,
+            met: None,
         }
     }
 
@@ -828,6 +896,7 @@ mod tests {
                 change: Change::Scope,
                 summary: "Proposed".into(),
                 snapshot: Snapshot {
+                    result: None,
                     parallel: None,
                     budget: None,
                     goal: p.goal.clone(),
@@ -843,6 +912,7 @@ mod tests {
                         machine: None,
                         model: None,
                         adopted: false,
+                        session: None,
                     }],
                 },
             };

@@ -1084,13 +1084,15 @@ impl CrewHub {
 
     /// What the boss is told of its message `m` to session `name`, as
     /// `did` ("told", "answered"), with where it stands, read again now:
-    /// what, if anything, it waits on; refused as stale once it was
-    /// withdrawn before it went in.
+    /// in, or queued and not yet delivered with what it waits on (`rushed`,
+    /// how an urgent one went, says it first); refused as stale once it was
+    /// withdrawn before it went in. Never "sent" before it is in.
     async fn nudge_said(
         &self,
         name: &str,
         did: &str,
         m: &workforce_desk::line::LineMessage,
+        rushed: Option<String>,
     ) -> Result<(String, workforce_desk::line::Delivery), String> {
         use workforce_desk::line::{Delivery, Wait};
         let now = match self.desk.store().line_message(m.id).await {
@@ -1103,19 +1105,37 @@ impl CrewHub {
                 super::picture::STALE
             ));
         }
-        let why = match self.desk.line_waits(&now) {
-            None => return Ok((format!("{did} {name}"), now.delivery)),
-            Some(Wait::Stopped) => "it is stopped and gets it when it runs again",
-            Some(Wait::Working) => "it gets it once its turn ends",
-            Some(Wait::Dialog) => "a dialog in its terminal waits on an answer: it gets it once that is answered and its turn ends",
-            Some(Wait::Asking) => "its turn ended asking the person something, so it gets it once they answer",
-            Some(Wait::Typing) => "the person is typing in its terminal: it gets it once they stop",
-            Some(Wait::Paused) => "Desk's breaker paused it: it gets it once the person lets it go on",
-            Some(Wait::ModeEnding) => "Desk starts it again in its own mode first, then it gets it",
-            Some(Wait::PersonDriving) => "the person is driving it, so your message waits until they stop giving it input for a little while or hand it back",
-            Some(Wait::NextCall) => "it reads it with its next tool call's result",
+        if !now.waits() {
+            let said =
+                rushed.map_or_else(|| format!("{did} {name}"), |r| format!("{did} {name}; {r}"));
+            return Ok((said, now.delivery));
+        }
+        let why = match (rushed, self.desk.line_waits(&now).await, now.delivery) {
+            (Some(r), ..) => r,
+            (None, Some(w), _) => match w {
+                Wait::Stopped => "it is stopped and gets it when it runs again",
+                Wait::Working => "it gets it once its turn ends",
+                Wait::Dialog => "a dialog in its terminal waits on an answer: it gets it once that is answered and its turn ends",
+                Wait::Asking => "its turn ended asking the person something, so it gets it once they answer",
+                Wait::Typing => "the person is typing in its terminal: it gets it once they stop",
+                Wait::Paused => "Desk's breaker paused it: it gets it once the person lets it go on",
+                Wait::ModeEnding => "Desk starts it again in its own mode first, then it gets it",
+                Wait::PersonDriving => "the person is driving it, so your message waits until they stop giving it input for a little while or hand it back",
+                Wait::NextCall => "it reads it with its next tool call's result",
+                Wait::Awaited => "its call waiting on that question takes it as its answer",
+                Wait::Behind => "an earlier message is still on its way in, and this one goes after it",
+            }
+            .into(),
+            (None, None, Delivery::Handed) => "it is on its way in, not yet said to have arrived".into(),
+            (None, None, _) => "it goes in next".into(),
         };
-        Ok((format!("{did} {name}; {why}"), now.delivery))
+        Ok((
+            format!(
+                "{did} {name}: queued, not yet delivered; {why}. Wait for it, and don't send it again; crew.history with message_id {} says once it was delivered.",
+                now.id
+            ),
+            now.delivery,
+        ))
     }
 
     /// The session `action` is done to, when it is one.
@@ -2105,7 +2125,10 @@ impl CrewHub {
                             .await
                             .map_err(line)?;
                         done.line = Some((answer.id, answer.delivery));
-                        Ok(format!("answered {name}"))
+                        let (said, delivery) =
+                            self.nudge_said(&name, "answered", &answer, None).await?;
+                        done.line = Some((answer.id, delivery));
+                        Ok(said)
                     }
                     // The answer to the question a turn ended on: refused as
                     // stale once it asks something else, never sent as a
@@ -2133,7 +2156,8 @@ impl CrewHub {
                             }
                             sent => sent.map_err(line)?,
                         };
-                        let (said, delivery) = self.nudge_said(&name, "answered", &answer).await?;
+                        let (said, delivery) =
+                            self.nudge_said(&name, "answered", &answer, None).await?;
                         done.line = Some((answer.id, delivery));
                         Ok(said)
                     }
@@ -2155,10 +2179,9 @@ impl CrewHub {
                             .await
                             .map_err(line)?;
                         done.line = Some((told.id, told.delivery));
-                        if let Some(said) = super::urgent::told(&name, rushed) {
-                            return Ok(said);
-                        }
-                        let (said, delivery) = self.nudge_said(&name, "told", &told).await?;
+                        let rushed = rushed.and_then(workforce_desk::line::Rushed::said);
+                        let (said, delivery) =
+                            self.nudge_said(&name, "told", &told, rushed).await?;
                         done.line = Some((told.id, delivery));
                         Ok(said)
                     }
@@ -2880,6 +2903,12 @@ impl CrewHub {
                 *id = Some(t.ticket.id);
                 if let Some(key) = &t.key {
                     ticket.clone_from(key);
+                }
+                // A goal's ticket is Desk's to close, once the goal is met.
+                if boss.is_some() {
+                    if let Some(why) = self.goal_held(t.ticket.id, ticket, *state).await {
+                        return Err(why);
+                    }
                 }
                 *was = Some(t.ticket.state);
                 *off_external = workforce_desk::board::unassigns(*state)

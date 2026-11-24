@@ -907,8 +907,8 @@ impl Desk {
                 .map(|(shell, _)| shell.as_str())
                 .collect();
             if !ended.is_empty() {
-                self.change(*id, |_, l| {
-                    if let Some(l) = l {
+                self.change_unseen(*id, |st| {
+                    if let Some(l) = st.live.get_mut(id) {
                         let now = Utc::now();
                         l.background = ended
                             .iter()

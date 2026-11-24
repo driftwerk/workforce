@@ -330,13 +330,32 @@ pub(crate) async fn block(service: &AgentService, channel: &str, owner: &str) ->
         (Some(open), Some(a)) => Some(format!("{}\n\n{a}", open.trim_end())),
         (open, a) => open.or(a),
     };
-    let body = body(
+    // Its goals and the work it sent with none saved: given whole, outside
+    // the notes, on every turn.
+    let goals: Vec<String> = Box::pin(crew.goals_block(boss.agent_id.as_str()))
+        .await
+        .into_iter()
+        .chain(
+            Box::pin(crew.unsaved_lines(&boss))
+                .await
+                .into_iter()
+                .map(|(_, line)| line),
+        )
+        .collect();
+    let goals = goals.join("\n\n");
+    let Some(body) = body(
         &entries,
         about,
         &posts,
         open.as_deref(),
         crew.desk.timezone(),
-    )?;
+    ) else {
+        return (!goals.is_empty()).then_some(goals);
+    };
+    let goals = match goals.is_empty() {
+        true => goals,
+        false => format!("\n\n{goals}"),
+    };
     let how = how.map(|h| format!("\n\n{h}")).unwrap_or_default();
     // Summaries said plainly read like fresh ones: the block opens with it.
     let spent = match crew.desk.cheap_ceiling_hit_today() {
@@ -345,7 +364,7 @@ pub(crate) async fn block(service: &AgentService, channel: &str, owner: &str) ->
     };
     Some(format!(
         "What Desk keeps of your crew now, the same in every turn of yours (read crew.account \
-         before you say anything specific of one session). {CHECK_FIRST}{spent}\n{}{how}",
+         before you say anything specific of one session). {CHECK_FIRST}{spent}\n{}{how}{goals}",
         reported(&body, "Desk's notes on your crew")
     ))
 }

@@ -115,10 +115,10 @@ async fn held_by(d: &Desk, s: uuid::Uuid) -> workforce_desk::assignment::Assignm
 async fn goes_in(d: &Desk, s: uuid::Uuid) {
     let line = held_by(d, s).await.line_message.expect("sent on its line");
     d.store()
-        .line_take(line, Delivery::Delivered)
+        .line_went_in(line)
         .await
         .unwrap()
-        .expect("still queued");
+        .expect("not in yet");
 }
 
 /// `s` writes `text` to its boss, and the boss's picture has it.
@@ -1080,9 +1080,9 @@ async fn a_stand_down_while_the_person_drives_is_theirs_and_goes_once_they_close
         crew.perform_with(&nudge(old.id, OWN_4), by(), &release("4"))
             .await
             .unwrap();
-        // A hooked session may have taken it already: either way it went in.
+        // Typed in already or not, its marker comes back: it went in.
         let line = held_by(&d, old.id).await.line_message.unwrap();
-        let _ = d.store().line_take(line, Delivery::Delivered).await;
+        let _ = d.store().line_went_in(line).await;
         eventually("its order to be in", async || {
             held_by(&d, old.id).await.delivered_at.map(|_| ())
         })

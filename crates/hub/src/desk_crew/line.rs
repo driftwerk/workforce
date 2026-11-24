@@ -770,7 +770,12 @@ impl CrewHub {
                 "folder": v.cwd,
                 "goal": v.goal,
                 "state": v.state,
-                "last_reply": v.last_reply.as_deref().map(|r| crew::clip(r, 1500)),
+                "last_reply": self.desk.reply_for_boss(
+                    &v,
+                    0,
+                    reply_most(ended),
+                    crew::ReadOn::Tools,
+                ),
             })),
             Err(_) => format!("session {session}"),
         };
@@ -1318,9 +1323,25 @@ pub(super) fn line_loop(
     }
 }
 
+/// How much of a session's reply a turn on its line reads first: a turn's
+/// end (`ended`) brings its reply's first page; a line turn its start, and
+/// the way to read on.
+pub(super) fn reply_most(ended: &[String]) -> usize {
+    match ended.is_empty() {
+        true => crew::REPLY_KEPT,
+        false => crew::REPLY_PAGE,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_line_turn_reads_a_replys_start_and_a_turns_end_its_first_page() {
+        assert_eq!(reply_most(&[]), crew::REPLY_KEPT);
+        assert_eq!(reply_most(&["finished".into()]), crew::REPLY_PAGE);
+    }
 
     #[test]
     fn a_turn_left_open_is_settled_by_its_reply_or_given_to_the_person() {

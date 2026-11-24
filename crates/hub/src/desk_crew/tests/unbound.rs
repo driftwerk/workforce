@@ -934,9 +934,18 @@ async fn a_running_session_goes_back_to_its_own_mode_when_unbound_ends() {
                 json!({"hook_event_name": "SessionStart", "session_id": "cli-1", "source": "resume"}),
             )
             .await;
+            // Typed in at its prompt, it is in once its marker comes back.
             let went = eventually("the deploy settled", async || {
                 let m = d.store().line_message(queued).await.unwrap()?;
-                (m.delivery != workforce_desk::line::Delivery::Queued).then_some(m.delivery)
+                match m.delivery {
+                    workforce_desk::line::Delivery::Queued => None,
+                    workforce_desk::line::Delivery::Handed => {
+                        let prompt = workforce_desk::line::marker(queued);
+                        hook(&new_url, json!({"hook_event_name": "UserPromptSubmit", "prompt": prompt})).await;
+                        None
+                    }
+                    went => Some(went),
+                }
             })
             .await;
             eprintln!("{ends:?}: the queued deploy {went:?}");

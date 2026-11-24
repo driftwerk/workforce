@@ -437,6 +437,16 @@ impl DeskStore {
         .await
     }
 
+    /// The tickets given to the session `party` names: a session here by
+    /// its id, or one on the person's machines as `machine/id`.
+    pub async fn party_tickets(&self, party: &str) -> Result<Vec<Ticket>> {
+        self.tickets_where(
+            "assignee ->> 'kind' = 'session' AND assignee ->> 'id' = $1",
+            &[&party],
+        )
+        .await
+    }
+
     /// The tickets linked to any of the sessions `ids`.
     pub async fn linked_tickets(&self, ids: &[Uuid]) -> Result<Vec<Ticket>> {
         let targets: Vec<String> = ids.iter().map(Uuid::to_string).collect();

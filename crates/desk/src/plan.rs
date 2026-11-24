@@ -20,6 +20,7 @@ use workforce_core::budget::{self, OnExceed, Period, Status, Unit, WARN_AT};
 use crate::board::{TicketState, BODY_MAX, TITLE_MAX};
 use crate::crew::Party;
 use crate::engine::{self, Deliver, Engine, EngineView, SignIn, View};
+use crate::goal::{GoalResult, Met};
 use crate::model::text_enum;
 
 /// The most tickets one plan has.
@@ -126,9 +127,38 @@ pub struct Plan {
     pub approved_revision: Option<i32>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    /// How done is measured, when it is a goal the person agreed: then only
+    /// a met reading or the person's own words close it.
+    pub result: Option<GoalResult>,
+    /// The person's own words that agreed it, as checked in their DM.
+    pub agreed: Option<String>,
+    pub agreed_at: Option<DateTime<Utc>>,
+    /// When Desk said the goal back to the person.
+    pub read_back_at: Option<DateTime<Utc>>,
+    /// The ticket that stands for the goal: it goes to Done only when the
+    /// goal is met.
+    pub goal_ticket: Option<Uuid>,
+    pub met: Option<Met>,
 }
 
 impl Plan {
+    /// Whether it is a goal still to be met.
+    pub fn goal_open(&self) -> bool {
+        self.result.is_some() && self.met.is_none()
+    }
+
+    /// Whether what it set out to do is done: it has no result to meet, or
+    /// its result was met.
+    pub fn goal_done(&self) -> bool {
+        self.result.is_none() || self.met.is_some()
+    }
+
+    /// Whether the person's agreement covers what the boss adds toward its
+    /// result: an agreed goal with a result.
+    pub fn covered(&self) -> bool {
+        self.agreed.is_some() && self.result.is_some()
+    }
+
     /// Whether a revision waits on the person: the first one, or a change of
     /// scope since.
     pub fn awaiting(&self) -> bool {
@@ -192,6 +222,10 @@ pub struct Planned {
     /// writes its words, deletes, drops or re-files it.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub adopted: bool,
+    /// The running session it stands for, taken on with it: its ticket is
+    /// that session's, and nothing starts for it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session: Option<Uuid>,
 }
 
 /// What a draft says of this computer as a ticket's machine.
@@ -325,6 +359,9 @@ pub struct Snapshot {
     /// What the plan may spend; none is no budget of its own.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub budget: Option<PlanBudget>,
+    /// How its goal is measured, when it has one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result: Option<GoalResult>,
 }
 
 impl Snapshot {
@@ -383,6 +420,11 @@ pub struct DraftTicket {
     /// `title` and `body` aren't said.
     #[serde(default)]
     pub adopt: Option<Uuid>,
+    /// The running session already on the work: its ticket is taken on
+    /// (made first, assigned to it in Doing, when it has none), and nothing
+    /// starts for it.
+    #[serde(default)]
+    pub session: Option<Uuid>,
     #[serde(default)]
     pub title: String,
     #[serde(default)]
@@ -527,6 +569,7 @@ pub fn edited(before: &Snapshot, edits: &[TicketEdit]) -> Result<Snapshot, Vec<P
             .map(|t| DraftTicket {
                 id: Some(t.id),
                 adopt: None,
+                session: None,
                 title: t.title.clone(),
                 body: t.body.clone(),
                 engine: Some(t.engine.as_str().to_string()),
@@ -902,6 +945,10 @@ pub fn snapshot_with(
                 model,
                 repo,
                 adopted: adopted.contains_key(&i),
+                session: adopted
+                    .contains_key(&i)
+                    .then(|| t.session.or_else(|| was.and_then(|w| w.session)))
+                    .flatten(),
             });
         }
     }
@@ -911,6 +958,7 @@ pub fn snapshot_with(
             tickets,
             parallel: before.and_then(|b| b.parallel),
             budget: before.and_then(|b| b.budget.clone()),
+            result: before.and_then(|b| b.result.clone()),
         }),
         false => Err(problems),
     }
@@ -1392,10 +1440,16 @@ pub fn settled(tickets: &[PlanTicket]) -> bool {
 /// says (its session's first prompt), an engine or a folder the approved
 /// revision doesn't use, a higher limit, and a budget raised or taken off.
 /// Where a ticket that has `started` runs can't change.
+///
+/// A goal the person agreed `covered` the work toward its result: then a
+/// ticket added or dropped, or what one says, is minor, all but the goal's
+/// own ticket. Its goal or result changing is never covered; where a
+/// result reads from, its measures and bounds the same, is minor.
 pub fn plan_change(
     applied: &Snapshot,
     next: &Snapshot,
     started: &HashSet<Uuid>,
+    covered: Option<&Covered>,
 ) -> Result<Option<Change>, Problem> {
     for t in &next.tickets {
         let Some(was) = applied.ticket(t.id) else {
@@ -1431,16 +1485,31 @@ pub fn plan_change(
                 || !machines.contains(&t.machine.as_deref())
                 || !repos.contains(&t.repo.as_deref()))
     });
-    let said = next.tickets.iter().any(|t| {
-        applied
-            .ticket(t.id)
-            .is_some_and(|was| was.body.trim() != t.body.trim())
-    });
+    let said: Vec<Uuid> = next
+        .tickets
+        .iter()
+        .filter(|t| {
+            applied
+                .ticket(t.id)
+                .is_some_and(|was| was.body.trim() != t.body.trim())
+        })
+        .map(|t| t.id)
+        .collect();
+    let dropped = next.dropped(applied);
+    let work = match covered {
+        Some(c) => c
+            .goal_ticket
+            .is_some_and(|g| dropped.contains(&g) || said.contains(&g)),
+        None => !next.added(applied).is_empty() || !dropped.is_empty() || !said.is_empty(),
+    };
+    let measured_otherwise = match (&applied.result, &next.result) {
+        (Some(a), Some(b)) => !a.same_but_address(b),
+        (a, b) => a != b,
+    };
     let scope = applied.goal.trim() != next.goal.trim()
-        || !next.added(applied).is_empty()
-        || !next.dropped(applied).is_empty()
+        || measured_otherwise
+        || work
         || elsewhere
-        || said
         || raises(applied.parallel, next.parallel)
         || applied
             .budget
@@ -1450,6 +1519,14 @@ pub fn plan_change(
         true => Change::Scope,
         false => Change::Minor,
     }))
+}
+
+/// What the person's agreement of a goal covers of a change to its plan:
+/// every ticket toward its result but `goal_ticket`, the one standing for
+/// the goal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Covered {
+    pub goal_ticket: Option<Uuid>,
 }
 
 /// Whether a plan's limit going from `was` to `now` lets it run more at
@@ -1473,6 +1550,18 @@ pub fn describe(before: &Snapshot, after: &Snapshot) -> String {
             "changed the goal to “{}”",
             crate::crew::one_line(&after.goal, 120)
         ));
+    }
+    if before.result != after.result {
+        said.push(match (&before.result, &after.result) {
+            (Some(was), Some(now)) if was.same_but_address(now) => {
+                "changed where its goal is read from".into()
+            }
+            (_, Some(r)) => format!(
+                "changed how it's measured to “{}”",
+                crate::crew::one_line(&r.words, 120)
+            ),
+            (_, None) => "stopped measuring it".into(),
+        });
     }
     for t in after.added(before) {
         said.push(match t.adopted {

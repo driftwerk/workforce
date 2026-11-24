@@ -790,6 +790,9 @@ struct State {
     /// What each session's process had running when it ended, and when:
     /// told to it, by name where known, when it runs again.
     cut_off: HashMap<Uuid, CutOff>,
+    /// Each session's last reply as Desk heard it whole (its card keeps a
+    /// clipped one): what its boss reads.
+    replies: HashMap<Uuid, crew::Reply>,
     /// Sessions run again after a restart that stopped work of theirs,
     /// until the turn that looks at it ends: what they are on now, and what
     /// was stopped, which a process ending before it is told again.
@@ -3125,25 +3128,13 @@ impl Desk {
         for (id, look) in due {
             let running = Self::running(table, &look);
             let now = Utc::now();
-            let looked = {
-                let st = self.0.state.lock();
+            self.change_unseen(id, |st| {
                 let found = st.sight.get(&id).map(|s| &s.found);
-                st.live
-                    .get(&id)
-                    .map(|l| {
-                        let after = l.background.clone().looked(running, found, now, unseen);
-                        (after, &l.background)
-                    })
-                    .filter(|(after, before)| after != *before)
-                    .map(|(after, _)| after)
-            };
-            if let Some(after) = looked {
-                self.change(id, |_, l| {
-                    if let Some(l) = l {
-                        l.background = after;
-                    }
-                });
-            }
+                if let Some(l) = st.live.get_mut(&id) {
+                    l.background =
+                        std::mem::take(&mut l.background).looked(running, found, now, unseen);
+                }
+            });
         }
     }
 
@@ -3383,8 +3374,17 @@ impl Desk {
         id: Uuid,
         f: impl FnOnce(&mut SessionRecord, Option<&mut Live>),
     ) {
-        let mut guard = self.0.state.lock();
-        let st = &mut *guard;
+        self.change_in(&mut self.0.state.lock(), seen, id, f);
+    }
+
+    /// [`Self::change_since`], with Desk's state already held.
+    fn change_in(
+        &self,
+        st: &mut State,
+        seen: Option<SessionView>,
+        id: Uuid,
+        f: impl FnOnce(&mut SessionRecord, Option<&mut Live>),
+    ) {
         let Some(old) = st.records.get(&id) else {
             return;
         };
@@ -3396,6 +3396,26 @@ impl Desk {
         self.saved(st, Some(before), r);
     }
 
+    /// Applies `f` to what Desk keeps of a session beside its record: kept
+    /// as it is while what a Desk sees of the session stays the same (a
+    /// look counting the shells it missed), else saved and announced as any
+    /// change is.
+    fn change_unseen(&self, id: Uuid, f: impl FnOnce(&mut State)) {
+        let mut guard = self.0.state.lock();
+        let st = &mut *guard;
+        let Some(before) = st.records.get(&id).map(|r| Self::view_of(st, r)) else {
+            return;
+        };
+        f(st);
+        if st
+            .records
+            .get(&id)
+            .is_some_and(|r| Self::view_of(st, r) != before)
+        {
+            self.change_in(st, Some(before), id, |_, _| {});
+        }
+    }
+
     fn record(&self, id: Uuid) -> Result<SessionRecord, DeskError> {
         self.0
             .state
@@ -3404,6 +3424,91 @@ impl Desk {
             .get(&id)
             .cloned()
             .ok_or(DeskError::NotFound)
+    }
+
+    /// The reply `id`'s turn ended on: heard `whole`, or only its kept
+    /// start (`preview`), which lets go of a whole one heard before. What
+    /// its card keeps, set with it; neither heard, none.
+    fn reply_heard(
+        &self,
+        id: Uuid,
+        whole: Option<&str>,
+        preview: Option<String>,
+    ) -> Option<String> {
+        let mut st = self.0.state.lock();
+        match whole.map(crew::Reply::of).filter(|r| !r.text.is_empty()) {
+            Some(r) => {
+                let kept = transcript::clip(&r.text);
+                st.replies.insert(id, r);
+                Some(kept)
+            }
+            None => {
+                if preview.is_some() {
+                    st.replies.remove(&id);
+                }
+                preview
+            }
+        }
+    }
+
+    /// `id`'s last reply as Desk heard it whole, if it did.
+    pub fn reply(&self, id: Uuid) -> Option<crew::Reply> {
+        self.0.state.lock().replies.get(&id).cloned()
+    }
+
+    /// What `v`'s boss reads of its last reply, from character `from`, at
+    /// most `most` characters, told what else there is as `on` can read it
+    /// ([`crew::reply_for_boss`]).
+    pub fn reply_for_boss(
+        &self,
+        v: &SessionView,
+        from: usize,
+        most: usize,
+        on: crew::ReadOn,
+    ) -> Option<String> {
+        crew::reply_for_boss(
+            self.reply(v.id).as_ref(),
+            v.last_reply.as_deref(),
+            self.record(v.id).is_ok_and(|r| r.transcript.is_some()),
+            from,
+            most,
+            on,
+        )
+    }
+
+    /// A page of `v`'s last reply, as crew.history reads it: from character
+    /// `from` of the reply `turn` names. One replaced since is said to be,
+    /// and one Desk no longer holds whole is said not to be held, never
+    /// read on in another.
+    pub fn reply_read(&self, v: &SessionView, from: usize, turn: Option<&str>) -> Option<String> {
+        let held = self.reply(v.id).or_else(|| {
+            v.last_reply
+                .as_deref()
+                .filter(|p| !transcript::clipped(p))
+                .map(crew::Reply::of)
+        });
+        match (turn, held) {
+            (Some(_), None) => Some(
+                match self.record(v.id).is_ok_and(|r| r.transcript.is_some()) {
+                    true => {
+                        "[Desk no longer holds the whole of the reply you were reading (Desk \
+                         restarted since): read it whole in its transcript with crew.inside \
+                         (session_id, facet: transcript).]"
+                    }
+                    false => {
+                        "[Desk no longer holds the whole of the reply you were reading (Desk \
+                          restarted since), and keeps no transcript of it.]"
+                    }
+                }
+                .into(),
+            ),
+            (Some(t), Some(r)) if r.turn != t => Some(
+                "[its reply changed since you began reading it. Read the new one from the start \
+                 (reply_from: 0).]"
+                    .into(),
+            ),
+            _ => self.reply_for_boss(v, from, crew::REPLY_PAGE, crew::ReadOn::Tools),
+        }
     }
 
     pub fn view(&self, id: Uuid) -> Result<SessionView, DeskError> {
@@ -4401,6 +4506,7 @@ impl Desk {
             st.working_noted.remove(&id);
             st.acted.remove(&id);
             st.cut_off.remove(&id);
+            st.replies.remove(&id);
             st.restarted.remove(&id);
             st.exited.remove(&id);
             st.deps.remove(&id);
@@ -6267,6 +6373,7 @@ impl Desk {
             }
         };
         self.mode_said(id, &hook, body);
+        self.prompts_seen_from(id);
         Some(self.apply_hook(id, hook, claude::agent_of(body)).await)
     }
 
@@ -7106,6 +7213,9 @@ impl Desk {
                 .contains_key(&id)
                 .then(|| Self::raw_running(&st, id))
         };
+        let heard = said
+            .as_deref()
+            .and_then(|reply| self.reply_heard(id, Some(reply), None));
         self.change(id, |r, mut l| {
             // The person spoke while it was read: that answers it.
             let asked = asked.filter(|_| l.as_ref().is_some_and(|l| l.prompts == prompts));
@@ -7120,8 +7230,8 @@ impl Desk {
                 read = l.reading;
             }
             r.transcript = path.clone().or(r.transcript.take());
-            if let Some(reply) = said {
-                r.last_reply = Some(transcript::clip(&reply));
+            if let Some(kept) = heard {
+                r.last_reply = Some(kept);
             }
             r.asked = asked;
             if let Some(l) = l {
@@ -7828,6 +7938,9 @@ impl Desk {
                 CodexEvent::Prompt(p) => Some(self.person_prompted(id, p)),
                 _ => None,
             };
+            if let CodexEvent::Prompt(_) = &event {
+                self.prompts_seen_from(id);
+            }
             let delivery = match &event {
                 CodexEvent::Prompt(p) => match crate::line::is_delivery(p) {
                     Some(mark) => {
@@ -8062,6 +8175,15 @@ impl Desk {
             // are in control of it.
             let for_boss = matches!(&event, CodexEvent::Question { asks: Some(_), .. })
                 && self.holds_dialog_for_boss(id);
+            // Its reply, and at its turn's end its rollout's: whole, and
+            // the card's start with it.
+            let heard = match (&event, &tail) {
+                (CodexEvent::Reply(text), _) => self.reply_heard(id, Some(text), None),
+                (CodexEvent::Idle, Some((_, t))) => {
+                    self.reply_heard(id, t.said.as_deref(), t.last_reply.clone())
+                }
+                _ => None,
+            };
             self.change(id, |r, mut l| {
                 r.cli_session_id.get_or_insert_with(|| thread.clone());
                 match event {
@@ -8124,8 +8246,8 @@ impl Desk {
                         if let Some((path, t)) = tail {
                             r.transcript = Some(path.to_string_lossy().into_owned());
                             r.last_prompt = asked_of(t.last_prompt).or(r.last_prompt.take());
-                            r.last_reply = t.last_reply.or(r.last_reply.take());
                         }
+                        r.last_reply = heard.or(r.last_reply.take());
                         r.asked = asked;
                         if let Some(l) = l {
                             l.current_tool = None;
@@ -8177,7 +8299,7 @@ impl Desk {
                         }
                     }
                     CodexEvent::Answered(_) | CodexEvent::Late(_) | CodexEvent::Failed(_) => {}
-                    CodexEvent::Reply(text) => r.last_reply = Some(transcript::clip(&text)),
+                    CodexEvent::Reply(_) => r.last_reply = heard.or(r.last_reply.take()),
                     CodexEvent::Child(_)
                     | CodexEvent::Usage(_)
                     | CodexEvent::SteerRefused(_)
@@ -8392,6 +8514,9 @@ impl Desk {
                                 self.ok_seen(&raw, ok);
                             }
                         }
+                        let heard = tail.as_ref().and_then(|t| {
+                            self.reply_heard(id, t.said.as_deref(), t.last_reply.clone())
+                        });
                         self.change(id, |r, _| {
                             r.origin = Origin::External;
                             r.state = state;
@@ -8401,8 +8526,8 @@ impl Desk {
                             r.transcript = transcript.clone().or(r.transcript.take());
                             if let Some(t) = tail {
                                 r.last_prompt = asked_of(t.last_prompt).or(r.last_prompt.take());
-                                r.last_reply = t.last_reply.or(r.last_reply.take());
                             }
+                            r.last_reply = heard.or(r.last_reply.take());
                         });
                     }
                 }
@@ -8411,8 +8536,11 @@ impl Desk {
                     let mut tail = tail.unwrap_or_default();
                     let failure = tail.failure.take();
                     let ok_at = tail.ok_at;
+                    let new_id = Uuid::new_v4();
+                    let last_reply =
+                        self.reply_heard(new_id, tail.said.as_deref(), tail.last_reply.take());
                     let r = SessionRecord {
-                        id: Uuid::new_v4(),
+                        id: new_id,
                         engine: Engine::Claude,
                         view: View::Terminal,
                         engine_version: None,
@@ -8434,7 +8562,7 @@ impl Desk {
                         cli_session_id: Some(ext.session_id.clone()),
                         transcript,
                         last_prompt: tail.last_prompt,
-                        last_reply: tail.last_reply,
+                        last_reply,
                         external_pid: ext.pid,
                         restore_offer: false,
                         terminal_id: None,
@@ -8448,7 +8576,6 @@ impl Desk {
                     if let Some(f) = failure {
                         self.0.state.lock().turn_failures.insert(r.id, f);
                     }
-                    let new_id = r.id;
                     self.save(r);
                     if let Some(ok) = ok_at {
                         let raw = Self::raw_running(&self.0.state.lock(), new_id);
@@ -8849,6 +8976,16 @@ mod tests {
         d.hook(id, &t, body.to_string().as_bytes()).await.unwrap()
     }
 
+    /// `next`, handed to Desk's plugin in `id`, went in: its marker came
+    /// back in the prompt it started, and the plugin said it submitted it.
+    pub(super) async fn went_in(d: &Desk, id: Uuid, next: &Value) {
+        if let Some(mark) = crate::line::is_delivery(next["text"].as_str().unwrap()) {
+            d.line_heard(id, &mark).await;
+        }
+        let m = serde_json::from_value(next["id"].clone()).unwrap();
+        d.line_ack(id, m, true).await.unwrap();
+    }
+
     #[test]
     fn a_codex_turns_background_is_what_its_app_server_started_in_it() {
         let table = procs::parse(
@@ -9169,7 +9306,7 @@ mod tests {
             eventually("queued again, waiting on the question", async || {
                 let m = row(earlier.id).await;
                 (m.delivery == crate::line::Delivery::Queued
-                    && second.line_waits(&m) == Some(crate::line::Wait::Asking))
+                    && second.line_waits(&m).await == Some(crate::line::Wait::Asking))
                 .then_some(())
             })
             .await;
@@ -9180,12 +9317,12 @@ mod tests {
                 .await
                 .unwrap();
             assert_ne!(
-                second.line_waits(&row(after.id).await),
+                second.line_waits(&row(after.id).await).await,
                 Some(crate::line::Wait::Asking),
                 "its running boss answers it"
             );
             assert_eq!(
-                second.line_waits(&row(earlier.id).await),
+                second.line_waits(&row(earlier.id).await).await,
                 Some(crate::line::Wait::Asking)
             );
         })
@@ -10355,6 +10492,79 @@ mod tests {
         )
         .unwrap();
         path
+    }
+
+    #[tokio::test]
+    async fn looks_that_miss_a_reported_shell_say_nothing_until_it_is_taken_to_have_ended() {
+        with_test_pool(build_pool, |pool| async move {
+            let dir = tempfile::tempdir().unwrap();
+            DeskStore::migrate(&pool).await.unwrap();
+            let d = Desk::start(
+                DeskStore::from_pool(pool),
+                Options {
+                    sight: SightOptions {
+                        shell_unseen: Duration::ZERO,
+                        ..SightOptions::default()
+                    },
+                    ..options(dir.path())
+                },
+                Floor::default(),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+            let s = new_session(&d, dir.path()).await;
+            post(
+                &d,
+                s.id,
+                json!({"hook_event_name": "UserPromptSubmit", "prompt": "start the server"}),
+            )
+            .await;
+            post(
+                &d,
+                s.id,
+                json!({"hook_event_name": "Stop", "last_assistant_message": "Started.",
+                "background_tasks": [{"id": "b1", "type": "shell", "status": "running"}]}),
+            )
+            .await;
+            let before = d.view(s.id).unwrap();
+            assert_eq!((before.state, before.waiting_on()), (SessionState::Done, 1));
+            let (_, mut events) = d.subscribe();
+            let said = |events: &mut broadcast::Receiver<DeskEvent>| {
+                std::iter::from_fn(|| events.try_recv().ok())
+                    .filter(|e| matches!(e, DeskEvent::Session { session } if session.id == s.id))
+                    .count()
+            };
+
+            d.look_at_background(&[s.id]).await;
+            assert_eq!(
+                said(&mut events),
+                0,
+                "a look that misses the shell changes nothing a Desk sees"
+            );
+            assert_eq!(
+                d.view(s.id).unwrap(),
+                before,
+                "nor when it was last changed"
+            );
+
+            let mut looks = 1;
+            while d.view(s.id).unwrap().waiting_on() > 0 && looks < 10 {
+                d.look_at_background(&[s.id]).await;
+                looks += 1;
+            }
+            assert_eq!(
+                d.view(s.id).unwrap().waiting_on(),
+                0,
+                "missed look after look, it ended"
+            );
+            assert_eq!(
+                said(&mut events),
+                1,
+                "only the look that took it to have ended said so"
+            );
+        })
+        .await;
     }
 
     #[tokio::test]
@@ -12053,6 +12263,111 @@ mod tests {
             let v = d.view(s.id).unwrap();
             assert_eq!((v.state, v.asked), (SessionState::Done, None));
             assert!(logs(&logged, |ops| last_question(ops) == Some((Outcome::Finished, None))).await);
+        })
+        .await;
+    }
+
+    /// A turn's long reply: its card keeps its start, its boss reads it
+    /// whole, page by page; a later turn's reply replaces it, and reading
+    /// on in the old one says so. One Desk no longer holds whole (it
+    /// restarted) is said not to be, never read on from its start.
+    #[tokio::test]
+    async fn a_long_reply_is_kept_whole_for_its_boss_and_read_on_in_pages() {
+        with_test_pool(build_pool, |pool| async move {
+            let dir = tempfile::tempdir().unwrap();
+            let d = desk(pool, dir.path()).await;
+            let s = new_session(&d, dir.path()).await;
+            let report: String = (0..1_500)
+                .map(|i| format!("Checked module {i:04}: no change needed.\n"))
+                .collect();
+            post(
+                &d,
+                s.id,
+                json!({"hook_event_name": "UserPromptSubmit", "prompt": "audit the modules"}),
+            )
+            .await;
+            post(
+                &d,
+                s.id,
+                json!({"hook_event_name": "Stop", "last_assistant_message": report}),
+            )
+            .await;
+            let v = d.view(s.id).unwrap();
+            assert_eq!(
+                v.last_reply,
+                Some(transcript::clip(&report)),
+                "its card keeps its start"
+            );
+            let turn = d.reply(s.id).unwrap().turn;
+            let mut from = 0;
+            let mut read = String::new();
+            loop {
+                let page = d
+                    .reply_read(&v, from, Some(turn.as_str()).filter(|_| from > 0))
+                    .unwrap();
+                let (said, note) = page.split_once("\n[").unwrap();
+                read.push_str(said);
+                if note.contains("the end of its reply") {
+                    break;
+                }
+                assert!(
+                    note.contains(&format!(
+                        "reply_from: {}, turn: {turn}",
+                        from + crew::REPLY_PAGE
+                    )),
+                    "{note}"
+                );
+                from += crew::REPLY_PAGE;
+            }
+            assert_eq!(read, report.trim());
+
+            post(
+                &d,
+                s.id,
+                json!({"hook_event_name": "UserPromptSubmit", "prompt": "and the tests?"}),
+            )
+            .await;
+            post(
+                &d,
+                s.id,
+                json!({"hook_event_name": "Stop", "last_assistant_message": "All green."}),
+            )
+            .await;
+            let v = d.view(s.id).unwrap();
+            assert_eq!(
+                d.reply_read(&v, crew::REPLY_PAGE, Some(&turn)).as_deref(),
+                Some(
+                    "[its reply changed since you began reading it. Read the new one from the \
+                     start (reply_from: 0).]"
+                )
+            );
+            assert_eq!(d.reply_read(&v, 0, None).as_deref(), Some("All green."));
+            assert_eq!(
+                d.reply(s.id).map(|r| r.turn),
+                Some(crew::Reply::of("All green.").turn)
+            );
+
+            // Its long reply again, then Desk holds none whole: a restart.
+            post(
+                &d,
+                s.id,
+                json!({"hook_event_name": "Stop", "last_assistant_message": report}),
+            )
+            .await;
+            d.0.state.lock().replies.clear();
+            let v = d.view(s.id).unwrap();
+            let gone = d.reply_read(&v, crew::REPLY_PAGE, Some(&turn)).unwrap();
+            assert!(
+                gone.starts_with("[Desk no longer holds the whole of the reply"),
+                "{gone}"
+            );
+            assert!(gone.contains("keeps no transcript of it"), "{gone}");
+            let on = d.reply_read(&v, crew::REPLY_PAGE, None).unwrap();
+            assert!(on.contains("so it can't be read on from 8000 here"), "{on}");
+            assert!(d
+                .reply_read(&v, 0, None)
+                .unwrap()
+                .starts_with(&transcript::clip(&report)));
         })
         .await;
     }

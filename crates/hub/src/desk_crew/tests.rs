@@ -2047,6 +2047,7 @@ mod groups;
 
 mod handovers;
 
+mod goals;
 mod plan_watch;
 mod plans;
 
@@ -2623,7 +2624,13 @@ mod floor {
                         (needs.len() == 1 && needs[0].id != first.id).then(|| needs[0].clone())
                     })
                     .await;
-                    let logged = logged_turns().await;
+                    // Scout's: the floor's log is shared with the tests
+                    // running beside this one.
+                    let logged: Vec<_> = logged_turns()
+                        .await
+                        .into_iter()
+                        .filter(|t| t.name == "Scout")
+                        .collect();
                     let [earlier, later] = logged.as_slice() else {
                         panic!("two turns: {logged:?}")
                     };
