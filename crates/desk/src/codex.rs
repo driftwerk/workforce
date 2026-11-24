@@ -54,25 +54,66 @@ pub struct CodexSpawn<'a> {
 /// What Fast mode sets: Codex's `service_tier`, which it sends to a model
 /// its catalogue lists with the tier (and drops for one it doesn't). Its
 /// `fast_mode` feature, on by default since 0.16x, must stay on for it to
-/// apply. Given to the TUI like [`APPROVE_FOR_ME`], whose settings start
-/// its thread.
+/// apply. Given to the TUI, whose settings start and resume its thread.
 pub const FAST: &str = "service_tier=\"priority\"";
 
-/// What `--approve-for-me` sets, as settings: approvals go to Codex's
-/// automatic reviewer, in the workspace-write sandbox. Given to the TUI,
-/// whose own settings start (and resume) its thread: on the app-server
-/// alone they don't reach it (verified on CLI 0.166, `/status`).
-pub const APPROVE_FOR_ME: [&str; 3] = [
-    "approvals_reviewer=auto_review",
-    "approval_policy=on-request",
-    "sandbox_mode=workspace-write",
-];
+/// The tier [`FAST`] names, as the app-server's `serviceTier`.
+const PRIORITY: &str = "priority";
+
+/// What a thread runs in: its approval policy and sandbox, as Codex's
+/// settings and its app-server's `thread/resume` both spell them, and who
+/// reviews its approvals. A new thread takes them from the TUI's settings:
+/// on the app-server alone they don't reach it (verified on CLI 0.166,
+/// `/status`). A resumed one takes them from the app-server only: the TUI
+/// refuses them on a resume through `--remote` ("Permission overrides are
+/// not supported when resuming a remote task", 0.166) and joins the
+/// thread Desk resumed with them ([`resume_params`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Permissions {
+    pub approval: &'static str,
+    pub sandbox: &'static str,
+    pub reviewer: &'static str,
+}
+
+impl Permissions {
+    /// What a session runs in: the mode Desk keeps for it, over Approve
+    /// for me's, else Codex's default; its approvals reviewed by Codex's
+    /// own reviewer with Approve for me (`--approve-for-me`), else by the
+    /// person.
+    pub fn of(mode: Option<crate::mode::Mode>, approve_for_me: bool) -> Self {
+        let (approval, sandbox) = mode
+            .unwrap_or(crate::mode::Mode::Default)
+            .codex_permissions();
+        Self {
+            approval,
+            sandbox,
+            reviewer: if approve_for_me {
+                "auto_review"
+            } else {
+                "user"
+            },
+        }
+    }
+
+    /// As the TUI's settings, for a new thread.
+    fn settings(self) -> [String; 3] {
+        [
+            format!("approvals_reviewer={}", self.reviewer),
+            format!("approval_policy={}", self.approval),
+            format!("sandbox_mode={}", self.sandbox),
+        ]
+    }
+}
 
 pub fn spawn(s: &CodexSpawn<'_>) -> Spawn {
     let remote = format!("unix://{}", s.socket.display());
-    let mut args = match s.launch {
-        Launch::New => vec![],
-        Launch::Resume { thread_id } => vec!["resume".to_string(), thread_id.to_string()],
+    let (mut args, permissions) = match s.launch {
+        Launch::New => (
+            vec![],
+            (s.approve_for_me || s.mode.is_some())
+                .then(|| Permissions::of(s.mode, s.approve_for_me)),
+        ),
+        Launch::Resume { thread_id } => (vec!["resume".to_string(), thread_id.to_string()], None),
     };
     args.extend([
         "--remote".to_string(),
@@ -80,28 +121,17 @@ pub fn spawn(s: &CodexSpawn<'_>) -> Spawn {
         "-C".to_string(),
         s.cwd.display().to_string(),
     ]);
-    if s.approve_for_me {
-        args.extend(
-            APPROVE_FOR_ME
-                .iter()
-                .flat_map(|c| ["-c".to_string(), c.to_string()]),
+    let settings = permissions
+        .into_iter()
+        .flat_map(Permissions::settings)
+        .chain(s.fast.then(|| FAST.to_string()))
+        // A TOML string, so it is only ever the value of `model`.
+        .chain(
+            s.model
+                .filter(|m| crate::plan::model_ok(m))
+                .map(|m| format!("model={}", toml_string(m))),
         );
-    }
-    if s.fast {
-        args.extend(["-c".to_string(), FAST.to_string()]);
-    }
-    // A TOML string, so it is only ever the value of `model`.
-    if let Some(m) = s.model.filter(|m| crate::plan::model_ok(m)) {
-        args.extend(["-c".to_string(), format!("model={}", toml_string(m))]);
-    }
-    // Later settings win: the mode Desk keeps for it over Approve for me's.
-    if let Some(mode) = s.mode {
-        args.extend(
-            mode.codex_settings()
-                .iter()
-                .flat_map(|c| ["-c".to_string(), c.to_string()]),
-        );
-    }
+    args.extend(settings.flat_map(|c| ["-c".to_string(), c]));
     // Its prompt is a prompt whatever it says: nothing after `--` is read
     // as an option.
     if let Some(p) = s.prompt {
@@ -113,6 +143,46 @@ pub fn spawn(s: &CodexSpawn<'_>) -> Spawn {
         cwd: s.cwd.to_path_buf(),
         env: s.env.clone(),
     }
+}
+
+/// Desk's `thread/resume` of a session's thread, sent before its TUI
+/// starts: the thread is loaded in `permissions`, and the TUI, resumed
+/// without them, joins it as it is. Its folder, model and tier are the
+/// TUI's own, which a loaded thread would otherwise not take from it.
+pub fn resume_params(
+    thread: &str,
+    cwd: &Path,
+    model: Option<&str>,
+    fast: bool,
+    permissions: Permissions,
+) -> Value {
+    let mut params = json!({
+        "threadId": thread,
+        "excludeTurns": true,
+        "cwd": cwd,
+        "approvalPolicy": permissions.approval,
+        "sandbox": permissions.sandbox,
+        "approvalsReviewer": permissions.reviewer,
+    });
+    if let Some(m) = model.filter(|m| crate::plan::model_ok(m)) {
+        params["model"] = json!(m);
+    }
+    if fast {
+        params["serviceTier"] = json!(PRIORITY);
+    }
+    params
+}
+
+/// Why Codex's TUI didn't start, when the end of what its terminal shows
+/// (`shown`, plain text) is the error its `main` printed (`Error: …`). It
+/// may stay up after it (CLI 0.166 on a refused resume), so its process
+/// ending is no sign of it.
+pub fn start_error(shown: &str) -> Option<&str> {
+    shown
+        .lines()
+        .map(str::trim)
+        .rfind(|l| !l.is_empty())
+        .filter(|l| l.starts_with("Error: "))
 }
 
 /// Where a session's app-server reaches Desk's line: its MCP address, and
@@ -1020,6 +1090,11 @@ pub struct Follower {
     /// The line's messages said into its turns, oldest first, until Codex
     /// answers each (`turn/steer` answers in order).
     steering: std::collections::VecDeque<Uuid>,
+    /// Resumes the thread itself as it joins, with these params
+    /// ([`resume_params`]), before its TUI does.
+    resume: Option<Value>,
+    /// Told whether that resume was taken, or Codex's words why not.
+    primed: Option<oneshot::Sender<Result<(), String>>>,
 }
 
 impl Follower {
@@ -1034,6 +1109,8 @@ impl Follower {
             turn: None,
             settled: false,
             steering: std::collections::VecDeque::new(),
+            resume: None,
+            primed: None,
         }
     }
 
@@ -1043,6 +1120,14 @@ impl Follower {
         self
     }
 
+    /// Resumes the thread with `params` as soon as it joins, and says how
+    /// to `primed`: Codex's words when it refuses, with nothing retried.
+    pub fn resuming(mut self, params: Value, primed: oneshot::Sender<Result<(), String>>) -> Self {
+        self.resume = Some(params);
+        self.primed = Some(primed);
+        self.at_once()
+    }
+
     /// Subscribes to the thread, when it is known and not yet subscribed.
     /// Without, it hears only the thread's status, never its requests.
     fn subscribe(&mut self) -> Option<Value> {
@@ -1050,8 +1135,11 @@ impl Follower {
         self.subscribed = true;
         // Not its history, which can outgrow a frame: what it asks still
         // comes.
-        Some(json!({ "id": SUBSCRIBE, "method": "thread/resume",
-            "params": { "threadId": thread, "excludeTurns": true } }))
+        let params = self
+            .resume
+            .take()
+            .unwrap_or_else(|| json!({ "threadId": thread, "excludeTurns": true }));
+        Some(json!({ "id": SUBSCRIBE, "method": "thread/resume", "params": params }))
     }
 
     /// What to send once joined.
@@ -1087,10 +1175,25 @@ impl Follower {
                 if id.as_i64() != Some(SUBSCRIBE) {
                     return (Vec::new(), None);
                 }
-                if v.get("error").is_some() {
-                    tracing::debug!(error = %v["error"], "codex: not subscribed to the thread yet");
-                    self.subscribed = false;
+                let primed = self.primed.take();
+                if let Some(error) = v.get("error") {
+                    match primed {
+                        Some(primed) => {
+                            let why = error
+                                .get("message")
+                                .and_then(Value::as_str)
+                                .map_or_else(|| error.to_string(), str::to_string);
+                            let _ = primed.send(Err(why));
+                        }
+                        None => {
+                            tracing::debug!(error = %error, "codex: not subscribed to the thread yet");
+                            self.subscribed = false;
+                        }
+                    }
                     return (Vec::new(), None);
+                }
+                if let Some(primed) = primed {
+                    let _ = primed.send(Ok(()));
                 }
                 // What the thread runs with, as Codex says it.
                 let said = v
@@ -1461,44 +1564,178 @@ pub(crate) mod tests {
         );
     }
 
+    fn args(
+        launch: Launch<'_>,
+        approve_for_me: bool,
+        mode: Option<crate::mode::Mode>,
+    ) -> Vec<String> {
+        spawn(&CodexSpawn {
+            program: Path::new("/bin/codex"),
+            cwd: Path::new("/repo"),
+            socket: Path::new("/run/s.sock"),
+            launch,
+            prompt: Some("go"),
+            approve_for_me,
+            fast: false,
+            model: None,
+            mode,
+            env: &BTreeMap::new(),
+        })
+        .args
+    }
+
     #[test]
-    fn approve_for_me_is_the_tuis_to_say() {
-        let env = BTreeMap::new();
-        for launch in [Launch::New, Launch::Resume { thread_id: "t1" }] {
-            let s = spawn(&CodexSpawn {
-                program: Path::new("/bin/codex"),
-                cwd: Path::new("/repo"),
-                socket: Path::new("/run/s.sock"),
-                launch,
-                prompt: Some("go"),
-                approve_for_me: true,
-                fast: false,
-                model: None,
-                mode: None,
-                env: &env,
-            });
-            let tail: Vec<&str> = s
-                .args
-                .iter()
-                .rev()
-                .take(8)
-                .rev()
-                .map(String::as_str)
-                .collect();
-            assert_eq!(
-                tail,
-                [
-                    "-c",
-                    "approvals_reviewer=auto_review",
-                    "-c",
-                    "approval_policy=on-request",
-                    "-c",
-                    "sandbox_mode=workspace-write",
-                    "--",
-                    "go"
-                ]
+    fn a_new_thread_starts_in_its_permissions_from_the_tuis_settings() {
+        let tail = |a: Vec<String>| a[a.len() - 8..].to_vec();
+        assert_eq!(
+            tail(args(Launch::New, true, None)),
+            [
+                "-c",
+                "approvals_reviewer=auto_review",
+                "-c",
+                "approval_policy=on-request",
+                "-c",
+                "sandbox_mode=workspace-write",
+                "--",
+                "go"
+            ]
+        );
+        // The mode Desk keeps for it over Approve for me's.
+        assert_eq!(
+            tail(args(
+                Launch::New,
+                true,
+                Some(crate::mode::Mode::BypassPermissions)
+            )),
+            [
+                "-c",
+                "approvals_reviewer=auto_review",
+                "-c",
+                "approval_policy=never",
+                "-c",
+                "sandbox_mode=danger-full-access",
+                "--",
+                "go"
+            ]
+        );
+        assert_eq!(
+            args(Launch::New, false, None),
+            ["--remote", "unix:///run/s.sock", "-C", "/repo", "--", "go"],
+            "its own: Codex's settings"
+        );
+    }
+
+    /// CLI 0.166 refuses a resume through `--remote` that sets any of these
+    /// ("Permission overrides are not supported when resuming a remote
+    /// task"): Desk's resume of its thread sets them instead.
+    #[test]
+    fn a_resume_never_gives_the_tui_a_permission_codex_refuses_on_one() {
+        let refused = [
+            "approval_policy",
+            "approvals_reviewer",
+            "sandbox_mode",
+            "sandbox_workspace_write",
+            "default_permissions",
+            "permissions",
+        ];
+        let modes = crate::mode::Mode::ALL.into_iter().map(Some).chain([None]);
+        for (mode, approve_for_me) in modes.flat_map(|m| [(m, false), (m, true)]) {
+            let a = args(Launch::Resume { thread_id: "t1" }, approve_for_me, mode);
+            assert!(
+                !a.iter().any(|x| refused.iter().any(|k| x.starts_with(k))),
+                "{mode:?} {approve_for_me}: {a:?}"
+            );
+            assert_eq!(&a[..2], ["resume", "t1"]);
+        }
+    }
+
+    #[test]
+    fn desk_resumes_a_thread_in_its_permissions_and_the_tuis_own_settings() {
+        use crate::mode::Mode;
+        let plan = Permissions::of(Some(Mode::Plan), true);
+        assert_eq!(
+            resume_params("t1", Path::new("/repo"), Some("gpt-6.1-sol"), true, plan),
+            json!({"threadId": "t1", "excludeTurns": true, "cwd": "/repo",
+                "approvalPolicy": "on-request", "sandbox": "read-only",
+                "approvalsReviewer": "auto_review", "model": "gpt-6.1-sol",
+                "serviceTier": "priority"})
+        );
+        // Its own: Codex's default, the person reviewing; never a mode a
+        // boss left it in.
+        assert_eq!(
+            resume_params(
+                "t1",
+                Path::new("/repo"),
+                Some("a\" b"),
+                false,
+                Permissions::of(None, false)
+            ),
+            json!({"threadId": "t1", "excludeTurns": true, "cwd": "/repo",
+                "approvalPolicy": "on-request", "sandbox": "workspace-write",
+                "approvalsReviewer": "user"})
+        );
+        // What 0.166's app-server takes: never `on-failure`, which it refuses.
+        for mode in Mode::ALL {
+            let p = Permissions::of(Some(mode), false);
+            assert!(
+                ["untrusted", "on-request", "never"].contains(&p.approval),
+                "{mode:?}"
+            );
+            assert!(
+                ["read-only", "workspace-write", "danger-full-access"].contains(&p.sandbox),
+                "{mode:?}"
             );
         }
+    }
+
+    #[test]
+    fn a_thread_desk_resumes_is_resumed_once_and_a_refusal_is_said_not_retried() {
+        let params = json!({"threadId": "t1", "excludeTurns": true, "sandbox": "read-only"});
+        let (tx, mut rx) = oneshot::channel();
+        let mut f = Follower::new(Some("t1".into()), None).resuming(params.clone(), tx);
+        assert_eq!(
+            f.joined(),
+            Some(json!({"id": SUBSCRIBE, "method": "thread/resume", "params": params})),
+            "at once, before its TUI"
+        );
+        assert!(rx.try_recv().is_err(), "not answered yet");
+        f.heard(&json!({"id": SUBSCRIBE, "error": {"code": -32600,
+            "message": "Invalid request: unknown variant `on-failure`"}}));
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            Err("Invalid request: unknown variant `on-failure`".to_string())
+        );
+        let status = json!({"method": "thread/status/changed",
+            "params": {"threadId": "t1", "status": {"type": "idle"}}});
+        assert_eq!(f.heard(&status).1, None, "never again on its own");
+
+        let (tx, mut rx) = oneshot::channel();
+        let mut f = Follower::new(Some("t1".into()), None).resuming(json!({}), tx);
+        f.joined();
+        f.heard(&json!({"id": SUBSCRIBE, "result": {"thread": {"id": "t1"}}}));
+        assert_eq!(rx.try_recv().unwrap(), Ok(()));
+        assert_eq!(f.heard(&status).1, None, "subscribed by it");
+    }
+
+    #[test]
+    fn a_tui_that_prints_why_it_did_not_start_is_told_from_one_that_runs() {
+        let shown = |bytes: &[&[u8]]| {
+            let mut term = crate::vt::Term::new(120, 40, 1000);
+            for b in bytes {
+                term.feed(b);
+            }
+            crate::pty::shown_end(&term.text(), 20)
+        };
+        let drawn: &[u8] = b"\x1b[?1049h\x1b[2J\x1b[H>_ OpenAI Codex (v0.166.0)\r\n\r\n  Resuming session\xe2\x80\xa6\r\n\r\n\xe2\x80\xba hello\r\n  Error: said in the conversation\r\n\r\n  gpt-6.1-sol default \xc2\xb7 ~/repo";
+        assert_eq!(start_error(&shown(&[drawn])), None, "it runs");
+        // What CLI 0.166 leaves on its terminal as it refuses a resume, and
+        // then stays up.
+        let refused: &[u8] = b"\x1b[?2026h\x1b[39m\x1b[49m\x1b[0m\x1b[37;3H\x1b[?25h\x1b[?2026l\x1b[?1006l\x1b[?1049l\x1b[<1u\x1b[?2004l\x1b[c\x1b[0 q\x1b[?25hError: Permission overrides are not supported when resuming a remote task.\r\n\x1b[0 q";
+        assert_eq!(
+            start_error(&shown(&[drawn, refused])),
+            Some("Error: Permission overrides are not supported when resuming a remote task.")
+        );
+        assert_eq!(start_error(""), None);
     }
 
     #[test]
@@ -2205,7 +2442,7 @@ pub(crate) mod tests {
         assert_eq!(
             launched.joined(),
             None,
-            "resumed: once its TUI has loaded it"
+            "known, not taken back: once its TUI has loaded it"
         );
         let status = json!({"method": "thread/status/changed",
             "params": {"threadId": "t9", "status": {"type": "idle"}}});

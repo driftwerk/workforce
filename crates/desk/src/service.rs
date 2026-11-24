@@ -91,6 +91,8 @@ mod asks_tests;
 mod breaker_tests;
 #[cfg(test)]
 mod codex_asks_tests;
+#[cfg(test)]
+mod codex_resume_tests;
 mod ledger;
 mod plans;
 pub use plans::{
@@ -809,6 +811,9 @@ struct State {
     /// How each session's process last ended on its own, until it starts
     /// again ([`SessionView::exited`]).
     exited: HashMap<Uuid, Exited>,
+    /// How each session's start before the one running now ended, when it
+    /// ended as it started: what the next end is told apart from.
+    ended_before: HashMap<Uuid, Exited>,
     /// Each session's folder's dependencies, as Desk installs them
     /// ([`SessionView::deps`]).
     deps: HashMap<Uuid, deps::Kept>,
@@ -1017,8 +1022,47 @@ const STOP_GRACE: Duration = Duration::from_millis(150);
 const EXITED_LINES: usize = 20;
 const EXITED_CHARS: usize = 2000;
 
+/// How long Desk waits for a Codex session's app-server to take its resume
+/// of the session's thread, before its TUI starts.
+const PRIMED_WITHIN: Duration = Duration::from_secs(30);
+
+/// How long, and how often, a starting Codex TUI is looked at for the
+/// error it may print and then stay up after ([`codex::start_error`]).
+const CODEX_START_WATCH: Duration = Duration::from_secs(60);
+const CODEX_START_LOOK: Duration = Duration::from_millis(250);
+
 /// How often, within a [`STOP_GRACE`], an ending process is looked for.
 const STOP_LOOKS: u32 = 10;
+
+/// Whether a Codex session's app-server took Desk's resume of its thread
+/// ([`codex::Follower::resuming`]), in time; why not, in words.
+async fn codex_primed(primed: oneshot::Receiver<Result<(), String>>) -> Result<(), String> {
+    match tokio::time::timeout(PRIMED_WITHIN, primed).await {
+        Ok(Ok(taken)) => taken,
+        Ok(Err(_)) => Err("Desk lost its link to the session's Codex app-server".into()),
+        Err(_) => Err(format!(
+            "its app-server didn't answer within {} s",
+            PRIMED_WITHIN.as_secs()
+        )),
+    }
+}
+
+/// Ends session `id`'s Codex TUI, `tui`, when it prints why it didn't
+/// start and stays up ([`codex::start_error`]), within its start: its end
+/// is then said as it started, with what it printed.
+async fn watch_codex_start(id: Uuid, tui: Weak<Pty>) {
+    let until = tokio::time::Instant::now() + CODEX_START_WATCH;
+    while tokio::time::Instant::now() < until {
+        tokio::time::sleep(CODEX_START_LOOK).await;
+        let Some(pty) = tui.upgrade() else { return };
+        let shown = crate::pty::shown_end(&pty.text(), EXITED_LINES);
+        if let Some(why) = codex::start_error(&shown) {
+            tracing::warn!(%id, why, "codex said why it didn't start and stayed up: ending it");
+            pty.kill();
+            return;
+        }
+    }
+}
 
 /// `read` every [`STOP_GRACE`]` / `[`STOP_LOOKS`] until `done` says what it
 /// read is enough, for at most `looks` looks: the last read.
@@ -2342,7 +2386,8 @@ impl Desk {
                     let (server_pty, _) = holder.adopt(&server, history, None);
                     let server = Server::Held(Arc::new(server_pty));
                     socket.map(|socket| {
-                        self.observe_codex(id, server, socket, record.cli_session_id.clone(), true)
+                        let follower = self.codex_follower(record.cli_session_id.clone());
+                        self.observe_codex(id, server, socket, follower.at_once())
                     })
                 }
                 other => {
@@ -3195,7 +3240,7 @@ impl Desk {
         let me = Party::session(now);
         let own = |kind: Kind, text: String| Event::new(kind, me.clone(), Some(me.clone()), text);
         // Ended as it started: a failure, whichever state it was lost from.
-        let died = now.ended_as_started().map(|e| own(Kind::Failed, e.words()));
+        let died = now.ended_as_started().map(|e| own(Kind::Failed, e.told()));
         transitions
             .iter()
             .filter_map(|t| match *t {
@@ -4137,6 +4182,24 @@ impl Desk {
         if self.0.state.lock().live.contains_key(&id) {
             return Err(DeskError::Conflict("session is already running".into()));
         }
+        // Started again and again by anyone but the person, a session that
+        // ends the same way each time would only go on ending.
+        if by
+            .as_ref()
+            .or(carrier)
+            .is_some_and(|b| b.party.kind != crew::PartyKind::You)
+        {
+            if let Some(e) = self
+                .0
+                .state
+                .lock()
+                .exited
+                .get(&id)
+                .filter(|e| e.repeats > 0)
+            {
+                return Err(DeskError::Conflict(e.again()));
+            }
+        }
         if r.origin == Origin::External && r.external_pid.is_some_and(adopt::alive) {
             return Err(DeskError::Conflict(
                 "still running in another terminal — close it there first".into(),
@@ -4191,8 +4254,12 @@ impl Desk {
             if by.is_some() {
                 st.acted.insert(id);
             }
-            // Starting again: how it last ended is over.
-            st.exited.remove(&id);
+            // Starting again: how it last ended is over, kept only to tell
+            // whether this start ends the same way.
+            match st.exited.remove(&id).filter(|e| e.on_start) {
+                Some(e) => st.ended_before.insert(id, e),
+                None => st.ended_before.remove(&id),
+            };
         }
         let carried = r.cli_session_id.clone();
         self.change(id, |r, _| {
@@ -4509,6 +4576,7 @@ impl Desk {
             st.replies.remove(&id);
             st.restarted.remove(&id);
             st.exited.remove(&id);
+            st.ended_before.remove(&id);
             st.deps.remove(&id);
             st.switch_by.remove(&id);
             st.switch_notes.remove(&id);
@@ -5852,6 +5920,34 @@ impl Desk {
                 };
                 let server = self.start_app_server(r.id, &socket, line).await?;
                 let thread = r.cli_session_id.as_deref().filter(|_| resume);
+                let follower = self.codex_follower(thread.map(str::to_string));
+                let (follower, primed) = match thread {
+                    Some(thread) => {
+                        let permissions = codex::Permissions::of(mode, r.approve_for_me);
+                        let params = codex::resume_params(thread, cwd, model, r.fast, permissions);
+                        let (tx, rx) = oneshot::channel();
+                        (follower.resuming(params, tx), Some(rx))
+                    }
+                    None => (follower, None),
+                };
+                let link = self.observe_codex(r.id, server, socket.clone(), follower);
+                if let Some(primed) = primed {
+                    if let Err(why) = codex_primed(primed).await {
+                        link.stop();
+                        let said = format!("Codex didn't resume its conversation: {why}");
+                        self.exited_now(
+                            r.id,
+                            Exited {
+                                code: None,
+                                last_output: said.clone(),
+                                at: Utc::now(),
+                                on_start: true,
+                                repeats: 0,
+                            },
+                        );
+                        return Err(DeskError::Conflict(said));
+                    }
+                }
                 let spec = codex::spawn(&codex::CodexSpawn {
                     program: self.program_of(Engine::Codex)?,
                     cwd,
@@ -5867,8 +5963,6 @@ impl Desk {
                     mode,
                     env: &env,
                 });
-                let link =
-                    self.observe_codex(r.id, server, socket, thread.map(str::to_string), false);
                 // Codex asks the terminal's colours once, at its start.
                 fixed_ground = colors.as_ref().map(|c| c.ground);
                 (spec, Some(link))
@@ -5981,6 +6075,7 @@ impl Desk {
         };
         let pty = Arc::new(pty);
         let exited = Arc::downgrade(&pty);
+        let codex_tui = codex.is_some().then(|| Arc::downgrade(&pty));
         self.0.state.lock().live.insert(
             r.id,
             Live {
@@ -6028,6 +6123,9 @@ impl Desk {
             self.devin_launched_with(r.id, started_at, &env);
         }
         tokio::spawn(self.clone().on_exit(r.id, r.engine, exited, exit));
+        if let Some(tui) = codex_tui {
+            tokio::spawn(watch_codex_start(r.id, tui));
+        }
         // What its line held while it wasn't running is looked at again now
         // it is: its state said Starting before it was (settling its CLI's
         // first run waits on a file), and a pump then still found it stopped.
@@ -6144,16 +6242,22 @@ impl Desk {
         Ok(Server::Held(pty))
     }
 
+    /// What follows a Codex session's `thread` (none until its first is
+    /// started).
+    fn codex_follower(&self, thread: Option<String>) -> codex::Follower {
+        codex::Follower::new(thread, self.0.env.get("HOME").map(PathBuf::from))
+    }
+
     /// Joins a Codex session's app-server as a second client to follow it,
-    /// subscribed to `thread` when it is known (resumed, or taken back):
-    /// `at_once` when its TUI already runs it (taken back).
+    /// as `follower` says: subscribed at once when its TUI already runs its
+    /// thread (taken back), resuming the thread itself before its TUI does
+    /// (resumed), or once its TUI has started it.
     fn observe_codex(
         &self,
         id: Uuid,
         server: Server,
         socket: PathBuf,
-        thread: Option<String>,
-        at_once: bool,
+        follower: codex::Follower,
     ) -> CodexLink {
         let watch = self.0.cancel.child_token();
         let (tx, rx) = mpsc::channel(64);
@@ -6164,12 +6268,6 @@ impl Desk {
             let socket = server.socket(&socket);
             let watch = watch.clone();
             let plans = self.0.plans.clone();
-            let follower = codex::Follower::new(thread, self.0.env.get("HOME").map(PathBuf::from));
-            let follower = if at_once {
-                follower.at_once()
-            } else {
-                follower
-            };
             async move {
                 if let Err(e) = codex::observe(
                     socket, follower, tx, answers, steered, line_said, plans, watch,
@@ -6273,10 +6371,7 @@ impl Desk {
         live.end();
         drop(live);
         if let Some(e) = exited {
-            if e.on_start || e.code != Some(0) {
-                tracing::warn!(%id, code = ?e.code, on_start = e.on_start, said = %e.said(400), "a desk session ended on its own");
-            }
-            self.0.state.lock().exited.insert(id, e);
+            self.exited_now(id, e);
         }
         self.spend_read_ending(id);
         self.change(id, |r, _| {
@@ -6289,6 +6384,21 @@ impl Desk {
                 r.state.after_loss()
             };
         });
+    }
+
+    /// Keeps how `id` ended on its own, `e`: once more, when it ended as it
+    /// started the way its start before did.
+    fn exited_now(&self, id: Uuid, e: Exited) {
+        if e.on_start || e.code != Some(0) {
+            tracing::warn!(%id, code = ?e.code, on_start = e.on_start, said = %e.said(400), "a desk session ended on its own");
+        }
+        let mut st = self.0.state.lock();
+        let repeats = st
+            .ended_before
+            .remove(&id)
+            .filter(|before| e.on_start && before.said(EXITED_CHARS) == e.said(EXITED_CHARS))
+            .map_or(0, |before| before.repeats + 1);
+        st.exited.insert(id, Exited { repeats, ..e });
     }
 
     /// How session `id`'s process ended on its own with `code`, from its run
@@ -6311,6 +6421,7 @@ impl Desk {
             .to_string(),
             at,
             on_start,
+            repeats: 0,
         })
     }
 
@@ -10973,7 +11084,10 @@ mod tests {
             let events = recorded(&d, 2).await;
             assert_eq!(
                 events.last().map(|(k, t, _)| (*k, t.as_str())),
-                Some((crew::Kind::Failed, "ended as it started (exit 3)"))
+                Some((
+                    crew::Kind::Failed,
+                    "ended as it started (exit 3): Starting / error: unknown model opus-9"
+                ))
             );
             let logged = log.text();
             assert!(

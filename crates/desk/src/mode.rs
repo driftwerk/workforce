@@ -3,12 +3,12 @@
 //! Neither engine takes a new mode reliably while it runs: Claude Code only
 //! cycles its modes from the keyboard (Shift+Tab), with nothing to say which
 //! it landed on until its next hook, and Codex's approval policy and sandbox
-//! reach its thread only from the TUI's own settings at launch (verified on
-//! CLI 0.166, [`crate::codex::APPROVE_FOR_ME`]). So Desk keeps the mode the
-//! session should run in and starts it in that mode: a running session is
-//! restarted in place, resumed by id with its conversation kept. Claude Code
-//! says the mode it runs in on every hook (`permission_mode`), which is what
-//! Desk reads back.
+//! reach its thread only as it is started or resumed (verified on CLI 0.166,
+//! [`crate::codex::Permissions`]). So Desk keeps the mode the session should
+//! run in and starts it in that mode: a running session is restarted in
+//! place, resumed by id with its conversation kept. Claude Code says the
+//! mode it runs in on every hook (`permission_mode`), which is what Desk
+//! reads back.
 
 use serde::{Deserialize, Serialize};
 
@@ -21,7 +21,7 @@ pub enum Mode {
     /// Edits go ahead; commands still ask.
     AcceptEdits,
     /// The engine decides for itself what is safe (Claude Code's auto mode;
-    /// Codex asks only when a command fails in its sandbox).
+    /// Codex's model asks when it needs to, in its sandbox).
     Auto,
     /// It only reads and plans; nothing changes.
     Plan,
@@ -101,15 +101,14 @@ impl Mode {
         Some(vec!["--permission-mode".to_string(), mode.to_string()])
     }
 
-    /// Codex's settings to start in it: its approval policy and sandbox.
-    pub fn codex_settings(self) -> [&'static str; 2] {
+    /// Codex's approval policy and sandbox to run in it, as both its
+    /// settings and its app-server spell them. Its `on-failure` is read as
+    /// `on-request` (CLI 0.166), and its app-server refuses the word.
+    pub fn codex_permissions(self) -> (&'static str, &'static str) {
         match self {
-            Self::Default | Self::AcceptEdits => {
-                ["approval_policy=on-request", "sandbox_mode=workspace-write"]
-            }
-            Self::Auto => ["approval_policy=on-failure", "sandbox_mode=workspace-write"],
-            Self::Plan => ["approval_policy=on-request", "sandbox_mode=read-only"],
-            Self::BypassPermissions => ["approval_policy=never", "sandbox_mode=danger-full-access"],
+            Self::Default | Self::AcceptEdits | Self::Auto => ("on-request", "workspace-write"),
+            Self::Plan => ("on-request", "read-only"),
+            Self::BypassPermissions => ("never", "danger-full-access"),
         }
     }
 }
