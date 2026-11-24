@@ -11,7 +11,7 @@ use tokio::net::UnixStream;
 use tokio_tungstenite::WebSocketStream;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
-use workforce_postgres::test_support::with_test_pool;
+use workforce_postgres::{test_support::with_test_pool, PostgresPool};
 
 use super::codex_asks_tests::{codex_session, until};
 use super::tests::options;
@@ -95,8 +95,18 @@ async fn resumed(ws: &mut WebSocketStream<UnixStream>, answer: Value) -> Value {
 }
 
 fn plan_in(dir: &Path) -> Value {
+    in_mode(dir, "on-request", "read-only")
+}
+
+fn in_mode(dir: &Path, approval: &str, sandbox: &str) -> Value {
     json!({"threadId": "t1", "excludeTurns": true, "cwd": dir,
-        "approvalPolicy": "on-request", "sandbox": "read-only", "approvalsReviewer": "user"})
+        "approvalPolicy": approval, "sandbox": sandbox, "approvalsReviewer": "user"})
+}
+
+/// In what it last ran in: the person's own, from Codex's settings or its
+/// terminal.
+fn its_own(dir: &Path) -> Value {
+    json!({"threadId": "t1", "excludeTurns": true, "cwd": dir})
 }
 
 fn status(kind: &str) -> Value {
@@ -119,33 +129,169 @@ async fn ended_as_started(d: &Desk, id: Uuid) -> crate::model::Exited {
     d.view(id).unwrap().exited.unwrap()
 }
 
+/// A Desk on the stand-in, and a Codex session on it whose TUI has
+/// started its thread (`t1`), which Desk follows.
+async fn started(pool: PostgresPool, dir: &Path) -> (Desk, crate::model::SessionView) {
+    DeskStore::migrate(&pool).await.unwrap();
+    let d = Desk::start(
+        DeskStore::from_pool(pool),
+        options(dir).with_program(Engine::Codex, fake_codex(dir)),
+        Default::default(),
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    let server = serve(dir);
+    let s = d.create(codex_session(dir, false), None).await.unwrap();
+    let mut ws = server.await.unwrap();
+    say(
+        &mut ws,
+        json!({"method": "thread/started", "params": {"thread": {"id": "t1",
+        "environments": [{"cwd": dir}], "path": null}}}),
+    )
+    .await;
+    say(&mut ws, status("idle")).await;
+    resumed(&mut ws, json!({"thread": {"id": "t1"}})).await;
+    until(|| {
+        d.record(s.id)
+            .is_ok_and(|r| r.cli_session_id.as_deref() == Some("t1"))
+    })
+    .await;
+    until(|| tui_starts(dir).len() == 1).await;
+    assert!(
+        tui_starts(dir)[0].starts_with("--remote"),
+        "{:?}",
+        tui_starts(dir)
+    );
+    (d, s)
+}
+
+/// Starts it again with `again`, its thread resumed by Desk as `answers`
+/// say, one by one: the params of each.
+async fn started_again<F>(
+    d: &Desk,
+    dir: &Path,
+    answers: &[Value],
+    again: impl FnOnce(Desk) -> F,
+) -> Vec<Value>
+where
+    F: std::future::Future<Output = Result<(), DeskError>> + Send + 'static,
+{
+    let server = serve(dir);
+    let again = tokio::spawn(again(d.clone()));
+    let mut ws = server.await.unwrap();
+    let mut asked = Vec::new();
+    for answer in answers {
+        asked.push(resumed(&mut ws, answer.clone()).await);
+    }
+    again.await.unwrap().unwrap();
+    asked
+}
+
+/// A session in its own mode is resumed in it, whoever starts it, never
+/// put in Codex's default; one a boss left in a mode that doesn't ask is
+/// put back in Codex's default once that mode goes, and a thread its last
+/// app-server still holds as it ends is waited for.
+#[tokio::test]
+async fn a_codex_session_runs_in_its_own_mode_unless_one_that_doesnt_ask_is_kept() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let dir = dir.path().canonicalize().unwrap();
+        let (d, s) = started(pool, &dir).await;
+        let ok = json!({"thread": {"id": "t1"}});
+        let tui_has_no_permissions = || {
+            tui_starts(&dir)
+                .iter()
+                .skip(1)
+                .all(|a| !a.contains("approval") && !a.contains("sandbox"))
+        };
+
+        // Restarted as its last app-server still holds the thread: asked
+        // again, in its own mode, and it runs.
+        let held = json!({"code": -32603, "message": "thread t1 already has an active writer"});
+        let asked = started_again(&d, &dir, &[held, ok.clone()], move |d| async move {
+            d.restart(s.id, None, By::you()).await.map(drop)
+        })
+        .await;
+        assert_eq!(asked, [its_own(&dir), its_own(&dir)]);
+        until(|| tui_starts(&dir).len() == 2).await;
+        assert!(tui_has_no_permissions());
+        let v = d.view(s.id).unwrap();
+        assert!(v.live && v.exited.is_none(), "{v:?}");
+
+        // A boss's restart: still its own.
+        let boss = || By::manager("crew", "Crew", "it should go on");
+        let asked = started_again(&d, &dir, std::slice::from_ref(&ok), move |d| async move {
+            d.restart(s.id, None, boss()).await.map(drop)
+        })
+        .await;
+        assert_eq!(asked, [its_own(&dir)]);
+        until(|| tui_starts(&dir).len() == 3).await;
+
+        // Acting fully, an unbound boss that runs it bypasses its
+        // permissions, and its restart keeps it so.
+        d.set_full(std::collections::HashMap::from([(
+            "crew".to_string(),
+            crate::charge::FullGrant {
+                anywhere: true,
+                unbound: true,
+                ..Default::default()
+            },
+        )]));
+        d.take_on(
+            s.id,
+            &crate::crew::Party::manager("crew", "Crew"),
+            crate::charge::How::Handed,
+            &Default::default(),
+            &By::you(),
+        )
+        .await
+        .unwrap();
+        let bypassed = in_mode(&dir, "never", "danger-full-access");
+        let asked = started_again(&d, &dir, std::slice::from_ref(&ok), move |d| async move {
+            d.set_mode(s.id, Mode::BypassPermissions, boss())
+                .await
+                .map(drop)
+        })
+        .await;
+        assert_eq!(asked, std::slice::from_ref(&bypassed));
+        until(|| tui_starts(&dir).len() == 4).await;
+        let asked = started_again(&d, &dir, std::slice::from_ref(&ok), move |d| async move {
+            d.restart(s.id, None, boss()).await.map(drop)
+        })
+        .await;
+        assert_eq!(asked, [bypassed]);
+        until(|| tui_starts(&dir).len() == 5).await;
+
+        // The person resumes it: that mode goes, and the thread is put back
+        // in Codex's default, not left bypassing; after which it is its own
+        // again.
+        stopped(&d, s.id).await;
+        let asked = started_again(&d, &dir, std::slice::from_ref(&ok), move |d| async move {
+            d.resume(s.id, None, Some(By::you())).await.map(drop)
+        })
+        .await;
+        assert_eq!(asked, [in_mode(&dir, "on-request", "workspace-write")]);
+        until(|| tui_starts(&dir).len() == 6).await;
+        stopped(&d, s.id).await;
+        let asked = started_again(&d, &dir, &[ok], move |d| async move {
+            d.resume(s.id, None, Some(By::you())).await.map(drop)
+        })
+        .await;
+        assert_eq!(asked, [its_own(&dir)]);
+        until(|| tui_starts(&dir).len() == 7).await;
+        assert!(tui_has_no_permissions());
+    })
+    .await;
+}
+
 #[tokio::test]
 async fn a_codex_session_keeps_its_mode_through_every_start_and_a_refusal_is_said_not_looped() {
     with_test_pool(build_pool, |pool| async move {
         let dir = tempfile::tempdir().unwrap();
         let dir = dir.path().canonicalize().unwrap();
-        DeskStore::migrate(&pool).await.unwrap();
-        let d = Desk::start(
-            DeskStore::from_pool(pool),
-            options(&dir).with_program(Engine::Codex, fake_codex(&dir)),
-            Default::default(),
-            CancellationToken::new(),
-        )
-        .await
-        .unwrap();
+        let (d, s) = started(pool, &dir).await;
         let boss = || By::manager("crew", "Crew", "it should go on");
-
-        // Started: its TUI starts the thread, which Desk then follows.
-        let server = serve(&dir);
-        let s = d.create(codex_session(&dir, false), None).await.unwrap();
-        let mut ws = server.await.unwrap();
-        say(&mut ws, json!({"method": "thread/started", "params": {"thread": {"id": "t1",
-            "environments": [{"cwd": dir}], "path": null}}})).await;
-        say(&mut ws, status("idle")).await;
-        resumed(&mut ws, json!({"thread": {"id": "t1"}})).await;
-        until(|| d.record(s.id).is_ok_and(|r| r.cli_session_id.as_deref() == Some("t1"))).await;
-        until(|| tui_starts(&dir).len() == 1).await;
-        assert!(tui_starts(&dir)[0].starts_with("--remote"), "{:?}", tui_starts(&dir));
 
         // Put in plan mode: started again in place, its thread resumed in
         // plan mode by Desk before its TUI joins it, with nothing it refuses.

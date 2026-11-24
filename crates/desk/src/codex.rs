@@ -37,17 +37,15 @@ pub struct CodexSpawn<'a> {
     pub socket: &'a Path,
     pub launch: Launch<'a>,
     pub prompt: Option<&'a str>,
-    /// Codex's own reviewer answers its approvals.
-    pub approve_for_me: bool,
     /// Fast mode: Codex asks the ChatGPT backend's faster tier.
     pub fast: bool,
     /// The model its thread runs; none, Codex's own default. Given to the
     /// TUI as a setting, as [`FAST`] is, so it starts (and resumes) the
     /// thread on it. Only a name [`crate::plan::model_ok`] passes is given.
     pub model: Option<&'a str>,
-    /// The permission mode to start in ([`crate::mode`]), over Approve for
-    /// me's; none, its own.
-    pub mode: Option<crate::mode::Mode>,
+    /// What a new thread starts in; none, Codex's own settings. Never
+    /// given on a resume ([`Permissions`]).
+    pub permissions: Option<Permissions>,
     pub env: &'a BTreeMap<String, String>,
 }
 
@@ -76,23 +74,25 @@ pub struct Permissions {
 }
 
 impl Permissions {
-    /// What a session runs in: the mode Desk keeps for it, over Approve
-    /// for me's, else Codex's default; its approvals reviewed by Codex's
-    /// own reviewer with Approve for me (`--approve-for-me`), else by the
-    /// person.
-    pub fn of(mode: Option<crate::mode::Mode>, approve_for_me: bool) -> Self {
-        let (approval, sandbox) = mode
-            .unwrap_or(crate::mode::Mode::Default)
-            .codex_permissions();
-        Self {
-            approval,
-            sandbox,
-            reviewer: if approve_for_me {
-                "auto_review"
-            } else {
-                "user"
-            },
-        }
+    /// What a session runs in, where Desk sets it: the mode Desk keeps for
+    /// it, over Approve for me's, else Codex's default; its approvals
+    /// reviewed by Codex's own reviewer in auto mode or with Approve for
+    /// me, else by the person. Neither, none: it runs in the person's own,
+    /// from Codex's settings or as its thread last ran.
+    pub fn of(mode: Option<crate::mode::Mode>, approve_for_me: bool) -> Option<Self> {
+        use crate::mode::Mode;
+        (approve_for_me || mode.is_some()).then(|| {
+            let (approval, sandbox) = mode.unwrap_or(Mode::Default).codex_permissions();
+            Self {
+                approval,
+                sandbox,
+                reviewer: if approve_for_me || mode == Some(Mode::Auto) {
+                    "auto_review"
+                } else {
+                    "user"
+                },
+            }
+        })
     }
 
     /// As the TUI's settings, for a new thread.
@@ -108,11 +108,7 @@ impl Permissions {
 pub fn spawn(s: &CodexSpawn<'_>) -> Spawn {
     let remote = format!("unix://{}", s.socket.display());
     let (mut args, permissions) = match s.launch {
-        Launch::New => (
-            vec![],
-            (s.approve_for_me || s.mode.is_some())
-                .then(|| Permissions::of(s.mode, s.approve_for_me)),
-        ),
+        Launch::New => (vec![], s.permissions),
         Launch::Resume { thread_id } => (vec!["resume".to_string(), thread_id.to_string()], None),
     };
     args.extend([
@@ -146,24 +142,27 @@ pub fn spawn(s: &CodexSpawn<'_>) -> Spawn {
 }
 
 /// Desk's `thread/resume` of a session's thread, sent before its TUI
-/// starts: the thread is loaded in `permissions`, and the TUI, resumed
-/// without them, joins it as it is. Its folder, model and tier are the
-/// TUI's own, which a loaded thread would otherwise not take from it.
+/// starts: the thread is loaded in `permissions`, else in what it last ran
+/// in, and the TUI, resumed without them, joins it as it is. Its folder,
+/// model and tier are the TUI's own, which a loaded thread would otherwise
+/// not take from it.
 pub fn resume_params(
     thread: &str,
     cwd: &Path,
     model: Option<&str>,
     fast: bool,
-    permissions: Permissions,
+    permissions: Option<Permissions>,
 ) -> Value {
     let mut params = json!({
         "threadId": thread,
         "excludeTurns": true,
         "cwd": cwd,
-        "approvalPolicy": permissions.approval,
-        "sandbox": permissions.sandbox,
-        "approvalsReviewer": permissions.reviewer,
     });
+    if let Some(p) = permissions {
+        params["approvalPolicy"] = json!(p.approval);
+        params["sandbox"] = json!(p.sandbox);
+        params["approvalsReviewer"] = json!(p.reviewer);
+    }
     if let Some(m) = model.filter(|m| crate::plan::model_ok(m)) {
         params["model"] = json!(m);
     }
@@ -177,12 +176,33 @@ pub fn resume_params(
 /// (`shown`, plain text) is the error its `main` printed (`Error: …`). It
 /// may stay up after it (CLI 0.166 on a refused resume), so its process
 /// ending is no sign of it.
-pub fn start_error(shown: &str) -> Option<&str> {
+fn start_error(shown: &str) -> Option<&str> {
     shown
         .lines()
         .map(str::trim)
         .rfind(|l| !l.is_empty())
         .filter(|l| l.starts_with("Error: "))
+}
+
+/// What Desk makes of a starting TUI's terminal, look by look.
+#[derive(Debug, Default)]
+pub struct StartWatch {
+    /// What the last look found it stopped at.
+    last: Option<String>,
+}
+
+impl StartWatch {
+    /// Why its TUI didn't start, once two looks in a row find the same
+    /// error ([`start_error`]) at the end of its primary screen (`shown`,
+    /// none while its program has the alternate one): its `main` prints
+    /// it as it leaves its alternate screen, and a line mid-frame, or
+    /// mid-redraw, is no such word.
+    pub fn look(&mut self, shown: Option<&str>) -> Option<String> {
+        let now = shown.and_then(start_error).map(str::to_string);
+        let held = now.is_some() && now == self.last;
+        self.last = now;
+        held.then(|| self.last.clone()).flatten()
+    }
 }
 
 /// Where a session's app-server reaches Desk's line: its MCP address, and
@@ -249,13 +269,38 @@ pub fn app_server(
     }
 }
 
-/// Makes `socket`'s folder and clears a stale socket, before a server starts.
+/// Makes `socket`'s folder, waits for the server last on it to end, and
+/// clears a stale socket, before a server starts.
 pub async fn prepare_socket(socket: &Path) -> Result<()> {
     if let Some(dir) = socket.parent() {
         tokio::fs::create_dir_all(dir).await?;
     }
+    last_server_ended(socket, LAST_SERVER_WITHIN).await;
     let _ = tokio::fs::remove_file(socket).await;
     Ok(())
+}
+
+/// How long a session's last app-server gets to end before its next one
+/// starts: its stop's grace, and its kill.
+const LAST_SERVER_WITHIN: Duration = Duration::from_secs(7);
+
+/// Waits, up to `within`, for whatever app-server still listens on
+/// `socket` to end: a session's last one, stopping without being waited
+/// for, holds its thread until it has ([`HELD_ELSEWHERE`]).
+async fn last_server_ended(socket: &Path, within: Duration) {
+    let named = format!("app-server --listen unix://{}", socket.display());
+    let Some(all) = crate::procs::table().await else {
+        return;
+    };
+    let last: Vec<u32> = all
+        .iter()
+        .filter(|p| p.args.contains(&named))
+        .map(|p| p.pid)
+        .collect();
+    let left = wait_gone(last, within).await;
+    if !left.is_empty() {
+        tracing::warn!(pids = ?left, socket = %socket.display(), "a session's last codex app-server is still running as its next one starts");
+    }
 }
 
 /// Waits up to ten seconds for a server to open `socket`.
@@ -1090,12 +1135,29 @@ pub struct Follower {
     /// The line's messages said into its turns, oldest first, until Codex
     /// answers each (`turn/steer` answers in order).
     steering: std::collections::VecDeque<Uuid>,
-    /// Resumes the thread itself as it joins, with these params
-    /// ([`resume_params`]), before its TUI does.
-    resume: Option<Value>,
-    /// Told whether that resume was taken, or Codex's words why not.
-    primed: Option<oneshot::Sender<Result<(), String>>>,
+    /// Its own resume of the thread, before its TUI's, while unanswered.
+    priming: Option<Priming>,
 }
+
+/// A follower's resume of its thread as it joins ([`Follower::resuming`]).
+struct Priming {
+    /// Its params ([`resume_params`]).
+    params: Value,
+    /// Told whether it was taken, or Codex's words why not.
+    told: oneshot::Sender<Result<(), String>>,
+    /// How many more times it is asked again while another app-server
+    /// still holds the thread.
+    waits: u32,
+}
+
+/// What Codex says when another app-server still holds a thread: its last
+/// one, as it ends (`rollout/src/writer_lock.rs`, CLI 0.166).
+const HELD_ELSEWHERE: &str = "already has an active writer";
+
+/// How many times, and how often, a resume of a thread another app-server
+/// still holds is asked again.
+const HELD_WAITS: u32 = 5;
+const HELD_WAIT: Duration = Duration::from_secs(1);
 
 impl Follower {
     pub fn new(thread: Option<String>, home: Option<PathBuf>) -> Self {
@@ -1109,8 +1171,7 @@ impl Follower {
             turn: None,
             settled: false,
             steering: std::collections::VecDeque::new(),
-            resume: None,
-            primed: None,
+            priming: None,
         }
     }
 
@@ -1121,11 +1182,25 @@ impl Follower {
     }
 
     /// Resumes the thread with `params` as soon as it joins, and says how
-    /// to `primed`: Codex's words when it refuses, with nothing retried.
+    /// to `primed`: Codex's words when it refuses. Nothing is asked again
+    /// but a thread its last app-server still holds as it ends ([`Self::waits`]).
     pub fn resuming(mut self, params: Value, primed: oneshot::Sender<Result<(), String>>) -> Self {
-        self.resume = Some(params);
-        self.primed = Some(primed);
+        self.priming = Some(Priming {
+            params,
+            told: primed,
+            waits: HELD_WAITS,
+        });
         self.at_once()
+    }
+
+    /// Whether its resume waits to be asked again ([`Self::again`]).
+    pub fn waits(&self) -> bool {
+        self.priming.is_some() && !self.subscribed
+    }
+
+    /// Its resume, asked again.
+    pub fn again(&mut self) -> Option<Value> {
+        self.waits().then(|| self.subscribe()).flatten()
     }
 
     /// Subscribes to the thread, when it is known and not yet subscribed.
@@ -1135,10 +1210,10 @@ impl Follower {
         self.subscribed = true;
         // Not its history, which can outgrow a frame: what it asks still
         // comes.
-        let params = self
-            .resume
-            .take()
-            .unwrap_or_else(|| json!({ "threadId": thread, "excludeTurns": true }));
+        let params = self.priming.as_ref().map_or_else(
+            || json!({ "threadId": thread, "excludeTurns": true }),
+            |p| p.params.clone(),
+        );
         Some(json!({ "id": SUBSCRIBE, "method": "thread/resume", "params": params }))
     }
 
@@ -1175,15 +1250,22 @@ impl Follower {
                 if id.as_i64() != Some(SUBSCRIBE) {
                     return (Vec::new(), None);
                 }
-                let primed = self.primed.take();
+                let priming = self.priming.take();
                 if let Some(error) = v.get("error") {
-                    match primed {
-                        Some(primed) => {
+                    match priming {
+                        Some(mut p) => {
                             let why = error
                                 .get("message")
                                 .and_then(Value::as_str)
                                 .map_or_else(|| error.to_string(), str::to_string);
-                            let _ = primed.send(Err(why));
+                            if p.waits > 0 && why.contains(HELD_ELSEWHERE) {
+                                tracing::debug!(why = %why, "codex: its thread's last app-server still holds it; asking again");
+                                p.waits -= 1;
+                                self.subscribed = false;
+                                self.priming = Some(p);
+                            } else {
+                                let _ = p.told.send(Err(why));
+                            }
                         }
                         None => {
                             tracing::debug!(error = %error, "codex: not subscribed to the thread yet");
@@ -1192,8 +1274,8 @@ impl Follower {
                     }
                     return (Vec::new(), None);
                 }
-                if let Some(primed) = primed {
-                    let _ = primed.send(Ok(()));
+                if let Some(p) = priming {
+                    let _ = p.told.send(Ok(()));
                 }
                 // What the thread runs with, as Codex says it.
                 let said = v
@@ -1416,12 +1498,21 @@ pub async fn observe(
         tx.send(Message::text(subscribe.to_string())).await?;
     }
     let mut limits: Option<Value> = None;
+    // When its resume, refused while the thread was held elsewhere, is
+    // asked again.
+    let mut again: Option<tokio::time::Instant> = None;
     let mut replying = true;
     let mut steering = true;
     let mut line_steering = true;
     loop {
         tokio::select! {
             _ = cancel.cancelled() => return Ok(()),
+            () = tokio::time::sleep_until(again.unwrap_or_else(tokio::time::Instant::now)), if again.is_some() => {
+                again = None;
+                if let Some(send) = follower.again() {
+                    tx.send(Message::text(send.to_string())).await?;
+                }
+            }
             steer = steers.recv(), if steering => match steer {
                 Some(text) => {
                     if let Some(send) = follower.steer(&text) {
@@ -1473,6 +1564,9 @@ pub async fn observe(
                 let (seen, send) = follower.heard(&v);
                 if let Some(send) = send {
                     tx.send(Message::text(send.to_string())).await?;
+                }
+                if again.is_none() && follower.waits() {
+                    again = Some(tokio::time::Instant::now() + HELD_WAIT);
                 }
                 for seen in seen {
                     events.send(seen).await?;
@@ -1536,6 +1630,39 @@ pub fn rollouts(home: &Path) -> Vec<PathBuf> {
 pub(crate) mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn a_sessions_next_app_server_waits_for_its_last_to_end() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("s.sock");
+        let mut last = tokio::process::Command::new("sh")
+            .args(["-c", "sleep 30; true", "app-server", "--listen"])
+            .arg(format!("unix://{}", socket.display()))
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let pid = last.id().unwrap();
+        let since = std::time::Instant::now();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            signal(pid, libc::SIGTERM);
+            last.wait().await.unwrap();
+        });
+        prepare_socket(&socket).await.unwrap();
+        let waited = since.elapsed();
+        assert!(
+            waited >= Duration::from_millis(500),
+            "it waited for the last one"
+        );
+        assert!(waited < LAST_SERVER_WITHIN, "not past its end");
+
+        let since = std::time::Instant::now();
+        prepare_socket(&socket).await.unwrap();
+        assert!(
+            since.elapsed() < Duration::from_secs(2),
+            "none left: at once"
+        );
+    }
+
     #[test]
     fn resume_reattaches_the_tui_to_the_session_app_server() {
         let env = BTreeMap::new();
@@ -1545,10 +1672,9 @@ pub(crate) mod tests {
             socket: Path::new("/run/s.sock"),
             launch: Launch::Resume { thread_id: "t1" },
             prompt: None,
-            approve_for_me: false,
             fast: false,
             model: None,
-            mode: None,
+            permissions: None,
             env: &env,
         });
         assert_eq!(
@@ -1575,10 +1701,9 @@ pub(crate) mod tests {
             socket: Path::new("/run/s.sock"),
             launch,
             prompt: Some("go"),
-            approve_for_me,
             fast: false,
             model: None,
-            mode,
+            permissions: Permissions::of(mode, approve_for_me),
             env: &BTreeMap::new(),
         })
         .args
@@ -1625,6 +1750,32 @@ pub(crate) mod tests {
         );
     }
 
+    /// Auto mode doesn't ask the person: Codex's own reviewer answers, with
+    /// Approve for me or without.
+    #[test]
+    fn auto_mode_has_codexs_reviewer_answer_for_the_person() {
+        use crate::mode::Mode;
+        for approve_for_me in [false, true] {
+            assert_eq!(
+                Permissions::of(Some(Mode::Auto), approve_for_me),
+                Some(Permissions {
+                    approval: "on-request",
+                    sandbox: "workspace-write",
+                    reviewer: "auto_review"
+                })
+            );
+        }
+        for mode in [Mode::Default, Mode::AcceptEdits, Mode::Plan] {
+            assert_eq!(
+                Permissions::of(Some(mode), false).map(|p| p.reviewer),
+                Some("user"),
+                "{mode:?} asks the person"
+            );
+        }
+        assert!(args(Launch::New, false, Some(Mode::Auto))
+            .contains(&"approvals_reviewer=auto_review".to_string()));
+    }
+
     /// CLI 0.166 refuses a resume through `--remote` that sets any of these
     /// ("Permission overrides are not supported when resuming a remote
     /// task"): Desk's resume of its thread sets them instead.
@@ -1660,23 +1811,16 @@ pub(crate) mod tests {
                 "approvalsReviewer": "auto_review", "model": "gpt-6.1-sol",
                 "serviceTier": "priority"})
         );
-        // Its own: Codex's default, the person reviewing; never a mode a
-        // boss left it in.
+        // Its own: what it last ran in, which may be what the person chose
+        // in its terminal or Codex's settings.
+        assert_eq!(Permissions::of(None, false), None);
         assert_eq!(
-            resume_params(
-                "t1",
-                Path::new("/repo"),
-                Some("a\" b"),
-                false,
-                Permissions::of(None, false)
-            ),
-            json!({"threadId": "t1", "excludeTurns": true, "cwd": "/repo",
-                "approvalPolicy": "on-request", "sandbox": "workspace-write",
-                "approvalsReviewer": "user"})
+            resume_params("t1", Path::new("/repo"), Some("a\" b"), false, None),
+            json!({"threadId": "t1", "excludeTurns": true, "cwd": "/repo"})
         );
         // What 0.166's app-server takes: never `on-failure`, which it refuses.
         for mode in Mode::ALL {
-            let p = Permissions::of(Some(mode), false);
+            let p = Permissions::of(Some(mode), false).unwrap();
             assert!(
                 ["untrusted", "on-request", "never"].contains(&p.approval),
                 "{mode:?}"
@@ -1717,25 +1861,70 @@ pub(crate) mod tests {
         assert_eq!(f.heard(&status).1, None, "subscribed by it");
     }
 
+    /// The thread's last app-server, ending, still holds it: the resume is
+    /// asked again, a few times, and only then said refused.
+    #[test]
+    fn a_thread_still_held_as_its_last_app_server_ends_is_resumed_once_it_lets_go() {
+        let params = json!({"threadId": "t1", "excludeTurns": true});
+        let request = json!({"id": SUBSCRIBE, "method": "thread/resume", "params": params});
+        let held = json!({"id": SUBSCRIBE, "error": {"code": -32603,
+            "message": "thread t1 already has an active writer"}});
+        let (tx, mut rx) = oneshot::channel();
+        let mut f = Follower::new(Some("t1".into()), None).resuming(params.clone(), tx);
+        assert_eq!(f.joined(), Some(request.clone()));
+        assert!(!f.waits());
+        assert_eq!(f.again(), None, "not while it is answered");
+        f.heard(&held);
+        assert!(f.waits() && rx.try_recv().is_err(), "waited out, not said");
+        assert_eq!(f.again(), Some(request.clone()), "its own params again");
+        f.heard(&json!({"id": SUBSCRIBE, "result": {"thread": {"id": "t1"}}}));
+        assert_eq!(rx.try_recv().unwrap(), Ok(()));
+        assert!(!f.waits());
+
+        let (tx, mut rx) = oneshot::channel();
+        let mut f = Follower::new(Some("t1".into()), None).resuming(params, tx);
+        f.joined();
+        for _ in 0..HELD_WAITS {
+            f.heard(&held);
+            assert_eq!(f.again(), Some(request.clone()));
+        }
+        f.heard(&held);
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            Err("thread t1 already has an active writer".to_string()),
+            "held for good: said"
+        );
+        assert!(!f.waits());
+    }
+
     #[test]
     fn a_tui_that_prints_why_it_did_not_start_is_told_from_one_that_runs() {
-        let shown = |bytes: &[&[u8]]| {
-            let mut term = crate::vt::Term::new(120, 40, 1000);
-            for b in bytes {
-                term.feed(b);
-            }
-            crate::pty::shown_end(&term.text(), 20)
+        let mut term = crate::vt::Term::new(120, 40, 1000);
+        let mut look = |watch: &mut StartWatch, bytes: &[u8]| {
+            term.feed(bytes);
+            let shown = (!term.alternate()).then(|| crate::pty::shown_end(&term.text(), 20));
+            watch.look(shown.as_deref())
         };
-        let drawn: &[u8] = b"\x1b[?1049h\x1b[2J\x1b[H>_ OpenAI Codex (v0.166.0)\r\n\r\n  Resuming session\xe2\x80\xa6\r\n\r\n\xe2\x80\xba hello\r\n  Error: said in the conversation\r\n\r\n  gpt-6.1-sol default \xc2\xb7 ~/repo";
-        assert_eq!(start_error(&shown(&[drawn])), None, "it runs");
+        // A frame that ends, for now, on a line of the conversation's.
+        let drawn: &[u8] = b"\x1b[?1049h\x1b[2J\x1b[H>_ OpenAI Codex (v0.166.0)\r\n\r\n  Resuming session\xe2\x80\xa6\r\n\r\n\xe2\x80\xba hello\r\n  Error: said in the conversation";
+        let mut watch = StartWatch::default();
+        for _ in 0..3 {
+            assert_eq!(look(&mut watch, drawn), None, "it runs");
+        }
         // What CLI 0.166 leaves on its terminal as it refuses a resume, and
-        // then stays up.
+        // then stays up: said once it is seen twice.
         let refused: &[u8] = b"\x1b[?2026h\x1b[39m\x1b[49m\x1b[0m\x1b[37;3H\x1b[?25h\x1b[?2026l\x1b[?1006l\x1b[?1049l\x1b[<1u\x1b[?2004l\x1b[c\x1b[0 q\x1b[?25hError: Permission overrides are not supported when resuming a remote task.\r\n\x1b[0 q";
+        assert_eq!(look(&mut watch, refused), None, "not on one look");
         assert_eq!(
-            start_error(&shown(&[drawn, refused])),
+            look(&mut watch, b"").as_deref(),
             Some("Error: Permission overrides are not supported when resuming a remote task.")
         );
-        assert_eq!(start_error(""), None);
+        // One that passes before the next look is no word on its start.
+        let mut watch = StartWatch::default();
+        assert_eq!(look(&mut watch, b"\r\nError: gone by"), None);
+        assert_eq!(look(&mut watch, b"\r\n$ "), None);
+        assert_eq!(look(&mut watch, b""), None);
+        assert_eq!(StartWatch::default().look(Some("")), None);
     }
 
     #[test]
@@ -1752,10 +1941,9 @@ pub(crate) mod tests {
                         Launch::Resume { thread_id } => Launch::Resume { thread_id },
                     },
                     prompt: Some("go"),
-                    approve_for_me: false,
                     fast,
                     model: None,
-                    mode: None,
+                    permissions: None,
                     env: &env,
                 })
                 .args
@@ -1785,10 +1973,9 @@ pub(crate) mod tests {
                         Launch::Resume { thread_id } => Launch::Resume { thread_id },
                     },
                     prompt: Some("go"),
-                    approve_for_me: false,
                     fast: false,
                     model,
-                    mode: None,
+                    permissions: None,
                     env: &env,
                 })
                 .args

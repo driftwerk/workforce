@@ -1052,11 +1052,14 @@ async fn codex_primed(primed: oneshot::Receiver<Result<(), String>>) -> Result<(
 /// is then said as it started, with what it printed.
 async fn watch_codex_start(id: Uuid, tui: Weak<Pty>) {
     let until = tokio::time::Instant::now() + CODEX_START_WATCH;
+    let mut watch = codex::StartWatch::default();
     while tokio::time::Instant::now() < until {
         tokio::time::sleep(CODEX_START_LOOK).await;
         let Some(pty) = tui.upgrade() else { return };
-        let shown = crate::pty::shown_end(&pty.text(), EXITED_LINES);
-        if let Some(why) = codex::start_error(&shown) {
+        let shown = pty
+            .primary_text()
+            .map(|t| crate::pty::shown_end(&t, EXITED_LINES));
+        if let Some(why) = watch.look(shown.as_deref()) {
             tracing::warn!(%id, why, "codex said why it didn't start and stayed up: ending it");
             pty.kill();
             return;
@@ -4577,6 +4580,7 @@ impl Desk {
             st.restarted.remove(&id);
             st.exited.remove(&id);
             st.ended_before.remove(&id);
+            st.modes_started.remove(&id);
             st.deps.remove(&id);
             st.switch_by.remove(&id);
             st.switch_notes.remove(&id);
@@ -5868,13 +5872,14 @@ impl Desk {
         // doesn't ask is shown on its card while it runs in it.
         let carried = self.0.state.lock().modes_carried.remove(&r.id);
         let mode = self.mode_to_start(r.id).await.or(carried);
-        {
+        // The one that doesn't ask it last started in, as a boss kept it.
+        let left = {
             let mut st = self.0.state.lock();
             match mode.filter(|m| !m.asks()) {
                 Some(m) => st.modes_started.insert(r.id, m),
                 None => st.modes_started.remove(&r.id),
-            };
-        }
+            }
+        };
         // A boss served from a grant runs it: Desk's check of each call fails
         // closed. Kept with its process, so a hub that takes it back knows.
         let fail_closed = r.engine == Engine::Claude && self.served_runs(r.id);
@@ -5920,10 +5925,15 @@ impl Desk {
                 };
                 let server = self.start_app_server(r.id, &socket, line).await?;
                 let thread = r.cli_session_id.as_deref().filter(|_| resume);
+                // A thread is resumed in what it last ran in, unless Desk
+                // keeps a mode for it, or it was left in one that doesn't
+                // ask: that one isn't its own, and it goes back to Codex's
+                // default.
+                let reset = left.and(thread).map(|_| crate::mode::Mode::Default);
+                let permissions = codex::Permissions::of(mode.or(reset), r.approve_for_me);
                 let follower = self.codex_follower(thread.map(str::to_string));
                 let (follower, primed) = match thread {
                     Some(thread) => {
-                        let permissions = codex::Permissions::of(mode, r.approve_for_me);
                         let params = codex::resume_params(thread, cwd, model, r.fast, permissions);
                         let (tx, rx) = oneshot::channel();
                         (follower.resuming(params, tx), Some(rx))
@@ -5957,10 +5967,9 @@ impl Desk {
                         None => codex::Launch::New,
                     },
                     prompt,
-                    approve_for_me: r.approve_for_me,
                     fast: r.fast,
                     model,
-                    mode,
+                    permissions,
                     env: &env,
                 });
                 // Codex asks the terminal's colours once, at its start.

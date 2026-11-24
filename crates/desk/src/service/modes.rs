@@ -231,11 +231,10 @@ impl Desk {
             }
             let kept = self.kept_modes().await;
             let running: Vec<(Uuid, Mode)> = {
-                let mut st = self.0.state.lock();
-                // Stopped with its mode gone: nothing is left to restore.
+                let st = self.0.state.lock();
                 let live: std::collections::HashSet<Uuid> = st.live.keys().copied().collect();
-                st.modes_started
-                    .retain(|id, _| live.contains(id) || kept.contains_key(id));
+                // A stopped one's is kept: its next start is put back in
+                // its own mode from it ([`Self::launch`]).
                 st.modes_started
                     .iter()
                     .filter(|(id, m)| !m.asks() && live.contains(id))

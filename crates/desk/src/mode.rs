@@ -21,7 +21,8 @@ pub enum Mode {
     /// Edits go ahead; commands still ask.
     AcceptEdits,
     /// The engine decides for itself what is safe (Claude Code's auto mode;
-    /// Codex's model asks when it needs to, in its sandbox).
+    /// in Codex, its own reviewer answers what its model asks, in its
+    /// sandbox: [`crate::codex::Permissions::of`]).
     Auto,
     /// It only reads and plans; nothing changes.
     Plan,
@@ -103,7 +104,11 @@ impl Mode {
 
     /// Codex's approval policy and sandbox to run in it, as both its
     /// settings and its app-server spell them. Its `on-failure` is read as
-    /// `on-request` (CLI 0.166), and its app-server refuses the word.
+    /// `on-request` (CLI 0.166), and its app-server refuses the word; who
+    /// answers what it asks is [`crate::codex::Permissions::of`]'s. Every
+    /// word here, the reviewer's `auto_review` among them, is one its
+    /// app-server has taken since CLI 0.125; none is `on-failure`, which
+    /// CLIs up to 0.140 ran as a policy of its own.
     pub fn codex_permissions(self) -> (&'static str, &'static str) {
         match self {
             Self::Default | Self::AcceptEdits | Self::Auto => ("on-request", "workspace-write"),
