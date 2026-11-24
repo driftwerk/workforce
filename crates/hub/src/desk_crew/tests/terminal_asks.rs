@@ -81,7 +81,7 @@ async fn act_fully_decides_what_a_session_asks_in_its_terminal_and_the_person_in
             home: base.clone(),
             ..Default::default()
         });
-        decides(&llm, "gh run view 4361", "ALLOW: it reads a CI run").await;
+        decides(&llm, "gh pr merge 4361", "ALLOW: it merges as asked").await;
         decides(&llm, "git push origin main", "ALLOW: it ships as asked").await;
         eventually("Desk to know it is unbound", async || {
             d.boss_unbound("desk").then_some(())
@@ -90,13 +90,13 @@ async fn act_fully_decides_what_a_session_asks_in_its_terminal_and_the_person_in
         let (s, url) = asking_in_terminal(&d, &base, "Cufflink Migration").await;
 
         // Held for the boss, and allowed by it, with no person involved.
-        let answer = tokio::time::timeout(Duration::from_secs(10), asked(&url, "gh run view 4361"))
+        let answer = tokio::time::timeout(Duration::from_secs(10), asked(&url, "gh pr merge 4361"))
             .await
             .expect("decided within seconds")
             .unwrap();
         assert_eq!(behavior(&answer), "allow", "{answer}");
         assert!(d.view(s.id).unwrap().pending.is_none());
-        assert_eq!(calls_about(&llm, "gh run view 4361").await.len(), 1);
+        assert_eq!(calls_about(&llm, "gh pr merge 4361").await.len(), 1);
         assert_eq!(
             said(&overseer, &["terminal"]),
             0,
