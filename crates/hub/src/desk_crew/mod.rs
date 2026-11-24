@@ -1735,11 +1735,17 @@ impl Crew for CrewHub {
         id: uuid::Uuid,
         answer: &str,
     ) -> Result<String, workforce_desk::crew::ItemRefused> {
-        self.me().answer_item(id, answer).await
+        let me = self.me();
+        let answered = me.answer_item(id, answer).await;
+        me.show_asks().await;
+        answered
     }
 
     async fn drop_item(&self, id: uuid::Uuid) -> Result<String, workforce_desk::crew::ItemRefused> {
-        self.me().drop_item(id).await
+        let me = self.me();
+        let dropped = me.drop_item(id).await;
+        me.show_asks().await;
+        dropped
     }
 
     async fn done_item(&self, id: uuid::Uuid) -> Result<String, workforce_desk::crew::ItemRefused> {

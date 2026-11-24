@@ -719,6 +719,62 @@ pub fn holds(text: &str, boss: &str) -> bool {
     })
 }
 
+/// What a boss's words call the person whose word a hold may wait on.
+const THE_PERSON: [&str; 4] = ["the person", "the owner", "the user", "they"];
+
+/// What comes before the person in a hold on their word: "once the owner
+/// decides", "until they answer".
+const UNTIL: [&str; 5] = ["until ", "till ", "once ", "when ", "after "];
+
+/// What comes before the person's word a hold waits for: "wait for the
+/// owner's decision", "pending the person's answer".
+const WAIT_FOR: [&str; 5] = [
+    "wait for ",
+    "waiting for ",
+    "waits for ",
+    "pending ",
+    "until ",
+];
+
+/// Whether `text`, a boss's words to a session, hold it for the person's
+/// word, not the boss's: "until the person decides", "once the owner
+/// decides", "wait for the owner's decision", "for the owner to approve",
+/// "until they answer". Such a hold is only ever sent with the question
+/// that goes to the person (DW-755: "wait for Desk to send the scope once
+/// the owner decides", and nobody asked them).
+pub fn holds_for_person(text: &str) -> bool {
+    let lower = plain(text);
+    THE_PERSON.iter().any(|who| {
+        lower.match_indices(who).any(|(at, _)| {
+            let before = &lower[..at];
+            let after = &lower[at + who.len()..];
+            if before
+                .chars()
+                .next_back()
+                .is_some_and(char::is_alphanumeric)
+                || after.starts_with(char::is_alphanumeric)
+                || UNDONE.iter().any(|u| {
+                    WAIT_FOR
+                        .iter()
+                        .any(|w| before.ends_with(&format!("{u}{w}")))
+                })
+            {
+                return false;
+            }
+            let then = after.trim_start();
+            let then = ["has ", "have ", "gives ", "give "]
+                .iter()
+                .find_map(|w| then.strip_prefix(w))
+                .unwrap_or(then);
+            let theirs = after
+                .strip_prefix("'s ")
+                .or_else(|| after.strip_prefix(" to "));
+            (UNTIL.iter().any(|u| before.ends_with(u)) && waits_on(then))
+                || (WAIT_FOR.iter().any(|w| before.ends_with(w)) && theirs.is_some_and(waits_on))
+        })
+    })
+}
+
 /// Who replies to a line message: a session, the overseer (its agent id),
 /// or the person.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1745,6 +1801,38 @@ fn short_question(question: String) -> Result<String, String> {
 
 #[cfg(test)]
 mod tests {
+    use super::holds_for_person;
+
+    #[test]
+    fn a_hold_on_the_persons_word_is_told_from_the_bosss() {
+        for held in [
+            "Stop polling CI and wait for Desk to send the scope once the owner decides.",
+            "Hold until the person decides which index to keep.",
+            "Wait for the owner's decision before you touch staging.",
+            "Don't merge: wait for the person to approve the migration.",
+            "Leave it until they answer.",
+            "Nothing more until the user has confirmed the window.",
+            "Pause here, pending the person's answer.",
+        ] {
+            assert!(holds_for_person(held), "{held}");
+        }
+        for not in [
+            "Wait for Desk to send the scope.",
+            "Until I answer, hold.",
+            "The owner decided: keep the old index.",
+            "No need to wait for the owner's decision: it's in the ticket.",
+            "Once the tests pass, open the PR.",
+            "The person's preference is small PRs.",
+            "Here is the owner's decision: keep the old index.",
+            "The person gave their answer: go with A.",
+            "Don't wait for the owner to approve: it's in the ticket.",
+            "Ask the authors to review it when they're back.",
+            "Tell the person what changed.",
+        ] {
+            assert!(!holds_for_person(not), "{not}");
+        }
+    }
+
     use super::*;
     use crate::model::{Approvals, Engine, GroupRef, SessionRecord, View};
 

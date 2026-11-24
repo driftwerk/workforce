@@ -218,9 +218,14 @@ impl CrewHub {
         });
         // Held by the plan guard: not run, and nothing posted. The next
         // wake-up or check-in comes as it would; a runaway is told once.
+        // Judged on the plan of the model the turn runs on, as it resolves
+        // it: the boss's own, wherever it was switched.
         if let Some(work) = &work {
+            let runs_on = model
+                .clone()
+                .unwrap_or_else(|| service.resolve_chat_model(&session, prompt));
             if let Some(why) =
-                Box::pin(self.held_by_plan(service, owner, work, model.as_deref())).await
+                Box::pin(self.held_by_plan(service, owner, work, Some(&runs_on))).await
             {
                 return Err(eyre::eyre!(why));
             }

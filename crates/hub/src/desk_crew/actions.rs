@@ -24,6 +24,9 @@ use super::read_only::read_only_in;
 use super::refusal::{Refusal, Refused};
 use super::CrewHub;
 
+/// Why a boss may not deny a request that only reads.
+pub(crate) const READ_NOT_DENIED: &str = "it only reads (CI status, checks, logs, git status or diff), and a hold stops new work, never reading: allow it, or tell the session what to do next with crew.nudge";
+
 /// Who a nudge goes to.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Target {
@@ -753,6 +756,9 @@ impl CrewHub {
         if let Some(why) = self.left_alone(action) {
             return Gate::No(why.into());
         }
+        if let Some(why) = self.denies_a_read(action) {
+            return Gate::No(why.into());
+        }
         // A command on a machine: what no boss does is the person's at
         // every level, unbound too.
         if let Action::MachineRun { .. } = action {
@@ -1381,6 +1387,19 @@ impl CrewHub {
     /// (a message, an answer, an approval, an interrupt, a ticket) until
     /// the person hands it to one again. Every boss still sees it. Taking
     /// it on again is the person's word ([`Action::TakeOn`]'s own gate).
+    /// Why denying a request that only reads is no boss's, at any level: a
+    /// hold stops new work, never reading (DW-755).
+    fn denies_a_read(&self, action: &Action) -> Option<&'static str> {
+        let Action::Deny { session, approval } = action else {
+            return None;
+        };
+        let view = self.desk.view(*session).ok()?;
+        view.pending
+            .as_ref()
+            .is_some_and(|p| p.id == *approval && read_only_in(&view.cwd, p))
+            .then_some(READ_NOT_DENIED)
+    }
+
     pub(crate) fn left_alone(&self, action: &Action) -> Option<String> {
         let session = match action {
             Action::AssignTicket {

@@ -68,6 +68,9 @@ pub(crate) struct Charges {
     unwoken: HashMap<String, String>,
     /// The requests a boss was given and left open: the person's now.
     left: std::collections::HashSet<Uuid>,
+    /// What a boss holds each session on the person's word for: its
+    /// question to them, as the hub's open items say.
+    asked: HashMap<Uuid, String>,
     /// The sessions whose dialog questions an Act fully boss answers, which
     /// boss that is, and how long the person's input keeps them theirs, as
     /// the hub last said.
@@ -210,6 +213,30 @@ impl Desk {
         }
     }
 
+    /// What a boss holds each session on the person's word for: its
+    /// question to them, as the hub's open items say (a session left out
+    /// holds on nothing of theirs). The sessions whose badge this changes
+    /// are shown again.
+    pub fn set_asked_of_you(&self, asked: HashMap<Uuid, String>) {
+        let changed: HashSet<Uuid> = {
+            let mut st = self.0.state.lock();
+            let was = std::mem::replace(&mut st.charges.asked, asked);
+            let now = &st.charges.asked;
+            was.keys()
+                .chain(now.keys())
+                .filter(|s| was.get(s) != now.get(s))
+                .copied()
+                .collect()
+        };
+        for session in changed {
+            if let Ok(view) = self.view(session) {
+                self.announce(DeskEvent::Session {
+                    session: Box::new(view),
+                });
+            }
+        }
+    }
+
     /// Why each boss isn't woken by what its sessions' turns end asking
     /// (its wake on a finish is off), by agent id, as the hub reads their
     /// settings: a boss left out is. The sessions whose badge this changes
@@ -283,9 +310,29 @@ impl Desk {
 
     /// Why what `view` waits on is the person's to answer though a boss
     /// runs it, if it is: they drive it, only its terminal can answer it,
-    /// its boss won't answer requests, or its boss left it to them. None
+    /// its boss won't answer requests, its boss left it to them, or its
+    /// boss holds it on the person's word, and what it asks them. None
     /// while its boss has it, and when no boss runs it.
     pub(super) fn waits_on_you(st: &super::State, view: &SessionView) -> Option<String> {
+        Self::waits_on_your_answer(st, view).or_else(|| {
+            let c = st.charges.rows.get(&view.id).filter(|c| c.live())?;
+            let asked = st.charges.asked.get(&view.id)?;
+            Some(format!("{} asks you: {asked}", Self::boss_called(st, c)))
+        })
+    }
+
+    /// What its boss calls itself, for what the person reads.
+    fn boss_called(st: &super::State, c: &Charge) -> String {
+        st.charges
+            .names
+            .get(&c.boss)
+            .cloned()
+            .unwrap_or_else(|| "Your boss".into())
+    }
+
+    /// [`Self::waits_on_you`] for what `view` asks: a request, or a
+    /// question its turn ended on.
+    fn waits_on_your_answer(st: &super::State, view: &SessionView) -> Option<String> {
         let c = st.charges.rows.get(&view.id).filter(|c| c.live())?;
         // A question its turn ended asking: the person's where they drive
         // it, its boss won't answer, or isn't woken by it. A stop with no
@@ -305,12 +352,7 @@ impl Desk {
                 _ => None,
             };
         };
-        let name = st
-            .charges
-            .names
-            .get(&c.boss)
-            .cloned()
-            .unwrap_or_else(|| "Your boss".into());
+        let name = Self::boss_called(st, c);
         if Self::wheel_now(st, c).person() {
             return Some("You're driving it.".into());
         }
@@ -339,13 +381,7 @@ impl Desk {
         if view.waits_on_you.is_some() || Self::wheel_now(st, c).person() {
             return None;
         }
-        Some(
-            st.charges
-                .names
-                .get(&c.boss)
-                .cloned()
-                .unwrap_or_else(|| "Your boss".into()),
-        )
+        Some(Self::boss_called(st, c))
     }
 
     /// Whether a boss has session `id` now ([`Self::boss_has`]): what of it

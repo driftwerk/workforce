@@ -3205,14 +3205,21 @@ pub(crate) async fn plan_login(
     route_login(service, model).await
 }
 
-/// The plan login a turn on `model` (the agent's own when unset) would run
-/// on: the first route of its chain, when that is a subscription.
+/// The plan login a turn on `model` (the agent's own when unset: its
+/// override, else its default) would run on: the first route of its chain,
+/// when that is a subscription.
 pub(crate) async fn route_login(
     service: &AgentService,
     model: Option<&str>,
 ) -> Option<crate::hub_core::logins::resolve::Login> {
     let spec = model.map_or_else(
-        || service.current_default_model.read().clone(),
+        || {
+            service
+                .active_model
+                .read()
+                .clone()
+                .unwrap_or_else(|| service.current_default_model.read().clone())
+        },
         str::to_string,
     );
     // Boxed: the turn's own future holds this one, and the chain is deep.
