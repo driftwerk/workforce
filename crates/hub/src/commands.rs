@@ -1644,6 +1644,8 @@ pub(crate) fn execute_secret(
         len = value.len(),
         "named secret stored via /secret"
     );
+    // Setups are Desk's, which runs only with Postgres: without it there is
+    // none to take the key, nor an agent to wake.
     #[cfg(feature = "postgres")]
     if let Some(told) = crate::desk_connections::setup::installed()
         .and_then(|setups| setups.key_sent(channel, user, name))

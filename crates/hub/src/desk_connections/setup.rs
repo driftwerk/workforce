@@ -3618,32 +3618,40 @@ impl Callers for Hub {
         };
         let (person, session) = (caller.person.clone(), caller.session.clone());
         tokio::spawn(async move {
-            // The turn the key came in on may still be closing.
+            // Queued behind the conversation's turn (the one the key came in
+            // on, or the agent's own): told once it has ended, never on top.
             let busy = || {
                 session
                     .as_deref()
                     .is_some_and(|s| service.live_turns.running(s))
             };
-            for _ in 0..TELL_TRIES {
-                if !busy() {
-                    break;
+            let until = Instant::now() + SETUP_TTL;
+            while Instant::now() < until {
+                if busy() {
+                    tokio::time::sleep(TELL_EVERY).await;
+                    continue;
                 }
-                tokio::time::sleep(TELL_EVERY).await;
+                match crew
+                    .run_turn(&service, &person, &conversation, &note, 0, None, None)
+                    .await
+                {
+                    // Another turn began first: it waits for that one too.
+                    Err(_) if busy() => continue,
+                    Err(e) => {
+                        tracing::warn!(agent = %service.agent_id, error = %e, "Desk couldn't tell the agent what became of a key the person sent");
+                        return;
+                    }
+                    Ok(_) => return,
+                }
             }
-            if let Err(e) = crew
-                .run_turn(&service, &person, &conversation, &note, 0, None, None)
-                .await
-            {
-                tracing::warn!(agent = %service.agent_id, error = %e, "Desk couldn't tell the agent what became of a key the person sent");
-            }
+            tracing::warn!(agent = %service.agent_id, "The conversation stayed busy, so Desk didn't tell the agent what became of a key the person sent");
         });
     }
 }
 
-/// How often, and how many times, Desk looks for the conversation's turn to
-/// end before it tells the agent there.
+/// How often Desk looks for the conversation's turn to end before it tells
+/// the agent there.
 const TELL_EVERY: Duration = Duration::from_millis(250);
-const TELL_TRIES: usize = 240;
 
 /// Setups over `connections`, and their routes.
 pub fn install(state: &Arc<crate::gateway::GatewayState>, connections: Arc<Connections>) -> Router {

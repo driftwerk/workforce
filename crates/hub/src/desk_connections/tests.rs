@@ -3194,33 +3194,53 @@ mod setups {
     }
 
     /// A key the person pastes into Desk's chat is theirs, handed over as
-    /// one sent with `cmd: secret` is.
+    /// one sent with `cmd: secret` is. One in another agent's hand-off, or
+    /// on a connection known only by its device, is nobody's.
     #[tokio::test]
-    async fn a_key_pasted_in_desks_chat_is_the_persons_own() {
+    async fn a_key_pasted_in_desks_chat_is_the_persons_own_and_a_hand_offs_never() {
         use crate::secret_cache::{testing::GlobalCache, InMemorySecretCache};
+        use workforce_agent::security::trust::TrustLevel;
         use workforce_common::secret_marker::SecretCache;
-        const PASTED: &str = concat!("lin_api_", "0123456789abcdefghijABCDEFGHIJ");
+        let pasted = format!("lin_api_{}", "x".repeat(30));
         let cache: Arc<dyn SecretCache> = Arc::new(InMemorySecretCache::with_defaults());
         let _cache = GlobalCache::install(Arc::clone(&cache));
         let (_h, s) = setups().await;
         let allan = caller("allan");
         let started = s.start(&allan, "linear", None, None, false).await.unwrap();
-        let (said, captured) = workforce_common::redact::tokenize_secrets(
-            &format!("here it is: {PASTED}"),
-            "desk:allan",
-            crate::gateway::pasted_by(Some(SARAH)),
+        let marker = |trust: Option<TrustLevel>, person: Option<&str>| {
+            let (said, captured) = workforce_common::redact::tokenize_secrets(
+                &format!("here it is: {pasted}"),
+                "desk:allan",
+                crate::gateway::pasted_by(person, trust),
+            );
+            assert_eq!(captured.len(), 1);
+            assert!(!said.contains(&pasted));
+            format!("[[secret:{}]]", captured[0].id)
+        };
+        for (trust, person) in [
+            (Some(TrustLevel::Paired), Some(SARAH)),
+            (Some(TrustLevel::Untrusted), Some(SARAH)),
+            (None, None),
+        ] {
+            assert!(s
+                .keep_given(&allan, &started.id, "api_key", &marker(trust, person))
+                .unwrap_err()
+                .contains("wasn't handed over by the person"));
+        }
+        // The hub's own token is the person's, as Owner is.
+        assert_eq!(
+            crate::gateway::pasted_by(Some(SARAH), None),
+            crate::gateway::pasted_by(Some(SARAH), Some(TrustLevel::Owner))
         );
-        assert_eq!(captured.len(), 1);
-        assert!(!said.contains(PASTED));
-        let marker = format!("[[secret:{}]]", captured[0].id);
         let kept = s
-            .keep_given(&allan, &started.id, "api_key", &marker)
+            .keep_given(
+                &allan,
+                &started.id,
+                "api_key",
+                &marker(Some(TrustLevel::Owner), Some(SARAH)),
+            )
             .unwrap();
         assert!(kept.ready, "{}", kept.test);
-        assert_eq!(
-            crate::gateway::pasted_by(None),
-            workforce_common::secret_marker::SecretSource::Unknown
-        );
     }
 
     /// A key bound to the site it was read off (Metabase's) is only ever

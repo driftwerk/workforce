@@ -164,6 +164,20 @@ pub(crate) fn hand_off_trust(
     }
 }
 
+/// Why a turn isn't run: another agent's hand-off that reads as one of the
+/// hub's commands, which run as the person (a `cmd: secret` in it would be
+/// kept as theirs). Only the person runs them.
+pub(crate) fn hand_off_refused(desk: Option<&DeskTurn>, content: &str) -> Option<&'static str> {
+    let command = [false, true]
+        .into_iter()
+        .any(|with_files| crate::commands::command_of(content, with_files).is_some());
+    (command && desk.is_some_and(DeskTurn::is_hand_off)).then_some(HAND_OFF_COMMAND)
+}
+
+/// What a hand-off that reads as a command is told.
+const HAND_OFF_COMMAND: &str =
+    "Another agent's hand-off never runs one of Desk's commands: only the person does.";
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -252,5 +266,28 @@ mod tests {
             Some(TrustLevel::Owner)
         );
         assert_eq!(hand_off_trust(None, None), None);
+    }
+
+    #[test]
+    fn a_hand_off_never_runs_a_command() {
+        let hand_off = from(DeskSpeaker::Agent {
+            name: "helper".into(),
+        });
+        let person = from(DeskSpeaker::Person);
+        let secret = "cmd: secret bank_key x";
+        assert_eq!(
+            hand_off_refused(Some(&hand_off), secret),
+            Some(HAND_OFF_COMMAND)
+        );
+        assert_eq!(
+            hand_off_refused(Some(&hand_off), "/new"),
+            Some(HAND_OFF_COMMAND)
+        );
+        assert_eq!(
+            hand_off_refused(Some(&hand_off), "Here's what I found."),
+            None
+        );
+        assert_eq!(hand_off_refused(Some(&person), secret), None);
+        assert_eq!(hand_off_refused(None, secret), None);
     }
 }
