@@ -9,7 +9,9 @@
 //! Inside the folder is no stronger than the folder: a session started in a
 //! home directory reads all of it. A repository's own config can still make
 //! a read command run a program (git's `core.fsmonitor`, a diff or textconv
-//! driver); it is the session's repository, and the person's.
+//! driver); it is the session's repository, and the person's. Both `git`
+//! and `gh` page through what the person's own config names (`core.pager`,
+//! gh's `pager`): theirs, as their shell is.
 
 use std::path::{Component, Path};
 
@@ -479,7 +481,8 @@ fn inside(cwd: &Path, path: &str) -> bool {
 }
 
 /// Whether the shell would make more of `command` than the words it splits
-/// into: a glob (`*`, `?`, `[`), a brace list (`{a,b}`), a zsh glob
+/// into: a glob (`*`, `?`, `[`, and `^` under zsh's `extendedglob`, which
+/// a person's `.zshenv` may set), a brace list (`{a,b}`), a zsh glob
 /// qualifier (`(…)`) or `=program`, a leading tilde, or a comment (`#`,
 /// which an interactive zsh doesn't take as one). Each would run words
 /// Desk never read: `{--pre=sh,.}` is a flag, `*` can match a file named
@@ -494,7 +497,7 @@ fn expands(command: &str) -> bool {
             Some(_) => {}
             None => match c {
                 '\'' | '"' => quote = Some(c),
-                '*' | '?' | '[' | '{' | '}' | '(' | ')' | '#' => return true,
+                '*' | '?' | '[' | '^' | '{' | '}' | '(' | ')' | '#' => return true,
                 '=' | '~' if word_start => return true,
                 _ => {}
             },
@@ -739,6 +742,7 @@ mod tests {
             "find * -name x",
             "grep -r secret .*",
             "cat src/?",
+            "cat ^README.md",
             "ls [.][.]",
             "ls *(e:'touch x':)",
             "cat =ls",
