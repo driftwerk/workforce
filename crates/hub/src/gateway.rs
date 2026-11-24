@@ -2592,7 +2592,9 @@ async fn handle_ws(
                                 workforce_common::redact::tokenize_secrets(
                                     &content,
                                     &channel,
-                                    workforce_common::secret_marker::SecretSource::Unknown,
+                                    pasted_by(
+                                        ws_identity_id.as_deref().or(ws_device_id.as_deref()),
+                                    ),
                                 );
 
                             // Resolve which agent to talk to
@@ -3985,6 +3987,15 @@ fn applied_by(reply: &TurnControlReply) -> Applied {
         (false, Some(REFUSED_BUSY)) => Applied::Busy,
         (false, _) => Applied::NotLive,
     }
+}
+
+/// What a secret pasted in the person's own message is stamped as: handed
+/// over by them, where the connection knows who they are.
+pub(crate) fn pasted_by(person: Option<&str>) -> workforce_common::secret_marker::SecretSource {
+    use workforce_common::secret_marker::SecretSource;
+    person.map_or(SecretSource::Unknown, |user| SecretSource::WebGateway {
+        user: user.to_string(),
+    })
 }
 
 /// A chat message offered to a live turn: an `approve <id>` / `reject <id>`

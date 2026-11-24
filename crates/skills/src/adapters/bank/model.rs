@@ -6,12 +6,13 @@ use serde::Serialize;
 use serde_json::Number;
 
 /// About how long a bank's approval lasts, an estimate: BankSync never says
-/// a consent's end over its API. Its UK page (banksync.io, "UK open banking
-/// access lasts 180 days") and its EU banks' ("again at least every 180
-/// days", Delegated Regulation (EU) 2022/2360 Art. 10a) say 180 days; its
-/// consents guide says UK banks "typically use a 90-day reconfirmation
-/// cycle". Only a reminder is drawn from it: a lapse is what BankSync says.
-pub const CONSENT_DAYS: i64 = 180;
+/// a consent's end over its API, nor which market a bank is in. Its EU banks
+/// renew "at least every 180 days" (Delegated Regulation (EU) 2022/2360
+/// Art. 10a); for the UK its pages disagree (180 days on its UK page, a
+/// "90-day reconfirmation cycle" in its consents guide), so the shorter
+/// stands for every bank: a reminder early is harmless, one late isn't.
+/// Only a reminder is drawn from it: a lapse is what BankSync says.
+pub const CONSENT_DAYS: i64 = 90;
 
 /// The days before an approval lapses on which the person is reminded.
 const REMIND_AT: &[i64] = &[7, 1, 0];
@@ -245,7 +246,7 @@ mod tests {
     #[test]
     fn an_approval_reminds_seven_days_before_the_day_before_and_on_the_day() {
         let consented: DateTime<Utc> = "2026-09-01T10:00:00Z".parse().unwrap();
-        let until = day("2027-02-28");
+        let until = day("2026-11-30");
         let reminded: Vec<i64> = (-2..=10)
             .map(|n| until - Duration::days(n))
             .map(|today| Approval::of(consented, today))

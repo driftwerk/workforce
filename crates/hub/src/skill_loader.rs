@@ -840,8 +840,8 @@ signed-in BankSync tab open Settings > Developers > API keys, make a key named \
 browser.capture_key, so it never passes through you. If the person has the key \
 already, mark the setup's key step waiting (connections.step {step: 'key', \
 state: 'waiting'}): the card asks them to send it with `cmd: secret bank_key <key>` \
-and the setup waits across turns; then keep it with connections.keep \
-{field: 'api_key', value: '[[secret:bank_key]]'}. Either way Desk \
+and the setup waits across turns: end your turn, and once it arrives Desk keeps \
+it and tells you how that went. Either way Desk \
 tests it (a key that can do more than read is refused) and keeps it.\n\
 A bank key goes in only through its setup, never with vault.set, and never with \
 any other scope.\n\

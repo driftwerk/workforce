@@ -2628,7 +2628,7 @@ pub fn spawn_slack_dispatch_loop(
                             workspace_id: workspace_id.clone(),
                             channel: channel.clone(),
                             message_ts: message_ts.clone().unwrap_or_default(),
-                            user: user.clone(),
+                            user: effective_user.clone(),
                         },
                     );
                     if !captured_secrets.is_empty() {
@@ -2688,7 +2688,7 @@ pub fn spawn_slack_dispatch_loop(
                         Some(crate::commands::Command::Secret { name, value }) => {
                             Some(CredentialReply::InThread(crate::commands::execute_secret(
                                 &session_key,
-                                &user,
+                                command_user,
                                 name.as_deref(),
                                 value.as_deref(),
                             )))
@@ -5187,9 +5187,22 @@ pub fn spawn_slack_dispatch_loop(
                     // ephemeral rather than posting to the channel.
                     if command == "/secret" {
                         let (name, value) = crate::commands::split_name_value(&text);
+                        // Kept as the person their conversation's turns run as.
+                        let person = match resolve_slack_identity_for_request(
+                            identity_store.as_ref(),
+                            workspace_concrete_surfaces
+                                .get(&workspace_id)
+                                .map(Arc::as_ref),
+                            &user,
+                        )
+                        .await
+                        {
+                            SlackIdentityForRequest::Resolved { identity_id, .. } => identity_id,
+                            _ => user.clone(),
+                        };
                         let result = crate::commands::execute_secret(
                             &session_key,
-                            &user,
+                            &person,
                             name.as_deref(),
                             value.as_deref(),
                         );

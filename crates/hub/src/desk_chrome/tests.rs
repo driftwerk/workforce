@@ -449,3 +449,42 @@ fn a_version_is_shown_only_as_digits_and_dots() {
         assert_eq!(version_of(said), "?", "{said:?}");
     }
 }
+
+/// One that updates itself, whose update didn't take (its folder isn't
+/// built at the revision, or it reloaded once and is still older), is
+/// reloaded by the person instead of waited on for ever.
+#[tokio::test]
+async fn an_extension_whose_update_didnt_take_is_reloaded_by_the_person() {
+    const ID: &str = "dghneofijcmcoipiebmbhehamminngmd";
+    for outcome in ["unbuilt", "tried"] {
+        let dir = tempfile::tempdir().unwrap();
+        let chrome = Chrome::new(dir.path().join("p.json"));
+        let port = hub(Arc::clone(&chrome)).await;
+        let mut e = ext(port, new_key()).await;
+        e.handshake_at(true, Some(SELF_UPDATING), Some(ID)).await;
+        assert!(chrome.confirm(&chrome.view()[0].id));
+        assert_eq!(e.hear().await["type"], "ready");
+        e.say(json!({ "type": "updating", "revision": REVISION, "outcome": "reloading" }))
+            .await;
+        e.say(json!({ "type": "updating", "revision": REVISION, "outcome": outcome }))
+            .await;
+        for _ in 0..400 {
+            if chrome
+                .outdated()
+                .is_some_and(|(o, _)| o == Outdated::Reload)
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            chrome.outdated(),
+            Some((Outdated::Reload, format!("chrome://extensions/?id={ID}"))),
+            "{outcome}"
+        );
+        assert_eq!(
+            chrome.view()[0].reload_at.as_deref(),
+            Some(format!("chrome://extensions/?id={ID}").as_str())
+        );
+    }
+}

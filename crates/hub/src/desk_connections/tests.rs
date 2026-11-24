@@ -1971,9 +1971,16 @@ mod setups {
     use setup::{Caller, Callers, Ended, NowKind, Setups, StepState, TabAt, Tabs, Way};
     use workforce_common::secret::Secret;
 
-    struct People;
+    /// The hub's people, and what the agents were told by Desk.
+    #[derive(Default)]
+    struct People {
+        told: Mutex<Vec<(String, String)>>,
+    }
 
     impl Callers for People {
+        fn tell(&self, caller: &Caller, note: String) {
+            self.told.lock().unwrap().push((caller.agent.clone(), note));
+        }
         fn holds_the_hub(&self, person: &str) -> bool {
             person == SARAH
         }
@@ -2000,7 +2007,7 @@ mod setups {
 
     async fn setups() -> (Hub, Arc<Setups>) {
         let h = hub().await;
-        let s = Arc::new(Setups::new(Arc::clone(&h.c), Arc::new(People)));
+        let s = Arc::new(Setups::new(Arc::clone(&h.c), Arc::new(People::default())));
         (h, s)
     }
 
@@ -2643,7 +2650,7 @@ mod setups {
         if let Some(gh) = gh {
             Arc::get_mut(&mut h.c).unwrap().services.gh = gh;
         }
-        Arc::new(Setups::new(Arc::clone(&h.c), Arc::new(People)).with_tabs(tab))
+        Arc::new(Setups::new(Arc::clone(&h.c), Arc::new(People::default())).with_tabs(tab))
     }
 
     /// A stand-in `gh`, signed in as Sarah: it never reaches the real one.
@@ -3086,6 +3093,134 @@ mod setups {
             .unwrap();
         assert_eq!(said["onFor"], json!("Allan"), "{said}");
         assert!(keys(&h.allan).iter().any(|k| k.ends_with("/api_key")));
+    }
+
+    /// A hub service for the hub's own commands.
+    async fn command_service() -> Arc<crate::serve::AgentService> {
+        use crate::serve::Compose as _;
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = workforce_common::settings::WorkforceConfig::default();
+        cfg.hub.data_dir = dir.path().to_string_lossy().into_owned();
+        cfg.memory.db_path = dir.path().join("memory.db").to_string_lossy().into_owned();
+        cfg.llm.api_key = Some("test-key".into());
+        std::mem::forget(dir);
+        crate::serve::AgentService::from_config(cfg, None)
+            .await
+            .expect("a hub service")
+    }
+
+    /// The person sends the key with `cmd: secret` and says nothing more,
+    /// through the hub's own command as their surface hands it on: from
+    /// Desk as themselves, or from Slack by their Slack id in a turn run as
+    /// them. The setup waiting on it is kept, checked and turned on, and
+    /// its agent woken with how that went. A colleague's is never theirs.
+    #[tokio::test]
+    async fn a_key_sent_alone_connects_its_setup_and_wakes_the_agent() {
+        use crate::secret_cache::{testing::GlobalCache, InMemorySecretCache};
+        use workforce_common::secret_marker::SecretCache;
+        use workforce_common::session::TurnPrincipal;
+        let cache: Arc<dyn SecretCache> = Arc::new(InMemorySecretCache::with_defaults());
+        let _cache = GlobalCache::install(Arc::clone(&cache));
+        let h = hub().await;
+        let people = Arc::new(People::default());
+        let s = Arc::new(Setups::new(
+            Arc::clone(&h.c),
+            Arc::clone(&people) as Arc<dyn Callers>,
+        ));
+        let _installed = setup::testing::Installed::install(Arc::clone(&s));
+        let service = command_service().await;
+        let waiting = |agent: &'static str| {
+            let s = Arc::clone(&s);
+            async move {
+                let who = caller(agent);
+                let started = s.start(&who, "linear", None, None, false).await.unwrap();
+                s.step(&who, &started.id, "key", StepState::Waiting, None)
+                    .unwrap();
+                s.turn_ended(&format!("s-{agent}"));
+                started.id
+            }
+        };
+        let send = |conversation: &'static str, user: &'static str, run_as: Option<&str>| {
+            let service = Arc::clone(&service);
+            let principal = TurnPrincipal::run_as(run_as.map(str::to_string));
+            async move {
+                let cmd =
+                    crate::commands::command_of(&format!("cmd: secret linear_key {GOOD}"), false)
+                        .expect("a command");
+                crate::user_config::as_principal(
+                    &principal,
+                    crate::commands::execute_command(&cmd, &service, conversation, user),
+                )
+                .await
+                .text
+            }
+        };
+        let told = || people.told.lock().unwrap().clone();
+
+        let allans = waiting("allan").await;
+        let said = send("desk:allan", "4f1c2d3e-0000-4000-8000-000000000002", None).await;
+        assert!(!said.contains("checking"), "{said}");
+        let card = card_shows(&s, &allans, NowKind::Step).await;
+        assert_eq!(card.ended, None, "a colleague's key is never the person's");
+
+        let said = send("desk:allan", SARAH, None).await;
+        assert!(said.contains("Desk is checking it with Linear"), "{said}");
+        assert!(!said.contains(GOOD));
+        let card = card_shows(&s, &allans, NowKind::Connected).await;
+        assert!(card.now.title.starts_with("Linear connected as"));
+        assert!(keys(&h.allan).iter().any(|k| k.ends_with("/api_key")));
+
+        let bens = waiting("ben").await;
+        let said = send("desk:ben", "U0SARAH", Some(SARAH)).await;
+        assert!(said.contains("Desk is checking it"), "{said}");
+        card_shows(&s, &bens, NowKind::Connected).await;
+
+        for _ in 0..400 {
+            if told().len() == 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let told = told();
+        assert_eq!(
+            told.iter().map(|(a, _)| a.as_str()).collect::<Vec<_>>(),
+            ["allan", "ben"]
+        );
+        for (_, note) in &told {
+            assert!(note.contains("Linear connected as"), "{note}");
+            assert!(note.contains("carry on"), "{note}");
+            assert!(!note.contains(GOOD));
+        }
+    }
+
+    /// A key the person pastes into Desk's chat is theirs, handed over as
+    /// one sent with `cmd: secret` is.
+    #[tokio::test]
+    async fn a_key_pasted_in_desks_chat_is_the_persons_own() {
+        use crate::secret_cache::{testing::GlobalCache, InMemorySecretCache};
+        use workforce_common::secret_marker::SecretCache;
+        const PASTED: &str = concat!("lin_api_", "0123456789abcdefghijABCDEFGHIJ");
+        let cache: Arc<dyn SecretCache> = Arc::new(InMemorySecretCache::with_defaults());
+        let _cache = GlobalCache::install(Arc::clone(&cache));
+        let (_h, s) = setups().await;
+        let allan = caller("allan");
+        let started = s.start(&allan, "linear", None, None, false).await.unwrap();
+        let (said, captured) = workforce_common::redact::tokenize_secrets(
+            &format!("here it is: {PASTED}"),
+            "desk:allan",
+            crate::gateway::pasted_by(Some(SARAH)),
+        );
+        assert_eq!(captured.len(), 1);
+        assert!(!said.contains(PASTED));
+        let marker = format!("[[secret:{}]]", captured[0].id);
+        let kept = s
+            .keep_given(&allan, &started.id, "api_key", &marker)
+            .unwrap();
+        assert!(kept.ready, "{}", kept.test);
+        assert_eq!(
+            crate::gateway::pasted_by(None),
+            workforce_common::secret_marker::SecretSource::Unknown
+        );
     }
 
     /// A key bound to the site it was read off (Metabase's) is only ever

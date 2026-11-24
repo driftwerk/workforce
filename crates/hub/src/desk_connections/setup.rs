@@ -572,11 +572,43 @@ fn given_secret(caller: &Caller, marker: &str) -> Result<Secret<String>, String>
     }
 }
 
+/// Which of `service`'s keys a secret the person named `name` is:
+/// `<service>_key` the next still to hold, `<service>_<field>` that one.
+/// `None` for no key of `service`'s.
+fn key_named(service: &str, name: &str) -> Option<Option<&'static str>> {
+    let rest = name.strip_prefix(service)?.strip_prefix('_')?;
+    let c = catalog::find(service)?;
+    match secret_fields(c).into_iter().find(|f| *f == rest) {
+        Some(field) => Some(Some(field)),
+        None => (rest == "key").then_some(None),
+    }
+}
+
+/// What the agent is told of a setup it was handed a key for, once Desk
+/// checked it: connected, or why not and what the person does.
+fn sent_outcome(view: &SetupView) -> String {
+    let now = &view.now;
+    match now.kind {
+        NowKind::Connected => format!(
+            "{}: carry on with what they asked for, using it.",
+            now.title
+        ),
+        _ => format!(
+            "{}{}: tell the person in a sentence; a new key is sent the same way.",
+            now.title,
+            now.detail
+                .as_deref()
+                .map(|d| format!(" ({d})"))
+                .unwrap_or_default()
+        ),
+    }
+}
+
 /// How the person hands their key over.
 const SEND_IT: &str = "Ask the person to send it themselves with `cmd: secret <name> <key>`.";
 
 /// How a key the person already has is handed over.
-const GIVE_A_KEY: &str = "A key never passes through you. If the person has it already, mark the key step waiting (connections.step {setup, step: \"key\", state: \"waiting\"}): the card asks them to send it with `cmd: secret <name> <key>`, and the setup waits for it across turns. Once they say it's sent, call connections.keep with its [[secret:<name>]] marker as the value. Otherwise read it off the service's page with browser.capture_key.";
+const GIVE_A_KEY: &str = "A key never passes through you. If the person has it already, mark the key step waiting (connections.step {setup, step: \"key\", state: \"waiting\"}): the card asks them to send it with `cmd: secret <service>_key <key>`, and the setup waits for it across turns: Desk keeps it, checks it and turns it on once it arrives, and tells you how that went. One sent already is kept with connections.keep, its [[secret:<name>]] marker as the value. Otherwise read it off the service's page with browser.capture_key.";
 
 /// The step the person does: what to do and where, in the hub's words,
 /// `<email>`, `<uri>` and `<name>` filled in when the card is shown.
@@ -724,6 +756,8 @@ struct Setup {
     /// The agent running it.
     by: String,
     session: Option<String>,
+    /// The conversation's key: where the person sends its key.
+    conversation: Option<String>,
     service: &'static str,
     name: String,
     key: String,
@@ -1005,7 +1039,7 @@ impl Setup {
                 // setup waits on them, across turns.
                 Some(x) if x.id == "key" => Now {
                     detail: Some(format!(
-                        "Send it here with `cmd: secret {}_key <the key>`: it goes straight to the vault on this computer, never into the chat. Then say it's sent.",
+                        "Send it here with `cmd: secret {}_key <the key>`: it goes straight to the vault on this computer, never into the chat, and Desk checks it and turns it on.",
                         self.service
                     )),
                     ..now(NowKind::Step, format!("Send {service}'s key in this conversation"))
@@ -1242,6 +1276,9 @@ pub trait Callers: Send + Sync {
     fn oversees(&self, agent: &str) -> bool;
     /// The agent `name` (its name or id) names, if there is one.
     fn agent_named(&self, name: &str) -> Option<String>;
+    /// Wakes `caller`'s agent in its conversation with `note`: what Desk
+    /// did there without it, for it to carry on from.
+    fn tell(&self, caller: &Caller, note: String);
 }
 
 /// The setups under way, over Connections.
@@ -1422,6 +1459,7 @@ impl Setups {
             person: caller.person.clone(),
             by: caller.agent.clone(),
             session: caller.session.clone(),
+            conversation: caller.session_key.clone(),
             service: c.id,
             name,
             key,
@@ -1700,13 +1738,24 @@ impl Setups {
             let _ = self.advance(caller, id).await;
             return;
         }
-        let Ok((false, write)) = self.with(caller, id, |s| {
-            let was = s.finishing;
-            s.finishing = true;
-            Ok((was, s.write))
-        }) else {
-            return;
-        };
+        if let Some(write) = self.claim(caller, id) {
+            self.finish_claimed(caller, id, write).await;
+        }
+    }
+
+    /// Takes setup `id`'s check and turning on as begun, so nothing else
+    /// begins it and a turn's end doesn't stop it: whether it takes writes,
+    /// or `None` where it was begun already.
+    fn claim(&self, caller: &Caller, id: &str) -> Option<bool> {
+        self.with(caller, id, |s| {
+            Ok((!std::mem::replace(&mut s.finishing, true)).then_some(s.write))
+        })
+        .ok()
+        .flatten()
+    }
+
+    /// [`Self::finish`], once [`Self::claim`]ed.
+    async fn finish_claimed(self: &Arc<Self>, caller: &Caller, id: &str, write: bool) {
         if let Err(e) = self.test(caller, id).await {
             let _ = self.with(caller, id, |s| {
                 s.finishing = false;
@@ -2254,7 +2303,7 @@ impl Setups {
              2. Open {} with browser.navigate, then call connections.wait. If the person must sign in, the card asks them and Desk sees when they have: never call browser.sign_in, never type or read a password.\n\
              3. Once signed in, make the key (name it like \"Desk · {}\").{making} The page hides keys from you: read {} with browser.capture_key {{connector: \"{}\"}}, with no selector: Desk finds it. The key never comes back to you. Make and read it in this turn: Desk's tab closes when your turn ends.\n\
              4. Call connections.wait: Desk checks it with the service and turns it on itself.\n\
-             If the person makes the key themselves or has one already, call connections.step {{setup, step: \"key\", state: \"waiting\"}}: the card asks them to send it with `cmd: secret {}_key <the key>`, and the setup waits for them across turns. Once they say it's sent, call connections.keep {{setup, field: \"{}\", value: \"[[secret:{}_key]]\"}}, then connections.wait: Desk checks it the same way.",
+             If the person makes the key themselves or has one already, call connections.step {{setup, step: \"key\", state: \"waiting\"}}: the card asks them to send it with `cmd: secret {}_key <the key>`, and the setup waits for them across turns. Tell them so and end your turn: once it arrives Desk keeps it, checks it and turns it on by itself, and tells you how that went, so they never have to say it's sent. Where they sent it already, call connections.keep {{setup, field: \"{}\", value: \"[[secret:{}_key]]\"}}, then connections.wait.",
             if plain.is_empty() { "nothing".to_string() } else { plain.join(", ") },
             page,
             view.name,
@@ -2605,10 +2654,22 @@ impl Setups {
         field: &str,
         marker: &str,
     ) -> Result<KeptKey, String> {
+        self.keep_handed(caller, id, Some(field), marker)
+    }
+
+    /// [`Self::keep_given`], into key `field`, else the next still to hold
+    /// that it is shaped for.
+    fn keep_handed(
+        &self,
+        caller: &Caller,
+        id: &str,
+        field: Option<&str>,
+        marker: &str,
+    ) -> Result<KeptKey, String> {
         self.check_caller(caller)?;
         let connector = self.with(caller, id, |s| {
             let c = catalog::find(s.service).expect("in the catalog");
-            if !secret_fields(c).contains(&field) {
+            if let Some(field) = field.filter(|f| !secret_fields(c).contains(f)) {
                 return Err(format!("{field} isn't one of {}'s keys", c.name));
             }
             if key_bound_to_page(s.service) {
@@ -2626,7 +2687,91 @@ impl Setups {
             return Err(format!("This {connector} setup isn't waiting on a key now, so nothing was kept: Desk is already checking one, or a newer setup took its place."));
         }
         let value = given_secret(caller, marker)?;
-        self.hold(caller, id, connector, Some(field), value, None)
+        self.hold(caller, id, connector, field, value, None)
+    }
+
+    /// The person sent `name` with `cmd: secret` in `conversation`. Where a
+    /// setup of theirs there takes a key in the conversation and `name` is
+    /// one of its keys' (`<service>_key`, or `<service>_<field>`), it is kept
+    /// as that key, checked with the service and turned on, and the agent
+    /// running it is told how that went, so it carries on with nothing more
+    /// said. What the person is told of it, where a setup took it.
+    pub fn key_sent(
+        self: &Arc<Self>,
+        conversation: &str,
+        person: &str,
+        name: &str,
+    ) -> Option<String> {
+        let (caller, id, service, field) = self.taking(conversation, person, name)?;
+        let kept = self.keep_handed(&caller, &id, field, &format!("[[secret:{name}]]"));
+        let claimed = match &kept {
+            Ok(k) if k.ready => self.claim(&caller, &id),
+            _ => None,
+        };
+        let c = catalog::find(service).expect("in the catalog");
+        let told = match &kept {
+            Ok(k) if k.ready => format!("Desk is checking it with {} and turning it on.", c.name),
+            Ok(k) => format!("Desk kept it as {}'s {}; it {}.", c.name, k.field, k.test),
+            Err(e) => format!("Desk didn't keep it as {}'s key: {e}", c.name),
+        };
+        let (this, name) = (Arc::clone(self), name.to_string());
+        tokio::spawn(async move {
+            if let Some(write) = claimed {
+                this.finish_claimed(&caller, &id, write).await;
+            }
+            let outcome = match kept {
+                Ok(k) if k.ready => this
+                    .with(&caller, &id, |s| Ok(s.view()))
+                    .map(|v| sent_outcome(&v))
+                    .unwrap_or_else(|e| e),
+                Ok(k) => format!("It is kept as its {}, and the setup {}: ask the person for the rest the same way.", k.field, k.test),
+                Err(e) => format!("Desk didn't keep it: {e}"),
+            };
+            this.callers.tell(
+                &caller,
+                format!("The person sent {}'s key with `cmd: secret {name}` for the setup [{id}], and Desk took it straight to the setup, never through you. {outcome}", c.name),
+            );
+        });
+        Some(told)
+    }
+
+    /// The setup in `conversation` of `person`'s that a key `name` they
+    /// sent there is for, with its caller and the key's field where `name`
+    /// names one.
+    #[allow(clippy::type_complexity)]
+    fn taking(
+        &self,
+        conversation: &str,
+        person: &str,
+        name: &str,
+    ) -> Option<(Caller, String, &'static str, Option<&'static str>)> {
+        let setups = self.setups.lock().expect("setups poisoned");
+        let now = Instant::now();
+        setups
+            .values()
+            .filter(|s| {
+                s.person == person
+                    && s.conversation.as_deref() == Some(conversation)
+                    && s.way == Way::Browser
+                    && s.flow.is_none()
+                    && s.until > now
+                    && s.ended.is_none()
+                    && s.connected.is_none()
+                    && !s.finishing
+                    && !key_bound_to_page(s.service)
+            })
+            .filter_map(|s| Some((s, key_named(s.service, name)?)))
+            .max_by_key(|(s, _)| s.started_at)
+            .map(|(s, field)| {
+                let caller = Caller {
+                    person: s.person.clone(),
+                    agent: s.by.clone(),
+                    session: s.session.clone(),
+                    session_key: s.conversation.clone(),
+                    overseer: s.overseer,
+                };
+                (caller, s.id.clone(), s.service, field)
+            })
     }
 
     /// Holds `value` as key `field` of setup `id` (the next one still to
@@ -3398,7 +3543,39 @@ static INSTALLED: OnceLock<Arc<Setups>> = OnceLock::new();
 
 /// The hub's setups, once a `[desk]` hub mounted Connections.
 pub fn installed() -> Option<Arc<Setups>> {
+    #[cfg(test)]
+    if let Some(setups) = testing::ON_THIS_THREAD.with(|s| s.borrow().clone()) {
+        return Some(setups);
+    }
     INSTALLED.get().cloned()
+}
+
+#[cfg(test)]
+pub(crate) mod testing {
+    use std::cell::RefCell;
+
+    use super::*;
+
+    thread_local! {
+        pub(super) static ON_THIS_THREAD: RefCell<Option<Arc<Setups>>> = const { RefCell::new(None) };
+    }
+
+    /// `setups` as the hub's, for the test on this thread (a current-thread
+    /// runtime's tasks with it) until dropped.
+    pub(crate) struct Installed;
+
+    impl Installed {
+        pub(crate) fn install(setups: Arc<Setups>) -> Self {
+            ON_THIS_THREAD.with(|s| *s.borrow_mut() = Some(setups));
+            Self
+        }
+    }
+
+    impl Drop for Installed {
+        fn drop(&mut self) {
+            ON_THIS_THREAD.with(|s| s.borrow_mut().take());
+        }
+    }
 }
 
 /// The hub's callers, from its registry and identities.
@@ -3428,7 +3605,45 @@ impl Callers for Hub {
             })
             .map(|s| s.agent_id.as_str().to_string())
     }
+
+    fn tell(&self, caller: &Caller, note: String) {
+        let Some(service) = self.0.registry.get(&caller.agent) else {
+            return;
+        };
+        let (Some(crew), Some(conversation)) = (
+            crate::desk_crew::for_service(&service),
+            caller.session_key.clone(),
+        ) else {
+            return;
+        };
+        let (person, session) = (caller.person.clone(), caller.session.clone());
+        tokio::spawn(async move {
+            // The turn the key came in on may still be closing.
+            let busy = || {
+                session
+                    .as_deref()
+                    .is_some_and(|s| service.live_turns.running(s))
+            };
+            for _ in 0..TELL_TRIES {
+                if !busy() {
+                    break;
+                }
+                tokio::time::sleep(TELL_EVERY).await;
+            }
+            if let Err(e) = crew
+                .run_turn(&service, &person, &conversation, &note, 0, None, None)
+                .await
+            {
+                tracing::warn!(agent = %service.agent_id, error = %e, "Desk couldn't tell the agent what became of a key the person sent");
+            }
+        });
+    }
 }
+
+/// How often, and how many times, Desk looks for the conversation's turn to
+/// end before it tells the agent there.
+const TELL_EVERY: Duration = Duration::from_millis(250);
+const TELL_TRIES: usize = 240;
 
 /// Setups over `connections`, and their routes.
 pub fn install(state: &Arc<crate::gateway::GatewayState>, connections: Arc<Connections>) -> Router {

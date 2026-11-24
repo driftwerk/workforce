@@ -104,8 +104,9 @@ type Answer = oneshot::Sender<std::result::Result<Value, String>>;
 struct Conn {
     out: mpsc::UnboundedSender<String>,
     waiting: Arc<parking_lot::Mutex<HashMap<u64, Answer>>>,
-    /// Where its extension is older than this hub needs, as its hello said.
-    outdated: Option<Outdated>,
+    /// Where its extension is older than this hub needs, as its hello said
+    /// and its update since went.
+    outdated: parking_lot::Mutex<Option<Outdated>>,
     /// Its extension's id, as Desk Helper said it from Chrome's origin.
     extension: Option<String>,
 }
@@ -210,7 +211,7 @@ impl Chrome {
             .filter(|p| p.confirmed || asking.contains(&p.id))
             .map(|p| {
                 let conn = live.get(&p.id);
-                let outdated = conn.and_then(|c| c.outdated);
+                let outdated = conn.and_then(|c| *c.outdated.lock());
                 ProfileView {
                     id: p.id.clone(),
                     label: p.label.clone(),
@@ -230,8 +231,8 @@ impl Chrome {
     /// Chrome's page for it.
     pub fn outdated(&self) -> Option<(Outdated, String)> {
         let conn = self.chosen_conn()?;
-        conn.outdated
-            .map(|o| (o, extensions_page(conn.extension.as_deref())))
+        let outdated = *conn.outdated.lock();
+        outdated.map(|o| (o, extensions_page(conn.extension.as_deref())))
     }
 
     /// Whether the profile Desk uses is connected now.
@@ -443,7 +444,9 @@ impl Chrome {
         let conn = Arc::new(Conn {
             out,
             waiting: Default::default(),
-            outdated: Outdated::of(hello["revision"].as_u64().unwrap_or(1)),
+            outdated: parking_lot::Mutex::new(Outdated::of(
+                hello["revision"].as_u64().unwrap_or(1),
+            )),
             extension: hello["extension"]
                 .as_str()
                 .filter(|id| is_extension_id(id))
@@ -518,6 +521,14 @@ impl Chrome {
                 Some("stopped") => crate::desk_browser::stop_everything().await,
                 _ => {}
             },
+            // Desk Helper passes on an update that didn't take: the person
+            // reloads it.
+            Some("updating") if matches!(m["outcome"].as_str(), Some("unbuilt" | "tried")) => {
+                let mut outdated = conn.outdated.lock();
+                if outdated.is_some() {
+                    *outdated = Some(Outdated::Reload);
+                }
+            }
             _ => {}
         }
     }
@@ -585,7 +596,8 @@ impl ExtensionLink for Chrome {
         let conn = self
             .chosen_conn()
             .ok_or_else(|| eyre!(browser::NOT_CONNECTED))?;
-        if let Some(outdated) = conn.outdated.filter(|_| !matches!(cmd, "close" | "stop")) {
+        let outdated = *conn.outdated.lock();
+        if let Some(outdated) = outdated.filter(|_| !matches!(cmd, "close" | "stop")) {
             return Err(eyre!(outdated.said()));
         }
         let id = self.next.fetch_add(1, Ordering::Relaxed);
@@ -653,7 +665,7 @@ impl Outdated {
     pub fn said(self) -> &'static str {
         match self {
             Self::Updating => "Desk's extension in the person's Chrome is updating itself to the build this Desk needs, so nothing was done: try again in a moment.",
-            Self::Reload => "Desk's extension in the person's Chrome is an old build that can't update itself, so Desk didn't use it. The setup's card and Settings → Browser ask the person to reload it once, and open Chrome's page for it: wait while they do (connections.wait), then try again.",
+            Self::Reload => "Desk's extension in the person's Chrome is an older build than this Desk needs and didn't update itself, so Desk didn't use it. The setup's card and Settings → Browser ask the person to reload it once, and open Chrome's page for it: wait while they do (connections.wait), then try again.",
         }
     }
 }

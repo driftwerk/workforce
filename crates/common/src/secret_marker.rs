@@ -140,14 +140,16 @@ impl std::fmt::Display for MarkerId {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SecretSource {
     /// Pasted into a Slack channel/thread. `message_ts` lets us build a
-    /// permalink for the "please delete" prompt.
+    /// permalink for the "please delete" prompt. `user` is the person as
+    /// the hub knows them: their identity where their Slack id maps to one.
     Slack {
         workspace_id: String,
         channel: String,
         message_ts: String,
         user: String,
     },
-    /// Came from a UI/web client message.
+    /// Came from a UI/web client message: Desk's chat, as the person the
+    /// connection is signed in as.
     WebGateway { user: String },
     /// Voice transcript — typically can't contain a real key but covered
     /// for completeness.
@@ -187,7 +189,7 @@ impl SecretSource {
     ///
     /// Only [`SecretSource::ToolResult`] qualifies. [`SecretSource::Unknown`]
     /// deliberately does not: every path that stamps it today is a *user
-    /// message* whose surface didn't classify itself further (gateway, Slack
+    /// message* whose surface didn't classify itself further (a Slack
     /// follow-up, the defence-in-depth pass in `serve`), so treating it as
     /// scraped would refuse the user's own pasted credential. A new capture
     /// path that reads external content must stamp `ToolResult`.

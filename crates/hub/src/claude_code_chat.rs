@@ -1865,7 +1865,7 @@ impl ClaudeChatService {
                     workspace_id: turn.workspace_id.clone(),
                     channel: turn.channel.clone(),
                     message_ts: turn.message_ts.clone().unwrap_or_default(),
-                    user: turn.user.clone(),
+                    user: turn.owner().to_string(),
                 },
             );
             turn.text = tokenized_text;
