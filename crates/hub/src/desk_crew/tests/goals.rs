@@ -444,11 +444,20 @@ async fn asked(d: &Desk, id: uuid::Uuid) -> uuid::Uuid {
 /// The person writes `text` in a thread of `boss`'s DM.
 fn person_says_in_a_thread(boss: &AgentService, text: &str) {
     let channel = workforce_core::desk::dm_thread_channel(&uuid::Uuid::new_v4().to_string());
+    says_in_thread(boss, &channel, text, true);
+}
+
+/// The person, else the boss, writes `text` in the DM thread `channel`.
+fn says_in_thread(boss: &AgentService, channel: &str, text: &str, person: bool) {
     let mut thread = boss
         .sessions
-        .get_or_create(&channel, PERSON, "desk")
+        .get_or_create(channel, PERSON, "desk")
         .unwrap();
-    thread.add_user_message(text, None);
+    if person {
+        thread.add_user_message(text, None);
+    } else {
+        thread.add_assistant_message(text, 0);
+    }
     boss.sessions.save(&thread).unwrap();
     boss.sessions
         .append_to_archive(&thread.id, thread.messages.last().unwrap())
@@ -657,9 +666,10 @@ async fn a_goal_the_person_changes_themselves_applies_on_their_words() {
 }
 
 /// The boss proposes a new goal and result in its DM, as a table; the
-/// person's plain "yes" right after it replaces both (DW-757), and the
-/// goal checks then measure the new result. A reply that isn't plainly to
-/// that proposal, or a goal it didn't say, still refuses.
+/// person's plain "yes" right after it replaces both (DW-757), as their
+/// "ok" in a thread does to one proposed there, and the goal checks then
+/// measure the new result. A reply that isn't plainly to that proposal,
+/// or a goal it didn't say, still refuses.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_persons_plain_yes_to_the_bosss_proposal_in_the_dm_replaces_the_goal() {
     with_test_pool(workforce_desk::store::build_pool, |pool| async move {
@@ -671,9 +681,9 @@ async fn the_persons_plain_yes_to_the_bosss_proposal_in_the_dm_replaces_the_goal
         let id = agreed_plan(&overseer, &s, judged()).await;
         let goal = "Keep acme/web's CI green on main";
         let proposal = "**Proposed done-when goal:**\n\n| Goal | Done when |\n|---|---|\n| Keep acme/web’s CI green on main | **Done when CI on main is green** |\n\nYes, or change it?";
-        let change = |goal: &str| {
+        let change = |goal: &str, said: &str| {
             json!({ "plan_id": id.to_string(), "goal": goal, "result": green("acme/web", 1),
-                    "person_said": "yes", "why": "They said yes." })
+                    "person_said": said, "why": "They agreed." })
         };
         let pause = || tokio::time::sleep(Duration::from_millis(20));
 
@@ -683,7 +693,7 @@ async fn the_persons_plain_yes_to_the_bosss_proposal_in_the_dm_replaces_the_goal
         person_says(&overseer, "yes");
         pause().await;
         person_says(&overseer, "hmm, wait a moment");
-        let r = run(&overseer, "crew.plan_update", change(goal)).await;
+        let r = run(&overseer, "crew.plan_update", change(goal, "yes")).await;
         assert!(!r.success, "more came after the yes: {r:?}");
         let why = r.error.unwrap();
         assert!(why.contains("Propose the change to them in your DM"), "{why}");
@@ -693,19 +703,41 @@ async fn the_persons_plain_yes_to_the_bosss_proposal_in_the_dm_replaces_the_goal
         boss_says(&overseer, proposal);
         pause().await;
         person_says(&overseer, "Yes.");
-        let r = run(&overseer, "crew.plan_update", change("Ship the docs")).await;
+        let r = run(&overseer, "crew.plan_update", change("Ship the docs", "yes")).await;
         assert!(!r.success, "{r:?}");
         let why = r.error.unwrap();
         assert!(why.contains("doesn't say the goal “Ship the docs”"), "{why}");
         assert_eq!(d.plan(id).await.unwrap().summary.plan.goal, "Keep the docs build green");
 
-        let r = run(&overseer, "crew.plan_update", change(goal)).await;
+        let r = run(&overseer, "crew.plan_update", change(goal, "yes")).await;
         assert!(r.success, "{r:?}");
         let p = d.plan(id).await.unwrap().summary.plan;
         assert_eq!(p.goal, goal);
         assert_eq!(p.result.as_ref().map(|r| r.words.as_str()), Some("Done when CI on main is green"));
         assert!(!p.awaiting(), "their yes applies it");
         assert!(p.met.is_none(), "red as it was changed");
+
+        // Proposed in a thread of the DM, answered there.
+        let thread = workforce_core::desk::dm_thread_channel(&uuid::Uuid::new_v4().to_string());
+        let wider = "Keep acme/web's CI green on main and the docs built";
+        let in_thread = format!("How about this goal?\n\n| Goal |\n|---|\n| {wider} |");
+        pause().await;
+        says_in_thread(&overseer, &thread, &in_thread, false);
+        pause().await;
+        says_in_thread(&overseer, &thread, "ok", true);
+        pause().await;
+        says_in_thread(&overseer, &thread, "and the API docs too?", true);
+        let r = run(&overseer, "crew.plan_update", change(wider, "ok")).await;
+        assert!(!r.success, "more came after the ok: {r:?}");
+        pause().await;
+        says_in_thread(&overseer, &thread, &in_thread, false);
+        pause().await;
+        says_in_thread(&overseer, &thread, "ok", true);
+        let r = run(&overseer, "crew.plan_update", change(wider, "ok")).await;
+        assert!(r.success, "{r:?}");
+        let p = d.plan(id).await.unwrap().summary.plan;
+        assert_eq!(p.goal, wider);
+        assert!(!p.awaiting(), "their ok applies it");
 
         crew.plan_turn_now(id, vec!["A turn of its session ended.".into()])
             .await;

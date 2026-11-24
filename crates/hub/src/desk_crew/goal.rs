@@ -741,10 +741,11 @@ impl CrewHub {
         Ok((None, at))
     }
 
-    /// When `quote` is the person's plain reply in their DM ("yes", "ok")
-    /// to the boss's own last message there, which proposed `applying`'s
-    /// goal and result in the words it passes: none when it isn't such a
-    /// reply, refused when the message it answers proposed other words.
+    /// When `quote` is the person's plain reply ("yes", "ok") to the
+    /// boss's own last message before it, in their DM or a thread of it,
+    /// which proposed `applying`'s goal and result in the words it passes:
+    /// none when it is no such reply, refused when the message it answers
+    /// proposed other words.
     fn replied_at(
         &self,
         service: &AgentService,
@@ -754,16 +755,6 @@ impl CrewHub {
         let Some(person) = self.person(Some(service)) else {
             return Ok(None);
         };
-        let theirs: Vec<_> = super::orchestrator::person_messages(
-            service,
-            &person,
-            crew::now() - AGREED_WITHIN,
-            MESSAGES_READ,
-        )
-        .into_iter()
-        .map(|(at, text)| (at, goal::answered_text(&text).to_string()))
-        .collect();
-        let boss = super::orchestrator::boss_said(service, &person, MESSAGES_READ);
         let proposed: Vec<(&str, &str)> = [
             applying.goal.as_deref().map(|g| ("the goal", g)),
             applying
@@ -775,15 +766,35 @@ impl CrewHub {
         .flatten()
         .collect();
         let words: Vec<&str> = proposed.iter().map(|(_, w)| *w).collect();
-        match goal::replied_to(&theirs, &boss, quote, &words) {
-            Ok(at) => Ok(Some(at)),
-            Err(NotReplied::NotProposed(n)) => Err(format!(
+        let replies: Vec<_> = super::orchestrator::dm_talks(
+            service,
+            &person,
+            crew::now() - AGREED_WITHIN,
+            MESSAGES_READ,
+        )
+        .into_iter()
+        .map(|talk| {
+            let theirs: Vec<_> = talk
+                .theirs
+                .into_iter()
+                .map(|(at, text)| (at, goal::answered_text(&text).to_string()))
+                .collect();
+            goal::replied_to(&theirs, &talk.boss, quote, &words)
+        })
+        .collect();
+        let unproposed = replies.iter().find_map(|r| match r {
+            Err(NotReplied::NotProposed(n)) => Some(*n),
+            _ => None,
+        });
+        match (replies.into_iter().filter_map(Result::ok).max(), unproposed) {
+            (Some(at), _) => Ok(Some(at)),
+            (None, Some(n)) => Err(format!(
                 "The person's “{}” answers your last message before it, which doesn't say {} “{}” word for word. Pass it exactly as you wrote it there; if you mean something else, put that to them in plain words first.",
                 crew::one_line(quote, 120),
                 proposed[n].0,
                 crew::one_line(proposed[n].1, 120)
             )),
-            Err(NotReplied::NoPlainReply | NotReplied::NothingProposed) => Ok(None),
+            (None, None) => Ok(None),
         }
     }
 
