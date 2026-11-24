@@ -26,7 +26,8 @@ fn fake_codex(dir: &Path) -> PathBuf {
     workforce_common::executable::write(
         &path,
         format!(
-            "#!/bin/sh\n[ \"$1\" = app-server ] && echo \"${{3#unix://}}\" > '{d}/listen'\n\
+            "#!/bin/sh\ncase \"$1\" in app-server|--remote|resume) ;; *) exit 0 ;; esac\n\
+             [ \"$1\" = app-server ] && echo \"${{3#unix://}}\" > '{d}/listen'\n\
              case \"$1\" in --remote|resume) echo \"$@\" > '{d}/tui-args' ;; esac\nexec sleep 60\n",
             d = dir.display()
         ),
@@ -517,7 +518,8 @@ async fn an_agents_codex_sessions_run_as_fast_as_the_agent() {
         DeskStore::migrate(&pool).await.unwrap();
         let d = Desk::start(
             DeskStore::from_pool(pool),
-            options(dir.path()),
+            // The stand-in: Desk reads no real `codex` it may find.
+            options(dir.path()).with_program(Engine::Codex, fake_codex(dir.path())),
             Default::default(),
             CancellationToken::new(),
         )

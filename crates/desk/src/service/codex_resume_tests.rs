@@ -24,15 +24,18 @@ use crate::store::{build_pool, DeskStore};
 
 const REFUSED: &str = "Error: Permission overrides are not supported when resuming a remote task.";
 
-/// A stand-in `codex`: its app-server says where it was told to listen; its
+/// A stand-in `codex`: Desk's other runs of it (its version, its sign-in)
+/// end at once; its app-server says where it was told to listen; its
 /// TUI writes down how it was started, one line each, and refuses a resume
-/// given a permission (or any, once `refuse` is in `dir`) as 0.166 does.
+/// given a permission (or any, once `refuse` is in `dir`) as 0.166 does;
+/// else it draws its screen, the alternate one, unless `hang` is in `dir`.
 fn fake_codex(dir: &Path) -> PathBuf {
     let path = dir.join("fake-codex");
     workforce_common::executable::write(
         &path,
         format!(
             "#!/bin/sh\nd='{d}'\n\
+             case \"$1\" in app-server|--remote|resume) ;; *) exit 0 ;; esac\n\
              if [ \"$1\" = app-server ]; then echo \"${{3#unix://}}\" > \"$d/listen\"; exec sleep 60; fi\n\
              echo \"$@\" >> \"$d/tui-args\"\n\
              refuse() {{ printf '\\033[?1049h>_ OpenAI Codex (v0.166.0)\\r\\n\\033[?1049l{REFUSED}\\r\\n'; exec sleep 60; }}\n\
@@ -40,6 +43,7 @@ fn fake_codex(dir: &Path) -> PathBuf {
              [ -e \"$d/refuse\" ] && refuse\n\
              for a in \"$@\"; do case \"$a\" in approval_policy=*|approvals_reviewer=*|sandbox_mode=*) refuse ;; esac; done\n\
              fi\n\
+             [ -e \"$d/hang\" ] || printf '\\033[?1049h>_ OpenAI Codex (v0.166.0)\\r\\n'\n\
              exec sleep 60\n",
             d = dir.display()
         ),
@@ -342,6 +346,7 @@ async fn a_codex_session_runs_in_its_own_mode_unless_one_that_doesnt_ask_is_kept
             .await;
         assert_eq!(asked, [reset]);
         until(|| tui_starts(&dir).len() == 10).await;
+        until(|| d.view(s.id).unwrap().state == SessionState::Idle).await;
         turn(&d, s.id, &mut ws).await;
         stopped(&d, s.id).await;
         let (asked, _) = started_again(&d, &dir, &[ok], move |d| async move {
@@ -351,6 +356,97 @@ async fn a_codex_session_runs_in_its_own_mode_unless_one_that_doesnt_ask_is_kept
         assert_eq!(asked, [its_own(&dir)]);
         until(|| tui_starts(&dir).len() == 11).await;
         assert!(tui_has_no_permissions());
+    })
+    .await;
+}
+
+/// What the session's warnings said, as the test's runtime runs it.
+#[derive(Clone, Default)]
+struct Said(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl std::io::Write for Said {
+    fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(b);
+        Ok(b.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl Said {
+    fn has(&self, what: &str) -> bool {
+        String::from_utf8_lossy(&self.0.lock().unwrap()).contains(what)
+    }
+}
+
+/// A resumed session is up once its TUI is on its screen, never on
+/// Desk's own resume of its thread: one that never draws stays starting,
+/// and is said so; one that never starts is never up.
+#[tokio::test]
+async fn a_resumed_codex_session_is_up_only_once_its_tui_is_on_its_screen() {
+    let said = Said::default();
+    let _said = tracing::subscriber::set_default(
+        tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::WARN)
+            .with_writer({
+                let said = said.clone();
+                move || said.clone()
+            })
+            .finish(),
+    );
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let dir = dir.path().canonicalize().unwrap();
+        let (d, s) = started(pool, &dir).await;
+        let ok = json!({"thread": {"id": "t1"}});
+        let resume =
+            move |d: Desk| async move { d.resume(s.id, None, Some(By::you())).await.map(drop) };
+        let state = || d.view(s.id).unwrap().state;
+
+        // On its screen: up. It is told to take it, whatever the person's
+        // settings say: one running inline never would.
+        stopped(&d, s.id).await;
+        started_again(&d, &dir, std::slice::from_ref(&ok), resume).await;
+        until(|| state() == SessionState::Idle).await;
+        let last = tui_starts(&dir).pop().unwrap();
+        assert!(last.contains("tui.alternate_screen=\"always\""), "{last}");
+
+        // Its thread loaded, but its TUI never takes its screen: still starting, and
+        // said so once its start's watch is over.
+        stopped(&d, s.id).await;
+        std::fs::write(dir.join("hang"), "").unwrap();
+        started_again(&d, &dir, std::slice::from_ref(&ok), resume).await;
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert_eq!(state(), SessionState::Starting);
+        assert!(d.view(s.id).unwrap().live);
+        until(|| said.has("a Codex session is still starting")).await;
+        assert_eq!(state(), SessionState::Starting);
+        stopped(&d, s.id).await;
+        std::fs::remove_file(dir.join("hang")).unwrap();
+
+        // Its thread loaded, and then its TUI can't start: never up.
+        let program = dir.join("fake-codex");
+        let mode = |m| {
+            std::fs::set_permissions(&program, std::os::unix::fs::PermissionsExt::from_mode(m))
+                .unwrap()
+        };
+        let server = serve(&dir);
+        let failed = tokio::spawn(resume(d.clone()));
+        let mut ws = server.await.unwrap();
+        mode(0o644);
+        resumed(&mut ws, ok.clone()).await;
+        let _ = failed.await.unwrap();
+        mode(0o755);
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let v = d.view(s.id).unwrap();
+        assert!(!v.live && v.state != SessionState::Idle, "{v:?}");
+
+        // Started again: up.
+        started_again(&d, &dir, std::slice::from_ref(&ok), resume).await;
+        until(|| state() == SessionState::Idle).await;
     })
     .await;
 }
@@ -380,6 +476,7 @@ async fn a_codex_session_keeps_its_mode_through_every_start_and_a_refusal_is_sai
         assert!(!started.contains("approval") && !started.contains("sandbox"), "{started}");
         tokio::time::sleep(Duration::from_millis(600)).await;
         assert!(d.view(s.id).unwrap().live, "its TUI took the resume");
+        until(|| d.view(s.id).unwrap().state == SessionState::Idle).await;
 
         // Interrupted mid-turn: its turn stops, and it isn't started again.
         say(&mut ws, status("active")).await;

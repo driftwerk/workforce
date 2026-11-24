@@ -55,6 +55,18 @@ pub struct CodexSpawn<'a> {
 /// apply. Given to the TUI, whose settings start and resume its thread.
 pub const FAST: &str = "service_tier=\"priority\"";
 
+/// Keeps the TUI from asking, as it starts, whether to update Codex: once a
+/// newer release is out, CLI 0.166 holds its start on that question until
+/// someone answers it in its terminal, which no boss sees. Desk reads the
+/// CLI's version itself.
+const NO_UPDATE_PROMPT: &str = "check_for_update_on_startup=false";
+
+/// Has the TUI take the alternate screen whatever the person's settings
+/// say: a resumed session is up once its TUI is on it, and one running
+/// inline (`never`, or `auto` where Codex judges the terminal can't) would
+/// never be (verified on CLI 0.166, through `--remote`).
+const ALTERNATE_SCREEN: &str = "tui.alternate_screen=\"always\"";
+
 /// The tier [`FAST`] names, as the app-server's `serviceTier`.
 const PRIORITY: &str = "priority";
 
@@ -117,9 +129,10 @@ pub fn spawn(s: &CodexSpawn<'_>) -> Spawn {
         "-C".to_string(),
         s.cwd.display().to_string(),
     ]);
-    let settings = permissions
+    let settings = [NO_UPDATE_PROMPT, ALTERNATE_SCREEN]
+        .map(str::to_string)
         .into_iter()
-        .flat_map(Permissions::settings)
+        .chain(permissions.into_iter().flat_map(Permissions::settings))
         .chain(s.fast.then(|| FAST.to_string()))
         // A TOML string, so it is only ever the value of `model`.
         .chain(
@@ -528,6 +541,12 @@ pub enum CodexEvent {
     /// A conversation (not one of Codex's own side threads) started; its
     /// rollout file, when the server says where.
     Thread {
+        rollout: Option<String>,
+    },
+    /// Desk's own resume loaded the conversation, before its TUI joins it;
+    /// its rollout file, when the server says where. Not a sign the
+    /// session is up: its TUI isn't yet.
+    Loaded {
         rollout: Option<String>,
     },
     Working {
@@ -1274,19 +1293,33 @@ impl Follower {
                     }
                     return (Vec::new(), None);
                 }
-                if let Some(p) = priming {
+                let Some(thread) = self.thread.clone() else {
+                    return (Vec::new(), None);
+                };
+                tracing::info!(target: crate::STARTS, %thread, "codex: following its thread");
+                // Loaded by its own resume: a resume says no
+                // `thread/started` (CLI 0.166), so this is where it is.
+                let loaded = priming.map(|p| {
                     let _ = p.told.send(Ok(()));
-                }
-                // What the thread runs with, as Codex says it.
-                let said = v
+                    Seen {
+                        thread: thread.clone(),
+                        event: CodexEvent::Loaded {
+                            rollout: v
+                                .pointer("/result/thread/path")
+                                .and_then(Value::as_str)
+                                .map(str::to_string),
+                        },
+                    }
+                });
+                // What it runs with, as Codex says it.
+                let reviewer = v
                     .pointer("/result/approvalsReviewer")
                     .and_then(Value::as_str)
-                    .zip(self.thread.clone())
-                    .map(|(reviewer, thread)| Seen {
+                    .map(|reviewer| Seen {
                         thread,
                         event: CodexEvent::Reviewer(reviewer.to_string()),
                     });
-                (said.into_iter().collect(), None)
+                (loaded.into_iter().chain(reviewer).collect(), None)
             }
             (Some(id), Some(method)) => {
                 let params = v.get("params").cloned().unwrap_or(Value::Null);
@@ -1634,9 +1667,17 @@ pub(crate) mod tests {
     async fn a_sessions_next_app_server_waits_for_its_last_to_end() {
         let dir = tempfile::tempdir().unwrap();
         let socket = dir.path().join("s.sock");
+        // Ended, it takes its sleep with it: nothing of it outlives the test.
         let mut last = tokio::process::Command::new("sh")
-            .args(["-c", "sleep 30; true", "app-server", "--listen"])
+            .args([
+                "-c",
+                "trap 'kill $!; exit' TERM; sleep 30 & wait",
+                "app-server",
+                "--listen",
+            ])
             .arg(format!("unix://{}", socket.display()))
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
             .kill_on_drop(true)
             .spawn()
             .unwrap();
@@ -1685,7 +1726,11 @@ pub(crate) mod tests {
                 "--remote",
                 "unix:///run/s.sock",
                 "-C",
-                "/repo"
+                "/repo",
+                "-c",
+                "check_for_update_on_startup=false",
+                "-c",
+                "tui.alternate_screen=\"always\""
             ]
         );
     }
@@ -1745,7 +1790,18 @@ pub(crate) mod tests {
         );
         assert_eq!(
             args(Launch::New, false, None),
-            ["--remote", "unix:///run/s.sock", "-C", "/repo", "--", "go"],
+            [
+                "--remote",
+                "unix:///run/s.sock",
+                "-C",
+                "/repo",
+                "-c",
+                "check_for_update_on_startup=false",
+                "-c",
+                "tui.alternate_screen=\"always\"",
+                "--",
+                "go"
+            ],
             "its own: Codex's settings"
         );
     }
@@ -2048,6 +2104,45 @@ pub(crate) mod tests {
             .map(|s| s.event)
             .filter(|e| matches!(e, CodexEvent::Working { .. } | CodexEvent::Idle))
             .collect()
+    }
+
+    /// Desk's resume of a thread as 0.166's app-server answered it, a real
+    /// TUI then joining it (recorded): no `thread/started` comes, and none
+    /// on the TUI's join. The answer says where the thread is, loaded, and
+    /// nothing says the session is up: its TUI does, once on its screen.
+    #[test]
+    fn a_thread_desk_resumes_is_said_loaded_and_never_started() {
+        let thread = "01a20dc3-0000-7000-8000-000000000001";
+        let (tx, mut rx) = oneshot::channel();
+        let mut f = Follower::new(Some(thread.into()), None).resuming(json!({}), tx);
+        f.joined();
+        let seen: Vec<CodexEvent> =
+            include_str!("../fixtures/codex/app-server-0.166-resumed.jsonl")
+                .lines()
+                .map(|l| serde_json::from_str::<Value>(l).unwrap())
+                .flat_map(|v| f.heard(&v).0)
+                .map(|s| s.event)
+                .filter(|e| {
+                    matches!(
+                        e,
+                        CodexEvent::Thread { .. }
+                            | CodexEvent::Loaded { .. }
+                            | CodexEvent::Reviewer(_)
+                    )
+                })
+                .collect();
+        assert_eq!(rx.try_recv().unwrap(), Ok(()));
+        assert_eq!(
+            seen,
+            [
+                CodexEvent::Loaded {
+                    rollout: Some(format!(
+                        "/home/me/.codex/sessions/2026/11/24/rollout-2026-11-24T13-00-00-{thread}.jsonl"
+                    ))
+                },
+                CodexEvent::Reviewer("user".into()),
+            ]
+        );
     }
 
     #[test]
@@ -2641,7 +2736,8 @@ pub(crate) mod tests {
             [Seen {
                 thread: "t9".into(),
                 event: CodexEvent::Reviewer("auto_review".into())
-            }]
+            }],
+            "a new thread's start was said already, once"
         );
         let mut back = Follower::new(Some("t9".into()), None).at_once();
         assert_eq!(

@@ -281,7 +281,7 @@ where
         handle.abort();
     }
 
-    let dropped_after = TestDb {
+    let mut dropped_after = TestDb {
         admin_url: admin_url.clone(),
         name: db_name.clone(),
     };
@@ -297,11 +297,17 @@ where
     test(pool.clone()).await;
 
     drop(pool);
-    drop(dropped_after);
+    // Awaited on the test's runtime, not blocked on as a panic's unwinding
+    // must: a connection that runtime was still opening answers its
+    // sign-in, where blocked it would hold the drop for Postgres'
+    // `authentication_timeout` (a minute), as every backend must take it.
+    teardown_test_db(&dropped_after.admin_url, &dropped_after.name).await;
+    dropped_after.name.clear();
 }
 
-/// A test's database, dropped with this: also when the test panics, and
-/// what it was awaited in is unwound.
+/// A test's database, dropped with this when the test panics, and what it
+/// was awaited in is unwound; one that ends drops it itself, and clears
+/// `name`.
 struct TestDb {
     admin_url: String,
     name: String,
@@ -309,6 +315,9 @@ struct TestDb {
 
 impl Drop for TestDb {
     fn drop(&mut self) {
+        if self.name.is_empty() {
+            return; // dropped already, as the test ended
+        }
         let (admin_url, name) = (self.admin_url.clone(), self.name.clone());
         // On a thread and a runtime of its own: this may be the unwinding
         // of a test's runtime, in which nothing more can be awaited.
