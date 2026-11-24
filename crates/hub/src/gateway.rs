@@ -2538,6 +2538,15 @@ async fn handle_ws(
                                 }
                             }
                             let raw_content = client_msg.content.unwrap_or_default();
+                            if let Some(why) = crate::desk_surface::hand_off_refused(
+                                desk_turn.as_ref(),
+                                &raw_content,
+                            ) {
+                                let session =
+                                    conn_session_recv.lock().await.clone().unwrap_or_default();
+                                let _ = broadcast_tx.send(refused(session, why.to_string()));
+                                continue;
+                            }
                             // Channel is metadata for downstream tooling only —
                             // session lookup uses session_id, not channel.
                             let channel = client_msg
@@ -2592,7 +2601,7 @@ async fn handle_ws(
                                 workforce_common::redact::tokenize_secrets(
                                     &content,
                                     &channel,
-                                    workforce_common::secret_marker::SecretSource::Unknown,
+                                    pasted_by(ws_identity_id.as_deref(), gateway_trust),
                                 );
 
                             // Resolve which agent to talk to
@@ -3984,6 +3993,23 @@ fn applied_by(reply: &TurnControlReply) -> Applied {
         (true, _) => Applied::Injected,
         (false, Some(REFUSED_BUSY)) => Applied::Busy,
         (false, _) => Applied::NotLive,
+    }
+}
+
+/// What a secret in a message on the person's connection is stamped as:
+/// handed over by them where it is their own word, at `trust` (`None`: the
+/// hub's own token, theirs). Another agent's hand-off, held below Owner, or
+/// a connection known only by its device, names nobody.
+pub(crate) fn pasted_by(
+    person: Option<&str>,
+    trust: Option<TrustLevel>,
+) -> workforce_common::secret_marker::SecretSource {
+    use workforce_common::secret_marker::SecretSource;
+    match person {
+        Some(user) if trust.is_none_or(|t| t >= TrustLevel::Owner) => SecretSource::WebGateway {
+            user: user.to_string(),
+        },
+        _ => SecretSource::Unknown,
     }
 }
 

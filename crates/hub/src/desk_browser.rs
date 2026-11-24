@@ -410,12 +410,7 @@ impl BrowserHooks for DeskHooks {
             read.path,
             workforce_common::secret::Secret::new(read.key.to_string()),
         )?;
-        // Every key held: the hub checks it and turns it on, as the setup's
-        // start said it would, while the agent waits.
-        if kept.ready {
-            let id = kept.setup.clone();
-            tokio::spawn(async move { setups.finish(&caller, &id).await });
-        }
+        setups.finish_when_ready(&caller, &kept);
         Ok(kept.test)
     }
 
@@ -926,8 +921,12 @@ pub fn install(
         shots: shots.clone(),
         settings: Arc::clone(&settings),
     });
-    // A turn's end closes the tab it used in the person's Chrome.
+    // A turn's end closes the tab it used in the person's Chrome, and stops
+    // a setup it left the agent's to carry on.
     workforce_hub_core::hub_core::live_turns::on_turn_end(Box::new(|session: &str| {
+        if let Some(setups) = crate::desk_connections::setup::installed() {
+            setups.turn_ended(session);
+        }
         let session = session.to_string();
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             handle.spawn(async move {

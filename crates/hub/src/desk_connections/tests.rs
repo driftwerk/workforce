@@ -5,6 +5,7 @@ use axum::extract::Form;
 use axum::routing::post as post_route;
 
 use super::*;
+use workforce_skills::adapters::bank::model::CONSENT_DAYS;
 
 const SARAH: &str = "4f1c2d3e-0000-4000-8000-000000000001";
 const GOOD: &str = "lin_api_good_key_0123456789";
@@ -256,20 +257,36 @@ async fn services(github: Arc<Github>) -> Services {
             get(|| async {
                 Json(json!({ "success": true, "data": [
                     { "id": "bnk_nw", "name": "NatWest", "connectionStatus": { "connected": true } },
-                    { "id": "bnk_rev", "name": "Revolut", "connectionStatus": { "connected": false } }
+                    { "id": "bnk_rev", "name": "Revolut", "connectionStatus": { "connected": false } },
+                    { "id": "bnk_st", "name": "Starling" },
+                    { "id": "bnk_bk", "name": "Bank", "connectionStatus": { "connected": false } }
                 ] }))
             }),
         )
         .route(
             "/banksync/banks/{id}",
             get(|axum::extract::Path(id): axum::extract::Path<String>| async move {
-                let (name, connected) = match id.as_str() {
-                    "bnk_nw" => ("NatWest", true),
-                    _ => ("Revolut", false),
+                // BankSync's detail says nothing of Starling's connection.
+                let data = match id.as_str() {
+                    "bnk_nw" => json!({ "id": id, "name": "NatWest", "connectionStatus": { "connected": true } }),
+                    "bnk_st" => json!({ "id": id, "name": "Starling" }),
+                    "bnk_bk" => json!({ "id": id, "name": "Bank", "connectionStatus": { "connected": false } }),
+                    _ => json!({ "id": id, "name": "Revolut", "connectionStatus": { "connected": false } }),
                 };
-                Json(json!({ "success": true, "data": {
-                    "id": id, "name": name, "connectionStatus": { "connected": connected }
-                } }))
+                Json(json!({ "success": true, "data": data }))
+            }),
+        )
+        .route(
+            "/banksync/banks/{id}/accounts",
+            get(|axum::extract::Path(id): axum::extract::Path<String>| async move {
+                match id.as_str() {
+                    "bnk_rev" => (
+                        StatusCode::CONFLICT,
+                        Json(json!({ "success": false, "error": "The bank needs reconnecting", "code": "reauth_required", "recovery": { "action": "reconnect" } })),
+                    )
+                        .into_response(),
+                    _ => Json(json!({ "success": true, "data": [] })).into_response(),
+                }
             }),
         )
         .route(
@@ -1954,9 +1971,16 @@ mod setups {
     use setup::{Caller, Callers, Ended, NowKind, Setups, StepState, TabAt, Tabs, Way};
     use workforce_common::secret::Secret;
 
-    struct People;
+    /// The hub's people, and what the agents were told by Desk.
+    #[derive(Default)]
+    struct People {
+        told: Mutex<Vec<(String, String)>>,
+    }
 
     impl Callers for People {
+        fn tell(&self, caller: &Caller, note: String) {
+            self.told.lock().unwrap().push((caller.agent.clone(), note));
+        }
         fn holds_the_hub(&self, person: &str) -> bool {
             person == SARAH
         }
@@ -1983,7 +2007,7 @@ mod setups {
 
     async fn setups() -> (Hub, Arc<Setups>) {
         let h = hub().await;
-        let s = Arc::new(Setups::new(Arc::clone(&h.c), Arc::new(People)));
+        let s = Arc::new(Setups::new(Arc::clone(&h.c), Arc::new(People::default())));
         (h, s)
     }
 
@@ -2558,7 +2582,8 @@ mod setups {
         for tool in setup::SetupTool::all("allan") {
             let effect = write(tool.effect(&json!({ "service": "linear" })));
             match tool.name() {
-                "connections.list" | "connections.step" | "connections.wait" => {
+                "connections.list" | "connections.step" | "connections.wait"
+                | "connections.stop" => {
                     assert_eq!(effect, None, "{}", tool.name())
                 }
                 // A connection write: asks below unbound. Starting a setup
@@ -2625,7 +2650,7 @@ mod setups {
         if let Some(gh) = gh {
             Arc::get_mut(&mut h.c).unwrap().services.gh = gh;
         }
-        Arc::new(Setups::new(Arc::clone(&h.c), Arc::new(People)).with_tabs(tab))
+        Arc::new(Setups::new(Arc::clone(&h.c), Arc::new(People::default())).with_tabs(tab))
     }
 
     /// A stand-in `gh`, signed in as Sarah: it never reaches the real one.
@@ -2931,6 +2956,389 @@ mod setups {
         assert_eq!(said["failed"], json!(true));
         assert!(!said.to_string().contains(BAD));
         assert!(keys(&h.allan).is_empty());
+    }
+
+    /// The person's own key, handed over in the conversation: the hub
+    /// resolves its marker, so the key never reaches the agent, and checks
+    /// and keeps it as one read off the service's page.
+    #[tokio::test]
+    async fn a_key_the_person_hands_over_connects_without_reaching_the_agent() {
+        use crate::secret_cache::{testing::GlobalCache, InMemorySecretCache};
+        use workforce_common::secret_marker::{MarkerId, SecretCache, SecretSource};
+        let cache: Arc<dyn SecretCache> = Arc::new(InMemorySecretCache::with_defaults());
+        let give = |name: &str, value: &str, source: SecretSource| {
+            cache.capture_named(
+                "desk:allan",
+                &MarkerId::named(name).unwrap(),
+                Secret::new(value.into()),
+                source,
+            )
+        };
+        let person = || SecretSource::SlashCommand { user: SARAH.into() };
+        give("linear_key", GOOD, person());
+        give("not_a_key", "hello", person());
+        give(
+            "scraped",
+            GOOD,
+            SecretSource::ToolResult {
+                tool: "browser.get_content".into(),
+            },
+        );
+        // Stamped on context nobody typed: a repository's code, other
+        // agents' lines in a room.
+        give("in_context", GOOD, SecretSource::Unknown);
+        give(
+            "a_colleagues",
+            GOOD,
+            SecretSource::SlashCommand {
+                user: "4f1c2d3e-0000-4000-8000-000000000002".into(),
+            },
+        );
+        let _installed = GlobalCache::install(Arc::clone(&cache));
+        let (h, s) = setups().await;
+        let allan = caller("allan");
+        let started = s.start(&allan, "linear", None, None, false).await.unwrap();
+        let next = s.next(&started);
+        assert!(next.contains("cmd: secret"), "{next}");
+        let refused =
+            |field: &str, value: &str| s.keep_given(&allan, &started.id, field, value).unwrap_err();
+        assert!(
+            refused("api_key", GOOD).contains("cmd: secret"),
+            "a raw key"
+        );
+        assert!(refused("api_key", "[[secret:linear_key]] and more").contains("cmd: secret"));
+        assert!(refused("api_key", "[[secret:nobody_sent]]").contains("holds no such secret"));
+        assert!(
+            refused("api_key", "[[secret:scraped]]").contains("wasn't handed over by the person")
+        );
+        assert!(refused("api_key", "[[secret:in_context]]")
+            .contains("wasn't handed over by the person"));
+        assert!(refused("api_key", "[[secret:a_colleagues]]")
+            .contains("Someone else in this conversation"));
+        assert!(
+            refused("api_key", "[[secret:not_a_key]]").contains("doesn't look like a Linear key")
+        );
+        assert!(refused("workspace", "[[secret:linear_key]]").contains("isn't one of"));
+        let elsewhere = Caller {
+            session_key: Some("desk:other".into()),
+            ..caller("allan")
+        };
+        assert!(
+            s.keep_given(&elsewhere, &started.id, "api_key", "[[secret:linear_key]]")
+                .unwrap_err()
+                .contains("holds no such secret"),
+            "another conversation's secret is never this one's"
+        );
+        assert!(keys(&h.allan).is_empty());
+
+        assert!(s
+            .keep_described(&started.id, Some("api_key"), Some("[[secret:linear_key]]"))
+            .contains("the key the person handed over"));
+        let kept = s
+            .keep_given(&allan, &started.id, "api_key", " [[secret:linear_key]] ")
+            .unwrap();
+        assert!(kept.ready && kept.test.starts_with("kept"), "{}", kept.test);
+        assert_eq!(kept.length, GOOD.len());
+        s.finish_when_ready(&allan, &kept);
+        let said = s
+            .wait(&allan, &started.id, Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert_eq!(said["onFor"], json!("Allan"), "{said}");
+        let card = card_shows(&s, &started.id, NowKind::Connected).await;
+        assert!(card.now.title.starts_with("Linear connected as"));
+        assert!(keys(&h.allan).iter().any(|k| k.ends_with("/api_key")));
+        let everything = format!("{said} {:?}", s.views(SARAH, None));
+        assert!(!everything.contains(GOOD));
+    }
+
+    /// The person makes the key in their own window and sends it in a later
+    /// turn: the agent marks the key step waiting, the turn ends and the
+    /// setup stays, its card asking for the key; it arrives, and the same
+    /// setup connects.
+    #[tokio::test]
+    async fn a_key_the_person_sends_in_a_later_turn_finishes_the_same_setup() {
+        use crate::secret_cache::{testing::GlobalCache, InMemorySecretCache};
+        use workforce_common::secret_marker::{MarkerId, SecretCache, SecretSource};
+        let cache: Arc<dyn SecretCache> = Arc::new(InMemorySecretCache::with_defaults());
+        let _installed = GlobalCache::install(Arc::clone(&cache));
+        let (h, s) = setups().await;
+        let allan = caller("allan");
+        let started = s.start(&allan, "linear", None, None, false).await.unwrap();
+        s.step(&allan, &started.id, "key", StepState::Waiting, None)
+            .unwrap();
+        s.turn_ended("s-allan");
+        let card = card_shows(&s, &started.id, NowKind::Step).await;
+        assert_eq!(
+            card.ended, None,
+            "a turn's end spares a setup waiting on the person"
+        );
+        assert!(card.now.detail.unwrap().contains("cmd: secret linear_key"));
+        // Next turn: the person sent it.
+        cache.capture_named(
+            "desk:allan",
+            &MarkerId::named("linear_key").unwrap(),
+            Secret::new(GOOD.into()),
+            SecretSource::SlashCommand { user: SARAH.into() },
+        );
+        let again = s.start(&allan, "linear", None, None, false).await.unwrap();
+        assert_eq!(again.id, started.id, "the same setup carries on");
+        let kept = s
+            .keep_given(&allan, &started.id, "api_key", "[[secret:linear_key]]")
+            .unwrap();
+        s.finish_when_ready(&allan, &kept);
+        let said = s
+            .wait(&allan, &started.id, Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert_eq!(said["onFor"], json!("Allan"), "{said}");
+        assert!(keys(&h.allan).iter().any(|k| k.ends_with("/api_key")));
+    }
+
+    /// A hub service for the hub's own commands.
+    async fn command_service() -> Arc<crate::serve::AgentService> {
+        use crate::serve::Compose as _;
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = workforce_common::settings::WorkforceConfig::default();
+        cfg.hub.data_dir = dir.path().to_string_lossy().into_owned();
+        cfg.memory.db_path = dir.path().join("memory.db").to_string_lossy().into_owned();
+        cfg.llm.api_key = Some("test-key".into());
+        std::mem::forget(dir);
+        crate::serve::AgentService::from_config(cfg, None)
+            .await
+            .expect("a hub service")
+    }
+
+    /// The person sends the key with `cmd: secret` and says nothing more,
+    /// through the hub's own command as their surface hands it on: from
+    /// Desk as themselves, or from Slack by their Slack id in a turn run as
+    /// them. The setup waiting on it is kept, checked and turned on, and
+    /// its agent woken with how that went. A colleague's is never theirs.
+    #[tokio::test]
+    async fn a_key_sent_alone_connects_its_setup_and_wakes_the_agent() {
+        use crate::secret_cache::{testing::GlobalCache, InMemorySecretCache};
+        use workforce_common::secret_marker::SecretCache;
+        use workforce_common::session::TurnPrincipal;
+        let cache: Arc<dyn SecretCache> = Arc::new(InMemorySecretCache::with_defaults());
+        let _cache = GlobalCache::install(Arc::clone(&cache));
+        let h = hub().await;
+        let people = Arc::new(People::default());
+        let s = Arc::new(Setups::new(
+            Arc::clone(&h.c),
+            Arc::clone(&people) as Arc<dyn Callers>,
+        ));
+        let _installed = setup::testing::Installed::install(Arc::clone(&s));
+        let service = command_service().await;
+        let waiting = |agent: &'static str| {
+            let s = Arc::clone(&s);
+            async move {
+                let who = caller(agent);
+                let started = s.start(&who, "linear", None, None, false).await.unwrap();
+                s.step(&who, &started.id, "key", StepState::Waiting, None)
+                    .unwrap();
+                s.turn_ended(&format!("s-{agent}"));
+                started.id
+            }
+        };
+        let send = |conversation: &'static str, user: &'static str, run_as: Option<&str>| {
+            let service = Arc::clone(&service);
+            let principal = TurnPrincipal::run_as(run_as.map(str::to_string));
+            async move {
+                let cmd =
+                    crate::commands::command_of(&format!("cmd: secret linear_key {GOOD}"), false)
+                        .expect("a command");
+                crate::user_config::as_principal(
+                    &principal,
+                    crate::commands::execute_command(&cmd, &service, conversation, user),
+                )
+                .await
+                .text
+            }
+        };
+        let told = || people.told.lock().unwrap().clone();
+
+        let allans = waiting("allan").await;
+        let said = send("desk:allan", "4f1c2d3e-0000-4000-8000-000000000002", None).await;
+        assert!(!said.contains("checking"), "{said}");
+        let card = card_shows(&s, &allans, NowKind::Step).await;
+        assert_eq!(card.ended, None, "a colleague's key is never the person's");
+
+        let said = send("desk:allan", SARAH, None).await;
+        assert!(said.contains("Desk is checking it with Linear"), "{said}");
+        assert!(!said.contains(GOOD));
+        let card = card_shows(&s, &allans, NowKind::Connected).await;
+        assert!(card.now.title.starts_with("Linear connected as"));
+        assert!(keys(&h.allan).iter().any(|k| k.ends_with("/api_key")));
+
+        let bens = waiting("ben").await;
+        let said = send("desk:ben", "U0SARAH", Some(SARAH)).await;
+        assert!(said.contains("Desk is checking it"), "{said}");
+        card_shows(&s, &bens, NowKind::Connected).await;
+
+        for _ in 0..400 {
+            if told().len() == 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let told = told();
+        assert_eq!(
+            told.iter().map(|(a, _)| a.as_str()).collect::<Vec<_>>(),
+            ["allan", "ben"]
+        );
+        for (_, note) in &told {
+            assert!(note.contains("Linear is connected as"), "{note}");
+            assert!(note.contains("carry on"), "{note}");
+            assert!(!note.contains(GOOD));
+        }
+    }
+
+    /// A key the person pastes into Desk's chat is theirs, handed over as
+    /// one sent with `cmd: secret` is. One in another agent's hand-off, or
+    /// on a connection known only by its device, is nobody's.
+    #[tokio::test]
+    async fn a_key_pasted_in_desks_chat_is_the_persons_own_and_a_hand_offs_never() {
+        use crate::secret_cache::{testing::GlobalCache, InMemorySecretCache};
+        use workforce_agent::security::trust::TrustLevel;
+        use workforce_common::secret_marker::SecretCache;
+        let pasted = format!("lin_api_{}", "x".repeat(30));
+        let cache: Arc<dyn SecretCache> = Arc::new(InMemorySecretCache::with_defaults());
+        let _cache = GlobalCache::install(Arc::clone(&cache));
+        let (_h, s) = setups().await;
+        let allan = caller("allan");
+        let started = s.start(&allan, "linear", None, None, false).await.unwrap();
+        let marker = |trust: Option<TrustLevel>, person: Option<&str>| {
+            let (said, captured) = workforce_common::redact::tokenize_secrets(
+                &format!("here it is: {pasted}"),
+                "desk:allan",
+                crate::gateway::pasted_by(person, trust),
+            );
+            assert_eq!(captured.len(), 1);
+            assert!(!said.contains(&pasted));
+            format!("[[secret:{}]]", captured[0].id)
+        };
+        for (trust, person) in [
+            (Some(TrustLevel::Paired), Some(SARAH)),
+            (Some(TrustLevel::Untrusted), Some(SARAH)),
+            (None, None),
+        ] {
+            assert!(s
+                .keep_given(&allan, &started.id, "api_key", &marker(trust, person))
+                .unwrap_err()
+                .contains("wasn't handed over by the person"));
+        }
+        // The hub's own token is the person's, as Owner is.
+        assert_eq!(
+            crate::gateway::pasted_by(Some(SARAH), None),
+            crate::gateway::pasted_by(Some(SARAH), Some(TrustLevel::Owner))
+        );
+        let kept = s
+            .keep_given(
+                &allan,
+                &started.id,
+                "api_key",
+                &marker(Some(TrustLevel::Owner), Some(SARAH)),
+            )
+            .unwrap();
+        assert!(kept.ready, "{}", kept.test);
+    }
+
+    /// A key bound to the site it was read off (Metabase's) is only ever
+    /// read there: a handed-over one could be sent anywhere.
+    #[tokio::test]
+    async fn a_key_bound_to_its_own_site_is_never_taken_handed_over() {
+        let (_h, s) = setups().await;
+        let allan = caller("allan");
+        let started = s
+            .start(&allan, "metabase", Some("Acme"), None, false)
+            .await
+            .unwrap();
+        assert!(s
+            .keep_given(&allan, &started.id, "api_key", "[[secret:metabase_key]]")
+            .unwrap_err()
+            .contains("browser.capture_key"));
+    }
+
+    /// DW-746: a setup called off ends at once, by the agent or on its card
+    /// by the person, and one left as the agent's to do ends with its turn.
+    /// One waiting on the person goes on.
+    #[tokio::test]
+    async fn a_setup_called_off_or_left_by_its_turn_ends_at_once() {
+        let (h, s) = setups().await;
+        let allan = caller("allan");
+        let stopped = s.start(&allan, "linear", None, None, false).await.unwrap();
+        let view = s.stop(&allan, &stopped.id).unwrap();
+        assert_eq!(view.ended, Some(Ended::Stopped));
+        assert_eq!(view.now.kind, NowKind::Ended);
+        assert!(view.now.title.contains("stopped"), "{}", view.now.title);
+        let said = s.wait(&allan, &stopped.id, Duration::ZERO).await.unwrap();
+        assert_eq!(said["ended"], json!(true), "{said}");
+        assert!(
+            s.key_page(&allan, "linear").is_none(),
+            "nothing is read for it"
+        );
+
+        let carded = s.start(&allan, "linear", None, None, false).await.unwrap();
+        assert_ne!(carded.id, stopped.id, "asked again, it starts over");
+        assert!(s.stop_for("someone-else", &carded.id).is_err());
+        let view = s.stop_for(SARAH, &carded.id).unwrap();
+        assert_eq!(view.ended, Some(Ended::Stopped));
+        assert!(
+            s.stop_for(SARAH, &carded.id).is_err(),
+            "a stopped setup is gone from its card"
+        );
+
+        *h.github.outcome.lock().unwrap() = "pending";
+        let left = s.start(&allan, "linear", None, None, false).await.unwrap();
+        let on_the_person = s.start(&allan, "github", None, None, true).await.unwrap();
+        assert_eq!(on_the_person.now.kind, NowKind::Code);
+        let elsewhere = Caller {
+            session: Some("elsewhere".into()),
+            ..caller("allan")
+        };
+        let other_turn = s
+            .start(&elsewhere, "linear", None, None, false)
+            .await
+            .unwrap();
+        s.turn_ended("s-allan");
+        let ended = |id: &str| {
+            s.views(SARAH, None)
+                .into_iter()
+                .find(|v| v.id == id)
+                .unwrap()
+                .ended
+        };
+        assert_eq!(ended(&left.id), Some(Ended::Stopped), "the agent's to do");
+        assert_eq!(ended(&on_the_person.id), None, "the person's code goes on");
+        assert_eq!(
+            ended(&other_turn.id),
+            None,
+            "another conversation's goes on"
+        );
+    }
+
+    /// A connected setup is past stopping: stopping it leaves it connected.
+    #[tokio::test]
+    async fn a_connected_setup_is_never_stopped() {
+        let (_h, s) = setups().await;
+        let allan = caller("allan");
+        let started = s.start(&allan, "linear", None, None, false).await.unwrap();
+        let kept = s
+            .keep_key(
+                &allan,
+                "linear",
+                None,
+                LINEAR_PAGE.0,
+                LINEAR_PAGE.1,
+                Secret::new(GOOD.into()),
+            )
+            .unwrap();
+        s.finish(&allan, &kept.setup).await;
+        card_shows(&s, &started.id, NowKind::Connected).await;
+        let view = s.stop(&allan, &started.id).unwrap();
+        assert_eq!((view.ended, view.now.kind), (None, NowKind::Connected));
+        s.turn_ended("s-allan");
+        card_shows(&s, &started.id, NowKind::Connected).await;
     }
 
     /// A token of the person's own, pasted on the card: offered from the
@@ -3581,10 +3989,10 @@ async fn a_bank_connects_only_on_a_key_that_reads_and_says_when_its_approval_lap
     assert_eq!(natwest.account.as_deref(), Some("NatWest"));
     let approval = natwest.approval.expect("an approval date");
     assert!(approval.estimated && !approval.due);
-    assert_eq!(approval.days_left, 90);
+    assert_eq!(approval.days_left, CONSENT_DAYS);
     assert_eq!(
         approval.until,
-        (Utc::now() + chrono::Duration::days(90)).date_naive()
+        (Utc::now() + chrono::Duration::days(CONSENT_DAYS)).date_naive()
     );
 
     let path = key_at(
@@ -3596,7 +4004,7 @@ async fn a_bank_connects_only_on_a_key_that_reads_and_says_when_its_approval_lap
         ),
     );
     let stamp = || h.allan.get(&path).expect("a stamp");
-    let long_ago = (Utc::now() - chrono::Duration::days(100)).to_rfc3339();
+    let long_ago = (Utc::now() - chrono::Duration::days(CONSENT_DAYS + 10)).to_rfc3339();
     h.allan
         .apply(
             &[VaultOp::Set {
@@ -3632,6 +4040,57 @@ async fn a_bank_connects_only_on_a_key_that_reads_and_says_when_its_approval_lap
     );
 }
 
+/// A check's words are scrubbed of the connection's secrets alone: a bank
+/// the person named "Bank" is said by its name, and BankSync's own stays.
+#[tokio::test]
+async fn a_lapse_names_the_bank_and_leaves_banksyncs_name_whole() {
+    let h = hub().await;
+    let refused =
+        h.c.connect(
+            SARAH,
+            "bank",
+            Some("Bank"),
+            "agent",
+            Some("allan"),
+            bank(BS_GOOD, "Bank"),
+        )
+        .await
+        .unwrap_err();
+    let said = format!("{refused:?}");
+    assert!(
+        said.contains(
+            "BankSync says Bank's approval has lapsed: the person reconnects it in BankSync"
+        ),
+        "{said}"
+    );
+    assert!(
+        !said.contains("[secret]") && !said.contains(BS_GOOD),
+        "{said}"
+    );
+}
+
+/// The settings case of DW-744: BankSync's detail of a bank need not say
+/// anything of its connection. One whose accounts BankSync serves connects,
+/// and Reconnect on it works.
+#[tokio::test]
+async fn a_bank_banksync_serves_connects_whatever_its_detail_leaves_out() {
+    let h = hub().await;
+    let starling =
+        h.c.connect(
+            SARAH,
+            "bank",
+            Some("Starling"),
+            "agent",
+            Some("allan"),
+            bank(BS_GOOD, "Starling"),
+        )
+        .await
+        .expect("connected");
+    assert_eq!(starling.account.as_deref(), Some("Starling"));
+    let renewed = h.c.renew(SARAH, "bank", &starling.id).await.unwrap();
+    assert_eq!(renewed.status, Status::Connected, "{:?}", renewed.detail);
+}
+
 #[tokio::test]
 async fn a_lapsed_bank_is_refused_and_only_the_persons_renewal_moves_its_approval() {
     let h = hub().await;
@@ -3645,7 +4104,11 @@ async fn a_lapsed_bank_is_refused_and_only_the_persons_renewal_moves_its_approva
             bank(BS_GOOD, "Revolut"),
         )
         .await;
-    assert!(lapsed.is_err(), "a bank whose approval lapsed is refused");
+    assert!(
+        format!("{:?}", lapsed.unwrap_err())
+            .contains("BankSync says Revolut's approval has lapsed"),
+        "a bank BankSync says needs reconnecting is refused, and told to try again"
+    );
 
     let natwest =
         h.c.connect(
@@ -3666,7 +4129,7 @@ async fn a_lapsed_bank_is_refused_and_only_the_persons_renewal_moves_its_approva
             natwest.id.rsplit('~').next().unwrap()
         ),
     );
-    let long_ago = (Utc::now() - chrono::Duration::days(100)).to_rfc3339();
+    let long_ago = (Utc::now() - chrono::Duration::days(CONSENT_DAYS + 10)).to_rfc3339();
     h.allan
         .apply(
             &[VaultOp::Set {
@@ -3682,7 +4145,7 @@ async fn a_lapsed_bank_is_refused_and_only_the_persons_renewal_moves_its_approva
         long_ago,
         "the person's renewal does"
     );
-    assert_eq!(renewed.approval.unwrap().days_left, 90);
+    assert_eq!(renewed.approval.unwrap().days_left, CONSENT_DAYS);
 
     h.c.disconnect(SARAH, "bank", &natwest.id).await.unwrap();
     assert!(h.allan.get(&path).is_none(), "its stamp goes with it");

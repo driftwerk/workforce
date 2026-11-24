@@ -5,7 +5,13 @@ use chrono::{DateTime, Duration, NaiveDate, Utc};
 use serde::Serialize;
 use serde_json::Number;
 
-/// How long a bank's approval lasts under UK open banking.
+/// About how long a bank's approval lasts, an estimate: BankSync never says
+/// a consent's end over its API, nor which market a bank is in. Its EU banks
+/// renew "at least every 180 days" (Delegated Regulation (EU) 2022/2360
+/// Art. 10a); for the UK its pages disagree (180 days on its UK page, a
+/// "90-day reconfirmation cycle" in its consents guide), so the shorter
+/// stands for every bank: a reminder early is harmless, one late isn't.
+/// Only a reminder is drawn from it: a lapse is what BankSync says.
 pub const CONSENT_DAYS: i64 = 90;
 
 /// The days before an approval lapses on which the person is reminded.
@@ -256,7 +262,10 @@ mod tests {
             .collect();
         assert_eq!(due, (-2..=7).collect::<Vec<_>>());
         let late_utc: DateTime<Utc> = "2026-09-01T23:30:00Z".parse().unwrap();
-        assert_eq!(Approval::of(late_utc, day("2026-09-01")).days_left, 90);
+        assert_eq!(
+            Approval::of(late_utc, day("2026-09-01")).days_left,
+            CONSENT_DAYS
+        );
     }
 
     #[test]

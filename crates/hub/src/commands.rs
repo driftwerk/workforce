@@ -363,6 +363,14 @@ pub fn command_of(message: &str, with_files: bool) -> Option<Command> {
     parse_command(message).filter(|c| !(with_files && matches!(c, Command::Unknown { .. })))
 }
 
+/// Whether a turn's message may run one of the hub's commands, which run as
+/// the person: never another agent's words relayed to it, a room's
+/// hand-off (`hand_off`) or the crew's nudges and tasks (a relayed Desk
+/// scope). Such a message goes to the agent as words, tokenised.
+pub(crate) fn runs_commands(hand_off: bool) -> bool {
+    !hand_off && !workforce_agent::runner::current_desk().is_some_and(|d| d.relayed)
+}
+
 /// Whether `message` is a command that runs on its raw text, untokenised
 /// and never joining a live turn: any but an unknown one, which goes on like
 /// a message.
@@ -768,7 +776,15 @@ pub async fn execute_command(
         } => execute_select_agent(service, channel, user, target, agent_node_id.as_deref()).await,
         Command::Tools { prefix } => execute_tools(service, prefix.as_deref()),
         Command::Secret { name, value } => {
-            execute_secret(channel, user, name.as_deref(), value.as_deref())
+            // Kept as the person the command runs as, as the conversation's
+            // turns know them, whatever the surface called them.
+            let person = crate::user_config::current_identity_id();
+            execute_secret(
+                channel,
+                person.as_deref().unwrap_or(user),
+                name.as_deref(),
+                value.as_deref(),
+            )
         }
         Command::Endpoint { args } => {
             crate::endpoint_cmd::execute_endpoint(service, user, args.as_deref()).await
@@ -1595,6 +1611,8 @@ async fn execute_env_remove(service: &AgentService, user: &str, rest: &str) -> C
 /// is the session key; the cache scopes the value to its conversation
 /// channel so the agent can reference `[[secret:<name>]]` from any
 /// thread. The cleartext is never logged, echoed, or sent to the LLM.
+/// `user` is the person as the conversation's turns run as them. A key a
+/// setup there waits on goes on to it ([`crate::desk_connections::setup::Setups::key_sent`]).
 pub(crate) fn execute_secret(
     channel: &str,
     user: &str,
@@ -1634,6 +1652,14 @@ pub(crate) fn execute_secret(
         len = value.len(),
         "named secret stored via /secret"
     );
+    // Setups are Desk's, which runs only with Postgres: without it there is
+    // none to take the key, nor an agent to wake.
+    #[cfg(feature = "postgres")]
+    if let Some(told) = crate::desk_connections::setup::installed()
+        .and_then(|setups| setups.key_sent(channel, user, name))
+    {
+        return CommandResult::info(format!("Stored secret `{name}` (value hidden). {told}"));
+    }
     CommandResult::info(format!(
         "Stored secret `{name}` (value hidden). Reference it as `[[secret:{name}]]` when a tool needs the credential — e.g. `vault.set(\"skills/datadog/api_key\", \"[[secret:{name}]]\")`. It stays available in this channel for 60 minutes of inactivity."
     ))

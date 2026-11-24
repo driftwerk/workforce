@@ -80,10 +80,11 @@ const SETUP_TTL: Duration = Duration::from_secs(60 * 60);
 /// The most setups one person keeps at once.
 const MAX_SETUPS: usize = 16;
 /// The tools, the ones that change nothing first.
-pub const NAMES: [&str; 7] = [
+pub const NAMES: [&str; 8] = [
     "connections.list",
     "connections.step",
     "connections.wait",
+    "connections.stop",
     "connections.setup",
     "connections.keep",
     "connections.test",
@@ -202,6 +203,9 @@ struct Device {
 pub enum Ended {
     /// A newer setup of the same service in the conversation took over.
     Replaced,
+    /// The person or the agent stopped it, or the agent's turn ended while
+    /// it was the agent's to carry on.
+    Stopped,
 }
 
 /// Where the agent's tab is, for a setup waiting on the person to sign in.
@@ -503,6 +507,104 @@ fn secret_fields(c: &Connector) -> Vec<&'static str> {
     }
 }
 
+/// What a setup in the person's Chrome shows while Desk's extension there
+/// is too old to use: reloading it, on Chrome's `page` for it, or its
+/// updating itself.
+fn outdated_now(outdated: crate::desk_chrome::Outdated, page: String, working: Now) -> Now {
+    match outdated {
+        crate::desk_chrome::Outdated::Reload => Now {
+            kind: NowKind::Step,
+            title: "Reload Desk's extension in Chrome".into(),
+            detail: Some("It's an old build that can't update itself. On Chrome's page for it, press the reload arrow on Desk's card: from then on it keeps itself up to date, and the setup carries on.".into()),
+            url: Some(page),
+            action: Some("reload_extension"),
+            ..working
+        },
+        crate::desk_chrome::Outdated::Updating => Now {
+            detail: Some("Desk's extension in Chrome is updating itself: a moment.".into()),
+            ..working
+        },
+    }
+}
+
+/// Whether `service`'s key goes to the site it was read on, so is only
+/// read off that site's page: Metabase's, at each person's own address.
+fn key_bound_to_page(service: &str) -> bool {
+    service == "metabase"
+}
+
+/// Whether `value` is one secret marker, whole: a key handed over with
+/// `cmd: secret`, never the key itself.
+pub fn is_marker(value: &str) -> bool {
+    let value = value.trim();
+    matches!(
+        workforce_common::secret_marker::parse_markers_spanned(value).as_slice(),
+        [(span, _)] if *span == (0..value.len())
+    )
+}
+
+/// The secret `marker` names, as the person the setup is for handed it over
+/// in `caller`'s conversation (`cmd: secret`, their own message): resolved
+/// here, so it never reaches the model. Anything else is refused: a value
+/// read off a page or a tool's answer, context nobody typed (a repository's
+/// code, other agents' lines), or another member's in a shared channel.
+fn given_secret(caller: &Caller, marker: &str) -> Result<Secret<String>, String> {
+    let marker = marker.trim();
+    let id = match workforce_common::secret_marker::parse_markers(marker).as_slice() {
+        [m] if is_marker(marker) => m.id.clone(),
+        _ => return Err(GIVE_A_KEY.into()),
+    };
+    let (value, meta) = caller
+        .session_key
+        .as_deref()
+        .and_then(|key| workforce_common::secret_marker::global_cache()?.lookup(key, &id))
+        .ok_or_else(|| {
+            format!("This conversation holds no such secret: it may have expired. {SEND_IT}")
+        })?;
+    match meta.source.handed_over_by() {
+        Some(by) if by == caller.person => Ok(value),
+        Some(_) => Err(format!(
+            "Someone else in this conversation sent that secret, so it isn't kept as this person's key. {SEND_IT}"
+        )),
+        None => Err(format!(
+            "That secret wasn't handed over by the person (it was read off a page, a tool's answer or other context), so it isn't kept as a key. {SEND_IT}"
+        )),
+    }
+}
+
+/// Which of `service`'s keys a secret the person named `name` is:
+/// `<service>_key` the next still to hold, `<service>_<field>` that one.
+/// `None` for no key of `service`'s.
+fn key_named(service: &str, name: &str) -> Option<Option<&'static str>> {
+    let rest = name.strip_prefix(service)?.strip_prefix('_')?;
+    let c = catalog::find(service)?;
+    match secret_fields(c).into_iter().find(|f| *f == rest) {
+        Some(field) => Some(Some(field)),
+        None => (rest == "key").then_some(None),
+    }
+}
+
+/// What the agent is told of a setup whose key the person sent, once Desk
+/// checked it: only Desk's own words and the account, never the service's.
+fn sent_outcome(view: &SetupView) -> String {
+    match &view.connected {
+        Some(c) => format!(
+            "{} is connected as {}: carry on with what they asked for, using it.",
+            view.service_name, c.account
+        ),
+        None => format!(
+            "{} refused the key: tell the person in a sentence; a new one is sent the same way.",
+            view.service_name
+        ),
+    }
+}
+
+/// How the person hands their key over.
+const SEND_IT: &str = "Ask the person to send it themselves with `cmd: secret <name> <key>`.";
+
+/// How a key the person already has is handed over.
+const GIVE_A_KEY: &str = "A key never passes through you. If the person has it already, mark the key step waiting (connections.step {setup, step: \"key\", state: \"waiting\"}): the card asks them to send it with `cmd: secret <service>_key <key>`, and the setup waits for it across turns: Desk keeps it, checks it and turns it on once it arrives, and tells you how that went. One sent already is kept with connections.keep, its [[secret:<name>]] marker as the value. Otherwise read it off the service's page with browser.capture_key.";
+
 /// The step the person does: what to do and where, in the hub's words,
 /// `<email>`, `<uri>` and `<name>` filled in when the card is shown.
 fn app_step(id: &'static str, label: &str, url: Option<&str>, instruction: &str) -> Step {
@@ -649,6 +751,8 @@ struct Setup {
     /// The agent running it.
     by: String,
     session: Option<String>,
+    /// The conversation's key: where the person sends its key.
+    conversation: Option<String>,
     service: &'static str,
     name: String,
     key: String,
@@ -736,6 +840,15 @@ impl Setup {
     /// The one thing its card shows now, from its own record.
     fn now(&self, service: &str) -> Now {
         let mut now = self.now_of(service);
+        // A setup in the person's Chrome waits on an extension too old to
+        // trust: Desk opens Chrome's page for it, the person reloads it.
+        if matches!(self.way, Way::Browser | Way::App) && now.kind == NowKind::Working {
+            if let Some((outdated, page)) =
+                crate::desk_chrome::installed().and_then(|c| c.outdated())
+            {
+                now = outdated_now(outdated, page, now);
+            }
+        }
         // GitHub: a token of the person's own, beside whatever else the
         // card asks, until it is connected.
         if self.service == "github"
@@ -765,8 +878,14 @@ impl Setup {
             true => "read and write",
             false => "read only",
         };
-        if self.ended.is_some() {
-            return now(NowKind::Ended, format!("This {service} setup was replaced"));
+        if let Some(ended) = self.ended {
+            return now(
+                NowKind::Ended,
+                match ended {
+                    Ended::Replaced => format!("This {service} setup was replaced"),
+                    Ended::Stopped => format!("This {service} setup was stopped"),
+                },
+            );
         }
         let failed = self.steps.iter().find(|s| s.state == StepState::Failed);
         if let Some(c) = self
@@ -911,6 +1030,15 @@ impl Setup {
                 format!("Checking {service} and turning it on for {}", self.whose),
             ),
             _ => match self.steps.iter().find(|s| s.state == StepState::Waiting) {
+                // The person hands over a key they made themselves: the
+                // setup waits on them, across turns.
+                Some(x) if x.id == "key" => Now {
+                    detail: Some(format!(
+                        "Send it here with `cmd: secret {}_key <the key>`: it goes straight to the vault on this computer, never into the chat, and Desk checks it and turns it on.",
+                        self.service
+                    )),
+                    ..now(NowKind::Step, format!("Send {service}'s key in this conversation"))
+                },
                 Some(_) => Now {
                     detail: Some("Your password stays with you: Desk never reads or types it. It carries on by itself once you're in.".into()),
                     action: Some("show_page"),
@@ -929,6 +1057,25 @@ impl Setup {
                 },
             },
         }
+    }
+
+    /// Ends it, `why`: nothing it holds is kept, and a sign-in under way
+    /// is let go.
+    fn end(&mut self, why: Ended, connections: &Connections) {
+        self.ended = Some(why);
+        self.secrets.clear();
+        if let Some(flow) = &self.flow {
+            connections.cancel(&self.person, flow);
+        }
+    }
+
+    /// Whether it waits on its agent to carry it on: nothing of the
+    /// person's, Desk's or the service's is under way.
+    fn agents_to_do(&self) -> bool {
+        self.ended.is_none()
+            && self.connected.is_none()
+            && !self.finishing
+            && self.now(self.service).kind == NowKind::Working
     }
 
     /// The name the person gave it, where it isn't the service's own.
@@ -1124,6 +1271,9 @@ pub trait Callers: Send + Sync {
     fn oversees(&self, agent: &str) -> bool;
     /// The agent `name` (its name or id) names, if there is one.
     fn agent_named(&self, name: &str) -> Option<String>;
+    /// Wakes `caller`'s agent in its conversation with `note`: what Desk
+    /// did there without it, for it to carry on from.
+    fn tell(&self, caller: &Caller, note: String);
 }
 
 /// The setups under way, over Connections.
@@ -1304,6 +1454,7 @@ impl Setups {
             person: caller.person.clone(),
             by: caller.agent.clone(),
             session: caller.session.clone(),
+            conversation: caller.session_key.clone(),
             service: c.id,
             name,
             key,
@@ -1407,11 +1558,7 @@ impl Setups {
                 same = Some(s.view());
                 continue;
             }
-            s.ended = Some(Ended::Replaced);
-            s.secrets.clear();
-            if let Some(flow) = &s.flow {
-                self.connections.cancel(&s.person, flow);
-            }
+            s.end(Ended::Replaced, &self.connections);
         }
         same
     }
@@ -1586,13 +1733,24 @@ impl Setups {
             let _ = self.advance(caller, id).await;
             return;
         }
-        let Ok((false, write)) = self.with(caller, id, |s| {
-            let was = s.finishing;
-            s.finishing = true;
-            Ok((was, s.write))
-        }) else {
-            return;
-        };
+        if let Some(write) = self.claim(caller, id) {
+            self.finish_claimed(caller, id, write).await;
+        }
+    }
+
+    /// Takes setup `id`'s check and turning on as begun, so nothing else
+    /// begins it and a turn's end doesn't stop it: whether it takes writes,
+    /// or `None` where it was begun already.
+    fn claim(&self, caller: &Caller, id: &str) -> Option<bool> {
+        self.with(caller, id, |s| {
+            Ok((!std::mem::replace(&mut s.finishing, true)).then_some(s.write))
+        })
+        .ok()
+        .flatten()
+    }
+
+    /// [`Self::finish`], once [`Self::claim`]ed.
+    async fn finish_claimed(self: &Arc<Self>, caller: &Caller, id: &str, write: bool) {
         if let Err(e) = self.test(caller, id).await {
             let _ = self.with(caller, id, |s| {
                 s.finishing = false;
@@ -1890,9 +2048,11 @@ impl Setups {
             })?;
             match view.now.kind {
                 NowKind::Ended => {
-                    return Ok(
-                        json!({ "ended": true, "next": "A newer setup of this service took over. Say nothing more about this one." }),
-                    )
+                    let next = match view.ended {
+                        Some(Ended::Stopped) => "This setup was stopped. Say nothing more about it unless the person asks to start again: then call connections.setup.",
+                        _ => "A newer setup of this service took over. Say nothing more about this one.",
+                    };
+                    return Ok(json!({ "ended": true, "next": next }));
                 }
                 NowKind::Connected => {
                     let c = view.connected.as_ref();
@@ -2127,20 +2287,25 @@ impl Setups {
                 .and_then(|r| (r.page)(&BTreeMap::new()))
                 .unwrap_or_else(|| "the service's key page".into()),
         };
-        let github = match view.service {
+        let making = match view.service {
             "github" => " The page comes filled in: choose \"All repositories\" under Repository access, then Generate token and confirm.",
+            "bank" => " On BankSync's Developers page: Create Key, Key Name as above, Expiration 1 year, under Permissions only banks:read and institutions:read, then Create API Key. BankSync shows the key once, on the view that follows: read it there before Done (press its show button first if it's masked).",
             _ => "",
         };
         format!(
             "{said}\n\
              1. Keep {} with connections.keep (ask the person if you can't tell).\n\
              2. Open {} with browser.navigate, then call connections.wait. If the person must sign in, the card asks them and Desk sees when they have: never call browser.sign_in, never type or read a password.\n\
-             3. Once signed in, make the key (name it like \"Desk · {}\").{github} The page hides keys from you: read {} with browser.capture_key {{connector: \"{}\"}}, with no selector: Desk finds it. The key never comes back to you.\n\
-             4. Call connections.wait: Desk checks it with the service and turns it on itself.",
+             3. Once signed in, make the key (name it like \"Desk · {}\").{making} The page hides keys from you: read {} with browser.capture_key {{connector: \"{}\"}}, with no selector: Desk finds it. The key never comes back to you. Make and read it in this turn: Desk's tab closes when your turn ends.\n\
+             4. Call connections.wait: Desk checks it with the service and turns it on itself.\n\
+             If the person makes the key themselves or has one already, call connections.step {{setup, step: \"key\", state: \"waiting\"}}: the card asks them to send it with `cmd: secret {}_key <the key>`, and the setup waits for them across turns. Tell them so and end your turn: once it arrives Desk keeps it, checks it and turns it on by itself, and tells you how that went, so they never have to say it's sent. Where they sent it already, call connections.keep {{setup, field: \"{}\", value: \"[[secret:{}_key]]\"}}, then connections.wait.",
             if plain.is_empty() { "nothing".to_string() } else { plain.join(", ") },
             page,
             view.name,
             secrets.join(" and "),
+            view.service,
+            view.service,
+            secrets.first().copied().unwrap_or("api_key"),
             view.service,
         )
     }
@@ -2220,10 +2385,7 @@ impl Setups {
                 .find(|f| f.name == field)
                 .ok_or_else(|| format!("{} has no field {field}", c.name))?;
             if f.secret {
-                return Err(format!(
-                    "{} is a secret: read it off the service's page with browser.capture_key, so it never passes through you.",
-                    f.label
-                ));
+                return Err(format!("{} is a key. {GIVE_A_KEY}", f.label));
             }
             // A key held goes only where it was read for: nothing about
             // the connection changes once one is.
@@ -2433,9 +2595,9 @@ impl Setups {
     /// `connector`: its `field` (the next one still to read where none is
     /// named). The page must be the setup's key page, and the value shaped
     /// like that service's key; otherwise it is dropped. Nothing is sent
-    /// anywhere: once every key is held, the agent checks it with
-    /// `connections.test`, which asks the person first. What comes back
-    /// holds none of it.
+    /// anywhere: once every key is held, Desk checks it with the service and
+    /// turns it on ([`Self::finish_when_ready`]). What comes back holds none
+    /// of it.
     pub fn keep_key(
         &self,
         caller: &Caller,
@@ -2449,13 +2611,179 @@ impl Setups {
         let id = self.running(caller, connector).ok_or_else(|| {
             format!("No {connector} setup is waiting on a key in this conversation, so nothing was kept. Start one with connections.setup.")
         })?;
-        let recipe = recipe(connector).ok_or_else(|| by_hand(connector).to_string())?;
         let page = self
             .page_of(caller, &id, connector)
             .ok_or("That setup has ended.")?;
         if read_origin != page.origin || !page.holds(read_path) {
             return Err("That wasn't the service's own key page, so nothing was kept.".into());
         }
+        let read = Secret::new(value.expose_secret().clone());
+        let kept = self.hold(caller, &id, connector, field, value, Some(page.origin))?;
+        // Should it come back into view, it reaches the model as a marker.
+        if let (Some(cache), Some(key)) = (
+            workforce_common::secret_marker::global_cache(),
+            caller.session_key.as_deref(),
+        ) {
+            cache.capture(
+                key,
+                read,
+                "CONNECTION_KEY",
+                workforce_common::secret_marker::SecretSource::ToolResult {
+                    tool: "browser.capture_key".into(),
+                },
+            );
+        }
+        Ok(kept)
+    }
+
+    /// Keeps key `field` of setup `id` from `marker`, a secret the person
+    /// sent in this conversation with `cmd: secret`: the hub
+    /// resolves it, so the key never passes through the model, and it is
+    /// held exactly as one read off the service's page. A raw value, a
+    /// marker this conversation doesn't hold, or one scraped from a page or
+    /// a tool's answer is refused.
+    pub fn keep_given(
+        &self,
+        caller: &Caller,
+        id: &str,
+        field: &str,
+        marker: &str,
+    ) -> Result<KeptKey, String> {
+        self.keep_handed(caller, id, Some(field), marker)
+    }
+
+    /// [`Self::keep_given`], into key `field`, else the next still to hold
+    /// that it is shaped for.
+    fn keep_handed(
+        &self,
+        caller: &Caller,
+        id: &str,
+        field: Option<&str>,
+        marker: &str,
+    ) -> Result<KeptKey, String> {
+        self.check_caller(caller)?;
+        let connector = self.with(caller, id, |s| {
+            let c = catalog::find(s.service).expect("in the catalog");
+            if let Some(field) = field.filter(|f| !secret_fields(c).contains(f)) {
+                return Err(format!("{field} isn't one of {}'s keys", c.name));
+            }
+            if key_bound_to_page(s.service) {
+                return Err(format!("{}'s key is read off its own site with browser.capture_key, so the site it goes to is the one it came from.", c.name));
+            }
+            if !matches!(s.way, Way::Browser | Way::App) {
+                return Err("This setup doesn't take a key from the conversation: its card says what the person does.".into());
+            }
+            if s.ended.is_some() {
+                return Err("That setup has ended: start it again with connections.setup, then keep the key.".into());
+            }
+            Ok(s.service)
+        })?;
+        if self.running(caller, connector).as_deref() != Some(id) {
+            return Err(format!("This {connector} setup isn't waiting on a key now, so nothing was kept: Desk is already checking one, or a newer setup took its place."));
+        }
+        let value = given_secret(caller, marker)?;
+        self.hold(caller, id, connector, field, value, None)
+    }
+
+    /// The person sent `name` with `cmd: secret` in `conversation`. Where a
+    /// setup of theirs there takes a key in the conversation and `name` is
+    /// one of its keys' (`<service>_key`, or `<service>_<field>`), it is kept
+    /// as that key, checked with the service and turned on, and the agent
+    /// running it is told how that went, so it carries on with nothing more
+    /// said. What the person is told of it, where a setup took it.
+    pub fn key_sent(
+        self: &Arc<Self>,
+        conversation: &str,
+        person: &str,
+        name: &str,
+    ) -> Option<String> {
+        let (caller, id, service, field) = self.taking(conversation, person, name)?;
+        let kept = self.keep_handed(&caller, &id, field, &format!("[[secret:{name}]]"));
+        let claimed = match &kept {
+            Ok(k) if k.ready => self.claim(&caller, &id),
+            _ => None,
+        };
+        let c = catalog::find(service).expect("in the catalog");
+        let told = match &kept {
+            Ok(k) if k.ready => format!("Desk is checking it with {} and turning it on.", c.name),
+            Ok(k) => format!("Desk kept it as {}'s {}; it {}.", c.name, k.field, k.test),
+            Err(e) => format!("Desk didn't keep it as {}'s key: {e}", c.name),
+        };
+        let (this, name) = (Arc::clone(self), name.to_string());
+        tokio::spawn(async move {
+            if let Some(write) = claimed {
+                this.finish_claimed(&caller, &id, write).await;
+            }
+            let outcome = match kept {
+                Ok(k) if k.ready => this
+                    .with(&caller, &id, |s| Ok(sent_outcome(&s.view())))
+                    .unwrap_or_else(|_| "The setup ended before Desk could check it.".into()),
+                Ok(k) => format!("It is kept as its {}, and the setup {}: ask the person for the rest the same way.", k.field, k.test),
+                Err(_) => format!("Desk didn't keep it as {}'s key: ask the person to send it again with `cmd: secret {service}_key <the key>`.", c.name),
+            };
+            this.callers.tell(
+                &caller,
+                format!("The person sent {}'s key with `cmd: secret {name}` for the setup [{id}], and Desk took it straight to the setup, never through you. {outcome}", c.name),
+            );
+        });
+        Some(told)
+    }
+
+    /// The setup in `conversation` of `person`'s that a key `name` they
+    /// sent there is for, with its caller and the key's field where `name`
+    /// names one.
+    #[allow(clippy::type_complexity)]
+    fn taking(
+        &self,
+        conversation: &str,
+        person: &str,
+        name: &str,
+    ) -> Option<(Caller, String, &'static str, Option<&'static str>)> {
+        let setups = self.setups.lock().expect("setups poisoned");
+        let now = Instant::now();
+        setups
+            .values()
+            .filter(|s| {
+                s.person == person
+                    && s.conversation.as_deref() == Some(conversation)
+                    && s.way == Way::Browser
+                    && s.flow.is_none()
+                    && s.until > now
+                    && s.ended.is_none()
+                    && s.connected.is_none()
+                    && !s.finishing
+                    && !key_bound_to_page(s.service)
+            })
+            .filter_map(|s| Some((s, key_named(s.service, name)?)))
+            .max_by_key(|(s, _)| s.started_at)
+            .map(|(s, field)| {
+                let caller = Caller {
+                    person: s.person.clone(),
+                    agent: s.by.clone(),
+                    session: s.session.clone(),
+                    session_key: s.conversation.clone(),
+                    overseer: s.overseer,
+                };
+                (caller, s.id.clone(), s.service, field)
+            })
+    }
+
+    /// Holds `value` as key `field` of setup `id` (the next one still to
+    /// read where none is named, by its shape), read on `read_at` where it
+    /// was read off a page.
+    fn hold(
+        &self,
+        caller: &Caller,
+        id: &str,
+        connector: &str,
+        field: Option<&str>,
+        value: Secret<String>,
+        read_at: Option<String>,
+    ) -> Result<KeptKey, String> {
+        let recipe = recipe(connector).ok_or_else(|| by_hand(connector).to_string())?;
+        let page = self
+            .page_of(caller, id, connector)
+            .ok_or("That setup has ended.")?;
         let c = catalog::find(connector).expect("in the catalog");
         let field = match field {
             Some(f) => secret_fields(c)
@@ -2477,27 +2805,13 @@ impl Setups {
             }
         };
         if !(recipe.shaped)(field, value.expose_secret()) {
-            return Err(
-                "What was read doesn't look like this service's key, so nothing was kept. Point at the key itself."
-                    .into(),
-            );
-        }
-        // Should it come back into view, it reaches the model as a marker.
-        if let (Some(cache), Some(key)) = (
-            workforce_common::secret_marker::global_cache(),
-            caller.session_key.as_deref(),
-        ) {
-            cache.capture(
-                key,
-                Secret::new(value.expose_secret().clone()),
-                "CONNECTION_KEY",
-                workforce_common::secret_marker::SecretSource::ToolResult {
-                    tool: "browser.capture_key".into(),
-                },
-            );
+            return Err(format!(
+                "That doesn't look like a {} key, so nothing was kept.",
+                c.name
+            ));
         }
         let length = value.expose_secret().chars().count();
-        let all = self.with(caller, &id, move |s| {
+        let all = self.with(caller, id, move |s| {
             // An app's id and secret may be shaped alike: the same value
             // read for both is neither.
             if c.sign_in == catalog::SignIn::App
@@ -2511,10 +2825,10 @@ impl Setups {
                 ));
             }
             s.secrets.insert(field.to_string(), value);
-            s.read_at = Some(page.origin.clone());
+            s.read_at = read_at;
             let all = secret_fields(c).iter().all(|f| s.secrets.contains_key(*f));
             if all {
-                // Everything before the keys is done once they are read.
+                // Everything before the keys is done once they are held.
                 let before: Vec<&'static str> = s
                     .steps
                     .iter()
@@ -2545,8 +2859,18 @@ impl Setups {
             length,
             test,
             ready: all,
-            setup: id,
+            setup: id.to_string(),
         })
+    }
+
+    /// Once `kept` was the last key its setup needed, Desk checks it with
+    /// the service and turns it on, as the setup's start said it would,
+    /// while the agent waits.
+    pub fn finish_when_ready(self: &Arc<Self>, caller: &Caller, kept: &KeptKey) {
+        if kept.ready {
+            let (this, caller, id) = (Arc::clone(self), caller.clone(), kept.setup.clone());
+            tokio::spawn(async move { this.finish(&caller, &id).await });
+        }
     }
 
     /// Checks what the setup holds and, on a pass, keeps it at its tier.
@@ -2602,7 +2926,7 @@ impl Setups {
                         .get(f)
                         .ok_or("Keep the site with connections.keep first.")?;
                     let origin = site_origin(svc, site)?;
-                    if svc == "metabase" && read_at.as_deref() != Some(origin.as_str()) {
+                    if key_bound_to_page(svc) && read_at.as_deref() != Some(origin.as_str()) {
                         return Err("Metabase's key was read on another site than the one kept, so nothing was kept.".into());
                     }
                 }
@@ -2665,7 +2989,10 @@ impl Setups {
                             Found::Failed(e) => (e, format!("{} couldn't be reached.", c.name)),
                             Found::Works { .. } => unreachable!(),
                         };
-                        let note: String = super::scrub(said, &fields).chars().take(200).collect();
+                        let note: String = super::scrub(said, &super::secrets_of(c, &fields))
+                            .chars()
+                            .take(200)
+                            .collect();
                         self.with(caller, id, |s| {
                             s.secrets.clear();
                             s.read_at = None;
@@ -2972,12 +3299,18 @@ impl Setups {
                 _ => UNKNOWN.into(),
             };
         }
-        let Some(f) = catalog::find(s.service)
-            .and_then(|c| c.fields.iter().find(|f| Some(f.name) == field && !f.secret))
+        let Some(f) =
+            catalog::find(s.service).and_then(|c| c.fields.iter().find(|f| Some(f.name) == field))
         else {
             return UNKNOWN.into();
         };
         let value = value.unwrap_or_default();
+        if f.secret {
+            return match is_marker(value) {
+                true => format!("{}: the key the person handed over", f.label),
+                false => UNKNOWN.into(),
+            };
+        }
         let shown = match (s.service, f.name) {
             ("jira", "site") | ("metabase", "site_url") => site_origin(s.service, value)
                 .map_or_else(
@@ -3034,6 +3367,44 @@ impl Setups {
             s.said_signed_in = true;
         }
         Some(s.view())
+    }
+
+    /// The agent stops setup `id` (`connections.stop`), as the person asked
+    /// or as it gave up on it.
+    pub fn stop(&self, caller: &Caller, id: &str) -> Result<SetupView, String> {
+        self.with(caller, id, |s| Ok(self.stop_one(s)))
+    }
+
+    /// The person stops setup `id` on its card.
+    pub fn stop_for(&self, person: &str, id: &str) -> Result<SetupView, String> {
+        let caller = self.caller_of(person, id).ok_or(GONE)?;
+        self.stop(&caller, id)
+    }
+
+    /// Ends `s` as stopped, unless it is past stopping: connected, or being
+    /// checked and turned on now, which finishes in a moment.
+    fn stop_one(&self, s: &mut Setup) -> SetupView {
+        if s.ended.is_none() && s.connected.is_none() && !s.finishing {
+            s.end(Ended::Stopped, &self.connections);
+        }
+        s.view()
+    }
+
+    /// A turn of conversation `session` ended: each of its setups that was
+    /// the agent's to carry on is stopped, so none shows as under way with
+    /// nobody doing it. One waiting on the person, the service or Desk's
+    /// own check goes on.
+    pub fn turn_ended(&self, session: &str) {
+        let mut setups = self.setups.lock().expect("setups poisoned");
+        for s in setups
+            .values_mut()
+            .filter(|s| s.session.as_deref() == Some(session))
+        {
+            s.sync(&self.connections);
+            if s.agents_to_do() {
+                s.end(Ended::Stopped, &self.connections);
+            }
+        }
     }
 
     /// Listing what the agent may use, for `connections.list`.
@@ -3166,7 +3537,39 @@ static INSTALLED: OnceLock<Arc<Setups>> = OnceLock::new();
 
 /// The hub's setups, once a `[desk]` hub mounted Connections.
 pub fn installed() -> Option<Arc<Setups>> {
+    #[cfg(test)]
+    if let Some(setups) = testing::ON_THIS_THREAD.with(|s| s.borrow().clone()) {
+        return Some(setups);
+    }
     INSTALLED.get().cloned()
+}
+
+#[cfg(test)]
+pub(crate) mod testing {
+    use std::cell::RefCell;
+
+    use super::*;
+
+    thread_local! {
+        pub(super) static ON_THIS_THREAD: RefCell<Option<Arc<Setups>>> = const { RefCell::new(None) };
+    }
+
+    /// `setups` as the hub's, for the test on this thread (a current-thread
+    /// runtime's tasks with it) until dropped.
+    pub(crate) struct Installed;
+
+    impl Installed {
+        pub(crate) fn install(setups: Arc<Setups>) -> Self {
+            ON_THIS_THREAD.with(|s| *s.borrow_mut() = Some(setups));
+            Self
+        }
+    }
+
+    impl Drop for Installed {
+        fn drop(&mut self) {
+            ON_THIS_THREAD.with(|s| s.borrow_mut().take());
+        }
+    }
 }
 
 /// The hub's callers, from its registry and identities.
@@ -3196,7 +3599,53 @@ impl Callers for Hub {
             })
             .map(|s| s.agent_id.as_str().to_string())
     }
+
+    fn tell(&self, caller: &Caller, note: String) {
+        let Some(service) = self.0.registry.get(&caller.agent) else {
+            return;
+        };
+        let (Some(crew), Some(conversation)) = (
+            crate::desk_crew::for_service(&service),
+            caller.session_key.clone(),
+        ) else {
+            return;
+        };
+        let (person, session) = (caller.person.clone(), caller.session.clone());
+        tokio::spawn(async move {
+            // Queued behind the conversation's turn (the one the key came in
+            // on, or the agent's own): told once it has ended, never on top.
+            let busy = || {
+                session
+                    .as_deref()
+                    .is_some_and(|s| service.live_turns.running(s))
+            };
+            let until = Instant::now() + SETUP_TTL;
+            while Instant::now() < until {
+                if busy() {
+                    tokio::time::sleep(TELL_EVERY).await;
+                    continue;
+                }
+                match crew
+                    .run_turn(&service, &person, &conversation, &note, 0, None, None)
+                    .await
+                {
+                    // Another turn began first: it waits for that one too.
+                    Err(_) if busy() => continue,
+                    Err(e) => {
+                        tracing::warn!(agent = %service.agent_id, error = %e, "Desk couldn't tell the agent what became of a key the person sent");
+                        return;
+                    }
+                    Ok(_) => return,
+                }
+            }
+            tracing::warn!(agent = %service.agent_id, "The conversation stayed busy, so Desk didn't tell the agent what became of a key the person sent");
+        });
+    }
 }
+
+/// How often Desk looks for the conversation's turn to end before it tells
+/// the agent there.
+const TELL_EVERY: Duration = Duration::from_millis(250);
 
 /// Setups over `connections`, and their routes.
 pub fn install(state: &Arc<crate::gateway::GatewayState>, connections: Arc<Connections>) -> Router {
@@ -3287,8 +3736,8 @@ async fn signed_in_route(
 }
 
 /// What the person chose on a setup's card: `use-cli` (the GitHub CLI's
-/// sign-in), `other-way`, `new-code`, or `done-step` (a step of their own
-/// app's done). Theirs alone: no tool reaches it.
+/// sign-in), `other-way`, `new-code`, `done-step` (a step of their own
+/// app's done), or `stop`. Theirs alone: no tool reaches it.
 async fn choice_route(
     State(r): State<Arc<Routes>>,
     h: HeaderMap,
@@ -3304,6 +3753,7 @@ async fn choice_route(
         "other-way" => r.setups.other_way(&person, &id).await,
         "new-code" => r.setups.new_code(&person, &id).await,
         "done-step" => r.setups.done_step(&person, &id).await,
+        "stop" => r.setups.stop_for(&person, &id),
         _ => {
             return (
                 StatusCode::NOT_FOUND,
@@ -3435,7 +3885,8 @@ impl Tool for SetupTool {
             "connections.step" => "Marks a step `current`, `waiting` or `done`. For Google and FreeAgent, mark each step of the person's app done as you finish it; otherwise rarely needed, as the card follows the setup by itself.",
             "connections.wait" => "Wait while a setup waits on the person (using a sign-in on this computer, approving GitHub's code, signing in to the service in your browser, approving Desk on Google's or FreeAgent's page, doing a step on the card): Desk sees when they have, and checks and turns the connection on itself. Returns what to do next, exactly. Call it again while it says it's still waiting; never message the person meanwhile, the card says what to do.",
             "connections.setup" => "Start setting up a connection to a service yourself: Jira, Linear, Datadog, Metabase, GitHub, Google (Calendar, Drive, Gmail), FreeAgent or Bank (one bank the person linked in BankSync: keep `bank`, its name, before the key). `name` is what the person calls it (Acme, Work; for FreeAgent, the business, like Harbor). Each Google account or FreeAgent business is its own connection: set up a second one with its own name. `for` is `me` (default), or, for the person's overseer only, `all` or another agent's name. `write` (default false) lets whom it is for make changes with it. Desk shows the person one card for it in this conversation, and turns it on itself once it works. For Google and FreeAgent you set up the person's own app in their Chrome first, where none is kept; the steps come back exactly. Calling it again for the same connection returns the same setup. Returns the setup's id and what to do next. Email and Slack the person connects themselves.",
-            "connections.keep" => "Keep a field of a setup that isn't a secret: a Jira site (acme.atlassian.net), a Metabase address (its https origin), a Datadog site (us1, eu1, …), a bank's name as BankSync shows it (NatWest), an email. For Google or FreeAgent: `email` (the account the person signs in with), `redirect_uri_added` = yes once Desk's new address is on their FreeAgent app, or `stuck` = what you saw, when Chrome isn't connected, a page isn't as described or a click fails twice: the card then shows the person the step, exactly. A key is read off its page with browser.capture_key instead, and once one is held nothing more is kept.",
+            "connections.keep" => "Keep a field of a setup that isn't a secret: a Jira site (acme.atlassian.net), a Metabase address (its https origin), a Datadog site (us1, eu1, …), a bank's name as BankSync shows it (NatWest), an email. For Google or FreeAgent: `email` (the account the person signs in with), `redirect_uri_added` = yes once Desk's new address is on their FreeAgent app, or `stuck` = what you saw, when Chrome isn't connected, a page isn't as described or a click fails twice: the card then shows the person the step, exactly. A key is read off its page with browser.capture_key; one the person already has, sent by them with `cmd: secret <name> <key>` (mark the key step waiting with connections.step while they do), is kept by its [[secret:…]] marker as the value (field: the key's, like api_key): the hub resolves it, so it never passes through you, and checks it with the service as it would a key it read. Once a key is held nothing more is kept.",
+            "connections.stop" => "Stop a setup that won't be finished: the person asked you to, or you are giving up on it. Its card goes and nothing it held is kept. One left as your work to carry on stops by itself when your turn ends; one waiting on the person (a sign-in, a code, the key they send) goes on.",
             "connections.test" => "Check the setup's keys with the service again, or finish GitHub's sign-in once the person approved its code. Only if it works are they kept, in the vault, for whom the setup is for. A failed check keeps nothing.",
             "connections.use" => "Turn a connection on for an agent: the setup's (`setup`), or one by `service` and `connection` (its name). `agent` is you by default; another agent only for the person's overseer. `write` (default false) lets it make changes; `default` makes it the one used when a request doesn't say.",
             _ => "",
@@ -3467,7 +3918,7 @@ impl Tool for SetupTool {
                 },
                 "required": ["service"]
             }),
-            "connections.wait" => json!({
+            "connections.wait" | "connections.stop" => json!({
                 "type": "object",
                 "properties": { "setup": setup },
                 "required": ["setup"]
@@ -3476,8 +3927,8 @@ impl Tool for SetupTool {
                 "type": "object",
                 "properties": {
                     "setup": setup,
-                    "field": { "type": "string", "description": "site, email, site_url; for Google and FreeAgent: email, stuck or redirect_uri_added" },
-                    "value": { "type": "string" }
+                    "field": { "type": "string", "description": "site, email, site_url, bank; a key's (api_key, token, …) with a [[secret:…]] marker; for Google and FreeAgent: email, stuck or redirect_uri_added" },
+                    "value": { "type": "string", "description": "The value, or for a key the [[secret:…]] marker the person handed it over as" }
                 },
                 "required": ["setup", "field", "value"]
             }),
@@ -3522,7 +3973,9 @@ impl Tool for SetupTool {
             .as_ref()
             .is_some_and(|d| d.for_agent.as_deref() != Some(self.agent.as_str()));
         match self.name {
-            "connections.list" | "connections.step" | "connections.wait" => Effect::None,
+            "connections.list" | "connections.step" | "connections.wait" | "connections.stop" => {
+                Effect::None
+            }
             // Starting a setup is the person's one word for it: its key is
             // kept, and it is turned on for whom it is for, once it works.
             "connections.setup" => {
@@ -3661,6 +4114,18 @@ impl Tool for SetupTool {
                 Err(e) => Err(e),
                 Ok(id) => setups.wait(&caller, &id, WAIT_MOST).await,
             },
+            "connections.stop" => need().and_then(|id| {
+                setups
+                    .stop(&caller, &id)
+                    .map(|v| {
+                        let next = match (v.ended, v.now.kind) {
+                            (Some(_), _) => "Say in one line that it's stopped, and nothing more about it.",
+                            (None, NowKind::Connected) => "It was connected already, so nothing was stopped: it stays on.",
+                            (None, _) => "Desk is checking its key and turning it on now, so it wasn't stopped: call connections.wait.",
+                        };
+                        json!({ "now": v.now.title, "next": next })
+                    })
+            }),
             "connections.step" => need().and_then(|id| {
                 let state = match text(&input, "state").as_deref() {
                     Some("current") => StepState::Current,
@@ -3678,6 +4143,18 @@ impl Tool for SetupTool {
                     )
                     .map(|v| json!({ "steps": v.steps }))
             }),
+            "connections.keep" if input.get("value").and_then(Value::as_str).is_some_and(is_marker) => {
+                need().and_then(|id| {
+                    let kept = setups.keep_given(
+                        &caller,
+                        &id,
+                        &text(&input, "field").unwrap_or_default(),
+                        input.get("value").and_then(Value::as_str).unwrap_or_default(),
+                    )?;
+                    setups.finish_when_ready(&caller, &kept);
+                    Ok(json!(kept))
+                })
+            }
             "connections.keep" => match need().and_then(|id| {
                 setups
                     .keep(

@@ -6,3 +6,7 @@ feac6f68038b4c68dadc336426fbd2a0b09eea21:crates/hub/src/desk_chrome/protocol-v1.
 # A macOS test's made-up install run marker (DESK_DEPS_RUN=tok) in
 # crates/desk/src/procs.rs, no secret; later commits name it run-1.
 90904d6dc51612f6b228282beac4f6e5477b2d0f:crates/desk/src/procs.rs:generic-api-key:308
+
+# A made-up Linear key a test of Desk's paste once spelled out (DW-744);
+# the test now builds it from repeated letters.
+d0efbcd261193010d97bffe525b00be72bc6a463:crates/hub/src/desk_connections/tests.rs:generic-api-key:3202
