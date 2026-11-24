@@ -122,7 +122,8 @@ async fn mantis_reads(
 }
 
 /// `gh`'s compare of acme/mantis from `base` to `head`: `status`, `base`
-/// whole as `sha`, its head commit made at `made`.
+/// whole as `sha`, its head commit made at `made`. Over the general mocks,
+/// under a test's own failure.
 async fn compare_mounted(
     gh: &wiremock::MockServer,
     base: &str,
@@ -139,7 +140,7 @@ async fn compare_mounted(
             "status": status, "base_commit": { "sha": sha }, "ahead_by": 1, "behind_by": 0,
             "total_commits": 1, "files": [],
             "commits": [{ "sha": head, "commit": { "committer": { "date": made.to_rfc3339() } } }] })))
-        .with_priority(1)
+        .with_priority(2)
         .mount(gh)
         .await;
 }
@@ -634,6 +635,43 @@ async fn a_checkpoint_takes_only_the_goals_work_since_it_was_agreed() {
             Some(PULL_HEAD),
             "{heads:?}"
         );
+    })
+    .await;
+}
+
+/// A head GitHub couldn't be asked for as the goal was first checked is
+/// read again until it is: main gets where it stood, not none.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_head_github_failed_to_give_is_read_again() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, ResponseTemplate};
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(dir.path()).unwrap();
+        let gh = mantis(chrono::Utc::now(), 22, "old").await;
+        Mock::given(method("GET"))
+            .and(path("/repos/acme/mantis/compare/main...main"))
+            .respond_with(ResponseTemplate::new(502))
+            .with_priority(1)
+            .up_to_n_times(1)
+            .mount(&gh)
+            .await;
+        let (_, _, d, _) = boss_on(&base, pool, &checking(1440), &gh).await;
+        let (id, _) = goal_running(&d, &base, fast_ci(true)).await;
+        let main = workforce_desk::goal::head_key("acme/mantis", "main");
+        eventually("main's head read again", async || {
+            let heads = d.store().goal_heads(id).await.ok()?;
+            (heads.get(&main).map(String::as_str) == Some(MAIN_HEAD)).then_some(())
+        })
+        .await;
+        let asked = gh
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .iter()
+            .filter(|r| r.url.path() == "/repos/acme/mantis/compare/main...main")
+            .count();
+        assert!(asked >= 2, "the 502, then the read that gave it: {asked}");
     })
     .await;
 }

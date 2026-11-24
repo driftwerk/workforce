@@ -22,12 +22,12 @@ use chrono::{DateTime, Utc};
 use serde_json::{json, Value};
 use uuid::Uuid;
 use workforce_desk::goal::{
-    self, head_for, head_key, heads_agreed, part_head_key, Evidence, FactKind, Found, GoalRefs,
-    GoalResult, Heads, NotShown, Reading, ABSENT,
+    self, head_for, head_key, part_head_key, Evidence, FactKind, Found, GoalRefs, GoalResult,
+    Heads, NotShown, Reading, ABSENT, UNREAD,
 };
 use workforce_desk::PlanDetail;
 
-use super::github::{each_as_person, GithubAccess};
+use super::github::{self, each_as_person, GithubAccess};
 use super::{AgentService, CrewHub};
 
 /// Whether `r` is a branch as GitHub's compare takes it in its path: git's
@@ -71,7 +71,9 @@ pub(super) struct Taken {
 /// Where a branch or pull request stood, what a commit on it is new
 /// against: its own head then, or the head then of the branch it comes from
 /// (`dated`), when it wasn't there itself, a commit new against which must
-/// also be made since.
+/// also be made since. Each is judged by a compare from it (a target's in
+/// [`Placing::compares`], or [`Judging::Compare`]), read by [`newer`]: a
+/// `dated` one only through the compare's `head_committed_at`.
 #[derive(Debug, Clone, PartialEq)]
 struct Then {
     sha: String,
@@ -233,13 +235,13 @@ impl CrewHub {
         goal::checkpoint_shows(&shown, &found, &earlier)
             .map_err(|why| not_shown_line(&why, &taken))?;
         let now = self
-            .as_person(service, heads_now(&access, &taken.refs, &Heads::new()))
+            .as_person(service, heads_now(&access, &taken.refs, |_| true))
             .await
             .unwrap_or_default();
         let moved: Heads = heads
             .into_iter()
             .chain(now)
-            .filter(|(_, sha)| sha != ABSENT)
+            .filter(|(_, sha)| sha != ABSENT && sha != UNREAD)
             .map(|(key, sha)| (part_head_key(part, &key), sha))
             .collect();
         self.keep_heads(plan.id, &moved, true).await;
@@ -247,9 +249,10 @@ impl CrewHub {
     }
 
     /// Where goal plan `plan`'s work, naming `refs`, stood as it was
-    /// agreed, read as the person and kept, once: each branch or pull
-    /// request it couldn't read [`ABSENT`], and one that comes later none,
-    /// so all on it is new. Whether it was read, or nothing is to be.
+    /// agreed, read as the person and kept: each branch or pull request
+    /// GitHub says isn't there [`ABSENT`], one it couldn't be asked for
+    /// [`UNREAD`] until it is, and one that comes later none, so all on it
+    /// is new. Whether all of it is read.
     pub(super) async fn heads_kept(
         &self,
         service: &AgentService,
@@ -259,18 +262,18 @@ impl CrewHub {
         let Ok(kept) = self.desk.store().goal_heads(plan).await else {
             return false;
         };
-        if refs.is_empty() || heads_agreed(&kept) {
-            return true;
-        }
         let access = super::goal::access(service);
         let Some(now) = self
-            .as_person(service, heads_now(&access, refs, &Heads::new()))
+            .as_person(
+                service,
+                heads_now(&access, refs, |key| goal::head_due(&kept, key)),
+            )
             .await
         else {
             return false;
         };
-        self.keep_heads(plan, &now, false).await;
-        true
+        self.keep_heads(plan, &now, true).await;
+        !now.values().any(|sha| sha == UNREAD)
     }
 
     /// Keeps `heads` with goal plan `plan`'s, over those it names when
@@ -306,10 +309,15 @@ impl CrewHub {
     }
 }
 
-/// Where each of `refs`' branches and pull requests not in `kept` stands
+/// Where each of `refs`' branches and pull requests that is `due` stands
 /// now, as the person in scope reads it, by [`head_key`]: [`ABSENT`] for
-/// one it couldn't read, none when GitHub couldn't be asked.
-async fn heads_now(access: &GithubAccess<'_>, refs: &GoalRefs, kept: &Heads) -> Option<Heads> {
+/// one GitHub says isn't there, [`UNREAD`] for one it couldn't be asked
+/// for, none when GitHub couldn't be asked at all.
+async fn heads_now(
+    access: &GithubAccess<'_>,
+    refs: &GoalRefs,
+    due: impl Fn(&str) -> bool,
+) -> Option<Heads> {
     let mut asks: Vec<(String, (&str, Value))> = refs
         .branches
         .iter()
@@ -324,7 +332,7 @@ async fn heads_now(access: &GithubAccess<'_>, refs: &GoalRefs, kept: &Heads) -> 
             let args = json!({ "owner": owner, "repo": name, "number": n });
             Some((head_key(repo, &format!("#{n}")), ("github.get_pull", args)))
         }))
-        .filter(|(key, _)| !kept.contains_key(key))
+        .filter(|(key, _)| due(key))
         .collect();
     asks.sort_by(|a, b| a.0.cmp(&b.0));
     if asks.is_empty() {
@@ -336,11 +344,19 @@ async fn heads_now(access: &GithubAccess<'_>, refs: &GoalRefs, kept: &Heads) -> 
         asks.into_iter()
             .zip(answered)
             .map(|((key, _), got)| {
-                let sha = got.ok().and_then(|got| {
-                    let sha = got["base_sha"].as_str().or(got["head_sha"].as_str())?;
-                    is_sha(sha).then(|| sha.to_string())
-                });
-                (key, sha.unwrap_or_else(|| ABSENT.to_string()))
+                let sha = match got {
+                    Ok(got) => got["base_sha"]
+                        .as_str()
+                        .or(got["head_sha"].as_str())
+                        .filter(|sha| is_sha(sha))
+                        .unwrap_or(UNREAD)
+                        .to_string(),
+                    Err(github::GithubError::Other(said)) if said == github::NOT_FOUND => {
+                        ABSENT.to_string()
+                    }
+                    Err(_) => UNREAD.to_string(),
+                };
+                (key, sha)
             })
             .collect(),
     )
@@ -379,15 +395,18 @@ fn fresh(at: &Value, since: DateTime<Utc>) -> bool {
 /// What a commit is to where its branch or pull request stood (`then`),
 /// as GitHub's compare from there to it says: new when not already in it
 /// (`ahead`, or `diverged` after a rebase or a force-push), and, against the
-/// branch it comes from, made since; else there already.
+/// branch it comes from, made since; else there already. Made since is the
+/// compare's `head_committed_at`, which `github.compare` gives only when it
+/// lists every commit: without it, a commit `dated` can't be placed.
 fn newer(got: Option<&Value>, then: &Then) -> Found {
-    let made = |g: &Value| {
-        let at = &g["head_committed_at"];
-        then.dated
-            .is_none_or(|since| at.is_null() || fresh(at, since))
+    let made = |g: &Value| match (then.dated, &g["head_committed_at"]) {
+        (None, _) => Found::OnGoal,
+        (Some(_), Value::Null) => Found::Unplaced,
+        (Some(since), at) if fresh(at, since) => Found::OnGoal,
+        (Some(_), _) => Found::Old,
     };
     match got.and_then(|g| Some((g["status"].as_str()?, g))) {
-        Some(("ahead" | "diverged", g)) if made(g) => Found::OnGoal,
+        Some(("ahead" | "diverged", g)) => made(g),
         Some(_) => Found::Old,
         None => Found::Missing,
     }
@@ -682,6 +701,8 @@ enum Reach {
     Old,
     /// Reachable from it; whether it is new couldn't be read.
     Unknown,
+    /// Reachable from it, on what wasn't there then, its making not dated.
+    Undated,
 }
 
 impl Placing {
@@ -731,6 +752,7 @@ impl Placing {
                         match newer(after.as_ref(), then) {
                             Found::OnGoal => Reach::New,
                             Found::Old => Reach::Old,
+                            Found::Unplaced => Reach::Undated,
                             _ => Reach::Unknown,
                         }
                     }
@@ -744,6 +766,7 @@ impl Placing {
         let found = [
             (Reach::New, Found::OnGoal),
             (Reach::Old, Found::Old),
+            (Reach::Undated, Found::Unplaced),
             (Reach::Unknown, Found::Missing),
             (Reach::Off, Found::OffGoal),
         ]
@@ -930,9 +953,10 @@ mod tests {
         );
         assert_eq!(
             newer(status("ahead").as_ref(), &from),
-            Found::OnGoal,
-            "too many commits to date its head"
+            Found::Unplaced,
+            "too many commits to date its head: cite the pull request"
         );
+        assert_eq!(newer(status("ahead").as_ref(), &own), Found::OnGoal);
 
         let placing = |then: Option<&str>| Placing {
             args: json!({ "owner": "acme", "repo": "mantis" }),
@@ -969,6 +993,18 @@ mod tests {
             Found::OffGoal
         );
         assert_eq!(placed(&kept, vec![None, None]).0, Found::Missing);
+        let came_later = Placing {
+            targets: vec![Target {
+                now: "1".repeat(40),
+                then: Some(from.clone()),
+            }],
+            ..placing(None)
+        };
+        assert_eq!(
+            placed(&came_later, vec![on("ahead"), status("ahead")]).0,
+            Found::Unplaced,
+            "on a pull request that came later, its making not dated"
+        );
         let none_kept = placing(None);
         assert_eq!(none_kept.compares().len(), 1);
         assert_eq!(

@@ -925,4 +925,15 @@ fn a_parts_head_is_where_its_last_checkpoint_left_it_else_where_it_was_agreed() 
         "absent: all on it is new"
     );
     assert_eq!(head_for(&heads, 2, &main), Some(&*"a".repeat(40)));
+
+    let pull = head_key("acme/web", "#4");
+    let heads = Heads::from([
+        (main.clone(), UNREAD.to_string()),
+        (unread.clone(), "a".repeat(40)),
+    ]);
+    assert_eq!(head_for(&heads, 1, &main), None, "not read yet: no head");
+    assert!(head_due(&heads, &main), "read again");
+    assert!(!head_due(&heads, &unread));
+    assert!(!head_due(&heads, &pull), "it came later");
+    assert!(head_due(&Heads::new(), &pull), "nothing read yet");
 }

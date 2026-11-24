@@ -731,12 +731,17 @@ impl GoalSaid {
 /// Where each of a goal's branches and pull requests stood as it was
 /// agreed, by [`head_key`], and as each judged part's last checkpoint left
 /// it, by [`part_head_key`]: what work shown toward that part must come
-/// after. [`ABSENT`] for one that couldn't be read then.
+/// after. [`ABSENT`] for one that wasn't there then, [`UNREAD`] for one
+/// still to be read.
 pub type Heads = BTreeMap<String, String>;
 
-/// What a head that couldn't be read is kept as: none, so everything on it
-/// is new.
+/// What a head GitHub says isn't there is kept as: none, so everything on
+/// it is new.
 pub const ABSENT: &str = "";
+
+/// What a head GitHub couldn't be asked for is kept as until it is read
+/// again: no head yet.
+pub const UNREAD: &str = "unread";
 
 /// What a part's head is kept by before its own key.
 const PART_HEAD: &str = "part ";
@@ -758,6 +763,13 @@ pub fn heads_agreed(heads: &Heads) -> bool {
     heads.keys().any(|k| !k.starts_with(PART_HEAD))
 }
 
+/// Whether head `key` is still to be read for where the goal's work stood
+/// as it was agreed (`heads`): any, before that was read; one [`UNREAD`]
+/// then; none that came later.
+pub fn head_due(heads: &Heads, key: &str) -> bool {
+    !heads_agreed(heads) || heads.get(key).is_some_and(|sha| sha == UNREAD)
+}
+
 /// Where head `key` stood for judged part `part` in `heads`: as its last
 /// checkpoint left it, else as the goal was agreed.
 pub fn head_for<'a>(heads: &'a Heads, part: u16, key: &str) -> Option<&'a str> {
@@ -765,7 +777,7 @@ pub fn head_for<'a>(heads: &'a Heads, part: u16, key: &str) -> Option<&'a str> {
         .iter()
         .filter_map(|k| heads.get(k))
         .map(String::as_str)
-        .find(|sha| *sha != ABSENT)
+        .find(|sha| *sha != ABSENT && *sha != UNREAD)
 }
 
 /// The stall leading `stalls`: the furthest in its spells, the longest
