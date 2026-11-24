@@ -242,6 +242,11 @@ impl Screen {
     fn text(&self) -> String {
         self.core.lock().term.text()
     }
+
+    fn primary_text(&self) -> Option<String> {
+        let core = self.core.lock();
+        (!core.term.alternate()).then(|| core.term.text())
+    }
 }
 
 /// The queries a blind screen answers, and how: the cursor position
@@ -527,6 +532,11 @@ impl Pty {
     /// screen while a program has it.
     pub fn text(&self) -> String {
         self.screen.text()
+    }
+
+    /// The same, only while no program has the alternate screen.
+    pub fn primary_text(&self) -> Option<String> {
+        self.screen.primary_text()
     }
 
     /// The process's working directory as the system knows it, else the

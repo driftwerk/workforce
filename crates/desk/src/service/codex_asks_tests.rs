@@ -54,7 +54,7 @@ fn serve(dir: &Path) -> tokio::task::JoinHandle<WebSocketStream<UnixStream>> {
     })
 }
 
-async fn until(mut ok: impl FnMut() -> bool) {
+pub(super) async fn until(mut ok: impl FnMut() -> bool) {
     for _ in 0..1000 {
         if ok() {
             return;
@@ -74,7 +74,7 @@ fn ask(id: i64, decisions: Option<Value>) -> Value {
     json!({"id": id, "method": "item/commandExecution/requestApproval", "params": params})
 }
 
-fn codex_session(dir: &Path, approve_for_me: bool) -> NewSession {
+pub(super) fn codex_session(dir: &Path, approve_for_me: bool) -> NewSession {
     NewSession {
         fresh_worktree: false,
         engine: Engine::Codex,

@@ -555,6 +555,11 @@ impl Term {
         bytes
     }
 
+    /// Whether a program has the alternate screen.
+    pub fn alternate(&self) -> bool {
+        self.parser.screen().alternate_screen()
+    }
+
     /// What the terminal shows as plain text: the primary screen's history
     /// and screen, or the alternate screen while a program has it.
     pub fn text(&self) -> String {

@@ -325,6 +325,9 @@ pub struct WaitsView {
     pub since: DateTime<Utc>,
 }
 
+/// How much of what a session said as it ended its [`Exited::words`] carry.
+const SAID_IN_WORDS: usize = 200;
+
 /// How a session's process ended on its own (not stopped, closed or ended
 /// by Desk): what it showed last, kept until it starts again.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -339,6 +342,10 @@ pub struct Exited {
     /// turn of it ended.
     #[serde(default)]
     pub on_start: bool,
+    /// How many starts before this one in a row ended as it started, saying
+    /// the same.
+    #[serde(default)]
+    pub repeats: u32,
 }
 
 impl Exited {
@@ -354,6 +361,25 @@ impl Exited {
             Some(c) => format!("ended as it started (exit {c})"),
             None => "ended as it started".into(),
         }
+    }
+
+    /// [`Self::words`], and what it said: "ended as it started (exit 1):
+    /// error: …".
+    pub fn told(&self) -> String {
+        match self.said(SAID_IN_WORDS) {
+            said if said.is_empty() => self.words(),
+            said => format!("{}: {said}", self.words()),
+        }
+    }
+
+    /// Why it isn't started again by anyone but the person, once it ended
+    /// as it started the same way more than once in a row.
+    pub fn again(&self) -> String {
+        format!(
+            "it ended as it started {} times in a row, each time saying “{}”: started again, it would end the same way, so only the person starts it now",
+            self.repeats + 1,
+            self.said(SAID_IN_WORDS)
+        )
     }
 
     /// The end of its last output on one line, its lines joined by " / ",
