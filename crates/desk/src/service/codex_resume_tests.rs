@@ -342,6 +342,7 @@ async fn a_codex_session_runs_in_its_own_mode_unless_one_that_doesnt_ask_is_kept
             .await;
         assert_eq!(asked, [reset]);
         until(|| tui_starts(&dir).len() == 10).await;
+        until(|| d.view(s.id).unwrap().state == SessionState::Idle).await;
         turn(&d, s.id, &mut ws).await;
         stopped(&d, s.id).await;
         let (asked, _) = started_again(&d, &dir, &[ok], move |d| async move {
@@ -380,6 +381,11 @@ async fn a_codex_session_keeps_its_mode_through_every_start_and_a_refusal_is_sai
         assert!(!started.contains("approval") && !started.contains("sandbox"), "{started}");
         tokio::time::sleep(Duration::from_millis(600)).await;
         assert!(d.view(s.id).unwrap().live, "its TUI took the resume");
+        assert_eq!(
+            d.view(s.id).unwrap().state,
+            SessionState::Idle,
+            "up once its thread is: nothing more comes as its TUI joins it"
+        );
 
         // Interrupted mid-turn: its turn stops, and it isn't started again.
         say(&mut ws, status("active")).await;
