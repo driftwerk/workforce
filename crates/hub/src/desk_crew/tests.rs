@@ -6778,3 +6778,59 @@ async fn a_wedged_mind_is_waited_for_only_so_long() {
     })
     .await;
 }
+
+/// A long message in an agent's Desk DM is listed cut, saying so and how
+/// to read it whole, and read by its id it comes whole.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_long_agent_message_is_listed_cut_and_read_whole_by_its_id() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (scout, _s) = agent(dir.path(), "scout", "On it.").await;
+        let mut dm = scout
+            .sessions
+            .get_or_create(DESK_CHANNEL, PERSON, "scout")
+            .unwrap();
+        dm.add_user_message("How did the audit go?", None);
+        let report: String = (0..300)
+            .map(|i| format!("Module {i:03} checked. "))
+            .collect();
+        dm.add_assistant_message(&report, 0);
+        scout.sessions.save(&dm).unwrap();
+        let (overseer, _crew, _d, _llm) = overseeing(
+            dir.path(),
+            pool,
+            "ok",
+            "[oversight]\nenabled = true\nlevel = \"act\"\n",
+            &[Arc::clone(&scout)],
+        )
+        .await;
+        eventually("the overseer's tools", async || {
+            overseer.tools.has("crew.history").then_some(())
+        })
+        .await;
+        let history = overseer.tools.get("crew.history").unwrap();
+        let listed = history.execute(json!({"agent_id": "scout"})).await.unwrap();
+        let shown = listed.output["messages"].as_str().unwrap();
+        assert!(shown.contains("Module 010 checked"), "{shown}");
+        assert!(!shown.contains("Module 250 checked"), "{shown}");
+        let id = dm.messages.last().unwrap().id.clone();
+        assert!(
+            shown.contains(&format!(
+                "[cut: its first 1499 of 5999 characters shown. Read it whole with crew.history (agent_id: scout, dm_id: {id}).]"
+            )),
+            "{shown}"
+        );
+        assert!(
+            !shown.contains(&dm.messages[0].id),
+            "only a cut message is named, by its note: {shown}"
+        );
+        let whole = history
+            .execute(json!({"agent_id": "scout", "dm_id": id}))
+            .await
+            .unwrap();
+        let read = whole.output["messages"].to_string();
+        assert!(read.contains("Module 299 checked"), "{read}");
+        assert!(!read.contains("[cut:"), "{read}");
+    })
+    .await;
+}

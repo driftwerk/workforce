@@ -484,19 +484,31 @@ impl CrewTool {
                     return Ok(json!({ "messages": [] }));
                 };
                 let speaker = workforce_desk::Speaker::agent(agent, &super::name_of(&service));
+                let dm = input["dm_id"].as_str();
                 let mut page = crate::desk_conversations::page(
                     service.sessions.as_ref(),
                     &speaker,
                     &owner,
                     workforce_common::channels::DESK_CHANNEL,
                     workforce_desk::Cursor::Newest,
-                    limit,
+                    dm.map_or(limit, |_| DM_LOOKBACK),
                 )
                 .map_err(|e| e.to_string())?;
                 crate::desk_conversations::with_authors(&crew.desk, &mut page).await;
-                let messages = json!(page.messages.iter().map(|m| json!({
-                    "from": m.from, "author": m.author, "text": crew::clip(&m.text, 1500), "at": m.at,
-                })).collect::<Vec<_>>());
+                let said = |m: &workforce_desk::conversations::Said, text: String| json!({ "from": m.from, "author": m.author, "text": text, "at": m.at });
+                let messages = match dm {
+                    Some(dm) => {
+                        let m = page.messages.iter().find(|m| m.id == dm).ok_or(
+                            "No message with that dm_id among the agent's recent Desk DM.",
+                        )?;
+                        json!([said(m, m.text.clone())])
+                    }
+                    None => json!(page
+                        .messages
+                        .iter()
+                        .map(|m| said(m, dm_text(agent, &m.id, &m.text)))
+                        .collect::<Vec<_>>()),
+                };
                 Ok(json!({
                     "messages": reported(&messages.to_string(), &format!("{agent}'s Desk DM")),
                 }))
@@ -1142,6 +1154,27 @@ impl CrewTool {
 /// `crew.ask_session`: the last resort, after the boss looked itself.
 pub(super) const ASK_SESSION_DESCRIPTION: &str = "Last resort: ask a session (session_id) about its work, as Desk's status question on its line, without derailing it. Look first: crew.inside (its processes, transcript and workspace) and crew.account answer most questions now. One that is working gets the question only once its turn ends, so a session stuck in a long tool call (a build queue, a hung command) won't answer: look inside it instead. It asks for words only and never changes what the session does; to have it wait, hold or change course, tell it so with crew.nudge.";
 
+/// How much of each message of an agent's Desk DM crew.history shows.
+const DM_CHARS: usize = 1500;
+/// How far back crew.history looks for the DM message `dm_id` names.
+const DM_LOOKBACK: usize = 100;
+
+/// `text`, a message `id` of `agent`'s Desk DM, as crew.history lists it:
+/// cut to [`DM_CHARS`], saying so and how to read it whole.
+fn dm_text(agent: &str, id: &str, text: &str) -> String {
+    let total = text.trim().chars().count();
+    match total > DM_CHARS {
+        true => {
+            let kept = crew::clip(text, DM_CHARS);
+            format!(
+                "{kept}\n[cut: its first {} of {total} characters shown. Read it whole with crew.history (agent_id: {agent}, dm_id: {id}).]",
+                kept.trim_end_matches('…').chars().count()
+            )
+        }
+        false => text.to_string(),
+    }
+}
+
 /// Where crew.history reads a session's reply from: its `reply_from`, and
 /// the `turn` that reply ended.
 pub(super) fn reply_asked(input: &Value) -> (usize, Option<String>) {
@@ -1202,7 +1235,7 @@ pub(crate) fn describe(name: &str) -> &'static str {
             "crew.activity" => "What happened on the crew, newest first: turns started and finished, questions, requests, failures, and what you and the person did. Filter to one agent or session with subject_id.",
             "crew.account" => "What one session (session_id) is for, who asked, its plan, what it has done (with its PRs, tickets, commits and deploys), what it is doing now, what it waits on, what comes next and the choices it made: its running account, brought up to date first when it is stale, with the time it is as of. Read it before you say anything of a session. With question, also the answer its own recent conversation gives to something the account doesn't say (which key, which file, what error).",
             "crew.ask_session" => ASK_SESSION_DESCRIPTION,
-            "crew.history" => "The recent messages of one agent's Desk DM with the person (agent_id), one session's last prompt, reply, pending request and terminal (session_id; a reply too long for one read says so and is read on with reply_from and turn), or one message on a session's Desk line, whole (message_id: when what you were shown of it says it was cut short).",
+            "crew.history" => "The recent messages of one agent's Desk DM with the person (agent_id; one too long says so and is read whole with dm_id), one session's last prompt, reply, pending request and terminal (session_id; a reply too long for one read says so and is read on with reply_from and turn), or one message on a session's Desk line, whole (message_id: when what you were shown of it says it was cut short).",
             "crew.nudge" => "Send a short message to an agent's DM (agent_id) or to a session on its Desk line (session_id): a check-in, a hint, a correction. A session gets it once its turn ends, or, with urgent, with its next tool call's result (crew.interrupt stops a turn now). With reply_to (a question's message id), it is your answer to what that session asked you.",
             "crew.escalate" => "Give a question a session asked you on its Desk line to the person (message_id): say why in reason, offer answers in options, and draft one in draft if you can. Use it for anything that pushes, deletes, deploys, spends, sends to people or changes scope, and whenever you are unsure; at Act fully, only for what the person's own orders and preferences don't cover (they are the rule, both ways).",
             "crew.approve" => "Allow a session's pending request (session_id, approval_id from crew.overview).",
@@ -1300,6 +1333,7 @@ pub(crate) fn schema(name: &str, engines: impl Fn() -> Vec<&'static str>) -> Val
             "agent_id": { "type": "string" },
             "session_id": session_schema(),
             "message_id": { "type": "string", "description": "A message on a session's Desk line, by its full id: read it whole" },
+            "dm_id": { "type": "string", "description": "With agent_id: one message of its Desk DM, by its id, read whole, as a cut one says" },
             "reply_from": { "type": "integer", "minimum": 0, "maximum": workforce_desk::crew::REPLY_FROM_MAX, "description": "With session_id: read its reply on from this character, as a cut reply says" },
             "turn": { "type": "string", "description": "With reply_from: the turn the cut reply said, so a reply replaced since isn't read on" },
             "limit": { "type": "integer", "minimum": 1, "maximum": 100 }
