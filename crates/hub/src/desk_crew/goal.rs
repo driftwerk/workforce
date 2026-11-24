@@ -99,6 +99,9 @@ pub(super) fn not_said(quote: &str, why: NotSaid, said: Said) -> String {
         (NotSaid::NotFound, Said::Agreeing) => format!(
             "Desk looked for “{q}” in {WHERE_LOOKED} over the last 24 hours and didn't find it word for word. Quote one message of theirs exactly as they wrote it: not your own words, and not spread over two messages."
         ),
+        (NotSaid::Refuses, _) => format!(
+            "The person's “{q}” doesn't agree to it: it says no, or asks for something else. Don't apply it: answer what they said, and if you propose something new, put it to them in plain words."
+        ),
         (NotSaid::NotFound, Said::Changing) => format!(
             "Desk looked for “{q}” in {WHERE_LOOKED} over the last 24 hours and didn't find it word for word. Quote one message of theirs exactly as they wrote it.{ask}"
         ),

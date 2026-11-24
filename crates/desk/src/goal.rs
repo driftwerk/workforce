@@ -1002,6 +1002,9 @@ pub enum NotSaid {
     NotWhole,
     /// In none of their messages, word for word.
     NotFound,
+    /// In a message of theirs that doesn't agree ([`consents`]): it says
+    /// no, or asks for something else ("not yet", "yes but wait").
+    Refuses,
 }
 
 /// Text as it is compared: compatibility forms folded (NFKC), curly
@@ -1051,25 +1054,29 @@ pub fn said_by(
     let (least_words, least_chars) = said.floor();
     let short = quoted.len() < least_words || quoted.join(" ").chars().count() < least_chars;
     let mut found = None;
-    let (mut too_short, mut not_whole) = (false, false);
+    let (mut too_short, mut not_whole, mut refused) = (false, false, false);
     for (at, text) in messages {
         let words = compared_words(text);
         let whole = words == quoted;
         let part = words.windows(quoted.len()).any(|w| w == quoted.as_slice());
         // An answer is the whole reply, however short: never a part of it.
-        let counts = match said {
+        let matched = match said {
             Said::Answering => whole,
             _ => (whole && said.whole_counts()) || (part && !short),
         };
-        let newer = part && !counts && *at > since;
+        // An answer or an agreement is one only when its message agrees.
+        let consented = said == Said::Changing || consents(text);
+        let newer = part && !matched && *at > since;
         not_whole |= newer && said == Said::Answering;
         too_short |= newer && said != Said::Answering;
-        if counts {
+        refused |= matched && !consented && *at > since;
+        if matched && consented {
             found = found.max(Some(*at));
         }
     }
     match found {
         Some(at) if at > since => Ok(at),
+        _ if refused => Err(NotSaid::Refuses),
         _ if not_whole => Err(NotSaid::NotWhole),
         _ if too_short => Err(NotSaid::TooShort {
             words: least_words,
@@ -1152,12 +1159,24 @@ pub fn agrees(text: &str) -> bool {
             })
     }
     let words = compared_words(text);
-    let thumbs = text.contains('\u{1F44D}');
-    let said = thumbs || words.iter().any(|w| w != "please");
-    let refuses = words
+    let said = text.contains('\u{1F44D}') || words.iter().any(|w| w != "please");
+    said && !refuses(&words) && phrased(&words)
+}
+
+/// Whether `words` say no or ask for something else: a word of
+/// [`NOT_AGREEING`]'s, or one ending "n't".
+fn refuses(words: &[String]) -> bool {
+    words
         .iter()
-        .any(|w| NOT_AGREEING.contains(&w.as_str()) || w.ends_with("n't"));
-    said && !refuses && phrased(&words)
+        .any(|w| NOT_AGREEING.contains(&w.as_str()) || w.ends_with("n't"))
+}
+
+/// Whether the person's message `text`, answering or agreeing, says yes:
+/// never with a word that refuses ([`NOT_AGREEING`]), whatever its length;
+/// a short one ([`stands_alone`] not) only when it [`agrees`]; a longer
+/// one ("Yes, and keep it fast") on its own words.
+pub fn consents(text: &str) -> bool {
+    !refuses(&compared_words(text)) && (stands_alone(text) || agrees(text))
 }
 
 /// When the person's `quote` is their plain reply to what the boss

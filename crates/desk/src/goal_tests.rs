@@ -1033,3 +1033,25 @@ fn a_plain_reply_settles_only_what_the_bosss_message_before_it_proposed() {
         Err(NotReplied::NothingProposed)
     );
 }
+
+#[test]
+fn a_short_answer_or_agreement_counts_only_when_it_agrees_and_none_that_refuses() {
+    for said in [Said::Answering, Said::Agreeing] {
+        let messages = vec![
+            (at(0), "no".to_string()),
+            (at(1), "not yet".to_string()),
+            (at(2), "Yes, but not the docs".to_string()),
+            (at(3), "ok".to_string()),
+            (at(4), "Yes, and keep it fast".to_string()),
+        ];
+        let by = |quote: &str| said_by(&messages, quote, at(-60), said);
+        for refused in ["no", "not yet", "Yes, but not the docs"] {
+            assert_eq!(by(refused), Err(NotSaid::Refuses), "{said:?} {refused}");
+        }
+        assert_eq!(by("ok"), Ok(at(3)), "{said:?}");
+        assert_eq!(by("Yes, and keep it fast"), Ok(at(4)), "{said:?}");
+    }
+    assert!(consents("Yes, and keep it fast"));
+    assert!(!consents("hmm"));
+    assert!(!consents("Let's fix it, but later"));
+}
