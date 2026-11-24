@@ -24,7 +24,8 @@ use crate::store::{build_pool, DeskStore};
 
 const REFUSED: &str = "Error: Permission overrides are not supported when resuming a remote task.";
 
-/// A stand-in `codex`: its app-server says where it was told to listen; its
+/// A stand-in `codex`: Desk's other runs of it (its version, its sign-in)
+/// end at once; its app-server says where it was told to listen; its
 /// TUI writes down how it was started, one line each, and refuses a resume
 /// given a permission (or any, once `refuse` is in `dir`) as 0.166 does;
 /// else it draws its screen, the alternate one, unless `hang` is in `dir`.
@@ -34,6 +35,7 @@ fn fake_codex(dir: &Path) -> PathBuf {
         &path,
         format!(
             "#!/bin/sh\nd='{d}'\n\
+             case \"$1\" in app-server|--remote|resume) ;; *) exit 0 ;; esac\n\
              if [ \"$1\" = app-server ]; then echo \"${{3#unix://}}\" > \"$d/listen\"; exec sleep 60; fi\n\
              echo \"$@\" >> \"$d/tui-args\"\n\
              refuse() {{ printf '\\033[?1049h>_ OpenAI Codex (v0.166.0)\\r\\n\\033[?1049l{REFUSED}\\r\\n'; exec sleep 60; }}\n\
@@ -379,11 +381,11 @@ impl Said {
     }
 }
 
-/// A resumed session is up once its TUI has drawn its screen, never on
+/// A resumed session is up once its TUI is on its screen, never on
 /// Desk's own resume of its thread: one that never draws stays starting,
 /// and is said so; one that never starts is never up.
 #[tokio::test]
-async fn a_resumed_codex_session_is_up_only_once_its_tui_has_drawn() {
+async fn a_resumed_codex_session_is_up_only_once_its_tui_is_on_its_screen() {
     let said = Said::default();
     let _said = tracing::subscriber::set_default(
         tracing_subscriber::fmt()
@@ -404,12 +406,15 @@ async fn a_resumed_codex_session_is_up_only_once_its_tui_has_drawn() {
             move |d: Desk| async move { d.resume(s.id, None, Some(By::you())).await.map(drop) };
         let state = || d.view(s.id).unwrap().state;
 
-        // Drawn: up.
+        // On its screen: up. It is told to take it, whatever the person's
+        // settings say: one running inline never would.
         stopped(&d, s.id).await;
         started_again(&d, &dir, std::slice::from_ref(&ok), resume).await;
         until(|| state() == SessionState::Idle).await;
+        let last = tui_starts(&dir).pop().unwrap();
+        assert!(last.contains("tui.alternate_screen=\"always\""), "{last}");
 
-        // Its thread loaded, but its TUI never draws: still starting, and
+        // Its thread loaded, but its TUI never takes its screen: still starting, and
         // said so once its start's watch is over.
         stopped(&d, s.id).await;
         std::fs::write(dir.join("hang"), "").unwrap();

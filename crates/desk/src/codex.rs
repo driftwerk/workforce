@@ -61,6 +61,12 @@ pub const FAST: &str = "service_tier=\"priority\"";
 /// CLI's version itself.
 const NO_UPDATE_PROMPT: &str = "check_for_update_on_startup=false";
 
+/// Has the TUI take the alternate screen whatever the person's settings
+/// say: a resumed session is up once its TUI is on it, and one running
+/// inline (`never`, or `auto` where Codex judges the terminal can't) would
+/// never be (verified on CLI 0.166, through `--remote`).
+const ALTERNATE_SCREEN: &str = "tui.alternate_screen=\"always\"";
+
 /// The tier [`FAST`] names, as the app-server's `serviceTier`.
 const PRIORITY: &str = "priority";
 
@@ -123,7 +129,9 @@ pub fn spawn(s: &CodexSpawn<'_>) -> Spawn {
         "-C".to_string(),
         s.cwd.display().to_string(),
     ]);
-    let settings = std::iter::once(NO_UPDATE_PROMPT.to_string())
+    let settings = [NO_UPDATE_PROMPT, ALTERNATE_SCREEN]
+        .map(str::to_string)
+        .into_iter()
         .chain(permissions.into_iter().flat_map(Permissions::settings))
         .chain(s.fast.then(|| FAST.to_string()))
         // A TOML string, so it is only ever the value of `model`.
@@ -1659,9 +1667,17 @@ pub(crate) mod tests {
     async fn a_sessions_next_app_server_waits_for_its_last_to_end() {
         let dir = tempfile::tempdir().unwrap();
         let socket = dir.path().join("s.sock");
+        // Ended, it takes its sleep with it: nothing of it outlives the test.
         let mut last = tokio::process::Command::new("sh")
-            .args(["-c", "sleep 30; true", "app-server", "--listen"])
+            .args([
+                "-c",
+                "trap 'kill $!; exit' TERM; sleep 30 & wait",
+                "app-server",
+                "--listen",
+            ])
             .arg(format!("unix://{}", socket.display()))
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
             .kill_on_drop(true)
             .spawn()
             .unwrap();
@@ -1712,7 +1728,9 @@ pub(crate) mod tests {
                 "-C",
                 "/repo",
                 "-c",
-                "check_for_update_on_startup=false"
+                "check_for_update_on_startup=false",
+                "-c",
+                "tui.alternate_screen=\"always\""
             ]
         );
     }
@@ -1779,6 +1797,8 @@ pub(crate) mod tests {
                 "/repo",
                 "-c",
                 "check_for_update_on_startup=false",
+                "-c",
+                "tui.alternate_screen=\"always\"",
                 "--",
                 "go"
             ],
@@ -2089,7 +2109,7 @@ pub(crate) mod tests {
     /// Desk's resume of a thread as 0.166's app-server answered it, a real
     /// TUI then joining it (recorded): no `thread/started` comes, and none
     /// on the TUI's join. The answer says where the thread is, loaded, and
-    /// nothing says the session is up: its TUI does, once drawn.
+    /// nothing says the session is up: its TUI does, once on its screen.
     #[test]
     fn a_thread_desk_resumes_is_said_loaded_and_never_started() {
         let thread = "01a20dc3-0000-7000-8000-000000000001";
