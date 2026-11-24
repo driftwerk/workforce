@@ -218,10 +218,15 @@ impl CrewHub {
         });
         // Held by the plan guard: not run, and nothing posted. The next
         // wake-up or check-in comes as it would; a runaway is told once.
+        // Judged on the plan of the model the turn runs on, as it resolves
+        // it: the boss's own, wherever it was switched.
         if let Some(work) = &work {
-            if let Some(why) =
-                Box::pin(self.held_by_plan(service, owner, work, model.as_deref())).await
-            {
+            let on = TurnOn {
+                session: &session,
+                prompt,
+                model: model.as_deref(),
+            };
+            if let Some(why) = Box::pin(self.held_by_plan(service, owner, work, on)).await {
                 return Err(eyre::eyre!(why));
             }
         }
@@ -305,6 +310,45 @@ impl CrewHub {
     }
 }
 
+/// What a boss's turn runs on: `model` when the turn names one, else the
+/// model `session` resolves for `prompt` (its override, the agent's, its
+/// default).
+pub(super) struct TurnOn<'a> {
+    pub(super) session: &'a workforce_common::session::Session,
+    pub(super) prompt: &'a str,
+    pub(super) model: Option<&'a str>,
+}
+
+/// The plan guard's word on the boss's own turn `work` for `owner`, judged
+/// on the owner's plan for the model the turn runs on.
+pub(super) async fn plan_admits(
+    service: &AgentService,
+    owner: &str,
+    work: &workforce_common::work_use::Work,
+    on: TurnOn<'_>,
+) -> crate::cost_governor::Admission {
+    let runs_on = on.model.map_or_else(
+        || service.resolve_chat_model(on.session, on.prompt),
+        str::to_string,
+    );
+    let person = owner.parse::<uuid::Uuid>().ok();
+    workforce_common::work_use::within(work.clone(), async {
+        let login = crate::user_config::billed_to(
+            person,
+            crate::turn_loop::plan_login(service, Some(&runs_on)),
+        )
+        .await;
+        service.cost_governor.preflight_on(
+            service.agent_id.as_str(),
+            Some(owner),
+            crate::cost_governor::OnPlan {
+                login: login.as_ref(),
+            },
+        )
+    })
+    .await
+}
+
 impl CrewHub {
     /// Why the plan guard holds the boss's own turn `work` for `owner`, if
     /// it does. A runaway is told to the person once, in the DM.
@@ -313,25 +357,10 @@ impl CrewHub {
         service: &Arc<AgentService>,
         owner: &str,
         work: &workforce_common::work_use::Work,
-        model: Option<&str>,
+        on: TurnOn<'_>,
     ) -> Option<String> {
-        use crate::cost_governor::{Admission, OnPlan};
-        // On the plan the turn runs on: the owner's.
-        let person = owner.parse::<uuid::Uuid>().ok();
-        let admitted = workforce_common::work_use::within(work.clone(), async {
-            let login =
-                crate::user_config::billed_to(person, crate::turn_loop::plan_login(service, model))
-                    .await;
-            service.cost_governor.preflight_on(
-                service.agent_id.as_str(),
-                Some(owner),
-                OnPlan {
-                    login: login.as_ref(),
-                },
-            )
-        })
-        .await;
-        match admitted {
+        use crate::cost_governor::Admission;
+        match plan_admits(service, owner, work, on).await {
             Admission::Waits(why) => Some(why),
             Admission::Stopped { why, first } => {
                 if first {
@@ -515,4 +544,135 @@ impl Ran {
 /// something on its way.
 fn ran_call(call: &workforce_agent::runner::ToolInvocation) -> bool {
     call.success || (call.policy_decision != "deny" && call.denial_reason.is_none())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{plan_admits, TurnOn};
+    use crate::cost_governor::Admission;
+    use crate::serve::AgentService;
+    use workforce_common::session::Session;
+    use workforce_common::subscription::SubscriptionKind;
+    use workforce_common::usage::{Window, SEVEN_DAY};
+    use workforce_common::work_use::Work;
+
+    const CLAUDE: &str = "claude-code:sonnet";
+    const CHATGPT: &str = "chatgpt:gpt-6.1-sol";
+
+    fn weekly(used: f64) -> Window {
+        Window {
+            used_percent: used,
+            resets_at: Some(chrono::Utc::now() + chrono::Duration::days(3)),
+            minutes: SEVEN_DAY,
+        }
+    }
+
+    /// A boss on ChatGPT by default whose owner has a Claude and a ChatGPT
+    /// plan, the Claude one at `claude`% of its week and the ChatGPT one at
+    /// `chatgpt`%.
+    async fn boss_with_plans(
+        dir: &std::path::Path,
+        claude: f64,
+        chatgpt: f64,
+    ) -> (std::sync::Arc<AgentService>, String, wiremock::MockServer) {
+        let server = wiremock::MockServer::start().await;
+        let service = crate::serve::testing::chatgpt_service(dir, &server, |_| {}).await;
+        let owner = uuid::Uuid::new_v4();
+        crate::serve::testing::store_chatgpt_login(&service, &owner.to_string());
+        service
+            .vault
+            .as_ref()
+            .unwrap()
+            .set(
+                &format!("users/{owner}/claude_code/oauth_token"),
+                &format!("token-{}", uuid::Uuid::new_v4()),
+            )
+            .unwrap();
+        let guard = service.cost_governor.plan_guard();
+        for (kind, used) in [
+            (SubscriptionKind::Claude, claude),
+            (SubscriptionKind::ChatGpt, chatgpt),
+        ] {
+            let login =
+                crate::user_config::billed_to(Some(owner), async { service.logins.resolve(kind) })
+                    .await
+                    .unwrap();
+            guard.observe(&login, &[weekly(used)], chrono::Utc::now());
+        }
+        (service, owner.to_string(), server)
+    }
+
+    /// The plan guard's word on a notices turn of the boss, on the agent's
+    /// model `agent` and its session's `session` override.
+    async fn notices_turn(
+        service: &AgentService,
+        owner: &str,
+        agent: Option<&str>,
+        session: Option<&str>,
+    ) -> Admission {
+        *service.active_model.write() = agent.map(str::to_string);
+        let mut dm = Session::new("desk", owner, service.agent_id.as_str());
+        dm.set_model_override(session.map(str::to_string));
+        let work = Work::boss(service.agent_id.as_str(), owner, "Desk");
+        let on = TurnOn {
+            session: &dm,
+            prompt: "Notices: MAN-544 is waiting.",
+            model: None,
+        };
+        plan_admits(service, owner, &work, on).await
+    }
+
+    fn waits_on(admitted: &Admission, plan: &str) {
+        assert!(
+            matches!(admitted, Admission::Waits(why) if why.contains(&format!("your weekly {plan} plan is at"))),
+            "{admitted:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_bosss_turn_waits_only_on_the_plan_its_model_runs_on() {
+        let dir = tempfile::tempdir().unwrap();
+        // Claude nearly used up, ChatGPT not.
+        let (service, owner, _server) = boss_with_plans(dir.path(), 95.0, 10.0).await;
+        assert_eq!(
+            notices_turn(&service, &owner, None, None).await,
+            Admission::Proceed,
+            "on its ChatGPT default"
+        );
+        waits_on(
+            &notices_turn(&service, &owner, Some(CLAUDE), None).await,
+            "Claude",
+        );
+        assert_eq!(
+            notices_turn(&service, &owner, Some(CLAUDE), Some(CHATGPT)).await,
+            Admission::Proceed,
+            "its session switched back to ChatGPT"
+        );
+        waits_on(
+            &notices_turn(&service, &owner, None, Some(CLAUDE)).await,
+            "Claude",
+        );
+    }
+
+    #[tokio::test]
+    async fn a_bosss_turn_on_a_plan_with_room_runs_while_its_default_plan_is_nearly_used() {
+        let dir = tempfile::tempdir().unwrap();
+        // ChatGPT nearly used up, Claude not.
+        let (service, owner, _server) = boss_with_plans(dir.path(), 10.0, 95.0).await;
+        waits_on(&notices_turn(&service, &owner, None, None).await, "ChatGPT");
+        assert_eq!(
+            notices_turn(&service, &owner, Some(CLAUDE), None).await,
+            Admission::Proceed,
+            "the agent switched to Claude"
+        );
+        assert_eq!(
+            notices_turn(&service, &owner, None, Some(CLAUDE)).await,
+            Admission::Proceed,
+            "its session switched to Claude"
+        );
+        waits_on(
+            &notices_turn(&service, &owner, Some(CLAUDE), Some(CHATGPT)).await,
+            "ChatGPT",
+        );
+    }
 }

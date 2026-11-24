@@ -607,8 +607,15 @@ async fn at_act_the_boss_that_runs_it_answers_a_session_whose_turn_ended_on_a_qu
             )
             .await
             .unwrap();
+        // Nothing holds it: it goes in next, or is already being handed in
+        // by the time its word is read back.
         assert!(
-            said.contains(": queued, not yet delivered; it goes in next."),
+            [
+                ": queued, not yet delivered; it goes in next.",
+                ": queued, not yet delivered; it is on its way in,",
+            ]
+            .iter()
+            .any(|w| said.contains(w)),
             "nothing holds it, so nothing is said to: {said}"
         );
         let thread = d.line_thread(s.id, None, None).await.unwrap();

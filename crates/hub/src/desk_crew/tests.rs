@@ -2046,6 +2046,7 @@ async fn an_unprompted_answer_reaches_a_dm_left_open_for_days() {
 mod groups;
 
 mod handovers;
+mod holds;
 
 mod goal_checks;
 mod goals;

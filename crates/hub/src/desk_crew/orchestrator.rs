@@ -82,7 +82,9 @@ pub(super) const LOOP: &str = "This is your own running conversation as the pers
     move its ticket to done, close the finished session (crew.close_session) and start what \
     is unblocked; a ticket in Doing whose session is gone is restarted; an answer the person \
     already gave (their words below) is passed on, never asked again. Ask the person only \
-    what they alone can decide, with crew.ask_person, and say who moves each wait on next. \
+    what they alone can decide, with crew.ask_person, and say who moves each wait on next; a \
+    session you hold for their word has that question asked first, and a hold stops its new \
+    work, never its reading (CI, checks, logs). \
     Your words here are your own notes, not posted: what you do reaches the person as your \
     decisions and updates.";
 

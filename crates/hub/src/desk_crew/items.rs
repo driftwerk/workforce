@@ -165,6 +165,36 @@ pub fn schema(name: &str) -> Value {
     }
 }
 
+/// What a boss is told when it holds a session on the person's word
+/// without asking them.
+pub(crate) const HOLD_ASKS: &str = "That holds the session on the person's word, and they \
+    haven't been asked: ask them first with crew.ask_person (session_id, the question in text, \
+    what it holds up in holding_up), then send the hold. While it holds, the session may still \
+    read (CI, checks, logs, git status): a hold stops new work, never reading.";
+
+/// Whether `i` asks the person something about session `s` that holds it:
+/// a question or a decision to confirm, not one that lets it carry on.
+fn asks_about(i: &OpenItem, s: Uuid) -> bool {
+    matches!(i.kind, OpenKind::Ask | OpenKind::Confirm)
+        && i.session == Some(s)
+        && i.state != OpenState::Closed
+        && i.layout.not_blocking.is_none()
+}
+
+/// What each session is held on the person's word for, of `items`: the
+/// newest question about it, in its one line.
+fn asks_of_sessions(items: &[OpenItem]) -> HashMap<Uuid, String> {
+    let mut newest: Vec<&OpenItem> = items
+        .iter()
+        .filter(|i| i.session.is_some_and(|s| asks_about(i, s)))
+        .collect();
+    newest.sort_by_key(|i| i.opened_at);
+    newest
+        .into_iter()
+        .filter_map(|i| Some((i.session?, i.headline())))
+        .collect()
+}
+
 /// An item as a needs-you post: one line, the rest behind "more" in its
 /// extras ([`OpenItem::detail`]); what only the person can do is "For you".
 pub(super) fn needs_you(i: &OpenItem) -> String {
@@ -292,7 +322,11 @@ impl CrewHub {
         let boss = b.service.agent_id.as_str();
         match name {
             ASK => self.ask_person(b, input).await,
-            CLOSE => self.close_item_tool(boss, input).await,
+            CLOSE => {
+                let closed = self.close_item_tool(boss, input).await;
+                self.show_asks().await;
+                closed
+            }
             PROMISE | ORDER => self.keep_tool(name, b, input).await,
             OPEN => {
                 let items = self
@@ -542,6 +576,7 @@ impl CrewHub {
                 .await
                 .map_err(Self::item_err)?;
         }
+        self.show_asks().await;
         let tz = self.desk.timezone();
         match opened {
             Opened::New(i) => {
@@ -1281,6 +1316,44 @@ impl CrewHub {
         }
     }
 
+    /// Shows on each session's tile and ticket what the person is asked
+    /// about it, as the open items say now.
+    pub(crate) async fn show_asks(&self) {
+        match self.desk.store().items_not_closed(None).await {
+            Ok(items) => self.desk.set_asked_of_you(asks_of_sessions(&items)),
+            Err(e) => {
+                tracing::warn!(error = %e, "the open items couldn't be read for the sessions' tiles")
+            }
+        }
+    }
+
+    /// Refuses a boss's word that holds a session on the person's word
+    /// while nothing asks them about it: a hold carries its question,
+    /// asked first with `crew.ask_person`.
+    pub(crate) async fn hold_asks(&self, action: &Action, boss: &str) -> Result<(), String> {
+        let Action::Nudge {
+            to: Target::Session(s),
+            message,
+            ..
+        } = action
+        else {
+            return Ok(());
+        };
+        if !workforce_desk::line::holds_for_person(message) {
+            return Ok(());
+        }
+        let items = self
+            .desk
+            .store()
+            .items_not_closed(Some(boss))
+            .await
+            .map_err(Self::item_err)?;
+        match items.iter().any(|i| asks_about(i, *s)) {
+            true => Ok(()),
+            false => Err(HOLD_ASKS.into()),
+        }
+    }
+
     /// Posts `text` about item `i` in `boss`'s DM, with its buttons (or the
     /// request's, `approvals`), and keeps its extras: at once, never held
     /// for a check-in. While the person types to the boss it goes once they
@@ -1998,6 +2071,7 @@ impl CrewHub {
             Ok(i) => i,
             Err(_) => return,
         };
+        self.desk.set_asked_of_you(asks_of_sessions(&items));
         self.resurface(&items).await;
         self.remind_waiting(&items).await;
         self.look_at_rechecks(&items).await;

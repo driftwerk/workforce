@@ -277,9 +277,11 @@ fn boss_named(m: &LineMessage) -> &str {
     }
 }
 
-/// Whether `m` holds its session for the boss's answer.
+/// Whether `m` holds its session for an answer: the boss's, or the
+/// person's.
 fn holds_for_answer(m: &LineMessage) -> bool {
     workforce_desk::line::holds(&m.text, boss_named(m))
+        || workforce_desk::line::holds_for_person(&m.text)
 }
 
 /// Whether `m`, a session's word to its boss, waits on the boss's answer.
@@ -310,7 +312,10 @@ pub(super) fn waiting_in(thread: &[LineMessage], boss: &str, s: Uuid) -> Option<
     let ours = thread.iter().rfind(|m| bosss_word(m, boss, s));
     let theirs = thread.iter().rfind(|m| to_boss(m, boss, s));
     let held = ours.is_some_and(holds_for_answer);
-    let persons = held && ours.is_some_and(|o| persons_hold(&o.text));
+    let persons = held
+        && ours.is_some_and(|o| {
+            persons_hold(&o.text) || workforce_desk::line::holds_for_person(&o.text)
+        });
     match (theirs, ours) {
         // Its word is the newest: the ball is in the boss's court when it
         // waits on an answer.
@@ -535,6 +540,7 @@ impl CrewHub {
             .map(|q| crew::one_line(&q, 300));
         let headline = match &question {
             Some(q) => format!("{name} waits on a decision: {q}"),
+            None if w.persons => format!("{name} is held until you decide"),
             None => format!(
                 "{name} is holding, waiting on {}'s answer",
                 self.boss_name_of(boss)

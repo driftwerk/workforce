@@ -24,7 +24,11 @@ const REPORT: &str =
 
 /// A session that ran a turn the person prompted and stopped, past the
 /// time their prompt keeps it theirs.
-async fn stopped(d: &Desk, dir: &Path, name: &str) -> (workforce_desk::model::SessionView, String) {
+pub(super) async fn stopped(
+    d: &Desk,
+    dir: &Path,
+    name: &str,
+) -> (workforce_desk::model::SessionView, String) {
     let s = new_session(d, dir, name).await;
     let url = hook_url(dir, s.id).await;
     hook(

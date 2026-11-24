@@ -31,14 +31,14 @@ pub(super) const THEIRS: &str = "[oversight]\nenabled = true\nlevel = \"full\"\n
 /// What the session asked, as it did: a variable, then a read of it.
 const READS: &str = "M=/x/memory; cat $M/man-567.md $M/production-change-window.md | head -80";
 
-fn asked(url: &str, command: &str) -> tokio::task::JoinHandle<Value> {
+pub(super) fn asked(url: &str, command: &str) -> tokio::task::JoinHandle<Value> {
     let url = url.to_string();
     let body = json!({"hook_event_name": "PermissionRequest", "tool_name": "Bash",
         "tool_input": {"command": command}});
     tokio::spawn(async move { hook(&url, body).await })
 }
 
-fn behavior(v: &Value) -> Value {
+pub(super) fn behavior(v: &Value) -> Value {
     v["hookSpecificOutput"]["decision"]["behavior"].clone()
 }
 

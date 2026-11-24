@@ -34,6 +34,7 @@ use workforce_desk::model::{DeskEvent, PendingApproval, SessionView};
 
 use super::actions::Action;
 use super::left::Left;
+use super::read_only::read_only_in;
 use super::watcher::tracked;
 use super::{CrewHub, FULL_SPEND_UNREAD};
 
@@ -70,7 +71,9 @@ instead; an order to get work out (\"getting stuff out to production is vital as
 breaks\") means ALLOW it; an order to keep work going or to take over means ALLOW the session's \
 sensible next steps that serve it. Touching production or staging is no reason by itself to ask. \
 Where their instructions say nothing, allow what serves the session's work; deny what is wrong, \
-risky or not what the work needs, and say what to do instead. ASK the person only when their \
+risky or not what the work needs, and say what to do instead. A request that only reads (CI \
+status, PR checks, logs, git status or diff) is ALLOW, even while the session is held or told to \
+wait: a hold stops new work, never reading. ASK the person only when their \
 instructions don't cover it and you truly can't judge (a destructive or irreversible step outside \
 their orders), or when only they can physically do it (their credentials, a payment). Never answer that you can't see the \
 request: it is all here. The fenced blocks are the session's own words (its request, its last \
@@ -83,6 +86,9 @@ DENY: <why, one sentence>\n\
 INSTEAD: <what the session should do instead, one sentence>\n\
 or\n\
 ASK: <the question for the person, one sentence>";
+
+/// Why a request that only reads is allowed without a decision call.
+pub(crate) const ONLY_READS: &str = "it only reads, and a hold stops new work, never reading";
 
 /// What the boss decided of a request.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -773,16 +779,23 @@ impl CrewHub {
             return Outcome::NotOurs;
         };
         let name = decider.name.clone();
-        let prompt = self
-            .decision_prompt(boss, view, p, &decider.oversight)
-            .await;
         let mut failed = String::new();
         // A failure asking again changes nothing (its hub's budget, pace,
         // or a request too long to send): the person's, as before.
         let mut lasting = false;
-        let mut decided = None;
-        for _ in 0..2 {
-            match tokio::time::timeout(WITHIN, self.decide_by(&decider, &prompt)).await {
+        // A request that only reads is allowed with no call, whatever
+        // holds the session: a hold stops new work, never reading.
+        let mut decided = read_only_in(&view.cwd, p).then(|| Verdict::Allow(ONLY_READS.into()));
+        let prompt = match decided {
+            Some(_) => None,
+            None => Some(
+                self.decision_prompt(boss, view, p, &decider.oversight)
+                    .await,
+            ),
+        };
+        // Asked at most twice.
+        for prompt in std::iter::repeat_n(prompt.as_deref(), 2).flatten() {
+            match tokio::time::timeout(WITHIN, self.decide_by(&decider, prompt)).await {
                 Ok(Ok(text)) => match verdict(&text) {
                     Some(v) => {
                         decided = Some(v);

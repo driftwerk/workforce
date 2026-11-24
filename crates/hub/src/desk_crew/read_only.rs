@@ -1,13 +1,17 @@
 //! Which of a session's requests only read inside its folder, so that the
 //! overseer may allow them without the person (`[oversight.act]
 //! read_only_approvals`): an allowlist of read tools, and of programs,
-//! subcommands and flags known to only read. Anything else is the person's
-//! call.
+//! subcommands and flags known to only read, `gh`'s reads of what GitHub
+//! holds (checks, pull requests, runs and their logs) among them. Anything
+//! else is the person's call. A hold never stops one (DW-755): it stops new
+//! work, never reading.
 //!
 //! Inside the folder is no stronger than the folder: a session started in a
 //! home directory reads all of it. A repository's own config can still make
 //! a read command run a program (git's `core.fsmonitor`, a diff or textconv
-//! driver); it is the session's repository, and the person's.
+//! driver); it is the session's repository, and the person's. Both `git`
+//! and `gh` page through what the person's own config names (`core.pager`,
+//! gh's `pager`): theirs, as their shell is.
 
 use std::path::{Component, Path};
 
@@ -171,8 +175,105 @@ const DIFF: Flags = Flags {
     operands: true,
 };
 
-/// The program `name`'s flags, when it is one that only reads. `git` and
-/// `find` have grammars of their own.
+/// `gh pr checks`, waiting on them (`--watch`) included, never opening a
+/// browser (`--web`).
+const GH_PR_CHECKS: Flags = Flags {
+    short: "",
+    short_valued: "Rqti",
+    short_optional: "",
+    long: "watch fail-fast required",
+    long_valued: "repo json jq template interval",
+    long_optional: "",
+    counts: false,
+    operands: true,
+};
+/// `gh pr view`, `gh issue view` and `gh repo view`.
+const GH_VIEW: Flags = Flags {
+    short: "c",
+    short_valued: "Rqtb",
+    short_optional: "",
+    long: "comments",
+    long_valued: "repo json jq template branch",
+    long_optional: "",
+    counts: false,
+    operands: true,
+};
+/// `gh pr list` and `gh issue list`.
+const GH_LIST: Flags = Flags {
+    short: "d",
+    short_valued: "RqtsLAaBHlSm",
+    short_optional: "",
+    long: "draft",
+    long_valued: "repo json jq template state limit author assignee base head label search milestone mention app",
+    long_optional: "",
+    counts: false,
+    operands: false,
+};
+const GH_PR_DIFF: Flags = Flags {
+    short: "",
+    short_valued: "R",
+    short_optional: "",
+    long: "name-only patch",
+    long_valued: "repo color",
+    long_optional: "",
+    counts: false,
+    operands: true,
+};
+const GH_PR_STATUS: Flags = Flags {
+    short: "c",
+    short_valued: "Rqt",
+    short_optional: "",
+    long: "conflict-status",
+    long_valued: "repo json jq template",
+    long_optional: "",
+    counts: false,
+    operands: false,
+};
+const GH_RUN_LIST: Flags = Flags {
+    short: "a",
+    short_valued: "RqtbLwsecu",
+    short_optional: "",
+    long: "all",
+    long_valued: "repo json jq template branch limit workflow status event commit user created",
+    long_optional: "",
+    counts: false,
+    operands: false,
+};
+/// `gh run view`, its logs included.
+const GH_RUN_VIEW: Flags = Flags {
+    short: "v",
+    short_valued: "Rqtja",
+    short_optional: "",
+    long: "log log-failed verbose exit-status",
+    long_valued: "repo json jq template job attempt",
+    long_optional: "",
+    counts: false,
+    operands: true,
+};
+
+/// Whether a `gh` command only reads what GitHub holds: its checks, pull
+/// requests, issues, runs and their logs. Its operands name those (a
+/// number, a branch, a URL), never a path. `gh api`, and any command that
+/// opens a browser, comments, merges or reruns, is not one.
+fn gh_reads(args: &[String]) -> bool {
+    let [group, sub, rest @ ..] = args else {
+        return false;
+    };
+    let flags = match (group.as_str(), sub.as_str()) {
+        ("pr", "checks") => &GH_PR_CHECKS,
+        ("pr" | "issue" | "repo", "view") => &GH_VIEW,
+        ("pr" | "issue", "list") => &GH_LIST,
+        ("pr", "diff") => &GH_PR_DIFF,
+        ("pr", "status") => &GH_PR_STATUS,
+        ("run", "list") => &GH_RUN_LIST,
+        ("run", "view") => &GH_RUN_VIEW,
+        _ => return false,
+    };
+    operands(flags, rest).is_some()
+}
+
+/// The program `name`'s flags, when it is one that only reads. `git`,
+/// `find` and `gh` have grammars of their own.
 fn read_only_program(name: &str) -> Option<&'static Flags> {
     Some(match name {
         "ls" => &LS,
@@ -380,7 +481,8 @@ fn inside(cwd: &Path, path: &str) -> bool {
 }
 
 /// Whether the shell would make more of `command` than the words it splits
-/// into: a glob (`*`, `?`, `[`), a brace list (`{a,b}`), a zsh glob
+/// into: a glob (`*`, `?`, `[`, and `^` under zsh's `extendedglob`, which
+/// a person's `.zshenv` may set), a brace list (`{a,b}`), a zsh glob
 /// qualifier (`(…)`) or `=program`, a leading tilde, or a comment (`#`,
 /// which an interactive zsh doesn't take as one). Each would run words
 /// Desk never read: `{--pre=sh,.}` is a flag, `*` can match a file named
@@ -395,7 +497,7 @@ fn expands(command: &str) -> bool {
             Some(_) => {}
             None => match c {
                 '\'' | '"' => quote = Some(c),
-                '*' | '?' | '[' | '{' | '}' | '(' | ')' | '#' => return true,
+                '*' | '?' | '[' | '^' | '{' | '}' | '(' | ')' | '#' => return true,
                 '=' | '~' if word_start => return true,
                 _ => {}
             },
@@ -425,7 +527,14 @@ pub(crate) fn read_only_in(cwd: &str, pending: &PendingApproval) -> bool {
         // can judge.
         return !detail.is_empty() && inside(cwd, detail);
     }
-    if name != "Bash" || detail.is_empty() {
+    if name != "Bash" {
+        return false;
+    }
+    let Some(command) = what_runs(pending) else {
+        return false;
+    };
+    let detail = command.trim();
+    if detail.is_empty() {
         return false;
     }
     if detail.chars().any(|c| {
@@ -445,10 +554,37 @@ pub(crate) fn read_only_in(cwd: &str, pending: &PendingApproval) -> bool {
     };
     let read = match program.as_str() {
         "git" => git_operands(args),
+        "gh" => gh_reads(args).then(Vec::new),
         "find" => find_operands(args),
         other => read_only_program(other).and_then(|flags| operands(flags, args)),
     };
     read.is_some_and(|paths| paths.iter().all(|p| inside(cwd, p)))
+}
+
+/// The command a request runs: what its engine sent whole (Codex's
+/// `/bin/zsh -lc '…'` unwrapped), never the engine's own reading of it,
+/// else the request as shown. None when what runs was cut short.
+fn what_runs(pending: &PendingApproval) -> Option<String> {
+    let Some(input) = pending.request.as_ref().map(|r| &r.input) else {
+        return Some(pending.detail.clone());
+    };
+    if input.get("clipped").and_then(serde_json::Value::as_bool) == Some(true) {
+        return None;
+    }
+    let command = input.get("command")?.as_str()?;
+    Some(unwrapped(command).unwrap_or_else(|| command.to_string()))
+}
+
+/// What a shell run as `sh -c '<command>'` (or `bash`, `zsh`, with `-lc`)
+/// runs: `<command>`.
+fn unwrapped(command: &str) -> Option<String> {
+    let words = shlex::split(command)?;
+    let [shell, flag, inner] = words.as_slice() else {
+        return None;
+    };
+    let shell = Path::new(shell).file_name()?.to_str()?;
+    (matches!(shell, "sh" | "bash" | "zsh") && matches!(flag.as_str(), "-c" | "-lc"))
+        .then(|| inner.clone())
 }
 
 #[cfg(test)]
@@ -606,6 +742,7 @@ mod tests {
             "find * -name x",
             "grep -r secret .*",
             "cat src/?",
+            "cat ^README.md",
             "ls [.][.]",
             "ls *(e:'touch x':)",
             "cat =ls",
@@ -616,6 +753,78 @@ mod tests {
             let tool = format!("Bash({detail})");
             assert!(!read_only_in(cwd, &pending(&tool, detail)), "{detail}");
         }
+    }
+
+    /// `gh`'s reads of what GitHub holds are read-only, whatever their
+    /// operands; what writes, runs or opens a browser is not (DW-755: a
+    /// Codex session's `gh pr checks 878 --repo mantis-crm/monorepo`).
+    #[test]
+    fn a_gh_read_of_checks_pulls_and_runs_is_read_only() {
+        let cwd = "/Users/k/dev/web";
+        for detail in [
+            "gh pr checks 878 --repo mantis-crm/monorepo",
+            "gh pr checks 878 -R mantis-crm/monorepo --watch --fail-fast",
+            "gh pr checks https://github.com/a/b/pull/9 --json name,state",
+            "gh pr view 551 --comments",
+            "gh pr view --json statusCheckRollup --jq '.statusCheckRollup[].conclusion'",
+            "gh pr list --state open --limit 20",
+            "gh pr diff 551 --name-only",
+            "gh pr status",
+            "gh run list --branch main -L 5",
+            "gh run view 123 --log-failed",
+            "gh issue view 12",
+            "gh repo view mantis-crm/monorepo",
+        ] {
+            let tool = format!("Bash({detail})");
+            assert!(read_only_in(cwd, &pending(&tool, detail)), "{detail}");
+        }
+        for detail in [
+            "gh pr merge 551",
+            "gh pr checks 878 --web",
+            "gh pr view 551 -w",
+            "gh pr comment 551 -b hi",
+            "gh pr checkout 551",
+            "gh run rerun 123",
+            "gh api repos/a/b/pulls/1 -X PATCH",
+            "gh api repos/a/b",
+            "gh pr list 3",
+            "gh pr",
+        ] {
+            let tool = format!("Bash({detail})");
+            assert!(!read_only_in(cwd, &pending(&tool, detail)), "{detail}");
+        }
+    }
+
+    /// Codex's request is judged by what runs, never by its own reading of
+    /// it: a read it shows that runs more is not read-only.
+    #[test]
+    fn a_request_is_judged_by_what_runs() {
+        let cwd = "/Users/k/dev/web";
+        let sent = |detail: &str, command: &str| PendingApproval {
+            request: Some(workforce_desk::model::Request {
+                tool: "Bash".into(),
+                input: serde_json::json!({ "command": command }),
+                cwd: Some(cwd.into()),
+                read_only: false,
+            }),
+            ..pending("Bash", detail)
+        };
+        let checks = "gh pr checks 878 --repo mantis-crm/monorepo";
+        assert!(read_only_in(
+            cwd,
+            &sent(checks, &format!("/bin/zsh -lc '{checks}'"))
+        ));
+        assert!(read_only_in(cwd, &sent(checks, checks)));
+        assert!(!read_only_in(
+            cwd,
+            &sent(checks, &format!("/bin/zsh -lc '{checks}; git push'"))
+        ));
+        assert!(!read_only_in(cwd, &sent(checks, "git push")));
+        let mut clipped = sent(checks, checks);
+        if let Some(r) = clipped.request.as_mut() {
+            r.input["clipped"] = serde_json::Value::Bool(true);
+        }
+        assert!(!read_only_in(cwd, &clipped));
     }
 
     /// A read tool is judged by the one path it names; one that names none,
