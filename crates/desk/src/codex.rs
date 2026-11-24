@@ -1285,7 +1285,7 @@ impl Follower {
                 let Some(thread) = self.thread.clone() else {
                     return (Vec::new(), None);
                 };
-                tracing::info!(%thread, "codex: following its thread");
+                tracing::info!(target: crate::STARTS, %thread, "codex: following its thread");
                 // Its thread is loaded and followed: a resume says no
                 // `thread/started`, and a TUI that joins a loaded thread
                 // says nothing at all (CLI 0.166), so this is the session's

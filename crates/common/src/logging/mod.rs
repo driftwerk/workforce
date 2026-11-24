@@ -204,7 +204,7 @@ impl<S: Subscriber> tracing_subscriber::Layer<S> for BufferLayer {
 
 // ─── Setup ───────────────────────────────────────────────────────────────────
 
-const DEFAULT_FILTER: &str = "workforce_core=info,workforce_common=info,workforce_nats=info,workforce_policy=info,workforce_agent=info,workforce::docs=info,warn";
+const DEFAULT_FILTER: &str = "workforce_core=info,workforce_common=info,workforce_nats=info,workforce_policy=info,workforce_agent=info,workforce::docs=info,workforce_desk::starts=info,warn";
 
 /// Targets pinned below their natural level regardless of the global filter.
 /// These are high-volume diagnostic streams whose data lives elsewhere (e.g.
@@ -527,6 +527,24 @@ mod tests {
         );
         assert_eq!(resolve_filter_string(Some(""), Some("")), DEFAULT_FILTER);
         assert_eq!(resolve_filter_string(None, None), DEFAULT_FILTER);
+    }
+
+    /// Each step of a session's start reaches the log by default, and
+    /// none of the rest of Desk's info.
+    #[test]
+    fn a_sessions_start_is_logged_by_default_and_the_rest_of_desk_isnt() {
+        let buffer = Arc::new(SharedLogBuffer::new(10));
+        let subscriber = tracing_subscriber::registry()
+            .with(EnvFilter::new(DEFAULT_FILTER))
+            .with(BufferLayer {
+                buffer: Arc::clone(&buffer),
+            });
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info!(target: "workforce_desk::starts", "a step");
+            tracing::info!(target: "workforce_desk::service", "chatter");
+        });
+        let targets: Vec<String> = buffer.read_last(10).into_iter().map(|e| e.target).collect();
+        assert_eq!(targets, ["workforce_desk::starts"]);
     }
 
     #[test]

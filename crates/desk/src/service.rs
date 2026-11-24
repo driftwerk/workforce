@@ -5911,7 +5911,7 @@ impl Desk {
                     .await
                     .inspect_err(|e| tracing::warn!(session = %r.id, error = %e, "a Codex session's app-server didn't start"))?;
                 let thread = r.cli_session_id.as_deref().filter(|_| resume);
-                tracing::info!(session = %r.id, pid = ?server.pid(), thread = ?thread, "a Codex session's app-server started");
+                tracing::info!(target: crate::STARTS, session = %r.id, pid = ?server.pid(), thread = ?thread, "a Codex session's app-server started");
                 // A thread is resumed in what it last ran in, unless Desk
                 // keeps a mode for it, or it was left in one that doesn't
                 // ask: that one isn't its own, and it goes back to Codex's
@@ -5945,7 +5945,7 @@ impl Desk {
                         );
                         return Err(DeskError::Conflict(said));
                     }
-                    tracing::info!(session = %r.id, "Codex resumed its conversation for its TUI to join");
+                    tracing::info!(target: crate::STARTS, session = %r.id, "Codex resumed its conversation for its TUI to join");
                 }
                 let spec = codex::spawn(&codex::CodexSpawn {
                     program: self.program_of(Engine::Codex)?,
@@ -6072,7 +6072,7 @@ impl Desk {
                 return Err(e);
             }
         };
-        tracing::info!(session = %r.id, engine = r.engine.as_str(), pid = ?pty.pid(), resume, "a session's CLI started");
+        tracing::info!(target: crate::STARTS, session = %r.id, engine = r.engine.as_str(), pid = ?pty.pid(), resume, "a session's CLI started");
         let pty = Arc::new(pty);
         let exited = Arc::downgrade(&pty);
         let codex_tui = codex.is_some().then(|| Arc::downgrade(&pty));

@@ -2,6 +2,10 @@
 //! the person at the machine, tracked through hooks and app-server events,
 //! kept in a Postgres registry, and restored after a restart.
 
+/// The log target each step of a session's start is said under: the hub's
+/// default filter lets it through at info, and none of Desk's other info.
+pub(crate) const STARTS: &str = "workforce_desk::starts";
+
 pub mod account;
 pub mod account_store;
 mod adopt;
