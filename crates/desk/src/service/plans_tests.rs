@@ -2695,7 +2695,7 @@ async fn a_goal_ends_only_once_it_is_met_and_desk_closes_its_ticket() {
         let sent = serde_json::to_value(&detail).unwrap();
         assert!(sent["goal"].is_string(), "{sent}");
         assert!(sent["goalProgress"]["parts"].is_array(), "{sent}");
-        assert_keys_once(&sent, &detail);
+        assert_keys_once(&detail);
         assert_eq!(
             p.summary.plan.goal_ticket,
             Some(t.ticket.id),
@@ -2735,8 +2735,9 @@ async fn a_goal_ends_only_once_it_is_met_and_desk_closes_its_ticket() {
 
 /// That `detail` sends no key twice at its top level, the way a flattened
 /// struct can: the later would replace the earlier.
-fn assert_keys_once(sent: &serde_json::Value, detail: &PlanDetail) {
+fn assert_keys_once(detail: &PlanDetail) {
     let text = serde_json::to_string(detail).unwrap();
+    let sent: serde_json::Value = serde_json::from_str(&text).unwrap();
     let mut keys = Vec::new();
     let mut depth = 0usize;
     let mut chars = text.char_indices().peekable();
