@@ -91,7 +91,14 @@ pub(crate) struct GoalChecks {
     looking: bool,
     /// The met plans whose closing turn was started.
     closing: HashSet<Uuid>,
+    /// Each running goal's heads as it was agreed: kept (none), or last
+    /// tried at, as GitHub couldn't be asked.
+    heads: HashMap<Uuid, Option<DateTime<Utc>>>,
 }
+
+/// How many crew minutes a goal waits to have its heads read again, once
+/// GitHub couldn't be asked.
+const HEADS_AGAIN_MINUTES: i32 = 30;
 
 /// What brought a goal's next reading forward.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -383,6 +390,7 @@ impl CrewHub {
             let mut c = self.goal_checks.lock();
             c.pulled.retain(|plan, _| open.contains(plan));
             c.pulls.retain(|(plan, ..), _| open.contains(plan));
+            c.heads.retain(|plan, _| open.contains(plan));
             for notes in c.notes.values_mut() {
                 notes.retain(|n| open.contains(&n.plan));
             }
@@ -444,10 +452,9 @@ impl CrewHub {
         let now = Utc::now();
         let minute = Duration::from_std(self.timing.minute).unwrap_or_default();
         let detail = self.read_when_due(service, detail, &r, now, minute).await;
-        let id = detail.summary.plan.id;
-        self.heads_kept(service, id, &GoalRefs::of(&r, &readings_of(&detail)))
-            .await;
+        self.heads_when_due(service, &detail, &r, now, minute).await;
         let plan = &detail.summary.plan;
+        let id = plan.id;
         if plan.met.is_some() || !matches!(plan.state, PlanState::Running | PlanState::Paused) {
             return Vec::new();
         }
@@ -521,6 +528,35 @@ impl CrewHub {
         }
         self.goal_checks.lock().pulled.remove(&id);
         self.read_kept(service, &detail).await.unwrap_or(detail)
+    }
+
+    /// Keeps where running goal plan `detail`'s work (by its result `r`)
+    /// stood as it was agreed, once: tried again only every
+    /// [`HEADS_AGAIN_MINUTES`] while GitHub can't be asked.
+    async fn heads_when_due(
+        &self,
+        service: &AgentService,
+        detail: &PlanDetail,
+        r: &goal::GoalResult,
+        now: DateTime<Utc>,
+        minute: Duration,
+    ) {
+        let id = detail.summary.plan.id;
+        let due = detail.summary.plan.state == PlanState::Running
+            && match self.goal_checks.lock().heads.get(&id) {
+                None => true,
+                Some(None) => false,
+                Some(Some(tried)) => now - *tried >= minute * HEADS_AGAIN_MINUTES,
+            };
+        if !due {
+            return;
+        }
+        let refs = GoalRefs::of(r, &readings_of(detail));
+        let kept = self.heads_kept(service, id, &refs).await;
+        self.goal_checks
+            .lock()
+            .heads
+            .insert(id, (!kept).then_some(now));
     }
 
     /// What goal plan `detail`'s stalls (`stalls`) wake its boss with,

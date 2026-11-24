@@ -108,22 +108,40 @@ async fn mantis_reads(
         "old" => ("ahead", "behind"),
         on => (on, "ahead"),
     };
-    let compare = |base: &str, head: &str, status: &str, sha: &str| {
-        Mock::given(method("GET"))
-            .and(path(format!("/repos/acme/mantis/compare/{base}...{head}")))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "status": status, "base_commit": { "sha": sha }, "ahead_by": 1, "behind_by": 0,
-                "total_commits": 1, "files": [] })))
-    };
     let whole = format!("{COMMIT}{}", "0".repeat(40 - COMMIT.len()));
-    for m in [
-        compare("main", "main", "identical", MAIN_HEAD),
-        compare(COMMIT, "main", on, &whole),
-        compare(MAIN_HEAD, COMMIT, after, MAIN_HEAD),
-        compare(MAIN_HEAD, MAIN_HEAD, "identical", MAIN_HEAD),
+    for (base, head, status, sha) in [
+        ("main", "main", "identical", MAIN_HEAD),
+        (COMMIT, "main", on, &whole),
+        (MAIN_HEAD, COMMIT, after, MAIN_HEAD),
+        (MAIN_HEAD, MAIN_HEAD, "identical", MAIN_HEAD),
+        // #40's own work is from before the goal.
+        (MAIN_HEAD, PULL_HEAD, "diverged", MAIN_HEAD),
     ] {
-        m.mount(gh).await;
+        compare_mounted(gh, base, head, status, sha, from).await;
     }
+}
+
+/// `gh`'s compare of acme/mantis from `base` to `head`: `status`, `base`
+/// whole as `sha`, its head commit made at `made`.
+async fn compare_mounted(
+    gh: &wiremock::MockServer,
+    base: &str,
+    head: &str,
+    status: &str,
+    sha: &str,
+    made: chrono::DateTime<chrono::Utc>,
+) {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, ResponseTemplate};
+    Mock::given(method("GET"))
+        .and(path(format!("/repos/acme/mantis/compare/{base}...{head}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "status": status, "base_commit": { "sha": sha }, "ahead_by": 1, "behind_by": 0,
+            "total_commits": 1, "files": [],
+            "commits": [{ "sha": head, "commit": { "committer": { "date": made.to_rfc3339() } } }] })))
+        .with_priority(1)
+        .mount(gh)
+        .await;
 }
 
 /// The commit a boss's checkpoint cites.
@@ -588,12 +606,7 @@ async fn a_checkpoint_takes_only_the_goals_work_since_it_was_agreed() {
             ("e".repeat(40), PULL_HEAD.to_string()),
             (MAIN_HEAD.to_string(), run_head.clone()),
         ] {
-            Mock::given(method("GET"))
-                .and(path(format!("/repos/acme/mantis/compare/{base}...{head}")))
-                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                    "status": "diverged", "base_commit": { "sha": base }, "files": [] })))
-                .mount(&gh)
-                .await;
+            compare_mounted(&gh, &base, &head, "diverged", &base, from).await;
         }
         Mock::given(method("GET"))
             .and(path("/repos/acme/mantis/actions/runs/10"))
@@ -621,6 +634,98 @@ async fn a_checkpoint_takes_only_the_goals_work_since_it_was_agreed() {
             Some(PULL_HEAD),
             "{heads:?}"
         );
+    })
+    .await;
+}
+
+/// Work on what came after the goal was agreed is new from where the branch
+/// it comes from stood: a pull request the goal names that wasn't there
+/// yet, a commit on it, and an old pull request reopened with new commits.
+/// What was on main already is still refused.
+#[tokio::test(flavor = "multi_thread")]
+async fn work_on_what_came_after_the_goal_is_new_from_where_it_came_from() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, ResponseTemplate};
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(dir.path()).unwrap();
+        let from = chrono::Utc::now() - chrono::Duration::hours(3);
+        let gh = mantis(from, 22, "old").await;
+        let (overseer, _, d, _) = boss_on(&base, pool, &checking(1440), &gh).await;
+        let mut r = fast_ci(true);
+        r.parts.push(Measure::PrMerged {
+            repo: "acme/mantis".into(),
+            pr: workforce_desk::goal::PrPick::Number(41),
+        });
+        let (id, _) = goal_running(&d, &base, r).await;
+        let key = |b: &str| workforce_desk::goal::head_key("acme/mantis", b);
+        eventually("where the goal's work stood kept", async || {
+            let heads = d.store().goal_heads(id).await.ok()?;
+            (heads.get(&key("main")).map(String::as_str) == Some(MAIN_HEAD)).then_some(heads)
+        })
+        .await;
+        assert_eq!(
+            d.store()
+                .goal_heads(id)
+                .await
+                .unwrap()
+                .get(&key("#41"))
+                .map(String::as_str),
+            Some(workforce_desk::goal::ABSENT),
+            "#41 wasn't there yet"
+        );
+
+        // #41 is opened, from fix/fast into main, with a new commit on it;
+        // #42, opened long before, is reopened with one.
+        let now = chrono::Utc::now();
+        let (pr41, new, pr42) = ("1".repeat(40), "2".repeat(40), "3".repeat(40));
+        for (n, head, branch, opened) in
+            [(41, &pr41, "fix/fast", now), (42, &pr42, "old/idea", from)]
+        {
+            Mock::given(method("GET"))
+                .and(path(format!("/repos/acme/mantis/pulls/{n}")))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "number": n, "state": "open", "merged": false, "merged_at": null,
+                    "created_at": opened.to_rfc3339(), "updated_at": now.to_rfc3339(),
+                    "head": { "ref": branch, "sha": head }, "base": { "ref": "main" } })))
+                .with_priority(1)
+                .mount(&gh)
+                .await;
+        }
+        let whole = format!("{COMMIT}{}", "0".repeat(40 - COMMIT.len()));
+        for (b, h, status, sha, made) in [
+            (COMMIT, pr41.as_str(), "ahead", whole.as_str(), from),
+            (new.as_str(), pr41.as_str(), "ahead", new.as_str(), now),
+            (new.as_str(), "main", "diverged", new.as_str(), now),
+            (MAIN_HEAD, new.as_str(), "diverged", MAIN_HEAD, now),
+            (MAIN_HEAD, pr41.as_str(), "ahead", MAIN_HEAD, now),
+            (MAIN_HEAD, pr42.as_str(), "diverged", MAIN_HEAD, now),
+        ] {
+            compare_mounted(&gh, b, h, status, sha, made).await;
+        }
+        let checkpoint = |evidence: Value| {
+            run(
+                &overseer,
+                "crew.plan_update",
+                json!({ "plan_id": id.to_string(), "why": "Showing the work",
+                        "checkpoint": { "part": 2, "said": "Only api's tests ran",
+                                        "evidence": evidence } }),
+            )
+        };
+        let r =
+            checkpoint(json!([{ "kind": "commit", "repo": "acme/mantis", "sha": COMMIT }])).await;
+        let error = r.error.clone().unwrap_or_default();
+        assert!(
+            !r.success && error.starts_with("Commit d05e8a4 of acme/mantis was there before"),
+            "on main already, though #41 carries it: {r:?}"
+        );
+        let r = checkpoint(json!([
+            { "kind": "pull", "repo": "acme/mantis", "number": 41 },
+            { "kind": "commit", "repo": "acme/mantis", "sha": new },
+            { "kind": "pull", "repo": "acme/mantis", "number": 42 }
+        ]))
+        .await;
+        assert!(r.success, "{r:?}");
     })
     .await;
 }

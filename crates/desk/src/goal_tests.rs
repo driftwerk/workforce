@@ -907,4 +907,22 @@ fn a_parts_head_is_where_its_last_checkpoint_left_it_else_where_it_was_agreed() 
     assert_eq!(head_for(&heads, 1, &main), Some(&*"b".repeat(40)));
     assert_eq!(head_for(&heads, 2, &main), Some(&*"a".repeat(40)));
     assert_eq!(head_for(&heads, 1, &head_key("acme/web", "#4")), None);
+    assert!(heads_agreed(&heads));
+    let moved = Heads::from([(part_head_key(1, &main), "b".repeat(40))]);
+    assert!(
+        !heads_agreed(&moved),
+        "a part's alone isn't where it was agreed"
+    );
+    let unread = head_key("acme/web", "fix/x");
+    let heads = Heads::from([
+        (unread.clone(), ABSENT.to_string()),
+        (part_head_key(2, &main), ABSENT.to_string()),
+        (main.clone(), "a".repeat(40)),
+    ]);
+    assert_eq!(
+        head_for(&heads, 2, &unread),
+        None,
+        "absent: all on it is new"
+    );
+    assert_eq!(head_for(&heads, 2, &main), Some(&*"a".repeat(40)));
 }

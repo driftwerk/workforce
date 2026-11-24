@@ -731,8 +731,15 @@ impl GoalSaid {
 /// Where each of a goal's branches and pull requests stood as it was
 /// agreed, by [`head_key`], and as each judged part's last checkpoint left
 /// it, by [`part_head_key`]: what work shown toward that part must come
-/// after.
+/// after. [`ABSENT`] for one that couldn't be read then.
 pub type Heads = BTreeMap<String, String>;
+
+/// What a head that couldn't be read is kept as: none, so everything on it
+/// is new.
+pub const ABSENT: &str = "";
+
+/// What a part's head is kept by before its own key.
+const PART_HEAD: &str = "part ";
 
 /// What a head of branch `branch` of `repo` is kept by, `branch` being
 /// `#n` for pull request `n`'s.
@@ -743,16 +750,22 @@ pub fn head_key(repo: &str, branch: &str) -> String {
 /// What head `key` is kept by for judged part `part`, once a checkpoint
 /// toward it moved it.
 pub fn part_head_key(part: u16, key: &str) -> String {
-    format!("part {part}: {key}")
+    format!("{PART_HEAD}{part}: {key}")
+}
+
+/// Whether `heads` hold where the goal's work stood as it was agreed.
+pub fn heads_agreed(heads: &Heads) -> bool {
+    heads.keys().any(|k| !k.starts_with(PART_HEAD))
 }
 
 /// Where head `key` stood for judged part `part` in `heads`: as its last
 /// checkpoint left it, else as the goal was agreed.
 pub fn head_for<'a>(heads: &'a Heads, part: u16, key: &str) -> Option<&'a str> {
-    heads
-        .get(&part_head_key(part, key))
-        .or_else(|| heads.get(key))
+    [part_head_key(part, key), key.to_string()]
+        .iter()
+        .filter_map(|k| heads.get(k))
         .map(String::as_str)
+        .find(|sha| *sha != ABSENT)
 }
 
 /// The stall leading `stalls`: the furthest in its spells, the longest
