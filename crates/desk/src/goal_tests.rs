@@ -939,6 +939,39 @@ fn a_parts_head_is_where_its_last_checkpoint_left_it_else_where_it_was_agreed() 
 }
 
 #[test]
+fn only_a_reply_that_agrees_and_nothing_else_is_a_yes() {
+    for yes in [
+        "yes",
+        "Yes!",
+        "ok, go ahead",
+        "Yeah, do it.",
+        "sounds good",
+        "LGTM",
+        "👍",
+        "yes please",
+        "Okay 👍",
+    ] {
+        assert!(agrees(yes), "{yes}");
+    }
+    for not in [
+        "no",
+        "not yet",
+        "wait",
+        "yes but wait",
+        "ok, change step 3",
+        "don't",
+        "hold on",
+        "later",
+        "please",
+        "yes, and the docs",
+        "hmm",
+        "",
+    ] {
+        assert!(!agrees(not), "{not}");
+    }
+}
+
+#[test]
 fn a_plain_reply_settles_only_what_the_bosss_message_before_it_proposed() {
     let proposal = "**Proposed done-when goal:**\n\n| Goal | Done when |\n|---|---|\n| Eden’s v1 is live for staff | **Eden v1 checklist** is ticked |\n\nYes, or change it?";
     let boss = vec![
@@ -949,31 +982,54 @@ fn a_plain_reply_settles_only_what_the_bosss_message_before_it_proposed() {
         texts.iter().map(|(m, t)| (at(*m), t.to_string())).collect()
     };
     let proposed = ["Eden's v1 is live for staff", "Eden v1 checklist is ticked"];
+    let reply = |theirs: &[(DateTime<Utc>, String)], quote: &str| {
+        replied_to(theirs, &boss, quote, &proposed, at(-60))
+    };
     let yes = said(&[(1, "hello"), (6, "Yes.")]);
-    assert_eq!(replied_to(&yes, &boss, "yes", &proposed), Ok(at(6)));
+    assert_eq!(reply(&yes, "yes"), Ok(at(6)));
     assert_eq!(
-        replied_to(&yes, &boss, "yes", &["Eden v2 is live"]),
+        replied_to(&yes, &boss, "yes", &["Eden v2 is live"], at(-60)),
         Err(NotReplied::NotProposed(0))
     );
     assert_eq!(
-        replied_to(&said(&[(4, "yes")]), &boss, "yes", &proposed),
+        reply(&said(&[(4, "yes")]), "yes"),
         Err(NotReplied::NotProposed(0)),
         "a yes before the proposal answers the message before it"
     );
+    assert_eq!(
+        replied_to(&yes, &boss, "yes", &proposed, at(6)),
+        Err(NotReplied::NoPlainReply),
+        "a yes applied already, or older than the goal was last said back"
+    );
+    let button = format!("{ANSWER_LEAD}Shall I merge #5?”: Yes");
     let unclear = [
         said(&[(6, "yes"), (7, "wait, drop staging")]),
         said(&[(6, "drop staging"), (7, "yes")]),
         said(&[(6, "yes but drop the staging part")]),
+        said(&[(6, "no")]),
+        said(&[(6, "not yet")]),
+        said(&[(6, button.as_str())]),
     ];
     for theirs in &unclear {
+        let quote = &theirs.last().unwrap().1;
         assert_eq!(
-            replied_to(theirs, &boss, "yes", &proposed),
+            reply(theirs, quote),
+            Err(NotReplied::NoPlainReply),
+            "{theirs:?}"
+        );
+        assert_eq!(
+            reply(theirs, "yes"),
             Err(NotReplied::NoPlainReply),
             "{theirs:?}"
         );
     }
+    let two = vec![(at(5), format!("Shall I merge #5 first?\n\n{proposal}"))];
     assert_eq!(
-        replied_to(&said(&[(6, "yes")]), &[], "yes", &proposed),
+        replied_to(&yes, &two, "yes", &proposed, at(-60)),
+        Err(NotReplied::AsksMore)
+    );
+    assert_eq!(
+        replied_to(&said(&[(6, "yes")]), &[], "yes", &proposed, at(-60)),
         Err(NotReplied::NothingProposed)
     );
 }

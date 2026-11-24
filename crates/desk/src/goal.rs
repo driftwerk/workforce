@@ -1103,33 +1103,85 @@ pub fn says_goal(text: &str, goal: &str) -> bool {
 /// last message to them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NotReplied {
-    /// The words aren't the whole of a plain reply ("yes", "ok, go") of
-    /// theirs, the only one since the boss's message before it.
+    /// The words aren't the whole of a reply of theirs that only agrees
+    /// ([`agrees`]), typed by them since `since`, their only one since the
+    /// boss's message before it.
     NoPlainReply,
     /// No message of the boss's came before their reply.
     NothingProposed,
+    /// The boss's message before their reply asks something besides what
+    /// it proposes, so a "yes" to it is unclear.
+    AsksMore,
     /// The boss's message before their reply doesn't say the `n`th of
     /// what it is said to propose.
     NotProposed(usize),
 }
 
+/// The words a reply that only agrees is made of, each a phrase.
+const AGREEING: &[&[&str]] = &[
+    &["go", "ahead"],
+    &["do", "it"],
+    &["sounds", "good"],
+    &["yes"],
+    &["yep"],
+    &["yeah"],
+    &["ok"],
+    &["okay"],
+    &["sure"],
+    &["go"],
+    &["agreed"],
+    &["lgtm"],
+    &["please"],
+];
+
+/// Words that make a reply say other than yes.
+const NOT_AGREEING: &[&str] = &[
+    "no", "not", "don't", "dont", "but", "wait", "except", "change", "stop", "later", "hold",
+];
+
+/// Whether the person's `text` only agrees: made of [`AGREEING`]'s
+/// phrases ("Yes, go ahead!", "ok 👍"), in any case and punctuation, with
+/// no word of [`NOT_AGREEING`]'s ("yes but wait", "not yet", "no").
+pub fn agrees(text: &str) -> bool {
+    fn phrased(rest: &[String]) -> bool {
+        rest.is_empty()
+            || AGREEING.iter().any(|p| {
+                rest.len() >= p.len()
+                    && rest.iter().zip(p.iter()).all(|(w, a)| w == a)
+                    && phrased(&rest[p.len()..])
+            })
+    }
+    let words = compared_words(text);
+    let thumbs = text.contains('\u{1F44D}');
+    let said = thumbs || words.iter().any(|w| w != "please");
+    let refuses = words
+        .iter()
+        .any(|w| NOT_AGREEING.contains(&w.as_str()) || w.ends_with("n't"));
+    said && !refuses && phrased(&words)
+}
+
 /// When the person's `quote` is their plain reply to what the boss
 /// proposed in its last message before it: the whole of the person's
-/// newest message in `theirs`, short enough to answer only what was just
-/// said ([`stands_alone`] not), their only one since that message of the
-/// boss's in `boss`, which says each of `proposed` word for word.
+/// newest message in `theirs`, typed by them (not an answer on an item's
+/// buttons) since `since`, one that only [`agrees`], their only one since
+/// that message of the boss's in `boss`. That message asks nothing else and
+/// says each of `proposed` word for word.
 pub fn replied_to(
     theirs: &[(DateTime<Utc>, String)],
     boss: &[(DateTime<Utc>, String)],
     quote: &str,
     proposed: &[&str],
+    since: DateTime<Utc>,
 ) -> Result<DateTime<Utc>, NotReplied> {
     let quoted = compared_words(quote);
     let at = theirs
         .iter()
         .max_by_key(|(at, _)| *at)
-        .filter(|(_, text)| {
-            !quoted.is_empty() && !stands_alone(text) && compared_words(text) == quoted
+        .filter(|(at, text)| {
+            *at > since
+                && !text.trim_start().starts_with(ANSWER_LEAD)
+                && agrees(text)
+                && compared_words(text) == quoted
         })
         .map(|(at, _)| *at)
         .ok_or(NotReplied::NoPlainReply)?;
@@ -1140,6 +1192,10 @@ pub fn replied_to(
         .ok_or(NotReplied::NothingProposed)?;
     if theirs.iter().filter(|(when, _)| when > asked_at).count() > 1 {
         return Err(NotReplied::NoPlainReply);
+    }
+    let questions = |text: &str| text.matches('?').count();
+    if questions(asked) > 1 + proposed.iter().map(|w| questions(w)).sum::<usize>() {
+        return Err(NotReplied::AsksMore);
     }
     match proposed.iter().position(|words| !says_goal(asked, words)) {
         Some(n) => Err(NotReplied::NotProposed(n)),

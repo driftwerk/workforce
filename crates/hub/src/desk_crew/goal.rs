@@ -699,7 +699,7 @@ impl CrewHub {
             return Ok((Some(ask.item), at));
         }
         if applying.met.is_none() {
-            if let Some(at) = self.replied_at(service, quote, applying)? {
+            if let Some(at) = self.replied_at(service, p, quote, applying)? {
                 return Ok((None, at));
             }
         }
@@ -743,12 +743,15 @@ impl CrewHub {
 
     /// When `quote` is the person's plain reply ("yes", "ok") to the
     /// boss's own last message before it, in their DM or a thread of it,
-    /// which proposed `applying`'s goal and result in the words it passes:
-    /// none when it is no such reply, refused when the message it answers
+    /// which proposed `applying`'s goal and result in the words it passes,
+    /// a change to plan `p`'s goal: typed by them since its goal was last
+    /// agreed or said back, so one reply applies once. None when it is no
+    /// such reply; refused when the message it answers asked more, or
     /// proposed other words.
     fn replied_at(
         &self,
         service: &AgentService,
+        p: &Plan,
         quote: &str,
         applying: &Proposal,
     ) -> Result<Option<DateTime<Utc>>, String> {
@@ -766,33 +769,31 @@ impl CrewHub {
         .flatten()
         .collect();
         let words: Vec<&str> = proposed.iter().map(|(_, w)| *w).collect();
-        let replies: Vec<_> = super::orchestrator::dm_talks(
-            service,
-            &person,
-            crew::now() - AGREED_WITHIN,
-            MESSAGES_READ,
-        )
-        .into_iter()
-        .map(|talk| {
-            let theirs: Vec<_> = talk
-                .theirs
+        let now = crew::now();
+        let since = [Some(now - AGREED_WITHIN), p.read_back_at, p.agreed_at]
+            .into_iter()
+            .flatten()
+            .max()
+            .unwrap_or(now - AGREED_WITHIN);
+        let replies: Vec<_> =
+            super::orchestrator::dm_talks(service, &person, now - AGREED_WITHIN, MESSAGES_READ)
                 .into_iter()
-                .map(|(at, text)| (at, goal::answered_text(&text).to_string()))
+                .map(|talk| goal::replied_to(&talk.theirs, &talk.boss, quote, &words, since))
                 .collect();
-            goal::replied_to(&theirs, &talk.boss, quote, &words)
-        })
-        .collect();
-        let unproposed = replies.iter().find_map(|r| match r {
-            Err(NotReplied::NotProposed(n)) => Some(*n),
+        let unclear = replies.iter().find_map(|r| match r {
+            Err(e @ (NotReplied::AsksMore | NotReplied::NotProposed(_))) => Some(*e),
             _ => None,
         });
-        match (replies.into_iter().filter_map(Result::ok).max(), unproposed) {
+        let q = crew::one_line(quote, 120);
+        match (replies.into_iter().filter_map(Result::ok).max(), unclear) {
             (Some(at), _) => Ok(Some(at)),
-            (None, Some(n)) => Err(format!(
-                "The person's “{}” answers your last message before it, which doesn't say {} “{}” word for word. Pass it exactly as you wrote it there; if you mean something else, put that to them in plain words first.",
-                crew::one_line(quote, 120),
+            (None, Some(NotReplied::NotProposed(n))) => Err(format!(
+                "The person's “{q}” answers your last message before it, which doesn't say {} “{}” word for word. Pass it exactly as you wrote it there; if you mean something else, put that to them in plain words first.",
                 proposed[n].0,
                 crew::one_line(proposed[n].1, 120)
+            )),
+            (None, Some(_)) => Err(format!(
+                "The person's “{q}” answers your last message before it, which asked more than this change, so it's unclear what they agreed to. Ask them about this change on its own, in plain words, then pass their reply."
             )),
             (None, None) => Ok(None),
         }

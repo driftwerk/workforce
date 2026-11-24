@@ -699,6 +699,25 @@ async fn the_persons_plain_yes_to_the_bosss_proposal_in_the_dm_replaces_the_goal
         assert!(why.contains("Propose the change to them in your DM"), "{why}");
         assert!(why.contains("never about this check"), "{why}");
 
+        // A "no", a yes to a message that asked more, and a yes on another
+        // item's buttons don't agree to it.
+        let button = format!("{}Shall I merge #5?”: Yes", workforce_desk::goal::ANSWER_LEAD);
+        let asks_more = format!("Shall I merge #5 first?\n\n{proposal}");
+        for (asked, reply, why) in [
+            (proposal, "no", "Propose the change"),
+            (asks_more.as_str(), "yes", "asked more than this change"),
+            (proposal, button.as_str(), "Propose the change"),
+        ] {
+            pause().await;
+            boss_says(&overseer, asked);
+            pause().await;
+            person_says(&overseer, reply);
+            let r = run(&overseer, "crew.plan_update", change(goal, "yes")).await;
+            assert!(!r.success, "{reply}: {r:?}");
+            let err = r.error.unwrap();
+            assert!(err.contains(why), "{reply}: {err}");
+        }
+
         pause().await;
         boss_says(&overseer, proposal);
         pause().await;
@@ -738,6 +757,10 @@ async fn the_persons_plain_yes_to_the_bosss_proposal_in_the_dm_replaces_the_goal
         let p = d.plan(id).await.unwrap().summary.plan;
         assert_eq!(p.goal, wider);
         assert!(!p.awaiting(), "their ok applies it");
+        // The DM's yes, applied already, doesn't change it back.
+        let r = run(&overseer, "crew.plan_update", change(goal, "yes")).await;
+        assert!(!r.success, "{r:?}");
+        assert_eq!(d.plan(id).await.unwrap().summary.plan.goal, wider);
 
         crew.plan_turn_now(id, vec!["A turn of its session ended.".into()])
             .await;
