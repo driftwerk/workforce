@@ -3373,7 +3373,9 @@ pub(crate) async fn process_turn(
         )));
     }
     let with_files = attachments.as_ref().is_some_and(|files| !files.is_empty());
-    if let Some(cmd) = crate::commands::command_of(message, with_files) {
+    let command = crate::commands::command_of(message, with_files)
+        .filter(|_| crate::commands::runs_commands(false));
+    if let Some(cmd) = command {
         // As the person, so a command's own model call (`/compact`'s
         // summary) runs on their route and is billed to them.
         let result = crate::user_config::as_principal(
@@ -4712,8 +4714,9 @@ pub(crate) async fn process_message_with_progress(
     // tokenize at the surface (gateway, chat_worker, voice,
     // workflow_runtime self-dispatch). Slash commands run on raw
     // text and may legitimately consume cleartext.
+    let commands = crate::commands::runs_commands(desk.is_some_and(|d| d.turn.is_hand_off()));
     let tokenized;
-    let message: &str = if crate::commands::runs_raw(message) {
+    let message: &str = if commands && crate::commands::runs_raw(message) {
         message
     } else {
         tokenized = workforce_common::redact::tokenize_secrets(
@@ -4727,7 +4730,7 @@ pub(crate) async fn process_message_with_progress(
 
     // Check for slash commands first
     let with_files = attachments.as_ref().is_some_and(|files| !files.is_empty());
-    if let Some(cmd) = crate::commands::command_of(message, with_files) {
+    if let Some(cmd) = crate::commands::command_of(message, with_files).filter(|_| commands) {
         let service = Arc::clone(service);
         let channel_owned = channel.to_string();
         let user_owned = user.to_string();

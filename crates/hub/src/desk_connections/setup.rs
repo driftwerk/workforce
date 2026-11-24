@@ -584,22 +584,17 @@ fn key_named(service: &str, name: &str) -> Option<Option<&'static str>> {
     }
 }
 
-/// What the agent is told of a setup it was handed a key for, once Desk
-/// checked it: connected, or why not and what the person does.
+/// What the agent is told of a setup whose key the person sent, once Desk
+/// checked it: only Desk's own words and the account, never the service's.
 fn sent_outcome(view: &SetupView) -> String {
-    let now = &view.now;
-    match now.kind {
-        NowKind::Connected => format!(
-            "{}: carry on with what they asked for, using it.",
-            now.title
+    match &view.connected {
+        Some(c) => format!(
+            "{} is connected as {}: carry on with what they asked for, using it.",
+            view.service_name, c.account
         ),
-        _ => format!(
-            "{}{}: tell the person in a sentence; a new key is sent the same way.",
-            now.title,
-            now.detail
-                .as_deref()
-                .map(|d| format!(" ({d})"))
-                .unwrap_or_default()
+        None => format!(
+            "{} refused the key: tell the person in a sentence; a new one is sent the same way.",
+            view.service_name
         ),
     }
 }
@@ -2721,11 +2716,10 @@ impl Setups {
             }
             let outcome = match kept {
                 Ok(k) if k.ready => this
-                    .with(&caller, &id, |s| Ok(s.view()))
-                    .map(|v| sent_outcome(&v))
-                    .unwrap_or_else(|e| e),
+                    .with(&caller, &id, |s| Ok(sent_outcome(&s.view())))
+                    .unwrap_or_else(|_| "The setup ended before Desk could check it.".into()),
                 Ok(k) => format!("It is kept as its {}, and the setup {}: ask the person for the rest the same way.", k.field, k.test),
-                Err(e) => format!("Desk didn't keep it: {e}"),
+                Err(_) => format!("Desk didn't keep it as {}'s key: ask the person to send it again with `cmd: secret {service}_key <the key>`.", c.name),
             };
             this.callers.tell(
                 &caller,

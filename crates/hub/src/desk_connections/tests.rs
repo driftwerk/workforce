@@ -3187,7 +3187,7 @@ mod setups {
             ["allan", "ben"]
         );
         for (_, note) in &told {
-            assert!(note.contains("Linear connected as"), "{note}");
+            assert!(note.contains("Linear is connected as"), "{note}");
             assert!(note.contains("carry on"), "{note}");
             assert!(!note.contains(GOOD));
         }

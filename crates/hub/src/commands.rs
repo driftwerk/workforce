@@ -363,6 +363,14 @@ pub fn command_of(message: &str, with_files: bool) -> Option<Command> {
     parse_command(message).filter(|c| !(with_files && matches!(c, Command::Unknown { .. })))
 }
 
+/// Whether a turn's message may run one of the hub's commands, which run as
+/// the person: never another agent's words relayed to it, a room's
+/// hand-off (`hand_off`) or the crew's nudges and tasks (a relayed Desk
+/// scope). Such a message goes to the agent as words, tokenised.
+pub(crate) fn runs_commands(hand_off: bool) -> bool {
+    !hand_off && !workforce_agent::runner::current_desk().is_some_and(|d| d.relayed)
+}
+
 /// Whether `message` is a command that runs on its raw text, untokenised
 /// and never joining a live turn: any but an unknown one, which goes on like
 /// a message.

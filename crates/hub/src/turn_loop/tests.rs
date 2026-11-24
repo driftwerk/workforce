@@ -2539,3 +2539,125 @@ fn a_session_stays_marked_once_a_turn_read_the_bank_even_after_compaction() {
         "reading a banked conversation back marks this one"
     );
 }
+
+/// One of the hub's commands runs as the person, so only their own words
+/// run one: another agent's relayed to a turn (a room's hand-off, the
+/// crew's nudges and tasks) go to the agent as words, a key in them
+/// tokenised and never kept as theirs.
+#[tokio::test(flavor = "multi_thread")]
+async fn only_the_persons_own_words_run_a_command() {
+    use crate::secret_cache::{testing::GlobalCache, InMemorySecretCache};
+    use std::sync::Arc;
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+    use workforce_common::channels::desk::{
+        DeskPlace, DeskScope, DeskSpeaker, DeskTarget, DESK_CHANNEL,
+    };
+    use workforce_common::secret_marker::{MarkerId, SecretCache};
+    let cache: Arc<dyn SecretCache> = Arc::new(InMemorySecretCache::with_defaults());
+    let _cache = GlobalCache::install(Arc::clone(&cache));
+    let tmp = tempfile::tempdir().unwrap();
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(400).set_body_string("no model here"))
+        .mount(&server)
+        .await;
+    let mut config = workforce_common::settings::WorkforceConfig::default();
+    config.hub.data_dir = tmp.path().to_string_lossy().to_string();
+    config.memory.db_path = tmp.path().join("memory.db").to_string_lossy().into_owned();
+    config.llm.provider = "ollama".into();
+    config.llm.api_key = Some(server.uri());
+    config.llm.default_model = "mock".into();
+    config.desk.enabled = true;
+    let service = AgentService::from_config(config, None).await.unwrap();
+    let key = format!("bsk_{}", "x".repeat(32));
+    let said = format!("cmd: secret bank_key {key}");
+    let hand_off = {
+        let mut turn = dm_turn(uuid::Uuid::new_v4());
+        turn.turn.speaker = DeskSpeaker::Agent {
+            name: "helper".into(),
+        };
+        turn
+    };
+    let crews = DeskScope {
+        target: DeskTarget::of_turn(&DeskPlace::Dm { thread: None }, DESK_CHANNEL, None, false),
+        owner: "identity-1".into(),
+        attended: true,
+        relayed: true,
+    };
+    let run = |channel: &'static str,
+               desk: Option<workforce_common::channels::desk::DeskTurnContext>,
+               scope: Option<DeskScope>| {
+        let (service, said) = (Arc::clone(&service), said.clone());
+        async move {
+            workforce_agent::runner::with_desk(scope, async move {
+                let MessageProgress {
+                    mut progress_rx,
+                    handle,
+                    ..
+                } = service
+                    .process_message_with_progress(
+                        channel,
+                        "identity-1",
+                        None,
+                        &said,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        desk.as_ref(),
+                    )
+                    .await
+                    .unwrap();
+                let mut answers = Vec::new();
+                while let Some(event) = progress_rx.recv().await {
+                    if let workforce_agent::runner::ProgressEvent::Response { text } = event {
+                        answers.push(text);
+                    }
+                }
+                let _ = handle.await;
+                answers.join(" ")
+            })
+            .await
+        }
+    };
+    let kept = |channel: &str| cache.lookup(channel, &MarkerId::named("bank_key").unwrap());
+
+    for (channel, desk, scope) in [
+        ("desk:handed-off", Some(hand_off), None),
+        ("desk:crew", None, Some(crews)),
+    ] {
+        let answer = run(channel, desk, scope).await;
+        assert!(!answer.contains("Stored secret"), "{channel}: {answer}");
+        assert!(
+            kept(channel).is_none(),
+            "{channel}: never kept as the person's"
+        );
+        let words: String = service
+            .sessions
+            .find(channel, "identity-1")
+            .unwrap()
+            .iter()
+            .flat_map(|s| s.messages.iter().map(|m| m.content.clone()))
+            .collect();
+        assert!(!words.contains(&key), "{channel}: tokenised");
+    }
+    let answer = run("desk:theirs", None, None).await;
+    assert!(answer.contains("Stored secret `bank_key`"), "{answer}");
+    assert!(kept("desk:theirs").is_some());
+}
