@@ -748,6 +748,9 @@ struct State {
     working_noted: HashMap<Uuid, std::time::Instant>,
     /// Sessions whose next stop or resume someone's action already recorded.
     acted: HashSet<Uuid>,
+    /// Codex sessions resumed out of a dropped mode, until a turn has run
+    /// in what they were put back in ([`modes::StartIn::Reset`]).
+    resetting: HashSet<Uuid>,
     /// Requests Desk answered, until the change that clears them is seen.
     decided: HashSet<Uuid>,
     /// The turn each session has open in the floor's log.
@@ -4580,6 +4583,7 @@ impl Desk {
             st.restarted.remove(&id);
             st.exited.remove(&id);
             st.ended_before.remove(&id);
+            st.resetting.remove(&id);
             st.deps.remove(&id);
             st.switch_by.remove(&id);
             st.switch_notes.remove(&id);
@@ -6124,7 +6128,13 @@ impl Desk {
             },
         );
         if start_in == modes::StartIn::Reset {
-            self.reset_done(r.id).await;
+            // Codex keeps what a thread runs in with its turns: until one
+            // has, its next resume would bring the dropped mode back.
+            if r.engine == Engine::Codex {
+                self.0.state.lock().resetting.insert(r.id);
+            } else {
+                self.reset_done(r.id).await;
+            }
         }
         // Started afresh: on its own account again, or on the CLI's sign-in
         // as it is now.
@@ -8236,7 +8246,11 @@ impl Desk {
                 }
                 _ => {}
             }
-            let turn_begins = matches!(event, CodexEvent::Working { .. })
+            let working = matches!(event, CodexEvent::Working { .. });
+            if working && self.0.state.lock().resetting.remove(&id) {
+                self.reset_done(id).await;
+            }
+            let turn_begins = working
                 && self.record(id).is_ok_and(|r| {
                     !matches!(r.state, SessionState::Working | SessionState::Blocked)
                 });

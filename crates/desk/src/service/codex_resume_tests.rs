@@ -192,13 +192,13 @@ async fn act_fully(d: &Desk, id: Uuid) {
 }
 
 /// Starts it again with `again`, its thread resumed by Desk as `answers`
-/// say, one by one: the params of each.
+/// say, one by one: the params of each, and its app-server's end.
 async fn started_again<F>(
     d: &Desk,
     dir: &Path,
     answers: &[Value],
     again: impl FnOnce(Desk) -> F,
-) -> Vec<Value>
+) -> (Vec<Value>, WebSocketStream<UnixStream>)
 where
     F: std::future::Future<Output = Result<(), DeskError>> + Send + 'static,
 {
@@ -210,7 +210,15 @@ where
         asked.push(resumed(&mut ws, answer.clone()).await);
     }
     again.await.unwrap().unwrap();
-    asked
+    (asked, ws)
+}
+
+/// A turn runs in its thread, from its start to its end.
+async fn turn(d: &Desk, id: Uuid, ws: &mut WebSocketStream<UnixStream>) {
+    say(ws, status("active")).await;
+    until(|| d.view(id).unwrap().state == SessionState::Working).await;
+    say(ws, status("idle")).await;
+    until(|| d.view(id).unwrap().state != SessionState::Working).await;
 }
 
 /// A session in its own mode is resumed in it, whoever starts it, never
@@ -236,7 +244,7 @@ async fn a_codex_session_runs_in_its_own_mode_unless_one_that_doesnt_ask_is_kept
         // Restarted as its last app-server still holds the thread: asked
         // again, in its own mode, and it runs.
         let held = json!({"code": -32603, "message": "thread t1 already has an active writer"});
-        let asked = started_again(&d, &dir, &[held, ok.clone()], move |d| async move {
+        let (asked, _) = started_again(&d, &dir, &[held, ok.clone()], move |d| async move {
             d.restart(s.id, None, By::you()).await.map(drop)
         })
         .await;
@@ -248,7 +256,7 @@ async fn a_codex_session_runs_in_its_own_mode_unless_one_that_doesnt_ask_is_kept
 
         // A boss's restart: still its own.
         let boss = || By::manager("crew", "Crew", "it should go on");
-        let asked = started_again(&d, &dir, std::slice::from_ref(&ok), move |d| async move {
+        let (asked, _) = started_again(&d, &dir, std::slice::from_ref(&ok), move |d| async move {
             d.restart(s.id, None, boss()).await.map(drop)
         })
         .await;
@@ -259,7 +267,7 @@ async fn a_codex_session_runs_in_its_own_mode_unless_one_that_doesnt_ask_is_kept
         // permissions, and its restart keeps it so.
         act_fully(&d, s.id).await;
         let bypassed = in_mode(&dir, "never", "danger-full-access");
-        let asked = started_again(&d, &dir, std::slice::from_ref(&ok), move |d| async move {
+        let (asked, _) = started_again(&d, &dir, std::slice::from_ref(&ok), move |d| async move {
             d.set_mode(s.id, Mode::BypassPermissions, boss())
                 .await
                 .map(drop)
@@ -267,7 +275,7 @@ async fn a_codex_session_runs_in_its_own_mode_unless_one_that_doesnt_ask_is_kept
         .await;
         assert_eq!(asked, std::slice::from_ref(&bypassed));
         until(|| tui_starts(&dir).len() == 4).await;
-        let asked = started_again(&d, &dir, std::slice::from_ref(&ok), move |d| async move {
+        let (asked, _) = started_again(&d, &dir, std::slice::from_ref(&ok), move |d| async move {
             d.restart(s.id, None, boss()).await.map(drop)
         })
         .await;
@@ -275,8 +283,9 @@ async fn a_codex_session_runs_in_its_own_mode_unless_one_that_doesnt_ask_is_kept
         until(|| tui_starts(&dir).len() == 5).await;
 
         // The person resumes it: that mode goes, and the thread is put back
-        // in Codex's default, not left bypassing, even when that start fails;
-        // after which it is its own again.
+        // in Codex's default, not left bypassing, even when that start fails
+        // or its TUI ends before a turn has run in it; once one has, it is
+        // its own again.
         let reset = in_mode(&dir, "on-request", "workspace-write");
         stopped(&d, s.id).await;
         let server = serve(&dir);
@@ -288,48 +297,59 @@ async fn a_codex_session_runs_in_its_own_mode_unless_one_that_doesnt_ask_is_kept
         let lost = json!({"code": -32603, "message": "no rollout found for thread id t1"});
         assert_eq!(resumed(&mut ws, lost).await, reset);
         assert!(failed.await.unwrap().is_err());
-        let asked = started_again(&d, &dir, std::slice::from_ref(&ok), move |d| async move {
+        let (asked, _) = started_again(&d, &dir, std::slice::from_ref(&ok), move |d| async move {
             d.resume(s.id, None, Some(By::you())).await.map(drop)
         })
         .await;
         assert_eq!(asked, std::slice::from_ref(&reset));
         until(|| tui_starts(&dir).len() == 6).await;
         stopped(&d, s.id).await;
-        let asked = started_again(&d, &dir, std::slice::from_ref(&ok), move |d| async move {
+        let (asked, mut ws) =
+            started_again(&d, &dir, std::slice::from_ref(&ok), move |d| async move {
+                d.resume(s.id, None, Some(By::you())).await.map(drop)
+            })
+            .await;
+        assert_eq!(asked, std::slice::from_ref(&reset), "no turn ran in it");
+        until(|| tui_starts(&dir).len() == 7).await;
+        turn(&d, s.id, &mut ws).await;
+        stopped(&d, s.id).await;
+        let (asked, _) = started_again(&d, &dir, std::slice::from_ref(&ok), move |d| async move {
             d.resume(s.id, None, Some(By::you())).await.map(drop)
         })
         .await;
         assert_eq!(asked, [its_own(&dir)]);
-        until(|| tui_starts(&dir).len() == 7).await;
+        until(|| tui_starts(&dir).len() == 8).await;
 
         // Bypassing again, stopped, and the hub restarted: its next hub
         // finds the mode gone, and puts the thread back in Codex's default.
         act_fully(&d, s.id).await;
-        let asked = started_again(&d, &dir, std::slice::from_ref(&ok), move |d| async move {
+        let (asked, _) = started_again(&d, &dir, std::slice::from_ref(&ok), move |d| async move {
             d.set_mode(s.id, Mode::BypassPermissions, boss())
                 .await
                 .map(drop)
         })
         .await;
         assert_eq!(asked, [in_mode(&dir, "never", "danger-full-access")]);
-        until(|| tui_starts(&dir).len() == 8).await;
+        until(|| tui_starts(&dir).len() == 9).await;
         stopped(&d, s.id).await;
         d.0.cancel.cancel();
         drop(d);
         let d = desk_on(pool, &dir, CancellationToken::new()).await;
-        let asked = started_again(&d, &dir, std::slice::from_ref(&ok), move |d| async move {
-            d.resume(s.id, None, Some(By::you())).await.map(drop)
-        })
-        .await;
+        let (asked, mut ws) =
+            started_again(&d, &dir, std::slice::from_ref(&ok), move |d| async move {
+                d.resume(s.id, None, Some(By::you())).await.map(drop)
+            })
+            .await;
         assert_eq!(asked, [reset]);
-        until(|| tui_starts(&dir).len() == 9).await;
+        until(|| tui_starts(&dir).len() == 10).await;
+        turn(&d, s.id, &mut ws).await;
         stopped(&d, s.id).await;
-        let asked = started_again(&d, &dir, &[ok], move |d| async move {
+        let (asked, _) = started_again(&d, &dir, &[ok], move |d| async move {
             d.resume(s.id, None, Some(By::you())).await.map(drop)
         })
         .await;
         assert_eq!(asked, [its_own(&dir)]);
-        until(|| tui_starts(&dir).len() == 10).await;
+        until(|| tui_starts(&dir).len() == 11).await;
         assert!(tui_has_no_permissions());
     })
     .await;
