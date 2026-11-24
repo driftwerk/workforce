@@ -2690,6 +2690,12 @@ async fn a_goal_ends_only_once_it_is_met_and_desk_closes_its_ticket() {
         });
         let p = d.propose_plan(new, &sarah(), &by_sarah()).await.unwrap();
         let id = p.summary.plan.id;
+        // Each key is sent once: a second `goal` replaced its words.
+        let detail = d.plan(id).await.unwrap();
+        let sent = serde_json::to_value(&detail).unwrap();
+        assert!(sent["goal"].is_string(), "{sent}");
+        assert!(sent["goalProgress"]["parts"].is_array(), "{sent}");
+        assert_keys_once(&detail);
         assert_eq!(
             p.summary.plan.goal_ticket,
             Some(t.ticket.id),
@@ -2725,4 +2731,41 @@ async fn a_goal_ends_only_once_it_is_met_and_desk_closes_its_ticket() {
         assert_eq!(done.summary.plan.state, PlanState::Done);
     })
     .await;
+}
+
+/// That `detail` sends no key twice at its top level, the way a flattened
+/// struct can: the later would replace the earlier.
+fn assert_keys_once(detail: &PlanDetail) {
+    let text = serde_json::to_string(detail).unwrap();
+    let sent: serde_json::Value = serde_json::from_str(&text).unwrap();
+    let mut keys = Vec::new();
+    let mut depth = 0usize;
+    let mut chars = text.char_indices().peekable();
+    while let Some((i, c)) = chars.next() {
+        match c {
+            '{' | '[' => depth += 1,
+            '}' | ']' => depth -= 1,
+            '"' => {
+                let start = i + 1;
+                let mut end = start;
+                while let Some((j, c)) = chars.next() {
+                    match c {
+                        '\\' => {
+                            chars.next();
+                        }
+                        '"' => {
+                            end = j;
+                            break;
+                        }
+                        _ => {}
+                    }
+                }
+                if depth == 1 && chars.peek().map(|(_, c)| *c) == Some(':') {
+                    keys.push(&text[start..end]);
+                }
+            }
+            _ => {}
+        }
+    }
+    assert_eq!(keys.len(), sent.as_object().unwrap().len(), "{keys:?}");
 }
