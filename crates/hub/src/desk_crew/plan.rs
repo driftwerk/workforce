@@ -242,8 +242,9 @@ ticket says, or moving one to a machine or folder the approved plan doesn't use 
 person to approve, while the plan runs on as approved. A draft the person hasn't approved stays \
 one: unbound, start_now with the person's own words asking to start it approves it. board (a \
 prefix) or new_board moves the whole plan to that board in your group, each ticket re-filed under \
-a new key; it applies at once. On a goal: goal, result and met are the person's, so ask them \
-first (crew.ask_person with plan_id and proposal) and pass their words (person_said); record what \
+a new key; it applies at once. On a goal: goal, result and met are the person's, so propose \
+them in your DM in the words you pass (or crew.ask_person with plan_id and proposal) and pass \
+their reply (person_said), a plain “yes” counting; record what \
 you report as done as facts, a judged part's progress as a checkpoint, and fix where a part is \
 read from with repair once its reads keep failing. Say why.";
 
@@ -413,9 +414,9 @@ pub fn update_schema() -> Value {
         "new_board": new_board_schema(),
         "machine": machine_schema("Where its new tickets run when one doesn't say"),
         "model": { "type": "string", "description": "The model its new tickets' sessions run when one doesn't say" },
-        "goal": { "type": "string", "description": "The goal, as the person's answer to your question changed it" },
+        "goal": { "type": "string", "description": "The goal, as the person agreed to change it" },
         "result": goal::result_schema(),
-        "person_said": { "type": "string", "description": "With goal or result: the person's reply to your question (crew.ask_person with plan_id and proposal), quoted exactly; a short “yes” counts. Or their own words asking for the new goal" },
+        "person_said": { "type": "string", "description": "With goal or result: the person's reply, quoted exactly, to your last DM message proposing them in the words you pass, or to your question (crew.ask_person with plan_id and proposal); a plain “yes” counts. Or their own words asking for the new goal" },
         "agreed": goal::said_schema("agreeing the first goal of a plan that has none (with result)"),
         "met": goal::said_schema("saying the goal is met: their reply to your question, or their own words"),
         "repair": goal::repair_schema(),

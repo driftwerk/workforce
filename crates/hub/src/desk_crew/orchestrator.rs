@@ -709,14 +709,15 @@ pub(super) fn person_messages(
         .collect()
 }
 
-/// When `service` last replied in its DM with `person` in a turn of its
-/// own, among the `look` newest messages there: Desk's posts by it (plan
-/// cards, updates, notices, a turn's failure) aren't its words to answer.
-pub(super) fn boss_last_said(
+/// What `service` replied in its DM with `person` in turns of its own,
+/// and when, among the `look` newest messages there: Desk's posts by it
+/// (plan cards, updates, notices, a turn's failure) aren't its words to
+/// answer.
+pub(super) fn boss_said(
     service: &AgentService,
     person: &str,
     look: usize,
-) -> Option<DateTime<Utc>> {
+) -> Vec<(DateTime<Utc>, String)> {
     use workforce_desk::conversations::Author;
     let speaker = workforce_desk::Speaker::agent(service.agent_id.as_str(), &name_of(service));
     match crate::desk_conversations::page(
@@ -736,11 +737,11 @@ pub(super) fn boss_last_said(
                     .as_ref()
                     .is_none_or(|k| k.delivery.is_none() && !k.failed)
             })
-            .map(|m| m.at)
-            .max(),
+            .map(|m| (m.at, m.text))
+            .collect(),
         Err(e) => {
             tracing::info!(error = %e, "the boss's DM couldn't be read");
-            None
+            Vec::new()
         }
     }
 }

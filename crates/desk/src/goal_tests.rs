@@ -937,3 +937,43 @@ fn a_parts_head_is_where_its_last_checkpoint_left_it_else_where_it_was_agreed() 
     assert!(!head_due(&heads, &pull), "it came later");
     assert!(head_due(&Heads::new(), &pull), "nothing read yet");
 }
+
+#[test]
+fn a_plain_reply_settles_only_what_the_bosss_message_before_it_proposed() {
+    let proposal = "**Proposed done-when goal:**\n\n| Goal | Done when |\n|---|---|\n| Eden’s v1 is live for staff | **Eden v1 checklist** is ticked |\n\nYes, or change it?";
+    let boss = vec![
+        (at(0), "Earlier news.".to_string()),
+        (at(5), proposal.to_string()),
+    ];
+    let said = |texts: &[(i64, &str)]| -> Vec<(DateTime<Utc>, String)> {
+        texts.iter().map(|(m, t)| (at(*m), t.to_string())).collect()
+    };
+    let proposed = ["Eden's v1 is live for staff", "Eden v1 checklist is ticked"];
+    let yes = said(&[(1, "hello"), (6, "Yes.")]);
+    assert_eq!(replied_to(&yes, &boss, "yes", &proposed), Ok(at(6)));
+    assert_eq!(
+        replied_to(&yes, &boss, "yes", &["Eden v2 is live"]),
+        Err(NotReplied::NotProposed(0))
+    );
+    assert_eq!(
+        replied_to(&said(&[(4, "yes")]), &boss, "yes", &proposed),
+        Err(NotReplied::NotProposed(0)),
+        "a yes before the proposal answers the message before it"
+    );
+    let unclear = [
+        said(&[(6, "yes"), (7, "wait, drop staging")]),
+        said(&[(6, "drop staging"), (7, "yes")]),
+        said(&[(6, "yes but drop the staging part")]),
+    ];
+    for theirs in &unclear {
+        assert_eq!(
+            replied_to(theirs, &boss, "yes", &proposed),
+            Err(NotReplied::NoPlainReply),
+            "{theirs:?}"
+        );
+    }
+    assert_eq!(
+        replied_to(&said(&[(6, "yes")]), &[], "yes", &proposed),
+        Err(NotReplied::NothingProposed)
+    );
+}

@@ -1099,6 +1099,54 @@ pub fn says_goal(text: &str, goal: &str) -> bool {
             .any(|w| w == words.as_slice())
 }
 
+/// Why the person's words don't settle what the boss proposed in its own
+/// last message to them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NotReplied {
+    /// The words aren't the whole of a plain reply ("yes", "ok, go") of
+    /// theirs, the only one since the boss's message before it.
+    NoPlainReply,
+    /// No message of the boss's came before their reply.
+    NothingProposed,
+    /// The boss's message before their reply doesn't say the `n`th of
+    /// what it is said to propose.
+    NotProposed(usize),
+}
+
+/// When the person's `quote` is their plain reply to what the boss
+/// proposed in its last message before it: the whole of the person's
+/// newest message in `theirs`, short enough to answer only what was just
+/// said ([`stands_alone`] not), their only one since that message of the
+/// boss's in `boss`, which says each of `proposed` word for word.
+pub fn replied_to(
+    theirs: &[(DateTime<Utc>, String)],
+    boss: &[(DateTime<Utc>, String)],
+    quote: &str,
+    proposed: &[&str],
+) -> Result<DateTime<Utc>, NotReplied> {
+    let quoted = compared_words(quote);
+    let at = theirs
+        .iter()
+        .max_by_key(|(at, _)| *at)
+        .filter(|(_, text)| {
+            !quoted.is_empty() && !stands_alone(text) && compared_words(text) == quoted
+        })
+        .map(|(at, _)| *at)
+        .ok_or(NotReplied::NoPlainReply)?;
+    let (asked_at, asked) = boss
+        .iter()
+        .filter(|(when, _)| *when < at)
+        .max_by_key(|(when, _)| *when)
+        .ok_or(NotReplied::NothingProposed)?;
+    if theirs.iter().filter(|(when, _)| when > asked_at).count() > 1 {
+        return Err(NotReplied::NoPlainReply);
+    }
+    match proposed.iter().position(|words| !says_goal(asked, words)) {
+        Some(n) => Err(NotReplied::NotProposed(n)),
+        None => Ok(at),
+    }
+}
+
 /// The prefix the person's answer on an item's buttons is posted with in
 /// their DM: "My answer to “…”: ".
 pub const ANSWER_LEAD: &str = "My answer to “";

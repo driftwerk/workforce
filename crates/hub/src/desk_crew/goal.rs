@@ -12,8 +12,8 @@ use serde_json::{json, Value};
 use uuid::Uuid;
 use workforce_desk::crew::{self, Party};
 use workforce_desk::goal::{
-    self, Evidence, Fact, FactKind, GoalResult, Measure, Met, MetBy, NotSaid, Progress, Proposal,
-    Reading, Said,
+    self, Evidence, Fact, FactKind, GoalResult, Measure, Met, MetBy, NotReplied, NotSaid, Progress,
+    Proposal, Reading, Said,
 };
 use workforce_desk::plan::Plan;
 use workforce_desk::PlanDetail;
@@ -53,14 +53,17 @@ on it (crew.plan_update facts).";
 
 /// Refused when the change applied isn't what the question proposed.
 const ANOTHER_PROPOSAL: &str = "Your question about this plan proposed something else, so its \
-answer doesn't apply this. Ask about this change: crew.ask_person with plan_id and proposal \
-(exactly the goal, result or met you pass here), then pass their reply as person_said; a short \
-“yes” counts.";
+answer doesn't apply this. Propose this change to the person in your DM, saying the goal and how \
+it's measured in the words you'll pass, then pass their reply as person_said: a plain “yes” right \
+after it counts. Or ask with crew.ask_person (plan_id and proposal: exactly what you pass here). \
+Tell the person only what you propose, never about this check.";
 /// Refused when a goal or its result changes without the person's words.
-pub(super) const ASK_FIRST: &str = "The goal and how it's measured are the person's. Ask them: \
-crew.ask_person with plan_id and proposal (the goal and/or result you'd change it to), then pass \
-their reply as person_said; a short “yes” counts. If they asked for a new goal themselves, pass \
-their words as person_said, with the goal said in their words.";
+pub(super) const ASK_FIRST: &str = "The goal and how it's measured are the person's. Propose the \
+change to them in your DM, saying the goal and how it's measured in the words you'll pass, then \
+pass their reply as person_said: a plain “yes” right after it counts. Or ask with crew.ask_person \
+(plan_id and proposal: the goal and/or result you'd change it to). If they asked for a new goal \
+themselves, pass their words as person_said, with the goal said in their words. Tell the person \
+only what you propose, never about this check.";
 /// Refused when a plan is given its first goal without the person's words.
 const FIRST_GOAL: &str = "A goal is the person's: give this plan its first goal with the words they agreed it in (agreed: {person_said}, from the last 24 hours), with its result.";
 /// Why the person's words `quote` don't count for `said`, and how the boss
@@ -646,7 +649,10 @@ impl CrewHub {
         let now = crew::now();
         let since = now - AGREED_WITHIN;
         let last = self.person(Some(service)).and_then(|person| {
-            super::orchestrator::boss_last_said(service, &person, MESSAGES_READ)
+            super::orchestrator::boss_said(service, &person, MESSAGES_READ)
+                .into_iter()
+                .map(|(at, _)| at)
+                .max()
         });
         let (now_words, earlier): (Vec<_>, Vec<_>) = self
             .person_words(service, now - WORDS_LOOKED)
@@ -692,6 +698,11 @@ impl CrewHub {
                 .map_err(|e| not_said(quote, e, Said::Answering))?;
             return Ok((Some(ask.item), at));
         }
+        if applying.met.is_none() {
+            if let Some(at) = self.replied_at(service, quote, applying)? {
+                return Ok((None, at));
+            }
+        }
         // A result is changed only on an answer: its parts are the boss's
         // to put to the person.
         if applying.result.is_some() {
@@ -728,6 +739,52 @@ impl CrewHub {
             }
         }
         Ok((None, at))
+    }
+
+    /// When `quote` is the person's plain reply in their DM ("yes", "ok")
+    /// to the boss's own last message there, which proposed `applying`'s
+    /// goal and result in the words it passes: none when it isn't such a
+    /// reply, refused when the message it answers proposed other words.
+    fn replied_at(
+        &self,
+        service: &AgentService,
+        quote: &str,
+        applying: &Proposal,
+    ) -> Result<Option<DateTime<Utc>>, String> {
+        let Some(person) = self.person(Some(service)) else {
+            return Ok(None);
+        };
+        let theirs: Vec<_> = super::orchestrator::person_messages(
+            service,
+            &person,
+            crew::now() - AGREED_WITHIN,
+            MESSAGES_READ,
+        )
+        .into_iter()
+        .map(|(at, text)| (at, goal::answered_text(&text).to_string()))
+        .collect();
+        let boss = super::orchestrator::boss_said(service, &person, MESSAGES_READ);
+        let proposed: Vec<(&str, &str)> = [
+            applying.goal.as_deref().map(|g| ("the goal", g)),
+            applying
+                .result
+                .as_ref()
+                .map(|r| ("how it's measured (the result's words)", r.words.as_str())),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        let words: Vec<&str> = proposed.iter().map(|(_, w)| *w).collect();
+        match goal::replied_to(&theirs, &boss, quote, &words) {
+            Ok(at) => Ok(Some(at)),
+            Err(NotReplied::NotProposed(n)) => Err(format!(
+                "The person's “{}” answers your last message before it, which doesn't say {} “{}” word for word. Pass it exactly as you wrote it there; if you mean something else, put that to them in plain words first.",
+                crew::one_line(quote, 120),
+                proposed[n].0,
+                crew::one_line(proposed[n].1, 120)
+            )),
+            Err(NotReplied::NoPlainReply | NotReplied::NothingProposed) => Ok(None),
+        }
     }
 
     /// Notes that question `item`'s proposal applies now, and closes it:

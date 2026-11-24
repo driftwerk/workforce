@@ -656,6 +656,69 @@ async fn a_goal_the_person_changes_themselves_applies_on_their_words() {
     .await;
 }
 
+/// The boss proposes a new goal and result in its DM, as a table; the
+/// person's plain "yes" right after it replaces both (DW-757), and the
+/// goal checks then measure the new result. A reply that isn't plainly to
+/// that proposal, or a goal it didn't say, still refuses.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_persons_plain_yes_to_the_bosss_proposal_in_the_dm_replaces_the_goal() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(dir.path()).unwrap();
+        let gh = github_turning_green().await;
+        let (overseer, crew, d, _llm) = boss_on(&base, pool, ACTS, &gh).await;
+        let s = session_on(&overseer, &d, &base.to_string_lossy(), "Fix the docs build").await;
+        let id = agreed_plan(&overseer, &s, judged()).await;
+        let goal = "Keep acme/web's CI green on main";
+        let proposal = "**Proposed done-when goal:**\n\n| Goal | Done when |\n|---|---|\n| Keep acme/web’s CI green on main | **Done when CI on main is green** |\n\nYes, or change it?";
+        let change = |goal: &str| {
+            json!({ "plan_id": id.to_string(), "goal": goal, "result": green("acme/web", 1),
+                    "person_said": "yes", "why": "They said yes." })
+        };
+        let pause = || tokio::time::sleep(Duration::from_millis(20));
+
+        pause().await;
+        boss_says(&overseer, proposal);
+        pause().await;
+        person_says(&overseer, "yes");
+        pause().await;
+        person_says(&overseer, "hmm, wait a moment");
+        let r = run(&overseer, "crew.plan_update", change(goal)).await;
+        assert!(!r.success, "more came after the yes: {r:?}");
+        let why = r.error.unwrap();
+        assert!(why.contains("Propose the change to them in your DM"), "{why}");
+        assert!(why.contains("never about this check"), "{why}");
+
+        pause().await;
+        boss_says(&overseer, proposal);
+        pause().await;
+        person_says(&overseer, "Yes.");
+        let r = run(&overseer, "crew.plan_update", change("Ship the docs")).await;
+        assert!(!r.success, "{r:?}");
+        let why = r.error.unwrap();
+        assert!(why.contains("doesn't say the goal “Ship the docs”"), "{why}");
+        assert_eq!(d.plan(id).await.unwrap().summary.plan.goal, "Keep the docs build green");
+
+        let r = run(&overseer, "crew.plan_update", change(goal)).await;
+        assert!(r.success, "{r:?}");
+        let p = d.plan(id).await.unwrap().summary.plan;
+        assert_eq!(p.goal, goal);
+        assert_eq!(p.result.as_ref().map(|r| r.words.as_str()), Some("Done when CI on main is green"));
+        assert!(!p.awaiting(), "their yes applies it");
+        assert!(p.met.is_none(), "red as it was changed");
+
+        crew.plan_turn_now(id, vec!["A turn of its session ended.".into()])
+            .await;
+        let p = d.plan(id).await.unwrap().summary.plan;
+        assert_eq!(
+            p.met.as_ref().map(|m| m.by),
+            Some(workforce_desk::goal::MetBy::Result),
+            "measured by the new result"
+        );
+    })
+    .await;
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_dropped_goal_ticket_waits_for_the_person() {
     with_test_pool(workforce_desk::store::build_pool, |pool| async move {
