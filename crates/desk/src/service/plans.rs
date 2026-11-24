@@ -112,8 +112,10 @@ pub struct PlanDetail {
     pub revisions: Vec<Revision>,
     /// Where its budget stands now, when it has one and it can be counted.
     pub spend: Option<Standing>,
-    /// How its goal stands, part by part, when it has a result.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// How its goal stands, part by part, when it has a result. Sent as
+    /// `goalProgress`: the flattened summary already sends `goal`, the
+    /// goal's words, and a second `goal` would replace them (DW-749).
+    #[serde(rename = "goalProgress", skip_serializing_if = "Option::is_none")]
     pub goal: Option<goal::Progress>,
     /// What its boss reported and showed toward its goal, newest first.
     #[serde(skip_serializing_if = "Vec::is_empty")]

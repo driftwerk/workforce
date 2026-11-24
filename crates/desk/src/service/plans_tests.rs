@@ -2690,6 +2690,13 @@ async fn a_goal_ends_only_once_it_is_met_and_desk_closes_its_ticket() {
         });
         let p = d.propose_plan(new, &sarah(), &by_sarah()).await.unwrap();
         let id = p.summary.plan.id;
+        // Its goal's words and its progress each go under their own key
+        // (DW-749: a second `goal` replaced the words and broke Desk).
+        let sent = serde_json::to_string(&d.plan(id).await.unwrap()).unwrap();
+        assert!(!sent.contains("\"goal\":{"), "{sent}");
+        let sent: serde_json::Value = serde_json::from_str(&sent).unwrap();
+        assert!(sent["goal"].is_string(), "{sent}");
+        assert!(sent["goalProgress"]["parts"].is_array(), "{sent}");
         assert_eq!(
             p.summary.plan.goal_ticket,
             Some(t.ticket.id),
