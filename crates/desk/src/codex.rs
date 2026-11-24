@@ -535,6 +535,12 @@ pub enum CodexEvent {
     Thread {
         rollout: Option<String>,
     },
+    /// Desk's own resume loaded the conversation, before its TUI joins it;
+    /// its rollout file, when the server says where. Not a sign the
+    /// session is up: its TUI isn't yet.
+    Loaded {
+        rollout: Option<String>,
+    },
     Working {
         waiting: bool,
     },
@@ -1279,26 +1285,25 @@ impl Follower {
                     }
                     return (Vec::new(), None);
                 }
-                if let Some(p) = priming {
-                    let _ = p.told.send(Ok(()));
-                }
                 let Some(thread) = self.thread.clone() else {
                     return (Vec::new(), None);
                 };
                 tracing::info!(target: crate::STARTS, %thread, "codex: following its thread");
-                // Its thread is loaded and followed: a resume says no
-                // `thread/started`, and a TUI that joins a loaded thread
-                // says nothing at all (CLI 0.166), so this is the session's
-                // word that it is up. Then what it runs with, as Codex says.
-                let loaded = Seen {
-                    thread: thread.clone(),
-                    event: CodexEvent::Thread {
-                        rollout: v
-                            .pointer("/result/thread/path")
-                            .and_then(Value::as_str)
-                            .map(str::to_string),
-                    },
-                };
+                // Loaded by its own resume: a resume says no
+                // `thread/started` (CLI 0.166), so this is where it is.
+                let loaded = priming.map(|p| {
+                    let _ = p.told.send(Ok(()));
+                    Seen {
+                        thread: thread.clone(),
+                        event: CodexEvent::Loaded {
+                            rollout: v
+                                .pointer("/result/thread/path")
+                                .and_then(Value::as_str)
+                                .map(str::to_string),
+                        },
+                    }
+                });
+                // What it runs with, as Codex says it.
                 let reviewer = v
                     .pointer("/result/approvalsReviewer")
                     .and_then(Value::as_str)
@@ -1306,7 +1311,7 @@ impl Follower {
                         thread,
                         event: CodexEvent::Reviewer(reviewer.to_string()),
                     });
-                (std::iter::once(loaded).chain(reviewer).collect(), None)
+                (loaded.into_iter().chain(reviewer).collect(), None)
             }
             (Some(id), Some(method)) => {
                 let params = v.get("params").cloned().unwrap_or(Value::Null);
@@ -2083,9 +2088,10 @@ pub(crate) mod tests {
 
     /// Desk's resume of a thread as 0.166's app-server answered it, a real
     /// TUI then joining it (recorded): no `thread/started` comes, and none
-    /// on the TUI's join, so the answer is the word that the thread is up.
+    /// on the TUI's join. The answer says where the thread is, loaded, and
+    /// nothing says the session is up: its TUI does, once drawn.
     #[test]
-    fn a_thread_desk_resumes_is_up_once_codex_has_loaded_it() {
+    fn a_thread_desk_resumes_is_said_loaded_and_never_started() {
         let thread = "01a20dc3-0000-7000-8000-000000000001";
         let (tx, mut rx) = oneshot::channel();
         let mut f = Follower::new(Some(thread.into()), None).resuming(json!({}), tx);
@@ -2096,13 +2102,20 @@ pub(crate) mod tests {
                 .map(|l| serde_json::from_str::<Value>(l).unwrap())
                 .flat_map(|v| f.heard(&v).0)
                 .map(|s| s.event)
-                .filter(|e| matches!(e, CodexEvent::Thread { .. } | CodexEvent::Reviewer(_)))
+                .filter(|e| {
+                    matches!(
+                        e,
+                        CodexEvent::Thread { .. }
+                            | CodexEvent::Loaded { .. }
+                            | CodexEvent::Reviewer(_)
+                    )
+                })
                 .collect();
         assert_eq!(rx.try_recv().unwrap(), Ok(()));
         assert_eq!(
             seen,
             [
-                CodexEvent::Thread {
+                CodexEvent::Loaded {
                     rollout: Some(format!(
                         "/home/me/.codex/sessions/2026/11/24/rollout-2026-11-24T13-00-00-{thread}.jsonl"
                     ))
@@ -2700,16 +2713,11 @@ pub(crate) mod tests {
             .heard(&json!({"id": SUBSCRIBE, "result": {"approvalsReviewer": "auto_review"}}));
         assert_eq!(
             seen,
-            [
-                Seen {
-                    thread: "t9".into(),
-                    event: CodexEvent::Thread { rollout: None }
-                },
-                Seen {
-                    thread: "t9".into(),
-                    event: CodexEvent::Reviewer("auto_review".into())
-                }
-            ]
+            [Seen {
+                thread: "t9".into(),
+                event: CodexEvent::Reviewer("auto_review".into())
+            }],
+            "a new thread's start was said already, once"
         );
         let mut back = Follower::new(Some("t9".into()), None).at_once();
         assert_eq!(
@@ -2828,11 +2836,6 @@ pub(crate) mod tests {
             json!({"id": 1, "method": "item/tool/requestUserInput", "params": {"threadId": "t1"}}),
         )
         .await;
-        let up = tokio::time::timeout(Duration::from_secs(5), seen.recv())
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(up.event, CodexEvent::Thread { rollout: None }, "followed");
         let got = tokio::time::timeout(Duration::from_secs(5), seen.recv())
             .await
             .unwrap()

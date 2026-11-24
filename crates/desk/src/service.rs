@@ -1030,8 +1030,13 @@ const EXITED_CHARS: usize = 2000;
 const PRIMED_WITHIN: Duration = Duration::from_secs(30);
 
 /// How long, and how often, a starting Codex TUI is looked at for the
-/// error it may print and then stay up after ([`codex::start_error`]).
-const CODEX_START_WATCH: Duration = Duration::from_secs(60);
+/// error it may print and then stay up after ([`codex::start_error`]), and
+/// for its drawn screen.
+const CODEX_START_WATCH: Duration = if cfg!(test) {
+    Duration::from_secs(3)
+} else {
+    Duration::from_secs(60)
+};
 const CODEX_START_LOOK: Duration = Duration::from_millis(250);
 
 /// How often, within a [`STOP_GRACE`], an ending process is looked for.
@@ -6133,7 +6138,8 @@ impl Desk {
         }
         tokio::spawn(self.clone().on_exit(r.id, r.engine, exited, exit));
         if let Some(tui) = codex_tui {
-            tokio::spawn(self.clone().watch_codex_start(r.id, tui));
+            let joins = resume && r.cli_session_id.is_some();
+            tokio::spawn(self.clone().watch_codex_start(r.id, tui, joins));
         }
         // What its line held while it wasn't running is looked at again now
         // it is: its state said Starting before it was (settling its CLI's
@@ -6217,17 +6223,30 @@ impl Desk {
 
     /// Ends session `id`'s Codex TUI, `tui`, when it prints why it didn't
     /// start and stays up ([`codex::StartWatch`]), within its start: its end
-    /// is then said as it started, with what it printed. One still starting
-    /// at the watch's end is said too, with what its terminal shows.
-    async fn watch_codex_start(self, id: Uuid, tui: Weak<Pty>) {
+    /// is then said as it started, with what it printed. A TUI that `joins`
+    /// a thread Desk's resume loaded says nothing to Desk as it does (CLI
+    /// 0.166): its session is up once it has drawn its screen, the
+    /// alternate one. One still starting at the watch's end is said, with
+    /// what its terminal shows.
+    async fn watch_codex_start(self, id: Uuid, tui: Weak<Pty>, joins: bool) {
         let until = tokio::time::Instant::now() + CODEX_START_WATCH;
         let mut watch = codex::StartWatch::default();
+        let mut drawn = false;
         while tokio::time::Instant::now() < until {
             tokio::time::sleep(CODEX_START_LOOK).await;
             let Some(pty) = tui.upgrade() else { return };
             let shown = pty
                 .primary_text()
                 .map(|t| crate::pty::shown_end(&t, EXITED_LINES));
+            if joins && !drawn && shown.is_none() {
+                drawn = true;
+                tracing::info!(target: crate::STARTS, %id, "a resumed Codex session's TUI has drawn its screen: it's up");
+                self.change(id, |r, _| {
+                    if r.state == SessionState::Starting {
+                        r.state = SessionState::Idle;
+                    }
+                });
+            }
             if let Some(why) = watch.look(shown.as_deref()) {
                 tracing::warn!(%id, why, "codex said why it didn't start and stayed up: ending it");
                 pty.kill();
@@ -8345,6 +8364,9 @@ impl Desk {
                         if r.state == SessionState::Starting {
                             r.state = SessionState::Idle;
                         }
+                    }
+                    CodexEvent::Loaded { rollout } => {
+                        r.transcript = rollout.or(r.transcript.take());
                     }
                     CodexEvent::Working { waiting } => {
                         if let Some(l) = l.as_deref_mut().filter(|_| baseline.is_some()) {
