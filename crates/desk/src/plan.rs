@@ -117,7 +117,8 @@ pub struct Plan {
     pub state: PlanState,
     pub paused: Option<Paused>,
     /// Why it paused, when Desk paused it for a ticket that keeps failing
-    /// to start.
+    /// to start. Sent only as its summary's `pausedWhy`.
+    #[serde(skip_serializing)]
     pub paused_why: Option<String>,
     /// This plan's limit of sessions at once, when lower than its boss's.
     pub parallel: Option<i16>,
