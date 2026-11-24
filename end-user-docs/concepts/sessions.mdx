@@ -79,13 +79,17 @@ The defaults are tuned for a 200,000-token context window and aim to keep usage 
 | `max_context_tokens` | 200,000 | The maximum context window size for the LLM. |
 | `compaction_threshold` | 0.8 | The fraction of the max tokens at which compaction is triggered (80%). |
 | `keep_recent_messages` | 20 | The number of recent messages to always keep intact during compaction. |
-| `urgent_compaction_threshold` | 0.95 | When usage passes this fraction, compaction must run immediately before the agent replies (95%). |
+| `urgent_compaction_threshold` | 0.95 | When usage passes this fraction, compaction must run immediately before the agent replies (95%). Between the compaction threshold and this value, compaction runs in the background after the agent responds. |
 | `rollover_warning_ratio` | 0.70 | When usage reaches this fraction of the compaction threshold, a rollover is suggested (70% of 80% = 56% of max). |
 | `prune_tool_outputs` | `true` | Enable lightweight truncation of large tool outputs as an alternative to full summarisation. |
 | `prune_tool_output_max_chars` | 2000 | Maximum characters in a tool output before it's truncated. |
 | `prune_tool_input_max_chars` | 1024 | Maximum characters in a tool input before it's truncated in older messages. |
 | `enable_memory_flush` | `true` | Extract important context to long-term memory files before compacting. |
-| `compaction_model` | `None` | Use the agent's default model for summarisation tasks. Can be set to a faster model (like Claude Haiku) for speed. |
+| `soft_eviction_threshold` | 0.60 | Fraction of the context window at which stale in-flight tool outputs are evicted mid-turn, before summarisation is needed (60%). |
+| `stale_rollover_hours` | 24 | Hours of inactivity after which resuming a conversational-channel session rolls it over to a fresh one. `0` disables. |
+| `voice_rollover_max_messages` | 80 | Message count at which a voice session rolls over regardless of token usage. `0` disables. |
+| `chat_rollover_max_messages` | 200 | Message count at which a text session on a conversational channel (iOS, web, terminal) rolls over. `0` disables. |
+| `compaction_model` | `None` | Unset by default; the agent's heavy background model (`heavy_model` in the `[llm]` settings) is used. Can be set to a faster model. |
 | `max_compaction_passes` | 3 | Maximum compaction iterations per cycle — safety valve. |
 | `min_messages_to_compact` | 5 | Minimum messages to compact — skip if fewer non-system messages would be replaced. |
 | `rollover_keep_recent` | 4 | Recent turns carried verbatim into a rolled-over session, on top of the carry-over summary. |
