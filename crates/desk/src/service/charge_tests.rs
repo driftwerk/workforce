@@ -625,6 +625,133 @@ fn boss_tell(text: &str, to: Uuid) -> Send {
     }
 }
 
+/// A session Sarah runs whose Desk plugin isn't heard from: what waits for
+/// it is typed in at its prompt. Taken on an hour ago, so input since is
+/// the person's.
+async fn typed_into(d: &Desk, dir: &std::path::Path) -> Uuid {
+    let s = new_session(d, dir).await;
+    hook(
+        d,
+        s.id,
+        json!({"hook_event_name": "SessionStart", "session_id": s.id.to_string()}),
+    )
+    .await;
+    d.take_on(s.id, &sarah(), How::Handed, &Default::default(), &By::you())
+        .await
+        .unwrap();
+    d.0.state.lock().charges.rows.get_mut(&s.id).unwrap().since =
+        Utc::now() - chrono::Duration::hours(1);
+    s.id
+}
+
+async fn waiting(d: &Desk, id: Uuid, row: Uuid) -> (Delivery, Option<Wait>) {
+    let thread = d.line_thread(id, None, None).await.unwrap();
+    let m = thread.iter().find(|m| m.id == row).unwrap();
+    (m.delivery, m.waiting)
+}
+
+async fn until_in(d: &Desk, id: Uuid, row: Uuid) {
+    let end = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        match waiting(d, id, row).await.0 {
+            Delivery::Delivered | Delivery::Handed => return,
+            Delivery::Queued if tokio::time::Instant::now() < end => {
+                tokio::time::sleep(Duration::from_millis(20)).await
+            }
+            other => panic!("it never went in: {other:?}"),
+        }
+    }
+}
+
+/// The person's keystroke holds the boss's message only within the
+/// boss's hold, and says when that is up: then it goes in, with no prompt
+/// of theirs to free it (MAN-835 waited on a stray byte until one).
+#[tokio::test]
+async fn a_keystroke_holds_the_bosss_message_only_within_the_hold() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(pool, dir.path()).await;
+        let id = typed_into(&d, dir.path()).await;
+        let hold = chrono::Duration::milliseconds(1500);
+        d.set_holds([("sarah".to_string(), hold)].into());
+        let pty = d.attach(id).unwrap();
+        let (viewer, _, _) = pty.attach();
+        viewer.claim();
+        viewer.input(b"hm").unwrap();
+        let k = d.line_keystroke(id).expect("typed within the hold");
+        assert_eq!(k.ends - k.at, hold);
+        let by = By::manager("sarah", "Sarah", "Next.");
+        let m = d
+            .line_send(Sender::Overseer(by), boss_tell("Push it.", id))
+            .await
+            .unwrap();
+        assert_eq!(
+            waiting(&d, id, m.id).await,
+            (Delivery::Queued, Some(Wait::Typing))
+        );
+        until_in(&d, id, m.id).await;
+        assert_eq!(d.line_keystroke(id), None, "its hold is up");
+    })
+    .await;
+}
+
+/// The person's draft, put in its prompt by Desk, is their input for the
+/// wheel and holds what Desk would type in as a draft, never as typing,
+/// with no end but the next turn's start; after it, the boss's messages go
+/// in.
+#[tokio::test]
+async fn a_draft_holds_the_bosss_message_until_the_next_turn_starts() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(pool, dir.path()).await;
+        let id = typed_into(&d, dir.path()).await;
+        assert_eq!(d.wheel_of(id), Some(Wheel::Boss));
+        d.line_draft(id, "About your questions:").unwrap();
+        assert_eq!(d.wheel_of(id), Some(Wheel::Person), "a draft is input");
+        assert_eq!(d.line_keystroke(id), None);
+        let by = By::manager("sarah", "Sarah", "Next.");
+        let m = d
+            .line_send(Sender::Overseer(by), boss_tell("Push it.", id))
+            .await
+            .unwrap();
+        assert_eq!(
+            waiting(&d, id, m.id).await,
+            (Delivery::Queued, Some(Wait::Draft))
+        );
+        // Handed back, the draft still holds it: it has no hold to end.
+        d.hand_back(id).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(
+            waiting(&d, id, m.id).await,
+            (Delivery::Queued, Some(Wait::Draft))
+        );
+        // They send it: the turn takes the draft (and overtakes what was
+        // decided before it), and once it ends and the wheel is back the
+        // boss's next message goes in.
+        hook(
+            &d,
+            id,
+            json!({"hook_event_name": "UserPromptSubmit", "prompt": "About your questions: go on"}),
+        )
+        .await;
+        assert_ne!(waiting(&d, id, m.id).await.1, Some(Wait::Draft));
+        hook(
+            &d,
+            id,
+            json!({"hook_event_name": "Stop", "last_assistant_message": "Done."}),
+        )
+        .await;
+        d.hand_back(id).await.unwrap();
+        let by = By::manager("sarah", "Sarah", "Next.");
+        let next = d
+            .line_send(Sender::Overseer(by), boss_tell("Then commit it.", id))
+            .await
+            .unwrap();
+        until_in(&d, id, next.id).await;
+    })
+    .await;
+}
+
 /// Let go while the person drives, what the boss said and the person held
 /// is withdrawn, never typed into a session the person now runs alone.
 #[tokio::test]

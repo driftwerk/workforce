@@ -265,8 +265,12 @@ pub enum Wait {
     Stopped,
     /// It is working: it gets this when its turn ends.
     Working,
-    /// The person is typing in its terminal.
+    /// The person typed in its terminal within their hold, since its last
+    /// turn started.
     Typing,
+    /// The person's draft, put in its prompt by Desk, waits there unsent:
+    /// it gets this once a turn starts.
+    Draft,
     /// Desk's breaker paused it: only the person's own messages go in.
     Paused,
     /// Its turn ended asking the person something: only they, the boss
@@ -298,7 +302,9 @@ impl Wait {
     /// or Desk itself lets it go: no one need move it.
     pub fn on_purpose(self) -> bool {
         match self {
-            Self::Typing | Self::Paused | Self::PersonDriving | Self::ModeEnding => true,
+            Self::Typing | Self::Draft | Self::Paused | Self::PersonDriving | Self::ModeEnding => {
+                true
+            }
             Self::Stopped
             | Self::Working
             | Self::Asking
@@ -1124,12 +1130,45 @@ fn turn_wait(recipient: &SessionView) -> Wait {
     }
 }
 
+/// The person's last keystroke in a session's terminal, while it holds what
+/// Desk would type in there.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Keystroke {
+    pub at: DateTime<Utc>,
+    /// When its hold is up, unless they type on.
+    pub ends: DateTime<Utc>,
+}
+
+/// The keystroke at `typed` as it holds a session at `now`: one after its
+/// last turn started (at `turned`), within `hold`, as the wheel reads the
+/// person's input ([`crate::charge::wheel`]).
+pub fn keystroke(
+    typed: Option<DateTime<Utc>>,
+    turned: Option<DateTime<Utc>>,
+    hold: chrono::Duration,
+    now: DateTime<Utc>,
+) -> Option<Keystroke> {
+    typed
+        .filter(|t| turned.is_none_or(|s| *t > s))
+        .map(|at| Keystroke {
+            at,
+            ends: at + hold,
+        })
+        .filter(|k| k.ends > now)
+}
+
 /// How a message reaches `recipient` now, or why it must wait. `typed` is
-/// whether the person typed in its terminal since their last prompt;
-/// `plugin` whether Desk's plugin was heard from in it. A Claude Code
-/// session whose plugin hasn't been heard (one started under an older
-/// Desk) is typed into at its prompt instead, as before there was a line.
-pub fn deliverable(recipient: &SessionView, typed: bool, plugin: bool) -> Result<Deliver, Wait> {
+/// whether a keystroke in its terminal holds it ([`keystroke`]); `drafted`
+/// whether the person's draft waits in its prompt; `plugin` whether Desk's
+/// plugin was heard from in it. A Claude Code session whose plugin hasn't
+/// been heard (one started under an older Desk) is typed into at its
+/// prompt instead, as before there was a line.
+pub fn deliverable(
+    recipient: &SessionView,
+    typed: bool,
+    drafted: bool,
+    plugin: bool,
+) -> Result<Deliver, Wait> {
     if !recipient.live {
         return Err(Wait::Stopped);
     }
@@ -1144,6 +1183,9 @@ pub fn deliverable(recipient: &SessionView, typed: bool, plugin: bool) -> Result
         Deliver::Submit if plugin && in_turn(recipient.state) => Err(turn_wait(recipient)),
         Deliver::Submit if plugin => Ok(Deliver::Submit),
         Deliver::Submit | Deliver::Paste => match recipient.state {
+            SessionState::Idle | SessionState::Done | SessionState::Asking if drafted => {
+                Err(Wait::Draft)
+            }
             SessionState::Idle | SessionState::Done | SessionState::Asking if typed => {
                 Err(Wait::Typing)
             }
@@ -2222,21 +2264,48 @@ mod tests {
     }
 
     #[test]
+    fn a_keystroke_holds_a_session_only_within_its_hold_and_since_its_last_turn() {
+        let now = Utc::now();
+        let ago = |s: i64| Some(now - chrono::Duration::seconds(s));
+        let hold = crate::charge::HOLD;
+        assert_eq!(keystroke(None, None, hold, now), None);
+        assert_eq!(
+            keystroke(ago(40), None, hold, now),
+            Some(Keystroke {
+                at: now - chrono::Duration::seconds(40),
+                ends: now + chrono::Duration::seconds(80),
+            })
+        );
+        assert_eq!(keystroke(ago(120), None, hold, now), None, "its hold is up");
+        assert_eq!(keystroke(ago(3600), ago(7200), hold, now), None);
+        assert_eq!(
+            keystroke(ago(40), ago(30), hold, now),
+            None,
+            "a turn took it"
+        );
+        assert!(keystroke(ago(20), ago(30), hold, now).is_some());
+        assert!(keystroke(ago(200), None, chrono::Duration::minutes(5), now).is_some());
+    }
+
+    #[test]
     fn a_message_waits_until_its_recipient_can_take_it() {
         let mut codex = session("acme-api", Engine::Codex);
-        assert_eq!(deliverable(&codex, false, false), Ok(Deliver::Paste));
-        assert_eq!(deliverable(&codex, true, false), Err(Wait::Typing));
+        assert_eq!(deliverable(&codex, false, false, false), Ok(Deliver::Paste));
+        assert_eq!(deliverable(&codex, true, false, false), Err(Wait::Typing));
+        // A draft waits in its prompt, typed on or not: never typing.
+        assert_eq!(deliverable(&codex, false, true, false), Err(Wait::Draft));
+        assert_eq!(deliverable(&codex, true, true, false), Err(Wait::Draft));
         codex.state = SessionState::Working;
-        assert_eq!(deliverable(&codex, false, false), Err(Wait::Working));
+        assert_eq!(deliverable(&codex, false, false, false), Err(Wait::Working));
         codex.live = false;
-        assert_eq!(deliverable(&codex, false, false), Err(Wait::Stopped));
+        assert_eq!(deliverable(&codex, false, false, false), Err(Wait::Stopped));
         // Claude Code's plugin is handed it at the idle, typed in there or
         // not: inside a turn Desk keeps it.
         let mut claude = session("acme-web", Engine::Claude);
         claude.state = SessionState::Working;
-        assert_eq!(deliverable(&claude, true, true), Err(Wait::Working));
+        assert_eq!(deliverable(&claude, true, false, true), Err(Wait::Working));
         claude.state = SessionState::Blocked;
-        assert_eq!(deliverable(&claude, false, true), Err(Wait::Dialog));
+        assert_eq!(deliverable(&claude, false, false, true), Err(Wait::Dialog));
         claude.state = SessionState::Working;
         claude.pending = Some(crate::model::PendingApproval {
             id: Uuid::new_v4(),
@@ -2252,29 +2321,35 @@ mod tests {
             agent: None,
             cli_session: None,
         });
-        assert_eq!(deliverable(&claude, false, true), Err(Wait::Dialog));
-        assert_eq!(deliverable(&claude, false, false), Err(Wait::Dialog));
+        assert_eq!(deliverable(&claude, false, false, true), Err(Wait::Dialog));
+        assert_eq!(deliverable(&claude, false, false, false), Err(Wait::Dialog));
         for state in [SessionState::Asking, SessionState::Idle] {
             claude.state = state;
             assert_eq!(
-                deliverable(&claude, false, true),
+                deliverable(&claude, false, false, true),
                 Err(Wait::Dialog),
                 "{state:?}"
             );
             assert_eq!(
-                deliverable(&claude, false, false),
+                deliverable(&claude, false, false, false),
                 Err(Wait::Dialog),
                 "{state:?}"
             );
         }
         claude.pending = None;
         claude.state = SessionState::Idle;
-        assert_eq!(deliverable(&claude, true, true), Ok(Deliver::Submit));
+        assert_eq!(deliverable(&claude, true, false, true), Ok(Deliver::Submit));
         claude.state = SessionState::Working;
         // Without Desk's plugin heard in it, typed in at its prompt.
-        assert_eq!(deliverable(&claude, false, false), Err(Wait::Working));
+        assert_eq!(
+            deliverable(&claude, false, false, false),
+            Err(Wait::Working)
+        );
         claude.state = SessionState::Idle;
-        assert_eq!(deliverable(&claude, false, false), Ok(Deliver::Paste));
+        assert_eq!(
+            deliverable(&claude, false, false, false),
+            Ok(Deliver::Paste)
+        );
     }
 
     #[test]

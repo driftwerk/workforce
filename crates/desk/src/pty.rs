@@ -14,6 +14,7 @@
 use std::collections::BTreeMap;
 use std::io::{Read, Write};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -322,14 +323,61 @@ pub struct Pty {
     pid: Option<u32>,
     /// When the person last typed in it (ms since the epoch; 0 never):
     /// Desk's line holds a paste while they do.
-    typed: std::sync::atomic::AtomicI64,
+    typed: AtomicI64,
+    /// A lone Esc not yet known to be a key or the start of an escape
+    /// sequence split across two inputs (ms; 0 none).
+    esc_at: AtomicI64,
+    /// When Desk put the person's draft in its prompt, until a turn starts
+    /// (ms; 0 none).
+    draft_at: AtomicI64,
+    /// When its last turn started, whoever prompted it (ms; 0 none).
+    turned: AtomicI64,
 }
 
-/// Whether a viewer's input is the person's keys, not the terminal's own
-/// answer to a query (a cursor report, colours), which comes as one escape
-/// sequence. Esc alone is a key.
+/// How long after a lone Esc the rest of an escape sequence split from it
+/// may come (ms): anything else, or nothing in time, makes the Esc a key.
+const ESC_TAIL_MS: i64 = 50;
+
+/// Whether a whole viewer input is the person's keys, not the terminal's
+/// own answer to a query (a cursor report, colours), which comes as one
+/// escape sequence.
 fn typed(bytes: &[u8]) -> bool {
-    !bytes.is_empty() && (bytes == b"\x1b" || !bytes.starts_with(b"\x1b"))
+    !bytes.is_empty() && !bytes.starts_with(b"\x1b")
+}
+
+/// What a viewer's `bytes` at `now` are, after a lone Esc `pending` (ms; 0
+/// none): the keystroke they stamp, if any, and the lone Esc pending after
+/// them. A lone Esc waits on what follows: the tail of a sequence split
+/// from it within [`ESC_TAIL_MS`] stamps nothing, anything else makes it a
+/// key at its own time.
+fn keyed(pending: i64, bytes: &[u8], now: i64) -> (Option<i64>, i64) {
+    let tail = pending != 0
+        && now - pending <= ESC_TAIL_MS
+        && matches!(bytes.first(), Some(b'[' | b']' | b'O'));
+    if tail {
+        return (None, 0);
+    }
+    let esc = (pending != 0).then_some(pending);
+    match bytes {
+        b"\x1b" => (esc, now),
+        _ => (typed(bytes).then_some(now).or(esc), 0),
+    }
+}
+
+/// A lone Esc `pending` (ms; 0 none) as a keystroke at `now`: one nothing
+/// followed within [`ESC_TAIL_MS`] was a key.
+fn esc_key(pending: i64, now: i64) -> Option<i64> {
+    (pending != 0 && now - pending > ESC_TAIL_MS).then_some(pending)
+}
+
+fn now_ms() -> i64 {
+    chrono::Utc::now().timestamp_millis()
+}
+
+fn at_ms(ms: i64) -> Option<chrono::DateTime<chrono::Utc>> {
+    (ms != 0)
+        .then(|| chrono::DateTime::from_timestamp_millis(ms))
+        .flatten()
 }
 
 /// One viewer of a [`Pty`]; dropping it detaches it, giving up the active
@@ -346,6 +394,9 @@ impl Pty {
             io,
             pid,
             typed: Default::default(),
+            esc_at: Default::default(),
+            draft_at: Default::default(),
+            turned: Default::default(),
         }
     }
 
@@ -479,21 +530,34 @@ impl Pty {
         self.io.write(input)
     }
 
-    /// The person's words were put in its prompt for them (not sent): it
-    /// holds what Desk would type in, as their own typing does.
-    pub fn person_typed(&self) {
-        self.typed.store(
-            chrono::Utc::now().timestamp_millis(),
-            std::sync::atomic::Ordering::Relaxed,
-        );
+    /// The person's words were put in its prompt for them (not sent): a
+    /// draft that waits there until a turn starts.
+    pub fn drafted(&self) {
+        self.draft_at.store(now_ms(), Ordering::Relaxed);
+    }
+
+    /// When the person's draft was put in its prompt, while it waits there.
+    pub fn draft_at(&self) -> Option<chrono::DateTime<chrono::Utc>> {
+        at_ms(self.draft_at.load(Ordering::Relaxed))
+    }
+
+    /// A turn started in it, whoever prompted it: what waited in its
+    /// prompt went in.
+    pub fn turn_started(&self) {
+        self.turned.store(now_ms(), Ordering::Relaxed);
+        self.draft_at.store(0, Ordering::Relaxed);
+    }
+
+    /// When its last turn started, if one has since it started.
+    pub fn turned_at(&self) -> Option<chrono::DateTime<chrono::Utc>> {
+        at_ms(self.turned.load(Ordering::Relaxed))
     }
 
     /// When the person last typed in it, if they have since it started.
     pub fn typed_at(&self) -> Option<chrono::DateTime<chrono::Utc>> {
-        match self.typed.load(std::sync::atomic::Ordering::Relaxed) {
-            0 => None,
-            ms => chrono::DateTime::from_timestamp_millis(ms),
-        }
+        let typed = self.typed.load(Ordering::Relaxed);
+        let esc = esc_key(self.esc_at.load(Ordering::Relaxed), now_ms());
+        at_ms(esc.map_or(typed, |esc| esc.max(typed)))
     }
 
     /// Resizes the terminal whoever is active.
@@ -577,11 +641,10 @@ impl Viewer {
         if !self.is_active() {
             return Ok(false);
         }
-        if typed(bytes) {
-            self.pty.typed.store(
-                chrono::Utc::now().timestamp_millis(),
-                std::sync::atomic::Ordering::Relaxed,
-            );
+        let (key, esc) = keyed(self.pty.esc_at.swap(0, Ordering::Relaxed), bytes, now_ms());
+        self.pty.esc_at.store(esc, Ordering::Relaxed);
+        if let Some(at) = key {
+            self.pty.typed.fetch_max(at, Ordering::Relaxed);
         }
         self.pty.write(bytes).map(|()| true)
     }
@@ -963,6 +1026,63 @@ pub(crate) mod tests {
         let (viewer, _, mut rx) = pty.attach();
         assert!(viewer.input(b"ping\r").unwrap());
         read_until(&mut rx, "got:ping").await;
+    }
+
+    #[test]
+    fn a_split_escape_sequences_tail_within_its_window_stamps_nothing() {
+        let (key, esc) = keyed(0, b"\x1b", 1_000);
+        assert_eq!(
+            (key, esc),
+            (None, 1_000),
+            "a lone Esc waits on what follows"
+        );
+        assert_eq!(esc_key(esc, 1_040), None);
+        assert_eq!(keyed(esc, b"[I", 1_040), (None, 0));
+        assert_eq!(keyed(esc, b"]11;rgb:0/0/0\x07", 1_050), (None, 0));
+        assert_eq!(keyed(esc, b"OP", 1_010), (None, 0));
+        assert_eq!(
+            keyed(0, b"\x1b[I", 1_000),
+            (None, 0),
+            "whole, it never was a key"
+        );
+    }
+
+    #[test]
+    fn a_lone_esc_is_a_key_at_its_own_time() {
+        // Nothing within the window: read as a key once it has passed.
+        assert_eq!(esc_key(1_000, 1_051), Some(1_000));
+        // A key after it, in time or not.
+        assert_eq!(keyed(1_000, b"a", 1_020), (Some(1_020), 0));
+        assert_eq!(keyed(1_000, b"\r", 1_020).0, Some(1_020));
+        // A tail too late is keys of its own, or a second Esc.
+        assert_eq!(keyed(1_000, b"[I", 1_051), (Some(1_051), 0));
+        assert_eq!(keyed(1_000, b"\x1b", 1_020), (Some(1_000), 1_020));
+        // What isn't a key after it still makes it one.
+        assert_eq!(keyed(1_000, b"\x1b[I", 1_020), (Some(1_000), 0));
+        assert_eq!(keyed(0, b"", 1_020), (None, 0));
+    }
+
+    #[tokio::test]
+    async fn a_viewers_keys_stamp_its_terminal_and_a_turn_takes_its_draft() {
+        let (pty, _exit) = spawn("sleep 30");
+        let (viewer, _, _) = pty.attach();
+        assert_eq!(pty.typed_at(), None);
+        viewer.input(b"\x1b[I").unwrap();
+        assert_eq!(pty.typed_at(), None, "the terminal's own report");
+        viewer.input(b"\x1b").unwrap();
+        viewer.input(b"a").unwrap();
+        let typed = pty.typed_at().expect("Esc, then a key");
+        assert!(chrono::Utc::now() - typed < chrono::Duration::seconds(5));
+        pty.drafted();
+        assert!(pty.draft_at().is_some());
+        pty.turn_started();
+        assert_eq!(pty.draft_at(), None);
+        assert!(pty.turned_at().is_some_and(|t| t >= typed));
+        assert_eq!(
+            pty.typed_at(),
+            Some(typed),
+            "the keystroke stays the wheel's"
+        );
     }
 
     #[tokio::test]

@@ -278,6 +278,7 @@ impl Desk {
                 | line::Wait::Stopped
                 | line::Wait::Working
                 | line::Wait::Typing
+                | line::Wait::Draft
                 | line::Wait::NextCall
                 | line::Wait::Awaited
                 | line::Wait::Behind => "It can't take this now.",

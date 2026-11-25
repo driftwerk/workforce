@@ -677,6 +677,21 @@ const CLOSES_WITHIN: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// What a boss is told of a resume or restart Desk didn't finish within
 /// [`STARTS_WITHIN`]: it may still be starting.
+/// What a boss is told of its message the person's keystroke `k` holds,
+/// at `now`: how long ago they typed, and when it goes in unless they type
+/// on.
+fn keystroke_said(
+    k: workforce_desk::line::Keystroke,
+    now: chrono::DateTime<chrono::Utc>,
+) -> String {
+    let ms = (k.ends - now).num_milliseconds().max(1);
+    format!(
+        "the person typed in its terminal {} s ago: it goes in within {} s, unless they type on",
+        (now - k.at).num_seconds(),
+        (ms + 999) / 1000
+    )
+}
+
 fn still_starting(session: uuid::Uuid) -> String {
     tracing::warn!(%session, "a boss's resume or restart didn't finish within a minute");
     format!(
@@ -1119,19 +1134,25 @@ impl CrewHub {
         let why = match (rushed, self.desk.line_waits(&now).await, now.delivery) {
             (Some(r), ..) => r,
             (None, Some(w), _) => match w {
-                Wait::Stopped => "it is stopped and gets it when it runs again",
-                Wait::Working => "it gets it once its turn ends",
-                Wait::Dialog => "a dialog in its terminal waits on an answer: it gets it once that is answered and its turn ends",
-                Wait::Asking => "its turn ended asking the person something, so it gets it once they answer",
-                Wait::Typing => "the person is typing in its terminal: it gets it once they stop",
-                Wait::Paused => "Desk's breaker paused it: it gets it once the person lets it go on",
-                Wait::ModeEnding => "Desk starts it again in its own mode first, then it gets it",
-                Wait::PersonDriving => "the person is driving it, so your message waits until they stop giving it input for a little while or hand it back",
-                Wait::NextCall => "it reads it with its next tool call's result",
-                Wait::Awaited => "its call waiting on that question takes it as its answer",
-                Wait::Behind => "an earlier message is still on its way in, and this one goes after it",
-            }
-            .into(),
+                Wait::Stopped => "it is stopped and gets it when it runs again".into(),
+                Wait::Working => "it gets it once its turn ends".into(),
+                Wait::Dialog => "a dialog in its terminal waits on an answer: it gets it once that is answered and its turn ends".into(),
+                Wait::Asking => "its turn ended asking the person something, so it gets it once they answer".into(),
+                Wait::Typing => now
+                    .to_session()
+                    .and_then(|s| self.desk.line_keystroke(s))
+                    .map_or_else(
+                        || "it goes in next".into(),
+                        |k| keystroke_said(k, chrono::Utc::now()),
+                    ),
+                Wait::Draft => "the person's draft is waiting in its prompt: it gets this once they send or clear it".into(),
+                Wait::Paused => "Desk's breaker paused it: it gets it once the person lets it go on".into(),
+                Wait::ModeEnding => "Desk starts it again in its own mode first, then it gets it".into(),
+                Wait::PersonDriving => "the person is driving it, so your message waits until they stop giving it input for a little while or hand it back".into(),
+                Wait::NextCall => "it reads it with its next tool call's result".into(),
+                Wait::Awaited => "its call waiting on that question takes it as its answer".into(),
+                Wait::Behind => "an earlier message is still on its way in, and this one goes after it".into(),
+            },
             (None, None, Delivery::Handed) => "it is on its way in, not yet said to have arrived".into(),
             (None, None, _) => "it goes in next".into(),
         };
