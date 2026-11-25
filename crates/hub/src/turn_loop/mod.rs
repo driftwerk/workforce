@@ -3637,6 +3637,7 @@ pub(crate) async fn process_admitted(
         service,
         &session,
         None,
+        principal,
         privacy == PromptPrivacy::Private,
     )
     .await;
@@ -5263,6 +5264,7 @@ pub(crate) async fn stream_admitted(
         service,
         &session,
         tool_whitelist,
+        principal,
         privacy == PromptPrivacy::Private,
     )
     .await;

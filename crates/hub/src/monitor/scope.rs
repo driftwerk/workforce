@@ -530,6 +530,58 @@ mod tests {
         }
     }
 
+    /// The alert turn of a monitor on one person's mail: the mail reads the
+    /// person's own account gives are offered to it, not just named.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_alert_turn_is_offered_the_mail_reads_of_the_owners_own_account() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (service, server) = crate::serve::testing::service_on_mock_llm(tmp.path()).await;
+        let vault = service.vault.clone().expect("agent vault");
+        [
+            ("username", "bob@example.com"),
+            ("password", "pw"),
+            ("imap_host", "imap.example.com"),
+            ("smtp_host", "smtp.example.com"),
+        ]
+        .into_iter()
+        .for_each(|(key, value)| {
+            vault
+                .set(&format!("users/bob/skills/email/accounts/work/{key}"), value)
+                .unwrap();
+        });
+
+        MonitorTurn::new(&meta(), &posts(), &[])
+            .run(&service, "monitor:inbox:1", "Alert on mail", Some("C1"), Some("bob"))
+            .await
+            .unwrap();
+
+        let offered: Vec<String> = server
+            .received_requests()
+            .await
+            .unwrap()
+            .into_iter()
+            .filter_map(|request| {
+                serde_json::from_slice::<serde_json::Value>(&request.body)
+                    .ok()?
+                    .get("tools")?
+                    .as_array()
+                    .map(|tools| {
+                        tools
+                            .iter()
+                            .filter_map(|tool| tool["function"]["name"].as_str().map(str::to_string))
+                            .collect::<Vec<_>>()
+                    })
+            })
+            .flatten()
+            .collect();
+        for tool in workforce_skills::adapters::email::READ_TOOLS {
+            assert!(
+                offered.iter().any(|name| name.replace('_', ".") == *tool || name == tool),
+                "{tool} is not offered: {offered:?}"
+            );
+        }
+    }
+
     #[test]
     fn the_default_set_reads_and_delivers_and_does_nothing_else() {
         let tools = turn_tools(&posts(), &[]);

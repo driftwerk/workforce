@@ -124,7 +124,7 @@ pub(crate) async fn turn_tools(
     session: &Session,
     whitelist: Option<&[String]>,
 ) -> TurnTools {
-    turn_tools_in(service, session, whitelist, false).await
+    turn_tools_in(service, session, whitelist, "", false).await
 }
 
 /// The tools `session`'s turn is offered, decided in one place for every
@@ -132,8 +132,10 @@ pub(crate) async fn turn_tools(
 /// session's local agent standing in for `exec.run`; without outbound
 /// delivery tools when the caller delivers; and narrowed to a whitelist
 /// — `whitelist`, else the turn's declared [`tool_whitelist`], else the
-/// one stamped on the session — as a frozen [`exclusive_registry`]. With
-/// `private` (the turn's prompt may carry its person's own context:
+/// one stamped on the session — as a frozen [`exclusive_registry`]. The
+/// adapters a whitelist names are loaded as `principal`, whose own
+/// credentials make them configured: the turn's task-locals are not yet
+/// scoped here. With `private` (the turn's prompt may carry its person's own context:
 /// [`PromptPrivacy::Private`]), also what their Desk shared.
 ///
 /// [`tool_whitelist`]: workforce_agent::runner::tool_whitelist
@@ -142,6 +144,7 @@ pub(crate) async fn turn_tools_in(
     service: &AgentService,
     session: &Session,
     whitelist: Option<&[String]>,
+    principal: &str,
     private: bool,
 ) -> TurnTools {
     if workforce_agent::runner::game_sandboxed() {
@@ -155,10 +158,12 @@ pub(crate) async fn turn_tools_in(
         .or_else(|| workforce_agent::runner::tool_whitelist().map(|w| w.tools.to_vec()))
         .or_else(|| session.tool_whitelist());
     if let Some(whitelist) = &whitelist {
-        crate::skill_loader::ensure_adapters_loaded(service, |skill| {
-            crate::skill_loader::static_skill_tool_names(skill)
-                .iter()
-                .any(|tool| whitelist.iter().any(|entry| names_tool(entry, tool)))
+        workforce_agent::runner::CURRENT_USER_ID.sync_scope(principal.to_string(), || {
+            crate::skill_loader::ensure_adapters_loaded(service, |skill| {
+                crate::skill_loader::static_skill_tool_names(skill)
+                    .iter()
+                    .any(|tool| whitelist.iter().any(|entry| names_tool(entry, tool)))
+            })
         });
     }
     let base = session_registry(service, session, private).await;
