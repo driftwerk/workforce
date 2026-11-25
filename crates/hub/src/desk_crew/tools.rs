@@ -119,7 +119,7 @@ pub(super) fn only_looks(tool: &str, input: &Value) -> bool {
         || crate::local_agent_registry::is_read_only_tool(tool)
         || node().is_some_and(|n| crate::local_agent_registry::is_read_only_tool(&n))
 }
-pub const ACT: [&str; 32] = [
+pub const ACT: [&str; 34] = [
     "crew.nudge",
     "crew.ask_session",
     "crew.escalate",
@@ -152,6 +152,8 @@ pub const ACT: [&str; 32] = [
     super::assignments::CLOSE,
     super::machines::MAKE_FOLDER,
     super::machines::RUN,
+    super::review::RECORD,
+    super::review::MERGE,
 ];
 
 /// The person's logins (engine accounts), each with what runs on it.
@@ -678,6 +680,9 @@ impl CrewTool {
             o.remove("needs_id");
             o.remove("need_ids");
             o.remove("brief_was");
+            if let Some(r) = o.get_mut("review_of").and_then(Value::as_object_mut) {
+                r.remove("head_sha");
+            }
             // What it applies is checked below and cited, never read as
             // part of the action or kept with a suggestion.
             for f in super::preferences::ACT_FIELDS {
@@ -825,11 +830,15 @@ impl CrewTool {
             Some(a) => format!("{}; {}", reason.trim_end().trim_end_matches('.'), a.cite),
             None => reason,
         };
+        crew.review_head(b, &mut action, &mut kept).await?;
         let input = &kept;
         let mut by = crew.by_boss(&b.service, &reason);
         by.preference = applied.as_ref().map(|a| a.id);
         let action = crew.as_sent(&action).await?;
-        crew.hold_asks(&action, b.service.agent_id.as_str()).await?;
+        let level = crew.level_now(b.service.agent_id.as_str(), oversight).0;
+        let hold = crew
+            .hold_asks(&action, input, b.service.agent_id.as_str(), level)
+            .await?;
         crew.know_question(&action).await;
         match crew.gate(&action, oversight) {
             Gate::No(why) => Err(why.into_owned()),
@@ -848,6 +857,9 @@ impl CrewTool {
                 let order = super::assignments::Order::of(input);
                 let Some((start, name)) = reused else {
                     let done = Box::pin(crew.perform_with(&action, by, &order)).await?;
+                    if let Some(h) = hold {
+                        crew.hold_changed(h).await;
+                    }
                     let mut out = json!({ "done": done });
                     // Work sent with no goal saved for it is said at once.
                     if let Action::Nudge { to: Target::Session(s), .. } = &action {
@@ -1230,6 +1242,8 @@ pub(crate) fn describe(name: &str) -> &'static str {
             super::machines::MACHINES => super::machines::MACHINES_DESCRIPTION,
             super::machines::FOLDERS => super::machines::FOLDERS_DESCRIPTION,
             super::machines::MAKE_FOLDER => super::machines::MAKE_FOLDER_DESCRIPTION,
+            super::review::RECORD => super::review::RECORD_DESCRIPTION,
+            super::review::MERGE => super::review::MERGE_DESCRIPTION,
             super::machines::RUN => super::machines::RUN_DESCRIPTION,
             super::watches::WATCH => super::watches::WATCH_DESCRIPTION,
             super::watches::WATCHES => super::watches::WATCHES_DESCRIPTION,
@@ -1237,8 +1251,8 @@ pub(crate) fn describe(name: &str) -> &'static str {
             "crew.account" => "What one session (session_id) is for, who asked, its plan, what it has done (with its PRs, tickets, commits and deploys), what it is doing now, what it waits on, what comes next and the choices it made: its running account, brought up to date first when it is stale, with the time it is as of. Read it before you say anything of a session. With question, also the answer its own recent conversation gives to something the account doesn't say (which key, which file, what error).",
             "crew.ask_session" => ASK_SESSION_DESCRIPTION,
             "crew.history" => "The recent messages of one agent's Desk DM with the person (agent_id; one too long says so and is read whole with dm_id), one session's last prompt, reply, pending request and terminal (session_id; a reply too long for one read says so and is read on with reply_from and turn), or one message on a session's Desk line, whole (message_id: when what you were shown of it says it was cut short).",
-            "crew.nudge" => "Send a short message to an agent's DM (agent_id) or to a session on its Desk line (session_id): a check-in, a hint, a correction. A session gets it once its turn ends, or, with urgent, with its next tool call's result (crew.interrupt stops a turn now). With reply_to (a question's message id), it is your answer to what that session asked you. To hold a session until the person decides, ask them first (crew.ask_person with its session_id): a hold on their word carries its question. A hold stops new work, never reading: leave its CI, checks and logs to it.",
-            "crew.escalate" => "Give a question a session asked you on its Desk line to the person (message_id): say why in reason, offer answers in options, and draft one in draft if you can. Use it for anything that pushes, deletes, deploys, spends, sends to people or changes scope, and whenever you are unsure; at Act fully, only for what the person's own orders and preferences don't cover (they are the rule, both ways).",
+            "crew.nudge" => "Send a short message to an agent's DM (agent_id) or to a session on its Desk line (session_id): a check-in, a hint, a correction. A session gets it once its turn ends, or, with urgent, with its next tool call's result (crew.interrupt stops a turn now). With reply_to (a question's message id), it is your answer to what that session asked you. To hold a session, name the directive that needs the hold (directive_id, from crew.directives) and what ends it (until: person_answers, directive_withdrawn, or a condition in words, like \"CI green at the head\"), and ask the person its question first (crew.ask_person with its session_id); a hold with no directive is refused. End a condition's hold with crew.nudge (session_id, hold_met: the condition, message: what to do now) once it is met. A hold stops new work, never reading: leave its CI, checks and logs to it.",
+            "crew.escalate" => concat!("Give a question a session asked you on its Desk line to the person (message_id): say why in reason, offer answers in options, and draft one in draft if you can. Use it for anything that pushes, deletes, deploys, spends, sends to people or changes scope, and whenever you are unsure; at Act fully, only as this says: ", super::watcher::act_fully!()),
             "crew.approve" => "Allow a session's pending request (session_id, approval_id from crew.overview).",
             "crew.deny" => "Deny a session's pending request (session_id, approval_id from crew.overview). Never one that only reads (CI status, PR checks, logs, git status or diff), even while you hold the session: a hold stops new work, never reading.",
             "crew.stop" => "Stop a running Desk session; its conversation is kept and it stays on the grid. A session the person started in a Desk terminal can't be stopped (the shell is theirs): interrupt it instead. To close a session whose work is done, use crew.close_session instead.",
@@ -1311,6 +1325,8 @@ pub(crate) fn schema(name: &str, engines: impl Fn() -> Vec<&'static str>) -> Val
         super::machines::MACHINES | super::machines::FOLDERS | super::machines::MAKE_FOLDER => {
             super::machines::schema(name)
         }
+        super::review::RECORD => super::review::record_schema(),
+        super::review::MERGE => super::review::merge_schema(),
         super::machines::RUN => act(
             props(super::machines::run_properties()),
             &["machine", "command"],
@@ -1355,7 +1371,10 @@ pub(crate) fn schema(name: &str, engines: impl Fn() -> Vec<&'static str>) -> Val
                 "agent_id": { "type": "string" },
                 "session_id": session_schema(),
                 "message": { "type": "string" },
-                "reply_to": { "type": "string", "description": "The message id of the session's question this answers" }
+                "reply_to": { "type": "string", "description": "The message id of the session's question this answers" },
+                "directive_id": { "type": "string", "description": "At Act fully, a hold's: the id of the person's directive that needs it (crew.directives)" },
+                "until": { "type": "string", "description": "What ends a hold: person_answers (default), directive_withdrawn, or its condition in words" },
+                "hold_met": { "type": "string", "description": "Ends the session's hold on a condition: how it was met" }
             }))
             .into_iter()
             .chain(props(super::assignments::order_properties(true, true)))
@@ -1434,7 +1453,12 @@ pub(crate) fn schema(name: &str, engines: impl Fn() -> Vec<&'static str>) -> Val
                     "model": { "type": "string", "description": "Only when the person named a model for this work, as its engine names it; omit it otherwise, and it runs their default (on another engine, that engine's own)" },
                     "view": { "type": "string", "enum": ["terminal"], "description": "Where it runs (default terminal)" },
                     "worktree": { "type": "string", "description": "A new branch to work on, in a worktree of its own" },
-                    "new": { "type": "boolean", "description": "true only when the person asked for a new session: none already there gets the work" }
+                    "new": { "type": "boolean", "description": "true only when the person asked for a new session: none already there gets the work" },
+                    "review_of": { "type": "object", "description": "To start a review session of a pull request: Desk asks it for its verdict at the PR's head now, which crew.record_review records",
+                        "properties": {
+                            "repo": { "type": "string", "description": "owner/name" },
+                            "number": { "type": "integer" }
+                        }, "required": ["repo", "number"] }
                 }))
                 .into_iter()
                 .chain(props(super::assignments::order_properties(true, false)))
@@ -1511,6 +1535,13 @@ impl Tool for CrewTool {
         if READ.contains(&self.name) {
             return true;
         }
+        // Recording a review and merging are Act fully's own, each gated by
+        // its own conditions (the verdict at the head; review, branch,
+        // checks and head): at Act fully they are the person's choice.
+        if [super::review::RECORD, super::review::MERGE].contains(&self.name) {
+            return !workforce_desk::grant::is_served(&self.agent)
+                && crew.level_now(&self.agent, &oversight).0 == Level::Full;
+        }
         super::actions::Action::parse(self.name, input)
             .is_ok_and(|action| matches!(crew.gate(&action, &oversight), super::actions::Gate::Run))
     }
@@ -1569,6 +1600,10 @@ impl Tool for CrewTool {
             crew.machine_run_tool(&bound, &input).await
         } else if self.name == super::assignments::CLOSE {
             crew.assignment_tool(&bound, &input).await
+        } else if self.name == super::review::RECORD {
+            crew.record_review_tool(&bound, &input).await
+        } else if self.name == super::review::MERGE {
+            crew.github_merge_tool(&bound, &input).await
         } else {
             // A ticket of an open plan changes through its plan; any other
             // change is the board's, gated as every action is.

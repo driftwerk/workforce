@@ -109,6 +109,7 @@ async fn a_devin_session_runs_on_its_hooks_and_resumes_its_conversation() {
                     account: None,
                     env: Default::default(),
                     group: None,
+                    review_of: None,
                 },
                 None,
             )
@@ -468,6 +469,7 @@ async fn devin_session(d: &Desk, dir: &Path) -> SessionView {
                 account: None,
                 env: Default::default(),
                 group: None,
+                review_of: None,
             },
             None,
         )

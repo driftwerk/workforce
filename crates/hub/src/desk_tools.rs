@@ -273,6 +273,7 @@ impl DeskTool {
                             env: Default::default(),
                             // In the caller's group when that is a boundary.
                             group: seen.scope.group().map(str::to_string),
+                            review_of: None,
                         },
                         caller(&self.agent),
                     )

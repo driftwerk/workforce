@@ -783,6 +783,117 @@ pub fn holds_for_person(text: &str) -> bool {
     })
 }
 
+/// What tells a session to hold, as whole words, whatever follows: "keep
+/// the hold in place", "hold off", "stand by".
+const HOLDS_SESSION: [&str; 6] = [
+    "hold",
+    "on hold",
+    "hold off",
+    "stay held",
+    "stand by",
+    "stay put",
+];
+
+/// What tells a session to wait, pause or not push, merge or rerun: a
+/// hold only when it is open-ended or waits on a person ([`OPEN_ENDED`],
+/// [`holds_for_person`]). "Wait until CI is green" is the work.
+const HOLDS_IF_OPEN: [&str; 13] = [
+    "wait",
+    "pause",
+    "do not push",
+    "don't push",
+    "dont push",
+    "no pushes",
+    "stop pushing",
+    "do not merge",
+    "don't merge",
+    "dont merge",
+    "do not rerun",
+    "don't rerun",
+    "dont rerun",
+];
+
+/// What, later in its sentence, leaves a wait or a "don't" open-ended.
+const OPEN_ENDED: [&str; 11] = [
+    "until i say",
+    "until you say",
+    "until they say",
+    "until i tell you",
+    "till i say",
+    "until further notice",
+    "till further notice",
+    "until told",
+    "until you're told",
+    "for now",
+    "yet",
+];
+
+/// What before a hold's words lifts it, or says there is none: "no need
+/// to hold", "lift the hold", "don't wait".
+const NO_HOLD: [&str; 12] = [
+    "no ",
+    "no need to ",
+    "not ",
+    "don't ",
+    "do not ",
+    "never ",
+    "without a ",
+    "lift the ",
+    "lifted the ",
+    "release the ",
+    "end the ",
+    "ended the ",
+];
+
+/// Whether `text`, a boss's words to a session, hold it: tell it to hold,
+/// or to wait or not push with no end but someone's word. At Act fully such words are only ever a directive's
+/// hold (25 Nov 19:08: "Keep the hold in place … do not push, rerun", and
+/// no directive asked for it).
+pub fn holds_session(text: &str) -> bool {
+    let lower = plain(text);
+    let for_person = holds_for_person(text);
+    let said = |phrases: &[&str], open_only: bool| {
+        phrases.iter().any(|h| {
+            lower.match_indices(h).any(|(at, _)| {
+                let before = &lower[..at];
+                let after = &lower[at + h.len()..];
+                if !whole_at(before, after) {
+                    return false;
+                }
+                let lifted = after.trim_start().starts_with("is lifted")
+                    || after.trim_start().starts_with("is over")
+                    || (!h.starts_with("do") && NO_HOLD.iter().any(|n| before.ends_with(n)));
+                if lifted {
+                    return false;
+                }
+                if !open_only {
+                    return true;
+                }
+                let sentence = after
+                    .split(['.', '!', '?', ';', '\n'])
+                    .next()
+                    .unwrap_or_default();
+                for_person
+                    || OPEN_ENDED.iter().any(|o| {
+                        sentence
+                            .match_indices(o)
+                            .any(|(i, _)| whole_at(&sentence[..i], &sentence[i + o.len()..]))
+                    })
+            })
+        })
+    };
+    said(&HOLDS_SESSION, false) || said(&HOLDS_IF_OPEN, true)
+}
+
+/// Whether words found between `before` and `after` stand whole.
+fn whole_at(before: &str, after: &str) -> bool {
+    !before
+        .chars()
+        .next_back()
+        .is_some_and(char::is_alphanumeric)
+        && !after.starts_with(char::is_alphanumeric)
+}
+
 /// Who replies to a line message: a session, the overseer (its agent id),
 /// or the person.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1845,7 +1956,48 @@ fn short_question(question: String) -> Result<String, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::holds_for_person;
+    use super::{holds_for_person, holds_session};
+
+    #[test]
+    fn words_that_hold_a_session_are_told_from_the_work() {
+        for held in [
+            "Keep the hold in place on MAN-839: do not push, rerun or merge until I say.",
+            "Keep the hold in place … do not push, rerun",
+            "Hold off on the merge.",
+            "Stay on hold for now.",
+            "Don't push yet.",
+            "Do not merge until further notice.",
+            "Pause for now.",
+            "Wait until I say.",
+            "Don't merge: wait for the person to approve the migration.",
+            "Stand by.",
+            "Stay put.",
+        ] {
+            assert!(holds_session(held), "{held}");
+        }
+        for not in [
+            "Push your branch and open the PR.",
+            "Wait for CI to finish, then merge.",
+            "No need to hold: carry on.",
+            "The hold is lifted: push and merge.",
+            "Lift the hold and push.",
+            "CI is green: merge it.",
+            "Look at the CI logs.",
+            "Raise the threshold to 5.",
+            "Keep a firm handhold on the API.",
+            "Don't wait for me: push it.",
+            "The upload paused mid-way; retry it.",
+            "Wait until CI is green, then merge.",
+            "Don't merge it yourself: I merge it with crew.github_merge.",
+            "Don't push until the tests pass.",
+            "Pause the watcher, then rerun the migration.",
+            "Wait until the release window opens.",
+            "Do not merge it.",
+            "Yet another test failed: don't push the fix without it.",
+        ] {
+            assert!(!holds_session(not), "{not}");
+        }
+    }
 
     #[test]
     fn a_hold_on_the_persons_word_is_told_from_the_bosss() {

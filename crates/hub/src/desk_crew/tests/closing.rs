@@ -14,6 +14,10 @@
 //!   stays open; the first is said once.
 //! - One whose close was undone is never closed again.
 //! - With the setting off, nothing is closed.
+//! - At Act fully a request the boss decides itself is cancelled, as its
+//!   own decision, so the session closes.
+//! - A session reviewing a ticket's pull request never supersedes the
+//!   session whose work it reviews.
 
 use super::act_fully::repo;
 use super::*;
@@ -23,6 +27,10 @@ use workforce_desk::crew::Party;
 use workforce_desk::decision::{Undo, UndoPlan};
 use workforce_desk::model::{SessionState, SessionView};
 use workforce_desk::update::{self, ClosedKind, ClosedLine};
+use workforce_desk::{AssignTo, NewBoard, NewTicket};
+
+use super::decides_at_once::{asked, behavior};
+use super::unbound::UNBOUND;
 
 const ACT: &str = "[oversight]\nenabled = true\nlevel = \"act\"\n";
 
@@ -520,6 +528,134 @@ async fn the_sweep_never_closes_a_session_its_boss_let_go() {
         })
         .await;
         assert_eq!(state(&d, let_go.id), SessionState::Done);
+    })
+    .await;
+}
+
+/// At Act fully a boss closes a session whose request it decides itself is
+/// still waiting on its model: the request is cancelled as the boss's own
+/// decision, and the session is closed.
+#[tokio::test(flavor = "multi_thread")]
+async fn at_act_fully_a_boss_cancels_the_request_it_decides_and_closes_the_session() {
+    use wiremock::matchers::{body_string_contains, method, path};
+    use wiremock::{Mock, ResponseTemplate};
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(dir.path()).unwrap();
+        let unbound = format!("{UNBOUND}[oversight.work]\nclose_finished = false\n");
+        let (overseer, crew, d, llm) = overseeing(&base, pool, "ok", &unbound, &[]).await;
+        crew.read_spent_today(&crew.overseers()).await;
+        d.boss_bounds_with(workforce_desk::charge::Bounds {
+            home: base.clone(),
+            ..Default::default()
+        });
+        eventually("Desk to know it is unbound", async || {
+            d.boss_unbound("desk").then_some(())
+        })
+        .await;
+        // Its model takes its time over the request.
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .and(body_string_contains(super::super::decide::MARK))
+            .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_secs(600)))
+            .with_priority(1)
+            .mount(&llm)
+            .await;
+        let web = base.join("acme-web");
+        repo(&web, "git@github.com:acme/acme-web.git");
+        let boss = Party::manager("desk", &super::super::name_of(&overseer));
+        let s = finished(&d, &crew, &base, &web, "web", &boss, How::Started).await;
+        let since = chrono::Utc::now();
+        let waiting = asked(&hook_url(&base, s.id).await, "cargo build --release");
+        let v = eventually("its request to wait on the boss", async || {
+            d.view(s.id).ok().filter(|v| v.pending.is_some())
+        })
+        .await;
+
+        let r = overseer
+            .tools
+            .get(super::super::closing::TOOL)
+            .unwrap()
+            .execute(json!({ "session_id": s.id.to_string(), "reason": "Its ticket is done." }))
+            .await
+            .unwrap();
+        assert!(r.success, "{r:?}");
+        assert_eq!(behavior(&waiting.await.unwrap()), "deny");
+        eventually("it closed", async || {
+            d.view(s.id)
+                .map_or(true, |v| v.state == SessionState::Closed)
+                .then_some(())
+        })
+        .await;
+        let cancelled = format!("cancelled {}'s request to close it", v.label());
+        let decided = d.store().decisions_since("desk", since, 50).await.unwrap();
+        let x = decided
+            .iter()
+            .find(|x| x.what == cancelled)
+            .unwrap_or_else(|| panic!("{cancelled}: {decided:?}"));
+        assert_eq!(x.session, Some(s.id));
+        assert_eq!(
+            x.need_ref.as_deref(),
+            v.pending.as_ref().map(|p| p.id.to_string()).as_deref()
+        );
+    })
+    .await;
+}
+
+/// A session started to review a ticket's pull request carries none of
+/// its work: handed the ticket, it never supersedes the session whose work
+/// it reviews, while a newer session handed it does.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_review_session_on_its_ticket_never_supersedes_the_session_it_reviews() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (_overseer, crew, d, _llm) = overseeing(dir.path(), pool, "ok", ACT, &[]).await;
+        let work = new_session(&d, dir.path(), "web").await;
+        let review = new_session(&d, dir.path(), "web-review").await;
+        let newer = new_session(&d, dir.path(), "web-again").await;
+        d.store()
+            .pr_review_link(
+                review.id,
+                "desk",
+                &workforce_desk::plan::PrRef::new("acme", "web", 7),
+            )
+            .await
+            .unwrap();
+        let board = d
+            .create_board(NewBoard {
+                name: "Acme".into(),
+                group: None,
+                prefix: None,
+            })
+            .await
+            .unwrap()
+            .id;
+        let ticket = d
+            .create_ticket(
+                NewTicket {
+                    board,
+                    title: "The date picker".into(),
+                    body: String::new(),
+                    state: Some(workforce_desk::board::TicketState::Todo),
+                    needs: vec![],
+                },
+                &By::you(),
+            )
+            .await
+            .unwrap()
+            .ticket
+            .id;
+        let you = By::you();
+        let give = |s: uuid::Uuid| d.assign_ticket(ticket, Some(AssignTo::Session(s)), &you);
+        give(work.id).await.unwrap();
+        assert!(!crew.superseded(work.id).await, "its own ticket");
+        give(review.id).await.unwrap();
+        assert!(
+            !crew.superseded(work.id).await,
+            "a review carries none of its work"
+        );
+        give(newer.id).await.unwrap();
+        assert!(crew.superseded(work.id).await, "a newer session carries it");
     })
     .await;
 }

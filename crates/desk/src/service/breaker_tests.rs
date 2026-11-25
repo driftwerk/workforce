@@ -306,6 +306,7 @@ async fn a_desk_total_holds_agents_new_starts_never_the_persons_and_never_runnin
             account: None,
             env: Default::default(),
             group: None,
+            review_of: None,
         };
         assert!(matches!(d.create(start(), Some(agent())).await, Err(DeskError::Conflict(_))));
         d.create(start(), Some(By::you())).await.unwrap();

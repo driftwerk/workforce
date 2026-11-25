@@ -33,6 +33,13 @@ impl SessionState {
         )
     }
 
+    /// At work: starting, working, or waiting on a request of its own. It
+    /// holds one of its boss's slots, and its plan ticket in Review holds
+    /// one of the plan's.
+    pub fn busy(self) -> bool {
+        matches!(self, Self::Starting | Self::Working | Self::Blocked)
+    }
+
     /// The state a running session is recorded in once its process is gone
     /// without having ended on its own (hub restart, reboot, crash).
     pub fn after_loss(self) -> Self {
@@ -666,6 +673,11 @@ pub struct NewSession {
     /// sessions go.
     #[serde(default)]
     pub group: Option<String>,
+    /// The pull request it is started to review: Desk asks it for its
+    /// verdict on that head ([`crate::plan::REVIEW_VERDICT`]) and keeps
+    /// the link a review is recorded from.
+    #[serde(default)]
+    pub review_of: Option<crate::plan::ReviewOf>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]

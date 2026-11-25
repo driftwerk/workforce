@@ -3799,6 +3799,9 @@ impl Desk {
             ));
         }
         check_env(&new.env)?;
+        if let Some(r) = &new.review_of {
+            r.check().map_err(DeskError::Invalid)?;
+        }
         let view = new
             .view
             .or_else(|| engine::views(new.engine).first().copied())
@@ -3887,6 +3890,16 @@ impl Desk {
             }
             (p, _) => p,
         };
+        let prompt = match &new.review_of {
+            Some(r) => {
+                let verdict = crate::plan::review_instruction(&r.head_sha);
+                Some(match prompt {
+                    Some(p) => format!("{p}\n\n{verdict}"),
+                    None => verdict,
+                })
+            }
+            None => prompt,
+        };
         let now = Utc::now();
         let caps = engine::caps(new.engine, view);
         let record = SessionRecord {
@@ -3936,6 +3949,16 @@ impl Desk {
         // than a second one started, so its first prompt goes in once.
         if placed.is_ok() && named {
             placed = self.0.store.put(&record).await.map_err(DeskError::Internal);
+        }
+        // Linked before it runs, to the boss that started it: a review it
+        // can't be found by is never recorded.
+        if let (Ok(()), Some(r), Some(b)) = (&placed, &new.review_of, boss) {
+            placed = self
+                .0
+                .store
+                .pr_review_link(id, &b.id, &r.pr)
+                .await
+                .map_err(DeskError::Internal);
         }
         let launched = match placed {
             Ok(()) => self.launch(&record, false, prompt.as_deref()).await,
@@ -9158,6 +9181,7 @@ mod tests {
                 account: None,
                 env: Default::default(),
                 group: None,
+                review_of: None,
             },
             None,
         )
@@ -10334,6 +10358,7 @@ mod tests {
                 account: None,
                 env: Default::default(),
                 group: None,
+                review_of: None,
             };
             let trusted = |cwd: &str| {
                 let doc: Value =
@@ -10500,6 +10525,7 @@ mod tests {
                         account: None,
                         env: BTreeMap::from([(PLUGIN_DIRS.into(), "/plugins/desk".into())]),
                         group: None,
+                        review_of: None,
                     },
                     None,
                 )
@@ -10560,6 +10586,7 @@ mod tests {
                         account: None,
                         env: BTreeMap::from([("NOT A NAME".into(), "x".into())]),
                         group: None,
+                        review_of: None,
                     },
                     None,
                 )
@@ -10614,6 +10641,7 @@ mod tests {
                     account: None,
                     env: added.clone(),
                     group: None,
+                    review_of: None,
                 },
                 None,
             )
@@ -11221,6 +11249,7 @@ mod tests {
                         account: None,
                         env: Default::default(),
                         group: None,
+                        review_of: None,
                     },
                     Some(By::you()),
                 )

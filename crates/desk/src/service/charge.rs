@@ -1058,6 +1058,27 @@ impl Desk {
         Some(bounds)
     }
 
+    /// The class of the riskiest push in `id`'s open request `approval`,
+    /// read as [`Self::boss_answerable`] reads it for `boss`
+    /// ([`crate::computer::boss::PushKind`]); `None` when it is answered,
+    /// isn't a command, or pushes nothing.
+    pub fn push_kind(
+        &self,
+        id: Uuid,
+        approval: Uuid,
+        boss: &str,
+    ) -> Option<crate::computer::boss::PushKind> {
+        let pending = self.pending_of(id, approval)?;
+        match self.judged_facts(id, &pending, boss) {
+            Ok((facts, bounds)) => {
+                charge::push_kind(&facts, &bounds, &crate::computer::boss::resolve_real)
+            }
+            // Not read: a push it may run is unknown, never none.
+            Err(_) => crate::computer::boss::may_push(&pending.detail)
+                .then_some(crate::computer::boss::PushKind::Unknown),
+        }
+    }
+
     /// Whether `boss` may let `pending`, a request of `id`, go on itself:
     /// what Desk reads in full and judges safe.
     fn boss_judges(
@@ -1066,6 +1087,40 @@ impl Desk {
         pending: &crate::model::PendingApproval,
         boss: &str,
     ) -> Result<(), charge::Irreversible> {
+        let (facts, bounds) = self.judged_facts(id, pending, boss)?;
+        let top = crate::computer::boss::resolve_real(&facts.own);
+        let tracked = |p: &std::path::Path| {
+            top.as_ref().is_some_and(|top| {
+                p.strip_prefix(top).is_ok_and(|rel| {
+                    std::process::Command::new("git")
+                        .arg("-C")
+                        .arg(top)
+                        .args(["ls-files", "--error-unmatch", "--"])
+                        .arg(rel)
+                        .stdin(std::process::Stdio::null())
+                        .stdout(std::process::Stdio::null())
+                        .stderr(std::process::Stdio::null())
+                        .status()
+                        .is_ok_and(|s| s.success())
+                })
+            })
+        };
+        charge::answerable(
+            &facts,
+            &bounds,
+            &crate::computer::boss::resolve_real,
+            &tracked,
+        )
+    }
+
+    /// What Desk reads of `pending`, a request of `id`, for `boss` to judge
+    /// it by, and where: its folder's repository as it is now.
+    fn judged_facts(
+        &self,
+        id: Uuid,
+        pending: &crate::model::PendingApproval,
+        boss: &str,
+    ) -> Result<(charge::Facts, charge::Bounds), charge::Irreversible> {
         let no = |why: &str| Err(charge::Irreversible(why.into()));
         let Some(bounds) = self.judging_bounds() else {
             return no("Desk can't judge requests for a boss yet");
@@ -1090,6 +1145,7 @@ impl Desk {
             let own = crate::computer::boss::resolve_real(&facts.own);
             if top.is_some() && top == own {
                 facts.branch = git_line(&cwd, &["symbolic-ref", "--short", "-q", "HEAD"]);
+                facts.push_to = push_to(&cwd);
                 facts.default_branch = git_line(
                     &cwd,
                     &["symbolic-ref", "--short", "-q", "refs/remotes/origin/HEAD"],
@@ -1184,29 +1240,7 @@ impl Desk {
                 }
             }
         }
-        let top = crate::computer::boss::resolve_real(&facts.own);
-        let tracked = |p: &std::path::Path| {
-            top.as_ref().is_some_and(|top| {
-                p.strip_prefix(top).is_ok_and(|rel| {
-                    std::process::Command::new("git")
-                        .arg("-C")
-                        .arg(top)
-                        .args(["ls-files", "--error-unmatch", "--"])
-                        .arg(rel)
-                        .stdin(std::process::Stdio::null())
-                        .stdout(std::process::Stdio::null())
-                        .stderr(std::process::Stdio::null())
-                        .status()
-                        .is_ok_and(|s| s.success())
-                })
-            })
-        };
-        charge::answerable(
-            &facts,
-            &bounds,
-            &crate::computer::boss::resolve_real,
-            &tracked,
-        )
+        Ok((facts, bounds))
     }
 
     /// Whether `id`'s open request `approval` would change an agent's own
@@ -1349,6 +1383,88 @@ impl Desk {
             .chain(l.codex_asks.iter().map(|a| &a.pending))
             .find(|p| p.id == approval)
             .cloned()
+    }
+
+    /// Cancels the requests of `id` that `boss` decides itself, so it can
+    /// close the session where it acts fully: each a command, file change
+    /// or permissions request Desk was sent whole and the boss may answer,
+    /// never left to the person. Codex's is cancelled and Claude's denied,
+    /// each through [`Self::decide`] as `boss`'s answer. Refused, saying
+    /// why, for a request left to the person (in its terminal, asked of
+    /// them, or a boss served from a grant), a question the session asked
+    /// itself, or where `boss` doesn't act fully. The ids it cancelled;
+    /// none when nothing waits.
+    pub async fn cancel_boss_pending(&self, id: Uuid, boss: &By) -> Result<Vec<Uuid>, DeskError> {
+        use crate::model::Decision;
+        let refuse = |why: &str| Err(DeskError::Conflict(why.into()));
+        if boss.party.kind != PartyKind::Manager {
+            return Err(DeskError::Invalid(
+                "only a boss cancels a request to close its session".into(),
+            ));
+        }
+        if crate::grant::is_served(&boss.party.id) {
+            return refuse(
+                "a boss served from a grant leaves its sessions' requests to the person",
+            );
+        }
+        if !self.acts_fully_in(id, &boss.party.id) && !self.full_of(&boss.party.id).unbound {
+            return refuse("only a boss acting fully cancels a request to close a session");
+        }
+        if !self
+            .charge_of(id)
+            .is_some_and(|c| c.live() && c.boss == boss.party.id)
+        {
+            return refuse("it isn't a session this boss runs");
+        }
+        let view = self.view(id)?;
+        if view.state == SessionState::Asking || view.asked.is_some() {
+            return refuse("it's asking something of its own; that's the person's to answer");
+        }
+        let pending: Vec<(crate::model::PendingApproval, bool)> = {
+            let st = self.0.state.lock();
+            let Some(l) = st.live.get(&id) else {
+                return Ok(Vec::new());
+            };
+            if l.open_question.is_some()
+                || l.codex_question.is_some()
+                || l.holder().is_some_and(|h| h.question)
+            {
+                return refuse("it's asking something of its own; that's the person's to answer");
+            }
+            l.pending
+                .iter()
+                .map(|p| (p.clone(), false))
+                .chain(l.codex_asks.iter().map(|a| (a.pending.clone(), true)))
+                .collect()
+        };
+        for (p, _) in &pending {
+            if !p.answerable || p.request.is_none() || p.options.is_some() {
+                return refuse("its request waits on the person; it's theirs to answer");
+            }
+            let key = crate::open_item::approval_key(&id.to_string(), &p.id.to_string());
+            if self
+                .0
+                .store
+                .item_ever_keyed(&boss.party.id, &key)
+                .await
+                .map_err(DeskError::Internal)?
+            {
+                return refuse("its request was left to the person; it's theirs to answer");
+            }
+        }
+        pending
+            .into_iter()
+            .map(|(p, codex)| {
+                let cancel =
+                    codex && (p.choices.is_empty() || p.choices.contains(&Decision::Cancel));
+                let decision = match cancel {
+                    true => Decision::Cancel,
+                    false => Decision::Deny,
+                };
+                self.decide(id, p.id, decision, Some(boss.clone()))
+                    .map(|_| p.id)
+            })
+            .collect()
     }
 
     /// Whether `boss` may make `decision` on `id`'s request `approval`:
@@ -2148,6 +2264,27 @@ fn git_lines(dir: &std::path::Path, args: &[&str]) -> Vec<String> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// Where a bare `git push` in `dir` sends its branch, as git's `@{push}`
+/// says (`origin/feat/x`): none when its config doesn't say plainly
+/// (`push.default` of `matching` or `nothing`, a remote's own push
+/// refspecs) or git can't tell.
+fn push_to(dir: &std::path::Path) -> Option<String> {
+    let default = git_line(dir, &["config", "push.default"]);
+    let refspecs = git_lines(dir, &["config", "--get-regexp", r"^remote\..*\.push$"]);
+    if matches!(default.as_deref(), Some("matching" | "nothing")) || !refspecs.is_empty() {
+        return None;
+    }
+    git_line(
+        dir,
+        &[
+            "rev-parse",
+            "--abbrev-ref",
+            "--symbolic-full-name",
+            "@{push}",
+        ],
+    )
 }
 
 /// One line git prints in `dir`, or `None` when it can't say.

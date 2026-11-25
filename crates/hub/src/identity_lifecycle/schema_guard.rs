@@ -284,6 +284,24 @@ const CLAIMS: &[(&str, &str, &str, Claim)] = &[
     ),
     (
         "desk",
+        "boss_holds",
+        "owner",
+        NotPersonal("`you`, the one person of the Desk whose own hub this is, whose directive holds the session"),
+    ),
+    (
+        "desk",
+        "pr_reviews",
+        "owner",
+        NotPersonal("the GitHub account or organisation a reviewed pull request's repository is under"),
+    ),
+    (
+        "desk",
+        "pr_review_sessions",
+        "owner",
+        NotPersonal("the GitHub account or organisation a reviewed pull request's repository is under"),
+    ),
+    (
+        "desk",
         "session_accounts",
         "owner",
         NotPersonal("`you`, the one person of the Desk whose own hub this is"),

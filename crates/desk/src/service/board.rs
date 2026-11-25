@@ -1240,6 +1240,7 @@ impl Desk {
                     account: None,
                     env: BTreeMap::new(),
                     group,
+                    review_of: None,
                 };
                 let view = match charged {
                     Some(c) => self.create_for(session, &c.boss, by.clone()).await?,

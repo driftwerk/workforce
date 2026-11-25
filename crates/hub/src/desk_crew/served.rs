@@ -1345,6 +1345,7 @@ impl CrewHub {
                     account: None,
                     env: Default::default(),
                     group: (g.group != workforce_desk::UNGROUPED).then(|| g.group.clone()),
+                    review_of: None,
                 },
                 &party,
                 by,

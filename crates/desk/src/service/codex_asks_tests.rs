@@ -92,6 +92,7 @@ pub(super) fn codex_session(dir: &Path, approve_for_me: bool) -> NewSession {
         account: None,
         env: Default::default(),
         group: None,
+        review_of: None,
     }
 }
 

@@ -39,6 +39,7 @@ async fn asking_session(d: &Desk, dir: &Path) -> SessionView {
             account: None,
             env: Default::default(),
             group: None,
+            review_of: None,
         },
         None,
     )

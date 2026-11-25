@@ -337,27 +337,46 @@ async fn desk_as(
     bosses: workforce_desk::grant::BossOptions,
     sight: workforce_desk::SightOptions,
 ) -> Desk {
+    let options = Options {
+        bosses,
+        sight,
+        ..options(dir, claude, codex)
+    };
+    desk_on(pool, options, floor).await
+}
+
+/// A desk's options under `dir`, its Claude Code `claude` and Codex `codex`.
+fn options(dir: &Path, claude: PathBuf, codex: PathBuf) -> Options {
+    Options {
+        programs: BTreeMap::from([
+            (workforce_desk::engine::Engine::Claude, claude),
+            (workforce_desk::engine::Engine::Codex, codex),
+        ]),
+        env: BTreeMap::from([("PATH".into(), "/usr/bin:/bin".into())]),
+        run_dir: dir.join("run"),
+        scrollback_bytes: 4096,
+        approval_timeout: Duration::from_secs(60),
+        restore: RestorePolicy::Off,
+        adopt_every: None,
+        holder: None,
+        hub_internal: Default::default(),
+        account_keys: None,
+        line_reach: workforce_desk::line::Reach::Group,
+        memory: Default::default(),
+        bosses: Default::default(),
+        sight: Default::default(),
+    }
+}
+
+/// A desk started with `options` and `floor`.
+async fn desk_on(
+    pool: workforce_postgres::PostgresPool,
+    options: Options,
+    floor: workforce_desk::Floor,
+) -> Desk {
     Desk::start(
         DeskStore::with_pool(pool).await.unwrap(),
-        Options {
-            programs: BTreeMap::from([
-                (workforce_desk::engine::Engine::Claude, claude),
-                (workforce_desk::engine::Engine::Codex, codex),
-            ]),
-            env: BTreeMap::from([("PATH".into(), "/usr/bin:/bin".into())]),
-            run_dir: dir.join("run"),
-            scrollback_bytes: 4096,
-            approval_timeout: Duration::from_secs(60),
-            restore: RestorePolicy::Off,
-            adopt_every: None,
-            holder: None,
-            hub_internal: Default::default(),
-            account_keys: None,
-            line_reach: workforce_desk::line::Reach::Group,
-            memory: Default::default(),
-            bosses,
-            sight,
-        },
+        options,
         floor,
         CancellationToken::new(),
     )
@@ -447,6 +466,7 @@ pub(crate) async fn new_session(
             account: None,
             env: Default::default(),
             group: None,
+            review_of: None,
         },
         Some(By::you()),
     )
@@ -2054,6 +2074,7 @@ mod plan_watch;
 mod plans;
 
 mod act_fully;
+mod ships;
 
 mod act_fully_budget;
 

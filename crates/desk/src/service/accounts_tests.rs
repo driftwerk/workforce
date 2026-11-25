@@ -122,6 +122,7 @@ fn session(dir: &Path, account: Option<Option<Uuid>>) -> NewSession {
         account,
         env: Default::default(),
         group: None,
+        review_of: None,
     }
 }
 

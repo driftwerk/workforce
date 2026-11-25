@@ -100,6 +100,7 @@ fn start(name: &str, cwd: &Path) -> NewSession {
         account: None,
         env: Default::default(),
         group: None,
+        review_of: None,
     }
 }
 

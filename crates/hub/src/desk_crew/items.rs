@@ -174,7 +174,7 @@ pub(crate) const HOLD_ASKS: &str = "That holds the session on the person's word,
 
 /// Whether `i` asks the person something about session `s` that holds it:
 /// a question or a decision to confirm, not one that lets it carry on.
-fn asks_about(i: &OpenItem, s: Uuid) -> bool {
+pub(super) fn asks_about(i: &OpenItem, s: Uuid) -> bool {
     matches!(i.kind, OpenKind::Ask | OpenKind::Confirm)
         && i.session == Some(s)
         && i.state != OpenState::Closed
@@ -307,7 +307,7 @@ fn due_minutes(v: &Value) -> Result<Option<i64>, String> {
 }
 
 impl CrewHub {
-    fn item_err(e: eyre::Report) -> String {
+    pub(super) fn item_err(e: eyre::Report) -> String {
         tracing::warn!(error = %format!("{e:#}"), "an open item couldn't be kept");
         "Desk couldn't keep that just now.".to_string()
     }
@@ -1332,33 +1332,6 @@ impl CrewHub {
             Err(e) => {
                 tracing::warn!(error = %e, "the open items couldn't be read for the sessions' tiles")
             }
-        }
-    }
-
-    /// Refuses a boss's word that holds a session on the person's word
-    /// while nothing asks them about it: a hold carries its question,
-    /// asked first with `crew.ask_person`.
-    pub(crate) async fn hold_asks(&self, action: &Action, boss: &str) -> Result<(), String> {
-        let Action::Nudge {
-            to: Target::Session(s),
-            message,
-            ..
-        } = action
-        else {
-            return Ok(());
-        };
-        if !workforce_desk::line::holds_for_person(message) {
-            return Ok(());
-        }
-        let items = self
-            .desk
-            .store()
-            .items_not_closed(Some(boss))
-            .await
-            .map_err(Self::item_err)?;
-        match items.iter().any(|i| asks_about(i, *s)) {
-            true => Ok(()),
-            false => Err(HOLD_ASKS.into()),
         }
     }
 

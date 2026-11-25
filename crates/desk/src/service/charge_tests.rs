@@ -10,6 +10,7 @@ use workforce_postgres::test_support::with_test_pool;
 
 use super::super::tests::{desk, new_session, went_in};
 use super::*;
+use crate::computer::boss::PushKind;
 use crate::line::{Delivery, Send, Target, Wait, When};
 use crate::service::Sender;
 use crate::store::build_pool;
@@ -420,6 +421,7 @@ fn start_in(dir: &std::path::Path, group: Option<&str>) -> crate::model::NewSess
         account: None,
         env: Default::default(),
         group: group.map(Into::into),
+        review_of: None,
     }
 }
 
@@ -1335,6 +1337,48 @@ fn git(dir: &std::path::Path, args: &[&str]) {
     assert!(out.status.success(), "git {args:?}: {out:?}");
 }
 
+/// Where a bare push goes is what git's `@{push}` says, only while its
+/// config says it plainly.
+#[test]
+fn a_bare_push_goes_where_git_says_only_while_its_config_is_plain() {
+    let dir = tempfile::tempdir().unwrap();
+    let base = std::fs::canonicalize(dir.path()).unwrap();
+    let (own, origin) = (base.join("acme-web"), base.join("origin.git"));
+    std::fs::create_dir_all(&own).unwrap();
+    std::fs::create_dir_all(&origin).unwrap();
+    git(&origin, &["init", "-q", "--bare"]);
+    git(&own, &["init", "-q", "-b", "feat/x"]);
+    git(
+        &own,
+        &["remote", "add", "origin", &origin.to_string_lossy()],
+    );
+    assert_eq!(push_to(&own), None, "no upstream: git can't say");
+    git(
+        &own,
+        &[
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "-q",
+            "--allow-empty",
+            "-m",
+            "x",
+        ],
+    );
+    git(&own, &["push", "-q", "-u", "origin", "feat/x"]);
+    assert_eq!(push_to(&own).as_deref(), Some("origin/feat/x"));
+    git(&own, &["config", "push.default", "matching"]);
+    assert_eq!(push_to(&own), None, "matching pushes every branch");
+    git(&own, &["config", "push.default", "simple"]);
+    git(
+        &own,
+        &["config", "remote.origin.push", "refs/heads/*:refs/heads/*"],
+    );
+    assert_eq!(push_to(&own), None, "a remote's own refspecs");
+}
+
 /// A push is judged by the repository it runs in: the own folder's, on a
 /// branch that isn't the default one. From another repository (another
 /// cwd, a nested one) the boss can't tell what it pushes.
@@ -1383,6 +1427,7 @@ async fn a_push_is_judged_by_the_repository_it_runs_in() {
             d.boss_answerable(s.id, a, "sarah").unwrap_err().to_string(),
             "Desk can't tell which branch this pushes"
         );
+        assert_eq!(d.push_kind(s.id, a, "sarah"), Some(PushKind::Unknown));
         d.decide(s.id, a, Decision::Deny, Some(boss.clone()))
             .unwrap();
         elsewhere.await.unwrap();
@@ -1390,6 +1435,7 @@ async fn a_push_is_judged_by_the_repository_it_runs_in() {
         let here = ask(&own);
         let a = open().await;
         assert_eq!(d.boss_answerable(s.id, a, "sarah"), Ok(()));
+        assert_eq!(d.push_kind(s.id, a, "sarah"), Some(PushKind::OwnBranch));
         d.decide(s.id, a, Decision::Allow, Some(boss)).unwrap();
         assert_eq!(
             here.await.unwrap()["hookSpecificOutput"]["decision"]["behavior"],
@@ -1694,6 +1740,134 @@ async fn an_unknown_release_reason_is_the_bosss_and_an_unreadable_charge_fails_t
         drop(client);
         assert!(d.store().charges().await.is_err(), "no row is skipped");
         assert!(!d.charge_load().await, "the load fails, as it would unread");
+    })
+    .await;
+}
+
+/// A boss acting fully cancels the requests it decides itself to close a
+/// session, as its own answer; never one left to the person, nor on a
+/// session it doesn't run, nor below Act fully.
+#[tokio::test]
+async fn a_boss_acting_fully_cancels_only_the_requests_it_decides() {
+    use crate::model::Decision;
+    use crate::open_item::{approval_key, NewItem, OpenKind};
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(pool, dir.path()).await;
+        let s = new_session(&d, dir.path()).await;
+        idle(&d, s.id).await;
+        d.take_on(s.id, &sarah(), How::Handed, &Default::default(), &By::you())
+            .await
+            .unwrap();
+        d.boss_bounds_with(crate::charge::Bounds {
+            home: dir.path().to_path_buf(),
+            ..Default::default()
+        });
+        let boss = By::manager("sarah", "Sarah", "Its ticket is done.");
+        let refused = |r: Result<Vec<Uuid>, DeskError>| match r {
+            Err(DeskError::Conflict(why) | DeskError::Invalid(why)) => why,
+            other => panic!("not refused: {other:?}"),
+        };
+        let build = ask_permission(&d, s.id, "cargo build");
+        let a = asked(&d, s.id, "cargo build").await;
+        assert_eq!(
+            refused(d.cancel_boss_pending(s.id, &boss).await),
+            "only a boss acting fully cancels a request to close a session"
+        );
+        let fully = crate::charge::FullGrant {
+            anywhere: true,
+            ..Default::default()
+        };
+        d.set_full(HashMap::from([
+            ("sarah".to_string(), fully.clone()),
+            ("mia".to_string(), fully),
+        ]));
+        assert!(refused(d.cancel_boss_pending(s.id, &By::you()).await).contains("only a boss"));
+        let mia = By::manager("mia", "Mia", "Mine now.");
+        assert_eq!(
+            refused(d.cancel_boss_pending(s.id, &mia).await),
+            "it isn't a session this boss runs"
+        );
+
+        // Left to the person: theirs, however the boss closes it.
+        let mut left = NewItem::ask("sarah", OpenKind::Ask, Some(s.id), "It waits on you.");
+        left.dedupe_key = approval_key(&s.id.to_string(), &a.to_string());
+        d.store().item_open(&left).await.unwrap();
+        assert_eq!(
+            refused(d.cancel_boss_pending(s.id, &boss).await),
+            "its request was left to the person; it's theirs to answer"
+        );
+        d.decide(s.id, a, Decision::Deny, Some(By::you())).unwrap();
+        build.await.unwrap();
+
+        // One it decides: denied as its answer, and nothing waits after.
+        let tests = ask_permission(&d, s.id, "cargo test");
+        let a = asked(&d, s.id, "cargo test").await;
+        assert_eq!(d.cancel_boss_pending(s.id, &boss).await.unwrap(), [a]);
+        assert_eq!(
+            tests.await.unwrap()["hookSpecificOutput"]["decision"]["behavior"],
+            "deny"
+        );
+        assert_eq!(
+            d.cancel_boss_pending(s.id, &boss).await.unwrap(),
+            Vec::<Uuid>::new()
+        );
+    })
+    .await;
+}
+
+/// A session started to review a pull request is asked for its verdict on
+/// the head it was given, and linked to that pull request before it runs.
+#[tokio::test]
+async fn a_review_session_is_asked_for_its_verdict_and_linked_to_its_pull_request() {
+    use crate::plan::{review_instruction, PrRef, ReviewOf};
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(pool, dir.path()).await;
+        let head = "0123456789abcdef0123456789abcdef01234567";
+        let pr = PrRef {
+            owner: "acme".into(),
+            repo: "web".into(),
+            number: 42,
+        };
+        let by = || By::manager("sarah", "Sarah", "Review it.");
+        let mut new = start_in(dir.path(), None);
+        new.prompt = Some("Review pull request 42.".into());
+        new.review_of = Some(ReviewOf {
+            pr: pr.clone(),
+            head_sha: head.into(),
+        });
+        let s = d.create_for(new, &sarah(), by()).await.unwrap();
+        assert_eq!(
+            d.view(s.id).unwrap().last_prompt,
+            Some(format!(
+                "Review pull request 42.\n\n{}",
+                review_instruction(head)
+            ))
+        );
+        assert_eq!(
+            d.store().pr_review_of(s.id).await.unwrap(),
+            Some((sarah().id, pr.clone()))
+        );
+
+        let mut plain = start_in(dir.path(), None);
+        plain.prompt = Some("Fix the date picker.".into());
+        let p = d.create_for(plain, &sarah(), by()).await.unwrap();
+        assert_eq!(
+            d.view(p.id).unwrap().last_prompt.as_deref(),
+            Some("Fix the date picker.")
+        );
+        assert_eq!(d.store().pr_review_of(p.id).await.unwrap(), None);
+
+        let mut short = start_in(dir.path(), None);
+        short.review_of = Some(ReviewOf {
+            pr,
+            head_sha: head[..12].into(),
+        });
+        assert!(matches!(
+            d.create_for(short, &sarah(), by()).await,
+            Err(DeskError::Invalid(_))
+        ));
     })
     .await;
 }

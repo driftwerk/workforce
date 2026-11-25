@@ -68,6 +68,25 @@ pub(super) async fn boss_until(
     gh: &wiremock::MockServer,
     stop: CancellationToken,
 ) -> (Arc<AgentService>, Arc<CrewHub>, Desk, wiremock::MockServer) {
+    let d = desk_running(
+        pool,
+        dir,
+        Default::default(),
+        installed_cli(dir),
+        not_installed(dir),
+    )
+    .await;
+    boss_over(dir, d, oversight, gh, stop).await
+}
+
+/// [`boss_until`] over the desk `d`.
+pub(super) async fn boss_over(
+    dir: &Path,
+    d: Desk,
+    oversight: &str,
+    gh: &wiremock::MockServer,
+    stop: CancellationToken,
+) -> (Arc<AgentService>, Arc<CrewHub>, Desk, wiremock::MockServer) {
     let uri = gh.uri();
     let (overseer, llm) = agent_configured(dir, "desk", "ok", &[], |c| {
         c.github.base_url = uri;
@@ -84,14 +103,6 @@ pub(super) async fn boss_until(
         .unwrap();
     write_config(&overseer, oversight);
     let state = hub(std::slice::from_ref(&overseer));
-    let d = desk_running(
-        pool,
-        dir,
-        Default::default(),
-        installed_cli(dir),
-        not_installed(dir),
-    )
-    .await;
     let dm = overseer
         .sessions
         .get_or_create(DESK_CHANNEL, PERSON, "desk")

@@ -251,7 +251,7 @@ async fn an_approved_plan_starts_four_sessions_and_the_fifth_when_one_finishes()
 
 /// How many sessions plan `id` holds now.
 async fn held_now(d: &Desk, id: uuid::Uuid) -> usize {
-    workforce_desk::plan::held(&d.plan_tickets(id).await.unwrap())
+    workforce_desk::plan::held(&d.plan_tickets(id).await.unwrap(), |s| d.session_busy(s))
 }
 
 /// A plan's session here keeps its slot until it is closed: a finished
@@ -3051,6 +3051,111 @@ async fn desk_sessions_says_which_of_the_ids_asked_about_were_closed_or_removed_
             .collect();
         assert_eq!(closed, [shut, removed]);
         assert!(listed.iter().all(|s| s.id != open || s.state != "closed"));
+    })
+    .await;
+}
+
+/// The plan keeps N working (DW-761): a ticket in Review whose session
+/// rests holds no slot, so the next ticket starts; its session resumed
+/// brings the plan to N+1 with nothing stopped and no new start; once its
+/// ticket is done, the plan watch closes the session.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_resting_review_frees_its_slot_a_resumed_one_is_n_plus_one_and_a_done_one_closes() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (_overseer, state, d, _llm) = hub_with(dir.path(), pool, ACTS).await;
+        let crew = CrewHub::start(state, d.clone(), FAST, CancellationToken::new());
+        *crew.close_settle.lock() = chrono::Duration::zero();
+        let p = proposed(&d, dir.path(), 6).await;
+        let id = p.summary.plan.id;
+        d.approve_plan(id, 1, &By::you()).await.unwrap();
+        let four = eventually("four sessions", async || {
+            let s = started(&d);
+            (s.len() == 4).then_some(s)
+        })
+        .await;
+        let one = four[0].id;
+        let url = hook_url(dir.path(), one).await;
+        hook(
+            &url,
+            json!({"hook_event_name": "SessionStart", "session_id": one.to_string()}),
+        )
+        .await;
+        eventually("its turn over", async || {
+            (!d.view(one).unwrap().state.busy()).then_some(())
+        })
+        .await;
+        let ticket = d
+            .plan_tickets(id)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|t| t.session.as_deref() == Some(&one.to_string()))
+            .unwrap()
+            .id;
+        let mv = |state| workforce_desk::Move {
+            state,
+            before: None,
+            after: None,
+        };
+        d.move_ticket(ticket, mv(TicketState::Review), &By::you())
+            .await
+            .unwrap();
+        eventually("the fifth starts", async || {
+            (started(&d).len() == 5).then_some(())
+        })
+        .await;
+        assert_eq!(held_now(&d, id).await, 4, "the resting review holds none");
+
+        hook(
+            &url,
+            json!({"hook_event_name": "UserPromptSubmit", "prompt": "address the review"}),
+        )
+        .await;
+        eventually("the review at work again", async || {
+            d.view(one).unwrap().state.busy().then_some(())
+        })
+        .await;
+        eventually("N+1 held", async || {
+            (held_now(&d, id).await == 5).then_some(())
+        })
+        .await;
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        let open: Vec<_> = started(&d)
+            .into_iter()
+            .filter(|v| v.state != SessionState::Closed)
+            .collect();
+        assert_eq!(open.len(), 5, "nothing stopped and nothing new started");
+
+        // Another, its turn over and its ticket done, is closed by the
+        // plan watch.
+        let two = four[1].id;
+        hook(
+            &hook_url(dir.path(), two).await,
+            json!({"hook_event_name": "SessionStart", "session_id": two.to_string()}),
+        )
+        .await;
+        eventually("its turn over", async || {
+            (!d.view(two).unwrap().state.busy()).then_some(())
+        })
+        .await;
+        let done = d
+            .plan_tickets(id)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|t| t.session.as_deref() == Some(&two.to_string()))
+            .unwrap()
+            .id;
+        d.move_ticket(done, mv(TicketState::Done), &By::you())
+            .await
+            .unwrap();
+        eventually("the plan watch closes it", async || {
+            d.view(two)
+                .map_or(true, |v| v.state == SessionState::Closed)
+                .then_some(())
+        })
+        .await;
     })
     .await;
 }
