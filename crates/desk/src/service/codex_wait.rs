@@ -98,12 +98,16 @@ impl Desk {
                     Kind::Asked,
                     me.clone(),
                     Some(me),
-                    format!("Codex asked {method}, which Desk doesn't know: its terminal answers it"),
+                    format!(
+                        "Codex asked {method}, which Desk doesn't know: its terminal answers it"
+                    ),
                 ));
             }
         }
         self.change(id, |_, l| {
-            if let Some(l) = l.filter(|l| !l.codex_wait.elsewhere.iter().any(|(r, _)| *r == request)) {
+            if let Some(l) =
+                l.filter(|l| !l.codex_wait.elsewhere.iter().any(|(r, _)| *r == request))
+            {
                 l.codex_wait.elsewhere.push((request, method));
             }
         });

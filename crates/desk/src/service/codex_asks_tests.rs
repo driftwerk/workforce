@@ -620,11 +620,19 @@ async fn following(
     let s = d.create(codex_session(dir, false), None).await.unwrap();
     let mut ws = server.await.unwrap();
     next_sent(&mut ws, |v| v["method"] == "initialized").await;
-    say(&mut ws, json!({"method": "thread/started", "params": {"thread": {"id": "t1",
-        "environments": [{"cwd": "/repo"}], "path": null}}})).await;
+    say(
+        &mut ws,
+        json!({"method": "thread/started", "params": {"thread": {"id": "t1",
+        "environments": [{"cwd": "/repo"}], "path": null}}}),
+    )
+    .await;
     say(&mut ws, status(&[])).await;
     let resume = next_sent(&mut ws, |v| v["method"] == "thread/resume").await;
-    say(&mut ws, json!({"id": resume["id"], "result": {"thread": {"id": "t1"}}})).await;
+    say(
+        &mut ws,
+        json!({"id": resume["id"], "result": {"thread": {"id": "t1"}}}),
+    )
+    .await;
     (d, s, ws)
 }
 
@@ -670,12 +678,17 @@ async fn a_request_desk_answers_never_reads_as_one_only_the_terminal_answers() {
         // Answered from Desk within the window, its flag still up a moment
         // after: no wait in its terminal, then or later.
         let p = d.view(s.id).unwrap().pending.unwrap();
-        d.decide(s.id, p.id, Decision::Allow, Some(By::you())).unwrap();
+        d.decide(s.id, p.id, Decision::Allow, Some(By::you()))
+            .unwrap();
         next_sent(&mut ws, |v| v.get("result").is_some()).await;
         tokio::time::sleep(Duration::from_millis(300)).await;
         no_false_wait(&d, s.id);
-        say(&mut ws, json!({"method": "serverRequest/resolved",
-            "params": {"threadId": "t1", "requestId": 0}})).await;
+        say(
+            &mut ws,
+            json!({"method": "serverRequest/resolved",
+            "params": {"threadId": "t1", "requestId": 0}}),
+        )
+        .await;
         say(&mut ws, status(&[])).await;
         tokio::time::sleep(PAST_WAIT).await;
         no_false_wait(&d, s.id);
@@ -683,7 +696,12 @@ async fn a_request_desk_answers_never_reads_as_one_only_the_terminal_answers() {
         assert_eq!((v.state, v.pending), (SessionState::Working, None));
         assert!(
             matches!(
-                d.decide(s.id, uuid::Uuid::new_v4(), Decision::Terminal, Some(By::you())),
+                d.decide(
+                    s.id,
+                    uuid::Uuid::new_v4(),
+                    Decision::Terminal,
+                    Some(By::you())
+                ),
                 Err(DeskError::Conflict(_) | DeskError::Invalid(_))
             ),
             "nothing to hand to the terminal"
@@ -700,17 +718,30 @@ async fn what_only_its_terminal_answers_shows_named_after_a_while_and_goes_once_
     with_test_pool(build_pool, |pool| async move {
         let dir = tempfile::tempdir().unwrap();
         let (d, s, mut ws) = following(pool, dir.path()).await;
-        say(&mut ws, json!({"id": 40, "method": "item/tool/call", "params": {"threadId": "t1",
-            "turnId": "u1", "callId": "c1", "namespace": null, "tool": "lookup", "arguments": {}}})).await;
+        say(
+            &mut ws,
+            json!({"id": 40, "method": "item/tool/call", "params": {"threadId": "t1",
+            "turnId": "u1", "callId": "c1", "namespace": null, "tool": "lookup", "arguments": {}}}),
+        )
+        .await;
         say(&mut ws, status(&["waitingOnApproval"])).await;
         until(|| d.view(s.id).unwrap().state == SessionState::Blocked).await;
         assert_eq!(d.view(s.id).unwrap().pending, None, "not at once");
         until(|| d.view(s.id).unwrap().pending.is_some()).await;
         let p = d.view(s.id).unwrap().pending.unwrap();
-        assert!(p.in_terminal() && p.detail.contains("item/tool/call"), "{p:?}");
-        assert!(d.decide(s.id, p.id, Decision::Allow, Some(By::you())).is_err());
-        say(&mut ws, json!({"method": "serverRequest/resolved",
-            "params": {"threadId": "t1", "requestId": 40}})).await;
+        assert!(
+            p.in_terminal() && p.detail.contains("item/tool/call"),
+            "{p:?}"
+        );
+        assert!(d
+            .decide(s.id, p.id, Decision::Allow, Some(By::you()))
+            .is_err());
+        say(
+            &mut ws,
+            json!({"method": "serverRequest/resolved",
+            "params": {"threadId": "t1", "requestId": 40}}),
+        )
+        .await;
         until(|| d.view(s.id).unwrap().pending.is_none()).await;
         assert_ne!(d.view(s.id).unwrap().state, SessionState::Blocked);
         assert!(
@@ -719,11 +750,18 @@ async fn what_only_its_terminal_answers_shows_named_after_a_while_and_goes_once_
         );
 
         // One Desk doesn't know: said, then shown named.
-        say(&mut ws, json!({"id": 41, "method": "item/someday/new", "params": {"threadId": "t1"}})).await;
+        say(
+            &mut ws,
+            json!({"id": 41, "method": "item/someday/new", "params": {"threadId": "t1"}}),
+        )
+        .await;
         say(&mut ws, status(&["waitingOnUserInput"])).await;
         until(|| d.view(s.id).unwrap().pending.is_some()).await;
         let p = d.view(s.id).unwrap().pending.unwrap();
-        assert!(p.in_terminal() && p.detail.contains("item/someday/new"), "{p:?}");
+        assert!(
+            p.in_terminal() && p.detail.contains("item/someday/new"),
+            "{p:?}"
+        );
         let mut said = false;
         for _ in 0..200 {
             said = d
@@ -761,4 +799,119 @@ async fn ws_sent_nothing_for(ws: &mut WebSocketStream<UnixStream>, id: i64) -> b
     })
     .await;
     !read.unwrap_or(false)
+}
+
+/// A boss acting fully closes a Codex session by cancelling what it
+/// decides: its permissions request, which has no cancel, is denied, so
+/// Codex is granted nothing.
+#[tokio::test]
+async fn a_permissions_request_cancelled_to_close_is_granted_nothing() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (d, s, mut ws) = following(pool, dir.path()).await;
+        // Asked before its boss takes it: what it runs in changes with the
+        // charge, once nothing waits.
+        say(
+            &mut ws,
+            json!({"id": 14, "method": "item/permissions/requestApproval",
+            "params": {"threadId": "t1", "turnId": "u1", "itemId": "perm-1", "startedAtMs": 1,
+            "cwd": "/repo", "reason": "Select a workspace root",
+            "permissions": {"network": {"enabled": true}, "fileSystem": {"write": ["/repo"]}}}}),
+        )
+        .await;
+        until(|| d.view(s.id).unwrap().pending.is_some_and(|p| p.answerable)).await;
+        d.set_full(std::collections::HashMap::from([(
+            "crew".to_string(),
+            crate::charge::FullGrant {
+                anywhere: true,
+                ..Default::default()
+            },
+        )]));
+        d.take_on(
+            s.id,
+            &crate::crew::Party::manager("crew", "Crew"),
+            crate::charge::How::Handed,
+            &Default::default(),
+            &By::you(),
+        )
+        .await
+        .unwrap();
+        let p = d.view(s.id).unwrap().pending.unwrap();
+        let boss = By::manager("crew", "Crew", "Its ticket is done.");
+        assert_eq!(d.cancel_boss_pending(s.id, &boss).await.unwrap(), [p.id]);
+        let sent = next_sent(&mut ws, |v| v["id"] == 14).await;
+        assert_eq!(sent["result"], json!({"permissions": {}, "scope": "turn"}));
+    })
+    .await;
+}
+
+/// What Codex asks to run is classed from the command it runs, wrapped in
+/// its shell, in the session's repository: what its boss's standing
+/// verdicts are about.
+#[tokio::test]
+async fn a_codex_request_is_classed_by_the_command_its_shell_runs() {
+    use crate::computer::boss::Class;
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let dir = dir.path().canonicalize().unwrap();
+        let origin = tempfile::tempdir().unwrap();
+        let run = |at: &Path, args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(at)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "{args:?}: {out:?}");
+        };
+        run(origin.path(), &["init", "-q", "--bare", "-b", "main"]);
+        let git = |args: &[&str]| run(&dir, args);
+        git(&["init", "-q", "-b", "main"]);
+        git(&[
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "-q",
+            "--allow-empty",
+            "-m",
+            "x",
+        ]);
+        git(&["remote", "add", "origin", &origin.path().to_string_lossy()]);
+        git(&["push", "-q", "origin", "main"]);
+        git(&["remote", "set-head", "origin", "main"]);
+        git(&["switch", "-q", "-c", "feat/x"]);
+        let (d, s, mut ws) = following(pool, &dir).await;
+        d.boss_bounds_with(crate::charge::Bounds {
+            home: dir.clone(),
+            ..Default::default()
+        });
+        for (id, command, class) in [
+            (21, "git commit -m 'a fix'", Class::Commit),
+            (22, "git push origin main", Class::DefaultBranchPush),
+            (23, "git push -f origin feat/x", Class::ForcePush),
+            (24, "npm test", Class::Other),
+        ] {
+            let mut request = ask(id, None);
+            request["params"]["command"] = json!(format!("/bin/zsh -lc \"{command}\""));
+            request["params"]["cwd"] = json!(dir);
+            request["params"]["commandActions"] = json!([]);
+            say(&mut ws, request).await;
+            until(|| d.view(s.id).unwrap().pending.is_some_and(|p| p.answerable)).await;
+            let p = d.view(s.id).unwrap().pending.unwrap();
+            assert_eq!(d.request_class(s.id, p.id, "crew"), class, "{command}");
+            d.decide(s.id, p.id, Decision::Deny, Some(By::you()))
+                .unwrap();
+            next_sent(&mut ws, |v| v["id"] == id).await;
+            say(
+                &mut ws,
+                json!({"method": "serverRequest/resolved",
+                "params": {"threadId": "t1", "requestId": id}}),
+            )
+            .await;
+            until(|| d.view(s.id).unwrap().pending.is_none()).await;
+        }
+    })
+    .await;
 }

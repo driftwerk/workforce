@@ -163,7 +163,12 @@ fn texts(words: &[Word]) -> Vec<&str> {
 /// Where a program is run from: a name the shell finds, or a system
 /// folder's; never one the workspace holds.
 fn program_name(text: &str) -> Option<&str> {
-    const SYSTEM: &[&str] = &["/bin/", "/usr/bin/", "/usr/local/bin/", "/opt/homebrew/bin/"];
+    const SYSTEM: &[&str] = &[
+        "/bin/",
+        "/usr/bin/",
+        "/usr/local/bin/",
+        "/opt/homebrew/bin/",
+    ];
     match text.rsplit_once('/') {
         None => Some(text),
         Some((_, name)) => SYSTEM
@@ -221,13 +226,15 @@ fn part(cmd: &Cmd, here: &Here<'_>, repo: &Repo<'_>, depth: usize, moved: bool) 
 /// `-c`, with the login and interactive flags a shell runs a script under
 /// (`-lc`, `-ic`, `-lic`).
 fn is_c_flag(flag: &str) -> bool {
-    flag.strip_prefix('-').is_some_and(|f| {
-        f.ends_with('c') && f.chars().all(|c| matches!(c, 'c' | 'l' | 'i'))
-    })
+    flag.strip_prefix('-')
+        .is_some_and(|f| f.ends_with('c') && f.chars().all(|c| matches!(c, 'c' | 'l' | 'i')))
 }
 
 fn operands<'a>(args: &[&'a str]) -> Vec<&'a str> {
-    args.iter().copied().filter(|a| !a.starts_with('-')).collect()
+    args.iter()
+        .copied()
+        .filter(|a| !a.starts_with('-'))
+        .collect()
 }
 
 fn git(args: &[&str], here: &Here<'_>, repo: &Repo<'_>, depth: usize, moved: bool) -> Class {
@@ -244,21 +251,28 @@ fn git(args: &[&str], here: &Here<'_>, repo: &Repo<'_>, depth: usize, moved: boo
         return Class::Other;
     }
     if let Some(alias) = repo.aliases.get(*sub) {
-        let tail = rest.iter().map(|a| shell_word(a)).collect::<Vec<_>>().join(" ");
+        let tail = rest
+            .iter()
+            .map(|a| shell_word(a))
+            .collect::<Vec<_>>()
+            .join(" ");
         return match alias.strip_prefix('!') {
             Some(script) => classed(&format!("{script} {tail}"), here, repo, depth + 1),
             None => classed(&format!("git {alias} {tail}"), here, repo, depth + 1),
         };
     }
-    let flags: Vec<&str> = rest.iter().copied().filter(|a| a.starts_with('-')).collect();
+    let flags: Vec<&str> = rest
+        .iter()
+        .copied()
+        .filter(|a| a.starts_with('-'))
+        .collect();
     let ops = operands(rest);
     let is_base = |b: &str| {
         here.default_branch
             .is_some_and(|d| b == d || b.strip_prefix("origin/") == Some(d))
     };
-    let from_own = |remote: Option<&&str>| {
-        remote.is_none_or(|r| *r == "origin" || repo.upstream == Some(*r))
-    };
+    let from_own =
+        |remote: Option<&&str>| remote.is_none_or(|r| *r == "origin" || repo.upstream == Some(*r));
     match *sub {
         "push" => {
             let words: Vec<Word> = rest
@@ -300,7 +314,11 @@ fn git(args: &[&str], here: &Here<'_>, repo: &Repo<'_>, depth: usize, moved: boo
         },
         "stash" => match rest {
             [] | ["list" | "show" | "pop" | "apply"] => Class::LocalGit,
-            ["push", more @ ..] if more.iter().all(|m| matches!(*m, "-m" | "--message") || !m.starts_with('-')) => {
+            ["push", more @ ..]
+                if more
+                    .iter()
+                    .all(|m| matches!(*m, "-m" | "--message") || !m.starts_with('-')) =>
+            {
                 Class::LocalGit
             }
             _ => Class::Other,
@@ -310,7 +328,9 @@ fn git(args: &[&str], here: &Here<'_>, repo: &Repo<'_>, depth: usize, moved: boo
             _ => Class::Other,
         },
         "fetch" => {
-            let plain = flags.iter().all(|f| matches!(*f, "--prune" | "-p" | "--tags" | "-q" | "--quiet"));
+            let plain = flags
+                .iter()
+                .all(|f| matches!(*f, "--prune" | "-p" | "--tags" | "-q" | "--quiet"));
             match (plain, ops.as_slice()) {
                 (true, [] | [_]) if from_own(ops.first()) => Class::FetchPull,
                 (true, [_, branch]) if from_own(ops.first()) && !branch.contains(':') => {
@@ -321,7 +341,9 @@ fn git(args: &[&str], here: &Here<'_>, repo: &Repo<'_>, depth: usize, moved: boo
         }
         "pull" => {
             let how = flags.iter().any(|f| matches!(*f, "--rebase" | "--ff-only"));
-            let plain = flags.iter().all(|f| matches!(*f, "--rebase" | "--ff-only" | "-q" | "--quiet"));
+            let plain = flags
+                .iter()
+                .all(|f| matches!(*f, "--rebase" | "--ff-only" | "-q" | "--quiet"));
             match (how && plain, ops.as_slice()) {
                 (true, [] | [_]) if from_own(ops.first()) => Class::FetchPull,
                 (true, [_, branch]) if from_own(ops.first()) && !branch.contains(':') => {
@@ -336,14 +358,23 @@ fn git(args: &[&str], here: &Here<'_>, repo: &Repo<'_>, depth: usize, moved: boo
 
 /// A word as the shell would read it back as one.
 fn shell_word(w: &str) -> String {
-    match w.chars().all(|c| c.is_ascii_alphanumeric() || "-_./:=@+,%".contains(c)) {
+    match w
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || "-_./:=@+,%".contains(c))
+    {
         true => w.to_string(),
         false => format!("'{}'", w.replace('\'', "'\\''")),
     }
 }
 
 fn gh(args: &[&str], here: &Here<'_>) -> Class {
-    let has = |names: &[&str]| args.iter().any(|a| names.iter().any(|n| a == n || a.starts_with(&format!("{n}="))));
+    let has = |names: &[&str]| {
+        args.iter().any(|a| {
+            names
+                .iter()
+                .any(|n| a == n || a.starts_with(&format!("{n}=")))
+        })
+    };
     match args {
         ["pr", "view" | "checks" | "diff" | "list", ..]
         | ["run", "view" | "list" | "watch", ..]
@@ -375,7 +406,7 @@ fn gh(args: &[&str], here: &Here<'_>) -> Class {
                 Some(m) => m.eq_ignore_ascii_case("GET"),
                 None => !sends,
             };
-            match reads && !operands(rest).first().is_some_and(|p| *p == "graphql") {
+            match reads && operands(rest).first().is_none_or(|p| *p != "graphql") {
                 true => Class::GhRead,
                 false => Class::Other,
             }
@@ -393,7 +424,10 @@ fn build(program: &str, args: &[&str]) -> Option<Class> {
         .any(|a| *a == "--config" || a.starts_with("--config=") || *a == "-Z");
     let built = match (program, args) {
         ("cargo", [sub, ..]) => {
-            matches!(*sub, "test" | "build" | "check" | "clippy" | "fmt" | "nextest") && !sets_runner
+            matches!(
+                *sub,
+                "test" | "build" | "check" | "clippy" | "fmt" | "nextest"
+            ) && !sets_runner
         }
         ("npm", ["ci", ..]) => true,
         ("pnpm" | "yarn", ["install", rest @ ..]) => rest.contains(&"--frozen-lockfile"),
@@ -401,7 +435,9 @@ fn build(program: &str, args: &[&str]) -> Option<Class> {
         ("python" | "python3", ["-m", "pytest", ..]) => true,
         ("go", [sub, ..]) => matches!(*sub, "test" | "build" | "vet"),
         ("tsc" | "eslint", _) => true,
-        ("prettier", rest) => rest.contains(&"--check") && !rest.iter().any(|a| a.starts_with("--write")),
+        ("prettier", rest) => {
+            rest.contains(&"--check") && !rest.iter().any(|a| a.starts_with("--write"))
+        }
         ("mvn", [sub, ..]) => matches!(*sub, "test" | "verify"),
         ("gradle", [sub, ..]) => matches!(*sub, "test" | "build"),
         _ => false,
@@ -433,9 +469,17 @@ fn registry_name(op: &str) -> bool {
 /// An install of named packages from the default registry.
 fn install(program: &str, args: &[&str]) -> Option<Class> {
     let elsewhere = args.iter().any(|a| {
-        ["--registry", "--index-url", "-i", "--extra-index-url", "--git", "--path", "--index"]
-            .iter()
-            .any(|f| a == f || a.starts_with(&format!("{f}=")))
+        [
+            "--registry",
+            "--index-url",
+            "-i",
+            "--extra-index-url",
+            "--git",
+            "--path",
+            "--index",
+        ]
+        .iter()
+        .any(|f| a == f || a.starts_with(&format!("{f}=")))
     });
     let named = |ops: &[&str]| !ops.is_empty() && ops.iter().all(|o| registry_name(o));
     let installs = match (program, args) {
@@ -473,7 +517,9 @@ fn shipping(program: &str, args: &[&str]) -> Option<Class> {
         ) => Some(Class::Deploy),
         ("kubectl", ["get" | "describe" | "logs" | "top", ..]) => Some(Class::ProdRead),
         ("aws", [_, op, ..])
-            if ["describe-", "get-", "list-"].iter().any(|p| op.starts_with(p)) =>
+            if ["describe-", "get-", "list-"]
+                .iter()
+                .any(|p| op.starts_with(p)) =>
         {
             Some(Class::ProdRead)
         }
@@ -516,11 +562,17 @@ mod tests {
     #[test]
     fn only_the_branch_its_on_to_origin_is_its_own_push() {
         assert_eq!(class("git push origin feat/x"), Class::OwnBranchPush);
-        assert_eq!(class("/bin/bash -lc 'git push -u origin HEAD'"), Class::OwnBranchPush);
+        assert_eq!(
+            class("/bin/bash -lc 'git push -u origin HEAD'"),
+            Class::OwnBranchPush
+        );
         for (command, want) in [
             ("git push origin HEAD:main", Class::DefaultBranchPush),
             ("git push origin +feat/x", Class::ForcePush),
-            ("git push --force-with-lease origin feat/x", Class::ForcePush),
+            (
+                "git push --force-with-lease origin feat/x",
+                Class::ForcePush,
+            ),
             ("git push -f origin feat/x", Class::ForcePush),
             ("git push --mirror origin", Class::ForcePush),
             ("git push --all origin", Class::Other),
@@ -537,11 +589,22 @@ mod tests {
 
     #[test]
     fn a_command_is_its_riskiest_part_however_it_is_wrapped() {
-        assert_eq!(class("true && git push origin main"), Class::DefaultBranchPush);
+        assert_eq!(
+            class("true && git push origin main"),
+            Class::DefaultBranchPush
+        );
         assert_eq!(class("sh -c 'git push -f'"), Class::ForcePush);
         assert_eq!(class("eval git push -f origin feat/x"), Class::ForcePush);
-        assert_eq!(class("git pf"), Class::ForcePush, "an alias that runs a shell");
-        assert_eq!(class("git up"), Class::OwnBranchPush, "an alias of git's own");
+        assert_eq!(
+            class("git pf"),
+            Class::ForcePush,
+            "an alias that runs a shell"
+        );
+        assert_eq!(
+            class("git up"),
+            Class::OwnBranchPush,
+            "an alias of git's own"
+        );
         assert_eq!(class("git st && cargo test"), Class::TestBuild);
         assert_eq!(class("git add -A && git commit -m 'x y'"), Class::Commit);
         assert_eq!(class("git status $(rm -rf /)"), Class::Other, "unparsable");
@@ -590,7 +653,10 @@ mod tests {
         ] {
             assert_eq!(class(c), Class::Other, "{c}");
         }
-        assert_eq!(class_with("git commit --amend --no-edit", false), Class::Commit);
+        assert_eq!(
+            class_with("git commit --amend --no-edit", false),
+            Class::Commit
+        );
         assert_eq!(
             class_with("git commit --amend --no-edit", true),
             Class::Other,
@@ -598,7 +664,11 @@ mod tests {
         );
         assert_eq!(class("git fetch origin"), Class::FetchPull);
         assert_eq!(class("git pull --rebase origin main"), Class::FetchPull);
-        assert_eq!(class("git pull origin main"), Class::Other, "a merge it may make");
+        assert_eq!(
+            class("git pull origin main"),
+            Class::Other,
+            "a merge it may make"
+        );
         assert_eq!(class("git fetch upstream-fork"), Class::Other);
     }
 

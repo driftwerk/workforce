@@ -110,7 +110,11 @@ impl Mode {
     /// is then the boss's to decide, so neither auto mode's network nor
     /// Codex's own reviewer applies; plan and bypass are the person's
     /// explicit choices and stay as they are.
-    pub fn codex_permissions(self, charged: bool, approve_for_me: bool) -> crate::codex::Permissions {
+    pub fn codex_permissions(
+        self,
+        charged: bool,
+        approve_for_me: bool,
+    ) -> crate::codex::Permissions {
         use crate::codex::{Network, Permissions, Reviewer};
         let asks = |reviewer| Permissions {
             approval: "on-request",
@@ -186,7 +190,10 @@ mod tests {
                     false => Reviewer::User,
                 };
                 for m in [Mode::Default, Mode::AcceptEdits] {
-                    assert_eq!(row(m, charged, afm), (ws.0, ws.1, Network::Person, reviewer));
+                    assert_eq!(
+                        row(m, charged, afm),
+                        (ws.0, ws.1, Network::Person, reviewer)
+                    );
                 }
                 let auto = match charged {
                     false => (ws.0, ws.1, Network::On, Reviewer::AutoReview),
@@ -199,7 +206,12 @@ mod tests {
                 );
                 assert_eq!(
                     row(Mode::BypassPermissions, charged, afm),
-                    ("never", "danger-full-access", Network::Person, Reviewer::User)
+                    (
+                        "never",
+                        "danger-full-access",
+                        Network::Person,
+                        Reviewer::User
+                    )
                 );
             }
         }

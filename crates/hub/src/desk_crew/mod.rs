@@ -81,6 +81,7 @@ pub(crate) mod served;
 pub(crate) mod shared_budget;
 mod spend;
 mod stalls;
+mod standing;
 mod tickets;
 mod tools;
 mod updates;
@@ -381,6 +382,8 @@ pub struct CrewHub {
     /// Each boss's mind: its own deciding, one stretch at a time
     /// ([`mind`]).
     minds: mind::Minds,
+    /// Each boss's standing verdicts on its sessions ([`standing`]).
+    standings: standing::Standings,
     /// Each oversight conversation's notices at Act fully, by boss and
     /// person ([`orchestrator`]).
     notices: orchestrator::Notices,
@@ -863,6 +866,7 @@ impl CrewHub {
             native: Arc::default(),
             relay_wait: Mutex::new(Duration::from_secs(30)),
             minds: mind::Minds::default(),
+            standings: standing::Standings::default(),
             notices: orchestrator::Notices::default(),
             watches_in_flight: Mutex::default(),
             watch_reads: Mutex::default(),

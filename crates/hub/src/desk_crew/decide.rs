@@ -30,6 +30,7 @@ use workforce_agent::runner::with_served_log;
 use workforce_common::cost::{CostEntry, TokenCounts};
 use workforce_common::oversight::Level;
 use workforce_common::subscription::{Origin, Served};
+use workforce_desk::computer::boss::Class;
 use workforce_desk::crew::{By, Kind, Party};
 use workforce_desk::decision::{BossDecision, How, Need};
 use workforce_desk::model::{DeskEvent, PendingApproval, SessionView};
@@ -592,9 +593,14 @@ impl CrewHub {
                 && !self.desk.asks_in_dialog(view.id)
                 && (p.tool != "Input" || p.detail.contains("permission"));
             if !prompt {
-                return waits(
-                    "it asks in its own terminal's dialog, which only you can answer".into(),
-                );
+                return waits(match view.engine {
+                    // Desk answers each of Codex's approvals and questions:
+                    // what waits in its terminal is none of them.
+                    workforce_desk::engine::Engine::Codex => {
+                        "it waits in its own terminal on something Desk doesn't answer".into()
+                    }
+                    _ => "it asks in its own terminal's dialog, which only you can answer".into(),
+                });
             }
             return self.clear_terminal(&view, &p, &boss, cleared, waits);
         }
@@ -774,7 +780,12 @@ impl CrewHub {
     }
 
     /// The boss's decision on `view`'s request `p`, done.
-    async fn decide_request(&self, view: &SessionView, p: &PendingApproval, boss: &str) -> Outcome {
+    async fn decide_request(
+        self: &Arc<Self>,
+        view: &SessionView,
+        p: &PendingApproval,
+        boss: &str,
+    ) -> Outcome {
         // This hub's own boss, or one on another hub served from a grant
         // here, whose call is made on its own hub ([`super::remote_decide`]).
         let Some(decider) = self.decider_of(boss, view) else {
@@ -792,11 +803,29 @@ impl CrewHub {
         let mut lasting = false;
         // A request that only reads is allowed with no call, whatever
         // holds the session: a hold stops new work, never reading.
-        let mut decided = read_only_in(&view.cwd, p).then(|| Verdict::Allow(ONLY_READS.into()));
+        let reads = read_only_in(&view.cwd, p);
+        // What kind of step it is: git is asked off the async workers.
+        let class = match reads {
+            true => Class::Other,
+            false => {
+                let (desk, id, approval, boss) =
+                    (self.desk.clone(), view.id, p.id, boss.to_string());
+                tokio::task::spawn_blocking(move || desk.request_class(id, approval, &boss))
+                    .await
+                    .unwrap_or(Class::Other)
+            }
+        };
+        let mut decided = match reads {
+            true => Some(Verdict::Allow(ONLY_READS.into())),
+            false => self
+                .standing_allow(&decider, view, class, boss)
+                .await
+                .map(Verdict::Allow),
+        };
         let prompt = match decided {
             Some(_) => None,
             None => Some(
-                self.decision_prompt(boss, view, p, &decider.oversight)
+                self.decision_prompt(boss, view, p, class, &decider.oversight)
                     .await,
             ),
         };
@@ -1024,20 +1053,7 @@ impl CrewHub {
             "waiting_on": account.as_ref().and_then(|a| a.waiting_on.as_ref()),
             "last_reply": self.desk.reply_for_boss(view, 0, LAST_REPLY, workforce_desk::crew::ReadOn::Not),
         });
-        let prefs = self
-            .preferences_context(
-                &workforce_desk::preference::boss_scope_of(o.scope.group()),
-                Some(view.id),
-                true,
-            )
-            .await
-            .map(|p| format!("\n\n{}\n{}", p.listed, p.how))
-            .unwrap_or_default();
-        let orders = self
-            .orders_words(boss, Some(view.id))
-            .await
-            .map(|w| format!("\n\n{w}"))
-            .unwrap_or_default();
+        let words = self.directive_words(boss, view.id, o).await;
         // The live picture of it: the person's words, every turn's
         // instructions, what it said (`super::picture`).
         let picture = self
@@ -1057,7 +1073,7 @@ impl CrewHub {
             false => String::new(),
         };
         let check = format!("\n\n{}{spent}", super::context::CHECK_FIRST_FOCUSED);
-        (session, format!("{check}{orders}{prefs}{picture}"))
+        (session, format!("{check}{words}{picture}"))
     }
 
     /// What `boss`'s model is given to decide `p`: the whole request, the
@@ -1068,6 +1084,7 @@ impl CrewHub {
         boss: &str,
         view: &SessionView,
         p: &PendingApproval,
+        class: Class,
         o: &workforce_common::oversight::Oversight,
     ) -> String {
         let request = match &p.request {
@@ -1111,8 +1128,12 @@ impl CrewHub {
             .push_kind(view.id, p.id, boss)
             .map(|k| format!("Desk read its push as: {} (own_branch is the session's own branch to origin).\n\n", k.as_str()))
             .unwrap_or_default();
+        let class = format!(
+            "Desk read its class as: {} (the riskiest step in it; other is what Desk can't read for certain).\n\n",
+            class.as_str()
+        );
         format!(
-            "{MARK} A session you oversee asks to do this. Decide it now.\n\n{codex}{devin}{push}{}\n\n{}{prefs}",
+            "{MARK} A session you oversee asks to do this. Decide it now.\n\n{codex}{devin}{push}{class}{}\n\n{}{prefs}",
             super::watcher::reported(&session.to_string(), "the session"),
             super::watcher::reported(&request.to_string(), "its request, whole"),
         )

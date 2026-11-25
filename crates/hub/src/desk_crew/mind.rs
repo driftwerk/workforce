@@ -115,6 +115,12 @@ impl Minds {
             .unwrap_or(false)
     }
 
+    /// Whether one of the person's turns in `boss`'s DM runs, however long
+    /// ago it began.
+    pub(super) fn person_in_turn(&self, boss: &str) -> bool {
+        self.person.lock().contains_key(boss)
+    }
+
     /// Whether one of the person's turns in `boss`'s DM runs, begun within
     /// [`PERSON_YIELD`].
     fn person_running(&self, boss: &str) -> bool {

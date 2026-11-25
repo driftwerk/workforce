@@ -1079,7 +1079,12 @@ impl Desk {
     /// [`Self::push_kind`] reads it for `boss`, in its folder's repository
     /// as it is now ([`crate::computer::boss::Class`]): anything but a
     /// command Desk read in full is [`crate::computer::boss::Class::Other`].
-    pub fn request_class(&self, id: Uuid, approval: Uuid, boss: &str) -> crate::computer::boss::Class {
+    pub fn request_class(
+        &self,
+        id: Uuid,
+        approval: Uuid,
+        boss: &str,
+    ) -> crate::computer::boss::Class {
         use crate::computer::boss::{Class, Repo};
         let Some(pending) = self.pending_of(id, approval).filter(|p| p.tool == "Bash") else {
             return Class::Other;
@@ -1099,7 +1104,11 @@ impl Desk {
                 })
                 .collect();
         let is_branch = |b: &str| {
-            git_line(&cwd, &["rev-parse", "-q", "--verify", &format!("refs/heads/{b}")]).is_some()
+            git_line(
+                &cwd,
+                &["rev-parse", "-q", "--verify", &format!("refs/heads/{b}")],
+            )
+            .is_some()
         };
         let head_pushed = std::process::Command::new("git")
             .arg("-C")
@@ -1472,8 +1481,10 @@ impl Desk {
             {
                 return refuse("it's asking something of its own; that's the person's to answer");
             }
+            // Codex's front request is one of its asks: cancelled once.
             l.pending
                 .iter()
+                .filter(|p| !l.codex_asks.iter().any(|a| a.pending.id == p.id))
                 .map(|p| (p.clone(), false))
                 .chain(l.codex_asks.iter().map(|a| (a.pending.clone(), true)))
                 .collect()

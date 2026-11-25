@@ -395,28 +395,42 @@ impl Desk {
     /// started in: a charge taken or released, a boss's grant changed.
     /// One Desk now leaves to the person's own runs on as it is.
     fn permissions_changed(&self, kept: &HashMap<Uuid, Kept>) -> Vec<Uuid> {
-        let running: Vec<(Uuid, bool, Option<crate::codex::Permissions>)> = {
+        type Running = (Uuid, bool, Option<crate::codex::Permissions>, bool);
+        let running: Vec<Running> = {
             let st = self.0.state.lock();
             st.live
                 .iter()
                 .filter_map(|(id, l)| {
                     let link = l._codex.as_ref()?;
                     let r = st.records.get(id)?;
-                    Some((*id, r.approve_for_me, link.permissions))
+                    Some((*id, r.approve_for_me, link.permissions, link.settled))
                 })
                 .collect()
         };
+        let loaded = self.charges_loaded();
         running
             .into_iter()
-            .filter(|(id, approve_for_me, launched)| {
+            .filter(|(id, approve_for_me, launched, settled)| {
                 let mode = kept
                     .get(id)
                     .filter(|k| k.holds() && (k.mode.asks() || self.unbound_runs(*id, &k.boss)))
                     .map(|k| k.mode);
-                self.codex_permissions(*id, mode, *approve_for_me)
-                    .is_some_and(|now| Some(now) != *launched)
+                let now = self.codex_permissions(*id, mode, *approve_for_me);
+                if *settled {
+                    return now.is_some_and(|now| Some(now) != *launched);
+                }
+                // Adopted before charges were read: it runs in what it was
+                // started in then, which is what they say now.
+                if loaded {
+                    let mut st = self.0.state.lock();
+                    if let Some(link) = st.live.get_mut(id).and_then(|l| l._codex.as_mut()) {
+                        link.permissions = now;
+                        link.settled = true;
+                    }
+                }
+                false
             })
-            .map(|(id, _, _)| id)
+            .map(|(id, ..)| id)
             .collect()
     }
 

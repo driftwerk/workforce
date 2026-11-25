@@ -93,6 +93,8 @@ mod breaker_tests;
 #[cfg(test)]
 mod codex_asks_tests;
 #[cfg(test)]
+mod codex_real_tests;
+#[cfg(test)]
 mod codex_resume_tests;
 mod ledger;
 mod plans;
@@ -683,6 +685,10 @@ struct CodexLink {
     line_steers: mpsc::UnboundedSender<(Uuid, String)>,
     /// What Desk launched it in; none, the person's own.
     permissions: Option<codex::Permissions>,
+    /// Whether `permissions` is known to be what it runs in: one adopted
+    /// before Desk knew which sessions bosses run is read again once it
+    /// does, never started again for it.
+    settled: bool,
     /// Whether its network is on, as Codex said it runs its thread.
     network: Option<bool>,
 }
@@ -1659,9 +1665,7 @@ fn asking(p: &PendingApproval) -> String {
         "Plan" => "wants its plan approved".into(),
         "Bash" => format!("wants to run {}", crew::clip(&detail, 160)),
         "Edit" | "Write" | "MultiEdit" => format!("wants to edit {}", crew::clip(&detail, 160)),
-        _ if p.in_terminal() => {
-            "is waiting for an answer in its terminal".into()
-        }
+        _ if p.in_terminal() => "is waiting for an answer in its terminal".into(),
         _ => format!("wants to use {}", crew::clip(&p.tool, 160)),
     }
 }
@@ -2383,14 +2387,14 @@ impl Desk {
                     let socket = server.meta["socket"].as_str().map(PathBuf::from);
                     let (server_pty, _) = holder.adopt(&server, history, None);
                     let server = Server::Held(Arc::new(server_pty));
-                    let permissions = self.codex_permissions(
-                        id,
-                        self.kept_mode(id).await,
-                        record.approve_for_me,
-                    );
+                    let permissions =
+                        self.codex_permissions(id, self.kept_mode(id).await, record.approve_for_me);
                     socket.map(|socket| {
                         let follower = self.codex_follower(record.cli_session_id.clone());
-                        self.observe_codex(id, server, socket, follower.at_once(), permissions)
+                        let mut link =
+                            self.observe_codex(id, server, socket, follower.at_once(), permissions);
+                        link.settled = self.charges_loaded();
+                        link
                     })
                 }
                 other => {
@@ -6368,7 +6372,7 @@ impl Desk {
                 return;
             };
             link.network = runs.network;
-            link.permissions
+            link.permissions.filter(|_| link.settled)
         };
         let differs = asked.as_ref().and_then(|a| runs.differs(a));
         if let (Some(differs), Ok(view)) = (differs, self.view(id)) {
@@ -6427,6 +6431,7 @@ impl Desk {
             steers,
             line_steers,
             permissions,
+            settled: true,
             network: None,
         }
     }
@@ -12989,6 +12994,7 @@ mod codex_stop_tests {
             steers: mpsc::unbounded_channel().0,
             line_steers: mpsc::unbounded_channel().0,
             permissions: None,
+            settled: true,
             network: None,
         };
         (link, pid, hdir)
