@@ -370,37 +370,36 @@ fn esc_key(pending: i64, now: i64) -> Option<i64> {
     (pending != 0 && now - pending > ESC_TAIL_MS).then_some(pending)
 }
 
-/// How many of a screen's last lines a draft is looked for in: its prompt
-/// and what wraps there.
-const DRAFT_LINES: usize = 30;
+/// How many of a screen's last lines a draft is looked for in: its
+/// prompt's input and what frames it, not what the session said above.
+const COMPOSER_LINES: usize = 10;
 
 /// How much of a draft's start and end is looked for on its screen.
 const DRAFT_MARK: usize = 40;
 
-/// The person's draft in a prompt: when it was put there, and its start
-/// and end as its screen would show them, letters and digits only (what
-/// wraps it, borders and spacing aside).
+/// The fewest letters and digits a draft's start or end is looked for
+/// with: a shorter draft must be a prompt row's whole content.
+const DRAFT_MARK_MIN: usize = 12;
+
+/// What Codex (`[Pasted Content 1200 chars]`) and Claude Code (`[Pasted
+/// text #1 +40 lines]`) show in their prompt for a long paste instead of
+/// its words.
+const COLLAPSED_PASTES: [&str; 2] = ["[Pasted Content ", "[Pasted text #"];
+
+/// The person's draft in a prompt: when it was put there, and its words as
+/// its screen would show them, letters and digits only (what wraps it,
+/// borders and spacing aside).
 #[derive(Debug)]
 struct Draft {
     at: chrono::DateTime<chrono::Utc>,
-    marks: [String; 2],
+    plain: String,
 }
 
 impl Draft {
     fn new(text: &str) -> Self {
-        let first = text
-            .lines()
-            .map(Self::plain)
-            .find(|l| !l.is_empty())
-            .unwrap_or_default()
-            .chars()
-            .take(DRAFT_MARK)
-            .collect();
-        let all: Vec<char> = Self::plain(text).chars().collect();
-        let last = all[all.len().saturating_sub(DRAFT_MARK)..].iter().collect();
         Self {
             at: chrono::Utc::now(),
-            marks: [first, last],
+            plain: Self::plain(text),
         }
     }
 
@@ -408,12 +407,25 @@ impl Draft {
         text.chars().filter(|c| c.is_alphanumeric()).collect()
     }
 
-    /// Whether `shown`, the end of its screen, still shows it.
-    fn shown_in(&self, shown: &str) -> bool {
-        let shown = Self::plain(shown);
-        self.marks
+    /// Whether `screen` (as [`Pty::text`] gives it) still shows it in its
+    /// prompt, its last lines. Unsure is shown: a prompt with nothing on
+    /// it yet, or one showing a long paste collapsed, which may be it.
+    fn shown_in(&self, screen: &str) -> bool {
+        let prompt = shown_end(screen, COMPOSER_LINES);
+        if prompt.trim().is_empty() || COLLAPSED_PASTES.iter().any(|p| prompt.contains(p)) {
+            return true;
+        }
+        let rows: Vec<String> = prompt.lines().map(Self::plain).collect();
+        let chars: Vec<char> = self.plain.chars().collect();
+        if chars.len() < DRAFT_MARK_MIN {
+            return rows.contains(&self.plain);
+        }
+        let shown = rows.concat();
+        let first: String = chars.iter().take(DRAFT_MARK).collect();
+        let last: String = chars[chars.len().saturating_sub(DRAFT_MARK)..]
             .iter()
-            .any(|m| !m.is_empty() && shown.contains(m.as_str()))
+            .collect();
+        shown.contains(&first) || shown.contains(&last)
     }
 }
 
@@ -591,9 +603,9 @@ impl Pty {
     /// Whether the person's draft still shows at the end of its screen:
     /// one it no longer shows was cleared, and is forgotten.
     pub fn draft_shown(&self) -> bool {
-        let shown = shown_end(&self.text(), DRAFT_LINES);
+        let screen = self.text();
         let mut draft = self.draft.lock();
-        let kept = draft.as_ref().is_some_and(|d| d.shown_in(&shown));
+        let kept = draft.as_ref().is_some_and(|d| d.shown_in(&screen));
         if !kept {
             *draft = None;
         }
@@ -1121,20 +1133,70 @@ pub(crate) mod tests {
         assert_eq!(keyed(0, b"", 1_020), (None, 0));
     }
 
+    /// A screen busy with what its session said, its prompt at the end.
+    fn screen(prompt: &str) -> String {
+        let said: String = (0..40)
+            .map(|i| format!("● ok: step {i} of the build is done, it's OK\n"))
+            .collect();
+        format!("{said}\n╭──────────────────────────────────────╮\n{prompt}\n╰──────────────────────────────────────╯\n  ? for shortcuts")
+    }
+
     #[test]
-    fn a_draft_is_shown_while_its_start_or_end_is_on_screen() {
+    fn a_draft_is_shown_while_its_prompt_shows_its_start_or_end() {
         let draft = Draft::new(
-            "\nAbout your questions: keep the old table, it still has rows from March, and drop the new one",
+            "About your questions: keep the old table, it still has rows from March, and drop the new one",
         );
-        let wrapped = "│ > About your questions: keep the old table, it still │\n│ has rows from March, and drop the new one            │";
-        assert!(draft.shown_in(wrapped));
+        assert!(draft.shown_in(&screen(
+            "│ > About your questions: keep the old table, it still │\n│ has rows from March, and drop the new one            │"
+        )));
+        assert!(draft.shown_in(&screen(
+            "│ > …old table, it still has rows from March, and drop the new one │"
+        )));
+        assert!(draft.shown_in(&screen(
+            "│ > About your questions: keep the old table, it still │"
+        )));
+        assert!(!draft.shown_in(&screen("│ > About your questions: keep the old │")));
+        assert!(!draft.shown_in(&screen("│ >                                     │")));
+    }
+
+    #[test]
+    fn a_long_paste_its_prompt_collapsed_is_shown() {
+        let draft = Draft::new(&"Keep the old table. ".repeat(60));
         assert!(
-            draft.shown_in("│ > …old table, it still has rows from March, and drop the new one │")
+            draft.shown_in(&screen("› [Pasted Content 1200 chars]")),
+            "Codex"
         );
-        assert!(draft.shown_in("│ > About your questions: keep the old table, it still │"));
-        assert!(!draft.shown_in("│ > About your questions: keep the old │"));
-        assert!(!draft.shown_in("│ >                                     │"));
-        assert!(!Draft::new(" ?! ").shown_in("?!"), "nothing to look for");
+        assert!(
+            draft.shown_in(&screen("│ > [Pasted text #1 +40 lines] │")),
+            "Claude Code"
+        );
+        assert!(!draft.shown_in(&screen("│ >                                     │")));
+    }
+
+    #[test]
+    fn a_draft_is_looked_for_in_its_prompt_not_in_what_was_said_above_it() {
+        let draft = Draft::new("OK\nkeep the old table, and drop the new one");
+        assert!(draft.shown_in(&screen("│ > OK                                  │\n│   keep the old table, and drop the new one │")));
+        assert!(
+            !draft.shown_in(&screen("│ >                                     │")),
+            "cleared"
+        );
+        let short = Draft::new("ok!");
+        assert!(short.shown_in(&screen("│ > ok!                                 │")));
+        assert!(
+            !short.shown_in(&screen("│ >                                     │")),
+            "cleared"
+        );
+        assert!(
+            !short.shown_in(&screen("│ > ok, and the docs                    │")),
+            "not all of it"
+        );
+    }
+
+    #[test]
+    fn a_prompt_not_yet_drawn_keeps_a_draft() {
+        assert!(Draft::new("ok").shown_in(""));
+        assert!(Draft::new("ok").shown_in("\n\n   \n"));
     }
 
     #[tokio::test]

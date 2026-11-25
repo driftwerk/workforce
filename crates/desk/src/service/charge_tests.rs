@@ -752,11 +752,28 @@ async fn a_draft_holds_the_bosss_message_until_the_next_turn_starts() {
     .await;
 }
 
+/// A desk whose sessions say what they did, then show a prompt their
+/// terminal echoes what it is sent at: a draft shows there.
+async fn prompting_desk(pool: workforce_postgres::PostgresPool, dir: &std::path::Path) -> Desk {
+    let cli = dir.join("prompting-cli");
+    workforce_common::executable::write(
+        &cli,
+        "#!/bin/sh\ni=0\nwhile [ $i -lt 30 ]; do echo \"step $i of the build is done, ok\"; i=$((i+1)); done\nprintf '> '\nexec sleep 60\n",
+    )
+    .unwrap();
+    super::super::tests::logged_desk(pool, dir, cli).await.0
+}
+
 /// A draft put in the prompt of a session Sarah runs, her hold short, and
-/// her message it holds. Its terminal echoes what it is sent, so the draft
-/// shows on its screen.
+/// her message it holds.
 async fn drafted(d: &Desk, dir: &std::path::Path) -> (Uuid, Uuid) {
     let id = typed_into(d, dir).await;
+    for _ in 0..100 {
+        if d.terminal_text(id, 4000).unwrap().contains("step 29") {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
     d.set_holds([("sarah".to_string(), chrono::Duration::milliseconds(300))].into());
     d.line_draft(id, "About your questions: keep the old table")
         .unwrap();
@@ -783,7 +800,7 @@ async fn drafted(d: &Desk, dir: &std::path::Path) -> (Uuid, Uuid) {
 async fn a_draft_still_shown_past_the_hold_holds_on() {
     with_test_pool(build_pool, |pool| async move {
         let dir = tempfile::tempdir().unwrap();
-        let d = desk(pool, dir.path()).await;
+        let d = prompting_desk(pool, dir.path()).await;
         let (id, m) = drafted(&d, dir.path()).await;
         tokio::time::sleep(Duration::from_millis(1500)).await;
         assert_eq!(
@@ -800,7 +817,7 @@ async fn a_draft_still_shown_past_the_hold_holds_on() {
 async fn a_draft_cleared_by_hand_lets_the_bosss_message_in() {
     with_test_pool(build_pool, |pool| async move {
         let dir = tempfile::tempdir().unwrap();
-        let d = desk(pool, dir.path()).await;
+        let d = prompting_desk(pool, dir.path()).await;
         let (id, m) = drafted(&d, dir.path()).await;
         let pty = d.attach(id).unwrap();
         let (viewer, _, _) = pty.attach();
