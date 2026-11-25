@@ -599,6 +599,14 @@ fn pointed_at(name: &str, mine: Option<&str>, other: &Client, dir: &Path) -> Vec
                 true,
             ),
         ],
+        // Only a review session of its own scope is recorded.
+        super::super::review::RECORD => vec![(json!({ "session_id": s }), true)],
+        // Only a pull request on a branch of a session it runs is merged:
+        // nothing of another scope's is read to refuse it.
+        super::super::review::MERGE => vec![(
+            json!({ "repo": "acme/widgets", "number": 1, "reason": r }),
+            false,
+        )],
         // Its own waits alone, kept by boss and person.
         super::super::watches::WATCHES => vec![(json!({}), false)],
         // Always the person's yes, and even then never another scope's.

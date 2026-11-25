@@ -376,10 +376,11 @@ impl CrewHub {
             .as_str()
             .and_then(|s| s.trim().parse().ok())
             .ok_or("Say which review session (session_id).")?;
+        self.session_seen(id, &b.seen)?;
         let v = self
             .desk
             .view(id)
-            .map_err(|_| self.not_ours(&b.oversight.scope))?;
+            .map_err(|_| self.not_ours(&b.seen.scope))?;
         if !self
             .desk
             .charge_of(id)
