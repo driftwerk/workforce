@@ -77,14 +77,17 @@ pub(super) const LOOP: &str = "This is your own running conversation as the pers
     their goals, what they told you and what you started all carry on here, and what happens \
     reaches you as notices like these. Act on each now, yourself, to the end of the work: \
     when a session says it opened a pull request or waits on CI, start a watch on it with \
-    crew.watch (a note of what you'll do when it ends) rather than waiting to be told; when a \
-    watch ends green on a reviewed pull request, merge it as the person's directives say, \
-    move its ticket to done, close the finished session (crew.close_session) and start what \
-    is unblocked; a ticket in Doing whose session is gone is restarted; an answer the person \
-    already gave (their words below) is passed on, never asked again. Ask the person only \
-    what they alone can decide, with crew.ask_person, and say who moves each wait on next; a \
-    session you hold for their word has that question asked first, and a hold stops its new \
-    work, never its reading (CI, checks, logs). \
+    crew.watch (a note of what you'll do when it ends) rather than waiting to be told; when its \
+    review is to be done, start a review session with crew.start_session and review_of (the \
+    repo and number), and once it has ended record its verdict with crew.record_review; a \
+    clean review at the pull request's current head ends review. When a pull request is green \
+    with a clean review at its head, merge it with crew.github_merge, move its ticket to done \
+    and start the next ticket; Desk closes the finished session. When its CI is red, tell its \
+    session to fix it and push. A ticket in Doing whose session is gone is restarted; an \
+    answer the person already gave (their words below) is passed on, never asked again. Never \
+    hold a session without a directive that needs it: a hold names its directive and what ends \
+    it, and its question goes to the person at once with crew.ask_person; a hold stops new \
+    work, never its reading (CI, checks, logs). Say who moves each wait on next. \
     Your words here are your own notes, not posted: what you do reaches the person as your \
     decisions and updates.";
 
@@ -515,8 +518,10 @@ impl CrewHub {
             .with_mind(&id, "its notices", async {
                 // Its crew calls are one hand-off on from what woke it.
                 self.wake_hop.lock().insert(id.clone(), hop);
-                let ran = self
-                    .run_turn(
+                // Its notices are plan turns: judged at no less than the floor.
+                let ran = crate::agent_turn::with_effort_floor(
+                    super::decide::EFFORT_FLOOR,
+                    self.run_turn(
                         service,
                         person,
                         &check_in_channel(&id),
@@ -524,8 +529,9 @@ impl CrewHub {
                         hop,
                         Some(approvals),
                         None,
-                    )
-                    .await;
+                    ),
+                )
+                .await;
                 self.wake_hop.lock().remove(&id);
                 ran
             })

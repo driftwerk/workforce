@@ -223,3 +223,43 @@ async fn act_fully_aims_at_the_end_state_in_parallel_without_polish_first() {
     })
     .await;
 }
+
+/// One text says what Act fully allows, everywhere the boss decides by it:
+/// ordinary development (its own branch, PRs, merging a reviewed green
+/// one), a gate only where a directive states one, asked at once.
+#[test]
+fn every_act_fully_text_carries_the_one_rule() {
+    use super::super::watcher::{ACT_FULLY, STANDING_RULE};
+    for says in [
+        super::super::decide::SYSTEM,
+        STANDING_RULE,
+        CrewHub::bound_level_line(Level::Full).as_str(),
+        super::super::tools::describe("crew.escalate"),
+    ] {
+        assert!(says.contains(ACT_FULLY), "{says}");
+    }
+    for words in [
+        "pushing the session's own branch",
+        "merging one that is green with a clean review at its head (crew.github_merge)",
+        "A gate exists only if a directive states it: never invent one",
+        "ask them at once with crew.ask_person, naming the directive",
+    ] {
+        assert!(ACT_FULLY.contains(words), "{words}");
+    }
+    assert!(!super::super::decide::SYSTEM.contains("pushing the default branch"));
+    assert!(super::super::orchestrator::LOOP.contains("crew.github_merge"));
+    assert!(super::super::orchestrator::LOOP.contains("Never hold a session without a directive"));
+}
+
+/// Desk's judgements run at no less than Medium, the person's higher
+/// choice kept.
+#[test]
+fn decisions_run_at_the_effort_floor_or_the_persons_higher_choice() {
+    use super::super::decide::{judging_effort, EFFORT_FLOOR};
+    use workforce_agent::llm::anthropic::Effort;
+    assert_eq!(EFFORT_FLOOR, Effort::Medium);
+    assert_eq!(judging_effort(None), Effort::Medium);
+    assert_eq!(judging_effort(Some(Effort::Low)), Effort::Medium);
+    assert_eq!(judging_effort(Some(Effort::High)), Effort::High);
+    assert_eq!(judging_effort(Some(Effort::Max)), Effort::Max);
+}

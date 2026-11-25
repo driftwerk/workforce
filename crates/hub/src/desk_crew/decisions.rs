@@ -1069,6 +1069,7 @@ mod tests {
             view: None,
             worktree: None,
             fresh: false,
+            review_of: None,
         };
         let started = Done {
             started: Some(s),

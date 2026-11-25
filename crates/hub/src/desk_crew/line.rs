@@ -820,9 +820,7 @@ impl CrewHub {
         let (level, outward) = match ships {
             true => (
                 Level::Full,
-                "deletes, spends, sends to people, changes scope or touches secrets, where the person's own \
-                 orders and preferences don't cover it (merging, pushing to the default branch, tagging, \
-                 promoting and deploying this repository are yours at Act fully)",
+                "a directive says needs their say, or only they can do (their credentials, a payment)",
             ),
             false => (
                 match o.level {
@@ -881,7 +879,7 @@ impl CrewHub {
             Level::Watch => "You only watch.",
             Level::Suggest => "You suggest: an answer you give becomes a draft the person sends.",
             Level::Act => "You may answer within what the person allowed; anything else becomes a draft for them.",
-            Level::Full => "You act fully: within what the person allowed, and in the repositories they named also on merging a pull request, pushing the default branch, tagging, releasing, and running the workflows they listed to promote and deploy. Anything else becomes a draft for them. Never secrets, registries, force pushes, remote deletes or your own limits.",
+            Level::Full => "You act fully, as the standing rule below says; your own limits stay the person's.",
         }
     }
 

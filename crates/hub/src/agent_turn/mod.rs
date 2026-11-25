@@ -619,6 +619,21 @@ async fn notice(text: String, progress: Option<&mpsc::Sender<ProgressEvent>>) ->
     ChainOutcome::Notice { text }
 }
 
+tokio::task_local! {
+    /// The least effort the turns in scope run at ([`with_effort_floor`]).
+    static EFFORT_FLOOR: workforce_agent::llm::anthropic::Effort;
+}
+
+/// Runs `fut` with its turns at no less than `floor`: the agent's own
+/// higher choice wins. Desk's own judgements (a boss's plan turns) run
+/// under it; a chat turn keeps exactly the agent's setting.
+pub(crate) async fn with_effort_floor<F: std::future::Future>(
+    floor: workforce_agent::llm::anthropic::Effort,
+    fut: F,
+) -> F::Output {
+    EFFORT_FLOOR.scope(floor, fut).await
+}
+
 /// No route of a turn could serve it; each says why.
 #[derive(Debug, thiserror::Error)]
 #[error("no route could serve this turn: {}", describe(.misses))]
@@ -646,6 +661,10 @@ impl TurnChain {
         let (effort, fast) = {
             let resolved = service.resolved.snapshot();
             (resolved.effort_level(), resolved.fast)
+        };
+        let effort = match EFFORT_FLOOR.try_with(|f| *f) {
+            Ok(floor) => Some(effort.map_or(floor, |e| e.max(floor))),
+            Err(_) => effort,
         };
         let kept = crate::monitor::scope::kept_guard(turn.session);
         let keeper = crate::monitor::scope::TurnKeeper::new(

@@ -4,7 +4,8 @@
 //! - Reads only: each tool calls one or two of the GitHub adapter's reads
 //!   ([`CALLS`]), from an adapter built for the call and registered
 //!   nowhere, so no write of the adapter (merge, rerun, a branch, the raw
-//!   API) is reachable through them.
+//!   API) is reachable through them. The one write, a merge ([`MERGE`]),
+//!   is `crew.github_merge`'s alone.
 //! - As the caller: the adapter is built, and its keys and instances read,
 //!   as the person whose turn it is (`CURRENT_USER_ID`), at the tiers the
 //!   boss's `[skills]` pins, as any connector call of the person's reads
@@ -31,8 +32,9 @@ pub(super) const BRANCH: &str = "crew.github_branch";
 pub(super) const CI: &str = "crew.github_ci";
 
 /// The GitHub adapter's tools these call: reads alone.
-pub(super) const CALLS: [&str; 5] = [
+pub(super) const CALLS: [&str; 6] = [
     "github.get_pull",
+    "github.get_repo",
     "github.list_pulls",
     "github.workflow_runs",
     "github.workflow_run_logs",
@@ -351,9 +353,29 @@ fn person_tools(access: &GithubAccess<'_>) -> Result<(String, Vec<Arc<dyn Tool>>
     Ok((person, skill.tools()))
 }
 
+/// The one write the boss makes on GitHub, kept apart from [`CALLS`]:
+/// merging a pull request, only through `crew.github_merge`
+/// ([`super::review`]).
+pub(super) const MERGE: &str = "github.pr_merge";
+
+/// Merges as the person in scope, as GitHub's `pr_merge` is asked with
+/// `args`: what it answered.
+pub(super) async fn merge_as_person(
+    access: &GithubAccess<'_>,
+    args: Value,
+) -> Result<Value, GithubError> {
+    let (_, tools) = person_tools(access)?;
+    run_one(&tools, MERGE, args).await
+}
+
 /// What `call`, one of [`CALLS`], answers `args` with among `tools`.
 async fn call_one(tools: &[Arc<dyn Tool>], call: &str, args: Value) -> Result<Value, GithubError> {
     debug_assert!(CALLS.contains(&call));
+    run_one(tools, call, args).await
+}
+
+/// What `call` answers `args` with among `tools`.
+async fn run_one(tools: &[Arc<dyn Tool>], call: &str, args: Value) -> Result<Value, GithubError> {
     let tool = tools
         .iter()
         .find(|t| t.name() == call)
@@ -566,6 +588,16 @@ pub(super) mod tests {
                 None => call.await,
             }
             .map_err(|e| e.to_string())
+        }
+
+        /// Where GitHub is reached from, as the boss reaches it.
+        pub(in super::super) fn access(&self) -> GithubAccess<'_> {
+            GithubAccess {
+                vault: Some(Arc::clone(&self.agent)),
+                global: Some(Arc::clone(&self.global)),
+                config: &self.config,
+                registry: &self.registry,
+            }
         }
 
         /// What [`fetch`] reads as `who`.

@@ -295,3 +295,108 @@ async fn the_boss_cant_deny_a_read_of_a_session_it_holds() {
     })
     .await;
 }
+
+/// At Act fully a hold is a directive's: one with no directive is refused;
+/// one naming the person's directive and a condition holds the session
+/// (it isn't closed) until the boss records the condition met, which
+/// closes its question too.
+#[tokio::test(flavor = "multi_thread")]
+async fn at_act_fully_a_hold_names_its_directive_and_ends_when_its_condition_is_met() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        use super::super::hold::NAMES_DIRECTIVE;
+        let dir = tempfile::tempdir().unwrap();
+        let (overseer, crew, d, _llm) =
+            overseeing(dir.path(), pool, "ok", super::unbound::UNBOUND, &[]).await;
+        crew.read_spent_today(&crew.overseers()).await;
+        let s = new_session(&d, dir.path(), "MAN-835").await;
+        taken_on(&d, &overseer, s.id).await;
+        let asked = json!({
+                "text": "MAN-835 is green; the release needs your OK to merge.",
+                "question": "Merge MAN-835 now?",
+                "session_id": s.id.to_string(),
+                "options": ["Merge", "Wait"],
+                "holding_up": "MAN-835's merge",
+                "cant_decide": "Their directive says releases need their OK.",
+            });
+        let ask = call(&crew, ASK, asked.clone()).await;
+        // At Act fully an ask is pushed back once to be checked against
+        // the person's instructions; asked again, the same, it goes.
+        assert!(!ask.success);
+        let ask = call(&crew, ASK, asked.clone()).await;
+        assert!(ask.success, "{:?}", ask.error);
+        let item = d
+            .store()
+            .items_not_closed(Some("desk"))
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|i| i.session == Some(s.id))
+            .unwrap();
+        let directive = d
+            .store()
+            .directive_own(&item.owner, "main", "Releases need my OK")
+            .await
+            .unwrap()
+            .unwrap();
+        let hold = |extra: Value| {
+            let mut h = json!({ "session_id": s.id.to_string(), "message": HOLD,
+                "reason": "A release waits on the person." });
+            h.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            h
+        };
+
+        let unnamed = call(&crew, "crew.nudge", hold(json!({}))).await;
+        assert_eq!(unnamed.error.as_deref(), Some(NAMES_DIRECTIVE));
+        let not_one = call(
+            &crew,
+            "crew.nudge",
+            hold(json!({ "directive_id": uuid::Uuid::new_v4().to_string() })),
+        )
+        .await;
+        assert!(!not_one.success);
+        assert!(crew.hold_on(s.id).await.is_none());
+
+        let held = call(
+            &crew,
+            "crew.nudge",
+            hold(json!({ "directive_id": directive.id.to_string(), "until": "CI green at the head" })),
+        )
+        .await;
+        assert!(held.success, "{:?}", held.error);
+        let h = crew.hold_on(s.id).await.expect("held");
+        assert_eq!(h.directive_id, directive.id);
+        assert_eq!(
+            h.until,
+            super::super::hold::Until::Condition("CI green at the head".into())
+        );
+        let v = d.view(s.id).unwrap();
+        assert!(crew.close_held(&v, "desk").await.is_some(), "held stays open");
+
+        let met = call(
+            &crew,
+            "crew.nudge",
+            json!({ "session_id": s.id.to_string(), "message": "CI is green: merge it.",
+                "hold_met": "CI went green at the head", "reason": "Its condition was met." }),
+        )
+        .await;
+        assert!(met.success, "{:?}", met.error);
+        assert!(crew.hold_on(s.id).await.is_none());
+        assert!(!d
+            .store()
+            .items_not_closed(Some("desk"))
+            .await
+            .unwrap()
+            .iter()
+            .any(|i| i.id == h.question));
+        let again = call(
+            &crew,
+            "crew.nudge",
+            json!({ "session_id": s.id.to_string(), "message": "go", "hold_met": "x", "reason": "r" }),
+        )
+        .await;
+        assert!(!again.success, "nothing left to end");
+    })
+    .await;
+}

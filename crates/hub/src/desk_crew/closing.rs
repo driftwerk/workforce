@@ -38,12 +38,13 @@ use workforce_desk::account::RefKind;
 use workforce_desk::board::TicketState;
 use workforce_desk::charge::How;
 use workforce_desk::crew::{By, MentionedSuggestion};
+use workforce_desk::decision::{BossDecision, How as Decided, Need};
 use workforce_desk::model::{Origin, SessionState, SessionView};
 use workforce_desk::update::{ClosedKind, ClosedSession};
 
 use super::actions::Action;
 use super::github_seen::Pull;
-use super::workspace::{folder, held, origin_of, pull_ref};
+use super::workspace::{self, folder, held, origin_of, pull_ref};
 use super::{name_of, AgentService, CrewHub};
 
 /// The action's tool name: a suggestion to close a session holds it.
@@ -486,22 +487,35 @@ impl CrewHub {
         if v.origin != Origin::Desk {
             return Some("It runs in another terminal, so it's the person's to close.".into());
         }
-        if v.pending.is_some() || v.asked.is_some() || v.state == SessionState::Asking {
+        let Some((service, o)) = self.overseer_named(boss) else {
+            return Some("No boss runs it now.".into());
+        };
+        // At Act fully a request the boss decides itself is cancelled as it
+        // closes ([`Self::cancel_to_close`]); Desk refuses any other.
+        let cancels = v.pending.is_some() && self.level_now(boss, &o).0 == Level::Full;
+        if v.asked.is_some() || v.state == SessionState::Asking {
+            return Some(
+                "It's asking something of its own: that's the person's to answer before it is closed."
+                    .into(),
+            );
+        }
+        if v.pending.is_some() && !cancels {
             return Some(
                 "It's asking something: answer it, or ask the person, before it is closed.".into(),
             );
         }
-        if matches!(
-            v.state,
-            SessionState::Starting | SessionState::Working | SessionState::Blocked
-        ) {
+        if matches!(v.state, SessionState::Starting | SessionState::Working)
+            || (v.state == SessionState::Blocked && !cancels)
+        {
             return Some("It's still working: it is closed only once its turn has ended.".into());
         }
-        let Some((service, o)) = self.overseer_named(boss) else {
-            return Some("No boss runs it now.".into());
-        };
+        if self.hold_on(v.id).await.is_some() {
+            return Some(
+                "It's held on the person's directive: it stays open until its hold ends.".into(),
+            );
+        }
         // Rested first, as the closer's own: what it did is seen.
-        if !at_rest(v, Utc::now(), *self.close_settle.lock()) {
+        if !cancels && !at_rest(v, Utc::now(), *self.close_settle.lock()) {
             return Some(format!(
                 "Its turn ended under {} minutes ago: it is closed once it has rested.",
                 self.close_settle.lock().num_minutes().max(1)
@@ -541,12 +555,160 @@ impl CrewHub {
             }
         }
         let (open, kept) = self.left_behind(&service, v).await;
+        // A newer session carries its ticket, and its pull requests with it.
+        let open = match self.superseded(v.id).await {
+            true => Vec::new(),
+            false => open,
+        };
         if let Some(n) = open.first() {
             return Some(format!(
                 "Its PR #{n} is still open: it stays open until that's merged or closed."
             ));
         }
         kept.map(|kept| format!("It stays open ({kept}): nothing is closed that would lose work."))
+    }
+
+    /// Whether a newer session now holds a ticket `session` was on.
+    async fn superseded(&self, session: Uuid) -> bool {
+        self.desk
+            .store()
+            .linked_tickets(&[session])
+            .await
+            .unwrap_or_default()
+            .iter()
+            .any(|t| {
+                !matches!(t.state, TicketState::Done | TicketState::Dropped)
+                    && t.assignee.as_ref().is_some_and(|a| {
+                        a.kind == workforce_desk::crew::PartyKind::Session
+                            && a.id != session.to_string()
+                    })
+            })
+    }
+
+    /// The plan watch's bookkeeping for `boss`'s plan `tickets`, before it
+    /// fills its slots: each session it runs whose ticket is done or
+    /// dropped and that rests with nothing open (no request, no line
+    /// message on its way) is closed, and so is each a newer session took
+    /// its ticket from. One of those with work in its folder is named in
+    /// Activity, once, and never closed.
+    pub(super) async fn close_plan_finished(
+        &self,
+        tickets: &[workforce_desk::plan::PlanTicket],
+        service: &Arc<AgentService>,
+    ) {
+        let boss = service.agent_id.as_str();
+        let current: HashSet<String> = tickets.iter().filter_map(|t| t.session.clone()).collect();
+        let finished = tickets
+            .iter()
+            .filter(|t| matches!(t.state, TicketState::Done | TicketState::Dropped))
+            .filter_map(|t| t.session.as_deref()?.parse::<Uuid>().ok());
+        let plan_ids: HashSet<Uuid> = tickets.iter().map(|t| t.id).collect();
+        let mut superseded = Vec::new();
+        for c in self.desk.charges().into_iter().filter(|c| c.boss == boss) {
+            if current.contains(&c.session.to_string()) {
+                continue;
+            }
+            let on_plan = self
+                .desk
+                .store()
+                .linked_tickets(&[c.session])
+                .await
+                .is_ok_and(|ts| ts.iter().any(|t| plan_ids.contains(&t.id)));
+            if on_plan && self.superseded(c.session).await {
+                superseded.push(c.session);
+            }
+        }
+        for id in finished.chain(superseded.iter().copied()) {
+            let Ok(v) = self.desk.view(id) else {
+                continue;
+            };
+            if !self
+                .desk
+                .charge_of(id)
+                .is_some_and(|c| c.live() && c.boss == boss)
+                || !matches!(v.state, SessionState::Idle | SessionState::Done)
+                || v.pending.is_some()
+                || v.asked.is_some()
+                || self.line_on_its_way(id).await
+            {
+                continue;
+            }
+            let name = v.label().to_string();
+            if superseded.contains(&id) {
+                if let workspace::Workspace::Repo(r) = workspace::workspace_of(&v.cwd).await {
+                    if !r.uncommitted.is_empty() {
+                        if self.closing.lock().told.insert((id, "superseded".into())) {
+                            let e = workforce_desk::crew::Event::new(
+                                workforce_desk::crew::Kind::Told,
+                                workforce_desk::crew::Party::manager(boss, &name_of(service)),
+                                Some(workforce_desk::crew::Party::session(&v)),
+                                format!(
+                                    "kept {name} open: a newer session has its ticket, and its folder has {} uncommitted file(s) for that session to check",
+                                    r.uncommitted.len()
+                                ),
+                            );
+                            self.desk.note(e);
+                        }
+                        continue;
+                    }
+                }
+            }
+            let why = match superseded.contains(&id) {
+                true => "A newer session has its ticket.",
+                false => "Its ticket is done.",
+            };
+            let by = By::manager(boss, &name_of(service), why);
+            match self.perform(&Action::Close { session: id }, by).await {
+                Ok(done) => {
+                    tracing::info!(session = %id, %boss, %done, "the plan watch closed a session")
+                }
+                Err(why) => {
+                    tracing::debug!(session = %id, %boss, %why, "the plan watch left a session open")
+                }
+            }
+        }
+    }
+
+    /// Whether a message to `session` on its line is still on its way.
+    async fn line_on_its_way(&self, session: Uuid) -> bool {
+        use workforce_desk::line::Delivery;
+        self.desk
+            .line_thread(session, None, None)
+            .await
+            .map_or(true, |ms| {
+                ms.iter().any(|m| {
+                    m.to_session() == Some(session)
+                        && matches!(
+                            m.delivery,
+                            Delivery::Queued | Delivery::Handed | Delivery::Held
+                        )
+                })
+            })
+    }
+
+    /// Cancels what `v` asks that `by`, its boss acting fully, decides
+    /// itself, so it closes: each cancel kept as its decision. Desk's
+    /// refusal, in its words, for anything else.
+    pub(super) async fn cancel_to_close(&self, v: &SessionView, by: &By) -> Result<(), String> {
+        if v.pending.is_none() {
+            return Ok(());
+        }
+        let cancelled = self
+            .desk
+            .cancel_boss_pending(v.id, by)
+            .await
+            .map_err(|e| e.to_string())?;
+        let name = v.label().to_string();
+        for approval in cancelled {
+            let what = format!("cancelled {name}'s request to close it");
+            let why = by.reason.as_deref().unwrap_or("Its work is done.");
+            let mut d = BossDecision::new(&by.party.id, Need::Approval, &what, why, Decided::Own)
+                .briefly(&what, None);
+            d.session = Some(v.id);
+            d.need_ref = Some(approval.to_string());
+            self.record(&mut d).await;
+        }
+        Ok(())
     }
 
     /// What closing `v` leaves behind, read as `service`: its pull requests

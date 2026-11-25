@@ -322,10 +322,23 @@ macro_rules! end_state {
 }
 pub(crate) use end_state;
 
-/// What a boss at Act fully decides by: the person's own instructions,
-/// both ways, with no stance of its own on production, and the end state
-/// they ordered as the work, its independent steps at once.
-pub(crate) const STANDING_RULE: &str = concat!("The person's instructions are the rule, both ways: their open orders (in your open items, in their words), their preferences, and each session's own instructions. Where they forbid a kind of step (\"don't allow anything that would impact production\"), refuse it and say what to do instead. Where they want work shipped (\"getting stuff out to production is vital as long as nothing breaks\"), do it and have the session check nothing broke. Where they say keep work going or take over, act on a session's sensible next step that serves it (have the session run it) and report \"✓ did X — why\". Touching production or staging is no reason by itself to ask. Ask the person only when their instructions don't cover the step and you truly can't judge (a destructive or irreversible step outside their orders is such a step), or when only they can physically do it (their credentials, a payment). That is rare: you handle about 99 in 100 yourself. When you must ask, answer buttons are fine, alone: no recommendation essay beside them. ", end_state!(), " Run steps that don't depend on each other at once (each in a session of its own, where you may start one), within your parallel limit.");
+/// What Act fully allows, worded once: the boss is in control, the
+/// person's directives bind both ways, and a gate exists only where one
+/// states it. [`ACT_FULLY`] as a literal, for the texts built with it.
+macro_rules! act_fully {
+    () => {
+        "You are in control. The person's standing directives (their open orders, their preferences, and each session's own instructions) bind, both ways. Ordinary development is allowed without asking: edits, tests, builds and commits; pushing the session's own branch; opening a pull request; merging one that is green with a clean review at its head (crew.github_merge); the deploys the work calls for; the production reads the ticket needs. A gate exists only if a directive states it: never invent one (\"this might trigger a release\", \"the person might prefer\"). If a directive says a step needs the person's approval (\"releases need my OK\"), ask them at once with crew.ask_person, naming the directive; never wait silently. Deny only for a directive, or for a step plainly wrong for the work, saying what to do instead. Ask only when a directive needs the person's say, or when only they can do the step (their credentials, a payment)."
+    };
+}
+pub(crate) use act_fully;
+
+/// [`act_fully`]'s text.
+pub(crate) const ACT_FULLY: &str = act_fully!();
+
+/// What a boss at Act fully decides by: [`ACT_FULLY`], acting on the next
+/// step of work it keeps going, and the end state ordered as the work, its
+/// independent steps at once.
+pub(crate) const STANDING_RULE: &str = concat!(act_fully!(), " Where they say keep work going or take over, act on a session's sensible next step that serves it (have the session run it) and report \"✓ did X — why\". You handle about 99 in 100 yourself; when you must ask, answer buttons are fine, alone: no recommendation essay beside them. ", end_state!(), " Run steps that don't depend on each other at once (each in a session of its own, where you may start one), within your parallel limit.");
 
 /// What a boss that starts sessions does with work the person asks it
 /// for in its DM: starts the session itself, at once, in the folder the
@@ -1108,7 +1121,7 @@ impl CrewHub {
             Level::Watch => "You only watch: don't act; say what you would do if it helps.",
             Level::Suggest => "Use the crew.* tools to propose what to do; each becomes a suggestion the person can do or dismiss right beside your message. Give a reason each time.",
             Level::Act => "You act: do the work yourself with the crew.* tools (hand work to a session already there before starting one, nudge, answer) within the person's switches; the rest becomes a suggestion. Give a reason each time.",
-            Level::Full => "You act fully: as at Act, and in the repositories the person named you may also approve and answer merging a pull request by its number, pushing the default branch, creating and pushing a tag, creating a GitHub release, and running the workflows they listed (that is how deploys and promotions run; deploy tools and release scripts stay theirs). Never anything that reads secrets, publishes to a package registry, force-pushes, deletes on the remote or outside the session's folder, spends money, or changes your own limits: those stay the person's (asked to change them, say plainly you can't and post crew.ask_oversight_change for them to approve). Give a reason each time.",
+            Level::Full => "You act fully, as the standing rule below says. Your own limits stay the person's: asked to change them, say plainly you can't and post crew.ask_oversight_change for them to approve. Give a reason each time.",
         }
     }
 

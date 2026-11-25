@@ -48,6 +48,7 @@ mod goal;
 mod goal_check;
 mod handover;
 mod held;
+mod hold;
 mod idle;
 mod inside;
 mod items;
@@ -74,6 +75,7 @@ pub(crate) mod relayed_decide;
 pub(crate) mod relayed_work;
 pub(crate) mod remote_asks;
 pub(crate) mod remote_decide;
+mod review;
 mod scope;
 pub(crate) mod served;
 pub(crate) mod shared_budget;
@@ -243,6 +245,9 @@ pub struct CrewHub {
     /// When each boss last asked the person with `crew.ask_person`: its
     /// turn's reply then isn't also kept as a question of its own.
     asked_person: Mutex<HashMap<String, DateTime<Utc>>>,
+    /// The sessions a boss holds at Act fully, on a directive of the
+    /// person's ([`hold`]).
+    holds: Mutex<HashMap<uuid::Uuid, hold::Hold>>,
     /// The asks at Act fully already checked against the person's own
     /// instructions, by boss and matter, and when.
     asks_checked: Mutex<HashMap<String, DateTime<Utc>>>,
@@ -810,6 +815,7 @@ impl CrewHub {
             quiet_ends: Mutex::default(),
             turns_begun: std::sync::atomic::AtomicU64::default(),
             asked_person: Mutex::default(),
+            holds: Mutex::default(),
             asks_checked: Mutex::default(),
             turn_acts: Mutex::default(),
             person_turns: Mutex::default(),

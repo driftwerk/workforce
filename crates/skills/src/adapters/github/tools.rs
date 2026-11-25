@@ -382,6 +382,8 @@ impl Tool for GithubGetRepoTool {
                         "created_at": data["created_at"],
                         "updated_at": data["updated_at"],
                         "topics": data["topics"],
+                        "allow_squash_merge": data["allow_squash_merge"],
+                        "allow_merge_commit": data["allow_merge_commit"],
                     }),
                     duration_ms,
                 ))
@@ -1179,7 +1181,9 @@ impl Tool for GithubGetPullTool {
                 "body": wrap_field(&pr["body"], "GitHub PR body"),
                 "user": pr["user"]["login"],
                 "head": pr["head"]["ref"],
+                "head_repo": pr["head"]["repo"]["full_name"],
                 "base": pr["base"]["ref"],
+                "base_repo": pr["base"]["repo"]["full_name"],
                 "draft": pr["draft"],
                 "merged": pr["merged"],
                 "merged_at": pr["merged_at"],

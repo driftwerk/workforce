@@ -114,6 +114,9 @@ pub(crate) enum Action {
         /// The person asked for a new session: none already there is
         /// given the work instead.
         fresh: bool,
+        /// The pull request it reviews, at its head as GitHub says it
+        /// ([`super::review`]).
+        review_of: Option<workforce_desk::plan::ReviewOf>,
     },
     Assign {
         agent: String,
@@ -258,6 +261,9 @@ struct Input {
     timeout_secs: Option<u64>,
     /// `crew.switch_login`'s login: its id (a name is resolved to it first).
     login: Option<String>,
+    /// `crew.start_session`'s pull request to review: `{repo, number}`,
+    /// with its head as Desk read it once it has.
+    review_of: Option<Value>,
 }
 
 fn id(raw: Option<&str>, what: &str) -> Result<Uuid, String> {
@@ -359,6 +365,26 @@ pub(crate) fn model_on(engine: Engine, asked: Option<&str>, o: &Oversight) -> Op
         .map(str::to_string)
 }
 
+/// A review's pull request as said (`{repo, number}`), at the head Desk
+/// read of it, when it has.
+fn review_of(v: &Value) -> Result<workforce_desk::plan::ReviewOf, String> {
+    let (owner, repo) =
+        workforce_desk::goal::github_repo(v["repo"].as_str().unwrap_or_default())
+            .ok_or("Say the pull request to review as review_of: { repo: owner/name, number }.")?;
+    let number = v["number"]
+        .as_i64()
+        .filter(|n| *n > 0)
+        .ok_or("Say the number of the pull request to review (review_of.number).")?;
+    Ok(workforce_desk::plan::ReviewOf {
+        pr: workforce_desk::plan::PrRef {
+            owner: owner.to_string(),
+            repo: repo.to_string(),
+            number,
+        },
+        head_sha: v["head_sha"].as_str().unwrap_or_default().to_string(),
+    })
+}
+
 fn blank_none(raw: Option<String>) -> Option<String> {
     raw.map(|t| t.trim().to_string()).filter(|t| !t.is_empty())
 }
@@ -452,6 +478,7 @@ impl Action {
                 view: i.view,
                 worktree: blank_none(i.worktree),
                 fresh: i.fresh.unwrap_or(false),
+                review_of: i.review_of.as_ref().map(review_of).transpose()?,
             },
             "crew.assign" => Self::Assign {
                 agent: text(i.agent_id, "which agent")?,
@@ -2277,6 +2304,7 @@ impl CrewHub {
                     if let Some(why) = self.close_held(&was, &by.party.id).await {
                         return Err(why);
                     }
+                    self.cancel_to_close(&was, &by).await?;
                 }
                 // The person's yes to a suggestion made a while ago: what has
                 // changed since is closed as they said, but removed only
@@ -2533,6 +2561,7 @@ impl CrewHub {
             model,
             view,
             worktree,
+            review_of,
             ..
         } = action
         else {
@@ -2574,7 +2603,7 @@ impl CrewHub {
                     account: None,
                     env: Default::default(),
                     group: self.boss_group(&service, &o),
-                    review_of: None,
+                    review_of: review_of.clone(),
                 },
                 &boss,
                 by,
@@ -2620,6 +2649,7 @@ impl CrewHub {
             engine,
             worktree: None,
             fresh: false,
+            review_of: None,
             ..
         } = &*action
         else {
