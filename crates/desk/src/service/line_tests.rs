@@ -662,8 +662,11 @@ async fn a_codex_session_gets_messages_typed_in_at_idle_while_the_person_isnt_ty
         let thread = d.line_thread(s.id, None, None).await.unwrap();
         assert!(thread.iter().any(|m| m.waiting == Some(Wait::Typing)));
 
-        // They send what they typed: its turn's end takes the first that
-        // waits.
+        assert!(d.line_keystroke(s.id).is_some());
+        // They send what they typed: its turn's start takes their keystroke,
+        // and its end the first that waits.
+        say(&mut ws, json!({"method": "turn/started", "params": {"threadId": "t1", "turn": {"id": "u2"}}})).await;
+        until(|| d.line_keystroke(s.id).is_none()).await;
         say(&mut ws, json!({"method": "item/started", "params": {"threadId": "t1",
             "item": {"type": "userMessage", "content": [{"type": "text", "text": "hm, also the docs"}]}}})).await;
         until(|| d.view(s.id).unwrap().last_prompt.as_deref() == Some("hm, also the docs")).await;
@@ -2318,10 +2321,11 @@ async fn the_persons_draft_goes_in_its_prompt_unsent_and_holds_what_desk_would_t
         let d = desk(pool, dir.path()).await;
         let s = new_session(&d, dir.path()).await;
         idle(&d, s.id).await;
-        assert!(!d.typed_since_idle(s.id));
+        assert!(d.line_draft_held(s.id).is_none());
         d.line_draft(s.id, "About your questions:\n- one\r\x1b[201~\r")
             .unwrap();
-        assert!(d.typed_since_idle(s.id), "the pump waits for them");
+        assert!(d.line_draft_held(s.id).is_some(), "the pump waits for them");
+        assert_eq!(d.line_keystroke(s.id), None, "never as typing");
         assert!(matches!(
             d.line_draft(s.id, "  "),
             Err(DeskError::Invalid(_))

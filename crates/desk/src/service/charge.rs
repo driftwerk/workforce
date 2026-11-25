@@ -490,6 +490,15 @@ impl Desk {
         Self::hold_of(&self.0.state.lock(), boss)
     }
 
+    /// How long the person's input holds session `id`: the hold of the
+    /// boss that runs it, [`charge::HOLD`] when none does.
+    pub(super) fn hold_on(st: &super::State, id: Uuid) -> chrono::Duration {
+        st.charges
+            .rows
+            .get(&id)
+            .map_or(charge::HOLD, |c| Self::hold_of(st, &c.boss))
+    }
+
     /// How long the person's input holds a session `boss` runs.
     fn hold_of(st: &super::State, boss: &str) -> chrono::Duration {
         st.charges.holds.get(boss).copied().unwrap_or(charge::HOLD)
@@ -595,10 +604,13 @@ impl Desk {
         Self::last_input(&self.0.state.lock(), id)
     }
 
-    /// When the person last gave `id` input: typed in its terminal,
-    /// prompted it, or wrote to it.
+    /// When the person last gave `id` input: typed in its terminal, had
+    /// their draft put in its prompt, prompted it, or wrote to it.
     pub(super) fn last_input(st: &super::State, id: Uuid) -> Option<DateTime<Utc>> {
-        let typed = st.live.get(&id).and_then(|l| l.pty.typed_at());
+        let typed = st
+            .live
+            .get(&id)
+            .and_then(|l| l.pty.typed_at().max(l.pty.draft_at()));
         typed.max(st.charges.driven.get(&id).copied())
     }
 

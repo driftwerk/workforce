@@ -625,6 +625,265 @@ fn boss_tell(text: &str, to: Uuid) -> Send {
     }
 }
 
+/// A session Sarah runs whose Desk plugin isn't heard from: what waits for
+/// it is typed in at its prompt. Taken on an hour ago, so input since is
+/// the person's.
+async fn typed_into(d: &Desk, dir: &std::path::Path) -> Uuid {
+    let s = new_session(d, dir).await;
+    hook(
+        d,
+        s.id,
+        json!({"hook_event_name": "SessionStart", "session_id": s.id.to_string()}),
+    )
+    .await;
+    d.take_on(s.id, &sarah(), How::Handed, &Default::default(), &By::you())
+        .await
+        .unwrap();
+    d.0.state.lock().charges.rows.get_mut(&s.id).unwrap().since =
+        Utc::now() - chrono::Duration::hours(1);
+    s.id
+}
+
+async fn waiting(d: &Desk, id: Uuid, row: Uuid) -> (Delivery, Option<Wait>) {
+    let thread = d.line_thread(id, None, None).await.unwrap();
+    let m = thread.iter().find(|m| m.id == row).unwrap();
+    (m.delivery, m.waiting)
+}
+
+async fn until_in(d: &Desk, id: Uuid, row: Uuid) {
+    let end = tokio::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        match waiting(d, id, row).await.0 {
+            Delivery::Delivered | Delivery::Handed => return,
+            Delivery::Queued if tokio::time::Instant::now() < end => {
+                tokio::time::sleep(Duration::from_millis(20)).await
+            }
+            other => panic!("it never went in: {other:?}"),
+        }
+    }
+}
+
+/// The person's keystroke holds the boss's message only within the
+/// boss's hold, and says when that is up: then it goes in, with no prompt
+/// of theirs to free it (MAN-835 waited on a stray byte until one).
+#[tokio::test]
+async fn a_keystroke_holds_the_bosss_message_only_within_the_hold() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(pool, dir.path()).await;
+        let id = typed_into(&d, dir.path()).await;
+        let hold = chrono::Duration::milliseconds(1500);
+        d.set_holds([("sarah".to_string(), hold)].into());
+        let pty = d.attach(id).unwrap();
+        let (viewer, _, _) = pty.attach();
+        viewer.claim();
+        viewer.input(b"hm").unwrap();
+        let k = d.line_keystroke(id).expect("typed within the hold");
+        assert_eq!(k.ends - k.at, hold);
+        let by = By::manager("sarah", "Sarah", "Next.");
+        let m = d
+            .line_send(Sender::Overseer(by), boss_tell("Push it.", id))
+            .await
+            .unwrap();
+        assert_eq!(
+            waiting(&d, id, m.id).await,
+            (Delivery::Queued, Some(Wait::Typing))
+        );
+        until_in(&d, id, m.id).await;
+        assert_eq!(d.line_keystroke(id), None, "its hold is up");
+    })
+    .await;
+}
+
+/// The person's draft, put in its prompt by Desk, is their input for the
+/// wheel and holds what Desk would type in as a draft, never as typing,
+/// with no end but the next turn's start; after it, the boss's messages go
+/// in.
+#[tokio::test]
+async fn a_draft_holds_the_bosss_message_until_the_next_turn_starts() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(pool, dir.path()).await;
+        let id = typed_into(&d, dir.path()).await;
+        assert_eq!(d.wheel_of(id), Some(Wheel::Boss));
+        d.line_draft(id, "About your questions:").unwrap();
+        assert_eq!(d.wheel_of(id), Some(Wheel::Person), "a draft is input");
+        assert_eq!(d.line_keystroke(id), None);
+        let by = By::manager("sarah", "Sarah", "Next.");
+        let m = d
+            .line_send(Sender::Overseer(by), boss_tell("Push it.", id))
+            .await
+            .unwrap();
+        assert_eq!(
+            waiting(&d, id, m.id).await,
+            (Delivery::Queued, Some(Wait::Draft))
+        );
+        // Handed back, the draft still holds it: it has no hold to end.
+        d.hand_back(id).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(
+            waiting(&d, id, m.id).await,
+            (Delivery::Queued, Some(Wait::Draft))
+        );
+        // They send it: the turn takes the draft (and overtakes what was
+        // decided before it), and once it ends and the wheel is back the
+        // boss's next message goes in.
+        hook(
+            &d,
+            id,
+            json!({"hook_event_name": "UserPromptSubmit", "prompt": "About your questions: go on"}),
+        )
+        .await;
+        assert_ne!(waiting(&d, id, m.id).await.1, Some(Wait::Draft));
+        hook(
+            &d,
+            id,
+            json!({"hook_event_name": "Stop", "last_assistant_message": "Done."}),
+        )
+        .await;
+        d.hand_back(id).await.unwrap();
+        let by = By::manager("sarah", "Sarah", "Next.");
+        let next = d
+            .line_send(Sender::Overseer(by), boss_tell("Then commit it.", id))
+            .await
+            .unwrap();
+        until_in(&d, id, next.id).await;
+    })
+    .await;
+}
+
+/// A desk whose sessions say what they did, then show a prompt their
+/// terminal echoes what it is sent at: a draft shows there.
+async fn prompting_desk(pool: workforce_postgres::PostgresPool, dir: &std::path::Path) -> Desk {
+    let cli = dir.join("prompting-cli");
+    workforce_common::executable::write(
+        &cli,
+        "#!/bin/sh\ni=0\nwhile [ $i -lt 30 ]; do echo \"step $i of the build is done, ok\"; i=$((i+1)); done\nprintf '> '\nexec sleep 60\n",
+    )
+    .unwrap();
+    super::super::tests::logged_desk(pool, dir, cli).await.0
+}
+
+/// A draft put in the prompt of a session Sarah runs, her hold short, and
+/// her message it holds.
+async fn drafted(d: &Desk, dir: &std::path::Path) -> (Uuid, Uuid) {
+    let id = typed_into(d, dir).await;
+    for _ in 0..100 {
+        if d.terminal_text(id, 4000).unwrap().contains("step 29") {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    d.set_holds([("sarah".to_string(), chrono::Duration::milliseconds(300))].into());
+    d.line_draft(id, "About your questions: keep the old table")
+        .unwrap();
+    let by = By::manager("sarah", "Sarah", "Next.");
+    let m = d
+        .line_send(Sender::Overseer(by), boss_tell("Push it.", id))
+        .await
+        .unwrap();
+    for _ in 0..100 {
+        if d.terminal_text(id, 4000)
+            .unwrap()
+            .contains("keep the old table")
+        {
+            return (id, m.id);
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!("the draft never showed");
+}
+
+/// Past the hold, a draft its screen still shows holds on: time alone
+/// never lets the boss's message in over it.
+#[tokio::test]
+async fn a_draft_still_shown_past_the_hold_holds_on() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = prompting_desk(pool, dir.path()).await;
+        let (id, m) = drafted(&d, dir.path()).await;
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        assert_eq!(
+            waiting(&d, id, m).await,
+            (Delivery::Queued, Some(Wait::Draft))
+        );
+    })
+    .await;
+}
+
+/// A draft the person clears by hand (Ctrl-U erases it from the screen)
+/// holds no more: the boss's message goes in with no turn started.
+#[tokio::test]
+async fn a_draft_cleared_by_hand_lets_the_bosss_message_in() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = prompting_desk(pool, dir.path()).await;
+        let (id, m) = drafted(&d, dir.path()).await;
+        let pty = d.attach(id).unwrap();
+        let (viewer, _, _) = pty.attach();
+        viewer.claim();
+        viewer.input(b"\x15").unwrap();
+        until_in(&d, id, m).await;
+        assert_eq!(pty.draft_at(), None);
+    })
+    .await;
+}
+
+/// A short draft over two lines holds while its prompt's rows show it, and
+/// once the person clears it the boss's message goes in. Its stand-in
+/// draws the draft in its prompt as a TUI does, and clears it on Ctrl-U.
+#[tokio::test]
+async fn a_short_draft_over_two_lines_holds_until_it_is_cleared() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let cli = dir.path().join("composer-cli");
+        workforce_common::executable::write(
+            &cli,
+            "#!/bin/sh\nstty raw -echo\ni=0\n\
+             while [ $i -lt 30 ]; do printf 'step %s of the build is done, ok\\r\\n' $i; i=$((i+1)); done\n\
+             printf '> '\ndrawn=\n\
+             while :; do\n\
+             c=$(dd bs=1 count=1 2>/dev/null | od -An -tx1 | tr -d ' \\n')\n\
+             [ -z \"$c\" ] && exit 0\n\
+             if [ \"$c\" = 15 ]; then printf '\\r\\033[2K\\033[1A\\r\\033[2K> '; drawn=\n\
+             elif [ -z \"$drawn\" ]; then printf 'Yes.\\r\\n  Go ahead'; drawn=1; fi\n\
+             done\n",
+        )
+        .unwrap();
+        let d = super::super::tests::logged_desk(pool, dir.path(), cli).await.0;
+        let id = typed_into(&d, dir.path()).await;
+        d.set_holds([("sarah".to_string(), chrono::Duration::milliseconds(300))].into());
+        let shown = async |text: &str| {
+            for _ in 0..100 {
+                if d.terminal_text(id, 4000).unwrap().contains(text) {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            panic!("{text:?} never showed");
+        };
+        shown("step 29").await;
+        d.line_draft(id, "Yes.\nGo ahead").unwrap();
+        shown("Go ahead").await;
+        let by = By::manager("sarah", "Sarah", "Next.");
+        let m = d
+            .line_send(Sender::Overseer(by), boss_tell("Push it.", id))
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        assert_eq!(
+            waiting(&d, id, m.id).await,
+            (Delivery::Queued, Some(Wait::Draft))
+        );
+        let pty = d.attach(id).unwrap();
+        let (viewer, _, _) = pty.attach();
+        viewer.claim();
+        viewer.input(b"\x15").unwrap();
+        until_in(&d, id, m.id).await;
+    })
+    .await;
+}
+
 /// Let go while the person drives, what the boss said and the person held
 /// is withdrawn, never typed into a session the person now runs alone.
 #[tokio::test]
