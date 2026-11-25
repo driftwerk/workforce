@@ -1053,6 +1053,34 @@ pub fn said_by(
     since: DateTime<Utc>,
     said: Said,
 ) -> Result<DateTime<Utc>, NotSaid> {
+    found(messages, quote, since, said, &|text| match said {
+        Said::Changing => Consent::Yes,
+        _ => consent(text),
+    })
+}
+
+/// [`said_by`] for the person agreeing work `goal` ([`Said::Agreeing`]),
+/// each message read by [`agreement`] with it.
+pub fn agreed_by(
+    messages: &[(DateTime<Utc>, String)],
+    quote: &str,
+    since: DateTime<Utc>,
+    goal: &str,
+) -> Result<DateTime<Utc>, NotSaid> {
+    found(messages, quote, since, Said::Agreeing, &|text| {
+        agreement(text, goal)
+    })
+}
+
+/// When the person said `quote` as `said` asks, each message saying what
+/// `reads` makes of it.
+fn found(
+    messages: &[(DateTime<Utc>, String)],
+    quote: &str,
+    since: DateTime<Utc>,
+    said: Said,
+    reads: &dyn Fn(&str) -> Consent,
+) -> Result<DateTime<Utc>, NotSaid> {
     let quoted = compared_words(quote);
     if quoted.is_empty() {
         return Err(NotSaid::NotFound);
@@ -1071,11 +1099,7 @@ pub fn said_by(
             _ => (whole && said.whole_counts()) || (part && !short),
         };
         // An answer or an agreement is one only when its message says yes.
-        let says = match said {
-            Said::Changing => Consent::Yes,
-            Said::Agreeing => agreement(text),
-            Said::Answering => consent(text),
-        };
+        let says = reads(text);
         let newer = part && !matched && *at > since;
         not_whole |= newer && said == Said::Answering;
         too_short |= newer && said != Said::Answering;
@@ -1195,7 +1219,7 @@ const REFUSING: &[&str] = &[
 const CHANGING: &[&str] = &[
     "change", "drop", "remove", "keep", "stop", "hold", "wait", "later", "not", "don't", "dont",
     "though", "although", "instead", "add", "also", "replace", "skip", "edit", "adjust", "tweak",
-    "move", "rename", "swap",
+    "rename", "swap",
 ];
 /// Phrases with a yes word that say nothing to what was asked.
 const NOT_ANSWERS: &[&[&str]] = &[&["good", "question"], &["great", "question"]];
@@ -1217,6 +1241,8 @@ const SAYINGS: &[&[&str]] = &[
     &["not", "a", "problem"],
     &["can't", "wait"],
 ];
+/// Sayings with a changing word that say yes ("keep going"): read as yes.
+const AGREEING_SAYINGS: &[&[&str]] = &[&["keep", "going"], &["keep", "it", "up"], &["move", "on"]];
 
 /// Whether `words` open with `phrase`.
 fn opens(words: &[String], phrase: &[&str]) -> bool {
@@ -1234,7 +1260,11 @@ fn plain_words(text: &str) -> Vec<String> {
     let mut out = Vec::with_capacity(words.len());
     let mut i = 0;
     while i < words.len() {
-        match SAYINGS.iter().find(|s| opens(&words[i..], s)) {
+        match SAYINGS
+            .iter()
+            .chain(AGREEING_SAYINGS)
+            .find(|s| opens(&words[i..], s))
+        {
             Some(s) => i += s.len(),
             None => {
                 out.push(words[i].clone());
@@ -1268,7 +1298,10 @@ pub fn plainly(text: &str) -> Consent {
     let words = plain_words(text);
     let agrees = words.iter().any(|w| AGREEING.contains(&w.as_str()))
         || text.contains(AGREEING_SIGNS)
-        || AGREEING_PHRASES.iter().any(|p| holds(&words, p));
+        || AGREEING_PHRASES.iter().any(|p| holds(&words, p))
+        || AGREEING_SAYINGS
+            .iter()
+            .any(|p| holds(&compared_words(text), p));
     if words.iter().any(|w| refusing(w)) {
         Consent::No
     } else if agrees && !unclear(text, &words) {
@@ -1286,17 +1319,21 @@ pub fn plainly(text: &str) -> Consent {
 /// drop the staging part"), so the person's change is never dropped by a
 /// yes.
 pub fn consent(text: &str) -> Consent {
-    read(text, true)
-}
-
-/// What the person's message `text` says agreeing work in their own words
-/// ("Yes, keep the docs build green"): as [`consent`], but a longer one's
-/// words are the work itself, so only a refusal or a qualifier says no.
-pub fn agreement(text: &str) -> Consent {
     read(text, false)
 }
 
-fn read(text: &str, answering: bool) -> Consent {
+/// What the person's message `text` says agreeing work `goal`: as
+/// [`consent`], but a longer one that says `goal` word for word ("Yes,
+/// keep the docs build green") is their own words for the work, so only a
+/// refusal or a qualifier says no; one that asks for a change to it
+/// otherwise ("Sure, drop the staging part") is unclear.
+pub fn agreement(text: &str, goal: &str) -> Consent {
+    read(text, says_goal(text, goal))
+}
+
+/// [`consent`]'s reading of `text`, its words asking for a change read as
+/// unclear unless they are `theirs`, the person's own words for the work.
+fn read(text: &str, theirs: bool) -> Consent {
     if !stands_alone(text) {
         return plainly(text);
     }
@@ -1304,7 +1341,7 @@ fn read(text: &str, answering: bool) -> Consent {
     let opens_no = words.first().is_some_and(|w| refusing(w));
     if opens_no || QUALIFYING.iter().any(|q| holds(&words, q)) {
         Consent::No
-    } else if answering && unclear(text, &words) {
+    } else if !theirs && unclear(text, &words) {
         Consent::Unclear
     } else {
         Consent::Yes

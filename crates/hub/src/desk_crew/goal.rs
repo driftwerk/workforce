@@ -527,7 +527,7 @@ impl CrewHub {
         }
         let answered = match (quoted, agreed) {
             (_, Some(words)) => {
-                let at = self.agreed_at(&b.service, &words)?;
+                let at = self.agreed_at(&b.service, &words, goal_to.unwrap_or(&p.goal))?;
                 Some((words, None, at))
             }
             (None, None) if changes && theirs && p.result.is_none() => {
@@ -660,6 +660,7 @@ impl CrewHub {
         &self,
         service: &AgentService,
         quote: &str,
+        goal: &str,
     ) -> Result<DateTime<Utc>, String> {
         let now = crew::now();
         let since = now - AGREED_WITHIN;
@@ -673,8 +674,8 @@ impl CrewHub {
             .person_words(service, now - WORDS_LOOKED)
             .into_iter()
             .partition(|(at, text)| goal::stands_alone(text) || last.is_none_or(|l| *at > l));
-        goal::said_by(&now_words, quote, since, Said::Agreeing).map_err(|e| {
-            match goal::said_by(&earlier, quote, since, Said::Agreeing) {
+        goal::agreed_by(&now_words, quote, since, goal).map_err(|e| {
+            match goal::agreed_by(&earlier, quote, since, goal) {
                 Ok(_) => format!(
                     "The person's “{}” came before your last message in your DM, so it answered something earlier, not this. Ask them in your DM whether they agree to the goal, then quote their reply.",
                     crew::one_line(quote, 120)

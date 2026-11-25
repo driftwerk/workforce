@@ -807,13 +807,18 @@ const REPLIES: [(&str, Option<&str>); 6] = [
     ("Yes, that looks right to me", None),
 ];
 
-/// An answer to the boss's proposal that asks for a change to it: never a
-/// yes to it as it stands. (Agreeing work in their own words, such words
-/// are the work.)
-const CHANGES_IT: (&str, Option<&str>) = (
-    "Sure, drop the staging part",
-    Some("couldn't read the person's “Sure, drop the staging part” as a clear yes"),
-);
+/// Replies that ask for a change to what was put to them: never a yes to
+/// it as it stands, answering or agreeing work.
+const CHANGES_IT: [(&str, Option<&str>); 2] = [
+    (
+        "Sure, drop the staging part",
+        Some("couldn't read the person's “Sure, drop the staging part” as a clear yes"),
+    ),
+    (
+        "Yes start it, skip the deploy step",
+        Some("couldn't read the person's “Yes start it, skip the deploy step” as a clear yes"),
+    ),
+];
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_no_never_answers_or_agrees_on_any_path_and_a_longer_yes_does() {
@@ -876,7 +881,7 @@ async fn a_no_never_answers_or_agrees_on_any_path_and_a_longer_yes_does() {
         check(&apply(to, "No").await, "No", Some("doesn't agree to it"));
         dm_idle(&overseer).await;
 
-        for (n, (said, refused)) in REPLIES.into_iter().chain([CHANGES_IT]).enumerate() {
+        for (n, (said, refused)) in REPLIES.into_iter().chain(CHANGES_IT).enumerate() {
             let to = format!("Keep the docs build green, step {n}");
             let item = ask(&to, json!([])).await;
             pause().await;
@@ -895,7 +900,7 @@ async fn a_no_never_answers_or_agrees_on_any_path_and_a_longer_yes_does() {
         );
 
         for field in ["agreed", "start_now"] {
-            for (n, (said, refused)) in REPLIES.into_iter().enumerate() {
+            for (n, (said, refused)) in REPLIES.into_iter().chain(CHANGES_IT).enumerate() {
                 pause().await;
                 person_says(&overseer, said);
                 let r = run(
@@ -1165,6 +1170,61 @@ async fn a_short_agreement_counts_only_after_the_bosss_last_message() {
         desk_posts(&overseer, "**Update.** acme-web finished its tests.").await;
         let r = run(&overseer, "crew.plan", plan).await;
         assert!(r.success, "{r:?}");
+    })
+    .await;
+}
+
+/// A click that lands while a turn runs in the boss's DM can't reach it:
+/// the item is open again and the person is told to answer it again.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_click_the_boss_cant_take_reopens_its_item_and_says_so() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        use workforce_desk::open_item::OpenState;
+        let dir = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(dir.path()).unwrap();
+        let gh = github().await;
+        let (overseer, crew, d, _llm) = boss_on(&base, pool, ACTS, &gh).await;
+        let r = run(
+            &overseer,
+            "crew.ask_person",
+            json!({ "text": "Shall I merge the docs fix?", "options": ["Merge", "Hold"] }),
+        )
+        .await;
+        assert!(r.success, "{r:?}");
+        let item = d
+            .store()
+            .items_not_closed(Some("desk"))
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|i| i.text == "Shall I merge the docs fix?")
+            .unwrap()
+            .id;
+        let dm = overseer
+            .sessions
+            .find(DESK_CHANNEL, PERSON)
+            .unwrap()
+            .unwrap();
+        let running = overseer
+            .begin_live_turn(
+                &dm.id,
+                workforce_agent::tools::approval::SelfServe::answerable_if(false),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(crew.answer_item(item, "Merge").await.unwrap(), "Answered.");
+        eventually("the item open again", async || {
+            let i = d.store().open_item(item).await.unwrap()?;
+            (i.state == OpenState::Open).then_some(())
+        })
+        .await;
+        eventually("the person told", async || {
+            (posted(&overseer, "didn't reach") > 0).then_some(())
+        })
+        .await;
+        assert!(posted(&overseer, "so it is still open: answer it again") > 0);
+        drop(running);
     })
     .await;
 }

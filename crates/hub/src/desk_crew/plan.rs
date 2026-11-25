@@ -1359,7 +1359,7 @@ impl CrewHub {
         }
         // The person's words are checked before anything is saved.
         let said = match agreed.as_deref().or(start_now.as_deref()) {
-            Some(w) => Some((w.to_string(), self.agreed_at(&b.service, w)?)),
+            Some(w) => Some((w.to_string(), self.agreed_at(&b.service, w, goal)?)),
             None => None,
         };
         let input = &self.sessions_named(b, input, None).await?;
@@ -1513,7 +1513,14 @@ impl CrewHub {
             .unwrap_or_default();
         // Read before anything changes: one that doesn't read changes nothing.
         let start_now = match start_now_of(input)? {
-            Some(w) => Some((self.agreed_at(&b.service, &w)?, w)),
+            Some(w) => {
+                let goal = input["goal"]
+                    .as_str()
+                    .map(str::trim)
+                    .filter(|g| !g.is_empty())
+                    .unwrap_or(&detail.summary.plan.goal);
+                Some((self.agreed_at(&b.service, &w, goal)?, w))
+            }
             None => None,
         };
         let goal_edit = self.goal_edit(b, &detail, input).await?;

@@ -966,9 +966,16 @@ fn a_short_reply_says_yes_with_a_yes_word_and_no_refusing_one() {
         "Yes, no rush",
         "do it",
     ];
+    for text in yes.into_iter().chain([
+        "keep going",
+        "Yes, keep it up",
+        "ok, move on",
+        "Looks good, keep going with it",
+    ]) {
+        assert_eq!(consent(text), Consent::Yes, "{text}");
+    }
     for text in yes {
         assert_eq!(plainly(text), Consent::Yes, "{text}");
-        assert_eq!(consent(text), Consent::Yes, "{text}");
     }
     let no = [
         "no",
@@ -1015,12 +1022,20 @@ fn a_longer_answer_is_no_only_when_it_opens_with_a_refusal_or_qualifies_it() {
     for text in changes {
         assert_eq!(consent(text), Consent::Unclear, "{text}");
     }
+    let goal = "Keep the docs build green";
     assert_eq!(
-        agreement("Yes, keep the docs build green"),
+        agreement("Yes, keep the docs build green", goal),
         Consent::Yes,
         "agreeing in their own words, the words are the work"
     );
-    assert_eq!(agreement("No, keep the old goal"), Consent::No);
+    assert_eq!(agreement("No, keep the old goal", goal), Consent::No);
+    for changes in [
+        "Sure, drop the staging part",
+        "Yes start it, skip the deploy step",
+    ] {
+        assert_eq!(agreement(changes, goal), Consent::Unclear, "{changes}");
+    }
+    assert_eq!(agreement("Yes, that looks right to me", goal), Consent::Yes);
     let yes = [
         "Yes, that's not a problem",
         "Sounds good, can't wait",
