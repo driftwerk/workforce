@@ -102,7 +102,11 @@ impl Permissions {
     /// for me or not ([`crate::mode::Mode::codex_permissions`]). With no
     /// mode kept, no charge and no Approve for me, none: it runs in the
     /// person's own, from Codex's settings or as its thread last ran.
-    pub fn of(mode: Option<crate::mode::Mode>, approve_for_me: bool, charged: bool) -> Option<Self> {
+    pub fn of(
+        mode: Option<crate::mode::Mode>,
+        approve_for_me: bool,
+        charged: bool,
+    ) -> Option<Self> {
         (approve_for_me || charged || mode.is_some()).then(|| {
             mode.unwrap_or(crate::mode::Mode::Default)
                 .codex_permissions(charged, approve_for_me)
@@ -149,14 +153,18 @@ pub struct Runs {
 impl Runs {
     /// What a `thread/resume` result says of it; none when it says nothing.
     fn of(result: &Value) -> Option<Self> {
-        let text = |p: &str| result.pointer(p).and_then(Value::as_str).map(str::to_string);
+        let text = |p: &str| {
+            result
+                .pointer(p)
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        };
         let runs = Self {
             reviewer: text("/approvalsReviewer"),
             sandbox: text("/sandbox/type"),
-            network: result.pointer("/sandbox/networkAccess").and_then(|n| {
-                n.as_bool()
-                    .or_else(|| n.as_str().map(|s| s == "enabled"))
-            }),
+            network: result
+                .pointer("/sandbox/networkAccess")
+                .and_then(|n| n.as_bool().or_else(|| n.as_str().map(|s| s == "enabled"))),
         };
         (runs.reviewer.is_some() || runs.sandbox.is_some()).then_some(runs)
     }
@@ -166,7 +174,11 @@ impl Runs {
     pub fn differs(&self, asked: &Permissions) -> Option<String> {
         let sandbox = asked.sandbox.replace('-', "");
         let mut said = Vec::new();
-        if let Some(r) = self.reviewer.as_deref().filter(|r| *r != asked.reviewer.as_str()) {
+        if let Some(r) = self
+            .reviewer
+            .as_deref()
+            .filter(|r| *r != asked.reviewer.as_str())
+        {
             said.push(format!("reviewer {r} (asked {})", asked.reviewer.as_str()));
         }
         if let Some(s) = self
@@ -351,6 +363,17 @@ pub fn app_server(
 pub async fn prepare_socket(socket: &Path) -> Result<()> {
     if let Some(dir) = socket.parent() {
         tokio::fs::create_dir_all(dir).await?;
+        // Codex listens only in a folder no other user can write in, which
+        // a umask of 002 would leave it.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = tokio::fs::metadata(dir).await?.permissions().mode();
+            if mode & 0o022 != 0 {
+                tokio::fs::set_permissions(dir, std::fs::Permissions::from_mode(mode & !0o022))
+                    .await?;
+            }
+        }
     }
     last_server_ended(socket, LAST_SERVER_WITHIN).await;
     let _ = tokio::fs::remove_file(socket).await;
@@ -904,7 +927,8 @@ fn permissions_asked(asked: &Value, home: Option<&Path>) -> String {
     };
     let network = (asked.pointer("/network/enabled").and_then(Value::as_bool) == Some(true))
         .then(|| "network access".to_string());
-    let listed = |verb: &str, p: Vec<String>| (!p.is_empty()).then(|| format!("{verb} {}", p.join(", ")));
+    let listed =
+        |verb: &str, p: Vec<String>| (!p.is_empty()).then(|| format!("{verb} {}", p.join(", ")));
     let entries = asked
         .pointer("/fileSystem/entries")
         .and_then(Value::as_array)
@@ -1670,7 +1694,9 @@ impl Follower {
     /// a request already answered.
     pub fn reply(&mut self, reply: &Reply) -> (Option<Seen>, Option<Value>) {
         let opened = self.open.remove(&reply.request.to_string());
-        let answer = opened.as_ref().and_then(|o| answer_of(reply, o.grant.as_ref()));
+        let answer = opened
+            .as_ref()
+            .and_then(|o| answer_of(reply, o.grant.as_ref()));
         let event = match answer {
             Some(_) => CodexEvent::Answered(reply.request.clone()),
             None => CodexEvent::Late(reply.request.clone()),
@@ -2036,7 +2062,9 @@ pub(crate) mod tests {
                     assert_eq!(a.iter().filter(|x| x.starts_with(key)).count(), 1, "{key}");
                 }
                 assert_eq!(
-                    a.iter().filter(|x| x.starts_with("sandbox_workspace_write")).count(),
+                    a.iter()
+                        .filter(|x| x.starts_with("sandbox_workspace_write"))
+                        .count(),
                     usize::from(p.network == Network::On)
                 );
                 let r = resume_params("t1", Path::new("/repo"), None, false, Some(p));
@@ -2372,9 +2400,7 @@ pub(crate) mod tests {
                 .filter(|e| {
                     matches!(
                         e,
-                        CodexEvent::Thread { .. }
-                            | CodexEvent::Loaded { .. }
-                            | CodexEvent::Runs(_)
+                        CodexEvent::Thread { .. } | CodexEvent::Loaded { .. } | CodexEvent::Runs(_)
                     )
                 })
                 .collect();
@@ -3036,10 +3062,17 @@ pub(crate) mod tests {
             .iter()
             .map(|(m, _)| (m.as_str(), owner_of(m)))
             .collect();
-        assert!(owners[..5].iter().all(|(_, o)| *o == Owner::Desk), "{owners:?}");
-        assert!(owners[5..].iter().all(|(_, o)| *o == Owner::Tui), "{owners:?}");
+        assert!(
+            owners[..5].iter().all(|(_, o)| *o == Owner::Desk),
+            "{owners:?}"
+        );
+        assert!(
+            owners[5..].iter().all(|(_, o)| *o == Owner::Tui),
+            "{owners:?}"
+        );
         assert_eq!(kinds[4].1, "Permissions");
-        let (seen, _) = f.heard(&json!({"id": 30, "method": "item/someday/new", "params": {"threadId": "t1"}}));
+        let (seen, _) =
+            f.heard(&json!({"id": 30, "method": "item/someday/new", "params": {"threadId": "t1"}}));
         assert_eq!(
             seen[0].event,
             CodexEvent::Elsewhere {
@@ -3083,8 +3116,10 @@ pub(crate) mod tests {
         };
         assert_eq!(
             f.reply(&reply(7, Decision::Allow)).1,
-            Some(json!({"id": 7, "result": {"permissions": {"network": {"enabled": true},
-                "fileSystem": {"write": ["/repo", "/shared"]}}, "scope": "turn"}}))
+            Some(
+                json!({"id": 7, "result": {"permissions": {"network": {"enabled": true},
+                "fileSystem": {"write": ["/repo", "/shared"]}}, "scope": "turn"}})
+            )
         );
         f.heard(&request(8));
         assert_eq!(
