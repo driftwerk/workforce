@@ -829,6 +829,61 @@ async fn a_draft_cleared_by_hand_lets_the_bosss_message_in() {
     .await;
 }
 
+/// A short draft over two lines holds while its prompt's rows show it, and
+/// once the person clears it the boss's message goes in. Its stand-in
+/// draws the draft in its prompt as a TUI does, and clears it on Ctrl-U.
+#[tokio::test]
+async fn a_short_draft_over_two_lines_holds_until_it_is_cleared() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let cli = dir.path().join("composer-cli");
+        workforce_common::executable::write(
+            &cli,
+            "#!/bin/sh\nstty raw -echo\ni=0\n\
+             while [ $i -lt 30 ]; do printf 'step %s of the build is done, ok\\r\\n' $i; i=$((i+1)); done\n\
+             printf '> '\ndrawn=\n\
+             while :; do\n\
+             c=$(dd bs=1 count=1 2>/dev/null | od -An -tx1 | tr -d ' \\n')\n\
+             [ -z \"$c\" ] && exit 0\n\
+             if [ \"$c\" = 15 ]; then printf '\\r\\033[2K\\033[1A\\r\\033[2K> '; drawn=\n\
+             elif [ -z \"$drawn\" ]; then printf 'Yes.\\r\\n  Go ahead'; drawn=1; fi\n\
+             done\n",
+        )
+        .unwrap();
+        let d = super::super::tests::logged_desk(pool, dir.path(), cli).await.0;
+        let id = typed_into(&d, dir.path()).await;
+        d.set_holds([("sarah".to_string(), chrono::Duration::milliseconds(300))].into());
+        let shown = async |text: &str| {
+            for _ in 0..100 {
+                if d.terminal_text(id, 4000).unwrap().contains(text) {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            panic!("{text:?} never showed");
+        };
+        shown("step 29").await;
+        d.line_draft(id, "Yes.\nGo ahead").unwrap();
+        shown("Go ahead").await;
+        let by = By::manager("sarah", "Sarah", "Next.");
+        let m = d
+            .line_send(Sender::Overseer(by), boss_tell("Push it.", id))
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        assert_eq!(
+            waiting(&d, id, m.id).await,
+            (Delivery::Queued, Some(Wait::Draft))
+        );
+        let pty = d.attach(id).unwrap();
+        let (viewer, _, _) = pty.attach();
+        viewer.claim();
+        viewer.input(b"\x15").unwrap();
+        until_in(&d, id, m.id).await;
+    })
+    .await;
+}
+
 /// Let go while the person drives, what the boss said and the person held
 /// is withdrawn, never typed into a session the person now runs alone.
 #[tokio::test]

@@ -378,7 +378,7 @@ const COMPOSER_LINES: usize = 10;
 const DRAFT_MARK: usize = 40;
 
 /// The fewest letters and digits a draft's start or end is looked for
-/// with: a shorter draft must be a prompt row's whole content.
+/// with: a shorter draft must be the whole content of a run of prompt rows.
 const DRAFT_MARK_MIN: usize = 12;
 
 /// What Codex (`[Pasted Content 1200 chars]`) and Claude Code (`[Pasted
@@ -418,7 +418,9 @@ impl Draft {
         let rows: Vec<String> = prompt.lines().map(Self::plain).collect();
         let chars: Vec<char> = self.plain.chars().collect();
         if chars.len() < DRAFT_MARK_MIN {
-            return rows.contains(&self.plain);
+            return (0..rows.len()).any(|from| {
+                (from + 1..=rows.len()).any(|to| rows[from..to].concat() == self.plain)
+            });
         }
         let shown = rows.concat();
         let first: String = chars.iter().take(DRAFT_MARK).collect();
@@ -1190,6 +1192,18 @@ pub(crate) mod tests {
         assert!(
             !short.shown_in(&screen("│ > ok, and the docs                    │")),
             "not all of it"
+        );
+        let lines = Draft::new("Yes.\nGo ahead");
+        assert!(lines.shown_in(&screen(
+            "│ > Yes.                                │\n│   Go ahead                            │"
+        )));
+        assert!(
+            !lines.shown_in(&screen("│ > Yes.                                │")),
+            "not all of it"
+        );
+        assert!(
+            !lines.shown_in(&screen("│ >                                     │")),
+            "cleared"
         );
     }
 
