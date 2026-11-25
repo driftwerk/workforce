@@ -136,10 +136,22 @@ async fn ended_as_started(d: &Desk, id: Uuid) -> crate::model::Exited {
 /// A Desk on the stand-in, and a Codex session on it whose TUI has
 /// started its thread (`t1`), which Desk follows.
 async fn started(pool: PostgresPool, dir: &Path) -> (Desk, crate::model::SessionView) {
+    started_with(pool, dir, false).await
+}
+
+/// [`started`], with Approve for me as `approve_for_me` says.
+async fn started_with(
+    pool: PostgresPool,
+    dir: &Path,
+    approve_for_me: bool,
+) -> (Desk, crate::model::SessionView) {
     DeskStore::migrate(&pool).await.unwrap();
     let d = desk_on(pool, dir, CancellationToken::new()).await;
     let server = serve(dir);
-    let s = d.create(codex_session(dir, false), None).await.unwrap();
+    let s = d
+        .create(codex_session(dir, approve_for_me), None)
+        .await
+        .unwrap();
     let mut ws = server.await.unwrap();
     say(
         &mut ws,
@@ -362,6 +374,71 @@ async fn a_codex_session_runs_in_its_own_mode_unless_one_that_doesnt_ask_is_kept
         assert_eq!(asked, [its_own(&dir)]);
         until(|| tui_starts(&dir).len() == 11).await;
         assert!(tui_has_no_permissions());
+    })
+    .await;
+}
+
+/// A boss's charge decides what a running Codex session runs in: taken or
+/// released, it is started again in place, between turns, only when that
+/// changes; a grant changed that leaves it as it is starts nothing again.
+#[tokio::test]
+async fn a_charge_starts_codex_again_in_place_only_when_what_it_runs_in_changes() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let dir = dir.path().canonicalize().unwrap();
+        let (d, s) = started_with(pool, &dir, true).await;
+        assert!(tui_starts(&dir)[0].contains("approvals_reviewer=auto_review"));
+        let ok = json!({"thread": {"id": "t1"}});
+        let boss = crate::crew::Party::manager("crew", "Crew");
+        let (asked, mut ws) = started_again(&d, &dir, std::slice::from_ref(&ok), {
+            let boss = boss.clone();
+            move |d| async move {
+                d.take_on(
+                    s.id,
+                    &boss,
+                    crate::charge::How::Handed,
+                    &Default::default(),
+                    &By::you(),
+                )
+                .await
+                .map(drop)
+            }
+        })
+        .await;
+        assert_eq!(
+            asked,
+            [in_mode(&dir, "on-request", "workspace-write")],
+            "under its boss, every escalation is the boss's: Codex's reviewer stands down"
+        );
+        until(|| tui_starts(&dir).len() == 2).await;
+        until(|| d.view(s.id).unwrap().live).await;
+
+        // A grant changed that leaves what it runs in as it is.
+        d.set_full(std::collections::HashMap::from([(
+            "crew".to_string(),
+            crate::charge::FullGrant {
+                repos: vec!["acme/web".into()],
+                ..Default::default()
+            },
+        )]));
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(tui_starts(&dir).len(), 2, "nothing started again");
+
+        // Released mid-turn: started again once its turn ends.
+        say(&mut ws, status("active")).await;
+        until(|| d.view(s.id).unwrap().state == SessionState::Working).await;
+        let server = serve(&dir);
+        d.release(s.id, &By::manager("crew", "Crew", "it's done"))
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(tui_starts(&dir).len(), 2, "not mid-turn");
+        say(&mut ws, status("idle")).await;
+        let mut ws = server.await.unwrap();
+        let mut back = in_mode(&dir, "on-request", "workspace-write");
+        back["approvalsReviewer"] = json!("auto_review");
+        assert_eq!(resumed(&mut ws, ok).await, back, "Approve for me's again");
+        until(|| tui_starts(&dir).len() == 3).await;
     })
     .await;
 }

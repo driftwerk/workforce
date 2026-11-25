@@ -80,6 +80,15 @@ impl StartIn {
     }
 }
 
+/// Why Desk starts a running session again in place.
+#[derive(Debug, Clone, Copy)]
+enum Restart {
+    /// Out of the mode that doesn't ask it ran in.
+    Mode(Mode),
+    /// In the Codex permissions it now runs in.
+    Permissions,
+}
+
 /// A mode set: the session as it is now, whether it was running, the mode
 /// its engine says it runs in when it said so in time (Claude Code only),
 /// and why it didn't start again, when it didn't.
@@ -298,7 +307,7 @@ impl Desk {
                 tracing::warn!(error = %e, "dropping sessions' kept modes failed");
             }
             let kept = self.kept_modes().await;
-            let running: Vec<(Uuid, Mode)> = {
+            let running: Vec<(Uuid, Restart)> = {
                 let mut st = self.0.state.lock();
                 // Stopped with its mode gone: nothing is left to restore.
                 let live: std::collections::HashSet<Uuid> = st.live.keys().copied().collect();
@@ -309,9 +318,16 @@ impl Desk {
                     .iter()
                     .filter(|(id, m)| !m.asks() && live.contains(id))
                     .filter(|(id, _)| !held(id))
-                    .map(|(id, m)| (*id, *m))
+                    .map(|(id, m)| (*id, Restart::Mode(*m)))
                     .collect()
             };
+            let changed: Vec<(Uuid, Restart)> = self
+                .permissions_changed(&kept)
+                .into_iter()
+                .filter(|id| !running.iter().any(|(r, _)| r == id))
+                .map(|id| (id, Restart::Permissions))
+                .collect();
+            let running: Vec<(Uuid, Restart)> = running.into_iter().chain(changed).collect();
             if running.is_empty() {
                 if self.0.modes_dirty.load(Ordering::SeqCst) {
                     continue;
@@ -319,7 +335,7 @@ impl Desk {
                 return;
             }
             let mut waiting = false;
-            for (id, mode) in running {
+            for (id, why) in running {
                 let Ok(view) = self.view(id) else { continue };
                 // Mid-turn, waiting on an answer, or the person typing into
                 // it: once that is over.
@@ -330,19 +346,41 @@ impl Desk {
                     waiting = true;
                     continue;
                 }
-                match self.start_again(id).await {
-                    Ok(v) => self.note(By::desk("Its boss is no longer unbound over it.").event(
-                        Kind::Restarted,
-                        Some(Party::session(&v)),
-                        format!(
-                            "put {} back in its own mode from {} mode (started again in place; its conversation is kept)",
-                            v.label(),
-                            mode.title()
+                match (self.start_again(id).await, why) {
+                    (Ok(v), Restart::Mode(mode)) => self.note(
+                        By::desk("Its boss is no longer unbound over it.").event(
+                            Kind::Restarted,
+                            Some(Party::session(&v)),
+                            format!(
+                                "put {} back in its own mode from {} mode (started again in place; its conversation is kept)",
+                                v.label(),
+                                mode.title()
+                            ),
                         ),
-                    )),
-                    Err(e) => {
+                    ),
+                    (Ok(v), Restart::Permissions) => self.note(
+                        By::desk("Who decides what it asks changed.").event(
+                            Kind::Restarted,
+                            Some(Party::session(&v)),
+                            format!(
+                                "started {} again in place in the permissions it now runs in (its conversation is kept)",
+                                v.label()
+                            ),
+                        ),
+                    ),
+                    (Err(e), Restart::Mode(_)) => {
                         tracing::warn!(%id, error = %e, "a session didn't go back to its own mode; trying again");
                         waiting = true;
+                    }
+                    (Err(e), Restart::Permissions) => {
+                        tracing::warn!(%id, error = %e, "a Codex session didn't start again in its new permissions; trying again");
+                        waiting = true;
+                        self.0.state.lock().turn_failures.insert(
+                            id,
+                            crate::limit::TurnFailure::Failed(format!(
+                                "Desk couldn't apply this session's permissions: {e}"
+                            )),
+                        );
                     }
                 }
             }
@@ -350,6 +388,36 @@ impl Desk {
                 tokio::time::sleep(RESTORE_EVERY).await;
             }
         }
+    }
+
+    /// The running Codex sessions whose permissions, as Desk would start
+    /// them now ([`Desk::codex_permissions`]), aren't those they were
+    /// started in: a charge taken or released, a boss's grant changed.
+    /// One Desk now leaves to the person's own runs on as it is.
+    fn permissions_changed(&self, kept: &HashMap<Uuid, Kept>) -> Vec<Uuid> {
+        let running: Vec<(Uuid, bool, Option<crate::codex::Permissions>)> = {
+            let st = self.0.state.lock();
+            st.live
+                .iter()
+                .filter_map(|(id, l)| {
+                    let link = l._codex.as_ref()?;
+                    let r = st.records.get(id)?;
+                    Some((*id, r.approve_for_me, link.permissions))
+                })
+                .collect()
+        };
+        running
+            .into_iter()
+            .filter(|(id, approve_for_me, launched)| {
+                let mode = kept
+                    .get(id)
+                    .filter(|k| k.holds() && (k.mode.asks() || self.unbound_runs(*id, &k.boss)))
+                    .map(|k| k.mode);
+                self.codex_permissions(*id, mode, *approve_for_me)
+                    .is_some_and(|now| Some(now) != *launched)
+            })
+            .map(|(id, _, _)| id)
+            .collect()
     }
 
     /// Stops `id` and starts it again in place, resumed by id: within

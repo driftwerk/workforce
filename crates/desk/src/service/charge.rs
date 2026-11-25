@@ -146,9 +146,13 @@ impl Desk {
                     }
                     (c.session, c)
                 });
-                let mut st = self.0.state.lock();
-                st.charges.rows = rows.collect();
-                st.charges.loaded = true;
+                {
+                    let mut st = self.0.state.lock();
+                    st.charges.rows = rows.collect();
+                    st.charges.loaded = true;
+                }
+                // What a Codex session started in before is known now.
+                self.modes_changed();
                 true
             }
             Err(e) => {
