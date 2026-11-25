@@ -985,15 +985,43 @@ fn a_short_reply_says_yes_with_a_yes_word_and_no_refusing_one() {
         assert_eq!(plainly(text), Consent::No, "{text}");
         assert_eq!(consent(text), Consent::No, "{text}");
     }
-    for text in ["please", "hmm", "", "thanks"] {
+    for text in [
+        "please",
+        "hmm",
+        "",
+        "thanks",
+        "ok?",
+        "sure?",
+        "approve?",
+        "good question",
+        "ok drop staging",
+    ] {
         assert_eq!(plainly(text), Consent::Unclear, "{text}");
+        assert_eq!(consent(text), Consent::Unclear, "{text}");
     }
 }
 
 #[test]
 fn a_longer_answer_is_no_only_when_it_opens_with_a_refusal_or_qualifies_it() {
-    let yes = [
+    let changes = [
+        "ok, change step 3",
+        "Sure, drop the staging part",
+        "Yes, and remove step 2",
+        "Looks good, though keep staging",
+        "Please change the result to the CI check",
         "Yes, and keep it fast",
+        "Is this the CI check on main?",
+    ];
+    for text in changes {
+        assert_eq!(consent(text), Consent::Unclear, "{text}");
+    }
+    assert_eq!(
+        agreement("Yes, keep the docs build green"),
+        Consent::Yes,
+        "agreeing in their own words, the words are the work"
+    );
+    assert_eq!(agreement("No, keep the old goal"), Consent::No);
+    let yes = [
         "Yes, that's not a problem",
         "Sounds good, can't wait",
         "Yes, no rush on the docs",
@@ -1087,7 +1115,7 @@ fn a_short_answer_or_agreement_counts_only_when_it_agrees_and_none_that_refuses(
             (at(1), "not yet".to_string()),
             (at(2), "Yes, but not the docs".to_string()),
             (at(3), "ok".to_string()),
-            (at(4), "Yes, and keep it fast".to_string()),
+            (at(4), "Yes, that looks right to me".to_string()),
         ];
         let by = |quote: &str| said_by(&messages, quote, at(-60), said);
         for refused in ["no", "not yet", "Yes, but not the docs"] {
@@ -1099,6 +1127,6 @@ fn a_short_answer_or_agreement_counts_only_when_it_agrees_and_none_that_refuses(
             Err(NotSaid::Unclear),
             "{said:?}"
         );
-        assert_eq!(by("Yes, and keep it fast"), Ok(at(4)), "{said:?}");
+        assert_eq!(by("Yes, that looks right to me"), Ok(at(4)), "{said:?}");
     }
 }

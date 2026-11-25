@@ -394,6 +394,22 @@ async fn github_turning_green() -> wiremock::MockServer {
     gh
 }
 
+/// acme/web's CI on main, red in `gh` until now, green from now on.
+async fn ci_turns_green(gh: &wiremock::MockServer) {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, ResponseTemplate};
+    let now = chrono::Utc::now().to_rfc3339();
+    Mock::given(method("GET"))
+        .and(path("/repos/acme/web/actions/runs"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "total_count": 1, "workflow_runs": [{ "id": 9, "name": "CI", "head_branch": "main",
+            "status": "completed", "conclusion": "success", "run_number": 9,
+            "created_at": now, "run_started_at": now, "updated_at": now }] })))
+        .with_priority(1)
+        .mount(gh)
+        .await;
+}
+
 /// A session of the boss's on `folder`, working on `goal`.
 async fn session_on(
     boss: &AgentService,
@@ -675,7 +691,7 @@ async fn the_persons_plain_yes_to_the_bosss_proposal_in_the_dm_replaces_the_goal
     with_test_pool(workforce_desk::store::build_pool, |pool| async move {
         let dir = tempfile::tempdir().unwrap();
         let base = std::fs::canonicalize(dir.path()).unwrap();
-        let gh = github_turning_green().await;
+        let gh = github().await;
         let (overseer, crew, d, _llm) = boss_on(&base, pool, ACTS, &gh).await;
         let s = session_on(&overseer, &d, &base.to_string_lossy(), "Fix the docs build").await;
         let id = agreed_plan(&overseer, &s, judged()).await;
@@ -762,6 +778,7 @@ async fn the_persons_plain_yes_to_the_bosss_proposal_in_the_dm_replaces_the_goal
         assert!(!r.success, "{r:?}");
         assert_eq!(d.plan(id).await.unwrap().summary.plan.goal, wider);
 
+        ci_turns_green(&gh).await;
         crew.plan_turn_now(id, vec!["A turn of its session ended.".into()])
             .await;
         let p = d.plan(id).await.unwrap().summary.plan;
@@ -787,8 +804,16 @@ const REPLIES: [(&str, Option<&str>); 6] = [
     ),
     ("ok", None),
     ("go for it", None),
-    ("Yes, and keep it fast", None),
+    ("Yes, that looks right to me", None),
 ];
+
+/// An answer to the boss's proposal that asks for a change to it: never a
+/// yes to it as it stands. (Agreeing work in their own words, such words
+/// are the work.)
+const CHANGES_IT: (&str, Option<&str>) = (
+    "Sure, drop the staging part",
+    Some("couldn't read the person's “Sure, drop the staging part” as a clear yes"),
+);
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_no_never_answers_or_agrees_on_any_path_and_a_longer_yes_does() {
@@ -832,16 +857,26 @@ async fn a_no_never_answers_or_agrees_on_any_path_and_a_longer_yes_does() {
         };
 
         // Its buttons are Yes and No, whatever the boss labels them, and a
-        // click of Yes applies it.
+        // click of Yes applies it. Each click is made with the DM idle, as
+        // a person's click lands between the boss's turns.
         let to = "Keep the docs build green, clicked yes";
         let item = ask(to, json!(["Apply goal", "Hold, I'll look"])).await;
         let i = d.store().open_item(item).await.unwrap().unwrap();
         assert_eq!(i.options, ["Yes", "No"]);
         pause().await;
+        dm_idle(&overseer).await;
         crew.answer_item(item, "Yes").await.unwrap();
         check(&apply(to, "Yes").await, "Yes", None);
+        // A click of No refuses it.
+        let to = "Keep the docs build green, clicked no";
+        let item = ask(to, json!(["Apply goal"])).await;
+        pause().await;
+        dm_idle(&overseer).await;
+        crew.answer_item(item, "No").await.unwrap();
+        check(&apply(to, "No").await, "No", Some("doesn't agree to it"));
+        dm_idle(&overseer).await;
 
-        for (n, (said, refused)) in REPLIES.into_iter().enumerate() {
+        for (n, (said, refused)) in REPLIES.into_iter().chain([CHANGES_IT]).enumerate() {
             let to = format!("Keep the docs build green, step {n}");
             let item = ask(&to, json!([])).await;
             pause().await;
@@ -1130,6 +1165,16 @@ async fn a_short_agreement_counts_only_after_the_bosss_last_message() {
         desk_posts(&overseer, "**Update.** acme-web finished its tests.").await;
         let r = run(&overseer, "crew.plan", plan).await;
         assert!(r.success, "{r:?}");
+    })
+    .await;
+}
+
+/// Once no turn runs in `boss`'s DM: a click's answer reaches the boss in
+/// a turn of its own there, which another turn running would hold up.
+async fn dm_idle(boss: &AgentService) {
+    eventually("the DM to be idle", async || {
+        let dm = boss.sessions.find(DESK_CHANNEL, PERSON).ok().flatten()?;
+        (!boss.live_turns.running(&dm.id)).then_some(())
     })
     .await;
 }
