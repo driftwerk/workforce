@@ -3950,13 +3950,13 @@ impl Desk {
         if placed.is_ok() && named {
             placed = self.0.store.put(&record).await.map_err(DeskError::Internal);
         }
-        // Linked before it runs: a review it can't be found by is never
-        // recorded.
-        if let (Ok(()), Some(r)) = (&placed, &new.review_of) {
+        // Linked before it runs, to the boss that started it: a review it
+        // can't be found by is never recorded.
+        if let (Ok(()), Some(r), Some(b)) = (&placed, &new.review_of, boss) {
             placed = self
                 .0
                 .store
-                .pr_review_link(id, &r.pr)
+                .pr_review_link(id, &b.id, &r.pr)
                 .await
                 .map_err(DeskError::Internal);
         }

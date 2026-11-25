@@ -24,12 +24,12 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 use workforce_agent::llm::anthropic::Effort;
-use workforce_agent::llm::provider::with_effort_override;
-use workforce_agent::llm::types::{ContentBlock, LlmMessage};
+use workforce_agent::llm::provider::{with_effort_override, LlmProvider};
+use workforce_agent::llm::types::{ContentBlock, LlmMessage, LlmResponse};
 use workforce_agent::runner::with_served_log;
 use workforce_common::cost::{CostEntry, TokenCounts};
 use workforce_common::oversight::Level;
-use workforce_common::subscription::Origin;
+use workforce_common::subscription::{Origin, Served};
 use workforce_desk::crew::{By, Kind, Party};
 use workforce_desk::decision::{BossDecision, How, Need};
 use workforce_desk::model::{DeskEvent, PendingApproval, SessionView};
@@ -1185,6 +1185,30 @@ impl CrewHub {
     }
 }
 
+/// `llm` (on `model`) asked `prompt` under `system` as a judgement at
+/// `effort`, with room for a reasoning model's verdict: what it answered,
+/// and on which plan.
+async fn judged(
+    llm: &dyn LlmProvider,
+    effort: Effort,
+    model: Option<&str>,
+    system: &str,
+    prompt: &str,
+) -> (eyre::Result<LlmResponse>, Option<Served>) {
+    with_effort_override(
+        Some(effort),
+        with_served_log(llm.create_message(
+            Some(system),
+            &[LlmMessage::user(prompt.to_string())],
+            &[],
+            model,
+            Some(DECISION_TOKENS),
+            true,
+        )),
+    )
+    .await
+}
+
 /// One call to `service`'s model for a decision, on whichever hub holds
 /// `service` (the person's own, or a remote boss's): its text. It runs on
 /// `service`'s heavy background model (`[llm] heavy_model`), never
@@ -1197,16 +1221,12 @@ pub(crate) async fn decision_call(
     let model = crate::turn_loop::heavy_model(service);
     let effort = judging_effort(service.resolved.snapshot().effort_level());
     let started = std::time::Instant::now();
-    let (response, served) = with_effort_override(
-        Some(effort),
-        with_served_log(service.llm.create_message(
-            Some(system),
-            &[LlmMessage::user(prompt.to_string())],
-            &[],
-            model.as_deref(),
-            Some(DECISION_TOKENS),
-            true,
-        )),
+    let (response, served) = judged(
+        service.llm.as_ref(),
+        effort,
+        model.as_deref(),
+        system,
+        prompt,
     )
     .await;
     let elapsed = started.elapsed();
@@ -1273,8 +1293,63 @@ fn asking(engine: workforce_desk::engine::Engine) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::{asking, kept_from, verdict, Verdict};
+    use super::{asking, judged, judging_effort, kept_from, verdict, Verdict, DECISION_TOKENS};
+    use workforce_agent::llm::anthropic::Effort;
+    use workforce_agent::llm::provider::{effective_effort, LlmProvider};
+    use workforce_agent::llm::types::{
+        ContentBlock, LlmMessage, LlmResponse, LlmToolDef, StopReason, TokenUsage,
+    };
     use workforce_desk::engine::Engine;
+
+    /// A model that keeps the effort and output cap each request was built
+    /// with, as a provider reads them into its body.
+    #[derive(Default)]
+    struct Heard(parking_lot::Mutex<Vec<(Option<Effort>, Option<u32>)>>);
+
+    #[async_trait::async_trait]
+    impl LlmProvider for Heard {
+        async fn create_message(
+            &self,
+            _: Option<&str>,
+            _: &[LlmMessage],
+            _: &[LlmToolDef],
+            _: Option<&str>,
+            max_tokens: Option<u32>,
+            _: bool,
+        ) -> eyre::Result<LlmResponse> {
+            self.0.lock().push((effective_effort(), max_tokens));
+            Ok(LlmResponse {
+                content: vec![ContentBlock::Text {
+                    text: "ALLOW: it serves the work".into(),
+                }],
+                stop_reason: StopReason::EndTurn,
+                usage: TokenUsage::default(),
+                model: "mock".into(),
+            })
+        }
+    }
+
+    /// A decision's request is built at the effort floor, or the person's
+    /// higher choice, with room for its verdict; a chat turn's effort isn't
+    /// touched by it.
+    #[tokio::test]
+    async fn a_decisions_request_carries_the_floor_or_the_persons_higher_effort() {
+        let heard = Heard::default();
+        for chosen in [None, Some(Effort::Low), Some(Effort::High)] {
+            let (answer, _) =
+                judged(&heard, judging_effort(chosen), None, "system", "prompt").await;
+            assert!(answer.is_ok());
+        }
+        assert_eq!(
+            *heard.0.lock(),
+            [
+                (Some(Effort::Medium), Some(DECISION_TOKENS)),
+                (Some(Effort::Medium), Some(DECISION_TOKENS)),
+                (Some(Effort::High), Some(DECISION_TOKENS)),
+            ]
+        );
+        assert_eq!(effective_effort(), None, "nothing outlives the call");
+    }
 
     #[test]
     fn a_boss_on_another_hub_decides_claudes_requests_only() {

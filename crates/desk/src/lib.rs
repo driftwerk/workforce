@@ -62,6 +62,7 @@ pub mod grant;
 mod grant_api;
 pub mod grant_store;
 pub mod handoff;
+pub mod hold_store;
 pub mod holder;
 pub mod identity;
 pub mod issues;

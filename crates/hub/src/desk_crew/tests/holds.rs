@@ -349,6 +349,15 @@ async fn at_act_fully_a_hold_names_its_directive_and_ends_when_its_condition_is_
 
         let unnamed = call(&crew, "crew.nudge", hold(json!({}))).await;
         assert_eq!(unnamed.error.as_deref(), Some(NAMES_DIRECTIVE));
+        // 25 Nov 19:08: a hold in the boss's own words, with no directive.
+        let own_words = call(
+            &crew,
+            "crew.nudge",
+            json!({ "session_id": s.id.to_string(), "reason": "Waiting on the release.",
+                "message": "Keep the hold in place on MAN-835: do not push, rerun or merge." }),
+        )
+        .await;
+        assert_eq!(own_words.error.as_deref(), Some(NAMES_DIRECTIVE));
         let not_one = call(
             &crew,
             "crew.nudge",
@@ -356,7 +365,7 @@ async fn at_act_fully_a_hold_names_its_directive_and_ends_when_its_condition_is_
         )
         .await;
         assert!(!not_one.success);
-        assert!(crew.hold_on(s.id).await.is_none());
+        assert!(crew.hold_on(s.id).await.unwrap().is_none());
 
         let held = call(
             &crew,
@@ -365,7 +374,7 @@ async fn at_act_fully_a_hold_names_its_directive_and_ends_when_its_condition_is_
         )
         .await;
         assert!(held.success, "{:?}", held.error);
-        let h = crew.hold_on(s.id).await.expect("held");
+        let h = crew.hold_on(s.id).await.unwrap().expect("held");
         assert_eq!(h.directive_id, directive.id);
         assert_eq!(
             h.until,
@@ -373,6 +382,17 @@ async fn at_act_fully_a_hold_names_its_directive_and_ends_when_its_condition_is_
         );
         let v = d.view(s.id).unwrap();
         assert!(crew.close_held(&v, "desk").await.is_some(), "held stays open");
+        // Kept through a restart: a crew started afresh on the same Desk,
+        // with nothing of this one's, finds it.
+        let stop = CancellationToken::new();
+        let restarted = CrewHub::start(
+            hub(std::slice::from_ref(&overseer)),
+            d.clone(),
+            FAST,
+            stop.clone(),
+        );
+        assert_eq!(restarted.hold_on(s.id).await.unwrap(), Some(h.clone()));
+        stop.cancel();
 
         let met = call(
             &crew,
@@ -382,7 +402,7 @@ async fn at_act_fully_a_hold_names_its_directive_and_ends_when_its_condition_is_
         )
         .await;
         assert!(met.success, "{:?}", met.error);
-        assert!(crew.hold_on(s.id).await.is_none());
+        assert!(crew.hold_on(s.id).await.unwrap().is_none());
         assert!(!d
             .store()
             .items_not_closed(Some("desk"))

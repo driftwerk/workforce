@@ -1702,6 +1702,18 @@ pub struct PrRef {
     pub number: i64,
 }
 
+impl PrRef {
+    /// `owner/repo#number`, its names in lowercase as GitHub matches them,
+    /// so one pull request is one `PrRef` however it was spelled.
+    pub fn new(owner: &str, repo: &str, number: i64) -> Self {
+        Self {
+            owner: owner.to_ascii_lowercase(),
+            repo: repo.to_ascii_lowercase(),
+            number,
+        }
+    }
+}
+
 /// What a review session is started to review: a pull request, at its
 /// head as it starts, which its verdict names ([`REVIEW_VERDICT`]).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1734,6 +1746,8 @@ impl ReviewOf {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PrReview {
+    /// The boss whose review session it was.
+    pub boss: String,
     #[serde(flatten)]
     pub pr: PrRef,
     pub head_sha: String,
@@ -1747,7 +1761,7 @@ pub struct PrReview {
 /// ([`review_verdict`]).
 pub const REVIEW_VERDICT: &str = "When your review is done, end your final reply with exactly \
 one line of its own naming the commit you reviewed (the pull request's head is {head}): \
-`REVIEW: clean {head}` when it is ready to merge as it is, or `REVIEW: changes {head}` when it \
+REVIEW: clean {head} when it is ready to merge as it is, or REVIEW: changes {head} when it \
 needs changes.";
 
 /// [`REVIEW_VERDICT`], for a pull request at `head`.
@@ -1756,11 +1770,17 @@ pub fn review_instruction(head: &str) -> String {
 }
 
 /// The verdict a review's reply ends with ([`REVIEW_VERDICT`]): its last
-/// line reading exactly `REVIEW: clean <sha>` or `REVIEW: changes <sha>`,
-/// with the full SHA of the commit it reviewed. `true`: clean.
+/// line reading `REVIEW: clean <sha>` or `REVIEW: changes <sha>`, with the
+/// full SHA of the commit it reviewed, as a model writes it: spaced, in
+/// code or bold, or ending its sentence. `true`: clean.
 pub fn review_verdict(text: &str) -> Option<(bool, String)> {
     text.lines().rev().find_map(|line| {
-        let (word, sha) = line.strip_prefix("REVIEW: ")?.split_once(' ')?;
+        let bare = line
+            .trim()
+            .trim_matches(|c| matches!(c, '`' | '*'))
+            .trim_end_matches(['.', '\r'])
+            .trim_matches(|c| matches!(c, '`' | '*'));
+        let (word, sha) = bare.strip_prefix("REVIEW: ")?.split_once(' ')?;
         let clean = match word {
             "clean" => true,
             "changes" => false,

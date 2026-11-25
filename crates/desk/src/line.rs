@@ -777,6 +777,71 @@ pub fn holds_for_person(text: &str) -> bool {
     })
 }
 
+/// What tells a session to hold, wait or not push, as whole words: "keep
+/// the hold in place", "hold off", "wait until", "do not push".
+const HOLDS_SESSION: [&str; 20] = [
+    "hold",
+    "on hold",
+    "hold off",
+    "hold here",
+    "stay held",
+    "wait until",
+    "wait till",
+    "wait before",
+    "wait here",
+    "stand by",
+    "stay put",
+    "pause",
+    "do not push",
+    "don't push",
+    "dont push",
+    "no pushes",
+    "stop pushing",
+    "do not merge",
+    "don't merge",
+    "do not rerun",
+];
+
+/// What before a hold's words lifts it, or says there is none: "no need
+/// to hold", "lift the hold", "don't wait".
+const NO_HOLD: [&str; 12] = [
+    "no ",
+    "no need to ",
+    "not ",
+    "don't ",
+    "do not ",
+    "never ",
+    "without a ",
+    "lift the ",
+    "lifted the ",
+    "release the ",
+    "end the ",
+    "ended the ",
+];
+
+/// Whether `text`, a boss's words to a session, hold it: tell it to hold,
+/// wait or not push. At Act fully such words are only ever a directive's
+/// hold (25 Nov 19:08: "Keep the hold in place … do not push, rerun", and
+/// no directive asked for it).
+pub fn holds_session(text: &str) -> bool {
+    let lower = plain(text);
+    HOLDS_SESSION.iter().any(|h| {
+        lower.match_indices(h).any(|(at, _)| {
+            let before = &lower[..at];
+            let after = &lower[at + h.len()..];
+            let whole = !before
+                .chars()
+                .next_back()
+                .is_some_and(char::is_alphanumeric)
+                && !after.starts_with(char::is_alphanumeric);
+            let lifted = after.trim_start().starts_with("is lifted")
+                || after.trim_start().starts_with("is over")
+                || (!h.starts_with("do") && NO_HOLD.iter().any(|n| before.ends_with(n)));
+            whole && !lifted
+        })
+    })
+}
+
 /// Who replies to a line message: a session, the overseer (its agent id),
 /// or the person.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1803,7 +1868,38 @@ fn short_question(question: String) -> Result<String, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::holds_for_person;
+    use super::{holds_for_person, holds_session};
+
+    #[test]
+    fn words_that_hold_a_session_are_told_from_the_work() {
+        for held in [
+            "Keep the hold in place on MAN-839: do not push, rerun or merge until I say.",
+            "Hold off on the merge.",
+            "Stay on hold for now.",
+            "Wait until the release window opens.",
+            "Don't push yet.",
+            "Do not merge it.",
+            "Pause here.",
+            "Stand by.",
+        ] {
+            assert!(holds_session(held), "{held}");
+        }
+        for not in [
+            "Push your branch and open the PR.",
+            "Wait for CI to finish, then merge.",
+            "No need to hold: carry on.",
+            "The hold is lifted: push and merge.",
+            "Lift the hold and push.",
+            "CI is green: merge it.",
+            "Look at the CI logs.",
+            "Raise the threshold to 5.",
+            "Keep a firm handhold on the API.",
+            "Don't wait for me: push it.",
+            "The upload paused mid-way; retry it.",
+        ] {
+            assert!(!holds_session(not), "{not}");
+        }
+    }
 
     #[test]
     fn a_hold_on_the_persons_word_is_told_from_the_bosss() {

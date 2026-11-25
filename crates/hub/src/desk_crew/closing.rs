@@ -509,10 +509,15 @@ impl CrewHub {
         {
             return Some("It's still working: it is closed only once its turn has ended.".into());
         }
-        if self.hold_on(v.id).await.is_some() {
-            return Some(
-                "It's held on the person's directive: it stays open until its hold ends.".into(),
-            );
+        match self.hold_on(v.id).await {
+            Ok(None) => {}
+            Ok(Some(_)) => {
+                return Some(
+                    "It's held on the person's directive: it stays open until its hold ends."
+                        .into(),
+                )
+            }
+            Err(why) => return Some(why),
         }
         // Rested first, as the closer's own: what it did is seen.
         if !cancels && !at_rest(v, Utc::now(), *self.close_settle.lock()) {
@@ -568,21 +573,32 @@ impl CrewHub {
         kept.map(|kept| format!("It stays open ({kept}): nothing is closed that would lose work."))
     }
 
-    /// Whether a newer session now holds a ticket `session` was on.
-    async fn superseded(&self, session: Uuid) -> bool {
-        self.desk
+    /// Whether a newer session now holds a ticket `session` was on: never
+    /// one started to review its pull request, which carries no work.
+    pub(crate) async fn superseded(&self, session: Uuid) -> bool {
+        let tickets = self
+            .desk
             .store()
             .linked_tickets(&[session])
             .await
-            .unwrap_or_default()
-            .iter()
-            .any(|t| {
-                !matches!(t.state, TicketState::Done | TicketState::Dropped)
-                    && t.assignee.as_ref().is_some_and(|a| {
-                        a.kind == workforce_desk::crew::PartyKind::Session
-                            && a.id != session.to_string()
-                    })
-            })
+            .unwrap_or_default();
+        let newer = tickets.iter().filter_map(|t| {
+            let a = t.assignee.as_ref()?;
+            (!matches!(t.state, TicketState::Done | TicketState::Dropped)
+                && a.kind == workforce_desk::crew::PartyKind::Session
+                && a.id != session.to_string())
+            .then_some(a.id.as_str())
+        });
+        for other in newer {
+            let reviews = match other.parse::<Uuid>() {
+                Ok(id) => !matches!(self.desk.store().pr_review_of(id).await, Ok(None)),
+                Err(_) => false,
+            };
+            if !reviews {
+                return true;
+            }
+        }
+        false
     }
 
     /// The plan watch's bookkeeping for `boss`'s plan `tickets`, before it

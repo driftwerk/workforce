@@ -75,11 +75,7 @@ fn pr_ref(repo: &str, number: Option<i64>) -> Result<PrRef, String> {
     let number = number
         .filter(|n| *n > 0)
         .ok_or("Say which pull request: its number.")?;
-    Ok(PrRef {
-        owner: owner.to_string(),
-        repo: name.to_string(),
-        number,
-    })
+    Ok(PrRef::new(owner, name, number))
 }
 
 fn number_of(v: &Value) -> Option<i64> {
@@ -344,12 +340,14 @@ impl CrewHub {
         else {
             return Ok(());
         };
-        r.head_sha = Self::pr_head(b, &r.pr).await?;
+        r.head_sha = self.as_person(&b.service, Self::pr_head(b, &r.pr)).await?;
         kept["review_of"]["head_sha"] = json!(r.head_sha);
         Ok(())
     }
 
-    /// The `(origin, branch)` of each session `boss` runs, as its folder is.
+    /// The `(origin, branch)` of each session `boss` runs now, as its folder
+    /// is: Desk's charges are only the live ones, so never one released or
+    /// taken back, which is no longer its work.
     async fn branches_of(&self, boss: &str) -> Vec<(String, String)> {
         let mut out = Vec::new();
         for c in self.desk.charges().into_iter().filter(|c| c.boss == boss) {
@@ -396,11 +394,13 @@ impl CrewHub {
             .pr_review_of(id)
             .await
             .map_err(|e| format!("Desk couldn't read what it reviews: {e}"))?
+            .filter(|(by, _)| by == boss)
+            .map(|(_, pr)| pr)
             .ok_or("It wasn't started to review a pull request: start a review with crew.start_session and review_of.")?;
         if v.state.busy() {
             return Err("It's still reviewing: record its verdict once its turn has ended.".into());
         }
-        let head = Self::pr_head(b, &pr).await?;
+        let head = self.as_person(&b.service, Self::pr_head(b, &pr)).await?;
         let folder = match workspace::workspace_of(&v.cwd).await {
             Workspace::Repo(r) => r.head,
             _ => None,
@@ -417,6 +417,7 @@ impl CrewHub {
             .unwrap_or_default();
         let clean = verdict_at(reply, &folder, &head)?;
         let review = PrReview {
+            boss: boss.to_string(),
             pr: pr.clone(),
             head_sha: head.clone(),
             clean,
@@ -464,13 +465,19 @@ impl CrewHub {
         let review = self
             .desk
             .store()
-            .pr_review_newest(&pr)
+            .pr_review_newest(boss, &pr)
             .await
             .map_err(|e| format!("Desk couldn't read its review: {e}"))?;
         let branches = self.branches_of(boss).await;
         let named = format!("{}#{}", full_name(&pr), pr.number);
         let actor = Party::manager(boss, &super::name_of(&b.service));
-        match merge(&Self::access(b), &pr, review.as_ref(), &branches).await {
+        let merged = self
+            .as_person(
+                &b.service,
+                merge(&Self::access(b), &pr, review.as_ref(), &branches),
+            )
+            .await;
+        match merged {
             Ok((ready, merged)) => {
                 let what = format!("merged {named}");
                 let mut d = BossDecision::new(boss, Need::Choice, &what, why, How::Own)
@@ -504,7 +511,7 @@ impl CrewHub {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use wiremock::matchers::{body_partial_json, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -523,6 +530,7 @@ mod tests {
 
     fn review(at: &str, clean: bool) -> PrReview {
         PrReview {
+            boss: "desk".into(),
             pr: pr(),
             head_sha: at.into(),
             clean,
@@ -658,21 +666,21 @@ mod tests {
             .contains(&format!("Its folder is at {OLD}, the PR is at {HEAD}")));
     }
 
-    /// GitHub as `get_pull`, `get_repo` and `pr_merge` read `acme/web#7`,
-    /// mergeable as `mergeable` says.
-    async fn github(server: &MockServer, mergeable: Value) {
+    /// GitHub as `get_pull`, `get_repo` and its checks read `acme/web#7`
+    /// from `dw-761`, at `head`, mergeable as `mergeable` says.
+    pub(in super::super) async fn github(server: &MockServer, head: &str, mergeable: Value) {
         Mock::given(method("GET"))
             .and(path("/repos/acme/web/pulls/7"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "number": 7, "state": "open", "merged": false, "draft": false,
                 "mergeable": mergeable, "mergeable_state": "clean",
-                "head": {"ref": "dw-761", "sha": HEAD, "repo": {"full_name": "acme/web"}},
+                "head": {"ref": "dw-761", "sha": head, "repo": {"full_name": "acme/web"}},
                 "base": {"ref": "main", "repo": {"full_name": "acme/web"}},
             })))
             .mount(server)
             .await;
         Mock::given(method("GET"))
-            .and(path(format!("/repos/acme/web/commits/{HEAD}/check-runs")))
+            .and(path(format!("/repos/acme/web/commits/{head}/check-runs")))
             .respond_with(
                 ResponseTemplate::new(200).set_body_json(json!({"check_runs": [
                     {"name": "Test", "status": "completed", "conclusion": "success"},
@@ -696,7 +704,7 @@ mod tests {
     #[tokio::test]
     async fn the_merge_squashes_the_reviewed_head_and_never_while_github_is_undecided() {
         let server = MockServer::start().await;
-        github(&server, json!(true)).await;
+        github(&server, HEAD, json!(true)).await;
         Mock::given(method("PUT"))
             .and(path("/repos/acme/web/pulls/7/merge"))
             .and(body_partial_json(json!({"sha": HEAD, "merge_method": "squash"})))
@@ -720,7 +728,7 @@ mod tests {
 
         let undecided = MockServer::start().await;
         super::super::github::tests::no_writes(&undecided).await;
-        github(&undecided, Value::Null).await;
+        github(&undecided, HEAD, Value::Null).await;
         let h = super::super::github::tests::hub(&undecided);
         let said = CURRENT_USER_ID
             .scope(

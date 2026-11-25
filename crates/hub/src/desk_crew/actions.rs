@@ -376,11 +376,7 @@ fn review_of(v: &Value) -> Result<workforce_desk::plan::ReviewOf, String> {
         .filter(|n| *n > 0)
         .ok_or("Say the number of the pull request to review (review_of.number).")?;
     Ok(workforce_desk::plan::ReviewOf {
-        pr: workforce_desk::plan::PrRef {
-            owner: owner.to_string(),
-            repo: repo.to_string(),
-            number,
-        },
+        pr: workforce_desk::plan::PrRef::new(owner, repo, number),
         head_sha: v["head_sha"].as_str().unwrap_or_default().to_string(),
     })
 }

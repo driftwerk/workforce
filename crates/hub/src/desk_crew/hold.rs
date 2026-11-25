@@ -3,14 +3,16 @@
 //! asked them).
 //!
 //! - **Named.** A hold is a directive's: `crew.nudge` with `directive_id`
-//!   (one of the person's directives) and `until`. One with no directive
-//!   is refused, so no gate is ever invented.
+//!   (one of the person's directives) and `until`. One with no directive,
+//!   however it says to hold, wait or not push, is refused, so no gate is
+//!   ever invented.
 //! - **Asked.** Its question goes to the person at once (`crew.ask_person`
 //!   about the session, asked first), as a hold below Act fully does.
 //! - **Ended** when the person answers its question (`person_answers`),
 //!   the directive is withdrawn (`directive_withdrawn`; a withdrawn
 //!   directive ends every hold of its), or the boss records its condition
 //!   met (`crew.nudge` with `hold_met`), which closes its question too.
+//! - **Kept** in Postgres (`boss_holds`), so a restart never drops one.
 
 use serde_json::Value;
 use uuid::Uuid;
@@ -34,38 +36,7 @@ const NOT_A_DIRECTIVE: &str = "That isn't one of the person's directives (crew.d
 const NO_CONDITION: &str =
     "That session isn't held on a condition, so hold_met has nothing to end.";
 
-/// What ends a hold.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum Until {
-    PersonAnswers,
-    DirectiveWithdrawn,
-    /// What the boss records as met, in words ("CI green at the head").
-    Condition(String),
-}
-
-impl Until {
-    fn of(raw: &str) -> Option<Self> {
-        match raw.trim() {
-            "" => None,
-            "person_answers" => Some(Self::PersonAnswers),
-            "directive_withdrawn" => Some(Self::DirectiveWithdrawn),
-            c => Some(Self::Condition(c.to_string())),
-        }
-    }
-}
-
-/// A session held on one of the person's directives.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct Hold {
-    pub session: Uuid,
-    pub boss: String,
-    /// The person whose directive it is.
-    pub owner: String,
-    pub directive_id: Uuid,
-    /// The open item that asks them its question.
-    pub question: Uuid,
-    pub until: Until,
-}
+pub(crate) use workforce_desk::hold_store::{Hold, Until};
 
 /// What a boss's message does to its session's hold, once it is sent.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -104,7 +75,7 @@ impl CrewHub {
             return Ok(None);
         };
         if let Some(met) = said(input, "hold_met") {
-            return match self.hold_on(*s).await {
+            return match self.hold_on(*s).await? {
                 Some(Hold {
                     until: Until::Condition(_),
                     ..
@@ -119,7 +90,10 @@ impl CrewHub {
         let until = said(input, "until").and_then(Until::of);
         let full = level == Level::Full;
         let holds = workforce_desk::line::holds_for_person(message)
-            || (full && (directive.is_some() || until.is_some()));
+            || (full
+                && (directive.is_some()
+                    || until.is_some()
+                    || workforce_desk::line::holds_session(message)));
         if !holds {
             return Ok(None);
         }
@@ -159,21 +133,24 @@ impl CrewHub {
     /// Keeps `change`, its message sent: the hold kept, or ended with its
     /// question closed.
     pub(crate) async fn hold_changed(&self, change: HoldChange) {
+        let store = self.desk.store();
         match change {
             HoldChange::Hold(h) => {
-                self.holds.lock().insert(h.session, h);
+                if let Err(e) = store.hold_put(&h).await {
+                    tracing::warn!(session = %h.session, error = %format!("{e:#}"), "a hold wasn't kept");
+                }
             }
             HoldChange::Met { session, said } => {
-                let Some(h) = self.holds.lock().remove(&session) else {
-                    return;
+                let h = match store.hold_end(session).await {
+                    Ok(Some(h)) => h,
+                    Ok(None) => return,
+                    Err(e) => {
+                        tracing::warn!(%session, error = %format!("{e:#}"), "a met hold wasn't ended");
+                        return;
+                    }
                 };
                 let why = format!("Its condition was met: {said}");
-                if let Err(e) = self
-                    .desk
-                    .store()
-                    .item_close(h.question, ClosedBy::Boss, &why)
-                    .await
-                {
+                if let Err(e) = store.item_close(h.question, ClosedBy::Boss, &why).await {
                     tracing::warn!(%session, error = %format!("{e:#}"), "a met hold's question wasn't closed");
                 }
             }
@@ -182,10 +159,16 @@ impl CrewHub {
 
     /// The hold `session` is under now, if any: one whose directive was
     /// withdrawn, or whose question the person answered when that ends it,
-    /// is over and dropped. One that can't be read is kept.
-    pub(crate) async fn hold_on(&self, session: Uuid) -> Option<Hold> {
-        let h = self.holds.lock().get(&session).cloned()?;
+    /// is over and ended. Why it can't be said, when its hold can't be read.
+    pub(crate) async fn hold_on(&self, session: Uuid) -> Result<Option<Hold>, String> {
         let store = self.desk.store();
+        let Some(h) = store.hold_of(session).await.map_err(|e| {
+            tracing::warn!(%session, error = %format!("{e:#}"), "a session's hold couldn't be read");
+            "Whether it is held couldn't be read, so it stays as it is for now.".to_string()
+        })?
+        else {
+            return Ok(None);
+        };
         let withdrawn = matches!(store.directive_of(&h.owner, h.directive_id).await, Ok(None));
         let answered = h.until == Until::PersonAnswers
             && store
@@ -193,9 +176,11 @@ impl CrewHub {
                 .await
                 .is_ok_and(|items| !items.iter().any(|i| i.id == h.question));
         if withdrawn || answered {
-            self.holds.lock().remove(&session);
-            return None;
+            if let Err(e) = store.hold_end(session).await {
+                tracing::warn!(%session, error = %format!("{e:#}"), "an ended hold wasn't dropped");
+            }
+            return Ok(None);
         }
-        Some(h)
+        Ok(Some(h))
     }
 }

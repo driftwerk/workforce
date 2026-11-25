@@ -1695,8 +1695,9 @@ fn a_ticket_names_its_folder_or_its_repository() {
 
 const HEAD: &str = "0123456789abcdef0123456789abcdef01234567";
 
-/// A review's verdict is its reply's last `REVIEW:` line, exactly, naming
-/// a full SHA; anything else is no verdict.
+/// A review's verdict is its reply's last `REVIEW:` line naming a full
+/// SHA, however it is spaced, put in code or bold, or ends its sentence;
+/// anything else is no verdict.
 #[test]
 fn a_review_verdict_is_its_last_review_line_with_a_full_sha() {
     let older = "fedcba9876543210fedcba9876543210fedcba98";
@@ -1718,9 +1719,14 @@ fn a_review_verdict_is_its_last_review_line_with_a_full_sha() {
         (format!("REVIEW: clean {HEAD}0"), None),
         (format!("REVIEW: clean {}", HEAD.to_uppercase()), None),
         (format!("REVIEW: approved {HEAD}"), None),
-        (format!(" REVIEW: clean {HEAD}"), None),
-        (format!("`REVIEW: clean {HEAD}`"), None),
-        (format!("REVIEW: clean {HEAD} "), None),
+        (format!(" REVIEW: clean {HEAD}"), Some((true, HEAD))),
+        (format!("`REVIEW: clean {HEAD}`"), Some((true, HEAD))),
+        (format!("**REVIEW: changes {HEAD}**"), Some((false, HEAD))),
+        (format!("REVIEW: clean {HEAD}."), Some((true, HEAD))),
+        (format!("`REVIEW: clean {HEAD}`.\r"), Some((true, HEAD))),
+        (format!("   REVIEW: clean {HEAD}   "), Some((true, HEAD))),
+        (format!("REVIEW: clean {HEAD} looks fine"), None),
+        (format!("REVIEW:clean {HEAD}"), None),
         ("All good, merge it.".to_string(), None),
         (String::new(), None),
     ] {
@@ -1738,8 +1744,9 @@ fn a_review_verdict_is_its_last_review_line_with_a_full_sha() {
 fn the_review_instruction_names_the_head_in_the_verdicts_words() {
     let said = review_instruction(HEAD);
     assert!(!said.contains("{head}"));
-    assert!(said.contains(&format!("`REVIEW: clean {HEAD}`")));
-    assert!(said.contains(&format!("`REVIEW: changes {HEAD}`")));
+    assert!(said.contains(&format!("REVIEW: clean {HEAD} when")));
+    assert!(said.contains(&format!("REVIEW: changes {HEAD} when")));
+    assert!(!said.contains('`'));
     assert_eq!(
         review_verdict(&format!("Done.\nREVIEW: clean {HEAD}")),
         Some((true, HEAD.to_string()))
@@ -1766,4 +1773,6 @@ fn a_review_names_its_pull_request_and_a_full_head() {
     }))
     .unwrap();
     assert_eq!(read, of("acme", 42, HEAD));
+    assert_eq!(PrRef::new("Acme", "Web", 42), PrRef::new("acme", "web", 42));
+    assert_eq!(PrRef::new("Acme", "Web", 42).owner, "acme");
 }

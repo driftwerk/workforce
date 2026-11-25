@@ -1588,7 +1588,7 @@ async fn a_review_session_is_asked_for_its_verdict_and_linked_to_its_pull_reques
         );
         assert_eq!(
             d.store().pr_review_of(s.id).await.unwrap(),
-            Some(pr.clone())
+            Some((sarah().id, pr.clone()))
         );
 
         let mut plain = start_in(dir.path(), None);
