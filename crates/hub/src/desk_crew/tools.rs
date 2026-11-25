@@ -1535,6 +1535,13 @@ impl Tool for CrewTool {
         if READ.contains(&self.name) {
             return true;
         }
+        // Recording a review and merging are Act fully's own, each gated by
+        // its own conditions (the verdict at the head; review, branch,
+        // checks and head): at Act fully they are the person's choice.
+        if [super::review::RECORD, super::review::MERGE].contains(&self.name) {
+            return !workforce_desk::grant::is_served(&self.agent)
+                && crew.level_now(&self.agent, &oversight).0 == Level::Full;
+        }
         super::actions::Action::parse(self.name, input)
             .is_ok_and(|action| matches!(crew.gate(&action, &oversight), super::actions::Gate::Run))
     }

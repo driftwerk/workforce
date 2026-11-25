@@ -49,6 +49,15 @@ async fn shipping(
     let d = desk_on(pool, options, floor).await;
     let (overseer, crew, d, llm) = boss_over(base, d, UNBOUND, gh, CancellationToken::new()).await;
     crew.read_spent_today(&crew.overseers()).await;
+    // As the hub sets it at start.
+    d.boss_bounds_with(workforce_desk::charge::Bounds {
+        home: base.to_path_buf(),
+        ..Default::default()
+    });
+    eventually("Desk to know the boss is unbound", async || {
+        d.boss_unbound("desk").then_some(())
+    })
+    .await;
     (overseer, crew, d, llm)
 }
 
@@ -415,12 +424,48 @@ async fn a_directive_that_releases_need_the_persons_ok_has_the_boss_ask_instead_
                 .unwrap();
         };
 
+        // At Act fully, recording and merging are the person's standing
+        // choice, so a turn that has read a transcript still runs them.
+        for tool in [MERGE, RECORD] {
+            assert!(
+                overseer.tools.get(tool).unwrap().standing_choice(&merge_7()),
+                "{tool}"
+            );
+        }
         calls_tool_once(&llm, "is ready to merge", "crew_github_merge", merge_7()).await;
         tell("acme/web#7 is green and reviewed clean: it is ready to merge.").await;
-        eventually("the boss merges it", async || {
-            (merges_asked(&gh).await == 1).then_some(())
-        })
-        .await;
+        let merged = async || {
+            for _ in 0..200 {
+                if merges_asked(&gh).await == 1 {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            let line = overseer
+                .sessions
+                .find(&super::super::line::line_channel(web.id), PERSON)
+                .ok()
+                .flatten()
+                .map(|l| l.messages.iter().map(|m| m.content.clone()).collect::<Vec<_>>());
+            let asked: Vec<(bool, bool)> = llm
+                .received_requests()
+                .await
+                .unwrap_or_default()
+                .iter()
+                .map(|r| String::from_utf8_lossy(&r.body).to_string())
+                .filter(|b| b.contains("is ready to merge"))
+                .map(|b| (b.contains("\"stream\":true"), b.contains("crew_github_merge")))
+                .collect();
+            let github: Vec<String> = gh
+                .received_requests()
+                .await
+                .unwrap_or_default()
+                .iter()
+                .map(|r| format!("{} {}", r.method, r.url.path()))
+                .collect();
+            panic!("the boss didn't merge: line {line:?}; model (stream, has the tool) {asked:?}; github {github:?}");
+        };
+        merged().await;
 
         let added = said(
             &overseer,
