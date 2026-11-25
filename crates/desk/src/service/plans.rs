@@ -408,13 +408,23 @@ impl Desk {
         Ok((tickets, runs, starting))
     }
 
+    /// Whether a plan ticket's `session` is at work ([`SessionState::busy`]),
+    /// as [`plan::holding`] reads it: one here by its state now, one on a
+    /// machine (`machine/id`, whose state is read there) as at work.
+    pub fn session_busy(&self, session: &str) -> bool {
+        match Uuid::parse_str(session) {
+            Ok(id) => self.view(id).is_ok_and(|v| v.state.busy()),
+            Err(_) => true,
+        }
+    }
+
     async fn plan_summary(&self, p: Plan) -> Result<PlanSummary, DeskError> {
         let tickets = self.plan_tickets(p.id).await?;
         let budget = self.applied(&p).await?.budget;
         Ok(PlanSummary {
             boss_name: self.plan_boss_name(&p),
             paused_why: self.paused_why(&p),
-            progress: plan::progress(&tickets),
+            progress: plan::progress(&tickets, |s| self.session_busy(s)),
             budget,
             held: self.plan_held(&p),
             limit: self.plan_limit(&p),
@@ -532,7 +542,7 @@ impl Desk {
             summary: PlanSummary {
                 boss_name: self.plan_boss_name(&p),
                 paused_why: self.paused_why(&p),
-                progress: plan::progress(&rows),
+                progress: plan::progress(&rows, |s| self.session_busy(s)),
                 budget: applied.budget.clone(),
                 held: self.plan_held(&p),
                 limit: self.plan_limit(&p),
@@ -3480,6 +3490,7 @@ impl Desk {
             account: None,
             env: BTreeMap::new(),
             group,
+            review_of: None,
         };
         self.create_for_as(session, new, boss, by.clone()).await
     }

@@ -219,18 +219,13 @@ pub fn takes_automatically(
     all && existing.is_none() && chargeable(s, scope, bossed).is_ok()
 }
 
-/// How many of `charges` hold one of their boss's slots: starting or
-/// working.
+/// How many of `charges` hold one of their boss's slots: at work
+/// ([`SessionState::busy`]).
 pub fn busy(charges: &[Charge], states: &HashMap<Uuid, SessionState>) -> usize {
     charges
         .iter()
         .filter(|c| c.live())
-        .filter(|c| {
-            matches!(
-                states.get(&c.session),
-                Some(SessionState::Starting | SessionState::Working)
-            )
-        })
+        .filter(|c| states.get(&c.session).is_some_and(|s| s.busy()))
         .count()
 }
 
@@ -481,6 +476,8 @@ pub struct Facts {
     pub ships: bool,
     /// Every remote of the repository is the one named: `gh` ships too.
     pub ships_gh: bool,
+    /// Where a bare `git push` sends the branch ([`boss::Here::push_to`]).
+    pub push_to: Option<String>,
     /// The repository says `push.followTags`.
     pub follow_tags: bool,
     /// The repository has git hooks.
@@ -603,6 +600,7 @@ pub fn facts_of(
         default_branch: None,
         ships: false,
         ships_gh: false,
+        push_to: None,
         follow_tags: false,
         hooks: false,
         workflows: Vec::new(),
@@ -697,6 +695,59 @@ fn what_of(engine: Engine, r: &Request, cwd: Option<&Path>, home: &Path) -> What
     }
 }
 
+/// Where a command of `facts` is judged, in `bounds`, its session's own
+/// folder `own` (none when it has none to speak of).
+fn here_of<'a>(
+    facts: &'a Facts,
+    bounds: &'a Bounds,
+    own: Option<&'a Path>,
+    real: &'a dyn Fn(&Path) -> Option<PathBuf>,
+    tracked: &'a dyn Fn(&Path) -> bool,
+) -> boss::Here<'a> {
+    boss::Here {
+        cwd: facts.cwd.clone(),
+        own,
+        folder: &facts.folder,
+        home: &bounds.home,
+        scratch: &bounds.scratch,
+        withheld: &bounds.withheld,
+        real,
+        branch: facts.branch.as_deref(),
+        default_branch: facts.default_branch.as_deref(),
+        ships: facts.ships,
+        ships_gh: facts.ships_gh,
+        push_to: facts.push_to.as_deref(),
+        follow_tags: facts.follow_tags,
+        hooks: facts.hooks,
+        workflows: &facts.workflows,
+        any_workflow: facts.any_workflow,
+        at_tip: facts.at_tip,
+        unpushed: facts.unpushed,
+        branches: &facts.branches,
+        tip_tags: &facts.tip_tags,
+        tracked,
+        // A session's folder is the person's choice.
+        vouched: true,
+    }
+}
+
+/// The class of the riskiest push in the command of `facts`
+/// ([`boss::push_kind`]); `None` when it is no command, or pushes nothing.
+pub fn push_kind(
+    facts: &Facts,
+    bounds: &Bounds,
+    real: &dyn Fn(&Path) -> Option<PathBuf>,
+) -> Option<boss::PushKind> {
+    let What::Command(command) = &facts.what else {
+        return None;
+    };
+    let own = real(&facts.own);
+    boss::push_kind(
+        command,
+        &here_of(facts, bounds, own.as_deref(), real, &|_| false),
+    )
+}
+
 /// Whether a boss may answer a request with `facts` itself, in `bounds`:
 /// only what Desk reads in full and judges safe ([`boss::judge`] for
 /// commands). `real` says where a path leads through existing symlinks.
@@ -722,31 +773,7 @@ pub fn answerable(
     };
     match &facts.what {
         What::Command(command) => {
-            let here = boss::Here {
-                cwd: facts.cwd.clone(),
-                own,
-                folder: &facts.folder,
-                home: &bounds.home,
-                scratch: &bounds.scratch,
-                withheld: &bounds.withheld,
-                real,
-                branch: facts.branch.as_deref(),
-                default_branch: facts.default_branch.as_deref(),
-                ships: facts.ships,
-                ships_gh: facts.ships_gh,
-                follow_tags: facts.follow_tags,
-                hooks: facts.hooks,
-                workflows: &facts.workflows,
-                any_workflow: facts.any_workflow,
-                at_tip: facts.at_tip,
-                unpushed: facts.unpushed,
-                branches: &facts.branches,
-                tip_tags: &facts.tip_tags,
-                tracked,
-                // A session's folder is the person's choice.
-                vouched: true,
-            };
-            boss::judge(command, &here).map_err(Irreversible)
+            boss::judge(command, &here_of(facts, bounds, own, real, tracked)).map_err(Irreversible)
         }
         What::Read(paths) => {
             for p in paths {
@@ -936,7 +963,7 @@ mod tests {
     }
 
     #[test]
-    fn only_starting_and_working_sessions_hold_a_slot() {
+    fn only_sessions_at_work_hold_a_slot() {
         let states: Vec<SessionState> = vec![
             SessionState::Starting,
             SessionState::Working,
@@ -955,10 +982,10 @@ mod tests {
             .zip(&states)
             .map(|(c, s)| (c.session, *s))
             .collect();
-        assert_eq!(busy(&charges, &by), 2);
+        assert_eq!(busy(&charges, &by), 3);
         let mut released = charges.clone();
         released[0].released_at = Some(Utc::now());
-        assert_eq!(busy(&released, &by), 1, "a released session holds none");
+        assert_eq!(busy(&released, &by), 2, "a released session holds none");
     }
 
     #[test]

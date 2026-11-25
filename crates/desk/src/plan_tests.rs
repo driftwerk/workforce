@@ -5,6 +5,7 @@ use serde_json::Value;
 
 use super::*;
 use crate::engine::{Via, View};
+use crate::model::SessionState;
 
 fn u(n: u128) -> Uuid {
     Uuid::from_u128(0x0000_0000_0000_4000_8000_0000_0000_0000 | n)
@@ -171,13 +172,13 @@ fn progress_agrees_with_the_shared_fixtures() {
         serde_json::from_str(include_str!("../fixtures/plan/progress.json")).unwrap();
     assert!(fixtures.cases.len() >= 5);
     for c in fixtures.cases {
-        assert_eq!(progress(&c.tickets), c.progress, "{}", c.name);
+        assert_eq!(progress(&c.tickets, |_| true), c.progress, "{}", c.name);
     }
 }
 
 #[test]
 fn progress_reads_and_writes_the_shape_desk_reads() {
-    let p = progress(&[ticket(1, TicketState::Todo, &[])]);
+    let p = progress(&[ticket(1, TicketState::Todo, &[])], |_| true);
     let v = serde_json::to_value(&p).unwrap();
     for field in [
         "done", "doing", "review", "ready", "blocked", "waiting", "total", "next", "holding",
@@ -660,7 +661,7 @@ fn a_ticket_held_back_never_starts_by_itself_and_waits_on_someone() {
         .map(|s| s.ticket)
         .collect();
     assert_eq!(order, vec![u(2)]);
-    let progress = super::progress(&tickets);
+    let progress = super::progress(&tickets, |_| true);
     assert_eq!((progress.ready, progress.blocked), (1, 1));
     assert_eq!(progress.next, vec!["ACM-2".to_string()]);
 }
@@ -1267,9 +1268,9 @@ fn eighteen_sessions_on_a_machine_hold_eighteen_slots_whatever_was_seen_of_them(
     // Nothing seen of them yet (a restart, devbox not answering), or each
     // seen working, idle or asking, or killed and so interrupted or
     // stopped: none is closed, and their tickets are still in Doing.
-    assert_eq!(held(&tickets), 18);
+    assert_eq!(held(&tickets, |_| true), 18);
     assert!(next_starts(&p, &tickets, room(&p, 18, 0, 12), None).is_empty());
-    let line = full(&progress(&tickets), 4).unwrap();
+    let line = full(&progress(&tickets, |_| true), 4).unwrap();
     assert!(
         line.starts_with("holds 18 of 4 sessions: ACM-1, ACM-2,"),
         "{line}"
@@ -1278,15 +1279,15 @@ fn eighteen_sessions_on_a_machine_hold_eighteen_slots_whatever_was_seen_of_them(
     for t in &mut tickets[..15] {
         t.session = None;
     }
-    assert_eq!(held(&tickets), 3);
+    assert_eq!(held(&tickets, |_| true), 3);
     let starts = next_starts(&p, &tickets, room(&p, 3, 0, 12), None);
     assert_eq!(starts.iter().map(|s| s.ticket).collect::<Vec<_>>(), [u(19)]);
-    assert_eq!(full(&progress(&tickets), 4), None);
+    assert_eq!(full(&progress(&tickets, |_| true), 4), None);
     // All eighteen closed: it starts four again.
     for t in &mut tickets {
         t.session = None;
     }
-    assert_eq!(held(&tickets), 0);
+    assert_eq!(held(&tickets, |_| true), 0);
     assert_eq!(next_starts(&p, &tickets, room(&p, 0, 0, 12), None).len(), 4);
 }
 
@@ -1309,12 +1310,89 @@ fn a_plan_holds_its_review_sessions_and_unknown_starts_once_each_and_not_its_don
     let mut done = on_devbox(34, TicketState::Done);
     done.session = Some("devbox/done".into());
     tickets.extend([review, unsure, linked, twice, done]);
-    let names: Vec<String> = holding(&tickets).iter().map(|t| t.name()).collect();
+    let names: Vec<String> = holding(&tickets, |_| true)
+        .iter()
+        .map(|t| t.name())
+        .collect();
     assert_eq!(names, ["ACM-1", "ACM-2", "ACM-30", "ACM-31", "ACM-32"]);
     // A closed session's ticket holds nothing; a linked start still does.
     tickets[2].session = None;
     tickets[4].session = None;
-    assert_eq!(held(&tickets), 4);
+    assert_eq!(held(&tickets, |_| true), 4);
+}
+
+/// A ticket in Review holds its session's slot only while the session is
+/// at work: an idle or done one waits on its merge, not on a slot. One in
+/// Doing holds it whatever its session is doing.
+#[test]
+fn a_review_ticket_holds_a_slot_only_while_its_session_is_busy() {
+    for state in [
+        SessionState::Starting,
+        SessionState::Working,
+        SessionState::Blocked,
+        SessionState::Asking,
+        SessionState::Done,
+        SessionState::Idle,
+        SessionState::Interrupted,
+        SessionState::Stopped,
+        SessionState::Closed,
+    ] {
+        let mut review = ticket(1, TicketState::Review, &[]);
+        review.session = Some("review".into());
+        let mut doing = ticket(2, TicketState::Doing, &[]);
+        doing.session = Some("doing".into());
+        let tickets = [review, doing];
+        let busy = |_: &str| state.busy();
+        let names: Vec<String> = holding(&tickets, busy).iter().map(|t| t.name()).collect();
+        let expected: &[&str] = match state.busy() {
+            true => &["ACM-1", "ACM-2"],
+            false => &["ACM-2"],
+        };
+        assert_eq!(names, expected, "{}", state.as_str());
+        assert_eq!(
+            progress(&tickets, busy).holding,
+            expected,
+            "{}",
+            state.as_str()
+        );
+    }
+}
+
+/// N+1: a Review session resumed while N others work counts again, and the
+/// plan holds N+1. Nothing is stopped, and nothing new starts until the
+/// count is back below N.
+#[test]
+fn a_resumed_review_session_brings_the_plan_to_n_plus_one_without_a_start() {
+    let mut p = plan(PlanState::Running);
+    p.parallel = Some(3);
+    let mut tickets: Vec<PlanTicket> = (1..=3)
+        .map(|n| {
+            let mut t = ticket(n, TicketState::Doing, &[]);
+            t.session = Some(format!("s{n}"));
+            t
+        })
+        .collect();
+    let mut review = ticket(4, TicketState::Review, &[]);
+    review.session = Some("s4".into());
+    tickets.push(review);
+    tickets.push(ticket(5, TicketState::Todo, &[]));
+    let idle = |s: &str| s != "s4";
+    assert_eq!(held(&tickets, idle), 3);
+    assert_eq!(room(&p, held(&tickets, idle), 0, 12), 0);
+    let resumed = |_: &str| true;
+    assert_eq!(held(&tickets, resumed), 4);
+    let room_now = room(&p, held(&tickets, resumed), 0, 12);
+    assert_eq!(room_now, 0);
+    assert!(next_starts(&p, &tickets, room_now, None).is_empty());
+    // One Doing ticket moves on to Done: still at N, so still nothing new.
+    tickets[0].state = TicketState::Done;
+    assert_eq!(room(&p, held(&tickets, resumed), 0, 12), 0);
+    // Its review settles too: below N, the next ticket starts.
+    let room_after = room(&p, held(&tickets, idle), 0, 12);
+    assert_eq!(room_after, 1);
+    let starts = next_starts(&p, &tickets, room_after, None);
+    assert_eq!(starts.len(), 1);
+    assert_eq!(starts[0].ticket, u(5));
 }
 
 #[test]
@@ -1613,4 +1691,79 @@ fn a_ticket_names_its_folder_or_its_repository() {
         s.tickets[0].repo.as_deref(),
         Some("github.com/driftwerk/vellev")
     );
+}
+
+const HEAD: &str = "0123456789abcdef0123456789abcdef01234567";
+
+/// A review's verdict is its reply's last `REVIEW:` line, exactly, naming
+/// a full SHA; anything else is no verdict.
+#[test]
+fn a_review_verdict_is_its_last_review_line_with_a_full_sha() {
+    let older = "fedcba9876543210fedcba9876543210fedcba98";
+    for (text, verdict) in [
+        (
+            format!("Looks good.\nREVIEW: clean {HEAD}"),
+            Some((true, HEAD)),
+        ),
+        (format!("REVIEW: changes {HEAD}\n"), Some((false, HEAD))),
+        (
+            format!("REVIEW: changes {older}\nFixed since.\nREVIEW: clean {HEAD}\nThanks."),
+            Some((true, HEAD)),
+        ),
+        (
+            format!("REVIEW: clean {HEAD}\nREVIEW: changes {older}"),
+            Some((false, older)),
+        ),
+        (format!("REVIEW: clean {}", &HEAD[..39]), None),
+        (format!("REVIEW: clean {HEAD}0"), None),
+        (format!("REVIEW: clean {}", HEAD.to_uppercase()), None),
+        (format!("REVIEW: approved {HEAD}"), None),
+        (format!(" REVIEW: clean {HEAD}"), None),
+        (format!("`REVIEW: clean {HEAD}`"), None),
+        (format!("REVIEW: clean {HEAD} "), None),
+        ("All good, merge it.".to_string(), None),
+        (String::new(), None),
+    ] {
+        assert_eq!(
+            review_verdict(&text),
+            verdict.map(|(c, s)| (c, s.to_string())),
+            "{text:?}"
+        );
+    }
+}
+
+/// The instruction names the head the review is of, in the very words its
+/// verdict is read by.
+#[test]
+fn the_review_instruction_names_the_head_in_the_verdicts_words() {
+    let said = review_instruction(HEAD);
+    assert!(!said.contains("{head}"));
+    assert!(said.contains(&format!("`REVIEW: clean {HEAD}`")));
+    assert!(said.contains(&format!("`REVIEW: changes {HEAD}`")));
+    assert_eq!(
+        review_verdict(&format!("Done.\nREVIEW: clean {HEAD}")),
+        Some((true, HEAD.to_string()))
+    );
+}
+
+#[test]
+fn a_review_names_its_pull_request_and_a_full_head() {
+    let of = |owner: &str, number: i64, head: &str| ReviewOf {
+        pr: PrRef {
+            owner: owner.into(),
+            repo: "web".into(),
+            number,
+        },
+        head_sha: head.into(),
+    };
+    assert_eq!(of("acme", 42, HEAD).check(), Ok(()));
+    assert!(of("acme", 42, &HEAD[..12]).check().is_err());
+    assert!(of("acme", 0, HEAD).check().is_err());
+    assert!(of("", 42, HEAD).check().is_err());
+    assert!(of("acme/x", 42, HEAD).check().is_err());
+    let read: ReviewOf = serde_json::from_value(serde_json::json!({
+        "owner": "acme", "repo": "web", "number": 42, "headSha": HEAD
+    }))
+    .unwrap();
+    assert_eq!(read, of("acme", 42, HEAD));
 }

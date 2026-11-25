@@ -447,6 +447,7 @@ pub(crate) async fn new_session(
             account: None,
             env: Default::default(),
             group: None,
+            review_of: None,
         },
         Some(By::you()),
     )

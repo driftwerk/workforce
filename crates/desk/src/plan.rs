@@ -1256,16 +1256,22 @@ pub struct Start {
 }
 
 /// The tickets of the sessions a plan holds, one each in order: every
-/// session its tickets in Doing or Review are on until it is closed or
-/// removed, and every start of one under way or whose outcome isn't known
-/// yet.
-pub fn holding(tickets: &[PlanTicket]) -> Vec<&PlanTicket> {
+/// session its tickets in Doing are on until it is closed or removed, every
+/// one its tickets in Review are on while it is `busy` (starting, working
+/// or blocked: an idle or done one waits on the merge, not on a slot), and
+/// every start of one under way or whose outcome isn't known yet.
+pub fn holding(tickets: &[PlanTicket], busy: impl Fn(&str) -> bool) -> Vec<&PlanTicket> {
     let mut seen = HashSet::new();
     tickets
         .iter()
         .filter(|t| {
-            let on = t.session.as_deref().filter(|_| {
-                t.starting || matches!(t.state, TicketState::Doing | TicketState::Review)
+            let on = t.session.as_deref().filter(|s| {
+                t.starting
+                    || match t.state {
+                        TicketState::Doing => true,
+                        TicketState::Review => busy(s),
+                        _ => false,
+                    }
             });
             match on {
                 Some(s) => seen.insert(s.to_string()),
@@ -1276,8 +1282,8 @@ pub fn holding(tickets: &[PlanTicket]) -> Vec<&PlanTicket> {
 }
 
 /// How many sessions a plan holds ([`holding`]).
-pub fn held(tickets: &[PlanTicket]) -> usize {
-    holding(tickets).len()
+pub fn held(tickets: &[PlanTicket], busy: impl Fn(&str) -> bool) -> usize {
+    holding(tickets, busy).len()
 }
 
 /// How many more sessions `plan` may start now: fewer than its own limit
@@ -1376,8 +1382,9 @@ pub struct Progress {
     pub holding: Vec<String>,
 }
 
-/// Where `tickets`, a plan's, stand.
-pub fn progress(tickets: &[PlanTicket]) -> Progress {
+/// Where `tickets`, a plan's, stand, their sessions `busy` as [`holding`]
+/// reads them.
+pub fn progress(tickets: &[PlanTicket], busy: impl Fn(&str) -> bool) -> Progress {
     let states: HashMap<Uuid, TicketState> = tickets.iter().map(|t| (t.id, t.state)).collect();
     let mut p = Progress::default();
     let mut next: Vec<&PlanTicket> = Vec::new();
@@ -1407,7 +1414,7 @@ pub fn progress(tickets: &[PlanTicket]) -> Progress {
     }
     next.sort_by(|a, b| a.rank.total_cmp(&b.rank));
     p.next = next.iter().map(|t| t.name()).collect();
-    p.holding = holding(tickets).iter().map(|t| t.name()).collect();
+    p.holding = holding(tickets, busy).iter().map(|t| t.name()).collect();
     p
 }
 
@@ -1683,6 +1690,89 @@ pub fn describe(before: &Snapshot, after: &Snapshot) -> String {
             s
         }
     }
+}
+
+// ── Reviews ─────────────────────────────────────────────────────────────
+
+/// A pull request on GitHub: `owner/repo#number`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct PrRef {
+    pub owner: String,
+    pub repo: String,
+    pub number: i64,
+}
+
+/// What a review session is started to review: a pull request, at its
+/// head as it starts, which its verdict names ([`REVIEW_VERDICT`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReviewOf {
+    #[serde(flatten)]
+    pub pr: PrRef,
+    pub head_sha: String,
+}
+
+impl ReviewOf {
+    /// Why it can't be reviewed as said, when it can't.
+    pub fn check(&self) -> Result<(), String> {
+        let named = |s: &str| {
+            !s.is_empty()
+                && s.chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+        };
+        if !named(&self.pr.owner) || !named(&self.pr.repo) || self.pr.number < 1 {
+            return Err("a review names its pull request as owner, repo and number".into());
+        }
+        match is_sha(&self.head_sha) {
+            true => Ok(()),
+            false => Err("a review names its pull request's head as a full commit SHA".into()),
+        }
+    }
+}
+
+/// What a review session said of a pull request, at the head it reviewed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PrReview {
+    #[serde(flatten)]
+    pub pr: PrRef,
+    pub head_sha: String,
+    pub clean: bool,
+    pub by_session: Uuid,
+    pub at: DateTime<Utc>,
+}
+
+/// What Desk adds to a review session's prompt, `{head}` the pull
+/// request's head as it starts: the verdict line its final reply ends with
+/// ([`review_verdict`]).
+pub const REVIEW_VERDICT: &str = "When your review is done, end your final reply with exactly \
+one line of its own naming the commit you reviewed (the pull request's head is {head}): \
+`REVIEW: clean {head}` when it is ready to merge as it is, or `REVIEW: changes {head}` when it \
+needs changes.";
+
+/// [`REVIEW_VERDICT`], for a pull request at `head`.
+pub fn review_instruction(head: &str) -> String {
+    REVIEW_VERDICT.replace("{head}", head)
+}
+
+/// The verdict a review's reply ends with ([`REVIEW_VERDICT`]): its last
+/// line reading exactly `REVIEW: clean <sha>` or `REVIEW: changes <sha>`,
+/// with the full SHA of the commit it reviewed. `true`: clean.
+pub fn review_verdict(text: &str) -> Option<(bool, String)> {
+    text.lines().rev().find_map(|line| {
+        let (word, sha) = line.strip_prefix("REVIEW: ")?.split_once(' ')?;
+        let clean = match word {
+            "clean" => true,
+            "changes" => false,
+            _ => return None,
+        };
+        is_sha(sha).then(|| (clean, sha.to_string()))
+    })
+}
+
+/// Whether `s` is a full commit SHA, as git spells it: 40 lowercase hex.
+pub fn is_sha(s: &str) -> bool {
+    s.len() == 40 && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 
 #[cfg(test)]

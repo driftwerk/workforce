@@ -38,6 +38,7 @@ async fn session(d: &Desk, dir: &Path, name: &str, goal: &str) -> SessionView {
             account: None,
             env: Default::default(),
             group: None,
+            review_of: None,
         },
         None,
     )

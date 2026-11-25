@@ -973,6 +973,7 @@ impl Desk {
             account: c.ask.account,
             env: Default::default(),
             group: c.facts.source_group.clone(),
+            review_of: None,
         };
         let started = self
             .start_session(

@@ -170,6 +170,7 @@ pub fn judged(command: &str, cwd: &Path, bounds: &crate::charge::Bounds) -> Resu
         // Nothing ships from a check, and git is taken at its most.
         ships: false,
         ships_gh: false,
+        push_to: None,
         follow_tags: true,
         hooks: true,
         workflows: &none,

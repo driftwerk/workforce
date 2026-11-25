@@ -607,6 +607,7 @@ async fn a_codex_session_gets_messages_typed_in_at_idle_while_the_person_isnt_ty
                     account: None,
                     env: Default::default(),
                     group: None,
+                    review_of: None,
                 },
                 None,
             )
@@ -727,6 +728,7 @@ async fn codex_working(
                 account: None,
                 env: Default::default(),
                 group: None,
+                review_of: None,
             },
             None,
         )
@@ -1818,6 +1820,7 @@ async fn a_dialog_on_its_screen_holds_its_bosss_message_until_it_is_answered() {
                     account: None,
                     env: Default::default(),
                     group: None,
+                    review_of: None,
                 },
                 None,
             )

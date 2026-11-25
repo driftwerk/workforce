@@ -2293,7 +2293,7 @@ impl CrewHub {
                 let busy = self.desk.charges_busy(&boss.id)
                     + self.desk.starts_under_way(&boss.id).await
                     + self.machine_busy(&boss.id);
-                let held = plan::held(&tickets);
+                let held = plan::held(&tickets, |s| self.desk.session_busy(s));
                 let room = plan::room(&p, held, busy, limit);
                 for s in plan::next_starts(&p, &rows, room, standing) {
                     match self.desk.plan_start(&p, &s, &boss, &by).await {
@@ -2569,7 +2569,7 @@ impl CrewHub {
         };
         let mut rows = tickets.to_vec();
         mark(&mut rows, &open);
-        let held = plan::held(&rows);
+        let held = plan::held(&rows, |s| self.desk.session_busy(s));
         mark(&mut rows, &settled);
         let opened = self
             .desk

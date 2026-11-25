@@ -459,7 +459,7 @@ async fn a_start_cut_off_before_its_session_starts_that_session_and_no_other() {
         assert!(d.view(session).is_err());
         let rows = d.plan_tickets(id).await.unwrap();
         assert!(rows[0].starting);
-        assert_eq!(plan::progress(&rows).doing, 1);
+        assert_eq!(plan::progress(&rows, |_| true).doing, 1);
 
         let link = d.0.store.starting().await.unwrap().remove(0);
         let started = d
@@ -512,6 +512,7 @@ async fn a_start_cut_off_before_its_session_starts_that_session_and_no_other() {
                     account: None,
                     env: Default::default(),
                     group: None,
+                    review_of: None,
                 },
                 &sarah(),
                 by_sarah(),
@@ -557,6 +558,7 @@ async fn a_start_cut_off_after_its_session_started_only_links_it() {
             account: None,
             env: Default::default(),
             group: None,
+            review_of: None,
         };
         d.create_for_as(session, new, &sarah(), by_sarah())
             .await
@@ -1597,6 +1599,7 @@ async fn the_breaker_holding_the_plans_group_holds_its_starts() {
                     account: None,
                     env: Default::default(),
                     group: Some("g-acme".into()),
+                    review_of: None,
                 },
                 Some(By::you()),
             )
@@ -2619,7 +2622,9 @@ async fn a_closed_or_removed_session_frees_its_plans_slot_and_a_restart_keeps_it
                     .id,
             );
         }
-        let held = async |d: &crate::Desk| crate::plan::held(&d.plan_tickets(id).await.unwrap());
+        let held = async |d: &crate::Desk| {
+            crate::plan::held(&d.plan_tickets(id).await.unwrap(), |s| d.session_busy(s))
+        };
         assert_eq!(held(&d).await, 2);
         d.end(sessions[0], Some(By::you())).await.unwrap();
         d.persisted().await;

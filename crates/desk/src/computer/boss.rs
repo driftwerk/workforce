@@ -76,6 +76,11 @@ pub struct Here<'a> {
     /// Every remote of the repository (fetch and push) is the one named,
     /// so whatever `gh` resolves the repository to, it is that one.
     pub ships_gh: bool,
+    /// Where a bare `git push` sends the branch the folder is on, as git's
+    /// `@{push}` says (`origin/feat/x`): none when its config doesn't say
+    /// plainly (`push.default` is `matching` or `nothing`, a remote has
+    /// push refspecs of its own) or git can't tell.
+    pub push_to: Option<&'a str>,
     /// The repository says `push.followTags`: a push sends tags too.
     pub follow_tags: bool,
     /// The repository has git hooks (in its hooks folder, or where
@@ -2645,7 +2650,7 @@ fn git(walk: &mut Walk<'_, '_>, args: &[Word]) -> Judged {
         "tag" if walk.here.ships => tag(walk, rest),
         "rebase" | "reset" | "restore" | "clean" | "update-ref" | "filter-branch"
         | "filter-repo" | "reflog" | "gc" | "prune" | "tag" | "replace" | "notes" => no(UNDONE),
-        "push" => push(walk, rest),
+        "push" => push(walk, rest).1,
         other => no(format!("Desk can't tell what git {other} does")),
     }
 }
@@ -2712,19 +2717,126 @@ fn tag_at_tip(walk: &Walk<'_, '_>, refspec: &str) -> bool {
     walk.here.tip_tags.iter().any(|t| t == name) || walk.made_tags.iter().any(|t| t == name)
 }
 
-/// A push the boss may allow: the branch the folder is on, to a named
-/// remote, when that branch isn't the default one; where it acts fully,
-/// also the default branch and one tag, to `origin` (the repository the
-/// person named).
-fn push(walk: &Walk<'_, '_>, rest: &[Word]) -> Judged {
+/// What a push sends, and where, as Desk reads it from the command and the
+/// repository, in order of risk: a push of several is its riskiest.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum PushKind {
+    /// The branch the folder is on, to `origin`.
+    OwnBranch,
+    /// The branch the folder is on, to another remote.
+    OtherRemote,
+    /// Tags.
+    Tag,
+    /// The default branch, or one that reads as one (`main`, `release-…`).
+    DefaultBranch,
+    /// What rewrites a remote branch's history.
+    Force,
+    /// What deletes a remote branch or tag.
+    Delete,
+    /// Desk can't tell what it sends, or where.
+    Unknown,
+}
+
+impl PushKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::OwnBranch => "own_branch",
+            Self::OtherRemote => "other_remote",
+            Self::Tag => "tag",
+            Self::DefaultBranch => "default_branch",
+            Self::Force => "force",
+            Self::Delete => "delete",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+/// Where one refspec of a push, from `branch`, sends what.
+enum Dest<'w> {
+    Own,
+    /// `exact`: the default branch itself, to itself.
+    Default {
+        exact: bool,
+    },
+    Tag(&'w str),
+    Force,
+    Delete,
+    Other,
+}
+
+fn dest<'w>(here: &Here<'_>, branch: &str, refspec: &'w str) -> Dest<'w> {
+    if refspec.starts_with('+') {
+        return Dest::Force;
+    }
+    if tag_ref(refspec) {
+        return Dest::Tag(refspec);
+    }
+    // `src:dest`, or one name for both.
+    let (src, to) = refspec.split_once(':').unwrap_or((refspec, refspec));
+    if src.is_empty() {
+        return Dest::Delete;
+    }
+    let own = (src == "HEAD" || src == branch) && (to == "HEAD" || to == branch);
+    if is_default(branch, here) || is_default(to, here) {
+        return Dest::Default {
+            exact: here.default_branch == Some(branch) && own,
+        };
+    }
+    match own {
+        true => Dest::Own,
+        false => Dest::Other,
+    }
+}
+
+impl Dest<'_> {
+    fn kind(&self, remote: &str) -> PushKind {
+        match self {
+            Self::Own if remote == "origin" => PushKind::OwnBranch,
+            Self::Own => PushKind::OtherRemote,
+            Self::Default { .. } => PushKind::DefaultBranch,
+            Self::Tag(_) => PushKind::Tag,
+            Self::Force => PushKind::Force,
+            Self::Delete => PushKind::Delete,
+            Self::Other => PushKind::Unknown,
+        }
+    }
+}
+
+/// Where a bare push (`git push`, `git push <remote>`) from `branch` goes,
+/// by git's own `@{push}` ([`Here::push_to`]): unknown when git's config
+/// doesn't say plainly, or the remote named isn't the one it says.
+fn bare_kind(here: &Here<'_>, branch: &str, remote: Option<&str>) -> PushKind {
+    here.push_to
+        .and_then(|to| to.split_once('/'))
+        .filter(|(r, _)| remote.is_none_or(|named| named == *r))
+        .map_or(PushKind::Unknown, |(r, b)| dest(here, branch, b).kind(r))
+}
+
+/// A push, read: its class ([`PushKind`]), and whether the boss may allow
+/// it. It may allow the branch the folder is on, to a named remote, when
+/// that branch isn't the default one; where it acts fully, also the
+/// default branch and one tag, to `origin` (the repository the person
+/// named). A bare push is classed by where git sends it, but stays the
+/// person's to allow.
+fn push(walk: &Walk<'_, '_>, rest: &[Word]) -> (PushKind, Judged) {
     let here = walk.here;
+    const EVERY: &str = "pushes every branch or tag; that's the person's to allow";
     for a in rest {
         let t = a.text.as_str();
-        if matches!(t, "--all" | "--mirror" | "--tags" | "--follow-tags") {
-            return no("pushes every branch or tag; that's the person's to allow");
-        }
-        if t.starts_with("--force") || t == "-f" || t == "-d" || t == "--delete" || t == "--prune" {
-            return no(UNDONE);
+        let short = t.starts_with('-') && !t.starts_with("--");
+        let refused = match t {
+            "--all" => Some((PushKind::Unknown, EVERY)),
+            "--mirror" => Some((PushKind::Force, EVERY)),
+            "--tags" | "--follow-tags" => Some((PushKind::Tag, EVERY)),
+            "--delete" | "--prune" => Some((PushKind::Delete, UNDONE)),
+            _ if t.starts_with("--force") || (short && t.contains('f')) => {
+                Some((PushKind::Force, UNDONE))
+            }
+            _ if short && t.contains('d') => Some((PushKind::Delete, UNDONE)),
+            _ => None,
+        };
+        if let Some((kind, why)) = refused {
+            return (kind, no(why));
         }
     }
     let spec = Spec {
@@ -2739,15 +2851,22 @@ fn push(walk: &Walk<'_, '_>, rest: &[Word]) -> Judged {
         ],
         ..Spec::default()
     };
-    let g = parse("git push", &spec, rest, false)?;
+    let g = match parse("git push", &spec, rest, false) {
+        Ok(g) => g,
+        Err(why) => return (PushKind::Unknown, Err(why)),
+    };
+    let unknown = |why: &str| (PushKind::Unknown, no(why));
     if walk.moved {
-        return no("Desk can't tell what this push sends after the command moves git");
+        return unknown("Desk can't tell what this push sends after the command moves git");
     }
     let Some(branch) = here.branch else {
-        return no("Desk can't tell which branch this pushes");
+        return unknown("Desk can't tell which branch this pushes");
     };
     if here.follow_tags && !rest.iter().any(|a| a.text == "--no-follow-tags") {
-        return no("sends tags too (push.followTags is set); that's the person's to allow");
+        return (
+            PushKind::Tag,
+            no("sends tags too (push.followTags is set); that's the person's to allow"),
+        );
     }
     // What ships goes only to `origin`, the repository the person named.
     let ships_to = |remote: &str| match remote == "origin" {
@@ -2762,53 +2881,116 @@ fn push(walk: &Walk<'_, '_>, rest: &[Word]) -> Judged {
             false => no("pushes a tag that isn't at the default branch's commit; that's the person's to allow"),
         }
     };
-    let operands: Vec<&Word> = match g.operands.as_slice() {
+    let named = |remote: &str| {
+        !remote.is_empty()
+            && remote
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+    };
+    const WHERE: &str = "Desk can't tell where this push goes; name the remote and branch";
+    let (remote, refspec) = match g.operands.as_slice() {
         // `git push origin tag v1.2.0`.
         [remote, t, name] if t.text == "tag" => {
             if !tag_name(&name.text) || name.glob {
-                return no(CANT_READ);
+                return unknown(CANT_READ);
             }
-            return ships_tag(&remote.text, &name.text);
+            return (PushKind::Tag, ships_tag(&remote.text, &name.text));
         }
-        ops => ops.to_vec(),
-    };
-    let [remote, refspec] = operands.as_slice() else {
-        return no("Desk can't tell where this push goes; name the remote and branch");
-    };
-    let (remote, refspec) = (remote.text.as_str(), refspec.text.as_str());
-    if remote.is_empty()
-        || !remote
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
-    {
-        return no("Desk can't tell where this push goes");
-    }
-    if tag_ref(refspec) {
-        return ships_tag(remote, refspec);
-    }
-    // `src:dest`, or one name for both.
-    let (src, dest) = refspec.split_once(':').unwrap_or((refspec, refspec));
-    let own_branch = (src == "HEAD" || src == branch) && (dest == "HEAD" || dest == branch);
-    // From a branch that reads as a default one (`main`, `production`,
-    // `release-…`): only the default branch itself, to itself, ships.
-    // Feature work reaches the default branch through `gh pr merge`.
-    if is_default(branch, here) || is_default(dest, here) {
-        let exact = here.default_branch == Some(branch) && own_branch;
-        if !exact {
-            return no(PUBLISHES);
+        [] => return (bare_kind(here, branch, None), no(WHERE)),
+        [remote] => return (bare_kind(here, branch, Some(&remote.text)), no(WHERE)),
+        [remote, refspec] => (remote.text.as_str(), refspec.text.as_str()),
+        [remote, refspecs @ ..] => {
+            let kind = match named(&remote.text) {
+                true => refspecs
+                    .iter()
+                    .map(|r| dest(here, branch, &r.text).kind(&remote.text))
+                    .max()
+                    .unwrap_or(PushKind::Unknown),
+                false => PushKind::Unknown,
+            };
+            return (kind, no(WHERE));
         }
-        ships_to(remote)?;
+    };
+    if !named(remote) {
+        return unknown("Desk can't tell where this push goes");
+    }
+    let to = dest(here, branch, refspec);
+    let judged = match to {
+        Dest::Tag(name) => ships_tag(remote, name),
+        // From a branch that reads as a default one (`main`, `production`,
+        // `release-…`): only the default branch itself, to itself, ships.
+        // Feature work reaches the default branch through `gh pr merge`.
+        Dest::Default { exact: false } => no(PUBLISHES),
         // Only a push that sends nothing new: reviewed work reaches the
         // default branch through `gh pr merge`.
-        if here.unpushed || walk.unsettled {
-            return no("pushes commits to the default branch that haven't been through a pull request; that's the person's to allow");
+        Dest::Default { exact: true } => ships_to(remote).and_then(|()| {
+            match here.unpushed || walk.unsettled {
+                true => no("pushes commits to the default branch that haven't been through a pull request; that's the person's to allow"),
+                false => Ok(()),
+            }
+        }),
+        Dest::Own => Ok(()),
+        Dest::Force | Dest::Delete | Dest::Other => {
+            no("pushes something other than the branch it's on")
         }
-        return Ok(());
+    };
+    (to.kind(remote), judged)
+}
+
+/// Whether `cmd` may change where, or on what, git works for a push after
+/// it: a `cd`, the shell's environment, or a git command that switches
+/// branch or changes its config or remotes (or that Desk can't read).
+fn moves_git(cmd: &Cmd) -> bool {
+    match cmd.words.as_slice() {
+        [first, ..] if first.text.contains('=') => true,
+        [program, rest @ ..] => match program.text.rsplit('/').next() {
+            Some("cd" | "pushd" | "popd" | "export" | "unset" | "source" | ".") => true,
+            Some("git") => rest.first().is_none_or(|sub| {
+                sub.text.starts_with('-')
+                    || matches!(
+                        sub.text.as_str(),
+                        "switch" | "checkout" | "remote" | "config" | "worktree"
+                    )
+            }),
+            _ => false,
+        },
+        [] => false,
     }
-    match own_branch {
-        true => Ok(()),
-        false => no("pushes something other than the branch it's on"),
-    }
+}
+
+/// The class of the riskiest push in `command`, run where `here` says
+/// ([`PushKind`]); `None` when it pushes nothing. A push Desk can't read
+/// straight (through a shell or a wrapper, with git's own options, after a
+/// command that moves git) is [`PushKind::Unknown`].
+pub fn push_kind(command: &str, here: &Here<'_>) -> Option<PushKind> {
+    let mentions = |t: &str| t.contains("git") && t.contains("push");
+    let Ok(cmds) = split(command) else {
+        return mentions(command).then_some(PushKind::Unknown);
+    };
+    let git = |w: &Word| w.text.rsplit('/').next() == Some("git");
+    cmds.iter()
+        .enumerate()
+        .filter_map(|(i, cmd)| match cmd.words.as_slice() {
+            [g, sub, rest @ ..] if git(g) && sub.text == "push" => {
+                let walk = Walk {
+                    here,
+                    cwd: here.cwd.clone(),
+                    moved: cmds[..i].iter().any(moves_git),
+                    made_tags: Vec::new(),
+                    unsettled: false,
+                };
+                Some(push(&walk, rest).0)
+            }
+            words => {
+                let pushes = words
+                    .iter()
+                    .position(git)
+                    .is_some_and(|at| words[at + 1..].iter().any(|w| w.text == "push"))
+                    || words.iter().any(|w| mentions(&w.text));
+                pushes.then_some(PushKind::Unknown)
+            }
+        })
+        .max()
 }
 
 fn gh(walk: &Walk<'_, '_>, args: &[Word]) -> Judged {
@@ -3665,6 +3847,7 @@ pub(crate) mod tests {
             default_branch: Some("main"),
             ships: false,
             ships_gh: false,
+            push_to: None,
             follow_tags: false,
             hooks: false,
             workflows: &[],
@@ -4389,6 +4572,7 @@ pub(crate) mod tests {
             default_branch: Some("main"),
             ships: false,
             ships_gh: false,
+            push_to: None,
             follow_tags: false,
             hooks: false,
             workflows: &[],
@@ -4804,5 +4988,142 @@ pub(crate) mod tests {
         ] {
             assert!(!settings(&repo.join(p), home, &w), "{p}");
         }
+    }
+
+    fn kind_with(command: &str, tweak: impl FnOnce(&mut Here<'_>)) -> Option<PushKind> {
+        let home = Path::new("/Users/sam");
+        let own = Path::new("/Users/sam/dev/acme-web");
+        let scratch = [PathBuf::from("/tmp")];
+        let withheld = [PathBuf::from("/Users/sam/Library/Application Support/Desk")];
+        let real = fake_real;
+        let mut here = here(home, own, &scratch, &withheld, &real, "feat/x");
+        tweak(&mut here);
+        push_kind(command, &here)
+    }
+
+    fn kind(command: &str) -> Option<PushKind> {
+        kind_with(command, |_| {})
+    }
+
+    /// Every spelling of a push is classed by what it sends and where, and
+    /// only the branch the folder is on, to `origin`, is its own.
+    #[test]
+    fn a_push_is_classed_by_what_it_sends_and_where() {
+        use PushKind::*;
+        for (command, class) in [
+            ("git push origin feat/x", OwnBranch),
+            ("git push origin HEAD", OwnBranch),
+            ("git push -u origin HEAD:feat/x", OwnBranch),
+            ("git push upstream feat/x", OtherRemote),
+            ("git push origin HEAD:main", DefaultBranch),
+            ("git push origin main", DefaultBranch),
+            ("git push origin HEAD:release-2026", DefaultBranch),
+            ("git push origin +feat/x", Force),
+            ("git push -f origin feat/x", Force),
+            ("git push --force origin feat/x", Force),
+            ("git push --force-with-lease origin feat/x", Force),
+            (
+                "git push --force-with-lease=feat/x:abc origin feat/x",
+                Force,
+            ),
+            ("git push -uf origin feat/x", Force),
+            ("git push --mirror origin", Force),
+            ("git push --all origin", Unknown),
+            ("git push origin :feat/x", Delete),
+            ("git push --delete origin feat/x", Delete),
+            ("git push -d origin feat/x", Delete),
+            ("git push --prune origin feat/x", Delete),
+            ("git push --tags origin", Tag),
+            ("git push --follow-tags origin feat/x", Tag),
+            ("git push origin v1.2.0", Tag),
+            ("git push origin refs/tags/v1.2.0", Tag),
+            ("git push origin tag v1.2.0", Tag),
+            ("git push origin other-feat", Unknown),
+            ("git push origin feat/x main", DefaultBranch),
+            ("git push origin feat/x +feat/x", Force),
+            ("git push --receive-pack=x origin feat/x", Unknown),
+            ("git push --repo=x origin feat/x", Unknown),
+            ("git push -o ci.skip origin feat/x", Unknown),
+            ("git push 'origin;x' feat/x", Unknown),
+        ] {
+            assert_eq!(kind(command), Some(class), "{command}");
+        }
+    }
+
+    /// A command of several takes its riskiest push; one Desk can't read
+    /// straight is unknown, and one pushing nothing has no class.
+    #[test]
+    fn a_command_takes_its_riskiest_push() {
+        use PushKind::*;
+        for (command, class) in [
+            ("true && git push origin main", Some(DefaultBranch)),
+            (
+                "git push origin feat/x && git push -f origin feat/x",
+                Some(Force),
+            ),
+            ("git status && git push origin feat/x", Some(OwnBranch)),
+            ("cd ../acme-api && git push origin feat/x", Some(Unknown)),
+            ("git checkout main && git push origin feat/x", Some(Unknown)),
+            ("sh -c 'git push -f'", Some(Unknown)),
+            ("git -C ../acme-api push origin feat/x", Some(Unknown)),
+            ("nice git push origin feat/x", Some(Unknown)),
+            ("git push origin \"$(echo main)\"", Some(Unknown)),
+            ("cargo test && git status", None),
+            ("echo push", None),
+        ] {
+            assert_eq!(kind(command), class, "{command}");
+        }
+    }
+
+    /// A bare push goes where git's `@{push}` says; without it, or to
+    /// another remote than the one named, Desk can't tell. Either way, the
+    /// judge leaves it to the person, as before.
+    #[test]
+    fn a_bare_push_is_classed_by_where_git_sends_it() {
+        use PushKind::*;
+        let to = |at: &'static str| move |h: &mut Here<'_>| h.push_to = Some(at);
+        assert_eq!(kind("git push"), Some(Unknown));
+        assert_eq!(kind_with("git push", to("origin/feat/x")), Some(OwnBranch));
+        assert_eq!(
+            kind_with("git push origin", to("origin/feat/x")),
+            Some(OwnBranch)
+        );
+        assert_eq!(
+            kind_with("git push", to("origin/main")),
+            Some(DefaultBranch)
+        );
+        assert_eq!(kind_with("git push", to("fork/feat/x")), Some(OtherRemote));
+        assert_eq!(
+            kind_with("git push upstream", to("origin/feat/x")),
+            Some(Unknown)
+        );
+        assert_eq!(kind_with("git push", to("origin/other")), Some(Unknown));
+        assert_eq!(kind_with("git push -f", to("origin/feat/x")), Some(Force));
+        assert_eq!(
+            kind_with("git push", |h| {
+                h.push_to = Some("origin/feat/x");
+                h.follow_tags = true;
+            }),
+            Some(Tag)
+        );
+        assert!(
+            judged_fully_with("git push", "feat/x", |h| h.push_to = Some("origin/feat/x")).is_err()
+        );
+    }
+
+    /// The classes are in order of risk: a push of several is its riskiest.
+    #[test]
+    fn push_classes_are_ordered_by_risk() {
+        use PushKind::*;
+        let order = [
+            OwnBranch,
+            OtherRemote,
+            Tag,
+            DefaultBranch,
+            Force,
+            Delete,
+            Unknown,
+        ];
+        assert!(order.windows(2).all(|w| w[0] < w[1]));
     }
 }

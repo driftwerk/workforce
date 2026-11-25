@@ -251,7 +251,7 @@ async fn an_approved_plan_starts_four_sessions_and_the_fifth_when_one_finishes()
 
 /// How many sessions plan `id` holds now.
 async fn held_now(d: &Desk, id: uuid::Uuid) -> usize {
-    workforce_desk::plan::held(&d.plan_tickets(id).await.unwrap())
+    workforce_desk::plan::held(&d.plan_tickets(id).await.unwrap(), |s| d.session_busy(s))
 }
 
 /// A plan's session here keeps its slot until it is closed: a finished

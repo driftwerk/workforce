@@ -59,6 +59,7 @@ fn claude_on(dir: &Path, model: Option<&str>) -> NewSession {
         account: None,
         env: Default::default(),
         group: None,
+        review_of: None,
     }
 }
 
