@@ -125,6 +125,8 @@ pub const VIA_WORKFLOW: &str =
     "deploys run through a named workflow at Act fully; this one is the person's to allow";
 
 pub const CANT_READ: &str = "Desk can't read this command";
+/// How a git subcommand Desk doesn't know (an alias) is refused.
+const UNKNOWN_GIT: &str = "Desk can't tell what git ";
 pub const PUBLISHES: &str = "pushes to the default branch, publishes or deploys";
 pub const UNDONE: &str = "can't be undone";
 pub const SECRETS: &str = "reads where secrets or Desk's own data are kept";
@@ -2651,7 +2653,7 @@ fn git(walk: &mut Walk<'_, '_>, args: &[Word]) -> Judged {
         "rebase" | "reset" | "restore" | "clean" | "update-ref" | "filter-branch"
         | "filter-repo" | "reflog" | "gc" | "prune" | "tag" | "replace" | "notes" => no(UNDONE),
         "push" => push(walk, rest).1,
-        other => no(format!("Desk can't tell what git {other} does")),
+        other => no(format!("{UNKNOWN_GIT}{other} does")),
     }
 }
 
@@ -2958,36 +2960,54 @@ fn moves_git(cmd: &Cmd) -> bool {
     }
 }
 
+/// Whether `text` may run a push, by its words alone: what a push Desk
+/// can't read otherwise is classed by.
+pub fn may_push(text: &str) -> bool {
+    text.contains("git") && text.contains("push")
+}
+
 /// The class of the riskiest push in `command`, run where `here` says
 /// ([`PushKind`]); `None` when it pushes nothing. A push Desk can't read
-/// straight (through a shell or a wrapper, with git's own options, after a
-/// command that moves git) is [`PushKind::Unknown`].
+/// straight (through a shell or a wrapper, with git's own options or an
+/// alias, after a command that moves git) is [`PushKind::Unknown`].
 pub fn push_kind(command: &str, here: &Here<'_>) -> Option<PushKind> {
-    let mentions = |t: &str| t.contains("git") && t.contains("push");
     let Ok(cmds) = split(command) else {
-        return mentions(command).then_some(PushKind::Unknown);
+        return may_push(command).then_some(PushKind::Unknown);
     };
-    let git = |w: &Word| w.text.rsplit('/').next() == Some("git");
+    let is_git = |w: &Word| w.text.rsplit('/').next() == Some("git");
     cmds.iter()
         .enumerate()
-        .filter_map(|(i, cmd)| match cmd.words.as_slice() {
-            [g, sub, rest @ ..] if git(g) && sub.text == "push" => {
-                let walk = Walk {
-                    here,
-                    cwd: here.cwd.clone(),
-                    moved: cmds[..i].iter().any(moves_git),
-                    made_tags: Vec::new(),
-                    unsettled: false,
-                };
-                Some(push(&walk, rest).0)
-            }
-            words => {
-                let pushes = words
-                    .iter()
-                    .position(git)
-                    .is_some_and(|at| words[at + 1..].iter().any(|w| w.text == "push"))
-                    || words.iter().any(|w| mentions(&w.text));
-                pushes.then_some(PushKind::Unknown)
+        .filter_map(|(i, cmd)| {
+            let mut walk = Walk {
+                here,
+                cwd: here.cwd.clone(),
+                moved: cmds[..i].iter().any(moves_git),
+                made_tags: Vec::new(),
+                unsettled: false,
+            };
+            match cmd.words.as_slice() {
+                [g, sub, rest @ ..] if is_git(g) && sub.text == "push" => Some(push(&walk, rest).0),
+                // With git's own options first, or a subcommand it doesn't
+                // know (an alias, which may push).
+                [g, rest @ ..] if is_git(g) => {
+                    let options = rest.first().is_some_and(|w| w.text.starts_with('-'));
+                    let pushes = match options {
+                        true => rest.iter().any(|w| w.text.contains("push")),
+                        false => matches!(
+                            git(&mut walk, rest),
+                            Err(why) if why.starts_with(UNKNOWN_GIT)
+                        ),
+                    };
+                    pushes.then_some(PushKind::Unknown)
+                }
+                words => {
+                    let pushes = words
+                        .iter()
+                        .position(is_git)
+                        .is_some_and(|at| words[at + 1..].iter().any(|w| w.text == "push"))
+                        || words.iter().any(|w| may_push(&w.text));
+                    pushes.then_some(PushKind::Unknown)
+                }
             }
         })
         .max()
@@ -5065,6 +5085,10 @@ pub(crate) mod tests {
             ("cd ../acme-api && git push origin feat/x", Some(Unknown)),
             ("git checkout main && git push origin feat/x", Some(Unknown)),
             ("sh -c 'git push -f'", Some(Unknown)),
+            ("git -c alias.p='push -f' p", Some(Unknown)),
+            ("git pf", Some(Unknown)),
+            ("git status", None),
+            ("git -C ../acme-api status", None),
             ("git -C ../acme-api push origin feat/x", Some(Unknown)),
             ("nice git push origin feat/x", Some(Unknown)),
             ("git push origin \"$(echo main)\"", Some(Unknown)),

@@ -1057,8 +1057,14 @@ impl Desk {
         boss: &str,
     ) -> Option<crate::computer::boss::PushKind> {
         let pending = self.pending_of(id, approval)?;
-        let (facts, bounds) = self.judged_facts(id, &pending, boss).ok()?;
-        charge::push_kind(&facts, &bounds, &crate::computer::boss::resolve_real)
+        match self.judged_facts(id, &pending, boss) {
+            Ok((facts, bounds)) => {
+                charge::push_kind(&facts, &bounds, &crate::computer::boss::resolve_real)
+            }
+            // Not read: a push it may run is unknown, never none.
+            Err(_) => crate::computer::boss::may_push(&pending.detail)
+                .then_some(crate::computer::boss::PushKind::Unknown),
+        }
     }
 
     /// Whether `boss` may let `pending`, a request of `id`, go on itself:
