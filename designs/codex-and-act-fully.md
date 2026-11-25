@@ -139,6 +139,12 @@ Line numbers are from origin/main 6d0970bc6. D = `crates/desk/src`, H = `crates/
   - **Unknown:** a `warn!` and an Activity note naming the method.
     - Desk never answers it. If Codex is still waiting on it after 10 s (`waitingOnApproval` or `waitingOnUserInput`), the session shows "waiting in its terminal" with the method name.
     - That is the only placeholder left, and `answerable` is false.
+- **The "waiting on you" item is raised only for a request Desk truly can't answer.** *(user report, 25 Nov, DW-762)* Desk told the person "MAN-839 is waiting on you to allow Codex (Answer in the terminal) … only you can answer", but Desk had already approved it.
+  - **Cause:** the placeholder is made from the thread's `waitingOnApproval` flag whenever no request Desk holds matches (D/service.rs:8406-8423). The flag can arrive before the request, or outlive it after Desk's answer. H/left.rs:97 then turns it into a person item.
+  - **Change:**
+    - A placeholder is made only when, 10 s after the flag, Codex still waits, and Desk holds no open request of a kind it answers for that thread. It names the method when it's an unknown one or `TuiOwned`.
+    - The placeholder, and the person item made from it, clear the moment anyone answers: Desk (`Answered`), the terminal (`Resolved`, `Late`), a status change to not-waiting, a new turn, or Idle. That uses one `clear_wait(id)` called from each of those events in `codex_loop`.
+    - The words "only you can answer" and "Answer in the terminal" are used only for a placeholder. A request of a kind Desk answers is never described that way, whoever decides it. The person item for it says who decides ("Desk's boss is deciding", or "waiting on your answer in Desk").
     - `Decision::Terminal` for forwarded kinds (D/service.rs:4866-4876) goes.
 - **The `Permissions` answer shape** *(source: `v2/permissions.rs:505-511`, `:787-806`; review H4)*:
   - **Allow:** `{"permissions": <exactly the requested profile's network and fileSystem>, "scope": "turn"}`.
@@ -418,7 +424,12 @@ Line numbers are from origin/main 6d0970bc6. D = `crates/desk/src`, H = `crates/
    - a `request_permissions` call becomes a `Permissions` approval, and the JSON Desk sends is exactly the requested profile with `scope: "turn"`, or the empty grant on deny;
    - a `TuiOwned` request is never answered by Desk, and the TUI answers it;
    - an unknown method gives the note, then "waiting in its terminal";
-   - a request not seen whole goes to the person.
+   - a request not seen whole goes to the person;
+   - **no false "waiting on you":**
+     - a command approval answered by the boss within the 10 s window never raises a placeholder or a person item;
+     - a `waitingOnApproval` flag that arrives before its request makes no placeholder once the request lands;
+     - a placeholder for a `TuiOwned` request clears, along with its person item, the moment the terminal answers;
+     - the person item for a Desk-answerable request never contains "only you" or "Answer in the terminal".
 3. **T3, seeing in:**
    - `crew.history` and `crew.inside` return the prompt, the command item and the reply from the rollout;
    - a 429 turn ends with `view.failure` set, in both event orders (`turn/completed` first, `systemError` first);
@@ -508,7 +519,7 @@ Each PR ships with its tests and green CI. Ordered so the plan moves first: *(re
 
   It fixes the boss refusing pushes it should allow, never merging, slots sitting empty, and invented gates. It does not make Codex escalations fast.
 - **PR 2, Codex permissions and approvals** (parts 1, 3 and 5; T1, T2, T5, T6, the harness, and T7's permissions-cancel case). It builds on PR 1, which carries `PushKind` and `Hold`. It makes Auto run without prompts, makes charged escalations instant through the fast path, makes permissions requests answerable, and gives every resume the right settings.
-- **PR 3, seeing in and failures** (parts 2 and 8; T3, T4). It gives the true state and the transcript to the boss, the tile and the ticket, and makes failures loud.
+- **PR 3, seeing in and failures** (parts 2 and 8; T3, T4). The no-false-"waiting on you" fix (part 3) ships with PR 2's `TuiOwned` arm, and its tests with T2. It gives the true state and the transcript to the boss, the tile and the ticket, and makes failures loud.
 
 **Order** *(review M2)*:
 - PR 0 and PR 1 go first, in parallel.
