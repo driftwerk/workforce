@@ -393,6 +393,9 @@ const COLLAPSED_PASTES: [&str; 2] = ["[Pasted Content ", "[Pasted text #"];
 struct Draft {
     at: chrono::DateTime<chrono::Utc>,
     plain: String,
+    /// What it shows when it has no letters or digits ("?", "..."): its
+    /// text, spacing and what frames a prompt aside.
+    bare: String,
 }
 
 impl Draft {
@@ -400,11 +403,26 @@ impl Draft {
         Self {
             at: chrono::Utc::now(),
             plain: Self::plain(text),
+            bare: Self::bare(text),
         }
     }
 
     fn plain(text: &str) -> String {
         text.chars().filter(|c| c.is_alphanumeric()).collect()
+    }
+
+    /// `text` with no spacing, box drawing or prompt sign.
+    fn bare(text: &str) -> String {
+        text.chars()
+            .filter(|c| !c.is_whitespace() && !('\u{2500}'..='\u{257f}').contains(c))
+            .filter(|c| !matches!(c, '>' | '›' | '❯'))
+            .collect()
+    }
+
+    /// Whether a run of consecutive `rows` joins to exactly `text`.
+    fn in_a_run(rows: &[String], text: &str) -> bool {
+        (0..rows.len())
+            .any(|from| (from + 1..=rows.len()).any(|to| rows[from..to].concat() == text))
     }
 
     /// Whether `screen` (as [`Pty::text`] gives it) still shows it in its
@@ -415,12 +433,14 @@ impl Draft {
         if prompt.trim().is_empty() || COLLAPSED_PASTES.iter().any(|p| prompt.contains(p)) {
             return true;
         }
+        if self.plain.is_empty() {
+            let rows: Vec<String> = prompt.lines().map(Self::bare).collect();
+            return self.bare.is_empty() || Self::in_a_run(&rows, &self.bare);
+        }
         let rows: Vec<String> = prompt.lines().map(Self::plain).collect();
         let chars: Vec<char> = self.plain.chars().collect();
         if chars.len() < DRAFT_MARK_MIN {
-            return (0..rows.len()).any(|from| {
-                (from + 1..=rows.len()).any(|to| rows[from..to].concat() == self.plain)
-            });
+            return Self::in_a_run(&rows, &self.plain);
         }
         let shown = rows.concat();
         let first: String = chars.iter().take(DRAFT_MARK).collect();
@@ -1203,6 +1223,26 @@ pub(crate) mod tests {
         );
         assert!(
             !lines.shown_in(&screen("│ >                                     │")),
+            "cleared"
+        );
+    }
+
+    #[test]
+    fn a_draft_with_no_letters_or_digits_is_looked_for_as_it_is() {
+        let draft = Draft::new(" ? ");
+        assert!(draft.shown_in(&screen("│ > ?                                   │")));
+        assert!(
+            !draft.shown_in(&screen("│ >                                     │")),
+            "cleared"
+        );
+        let dots = Draft::new("...");
+        assert!(dots.shown_in(&screen("│ > ...                                 │")));
+        assert!(
+            !dots.shown_in(&screen("│ > ..                                  │")),
+            "not all of it"
+        );
+        assert!(
+            !dots.shown_in(&screen("│ >                                     │")),
             "cleared"
         );
     }
