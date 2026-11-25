@@ -937,3 +937,222 @@ fn a_parts_head_is_where_its_last_checkpoint_left_it_else_where_it_was_agreed() 
     assert!(!head_due(&heads, &pull), "it came later");
     assert!(head_due(&Heads::new(), &pull), "nothing read yet");
 }
+
+#[test]
+fn a_short_reply_says_yes_with_a_yes_word_and_no_refusing_one() {
+    let yes = [
+        "yes",
+        "Yes!",
+        "ok, go ahead",
+        "Yeah, do it.",
+        "sounds good",
+        "LGTM",
+        "👍",
+        "yes please",
+        "Okay 👍",
+        "yes please do",
+        "go for it",
+        "yes thanks",
+        "perfect",
+        "great",
+        "looks good",
+        "ship it",
+        "approved",
+        "confirmed",
+        "fine",
+        "alright",
+        "yup",
+        "y",
+        "Yes, no rush",
+        "do it",
+    ];
+    for text in yes.into_iter().chain([
+        "keep going",
+        "Yes, keep it up",
+        "ok, move on",
+        "Looks good, keep going with it",
+    ]) {
+        assert_eq!(consent(text), Consent::Yes, "{text}");
+    }
+    for text in yes {
+        assert_eq!(plainly(text), Consent::Yes, "{text}");
+    }
+    let no = [
+        "no",
+        "not yet",
+        "wait",
+        "yes but wait",
+        "ok, change it",
+        "don't",
+        "hold on",
+        "later",
+        "nope",
+    ];
+    for text in no {
+        assert_eq!(plainly(text), Consent::No, "{text}");
+        assert_eq!(consent(text), Consent::No, "{text}");
+    }
+    for text in [
+        "please",
+        "hmm",
+        "",
+        "thanks",
+        "ok?",
+        "sure?",
+        "approve?",
+        "good question",
+        "ok drop staging",
+    ] {
+        assert_eq!(plainly(text), Consent::Unclear, "{text}");
+        assert_eq!(consent(text), Consent::Unclear, "{text}");
+    }
+}
+
+#[test]
+fn a_longer_answer_is_no_only_when_it_opens_with_a_refusal_or_qualifies_it() {
+    let changes = [
+        "ok, change step 3",
+        "Sure, drop the staging part",
+        "Yes, and remove step 2",
+        "Looks good, though keep staging",
+        "Please change the result to the CI check",
+        "Yes, and keep it fast",
+        "Is this the CI check on main?",
+    ];
+    for text in changes {
+        assert_eq!(consent(text), Consent::Unclear, "{text}");
+    }
+    let goal = "Keep the docs build green";
+    assert_eq!(
+        agreement("Yes, keep the docs build green", goal),
+        Consent::Yes,
+        "agreeing in their own words, the words are the work"
+    );
+    assert_eq!(agreement("No, keep the old goal", goal), Consent::No);
+    for changes in [
+        "Sure, drop the staging part",
+        "Yes start it, skip the deploy step",
+    ] {
+        assert_eq!(agreement(changes, goal), Consent::Unclear, "{changes}");
+    }
+    assert_eq!(agreement("Yes, that looks right to me", goal), Consent::Yes);
+    let moves = "Yes, move the deploy step after tests";
+    assert_eq!(
+        consent(moves),
+        Consent::Unclear,
+        "an answer asking to move a step"
+    );
+    assert_eq!(
+        agreement("Move it to devbox and start it now", goal),
+        Consent::Yes,
+        "their own words saying where the work they start runs"
+    );
+    let yes = [
+        "Yes, that's not a problem",
+        "Sounds good, can't wait",
+        "Yes, no rush on the docs",
+        "Apply the goal as you wrote it",
+    ];
+    for text in yes {
+        assert_eq!(consent(text), Consent::Yes, "{text}");
+    }
+    let no = [
+        "Yes, but not the docs",
+        "No, keep the old goal",
+        "Not yet, the release comes first",
+        "Fine, except the staging part",
+        "Ok, only if CI stays green",
+        "Let's fix it, but later",
+    ];
+    for text in no {
+        assert_eq!(consent(text), Consent::No, "{text}");
+    }
+}
+
+#[test]
+fn a_plain_reply_settles_only_what_the_bosss_message_before_it_proposed() {
+    let proposal = "**Proposed done-when goal:**\n\n| Goal | Done when |\n|---|---|\n| Eden’s v1 is live for staff | **Eden v1 checklist** is ticked |\n\nYes, or change it?";
+    let boss = vec![
+        (at(0), "Earlier news.".to_string()),
+        (at(5), proposal.to_string()),
+    ];
+    let said = |texts: &[(i64, &str)]| -> Vec<(DateTime<Utc>, String)> {
+        texts.iter().map(|(m, t)| (at(*m), t.to_string())).collect()
+    };
+    let proposed = ["Eden's v1 is live for staff", "Eden v1 checklist is ticked"];
+    let reply = |theirs: &[(DateTime<Utc>, String)], quote: &str| {
+        replied_to(theirs, &boss, quote, &proposed, at(-60))
+    };
+    let yes = said(&[(1, "hello"), (6, "Yes.")]);
+    assert_eq!(reply(&yes, "yes"), Ok(at(6)));
+    assert_eq!(
+        replied_to(&yes, &boss, "yes", &["Eden v2 is live"], at(-60)),
+        Err(NotReplied::NotProposed(0))
+    );
+    assert_eq!(
+        reply(&said(&[(4, "yes")]), "yes"),
+        Err(NotReplied::NotProposed(0)),
+        "a yes before the proposal answers the message before it"
+    );
+    assert_eq!(
+        replied_to(&yes, &boss, "yes", &proposed, at(6)),
+        Err(NotReplied::NoPlainReply),
+        "a yes applied already, or older than the goal was last said back"
+    );
+    let button = format!("{ANSWER_LEAD}Shall I merge #5?”: Yes");
+    let unclear = [
+        said(&[(6, "yes"), (7, "wait, drop staging")]),
+        said(&[(6, "drop staging"), (7, "yes")]),
+        said(&[(6, "yes but drop the staging part")]),
+        said(&[(6, "no")]),
+        said(&[(6, "not yet")]),
+        said(&[(6, button.as_str())]),
+    ];
+    for theirs in &unclear {
+        let quote = &theirs.last().unwrap().1;
+        assert!(reply(theirs, quote).is_err(), "{theirs:?}");
+        assert!(reply(theirs, "yes").is_err(), "{theirs:?}");
+    }
+    assert_eq!(
+        reply(&said(&[(6, "not yet")]), "not yet"),
+        Err(NotReplied::Says(Consent::No))
+    );
+    assert_eq!(
+        reply(&said(&[(6, "hmm")]), "hmm"),
+        Err(NotReplied::Says(Consent::Unclear))
+    );
+    assert_eq!(reply(&said(&[(6, "go for it")]), "go for it"), Ok(at(6)));
+    let two = vec![(at(5), format!("Shall I merge #5 first?\n\n{proposal}"))];
+    assert_eq!(
+        replied_to(&yes, &two, "yes", &proposed, at(-60)),
+        Err(NotReplied::AsksMore)
+    );
+    assert_eq!(
+        replied_to(&said(&[(6, "yes")]), &[], "yes", &proposed, at(-60)),
+        Err(NotReplied::NothingProposed)
+    );
+}
+
+#[test]
+fn a_short_answer_or_agreement_counts_only_when_it_agrees_and_none_that_refuses() {
+    for said in [Said::Answering, Said::Agreeing] {
+        let messages = vec![
+            (at(0), "no".to_string()),
+            (at(1), "not yet".to_string()),
+            (at(2), "Yes, but not the docs".to_string()),
+            (at(3), "ok".to_string()),
+            (at(4), "Yes, that looks right to me".to_string()),
+        ];
+        let by = |quote: &str| said_by(&messages, quote, at(-60), said);
+        for refused in ["no", "not yet", "Yes, but not the docs"] {
+            assert_eq!(by(refused), Err(NotSaid::Refuses), "{said:?} {refused}");
+        }
+        assert_eq!(by("ok"), Ok(at(3)), "{said:?}");
+        assert_eq!(
+            said_by(&[(at(0), "hmm".to_string())], "hmm", at(-60), said),
+            Err(NotSaid::Unclear),
+            "{said:?}"
+        );
+        assert_eq!(by("Yes, that looks right to me"), Ok(at(4)), "{said:?}");
+    }
+}
