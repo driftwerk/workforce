@@ -1036,6 +1036,17 @@ fn a_longer_answer_is_no_only_when_it_opens_with_a_refusal_or_qualifies_it() {
         assert_eq!(agreement(changes, goal), Consent::Unclear, "{changes}");
     }
     assert_eq!(agreement("Yes, that looks right to me", goal), Consent::Yes);
+    let moves = "Yes, move the deploy step after tests";
+    assert_eq!(
+        consent(moves),
+        Consent::Unclear,
+        "an answer asking to move a step"
+    );
+    assert_eq!(
+        agreement("Move it to devbox and start it now", goal),
+        Consent::Yes,
+        "their own words saying where the work they start runs"
+    );
     let yes = [
         "Yes, that's not a problem",
         "Sounds good, can't wait",

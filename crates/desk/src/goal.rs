@@ -1219,8 +1219,12 @@ const REFUSING: &[&str] = &[
 const CHANGING: &[&str] = &[
     "change", "drop", "remove", "keep", "stop", "hold", "wait", "later", "not", "don't", "dont",
     "though", "although", "instead", "add", "also", "replace", "skip", "edit", "adjust", "tweak",
-    "rename", "swap",
+    "move", "rename", "swap",
 ];
+/// Of [`CHANGING`]'s words, those the person's own words agreeing work
+/// may hold ("Move it to devbox and start it now"): they say how the work
+/// they start runs, which the boss applies with it.
+const AGREEING_MAY_SAY: &[&str] = &["move"];
 /// Phrases with a yes word that say nothing to what was asked.
 const NOT_ANSWERS: &[&[&str]] = &[&["good", "question"], &["great", "question"]];
 /// Words that, anywhere in a longer reply, make it yes to something else.
@@ -1282,11 +1286,10 @@ fn refusing(w: &str) -> bool {
 /// Whether `words` (as [`plain_words`] leaves them) of `text` can't be
 /// read as a yes to what was proposed as it stands: they ask for a change
 /// ([`CHANGING`]), say nothing to it ([`NOT_ANSWERS`]), or ask back.
-fn unclear(text: &str, words: &[String]) -> bool {
+fn unclear(text: &str, words: &[String], may_say: &[&str]) -> bool {
+    let changes = |w: &str| (CHANGING.contains(&w) && !may_say.contains(&w)) || w.ends_with("n't");
     text.trim_end().ends_with('?')
-        || words
-            .iter()
-            .any(|w| CHANGING.contains(&w.as_str()) || w.ends_with("n't"))
+        || words.iter().any(|w| changes(w))
         || NOT_ANSWERS.iter().any(|p| holds(words, p))
 }
 
@@ -1304,7 +1307,7 @@ pub fn plainly(text: &str) -> Consent {
             .any(|p| holds(&compared_words(text), p));
     if words.iter().any(|w| refusing(w)) {
         Consent::No
-    } else if agrees && !unclear(text, &words) {
+    } else if agrees && !unclear(text, &words, &[]) {
         Consent::Yes
     } else {
         Consent::Unclear
@@ -1319,7 +1322,7 @@ pub fn plainly(text: &str) -> Consent {
 /// drop the staging part"), so the person's change is never dropped by a
 /// yes.
 pub fn consent(text: &str) -> Consent {
-    read(text, false)
+    read(text, false, &[])
 }
 
 /// What the person's message `text` says agreeing work `goal`: as
@@ -1328,12 +1331,13 @@ pub fn consent(text: &str) -> Consent {
 /// refusal or a qualifier says no; one that asks for a change to it
 /// otherwise ("Sure, drop the staging part") is unclear.
 pub fn agreement(text: &str, goal: &str) -> Consent {
-    read(text, says_goal(text, goal))
+    read(text, says_goal(text, goal), AGREEING_MAY_SAY)
 }
 
 /// [`consent`]'s reading of `text`, its words asking for a change read as
-/// unclear unless they are `theirs`, the person's own words for the work.
-fn read(text: &str, theirs: bool) -> Consent {
+/// unclear unless they are `theirs`, the person's own words for the work,
+/// or words it `may_say`.
+fn read(text: &str, theirs: bool, may_say: &[&str]) -> Consent {
     if !stands_alone(text) {
         return plainly(text);
     }
@@ -1341,7 +1345,7 @@ fn read(text: &str, theirs: bool) -> Consent {
     let opens_no = words.first().is_some_and(|w| refusing(w));
     if opens_no || QUALIFYING.iter().any(|q| holds(&words, q)) {
         Consent::No
-    } else if !theirs && unclear(text, &words) {
+    } else if !theirs && unclear(text, &words, may_say) {
         Consent::Unclear
     } else {
         Consent::Yes
