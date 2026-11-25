@@ -12,8 +12,8 @@ use serde_json::{json, Value};
 use uuid::Uuid;
 use workforce_desk::crew::{self, Party};
 use workforce_desk::goal::{
-    self, Evidence, Fact, FactKind, GoalResult, Measure, Met, MetBy, NotReplied, NotSaid, Progress,
-    Proposal, Reading, Said,
+    self, Consent, Evidence, Fact, FactKind, GoalResult, Measure, Met, MetBy, NotReplied, NotSaid,
+    Progress, Proposal, Reading, Said,
 };
 use workforce_desk::plan::Plan;
 use workforce_desk::PlanDetail;
@@ -66,6 +66,19 @@ themselves, pass their words as person_said, with the goal said in their words. 
 only what you propose, never about this check.";
 /// Refused when a plan is given its first goal without the person's words.
 const FIRST_GOAL: &str = "A goal is the person's: give this plan its first goal with the words they agreed it in (agreed: {person_said}, from the last 24 hours), with its result.";
+/// Why the person's `quote` (`q`) doesn't apply what it answers, when it
+/// says no or isn't a clear yes.
+fn not_yes(q: &str, says: Consent) -> String {
+    match says {
+        Consent::No => format!(
+            "The person's “{q}” doesn't agree to it: it says no, or asks for something else. Don't apply it: answer what they said, and if you propose something new, put it to them in plain words."
+        ),
+        _ => format!(
+            "Desk couldn't read the person's “{q}” as a clear yes, so it applies nothing: ask them to reply yes or no, in plain words, then pass their reply."
+        ),
+    }
+}
+
 /// Why the person's words `quote` don't count for `said`, and how the boss
 /// gets them to.
 pub(super) fn not_said(quote: &str, why: NotSaid, said: Said) -> String {
@@ -99,9 +112,8 @@ pub(super) fn not_said(quote: &str, why: NotSaid, said: Said) -> String {
         (NotSaid::NotFound, Said::Agreeing) => format!(
             "Desk looked for “{q}” in {WHERE_LOOKED} over the last 24 hours and didn't find it word for word. Quote one message of theirs exactly as they wrote it: not your own words, and not spread over two messages."
         ),
-        (NotSaid::Refuses, _) => format!(
-            "The person's “{q}” doesn't agree to it: it says no, or asks for something else. Don't apply it: answer what they said, and if you propose something new, put it to them in plain words."
-        ),
+        (NotSaid::Refuses, _) => not_yes(&q, Consent::No),
+        (NotSaid::Unclear, _) => not_yes(&q, Consent::Unclear),
         (NotSaid::NotFound, Said::Changing) => format!(
             "Desk looked for “{q}” in {WHERE_LOOKED} over the last 24 hours and didn't find it word for word. Quote one message of theirs exactly as they wrote it.{ask}"
         ),
@@ -784,7 +796,9 @@ impl CrewHub {
                 .map(|talk| goal::replied_to(&talk.theirs, &talk.boss, quote, &words, since))
                 .collect();
         let unclear = replies.iter().find_map(|r| match r {
-            Err(e @ (NotReplied::AsksMore | NotReplied::NotProposed(_))) => Some(*e),
+            Err(e @ (NotReplied::AsksMore | NotReplied::NotProposed(_) | NotReplied::Says(_))) => {
+                Some(*e)
+            }
             _ => None,
         });
         let q = crew::one_line(quote, 120);
@@ -795,6 +809,7 @@ impl CrewHub {
                 proposed[n].0,
                 crew::one_line(proposed[n].1, 120)
             )),
+            (None, Some(NotReplied::Says(says))) => Err(not_yes(&q, says)),
             (None, Some(_)) => Err(format!(
                 "The person's “{q}” answers your last message before it, which asked more than this change, so it's unclear what they agreed to. Ask them about this change on its own, in plain words, then pass their reply."
             )),

@@ -939,8 +939,8 @@ fn a_parts_head_is_where_its_last_checkpoint_left_it_else_where_it_was_agreed() 
 }
 
 #[test]
-fn only_a_reply_that_agrees_and_nothing_else_is_a_yes() {
-    for yes in [
+fn a_short_reply_says_yes_with_a_yes_word_and_no_refusing_one() {
+    let yes = [
         "yes",
         "Yes!",
         "ok, go ahead",
@@ -950,24 +950,68 @@ fn only_a_reply_that_agrees_and_nothing_else_is_a_yes() {
         "👍",
         "yes please",
         "Okay 👍",
-    ] {
-        assert!(agrees(yes), "{yes}");
+        "yes please do",
+        "go for it",
+        "yes thanks",
+        "perfect",
+        "great",
+        "looks good",
+        "ship it",
+        "approved",
+        "confirmed",
+        "fine",
+        "alright",
+        "yup",
+        "y",
+        "Yes, no rush",
+        "do it",
+    ];
+    for text in yes {
+        assert_eq!(plainly(text), Consent::Yes, "{text}");
+        assert_eq!(consent(text), Consent::Yes, "{text}");
     }
-    for not in [
+    let no = [
         "no",
         "not yet",
         "wait",
         "yes but wait",
-        "ok, change step 3",
+        "ok, change it",
         "don't",
         "hold on",
         "later",
-        "please",
-        "yes, and the docs",
-        "hmm",
-        "",
-    ] {
-        assert!(!agrees(not), "{not}");
+        "nope",
+    ];
+    for text in no {
+        assert_eq!(plainly(text), Consent::No, "{text}");
+        assert_eq!(consent(text), Consent::No, "{text}");
+    }
+    for text in ["please", "hmm", "", "thanks"] {
+        assert_eq!(plainly(text), Consent::Unclear, "{text}");
+    }
+}
+
+#[test]
+fn a_longer_answer_is_no_only_when_it_opens_with_a_refusal_or_qualifies_it() {
+    let yes = [
+        "Yes, and keep it fast",
+        "Yes, that's not a problem",
+        "Sounds good, can't wait",
+        "Yes, no rush on the docs",
+        "Apply the goal as you wrote it",
+    ];
+    for text in yes {
+        assert_eq!(consent(text), Consent::Yes, "{text}");
+    }
+    let no = [
+        "Yes, but not the docs",
+        "No, keep the old goal",
+        "Not yet, the release comes first",
+        "Fine, except the staging part",
+        "Ok, only if CI stays green",
+        "Let's fix it, but later",
+    ];
+    for text in no {
+        assert_eq!(consent(text), Consent::No, "{text}");
     }
 }
 
@@ -1012,17 +1056,18 @@ fn a_plain_reply_settles_only_what_the_bosss_message_before_it_proposed() {
     ];
     for theirs in &unclear {
         let quote = &theirs.last().unwrap().1;
-        assert_eq!(
-            reply(theirs, quote),
-            Err(NotReplied::NoPlainReply),
-            "{theirs:?}"
-        );
-        assert_eq!(
-            reply(theirs, "yes"),
-            Err(NotReplied::NoPlainReply),
-            "{theirs:?}"
-        );
+        assert!(reply(theirs, quote).is_err(), "{theirs:?}");
+        assert!(reply(theirs, "yes").is_err(), "{theirs:?}");
     }
+    assert_eq!(
+        reply(&said(&[(6, "not yet")]), "not yet"),
+        Err(NotReplied::Says(Consent::No))
+    );
+    assert_eq!(
+        reply(&said(&[(6, "hmm")]), "hmm"),
+        Err(NotReplied::Says(Consent::Unclear))
+    );
+    assert_eq!(reply(&said(&[(6, "go for it")]), "go for it"), Ok(at(6)));
     let two = vec![(at(5), format!("Shall I merge #5 first?\n\n{proposal}"))];
     assert_eq!(
         replied_to(&yes, &two, "yes", &proposed, at(-60)),
@@ -1049,9 +1094,11 @@ fn a_short_answer_or_agreement_counts_only_when_it_agrees_and_none_that_refuses(
             assert_eq!(by(refused), Err(NotSaid::Refuses), "{said:?} {refused}");
         }
         assert_eq!(by("ok"), Ok(at(3)), "{said:?}");
+        assert_eq!(
+            said_by(&[(at(0), "hmm".to_string())], "hmm", at(-60), said),
+            Err(NotSaid::Unclear),
+            "{said:?}"
+        );
         assert_eq!(by("Yes, and keep it fast"), Ok(at(4)), "{said:?}");
     }
-    assert!(consents("Yes, and keep it fast"));
-    assert!(!consents("hmm"));
-    assert!(!consents("Let's fix it, but later"));
 }

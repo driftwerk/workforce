@@ -774,10 +774,22 @@ async fn the_persons_plain_yes_to_the_bosss_proposal_in_the_dm_replaces_the_goal
     .await;
 }
 
-/// On every path a short answer or agreement says yes only when it agrees,
-/// and none that refuses does, whatever its length: an answer to the
-/// boss's question, a first goal agreed and work started on the person's
-/// word. A longer yes is read on its own words.
+/// The person's replies on every path: an answer to the boss's question,
+/// a first goal agreed and work started on their word. A "no" never says
+/// yes, whatever its length; one that is neither is said to be unclear; a
+/// short yes counts in its many words, and a longer one on its own words.
+const REPLIES: [(&str, Option<&str>); 6] = [
+    ("no", Some("doesn't agree to it")),
+    ("not yet", Some("doesn't agree to it")),
+    (
+        "hmm",
+        Some("couldn't read the person's “hmm” as a clear yes"),
+    ),
+    ("ok", None),
+    ("go for it", None),
+    ("Yes, and keep it fast", None),
+];
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_no_never_answers_or_agrees_on_any_path_and_a_longer_yes_does() {
     with_test_pool(workforce_desk::store::build_pool, |pool| async move {
@@ -785,55 +797,70 @@ async fn a_no_never_answers_or_agrees_on_any_path_and_a_longer_yes_does() {
         let base = std::fs::canonicalize(dir.path()).unwrap();
         let folder = base.to_string_lossy().to_string();
         let gh = github().await;
-        let (overseer, _crew, d, _llm) = boss_on(&base, pool, ACTS, &gh).await;
+        let (overseer, crew, d, _llm) = boss_on(&base, pool, ACTS, &gh).await;
         let pause = || tokio::time::sleep(Duration::from_millis(20));
-        let refuses = |r: &workforce_agent::tools::ToolResult, said: &str| {
-            assert!(!r.success, "{said}: {r:?}");
-            let why = r.error.clone().unwrap();
-            assert!(why.contains("doesn't agree to it"), "{said}: {why}");
+        let check = |r: &workforce_agent::tools::ToolResult, said: &str, refused: Option<&str>| {
+            match refused {
+                Some(why) => {
+                    assert!(!r.success, "{said}: {r:?}");
+                    let err = r.error.clone().unwrap();
+                    assert!(err.contains(why), "{said}: {err}");
+                }
+                None => assert!(r.success, "{said}: {r:?}"),
+            }
         };
-
         let s = session_on(&overseer, &d, &folder, "Fix the docs build").await;
         let id = agreed_plan(&overseer, &s, judged()).await;
-        for (n, said) in ["no", "not yet", "ok", "Yes, and keep it fast"].into_iter().enumerate() {
-            let to = format!("Keep the docs build green, step {n}");
+        let ask = async |to: &str, options: Value| {
             let r = run(
                 &overseer,
                 "crew.ask_person",
                 json!({ "text": format!("Shall the goal be: {to}?"), "plan_id": id.to_string(),
-                        "proposal": { "goal": to } }),
+                        "proposal": { "goal": to }, "options": options, "recommended": "Apply goal" }),
             )
             .await;
             assert!(r.success, "{r:?}");
-            pause().await;
-            person_says(&overseer, said);
-            let r = run(
+            asked(&d, id).await
+        };
+        let apply = async |to: &str, said: &str| {
+            run(
                 &overseer,
                 "crew.plan_update",
                 json!({ "plan_id": id.to_string(), "goal": to, "person_said": said, "why": "Their answer." }),
             )
-            .await;
-            match n {
-                0 | 1 => refuses(&r, said),
-                _ => assert!(r.success, "{said}: {r:?}"),
-            }
-            if n < 2 {
-                let open = d.store().goal_asks(id).await.unwrap();
-                for ask in open {
-                    d.store()
-                        .item_close(ask.item, workforce_desk::open_item::ClosedBy::Boss, "They said no.")
-                        .await
-                        .unwrap();
-                }
+            .await
+        };
+
+        // Its buttons are Yes and No, whatever the boss labels them, and a
+        // click of Yes applies it.
+        let to = "Keep the docs build green, clicked yes";
+        let item = ask(to, json!(["Apply goal", "Hold, I'll look"])).await;
+        let i = d.store().open_item(item).await.unwrap().unwrap();
+        assert_eq!(i.options, ["Yes", "No"]);
+        pause().await;
+        crew.answer_item(item, "Yes").await.unwrap();
+        check(&apply(to, "Yes").await, "Yes", None);
+
+        for (n, (said, refused)) in REPLIES.into_iter().enumerate() {
+            let to = format!("Keep the docs build green, step {n}");
+            let item = ask(&to, json!([])).await;
+            pause().await;
+            person_says(&overseer, said);
+            check(&apply(&to, said).await, said, refused);
+            if refused.is_some() {
+                let _ = d
+                    .store()
+                    .item_close(item, workforce_desk::open_item::ClosedBy::Boss, "Not a yes.")
+                    .await;
             }
         }
         assert_eq!(
             d.plan(id).await.unwrap().summary.plan.goal,
-            "Keep the docs build green, step 3"
+            "Keep the docs build green, step 5"
         );
 
         for field in ["agreed", "start_now"] {
-            for (n, said) in ["no", "not yet", "ok", "Yes, and keep it fast"].into_iter().enumerate() {
+            for (n, (said, refused)) in REPLIES.into_iter().enumerate() {
                 pause().await;
                 person_says(&overseer, said);
                 let r = run(
@@ -844,10 +871,7 @@ async fn a_no_never_answers_or_agrees_on_any_path_and_a_longer_yes_does() {
                             "tickets": [{ "title": format!("Fix suite {field} {n}"), "folder": folder }] }),
                 )
                 .await;
-                match n {
-                    0 | 1 => refuses(&r, said),
-                    _ => assert!(r.success, "{field} {said}: {r:?}"),
-                }
+                check(&r, said, refused);
             }
         }
     })

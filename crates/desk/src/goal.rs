@@ -257,6 +257,10 @@ pub struct GoalAsk {
 /// How an item the person answered on its buttons says their answer.
 pub const YOU_ANSWERED: &str = "You answered: ";
 
+/// The buttons a question proposing a change to a goal is answered on:
+/// its proposal says what a yes applies.
+pub const GOAL_ANSWERS: [&str; 2] = ["Yes", "No"];
+
 /// Why a result doesn't read, in the boss's words.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum Problem {
@@ -1002,9 +1006,11 @@ pub enum NotSaid {
     NotWhole,
     /// In none of their messages, word for word.
     NotFound,
-    /// In a message of theirs that doesn't agree ([`consents`]): it says
-    /// no, or asks for something else ("not yet", "yes but wait").
+    /// In a message of theirs that says no, or yes to something else
+    /// ([`consent`]: "not yet", "yes but wait").
     Refuses,
+    /// In a message of theirs that reads as neither yes nor no ("hmm").
+    Unclear,
 }
 
 /// Text as it is compared: compatibility forms folded (NFKC), curly
@@ -1054,7 +1060,7 @@ pub fn said_by(
     let (least_words, least_chars) = said.floor();
     let short = quoted.len() < least_words || quoted.join(" ").chars().count() < least_chars;
     let mut found = None;
-    let (mut too_short, mut not_whole, mut refused) = (false, false, false);
+    let (mut too_short, mut not_whole, mut refused, mut unclear) = (false, false, false, false);
     for (at, text) in messages {
         let words = compared_words(text);
         let whole = words == quoted;
@@ -1064,19 +1070,26 @@ pub fn said_by(
             Said::Answering => whole,
             _ => (whole && said.whole_counts()) || (part && !short),
         };
-        // An answer or an agreement is one only when its message agrees.
-        let consented = said == Said::Changing || consents(text);
+        // An answer or an agreement is one only when its message says yes.
+        let says = match said {
+            Said::Changing => Consent::Yes,
+            _ => consent(text),
+        };
         let newer = part && !matched && *at > since;
         not_whole |= newer && said == Said::Answering;
         too_short |= newer && said != Said::Answering;
-        refused |= matched && !consented && *at > since;
-        if matched && consented {
+        if matched && *at > since {
+            refused |= says == Consent::No;
+            unclear |= says == Consent::Unclear;
+        }
+        if matched && says == Consent::Yes {
             found = found.max(Some(*at));
         }
     }
     match found {
         Some(at) if at > since => Ok(at),
         _ if refused => Err(NotSaid::Refuses),
+        _ if unclear => Err(NotSaid::Unclear),
         _ if not_whole => Err(NotSaid::NotWhole),
         _ if too_short => Err(NotSaid::TooShort {
             words: least_words,
@@ -1110,10 +1123,11 @@ pub fn says_goal(text: &str, goal: &str) -> bool {
 /// last message to them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NotReplied {
-    /// The words aren't the whole of a reply of theirs that only agrees
-    /// ([`agrees`]), typed by them since `since`, their only one since the
-    /// boss's message before it.
+    /// The words aren't the whole of a reply typed by them since `since`,
+    /// their only one since the boss's message before it.
     NoPlainReply,
+    /// Their reply says no, or isn't a clear yes ([`plainly`]).
+    Says(Consent),
     /// No message of the boss's came before their reply.
     NothingProposed,
     /// The boss's message before their reply asks something besides what
@@ -1124,65 +1138,145 @@ pub enum NotReplied {
     NotProposed(usize),
 }
 
-/// The words a reply that only agrees is made of, each a phrase.
-const AGREEING: &[&[&str]] = &[
-    &["go", "ahead"],
-    &["do", "it"],
-    &["sounds", "good"],
-    &["yes"],
-    &["yep"],
-    &["yeah"],
-    &["ok"],
-    &["okay"],
-    &["sure"],
-    &["go"],
-    &["agreed"],
-    &["lgtm"],
-    &["please"],
+/// What the person's words say to what was put to them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Consent {
+    Yes,
+    /// No, or yes to something else ("not yet", "yes but wait").
+    No,
+    /// Nothing that reads as a yes or a no ("hmm").
+    Unclear,
+}
+
+/// Words that say yes, alone or in a short reply.
+const AGREEING: &[&str] = &[
+    "yes",
+    "yep",
+    "yup",
+    "yeah",
+    "yea",
+    "ya",
+    "y",
+    "ok",
+    "okay",
+    "k",
+    "kk",
+    "sure",
+    "go",
+    "agreed",
+    "agree",
+    "lgtm",
+    "perfect",
+    "great",
+    "good",
+    "fine",
+    "alright",
+    "approved",
+    "approve",
+    "confirmed",
+    "confirm",
+    "ship",
+    "correct",
+    "absolutely",
+    "definitely",
+];
+/// Signs that say yes.
+const AGREEING_SIGNS: &[char] = &['\u{1F44D}', '\u{1F44C}', '\u{2705}'];
+/// Words that say yes together, none of them on its own.
+const AGREEING_PHRASES: &[&[&str]] = &[&["do", "it"]];
+/// Words that say no, or yes to something else, in a short reply.
+const REFUSING: &[&str] = &[
+    "no", "nope", "nah", "not", "don't", "dont", "but", "wait", "except", "change", "stop",
+    "later", "hold", "instead", "unless", "rather",
+];
+/// Words that, anywhere in a longer reply, make it yes to something else.
+const QUALIFYING: &[&[&str]] = &[
+    &["but"],
+    &["except"],
+    &["instead"],
+    &["unless"],
+    &["rather"],
+    &["only", "if"],
+];
+/// Sayings with a refusing word that agree ("no rush"): read as nothing.
+const SAYINGS: &[&[&str]] = &[
+    &["no", "rush"],
+    &["no", "problem"],
+    &["no", "worries"],
+    &["no", "objection"],
+    &["not", "a", "problem"],
+    &["can't", "wait"],
 ];
 
-/// Words that make a reply say other than yes.
-const NOT_AGREEING: &[&str] = &[
-    "no", "not", "don't", "dont", "but", "wait", "except", "change", "stop", "later", "hold",
-];
+/// Whether `words` open with `phrase`.
+fn opens(words: &[String], phrase: &[&str]) -> bool {
+    words.len() >= phrase.len() && words.iter().zip(phrase).all(|(a, b)| a == b)
+}
 
-/// Whether the person's `text` only agrees: made of [`AGREEING`]'s
-/// phrases ("Yes, go ahead!", "ok 👍"), in any case and punctuation, with
-/// no word of [`NOT_AGREEING`]'s ("yes but wait", "not yet", "no").
-pub fn agrees(text: &str) -> bool {
-    fn phrased(rest: &[String]) -> bool {
-        rest.is_empty()
-            || AGREEING.iter().any(|p| {
-                rest.len() >= p.len()
-                    && rest.iter().zip(p.iter()).all(|(w, a)| w == a)
-                    && phrased(&rest[p.len()..])
-            })
-    }
+/// Whether `words` hold `phrase` anywhere.
+fn holds(words: &[String], phrase: &[&str]) -> bool {
+    (0..words.len()).any(|i| opens(&words[i..], phrase))
+}
+
+/// `text`'s compared words with [`SAYINGS`] taken out.
+fn plain_words(text: &str) -> Vec<String> {
     let words = compared_words(text);
-    let said = text.contains('\u{1F44D}') || words.iter().any(|w| w != "please");
-    said && !refuses(&words) && phrased(&words)
+    let mut out = Vec::with_capacity(words.len());
+    let mut i = 0;
+    while i < words.len() {
+        match SAYINGS.iter().find(|s| opens(&words[i..], s)) {
+            Some(s) => i += s.len(),
+            None => {
+                out.push(words[i].clone());
+                i += 1;
+            }
+        }
+    }
+    out
 }
 
-/// Whether `words` say no or ask for something else: a word of
-/// [`NOT_AGREEING`]'s, or one ending "n't".
-fn refuses(words: &[String]) -> bool {
-    words
-        .iter()
-        .any(|w| NOT_AGREEING.contains(&w.as_str()) || w.ends_with("n't"))
+fn refusing(w: &str) -> bool {
+    REFUSING.contains(&w) || w.ends_with("n't")
 }
 
-/// Whether the person's message `text`, answering or agreeing, says yes:
-/// never with a word that refuses ([`NOT_AGREEING`]), whatever its length;
-/// a short one ([`stands_alone`] not) only when it [`agrees`]; a longer
-/// one ("Yes, and keep it fast") on its own words.
-pub fn consents(text: &str) -> bool {
-    !refuses(&compared_words(text)) && (stands_alone(text) || agrees(text))
+/// What a short reply says, or any typed as a plain yes to a proposal:
+/// no with a word of [`REFUSING`]'s, yes with one of [`AGREEING`]'s (or
+/// its signs, or "do it"), else unclear. Fillers ("please", "thanks")
+/// say nothing either way.
+pub fn plainly(text: &str) -> Consent {
+    let words = plain_words(text);
+    let agrees = words.iter().any(|w| AGREEING.contains(&w.as_str()))
+        || text.contains(AGREEING_SIGNS)
+        || AGREEING_PHRASES.iter().any(|p| holds(&words, p));
+    if words.iter().any(|w| refusing(w)) {
+        Consent::No
+    } else if agrees {
+        Consent::Yes
+    } else {
+        Consent::Unclear
+    }
+}
+
+/// What the person's message `text` says, answering or agreeing: a short
+/// one ([`stands_alone`] not) [`plainly`]; a longer one is read on its own
+/// words, no only when it opens with a refusal ("No, keep it") or carries
+/// a qualifier that changes what is agreed ("Yes, but not the docs").
+pub fn consent(text: &str) -> Consent {
+    if !stands_alone(text) {
+        return plainly(text);
+    }
+    let words = plain_words(text);
+    let opens_no = words.first().is_some_and(|w| refusing(w));
+    match opens_no || QUALIFYING.iter().any(|q| holds(&words, q)) {
+        true => Consent::No,
+        false => Consent::Yes,
+    }
 }
 
 /// When the person's `quote` is their plain reply to what the boss
 /// proposed in its last message before it: the whole of the person's
 /// newest message in `theirs`, typed by them (not an answer on an item's
-/// buttons) since `since`, one that only [`agrees`], their only one since
+/// buttons) since `since`, a yes [`plainly`], their only one since
 /// that message of the boss's in `boss`. That message asks nothing else and
 /// says each of `proposed` word for word.
 pub fn replied_to(
@@ -1193,17 +1287,20 @@ pub fn replied_to(
     since: DateTime<Utc>,
 ) -> Result<DateTime<Utc>, NotReplied> {
     let quoted = compared_words(quote);
-    let at = theirs
+    let (at, reply) = theirs
         .iter()
         .max_by_key(|(at, _)| *at)
         .filter(|(at, text)| {
             *at > since
                 && !text.trim_start().starts_with(ANSWER_LEAD)
-                && agrees(text)
                 && compared_words(text) == quoted
         })
-        .map(|(at, _)| *at)
+        .map(|(at, text)| (*at, text))
         .ok_or(NotReplied::NoPlainReply)?;
+    match plainly(reply) {
+        Consent::Yes => {}
+        says => return Err(NotReplied::Says(says)),
+    }
     let (asked_at, asked) = boss
         .iter()
         .filter(|(when, _)| *when < at)
