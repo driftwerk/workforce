@@ -339,6 +339,10 @@ impl Desk {
         // request is a dialog only its terminal answers.
         let Some(p) = view.pending.as_ref() else {
             return match view.state {
+                // Codex says it waits before what it waits on comes, and
+                // after Desk answered: it shows in its terminal only once
+                // nothing Desk answers has come for a while.
+                SessionState::Blocked if view.engine == crate::model::Engine::Codex => None,
                 SessionState::Blocked => Some("Only its terminal can answer this.".into()),
                 SessionState::Asking if Self::wheel_now(st, c).person() => {
                     Some("You're driving it.".into())

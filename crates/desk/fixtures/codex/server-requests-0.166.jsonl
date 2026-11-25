@@ -1,0 +1,11 @@
+{"id":10,"method":"item/commandExecution/requestApproval","params":{"threadId":"t1","turnId":"u1","itemId":"exec-1","startedAtMs":1,"command":"/bin/bash -lc 'git push origin feat/x'","cwd":"/repo","reason":"Push the branch?","commandActions":[{"type":"unknown","command":"git push origin feat/x"}]}}
+{"id":11,"method":"item/fileChange/requestApproval","params":{"threadId":"t1","turnId":"u1","itemId":"patch-1","startedAtMs":1,"reason":null,"grantRoot":null}}
+{"id":12,"method":"item/tool/requestUserInput","params":{"threadId":"t1","turnId":"u1","itemId":"ask-1","questions":[{"id":"confirm_path","header":"Confirm","question":"Proceed with the plan?","isOther":false,"isSecret":false,"options":[{"label":"Yes","description":"Go on."},{"label":"No","description":"Stop."}]}]}}
+{"id":13,"method":"mcpServer/elicitation/request","params":{"threadId":"t1","turnId":"u1","serverName":"tracker","request":{"mode":"form","message":"Which project?","requestedSchema":{"type":"object","properties":{}}}}}
+{"id":14,"method":"item/permissions/requestApproval","params":{"threadId":"t1","turnId":"u1","itemId":"perm-1","startedAtMs":1,"cwd":"/repo","reason":"Select a workspace root","permissions":{"network":{"enabled":true},"fileSystem":{"write":["/repo","/shared"]}}}}
+{"id":15,"method":"item/tool/call","params":{"threadId":"t1","turnId":"u1","callId":"call-1","namespace":null,"tool":"lookup","arguments":{}}}
+{"id":16,"method":"account/chatgptAuthTokens/refresh","params":{"reason":"unauthorized","previousAccountId":null}}
+{"id":17,"method":"attestation/generate","params":{"token":"[redacted]"}}
+{"id":18,"method":"currentTime/read","params":{"threadId":"t1"}}
+{"id":19,"method":"applyPatchApproval","params":{"conversationId":"t1","callId":"call-2","fileChanges":{},"reason":null,"grantRoot":null}}
+{"id":20,"method":"execCommandApproval","params":{"conversationId":"t1","callId":"call-3","approvalId":null,"command":["git","push"],"cwd":"/repo","reason":null,"parsedCmd":[]}}

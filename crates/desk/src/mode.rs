@@ -102,18 +102,40 @@ impl Mode {
         Some(vec!["--permission-mode".to_string(), mode.to_string()])
     }
 
-    /// Codex's approval policy and sandbox to run in it, as both its
-    /// settings and its app-server spell them. Its `on-failure` is read as
-    /// `on-request` (CLI 0.166), and its app-server refuses the word; who
-    /// answers what it asks is [`crate::codex::Permissions::of`]'s. Every
-    /// word here, the reviewer's `auto_review` among them, is one its
-    /// app-server has taken since CLI 0.125; none is `on-failure`, which
-    /// CLIs up to 0.140 ran as a policy of its own.
-    pub fn codex_permissions(self) -> (&'static str, &'static str) {
+    /// What a Codex session runs in, in it: its approval policy and sandbox,
+    /// as both its settings and its app-server spell them (never
+    /// `on-failure`, which CLIs up to 0.140 ran as a policy of its own and
+    /// 0.166's app-server refuses), its network, and who answers what it
+    /// asks. `charged`: a boss's live charge holds it, and every escalation
+    /// is then the boss's to decide, so neither auto mode's network nor
+    /// Codex's own reviewer applies; plan and bypass are the person's
+    /// explicit choices and stay as they are.
+    pub fn codex_permissions(self, charged: bool, approve_for_me: bool) -> crate::codex::Permissions {
+        use crate::codex::{Network, Permissions, Reviewer};
+        let asks = |reviewer| Permissions {
+            approval: "on-request",
+            sandbox: "workspace-write",
+            network: Network::Person,
+            reviewer,
+        };
         match self {
-            Self::Default | Self::AcceptEdits | Self::Auto => ("on-request", "workspace-write"),
-            Self::Plan => ("on-request", "read-only"),
-            Self::BypassPermissions => ("never", "danger-full-access"),
+            Self::Auto if !charged => Permissions {
+                network: Network::On,
+                ..asks(Reviewer::AutoReview)
+            },
+            Self::Default | Self::AcceptEdits if approve_for_me && !charged => {
+                asks(Reviewer::AutoReview)
+            }
+            Self::Default | Self::AcceptEdits | Self::Auto => asks(Reviewer::User),
+            Self::Plan => Permissions {
+                sandbox: "read-only",
+                ..asks(Reviewer::User)
+            },
+            Self::BypassPermissions => Permissions {
+                approval: "never",
+                sandbox: "danger-full-access",
+                ..asks(Reviewer::User)
+            },
         }
     }
 }
@@ -147,5 +169,39 @@ mod tests {
             ["--dangerously-skip-permissions"]
         );
         assert!(Mode::Default.asks() && !Mode::Auto.asks());
+    }
+
+    #[test]
+    fn codex_runs_each_mode_as_its_table_says_and_a_charge_wins_over_auto() {
+        use crate::codex::{Network, Reviewer};
+        let row = |m: Mode, charged, afm| {
+            let p = m.codex_permissions(charged, afm);
+            (p.approval, p.sandbox, p.network, p.reviewer)
+        };
+        let ws = ("on-request", "workspace-write");
+        for charged in [false, true] {
+            for afm in [false, true] {
+                let reviewer = match afm && !charged {
+                    true => Reviewer::AutoReview,
+                    false => Reviewer::User,
+                };
+                for m in [Mode::Default, Mode::AcceptEdits] {
+                    assert_eq!(row(m, charged, afm), (ws.0, ws.1, Network::Person, reviewer));
+                }
+                let auto = match charged {
+                    false => (ws.0, ws.1, Network::On, Reviewer::AutoReview),
+                    true => (ws.0, ws.1, Network::Person, Reviewer::User),
+                };
+                assert_eq!(row(Mode::Auto, charged, afm), auto, "{charged} {afm}");
+                assert_eq!(
+                    row(Mode::Plan, charged, afm),
+                    ("on-request", "read-only", Network::Person, Reviewer::User)
+                );
+                assert_eq!(
+                    row(Mode::BypassPermissions, charged, afm),
+                    ("never", "danger-full-access", Network::Person, Reviewer::User)
+                );
+            }
+        }
     }
 }

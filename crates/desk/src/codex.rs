@@ -71,49 +71,115 @@ const ALTERNATE_SCREEN: &str = "tui.alternate_screen=\"always\"";
 const PRIORITY: &str = "priority";
 
 /// What a thread runs in: its approval policy and sandbox, as Codex's
-/// settings and its app-server's `thread/resume` both spell them, and who
-/// reviews its approvals. A new thread takes them from the TUI's settings:
-/// on the app-server alone they don't reach it (verified on CLI 0.166,
-/// `/status`). A resumed one takes them from the app-server only: the TUI
-/// refuses them on a resume through `--remote` ("Permission overrides are
-/// not supported when resuming a remote task", 0.166) and joins the
-/// thread Desk resumed with them ([`resume_params`]).
+/// settings and its app-server's `thread/resume` both spell them, its
+/// network, and who reviews its approvals. A new thread takes them from
+/// the TUI's settings ([`Self::args`]), which it forwards to its own
+/// `thread/start` and which keep the TUI's own settings (CLI 0.166,
+/// `tui/src/app_server_session.rs`). A resumed one takes them from the
+/// app-server only ([`resume_params`]): the TUI refuses them on a resume
+/// through `--remote` ("Permission overrides are not supported when
+/// resuming a remote task") and joins the thread Desk resumed with them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Permissions {
     pub approval: &'static str,
     pub sandbox: &'static str,
-    pub reviewer: &'static str,
+    pub network: Network,
+    pub reviewer: Reviewer,
 }
+
+/// A workspace-write sandbox's network: the person's own setting, or on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Network {
+    Person,
+    On,
+}
+
+crate::model::text_enum!(Reviewer { User => "user", AutoReview => "auto_review" });
 
 impl Permissions {
     /// What a session runs in, where Desk sets it: the mode Desk keeps for
-    /// it, over Approve for me's, else Codex's default; its approvals
-    /// reviewed by Codex's own reviewer in auto mode or with Approve for
-    /// me, else by the person. Neither, none: it runs in the person's own,
-    /// from Codex's settings or as its thread last ran.
-    pub fn of(mode: Option<crate::mode::Mode>, approve_for_me: bool) -> Option<Self> {
-        use crate::mode::Mode;
-        (approve_for_me || mode.is_some()).then(|| {
-            let (approval, sandbox) = mode.unwrap_or(Mode::Default).codex_permissions();
-            Self {
-                approval,
-                sandbox,
-                reviewer: if approve_for_me || mode == Some(Mode::Auto) {
-                    "auto_review"
-                } else {
-                    "user"
-                },
-            }
+    /// it, else Codex's default, under a boss's charge or not, with Approve
+    /// for me or not ([`crate::mode::Mode::codex_permissions`]). With no
+    /// mode kept, no charge and no Approve for me, none: it runs in the
+    /// person's own, from Codex's settings or as its thread last ran.
+    pub fn of(mode: Option<crate::mode::Mode>, approve_for_me: bool, charged: bool) -> Option<Self> {
+        (approve_for_me || charged || mode.is_some()).then(|| {
+            mode.unwrap_or(crate::mode::Mode::Default)
+                .codex_permissions(charged, approve_for_me)
         })
     }
 
     /// As the TUI's settings, for a new thread.
-    fn settings(self) -> [String; 3] {
+    pub fn args(self) -> Vec<String> {
         [
-            format!("approvals_reviewer={}", self.reviewer),
+            format!("approvals_reviewer={}", self.reviewer.as_str()),
             format!("approval_policy={}", self.approval),
             format!("sandbox_mode={}", self.sandbox),
         ]
+        .into_iter()
+        .chain((self.network == Network::On).then(|| NETWORK_ON.to_string()))
+        .collect()
+    }
+
+    /// Into a `thread/resume`'s params.
+    fn resume_into(self, params: &mut Value) {
+        params["approvalPolicy"] = json!(self.approval);
+        params["sandbox"] = json!(self.sandbox);
+        params["approvalsReviewer"] = json!(self.reviewer.as_str());
+        if self.network == Network::On {
+            params["config"] = json!({ "sandbox_workspace_write": { "network_access": true } });
+        }
+    }
+}
+
+/// The setting that turns a workspace-write sandbox's network on.
+const NETWORK_ON: &str = "sandbox_workspace_write.network_access=true";
+
+/// What a thread runs in, as its app-server says on `thread/resume`: who
+/// reviews its approvals, its sandbox's kind, and whether its network is
+/// on. The truth, whatever Desk asked: the person's own config layers and
+/// profiles can't be read reliably.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Runs {
+    pub reviewer: Option<String>,
+    pub sandbox: Option<String>,
+    pub network: Option<bool>,
+}
+
+impl Runs {
+    /// What a `thread/resume` result says of it; none when it says nothing.
+    fn of(result: &Value) -> Option<Self> {
+        let text = |p: &str| result.pointer(p).and_then(Value::as_str).map(str::to_string);
+        let runs = Self {
+            reviewer: text("/approvalsReviewer"),
+            sandbox: text("/sandbox/type"),
+            network: result.pointer("/sandbox/networkAccess").and_then(|n| {
+                n.as_bool()
+                    .or_else(|| n.as_str().map(|s| s == "enabled"))
+            }),
+        };
+        (runs.reviewer.is_some() || runs.sandbox.is_some()).then_some(runs)
+    }
+
+    /// How it differs from `asked`, in words: none when it runs in what
+    /// was asked, as far as Codex says.
+    pub fn differs(&self, asked: &Permissions) -> Option<String> {
+        let sandbox = asked.sandbox.replace('-', "");
+        let mut said = Vec::new();
+        if let Some(r) = self.reviewer.as_deref().filter(|r| *r != asked.reviewer.as_str()) {
+            said.push(format!("reviewer {r} (asked {})", asked.reviewer.as_str()));
+        }
+        if let Some(s) = self
+            .sandbox
+            .as_deref()
+            .filter(|s| !s.eq_ignore_ascii_case(&sandbox))
+        {
+            said.push(format!("sandbox {s} (asked {})", asked.sandbox));
+        }
+        if asked.network == Network::On && self.network == Some(false) {
+            said.push("network off (asked on)".into());
+        }
+        (!said.is_empty()).then(|| said.join(", "))
     }
 }
 
@@ -132,7 +198,7 @@ pub fn spawn(s: &CodexSpawn<'_>) -> Spawn {
     let settings = [NO_UPDATE_PROMPT, ALTERNATE_SCREEN]
         .map(str::to_string)
         .into_iter()
-        .chain(permissions.into_iter().flat_map(Permissions::settings))
+        .chain(permissions.into_iter().flat_map(Permissions::args))
         .chain(s.fast.then(|| FAST.to_string()))
         // A TOML string, so it is only ever the value of `model`.
         .chain(
@@ -172,9 +238,7 @@ pub fn resume_params(
         "cwd": cwd,
     });
     if let Some(p) = permissions {
-        params["approvalPolicy"] = json!(p.approval);
-        params["sandbox"] = json!(p.sandbox);
-        params["approvalsReviewer"] = json!(p.reviewer);
+        p.resume_into(&mut params);
     }
     if let Some(m) = model.filter(|m| crate::plan::model_ok(m)) {
         params["model"] = json!(m);
@@ -575,6 +639,15 @@ pub enum CodexEvent {
         /// secret): what a boss that answers its dialogs answers.
         asks: Option<Value>,
     },
+    /// It asks something Desk never answers: its TUI's to (a dynamic tool
+    /// call, a sign-in refresh, the legacy approvals), or a request Desk
+    /// doesn't know (`known: false`). The request's JSON-RPC id, and its
+    /// method.
+    Elsewhere {
+        request: Value,
+        method: String,
+        known: bool,
+    },
     /// A request it asked was answered, by Desk or the terminal (the
     /// request's JSON-RPC id).
     Resolved(Value),
@@ -586,9 +659,9 @@ pub enum CodexEvent {
     /// What Desk said into its running turn (`turn/steer`) didn't go in:
     /// no turn ran, or Codex refused it. The line message's id.
     SteerRefused(Uuid),
-    /// Who answers its thread's approvals, as Codex said when subscribed:
-    /// `user`, or `auto_review` ("Approve for me").
-    Reviewer(String),
+    /// What its thread runs in, as Codex said when Desk subscribed to it
+    /// or resumed it.
+    Runs(Runs),
     /// Its automatic reviewer ("Approve for me") decided a request: what
     /// it was, and the verdict in plain words.
     Reviewed {
@@ -785,9 +858,86 @@ fn deletes(change: &Value) -> bool {
         || kind.and_then(|k| k.get("type")).and_then(Value::as_str) == Some("delete")
 }
 
+/// Who answers a server request, by its method: every request CLI 0.166's
+/// app-server sends (`app-server-protocol/src/protocol/common.rs`,
+/// `server_request_definitions!`), and any other.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Owner {
+    /// Desk: an approval of a command, a file change or more permissions
+    /// ([`ask_of`]), or a question ([`question_of`]).
+    Desk,
+    /// The TUI: Desk only sees it.
+    Tui,
+    /// No request 0.166 sends: Desk never answers it.
+    Unknown,
+}
+
+pub fn owner_of(method: &str) -> Owner {
+    match method {
+        "item/commandExecution/requestApproval"
+        | "item/fileChange/requestApproval"
+        | "item/permissions/requestApproval"
+        | "item/tool/requestUserInput"
+        | "mcpServer/elicitation/request" => Owner::Desk,
+        "item/tool/call"
+        | "account/chatgptAuthTokens/refresh"
+        | "attestation/generate"
+        | "currentTime/read"
+        | "applyPatchApproval"
+        | "execCommandApproval" => Owner::Tui,
+        _ => Owner::Unknown,
+    }
+}
+
+/// What a permissions request asks, in words: its network, and the
+/// folders it would read and write.
+fn permissions_asked(asked: &Value, home: Option<&Path>) -> String {
+    let paths = |k: &str| -> Vec<String> {
+        asked
+            .pointer(&format!("/fileSystem/{k}"))
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .map(|p| tilde(p, home))
+            .collect()
+    };
+    let network = (asked.pointer("/network/enabled").and_then(Value::as_bool) == Some(true))
+        .then(|| "network access".to_string());
+    let listed = |verb: &str, p: Vec<String>| (!p.is_empty()).then(|| format!("{verb} {}", p.join(", ")));
+    let entries = asked
+        .pointer("/fileSystem/entries")
+        .and_then(Value::as_array)
+        .is_some_and(|e| !e.is_empty())
+        .then(|| "file system entries".to_string());
+    let said: Vec<String> = network
+        .into_iter()
+        .chain(listed("write", paths("write")))
+        .chain(listed("read", paths("read")))
+        .chain(entries)
+        .collect();
+    match said.is_empty() {
+        true => "more permissions".into(),
+        false => said.join("; "),
+    }
+}
+
+/// The permissions a request asks, as Codex takes them back granted:
+/// exactly its profile's network and file system, nothing it might add.
+fn requested_grant(params: &Value) -> Value {
+    let asked = params.get("permissions");
+    let mut grant = serde_json::Map::new();
+    for k in ["network", "fileSystem"] {
+        if let Some(v) = asked.and_then(|a| a.get(k)).filter(|v| !v.is_null()) {
+            grant.insert(k.to_string(), v.clone());
+        }
+    }
+    Value::Object(grant)
+}
+
 /// The approval a server request is, when it is one Desk answers: a
-/// command's, or a file change's (whose files and diffs its item named, in
-/// `changed`).
+/// command's, a file change's (whose files and diffs its item named, in
+/// `changed`), or more permissions for the rest of its turn.
 pub fn ask_of(
     method: &str,
     id: &Value,
@@ -871,6 +1021,12 @@ pub fn ask_of(
                 .unwrap_or_default();
             ("Edit", named, input)
         }
+        "item/permissions/requestApproval" => {
+            let grant = requested_grant(params);
+            let detail = permissions_asked(&grant, home);
+            let input = json!({ "permissions": grant, "cwd": cwd });
+            ("Permissions", detail, Some(input))
+        }
         _ => return None,
     };
     Some(Seen {
@@ -880,7 +1036,10 @@ pub fn ask_of(
             tool: tool.into(),
             detail,
             why: why_of(params, home),
-            choices: choices_of(params),
+            choices: match method {
+                "item/permissions/requestApproval" => vec![Decision::Allow, Decision::Deny],
+                _ => choices_of(params),
+            },
             whole: input.map(|input| crate::model::Request {
                 tool: tool.into(),
                 input,
@@ -1144,7 +1303,7 @@ pub struct Follower {
     /// The files each file change item it started touches, and how.
     files: Changed,
     /// The requests it forwarded that nobody has answered, by id.
-    open: HashMap<String, String>,
+    open: HashMap<String, Opened>,
     home: Option<PathBuf>,
     /// The thread's turn running now, which a steer must name.
     turn: Option<String>,
@@ -1156,6 +1315,13 @@ pub struct Follower {
     steering: std::collections::VecDeque<Uuid>,
     /// Its own resume of the thread, before its TUI's, while unanswered.
     priming: Option<Priming>,
+}
+
+/// A request it forwarded: its thread, and for a permissions request, what
+/// it asks, which is what an allow grants.
+struct Opened {
+    thread: String,
+    grant: Option<Value>,
 }
 
 /// A follower's resume of its thread as it joins ([`Follower::resuming`]).
@@ -1311,35 +1477,64 @@ impl Follower {
                         },
                     }
                 });
-                // What it runs with, as Codex says it.
-                let reviewer = v
-                    .pointer("/result/approvalsReviewer")
-                    .and_then(Value::as_str)
-                    .map(|reviewer| Seen {
-                        thread,
-                        event: CodexEvent::Reviewer(reviewer.to_string()),
-                    });
-                (loaded.into_iter().chain(reviewer).collect(), None)
+                // What it runs in, as Codex says it.
+                let runs = v.get("result").and_then(Runs::of).map(|runs| Seen {
+                    thread,
+                    event: CodexEvent::Runs(runs),
+                });
+                (loaded.into_iter().chain(runs).collect(), None)
             }
             (Some(id), Some(method)) => {
                 let params = v.get("params").cloned().unwrap_or(Value::Null);
+                let ours = |thread: &str| self.thread.as_deref() == Some(thread);
+                if owner_of(method) != Owner::Desk {
+                    let thread = params
+                        .get("threadId")
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                        .or_else(|| self.thread.clone())
+                        .filter(|t| ours(t));
+                    let seen = thread.map(|thread| Seen {
+                        thread,
+                        event: CodexEvent::Elsewhere {
+                            request: id.clone(),
+                            method: method.to_string(),
+                            known: owner_of(method) == Owner::Tui,
+                        },
+                    });
+                    return (seen.into_iter().collect(), None);
+                }
                 let asks = ask_of(method, id, &params, &self.files, self.home.as_deref())
-                    .filter(|s| self.thread.as_deref() == Some(s.thread.as_str()));
+                    .filter(|s| ours(&s.thread));
                 if let Some(s) = &asks {
-                    self.open.insert(id.to_string(), s.thread.clone());
+                    let grant = (method == "item/permissions/requestApproval")
+                        .then(|| requested_grant(&params));
+                    self.open.insert(
+                        id.to_string(),
+                        Opened {
+                            thread: s.thread.clone(),
+                            grant,
+                        },
+                    );
                 }
                 // A question is the terminal's to answer: only shown.
                 let asked = asks
                     .is_none()
                     .then(|| question_of(method, id, &params))
                     .flatten()
-                    .filter(|s| self.thread.as_deref() == Some(s.thread.as_str()));
+                    .filter(|s| ours(&s.thread));
                 // One a boss may answer is open until answered anywhere.
                 if let Some(s) = asked
                     .as_ref()
                     .filter(|s| matches!(&s.event, CodexEvent::Question { asks: Some(_), .. }))
                 {
-                    self.open.insert(id.to_string(), s.thread.clone());
+                    self.open.insert(
+                        id.to_string(),
+                        Opened {
+                            thread: s.thread.clone(),
+                            grant: None,
+                        },
+                    );
                 }
                 (asks.into_iter().chain(asked).collect(), None)
             }
@@ -1474,21 +1669,32 @@ impl Follower {
     /// What to send for `reply`, and what to say of it: nothing is sent to
     /// a request already answered.
     pub fn reply(&mut self, reply: &Reply) -> (Option<Seen>, Option<Value>) {
-        let thread = self.open.remove(&reply.request.to_string());
-        let answer = answer_of(reply).filter(|_| thread.is_some());
+        let opened = self.open.remove(&reply.request.to_string());
+        let answer = opened.as_ref().and_then(|o| answer_of(reply, o.grant.as_ref()));
         let event = match answer {
             Some(_) => CodexEvent::Answered(reply.request.clone()),
             None => CodexEvent::Late(reply.request.clone()),
         };
-        let thread = thread.or_else(|| self.thread.clone());
+        let thread = opened.map(|o| o.thread).or_else(|| self.thread.clone());
         (thread.map(|thread| Seen { thread, event }), answer)
     }
 }
 
-/// The answer to send for `reply`.
-fn answer_of(reply: &Reply) -> Option<Value> {
+/// The answer to send for `reply`: to a permissions request (`grant`, what
+/// it asks), that grant for its turn or none at all, never for the rest of
+/// the session nor with a stricter review.
+fn answer_of(reply: &Reply, grant: Option<&Value>) -> Option<Value> {
     if let Some(answers) = &reply.answers {
         return Some(json!({ "id": reply.request, "result": { "answers": answers } }));
+    }
+    if let Some(grant) = grant {
+        let granted = match reply.decision {
+            Decision::Allow => grant.clone(),
+            Decision::Deny | Decision::Cancel => json!({}),
+            Decision::AllowForSession | Decision::Terminal => return None,
+        };
+        return Some(json!({ "id": reply.request,
+            "result": { "permissions": granted, "scope": "turn" } }));
     }
     let decision = codex_decision(reply.decision)?;
     Some(json!({ "id": reply.request, "result": { "decision": decision } }))
@@ -1748,7 +1954,7 @@ pub(crate) mod tests {
             prompt: Some("go"),
             fast: false,
             model: None,
-            permissions: Permissions::of(mode, approve_for_me),
+            permissions: Permissions::of(mode, approve_for_me, false),
             env: &BTreeMap::new(),
         })
         .args
@@ -1756,9 +1962,10 @@ pub(crate) mod tests {
 
     #[test]
     fn a_new_thread_starts_in_its_permissions_from_the_tuis_settings() {
-        let tail = |a: Vec<String>| a[a.len() - 8..].to_vec();
+        use crate::mode::Mode;
+        let tail = |a: Vec<String>, n: usize| a[a.len() - n..].to_vec();
         assert_eq!(
-            tail(args(Launch::New, true, None)),
+            tail(args(Launch::New, true, None), 8),
             [
                 "-c",
                 "approvals_reviewer=auto_review",
@@ -1770,16 +1977,27 @@ pub(crate) mod tests {
                 "go"
             ]
         );
-        // The mode Desk keeps for it over Approve for me's.
         assert_eq!(
-            tail(args(
-                Launch::New,
-                true,
-                Some(crate::mode::Mode::BypassPermissions)
-            )),
+            tail(args(Launch::New, false, Some(Mode::Auto)), 10),
             [
                 "-c",
                 "approvals_reviewer=auto_review",
+                "-c",
+                "approval_policy=on-request",
+                "-c",
+                "sandbox_mode=workspace-write",
+                "-c",
+                "sandbox_workspace_write.network_access=true",
+                "--",
+                "go"
+            ],
+            "auto mode, uncharged: Codex's own reviewer, with its network on"
+        );
+        assert_eq!(
+            tail(args(Launch::New, true, Some(Mode::BypassPermissions)), 8),
+            [
+                "-c",
+                "approvals_reviewer=user",
                 "-c",
                 "approval_policy=never",
                 "-c",
@@ -1806,30 +2024,60 @@ pub(crate) mod tests {
         );
     }
 
-    /// Auto mode doesn't ask the person: Codex's own reviewer answers, with
-    /// Approve for me or without.
+    /// One value, two serializers: each field once in each.
     #[test]
-    fn auto_mode_has_codexs_reviewer_answer_for_the_person() {
+    fn a_threads_permissions_are_written_once_each_for_a_start_and_a_resume() {
         use crate::mode::Mode;
-        for approve_for_me in [false, true] {
-            assert_eq!(
-                Permissions::of(Some(Mode::Auto), approve_for_me),
-                Some(Permissions {
-                    approval: "on-request",
-                    sandbox: "workspace-write",
-                    reviewer: "auto_review"
-                })
-            );
+        for mode in Mode::ALL {
+            for (afm, charged) in [(false, false), (true, false), (false, true), (true, true)] {
+                let p = Permissions::of(Some(mode), afm, charged).unwrap();
+                let a = p.args();
+                for key in ["approvals_reviewer=", "approval_policy=", "sandbox_mode="] {
+                    assert_eq!(a.iter().filter(|x| x.starts_with(key)).count(), 1, "{key}");
+                }
+                assert_eq!(
+                    a.iter().filter(|x| x.starts_with("sandbox_workspace_write")).count(),
+                    usize::from(p.network == Network::On)
+                );
+                let r = resume_params("t1", Path::new("/repo"), None, false, Some(p));
+                assert_eq!(r["approvalPolicy"], p.approval);
+                assert_eq!(r["sandbox"], p.sandbox);
+                assert_eq!(r["approvalsReviewer"], p.reviewer.as_str());
+                assert_eq!(
+                    r.pointer("/config/sandbox_workspace_write/network_access"),
+                    (p.network == Network::On).then_some(&json!(true))
+                );
+            }
         }
-        for mode in [Mode::Default, Mode::AcceptEdits, Mode::Plan] {
-            assert_eq!(
-                Permissions::of(Some(mode), false).map(|p| p.reviewer),
-                Some("user"),
-                "{mode:?} asks the person"
-            );
-        }
-        assert!(args(Launch::New, false, Some(Mode::Auto))
-            .contains(&"approvals_reviewer=auto_review".to_string()));
+        assert_eq!(Permissions::of(None, false, false), None);
+        assert_eq!(
+            Permissions::of(None, false, true),
+            Some(Mode::Default.codex_permissions(true, false)),
+            "under a charge, whatever the person's config says, the boss decides"
+        );
+    }
+
+    #[test]
+    fn what_codex_says_its_thread_runs_in_is_read_against_what_was_asked() {
+        let asked = crate::mode::Mode::Auto.codex_permissions(false, false);
+        let runs = Runs::of(&json!({"approvalsReviewer": "auto_review",
+            "sandbox": {"type": "workspaceWrite", "networkAccess": true}}))
+        .unwrap();
+        assert_eq!(runs.differs(&asked), None);
+        let off = Runs::of(&json!({"approvalsReviewer": "user",
+            "sandbox": {"type": "workspaceWrite", "networkAccess": false}}))
+        .unwrap();
+        assert_eq!(
+            off.differs(&asked).as_deref(),
+            Some("reviewer user (asked auto_review), network off (asked on)")
+        );
+        let plan = crate::mode::Mode::Plan.codex_permissions(false, false);
+        assert_eq!(
+            Runs::of(&json!({"approvalsReviewer": "user", "sandbox": {"type": "readOnly"}}))
+                .and_then(|r| r.differs(&plan)),
+            None
+        );
+        assert_eq!(Runs::of(&json!({"thread": {"id": "t1"}})), None);
     }
 
     /// CLI 0.166 refuses a resume through `--remote` that sets any of these
@@ -1859,24 +2107,23 @@ pub(crate) mod tests {
     #[test]
     fn desk_resumes_a_thread_in_its_permissions_and_the_tuis_own_settings() {
         use crate::mode::Mode;
-        let plan = Permissions::of(Some(Mode::Plan), true);
+        let plan = Permissions::of(Some(Mode::Plan), true, false);
         assert_eq!(
             resume_params("t1", Path::new("/repo"), Some("gpt-6.1-sol"), true, plan),
             json!({"threadId": "t1", "excludeTurns": true, "cwd": "/repo",
                 "approvalPolicy": "on-request", "sandbox": "read-only",
-                "approvalsReviewer": "auto_review", "model": "gpt-6.1-sol",
+                "approvalsReviewer": "user", "model": "gpt-6.1-sol",
                 "serviceTier": "priority"})
         );
         // Its own: what it last ran in, which may be what the person chose
         // in its terminal or Codex's settings.
-        assert_eq!(Permissions::of(None, false), None);
         assert_eq!(
             resume_params("t1", Path::new("/repo"), Some("a\" b"), false, None),
             json!({"threadId": "t1", "excludeTurns": true, "cwd": "/repo"})
         );
         // What 0.166's app-server takes: never `on-failure`, which it refuses.
         for mode in Mode::ALL {
-            let p = Permissions::of(Some(mode), false).unwrap();
+            let p = Permissions::of(Some(mode), false, false).unwrap();
             assert!(
                 ["untrusted", "on-request", "never"].contains(&p.approval),
                 "{mode:?}"
@@ -2127,7 +2374,7 @@ pub(crate) mod tests {
                         e,
                         CodexEvent::Thread { .. }
                             | CodexEvent::Loaded { .. }
-                            | CodexEvent::Reviewer(_)
+                            | CodexEvent::Runs(_)
                     )
                 })
                 .collect();
@@ -2140,7 +2387,11 @@ pub(crate) mod tests {
                         "/home/me/.codex/sessions/2026/11/24/rollout-2026-11-24T13-00-00-{thread}.jsonl"
                     ))
                 },
-                CodexEvent::Reviewer("user".into()),
+                CodexEvent::Runs(Runs {
+                    reviewer: Some("user".into()),
+                    sandbox: Some("workspaceWrite".into()),
+                    network: Some(false),
+                }),
             ]
         );
     }
@@ -2735,7 +2986,11 @@ pub(crate) mod tests {
             seen,
             [Seen {
                 thread: "t9".into(),
-                event: CodexEvent::Reviewer("auto_review".into())
+                event: CodexEvent::Runs(Runs {
+                    reviewer: Some("auto_review".into()),
+                    sandbox: None,
+                    network: None,
+                })
             }],
             "a new thread's start was said already, once"
         );
@@ -2745,6 +3000,102 @@ pub(crate) mod tests {
             Some(
                 json!({"id": SUBSCRIBE, "method": "thread/resume", "params": {"threadId": "t9", "excludeTurns": true}})
             )
+        );
+    }
+
+    /// Every request 0.166's app-server sends is Desk's to answer, its
+    /// TUI's, or none Desk knows: each is seen, and only Desk's are open
+    /// for Desk to answer.
+    #[test]
+    fn every_request_0_166_sends_is_desks_or_its_tuis_and_any_other_is_unknown() {
+        let mut f = Follower::new(Some("t1".into()), None);
+        let mut kinds = Vec::new();
+        for line in include_str!("../fixtures/codex/server-requests-0.166.jsonl").lines() {
+            let v: Value = serde_json::from_str(line).unwrap();
+            let method = v["method"].as_str().unwrap().to_string();
+            let (seen, send) = f.heard(&v);
+            assert_eq!(send, None, "{method}: never answered as it is heard");
+            let kind = match seen.as_slice() {
+                [Seen {
+                    event: CodexEvent::Asks(a),
+                    ..
+                }] => a.tool.clone(),
+                [Seen {
+                    event: CodexEvent::Question { .. },
+                    ..
+                }] => "Question".into(),
+                [Seen {
+                    event: CodexEvent::Elsewhere { known: true, .. },
+                    ..
+                }] => "Tui".into(),
+                other => panic!("{method}: {other:?}"),
+            };
+            kinds.push((method, kind));
+        }
+        let owners: Vec<(&str, Owner)> = kinds
+            .iter()
+            .map(|(m, _)| (m.as_str(), owner_of(m)))
+            .collect();
+        assert!(owners[..5].iter().all(|(_, o)| *o == Owner::Desk), "{owners:?}");
+        assert!(owners[5..].iter().all(|(_, o)| *o == Owner::Tui), "{owners:?}");
+        assert_eq!(kinds[4].1, "Permissions");
+        let (seen, _) = f.heard(&json!({"id": 30, "method": "item/someday/new", "params": {"threadId": "t1"}}));
+        assert_eq!(
+            seen[0].event,
+            CodexEvent::Elsewhere {
+                request: json!(30),
+                method: "item/someday/new".into(),
+                known: false
+            }
+        );
+        assert_eq!(owner_of("item/someday/new"), Owner::Unknown);
+    }
+
+    /// A permissions request is allowed with exactly what it asks, for its
+    /// turn, and denied with nothing; never for the session, never with a
+    /// stricter review.
+    #[test]
+    fn a_permissions_request_is_granted_what_it_asks_for_its_turn_or_nothing() {
+        let request = |id: i64| {
+            json!({"id": id, "method": "item/permissions/requestApproval", "params": {
+                "threadId": "t1", "turnId": "u1", "itemId": "perm-1", "startedAtMs": 1,
+                "cwd": "/repo", "reason": "Select a workspace root",
+                "permissions": {"network": {"enabled": true},
+                    "fileSystem": {"write": ["/repo", "/shared"]}, "later": {"x": 1}}}})
+        };
+        let mut f = Follower::new(Some("t1".into()), None);
+        let (seen, _) = f.heard(&request(7));
+        let CodexEvent::Asks(ask) = &seen[0].event else {
+            panic!("{seen:?}")
+        };
+        assert_eq!(ask.tool, "Permissions");
+        assert_eq!(ask.detail, "network access; write /repo, /shared");
+        assert_eq!(ask.choices, [Decision::Allow, Decision::Deny]);
+        assert_eq!(
+            ask.whole.as_ref().unwrap().input,
+            json!({"permissions": {"network": {"enabled": true},
+                "fileSystem": {"write": ["/repo", "/shared"]}}, "cwd": "/repo"})
+        );
+        let reply = |id: i64, decision| Reply {
+            request: json!(id),
+            decision,
+            answers: None,
+        };
+        assert_eq!(
+            f.reply(&reply(7, Decision::Allow)).1,
+            Some(json!({"id": 7, "result": {"permissions": {"network": {"enabled": true},
+                "fileSystem": {"write": ["/repo", "/shared"]}}, "scope": "turn"}}))
+        );
+        f.heard(&request(8));
+        assert_eq!(
+            f.reply(&reply(8, Decision::Deny)).1,
+            Some(json!({"id": 8, "result": {"permissions": {}, "scope": "turn"}}))
+        );
+        f.heard(&request(9));
+        assert_eq!(
+            f.reply(&reply(9, Decision::Cancel)).1,
+            Some(json!({"id": 9, "result": {"permissions": {}, "scope": "turn"}})),
+            "cancelled as a boss closing its session cancels: nothing granted"
         );
     }
 
@@ -2767,19 +3118,25 @@ pub(crate) mod tests {
             }]
         );
         assert_eq!(
-            answer_of(&Reply {
-                request: json!(0),
-                decision: Decision::AllowForSession,
-                answers: None,
-            }),
+            answer_of(
+                &Reply {
+                    request: json!(0),
+                    decision: Decision::AllowForSession,
+                    answers: None,
+                },
+                None
+            ),
             Some(json!({"id": 0, "result": {"decision": "acceptForSession"}}))
         );
         assert_eq!(
-            answer_of(&Reply {
-                request: json!(0),
-                decision: Decision::Terminal,
-                answers: None,
-            }),
+            answer_of(
+                &Reply {
+                    request: json!(0),
+                    decision: Decision::Terminal,
+                    answers: None,
+                },
+                None
+            ),
             None
         );
     }

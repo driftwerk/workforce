@@ -321,7 +321,11 @@ async fn a_codex_session_runs_in_its_own_mode_unless_one_that_doesnt_ask_is_kept
             d.resume(s.id, None, Some(By::you())).await.map(drop)
         })
         .await;
-        assert_eq!(asked, [its_own(&dir)]);
+        assert_eq!(
+            asked,
+            std::slice::from_ref(&reset),
+            "still its boss's: every escalation goes to the boss, whatever Codex's settings say"
+        );
         until(|| tui_starts(&dir).len() == 8).await;
 
         // Bypassing again, stopped, and the hub restarted: its next hub
@@ -349,6 +353,8 @@ async fn a_codex_session_runs_in_its_own_mode_unless_one_that_doesnt_ask_is_kept
         until(|| d.view(s.id).unwrap().state == SessionState::Idle).await;
         turn(&d, s.id, &mut ws).await;
         stopped(&d, s.id).await;
+        // No boss runs it now: its own again.
+        d.release(s.id, &boss()).await.unwrap();
         let (asked, _) = started_again(&d, &dir, &[ok], move |d| async move {
             d.resume(s.id, None, Some(By::you())).await.map(drop)
         })

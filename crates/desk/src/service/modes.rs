@@ -165,6 +165,15 @@ impl Desk {
         })
     }
 
+    /// The mode Desk keeps for `id` and it runs in, as kept now.
+    pub(crate) async fn kept_mode(&self, id: Uuid) -> Option<Mode> {
+        self.kept_modes()
+            .await
+            .get(&id)
+            .filter(|k| k.holds())
+            .map(|k| k.mode)
+    }
+
     /// `id` started again out of the mode it was dropped from: nothing is
     /// left of it.
     pub(crate) async fn reset_done(&self, id: Uuid) {

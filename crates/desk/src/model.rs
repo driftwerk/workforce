@@ -175,7 +175,17 @@ impl PendingApproval {
     pub fn key(&self) -> String {
         self.id.to_string()
     }
+
+    /// Whether it only says its session waits in its terminal on what Desk
+    /// can't answer: the one request only the person can answer, there.
+    pub fn in_terminal(&self) -> bool {
+        !self.answerable && self.detail.starts_with(IN_TERMINAL)
+    }
 }
+
+/// What a request only its terminal shows says, when nothing says what it
+/// is ([`PendingApproval::in_terminal`]).
+pub const IN_TERMINAL: &str = "Answer in the terminal";
 
 /// A session's request in full, as its engine sent it.
 #[derive(Debug, Clone, PartialEq)]
@@ -265,6 +275,10 @@ pub struct SessionView {
     /// in, while it runs in it: shown on its card.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mode: Option<crate::mode::Mode>,
+    /// Codex only: whether its sandbox's network is on, as Codex said it
+    /// runs its thread.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub network: Option<bool>,
     /// Why what it waits on (`pending`) is the person's to answer though a
     /// boss runs it, in a few words; absent while the boss has it, or no
     /// boss runs it. Its badge says "Waiting on you" while it is set.
@@ -494,6 +508,7 @@ impl SessionView {
             interrupted: false,
             reading: false,
             mode: None,
+            network: None,
             waits_on_you: None,
             boss_has: None,
             failure: None,
