@@ -1075,6 +1075,51 @@ impl Desk {
         }
     }
 
+    /// The class of `id`'s open request `approval`, read as
+    /// [`Self::push_kind`] reads it for `boss`, in its folder's repository
+    /// as it is now ([`crate::computer::boss::Class`]): anything but a
+    /// command Desk read in full is [`crate::computer::boss::Class::Other`].
+    pub fn request_class(&self, id: Uuid, approval: Uuid, boss: &str) -> crate::computer::boss::Class {
+        use crate::computer::boss::{Class, Repo};
+        let Some(pending) = self.pending_of(id, approval).filter(|p| p.tool == "Bash") else {
+            return Class::Other;
+        };
+        let Ok((facts, bounds)) = self.judged_facts(id, &pending, boss) else {
+            return Class::Other;
+        };
+        let Some(cwd) = facts.cwd.clone().filter(|_| facts.branch.is_some()) else {
+            return Class::Other;
+        };
+        let aliases: HashMap<String, String> =
+            git_lines(&cwd, &["config", "--get-regexp", r"^alias\."])
+                .into_iter()
+                .filter_map(|l| {
+                    let (k, v) = l.split_once(char::is_whitespace)?;
+                    Some((k.strip_prefix("alias.")?.to_string(), v.trim().to_string()))
+                })
+                .collect();
+        let is_branch = |b: &str| {
+            git_line(&cwd, &["rev-parse", "-q", "--verify", &format!("refs/heads/{b}")]).is_some()
+        };
+        let head_pushed = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&cwd)
+            .args(["merge-base", "--is-ancestor", "HEAD", "@{push}"])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success());
+        let upstream = git_line(&cwd, &["rev-parse", "--abbrev-ref", "@{upstream}"]);
+        let repo = Repo {
+            aliases: &aliases,
+            is_branch: &is_branch,
+            head_pushed,
+            upstream: upstream.as_deref().and_then(|u| u.split('/').next()),
+        };
+        charge::class_of(&facts, &bounds, &crate::computer::boss::resolve_real, &repo)
+    }
+
     /// Whether `boss` may let `pending`, a request of `id`, go on itself:
     /// what Desk reads in full and judges safe.
     fn boss_judges(
