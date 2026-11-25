@@ -2321,10 +2321,10 @@ async fn the_persons_draft_goes_in_its_prompt_unsent_and_holds_what_desk_would_t
         let d = desk(pool, dir.path()).await;
         let s = new_session(&d, dir.path()).await;
         idle(&d, s.id).await;
-        assert!(!d.line_drafted(s.id));
+        assert!(d.line_draft_held(s.id).is_none());
         d.line_draft(s.id, "About your questions:\n- one\r\x1b[201~\r")
             .unwrap();
-        assert!(d.line_drafted(s.id), "the pump waits for them");
+        assert!(d.line_draft_held(s.id).is_some(), "the pump waits for them");
         assert_eq!(d.line_keystroke(s.id), None, "never as typing");
         assert!(matches!(
             d.line_draft(s.id, "  "),

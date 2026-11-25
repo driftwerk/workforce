@@ -327,9 +327,9 @@ pub struct Pty {
     /// A lone Esc not yet known to be a key or the start of an escape
     /// sequence split across two inputs (ms; 0 none).
     esc_at: AtomicI64,
-    /// When Desk put the person's draft in its prompt, until a turn starts
-    /// (ms; 0 none).
-    draft_at: AtomicI64,
+    /// The person's draft Desk put in its prompt, until a turn starts or
+    /// its screen no longer shows it.
+    draft: Mutex<Option<Draft>>,
     /// When its last turn started, whoever prompted it (ms; 0 none).
     turned: AtomicI64,
 }
@@ -370,6 +370,53 @@ fn esc_key(pending: i64, now: i64) -> Option<i64> {
     (pending != 0 && now - pending > ESC_TAIL_MS).then_some(pending)
 }
 
+/// How many of a screen's last lines a draft is looked for in: its prompt
+/// and what wraps there.
+const DRAFT_LINES: usize = 30;
+
+/// How much of a draft's start and end is looked for on its screen.
+const DRAFT_MARK: usize = 40;
+
+/// The person's draft in a prompt: when it was put there, and its start
+/// and end as its screen would show them, letters and digits only (what
+/// wraps it, borders and spacing aside).
+#[derive(Debug)]
+struct Draft {
+    at: chrono::DateTime<chrono::Utc>,
+    marks: [String; 2],
+}
+
+impl Draft {
+    fn new(text: &str) -> Self {
+        let first = text
+            .lines()
+            .map(Self::plain)
+            .find(|l| !l.is_empty())
+            .unwrap_or_default()
+            .chars()
+            .take(DRAFT_MARK)
+            .collect();
+        let all: Vec<char> = Self::plain(text).chars().collect();
+        let last = all[all.len().saturating_sub(DRAFT_MARK)..].iter().collect();
+        Self {
+            at: chrono::Utc::now(),
+            marks: [first, last],
+        }
+    }
+
+    fn plain(text: &str) -> String {
+        text.chars().filter(|c| c.is_alphanumeric()).collect()
+    }
+
+    /// Whether `shown`, the end of its screen, still shows it.
+    fn shown_in(&self, shown: &str) -> bool {
+        let shown = Self::plain(shown);
+        self.marks
+            .iter()
+            .any(|m| !m.is_empty() && shown.contains(m.as_str()))
+    }
+}
+
 fn now_ms() -> i64 {
     chrono::Utc::now().timestamp_millis()
 }
@@ -395,7 +442,7 @@ impl Pty {
             pid,
             typed: Default::default(),
             esc_at: Default::default(),
-            draft_at: Default::default(),
+            draft: Default::default(),
             turned: Default::default(),
         }
     }
@@ -530,22 +577,34 @@ impl Pty {
         self.io.write(input)
     }
 
-    /// The person's words were put in its prompt for them (not sent): a
-    /// draft that waits there until a turn starts.
-    pub fn drafted(&self) {
-        self.draft_at.store(now_ms(), Ordering::Relaxed);
+    /// The person's words `text` were put in its prompt for them (not
+    /// sent): a draft that waits there until a turn starts, or they clear it.
+    pub fn drafted(&self, text: &str) {
+        *self.draft.lock() = Some(Draft::new(text));
     }
 
     /// When the person's draft was put in its prompt, while it waits there.
     pub fn draft_at(&self) -> Option<chrono::DateTime<chrono::Utc>> {
-        at_ms(self.draft_at.load(Ordering::Relaxed))
+        self.draft.lock().as_ref().map(|d| d.at)
+    }
+
+    /// Whether the person's draft still shows at the end of its screen:
+    /// one it no longer shows was cleared, and is forgotten.
+    pub fn draft_shown(&self) -> bool {
+        let shown = shown_end(&self.text(), DRAFT_LINES);
+        let mut draft = self.draft.lock();
+        let kept = draft.as_ref().is_some_and(|d| d.shown_in(&shown));
+        if !kept {
+            *draft = None;
+        }
+        kept
     }
 
     /// A turn started in it, whoever prompted it: what waited in its
     /// prompt went in.
     pub fn turn_started(&self) {
         self.turned.store(now_ms(), Ordering::Relaxed);
-        self.draft_at.store(0, Ordering::Relaxed);
+        *self.draft.lock() = None;
     }
 
     /// When its last turn started, if one has since it started.
@@ -1062,6 +1121,22 @@ pub(crate) mod tests {
         assert_eq!(keyed(0, b"", 1_020), (None, 0));
     }
 
+    #[test]
+    fn a_draft_is_shown_while_its_start_or_end_is_on_screen() {
+        let draft = Draft::new(
+            "\nAbout your questions: keep the old table, it still has rows from March, and drop the new one",
+        );
+        let wrapped = "│ > About your questions: keep the old table, it still │\n│ has rows from March, and drop the new one            │";
+        assert!(draft.shown_in(wrapped));
+        assert!(
+            draft.shown_in("│ > …old table, it still has rows from March, and drop the new one │")
+        );
+        assert!(draft.shown_in("│ > About your questions: keep the old table, it still │"));
+        assert!(!draft.shown_in("│ > About your questions: keep the old │"));
+        assert!(!draft.shown_in("│ >                                     │"));
+        assert!(!Draft::new(" ?! ").shown_in("?!"), "nothing to look for");
+    }
+
     #[tokio::test]
     async fn a_viewers_keys_stamp_its_terminal_and_a_turn_takes_its_draft() {
         let (pty, _exit) = spawn("sleep 30");
@@ -1073,7 +1148,7 @@ pub(crate) mod tests {
         viewer.input(b"a").unwrap();
         let typed = pty.typed_at().expect("Esc, then a key");
         assert!(chrono::Utc::now() - typed < chrono::Duration::seconds(5));
-        pty.drafted();
+        pty.drafted("About it");
         assert!(pty.draft_at().is_some());
         pty.turn_started();
         assert_eq!(pty.draft_at(), None);

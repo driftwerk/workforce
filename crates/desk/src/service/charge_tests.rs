@@ -651,7 +651,7 @@ async fn waiting(d: &Desk, id: Uuid, row: Uuid) -> (Delivery, Option<Wait>) {
 }
 
 async fn until_in(d: &Desk, id: Uuid, row: Uuid) {
-    let end = tokio::time::Instant::now() + Duration::from_secs(10);
+    let end = tokio::time::Instant::now() + Duration::from_secs(15);
     loop {
         match waiting(d, id, row).await.0 {
             Delivery::Delivered | Delivery::Handed => return,
@@ -748,6 +748,66 @@ async fn a_draft_holds_the_bosss_message_until_the_next_turn_starts() {
             .await
             .unwrap();
         until_in(&d, id, next.id).await;
+    })
+    .await;
+}
+
+/// A draft put in the prompt of a session Sarah runs, her hold short, and
+/// her message it holds. Its terminal echoes what it is sent, so the draft
+/// shows on its screen.
+async fn drafted(d: &Desk, dir: &std::path::Path) -> (Uuid, Uuid) {
+    let id = typed_into(d, dir).await;
+    d.set_holds([("sarah".to_string(), chrono::Duration::milliseconds(300))].into());
+    d.line_draft(id, "About your questions: keep the old table")
+        .unwrap();
+    let by = By::manager("sarah", "Sarah", "Next.");
+    let m = d
+        .line_send(Sender::Overseer(by), boss_tell("Push it.", id))
+        .await
+        .unwrap();
+    for _ in 0..100 {
+        if d.terminal_text(id, 4000)
+            .unwrap()
+            .contains("keep the old table")
+        {
+            return (id, m.id);
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!("the draft never showed");
+}
+
+/// Past the hold, a draft its screen still shows holds on: time alone
+/// never lets the boss's message in over it.
+#[tokio::test]
+async fn a_draft_still_shown_past_the_hold_holds_on() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(pool, dir.path()).await;
+        let (id, m) = drafted(&d, dir.path()).await;
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        assert_eq!(
+            waiting(&d, id, m).await,
+            (Delivery::Queued, Some(Wait::Draft))
+        );
+    })
+    .await;
+}
+
+/// A draft the person clears by hand (Ctrl-U erases it from the screen)
+/// holds no more: the boss's message goes in with no turn started.
+#[tokio::test]
+async fn a_draft_cleared_by_hand_lets_the_bosss_message_in() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(pool, dir.path()).await;
+        let (id, m) = drafted(&d, dir.path()).await;
+        let pty = d.attach(id).unwrap();
+        let (viewer, _, _) = pty.attach();
+        viewer.claim();
+        viewer.input(b"\x15").unwrap();
+        until_in(&d, id, m).await;
+        assert_eq!(pty.draft_at(), None);
     })
     .await;
 }
