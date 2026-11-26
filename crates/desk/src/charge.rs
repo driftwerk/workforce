@@ -82,6 +82,11 @@ impl Wheel {
     }
 }
 
+/// How long after the person's last input in a session they are still in
+/// it: what is theirs to answer there stays theirs, and a boss closes
+/// nothing of it.
+pub const PERSON_NOW_MINUTES: i64 = 15;
+
 /// How long the person's wheel lasts after their last input (a keystroke,
 /// a prompt, a message) before it goes back to the boss, unless the boss's
 /// `[oversight.wake] hold_minutes` says otherwise.

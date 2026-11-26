@@ -25,8 +25,8 @@ fn review(r: &Row) -> Result<PrReview> {
     })
 }
 
-const LINK: &str = "SELECT session_id, boss, owner, repo, number, head_sha, for_session \
-                    FROM pr_review_sessions";
+const LINK: &str = "SELECT session_id, boss, owner, repo, number, head_sha, for_session, \
+                    settled_at IS NOT NULL FROM pr_review_sessions";
 
 fn link(r: &Row) -> Result<ReviewLink> {
     Ok(ReviewLink {
@@ -39,6 +39,7 @@ fn link(r: &Row) -> Result<ReviewLink> {
         },
         head_sha: r.try_get(5)?,
         for_session: r.try_get(6)?,
+        settled: r.try_get(7)?,
     })
 }
 
@@ -54,7 +55,7 @@ impl DeskStore {
                  ON CONFLICT (session_id) DO UPDATE \
                  SET boss = EXCLUDED.boss, owner = EXCLUDED.owner, repo = EXCLUDED.repo, \
                  number = EXCLUDED.number, head_sha = EXCLUDED.head_sha, \
-                 for_session = EXCLUDED.for_session",
+                 for_session = EXCLUDED.for_session, settled_at = NULL",
                 &[
                     &session,
                     &boss,
@@ -79,6 +80,35 @@ impl DeskStore {
             )
             .await?;
         Ok(())
+    }
+
+    /// Keeps that Desk is done with `session`'s review: its verdict
+    /// recorded, or nothing left to record. A link settled stays.
+    pub async fn pr_review_settle(&self, session: Uuid) -> Result<()> {
+        let client = self.pool().get().await?;
+        client
+            .execute(
+                "UPDATE pr_review_sessions SET settled_at = now() \
+                 WHERE session_id = $1 AND settled_at IS NULL",
+                &[&session],
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// The review sessions `boss` started at a head that Desk isn't done
+    /// with yet.
+    pub async fn pr_reviews_unsettled(&self, boss: &str) -> Result<Vec<ReviewLink>> {
+        let client = self.pool().get().await?;
+        client
+            .query(
+                &format!("{LINK} WHERE boss = $1 AND head_sha IS NOT NULL AND settled_at IS NULL"),
+                &[&boss],
+            )
+            .await?
+            .iter()
+            .map(link)
+            .collect()
     }
 
     /// The review sessions started for `session`'s work.
@@ -252,12 +282,16 @@ mod tests {
                 pr: pr(42),
                 head_sha: Some("a".repeat(40)),
                 for_session: Some(work),
+                settled: false,
             };
             assert_eq!(
                 store.pr_review_of(session).await.unwrap(),
                 Some(linked.clone())
             );
-            assert_eq!(store.pr_reviews_for(work).await.unwrap(), vec![linked]);
+            assert_eq!(
+                store.pr_reviews_for(work).await.unwrap(),
+                vec![linked.clone()]
+            );
             assert_eq!(
                 store
                     .pr_reviews_at("sarah", &pr(42), &"a".repeat(40))
@@ -275,13 +309,33 @@ mod tests {
                 .await
                 .unwrap()
                 .is_empty());
+            assert_eq!(
+                store.pr_reviews_unsettled("sarah").await.unwrap(),
+                vec![linked.clone()]
+            );
+            assert!(store.pr_reviews_unsettled("mia").await.unwrap().is_empty());
+
+            store.pr_review_settle(session).await.unwrap();
+            assert!(store.pr_reviews_unsettled("sarah").await.unwrap().is_empty());
+            assert_eq!(
+                store.pr_review_of(session).await.unwrap(),
+                Some(ReviewLink {
+                    settled: true,
+                    ..linked
+                }),
+                "settled, and still linked"
+            );
 
             store
                 .pr_review_link(session, "sarah", &of(43, 'b', None))
                 .await
                 .unwrap();
             let again = store.pr_review_of(session).await.unwrap().unwrap();
-            assert_eq!((again.pr, again.for_session), (pr(43), None));
+            assert_eq!(
+                (again.pr, again.for_session, again.settled),
+                (pr(43), None, false),
+                "linked again, a review to settle again"
+            );
             assert!(store.pr_reviews_for(work).await.unwrap().is_empty());
 
             store.pr_review_unlink(session).await.unwrap();

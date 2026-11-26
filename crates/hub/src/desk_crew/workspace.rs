@@ -4,7 +4,8 @@
 //! from it ([`Folder`], [`held`]), and so does what the boss sees inside a
 //! session, so the two never disagree.
 
-use std::path::Path;
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 /// How long a git command in a session's folder may take.
@@ -232,6 +233,11 @@ pub(crate) async fn workspace_of(cwd: &str) -> Workspace {
     };
     let mut repo = status_of(&status);
     repo.worktree = worktree;
+    // The worktrees Desk keeps in a checkout are nobody's work; anything
+    // else in their folder is.
+    if repo.uncommitted.iter().any(|p| p == DESK_WORKTREES) && only_worktrees(dir).await {
+        repo.uncommitted.retain(|p| p != DESK_WORKTREES);
+    }
     if repo.head.is_some() {
         repo.unpushed = git(dir, &["rev-list", "--count", "HEAD", "--not", "--remotes"])
             .await
@@ -258,6 +264,29 @@ fn same_dir(dir: &Path, own: &str, common: &str) -> bool {
 
 /// Where Desk keeps a checkout's worktrees, as `git status` names it.
 const DESK_WORKTREES: &str = ".worktrees/";
+
+/// Whether everything in the `.worktrees/` of `dir`'s checkout is one of
+/// its worktrees, as git lists them.
+async fn only_worktrees(dir: &Path) -> bool {
+    let (Ok(top), Ok(listed)) = (
+        git(dir, &["rev-parse", "--show-toplevel"]).await,
+        git(dir, &["worktree", "list", "--porcelain"]).await,
+    ) else {
+        return false;
+    };
+    let real = |p: &Path| std::fs::canonicalize(p).ok();
+    let listed: HashSet<PathBuf> = listed
+        .lines()
+        .filter_map(|l| l.strip_prefix("worktree "))
+        .filter_map(|p| real(Path::new(p)))
+        .collect();
+    let Ok(children) = std::fs::read_dir(Path::new(top.trim()).join(DESK_WORKTREES)) else {
+        return false;
+    };
+    children
+        .map(|c| c.ok().and_then(|c| real(&c.path())))
+        .all(|c| c.is_some_and(|c| listed.contains(&c)))
+}
 
 /// A repository's branch, HEAD, upstream and changed paths from
 /// `git status --porcelain=v2 -z --branch`.
@@ -294,9 +323,8 @@ fn status_of(status: &str) -> Repo {
             .flatten()
             .filter_map(changed_path)
             // Finder's own files are nobody's work (the person's global
-            // ignore isn't read by a hardened git), nor are the worktrees
-            // Desk keeps in a checkout.
-            .filter(|p| !p.ends_with(".DS_Store") && *p != DESK_WORKTREES)
+            // ignore isn't read by a hardened git).
+            .filter(|p| !p.ends_with(".DS_Store"))
             .map(str::to_string)
             .collect(),
         ..Repo::default()
@@ -470,16 +498,27 @@ mod tests {
         );
         std::fs::write(work.join("a.txt"), "a").unwrap();
         std::fs::write(work.join(".DS_Store"), "x").unwrap();
-        std::fs::create_dir_all(work.join(".worktrees/review-7")).unwrap();
-        std::fs::write(work.join(".worktrees/review-7/x.ts"), "x").unwrap();
         assert_eq!(
             folder(w).await,
             Folder::Uncommitted(1),
             "Finder's file isn't work"
         );
+        std::fs::create_dir_all(work.join(".worktrees/notes")).unwrap();
+        std::fs::write(work.join(".worktrees/notes/x.ts"), "x").unwrap();
+        assert_eq!(
+            folder(w).await,
+            Folder::Uncommitted(2),
+            "a folder in .worktrees that is no worktree is work"
+        );
+        std::fs::remove_dir_all(work.join(".worktrees/notes")).unwrap();
         sh(&work, &["add", "a.txt"]).await;
         sh(&work, &["commit", "-q", "-m", "a"]).await;
         std::fs::remove_file(work.join(".DS_Store")).unwrap();
+        sh(
+            &work,
+            &["worktree", "add", "-q", "--detach", ".worktrees/review-7", "HEAD"],
+        )
+        .await;
         assert!(matches!(
             folder(w).await,
             Folder::Clean {

@@ -289,6 +289,7 @@ async fn a_pull_request_reviewed_clean_at_its_head_is_recorded_and_merged_at_tha
                 pr: PrRef::new("acme", "web", 7),
                 head_sha: Some(head.clone()),
                 for_session: Some(web.id),
+                settled: false,
             }),
             "linked to the session whose branch it is"
         );
@@ -685,6 +686,38 @@ async fn reviewed_by_desk(d: &Desk, head: &str) -> SessionView {
     r
 }
 
+/// `dw-761` a commit on, pushed, and #7 green at it: its new head.
+fn pushed_again(base: &Path, gh: &Github, crew: &CrewHub, file: &str) -> String {
+    let web = base.join("web");
+    std::fs::write(web.join(file), "export const more = 1;\n").unwrap();
+    git(&web, &["add", file]);
+    git(&web, &["commit", "-q", "-m", file]);
+    git(&web, &["update-ref", "refs/remotes/origin/dw-761", "HEAD"]);
+    let next = head_of(&web);
+    *gh.head.lock() = next.clone();
+    crew.pull_seen(
+        "acme/web",
+        7,
+        Pull {
+            number: 7,
+            open: true,
+            head: Some(next.clone()),
+            checks: Some("success".into()),
+            ..Default::default()
+        },
+    );
+    next
+}
+
+/// Whether Desk is done with `review`'s link.
+async fn settled(d: &Desk, review: &SessionView) -> bool {
+    d.store()
+        .pr_review_of(review.id)
+        .await
+        .unwrap()
+        .is_some_and(|l| l.settled)
+}
+
 /// Waits for `review` to be closed and its worktree removed.
 async fn closed(d: &Desk, review: &SessionView) {
     eventually("the review closed and its worktree removed", async || {
@@ -734,6 +767,7 @@ async fn a_green_pull_request_is_reviewed_by_desk_merged_by_the_boss_and_the_nex
                 pr: PrRef::new("acme", "web", 7),
                 head_sha: Some(head.clone()),
                 for_session: Some(first.id),
+                settled: false,
             })
         );
         assert_eq!(
@@ -844,24 +878,7 @@ async fn a_review_asking_for_changes_goes_to_its_session_and_the_next_head_is_re
         assert!(!recorded.clean);
         closed(&d, &review).await;
 
-        let web = base.join("web");
-        std::fs::write(web.join("empty.ts"), "export const empty = 1;\n").unwrap();
-        git(&web, &["add", "empty.ts"]);
-        git(&web, &["commit", "-q", "-m", "The empty state"]);
-        git(&web, &["update-ref", "refs/remotes/origin/dw-761", "HEAD"]);
-        let next = head_of(&web);
-        *gh.head.lock() = next.clone();
-        crew.pull_seen(
-            "acme/web",
-            7,
-            Pull {
-                number: 7,
-                open: true,
-                head: Some(next.clone()),
-                checks: Some("success".into()),
-                ..Default::default()
-            },
-        );
+        let next = pushed_again(&base, &gh, &crew, "empty.ts");
         let first = d.view(first.id).unwrap();
         turn_ends(&d, &base, &first, "Pushed the empty state; CI is green.").await;
         reviewed_by_desk(&d, &next).await;
@@ -895,14 +912,149 @@ async fn a_sessions_own_merge_is_refused_at_once_for_its_bosss_merge() {
         assert_eq!(behavior(&answer), "deny", "{answer}");
         let message = answer["hookSpecificOutput"]["decision"]["message"].to_string();
         assert!(
-            message.contains(super::super::decide::OWN_MERGE)
-                && message.contains(super::super::decide::OWN_MERGE_INSTEAD),
+            message.contains(workforce_desk::plan::OWN_MERGE)
+                && message.contains(workforce_desk::plan::OWN_MERGE_INSTEAD),
             "{message}"
         );
         assert!(
             calls_about(&llm, "gh pr merge").await.is_empty(),
             "no model asked"
         );
+    })
+    .await;
+}
+
+/// A review whose pull request moved on while it read records nothing of
+/// the head it read: it is closed, its worktree removed, and the new head
+/// is reviewed once its ticket's session rests.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_review_of_a_head_that_moved_on_is_closed_unrecorded_and_the_new_head_reviewed() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(dir.path()).unwrap();
+        let head = pull_request(&base);
+        let gh = Github::at(&head).await;
+        let (_overseer, crew, d, _llm, first) = a_plan_of_two(&base, pool, &gh).await;
+        turn_ends(&d, &base, &first, "Opened #7; CI is green.").await;
+        let review = reviewed_by_desk(&d, &head).await;
+        let next = pushed_again(&base, &gh, &crew, "more.ts");
+
+        let claude = Claude::started(&base, review.id).await;
+        claude.asked(review.last_prompt.as_deref().unwrap()).await;
+        claude
+            .replies(&d, review.id, &format!("Fine.\n\nREVIEW: clean {head}"))
+            .await;
+        closed(&d, &review).await;
+        assert!(settled(&d, &review).await);
+        assert_eq!(
+            d.store()
+                .pr_review_newest("desk", &PrRef::new("acme", "web", 7))
+                .await
+                .unwrap(),
+            None,
+            "nothing recorded of the head it read"
+        );
+        let first = d.view(first.id).unwrap();
+        turn_ends(&d, &base, &first, "Pushed more; CI is green.").await;
+        reviewed_by_desk(&d, &next).await;
+        assert!(!gh.merged.load(Ordering::SeqCst), "nothing merged");
+    })
+    .await;
+}
+
+/// A review its boss would close before Desk recorded it stays open; one
+/// the person closes first is still recorded from what it said, and its
+/// pull request merged by its boss.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_review_closed_before_it_was_recorded_is_recorded_from_what_it_said() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(dir.path()).unwrap();
+        let head = pull_request(&base);
+        let gh = Github::at(&head).await;
+        let (_overseer, crew, d, llm, first) = a_plan_of_two(&base, pool, &gh).await;
+        calls_tool_once(
+            &llm,
+            "Desk recorded a clean review of acme/web#7",
+            "crew_github_merge",
+            merge_7(),
+        )
+        .await;
+        turn_ends(&d, &base, &first, "Opened #7; CI is green.").await;
+        let review = reviewed_by_desk(&d, &head).await;
+        // Its turn never rests long enough for Desk to record it.
+        *crew.close_settle.lock() = chrono::Duration::hours(1);
+        let claude = Claude::started(&base, review.id).await;
+        claude.asked(review.last_prompt.as_deref().unwrap()).await;
+        claude
+            .replies(&d, review.id, &format!("Good.\n\nREVIEW: clean {head}"))
+            .await;
+        let unrecorded = d.view(review.id).unwrap();
+        let held = crew.close_held(&unrecorded, "desk").await;
+        assert!(
+            held.as_deref().is_some_and(|h| h.contains("review isn't recorded yet")),
+            "{held:?}"
+        );
+
+        d.end(review.id, Some(By::you())).await.unwrap();
+        eventually("the boss to merge #7", async || {
+            gh.merged.load(Ordering::SeqCst).then_some(())
+        })
+        .await;
+        let recorded = d
+            .store()
+            .pr_review_newest("desk", &PrRef::new("acme", "web", 7))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!((recorded.clean, recorded.by_session), (true, review.id));
+        closed(&d, &review).await;
+        assert!(settled(&d, &review).await);
+    })
+    .await;
+}
+
+/// A review Desk started at Act fully is still recorded and closed once
+/// its boss acts at a lower level, but its boss isn't told to merge.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_review_is_recorded_and_closed_after_its_boss_drops_below_act_fully_and_nothing_merges() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(dir.path()).unwrap();
+        let head = pull_request(&base);
+        let gh = Github::at(&head).await;
+        let (overseer, _crew, d, llm, first) = a_plan_of_two(&base, pool, &gh).await;
+        turn_ends(&d, &base, &first, "Opened #7; CI is green.").await;
+        let review = reviewed_by_desk(&d, &head).await;
+        write_config(
+            &overseer,
+            &format!(
+                "{}[oversight.work]\nparallel = 1\n",
+                UNBOUND.replace("level = \"full\"", "level = \"act\"")
+            ),
+        );
+
+        let claude = Claude::started(&base, review.id).await;
+        claude.asked(review.last_prompt.as_deref().unwrap()).await;
+        claude
+            .replies(&d, review.id, &format!("Good.\n\nREVIEW: clean {head}"))
+            .await;
+        closed(&d, &review).await;
+        assert!(settled(&d, &review).await);
+        let recorded = d
+            .store()
+            .pr_review_newest("desk", &PrRef::new("acme", "web", 7))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(recorded.clean);
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(
+            asked_with(&llm, &["Desk recorded a clean review"]).await,
+            0,
+            "no merge is asked for below Act fully"
+        );
+        assert!(!gh.merged.load(Ordering::SeqCst));
     })
     .await;
 }

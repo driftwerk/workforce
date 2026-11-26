@@ -689,62 +689,117 @@ fn gh(args: &[&str], here: &Here<'_>) -> Class {
             is(Class::GhPrCreate, own)
         }
         ["pr", "merge", ..] => Class::GhPrMerge,
-        ["api", rest @ ..] => {
-            let known = Known {
-                valued: &[
-                    "-X",
-                    "--method",
-                    "-f",
-                    "--raw-field",
-                    "-F",
-                    "--field",
-                    "-H",
-                    "--header",
-                    "--jq",
-                    "-q",
-                    "--template",
-                    "-t",
-                    "--cache",
-                    "--hostname",
-                    "-p",
-                    "--preview",
-                ],
-                bare: &[
-                    "--paginate",
-                    "--slurp",
-                    "-i",
-                    "--include",
-                    "--silent",
-                    "--verbose",
-                ],
-            };
-            let Some((flags, ops)) = known.read(rest) else {
-                return Class::Other;
-            };
-            let methods: Vec<&str> = flags
-                .iter()
-                .filter(|(n, _)| matches!(*n, "-X" | "--method"))
-                .filter_map(|(_, v)| *v)
-                .collect();
-            // A field makes gh send a POST unless a GET is named, and the
-            // last method named is the one it sends.
-            let fields = flags
-                .iter()
-                .any(|(n, _)| matches!(*n, "-f" | "--raw-field" | "-F" | "--field"));
-            let reads = match methods.last() {
-                Some(m) => m.eq_ignore_ascii_case("GET"),
-                None => !fields,
-            };
-            let graphql = ops
-                .first()
-                .is_none_or(|e| e.trim_start_matches('/') == "graphql");
-            match ops[..] {
-                [e] if !reads && merges(e) => Class::GhPrMerge,
-                _ => is(Class::GhRead, reads && ops.len() == 1 && !graphql),
-            }
-        }
+        ["api", rest @ ..] => gh_api(rest),
         ["workflow", "run", ..] | ["release", "create", ..] => Class::Deploy,
         _ => Class::Other,
+    }
+}
+
+/// `gh api`'s `rest`: a read only it reads, the merge of a pull request
+/// by GitHub's REST or GraphQL API, else [`Class::Other`].
+fn gh_api(rest: &[&str]) -> Class {
+    let is = |c: Class, ok: bool| if ok { c } else { Class::Other };
+    let known = Known {
+        valued: &[
+            "-X",
+            "--method",
+            "-f",
+            "--raw-field",
+            "-F",
+            "--field",
+            "-H",
+            "--header",
+            "--jq",
+            "-q",
+            "--template",
+            "-t",
+            "--cache",
+            "--hostname",
+            "-p",
+            "--preview",
+        ],
+        bare: &[
+            "--paginate",
+            "--slurp",
+            "-i",
+            "--include",
+            "--silent",
+            "--verbose",
+        ],
+    };
+    let Some((flags, ops)) = known.read(rest) else {
+        return Class::Other;
+    };
+    let methods: Vec<&str> = flags
+        .iter()
+        .filter(|(n, _)| matches!(*n, "-X" | "--method"))
+        .filter_map(|(_, v)| *v)
+        .collect();
+    // A field makes gh send a POST unless a GET is named, and the
+    // last method named is the one it sends.
+    let fields = flags
+        .iter()
+        .any(|(n, _)| matches!(*n, "-f" | "--raw-field" | "-F" | "--field"));
+    let reads = match methods.last() {
+        Some(m) => m.eq_ignore_ascii_case("GET"),
+        None => !fields,
+    };
+    let graphql = ops
+        .first()
+        .is_none_or(|e| e.trim_start_matches('/') == "graphql");
+    // GraphQL's merge names its mutation in a field: `-f query=…`.
+    let merges_by_graphql = graphql
+        && flags.iter().any(|(n, v)| {
+            matches!(*n, "-f" | "--raw-field" | "-F" | "--field")
+                && v.is_some_and(|v| v.contains("mergePullRequest"))
+        });
+    match ops[..] {
+        [e] if !reads && merges(e) => Class::GhPrMerge,
+        _ if merges_by_graphql => Class::GhPrMerge,
+        _ => is(Class::GhRead, reads && ops.len() == 1 && !graphql),
+    }
+}
+
+/// Whether `gh` run with `args` merges a pull request ([`gh`]'s
+/// [`Class::GhPrMerge`]).
+fn gh_merges(args: &[&str]) -> bool {
+    match args {
+        ["pr", "merge", ..] => true,
+        ["api", rest @ ..] => gh_api(rest) == Class::GhPrMerge,
+        _ => false,
+    }
+}
+
+/// Whether any command in `command` merges a pull request with `gh` (`gh
+/// pr merge`, GitHub's REST merge or its GraphQL `mergePullRequest`),
+/// chained or run in a shell (`sh -c`, `eval`), whatever else it runs:
+/// what Desk refuses a session before it runs while a boss acting fully
+/// has it. What can't be read as plain commands is never said to.
+pub fn merges_a_pull(command: &str) -> bool {
+    merges_within(command, 0)
+}
+
+fn merges_within(command: &str, depth: usize) -> bool {
+    depth <= DEPTH && split(command).is_ok_and(|cmds| cmds.iter().any(|c| merges_in(c, depth)))
+}
+
+fn merges_in(cmd: &Cmd, depth: usize) -> bool {
+    let env = cmd
+        .words
+        .iter()
+        .take_while(|w| super::assigned(w).is_some())
+        .count();
+    let words = texts(&cmd.words[env..]);
+    let Some((program, args)) = words.split_first() else {
+        return false;
+    };
+    match program_name(program) {
+        Some("gh") => gh_merges(args),
+        Some("sh" | "bash" | "zsh") => {
+            matches!(args, [flag, script] if is_c_flag(flag) && merges_within(script, depth + 1))
+        }
+        Some("eval") => merges_within(&args.join(" "), depth + 1),
+        _ => false,
     }
 }
 
@@ -1112,6 +1167,35 @@ mod tests {
         class_with(command, false)
     }
 
+    /// A merge is found in any command of a line, chained or in a shell;
+    /// what only reads, or names a merge in words, isn't one.
+    #[test]
+    fn a_merge_is_found_wherever_a_line_runs_it() {
+        for c in [
+            "gh pr merge 7 --squash",
+            "cd web && gh pr merge 7",
+            "git push && GH_TOKEN=x gh pr merge 7 --auto",
+            "bash -lc 'gh pr merge 7 --squash'",
+            "eval gh pr merge 7",
+            "gh api -X PUT repos/acme/web/pulls/7/merge",
+            "gh api 'repos/{owner}/{repo}/pulls/7/merge' -f sha=abc",
+            "gh api graphql -f query='mutation { mergePullRequest(input: {}) { clientMutationId } }'",
+            "/usr/local/bin/gh pr merge 7",
+        ] {
+            assert!(super::merges_a_pull(c), "{c}");
+        }
+        for c in [
+            "gh pr view 7",
+            "gh api repos/acme/web/pulls/7/merge",
+            "echo gh pr merge 7",
+            "git merge main",
+            "gh pr checks 7 && git log",
+            "gh api repos/acme/web/pulls/7/merge {",
+        ] {
+            assert!(!super::merges_a_pull(c), "{c}");
+        }
+    }
+
     #[test]
     fn only_the_branch_its_on_to_origin_is_its_own_push() {
         assert_eq!(class("git push origin feat/x"), Class::OwnBranchPush);
@@ -1312,6 +1396,14 @@ mod tests {
         ] {
             assert_eq!(class(c), Class::GhPrMerge, "{c}");
         }
+        assert_eq!(
+            class("gh api graphql -f query='mutation { mergePullRequest(input: {pullRequestId: \"x\"}) { clientMutationId } }'"),
+            Class::GhPrMerge
+        );
+        assert_eq!(
+            class("gh api graphql -f query='query { viewer { login } }'"),
+            Class::Other
+        );
         assert_eq!(class("gh api repos/acme/web/pulls/12/merge"), Class::GhRead);
         assert_eq!(
             class("gh api -X PUT repos/acme/web/pulls/12/reviews"),

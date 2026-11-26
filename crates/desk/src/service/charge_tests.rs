@@ -1816,35 +1816,60 @@ async fn a_boss_acting_fully_cancels_only_the_requests_it_decides() {
     .await;
 }
 
-/// A session started to review a pull request is asked for its verdict on
-/// the head it was given, and linked to that pull request before it runs.
+/// `base/web`, a repository two commits deep: git run in it, and its
+/// first commit, the head its pull request is reviewed at.
+fn reviewed_repo(base: &std::path::Path) -> (std::path::PathBuf, String) {
+    let repo = base.join("web");
+    std::fs::create_dir_all(&repo).unwrap();
+    git_in(&repo, &["init", "-q", "-b", "main"]);
+    git_in(&repo, &["commit", "-q", "--allow-empty", "-m", "one"]);
+    let head = git_in(&repo, &["rev-parse", "HEAD"]);
+    git_in(&repo, &["commit", "-q", "--allow-empty", "-m", "two"]);
+    (repo, head)
+}
+
+fn git_in(dir: &std::path::Path, args: &[&str]) -> String {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(["-c", "user.email=d@e", "-c", "user.name=d"])
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    String::from_utf8(out.stdout).unwrap().trim().to_string()
+}
+
+fn review_of(head: &str, for_session: Option<Uuid>) -> crate::plan::ReviewOf {
+    crate::plan::ReviewOf {
+        pr: crate::plan::PrRef::new("acme", "web", 7),
+        head_sha: head.into(),
+        for_session,
+    }
+}
+
+/// A review session is asked for its verdict at the head it reviews, and
+/// linked to its pull request for the session whose work it is; one named
+/// by a short head is refused.
 #[tokio::test]
 async fn a_review_session_is_asked_for_its_verdict_and_linked_to_its_pull_request() {
-    use crate::plan::{review_instruction, PrRef, ReviewLink, ReviewOf};
+    use crate::plan::{review_instruction, ReviewLink};
     with_test_pool(build_pool, |pool| async move {
         let dir = tempfile::tempdir().unwrap();
-        let d = desk(pool, dir.path()).await;
-        let head = "0123456789abcdef0123456789abcdef01234567";
-        let pr = PrRef {
-            owner: "acme".into(),
-            repo: "web".into(),
-            number: 42,
-        };
+        let base = std::fs::canonicalize(dir.path()).unwrap();
+        let (repo, head) = reviewed_repo(&base);
+        let d = desk(pool, &base).await;
         let by = || By::manager("sarah", "Sarah", "Review it.");
-        let mut new = start_in(dir.path(), None);
-        new.prompt = Some("Review pull request 42.".into());
+        let mut new = start_in(&repo, None);
+        new.prompt = Some("Review pull request 7.".into());
         let work = Uuid::new_v4();
-        new.review_of = Some(ReviewOf {
-            pr: pr.clone(),
-            head_sha: head.into(),
-            for_session: Some(work),
-        });
+        new.review_of = Some(review_of(&head, Some(work)));
         let s = d.create_for(new, &sarah(), by()).await.unwrap();
         assert_eq!(
             d.view(s.id).unwrap().last_prompt,
             Some(format!(
-                "Review pull request 42.\n\n{}",
-                review_instruction(head)
+                "Review pull request 7.\n\n{}",
+                review_instruction(&head)
             ))
         );
         assert_eq!(
@@ -1852,13 +1877,14 @@ async fn a_review_session_is_asked_for_its_verdict_and_linked_to_its_pull_reques
             Some(ReviewLink {
                 session: s.id,
                 boss: sarah().id,
-                pr: pr.clone(),
-                head_sha: Some(head.into()),
+                pr: crate::plan::PrRef::new("acme", "web", 7),
+                head_sha: Some(head.clone()),
                 for_session: Some(work),
+                settled: false,
             })
         );
 
-        let mut plain = start_in(dir.path(), None);
+        let mut plain = start_in(&repo, None);
         plain.prompt = Some("Fix the date picker.".into());
         let p = d.create_for(plain, &sarah(), by()).await.unwrap();
         assert_eq!(
@@ -1867,12 +1893,8 @@ async fn a_review_session_is_asked_for_its_verdict_and_linked_to_its_pull_reques
         );
         assert_eq!(d.store().pr_review_of(p.id).await.unwrap(), None);
 
-        let mut short = start_in(dir.path(), None);
-        short.review_of = Some(ReviewOf {
-            pr,
-            head_sha: head[..12].into(),
-            for_session: None,
-        });
+        let mut short = start_in(&repo, None);
+        short.review_of = Some(review_of(&head[..12], None));
         assert!(matches!(
             d.create_for(short, &sarah(), by()).await,
             Err(DeskError::Invalid(_))
@@ -1881,55 +1903,33 @@ async fn a_review_session_is_asked_for_its_verdict_and_linked_to_its_pull_reques
     .await;
 }
 
-/// A review the boss names a worktree for is read in one detached at the
-/// head it reviews; a second review of that head is refused while the
+/// A review is read in a worktree of its own, detached at the head it
+/// reviews and named for it, whatever worktree its boss names, a ticket's
+/// own among them; a second review of that head is refused while the
 /// first is open, and may start once it is closed.
 #[tokio::test]
 async fn a_review_reads_its_head_in_a_detached_worktree_and_one_head_has_one_open_review() {
-    use crate::plan::{PrRef, ReviewOf};
     with_test_pool(build_pool, |pool| async move {
         let dir = tempfile::tempdir().unwrap();
         let base = std::fs::canonicalize(dir.path()).unwrap();
-        let repo = base.join("web");
-        std::fs::create_dir_all(&repo).unwrap();
-        let git = |args: &[&str]| {
-            let out = std::process::Command::new("git")
-                .arg("-C")
-                .arg(&repo)
-                .args(["-c", "user.email=d@e", "-c", "user.name=d"])
-                .args(args)
-                .output()
-                .unwrap();
-            assert!(out.status.success(), "{out:?}");
-            String::from_utf8(out.stdout).unwrap().trim().to_string()
-        };
-        git(&["init", "-q", "-b", "main"]);
-        git(&["commit", "-q", "--allow-empty", "-m", "one"]);
-        let head = git(&["rev-parse", "HEAD"]);
-        git(&["commit", "-q", "--allow-empty", "-m", "two"]);
+        let (repo, head) = reviewed_repo(&base);
         let d = desk(pool, &base).await;
         let by = || By::manager("sarah", "Sarah", "Review it.");
+        let mut ticket = start_in(&repo, None);
+        ticket.worktree = Some("des-1".into());
+        let ticket = d.create_for(ticket, &sarah(), by()).await.unwrap();
         let review = || {
             let mut new = start_in(&repo, None);
-            new.worktree = Some("review-7".into());
-            new.review_of = Some(ReviewOf {
-                pr: PrRef::new("acme", "web", 7),
-                head_sha: head.clone(),
-                for_session: None,
-            });
+            new.worktree = Some("des-1".into());
+            new.review_of = Some(review_of(&head, Some(ticket.id)));
             new
         };
         let s = d.create_for(review(), &sarah(), by()).await.unwrap();
-        let folder = repo.join(".worktrees/review-7");
-        assert_eq!(s.cwd, folder.to_string_lossy());
+        let folder = repo.join(format!(".worktrees/review-7-{}", &head[..7]));
+        assert_eq!(s.cwd, folder.to_string_lossy(), "never the ticket's own");
         assert_eq!(s.branch, None);
-        let at = std::process::Command::new("git")
-            .arg("-C")
-            .arg(&folder)
-            .args(["rev-parse", "HEAD"])
-            .output()
-            .unwrap();
-        assert_eq!(String::from_utf8(at.stdout).unwrap().trim(), head);
+        assert_eq!(git_in(&folder, &["rev-parse", "HEAD"]), head);
+        assert_eq!(git_in(&folder, &["branch", "--show-current"]), "");
 
         let again = d.create_for(review(), &sarah(), by()).await.unwrap_err();
         assert!(
@@ -1939,6 +1939,100 @@ async fn a_review_reads_its_head_in_a_detached_worktree_and_one_head_has_one_ope
         d.end(s.id, Some(by())).await.unwrap();
         let next = d.create_for(review(), &sarah(), by()).await.unwrap();
         assert_eq!(next.cwd, s.cwd, "its worktree found again at the head");
+    })
+    .await;
+}
+
+/// A review whose session doesn't start leaves nothing behind: no link,
+/// and no worktree it made; one it found there already stays.
+#[tokio::test]
+async fn a_review_that_doesnt_start_leaves_no_link_and_no_worktree_it_made() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(dir.path()).unwrap();
+        let (repo, head) = reviewed_repo(&base);
+        crate::store::DeskStore::migrate(&pool).await.unwrap();
+        let mut opts = super::super::tests::options(&base);
+        let nowhere = base.join("no-such-claude");
+        opts.programs = crate::testing::programs(nowhere.clone(), nowhere);
+        let d = Desk::start(
+            crate::store::DeskStore::from_pool(pool),
+            opts,
+            Default::default(),
+            tokio_util::sync::CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        let by = || By::manager("sarah", "Sarah", "Review it.");
+        let review = || {
+            let mut new = start_in(&repo, None);
+            new.review_of = Some(review_of(&head, None));
+            new
+        };
+        let folder = repo.join(format!(".worktrees/review-7-{}", &head[..7]));
+        d.create_for(review(), &sarah(), by()).await.unwrap_err();
+        assert!(!folder.exists(), "the worktree it made is removed");
+        assert!(d
+            .store()
+            .pr_reviews_at(&sarah().id, &crate::plan::PrRef::new("acme", "web", 7), &head)
+            .await
+            .unwrap()
+            .is_empty());
+
+        git_in(&repo, &["worktree", "add", "-q", "--detach", &folder.to_string_lossy(), &head]);
+        d.create_for(review(), &sarah(), by()).await.unwrap_err();
+        assert!(folder.exists(), "one it found stays");
+    })
+    .await;
+}
+
+/// A session's own merge is refused before it runs while a boss acting
+/// fully has it, in a mode that asks nothing too, and whatever else the
+/// command runs; not while the person is in it, nor under a boss that
+/// doesn't act fully, nor what only reads.
+#[tokio::test]
+async fn a_sessions_own_merge_is_refused_before_it_runs_under_a_boss_acting_fully() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(pool, dir.path()).await;
+        let call = |command: &str| {
+            json!({"hook_event_name": "PreToolUse", "permission_mode": "bypassPermissions",
+                "tool_name": "Bash", "tool_use_id": "toolu_1", "tool_input": {"command": command}})
+        };
+        let refused = |answer: &Value| answer["hookSpecificOutput"]["permissionDecision"] == "deny";
+        let s = d.create(start_in(dir.path(), None), None).await.unwrap();
+        idle(&d, s.id).await;
+        d.take_on(s.id, &sarah(), How::Handed, &Default::default(), &By::you())
+            .await
+            .unwrap();
+        let merge = "git push && gh pr merge 7 --squash";
+        assert!(!refused(&hook(&d, s.id, call(merge)).await), "she doesn't act fully");
+
+        d.set_full(HashMap::from([(
+            sarah().id,
+            charge::FullGrant {
+                anywhere: true,
+                unbound: true,
+                ..Default::default()
+            },
+        )]));
+        let answer = hook(&d, s.id, call(merge)).await;
+        assert!(refused(&answer), "{answer}");
+        let why = answer["hookSpecificOutput"]["permissionDecisionReason"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(why.contains(crate::plan::OWN_MERGE) && why.contains(crate::plan::OWN_MERGE_INSTEAD), "{why}");
+        assert!(!refused(&hook(&d, s.id, call("gh pr view 7")).await));
+        let token = d.0.state.lock().live[&s.id].token.clone();
+        assert_eq!(
+            d.gh_asked(s.id, &token, "gh 'pr' 'merge' '7'"),
+            Some(Some(crate::plan::own_merge_refused())),
+            "a Codex session's gh is told the same"
+        );
+        assert_eq!(d.gh_asked(s.id, "not-its-token", "gh pr merge 7"), None);
+
+        d.person_typing(s.id).unwrap();
+        assert!(!refused(&hook(&d, s.id, call(merge)).await), "the person is in it");
     })
     .await;
 }

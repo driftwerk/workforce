@@ -135,14 +135,32 @@ pub(crate) fn short(sha: &str) -> &str {
     &sha[..sha.len().min(7)]
 }
 
+/// Whether ticket `t` names `pr`: among its links, or in its words.
+fn names_pull(t: &workforce_desk::board::Ticket, pr: &PrRef) -> bool {
+    let url = format!(
+        "github.com/{}/{}/pull/{}",
+        pr.owner, pr.repo, pr.number
+    );
+    // Its number whole: #7 is never #70.
+    let ends = |text: &str, said: &str| {
+        text.match_indices(said).any(|(at, _)| {
+            !text[at + said.len()..]
+                .starts_with(|c: char| c.is_ascii_digit())
+        })
+    };
+    let mentions = |text: &str| {
+        let text = text.to_ascii_lowercase();
+        ends(&text, &url) || ends(&text, &named(pr))
+    };
+    t.links.iter().any(|l| {
+        matches!(l, workforce_desk::board::Link::Pr { url, .. } if mentions(url))
+    }) || mentions(&t.title)
+        || mentions(&t.body)
+}
+
 /// `owner/repo#number`.
 pub(crate) fn named(pr: &PrRef) -> String {
     format!("{}#{}", full_name(pr), pr.number)
-}
-
-/// The worktree a review of `pr` at `head` reads it in.
-pub(crate) fn worktree(pr: &PrRef, head: &str) -> String {
-    format!("review-{}-{}", pr.number, short(head))
 }
 
 /// Whether `cwd` is the worktree Desk makes a review of `pr` at `head`
@@ -150,7 +168,7 @@ pub(crate) fn worktree(pr: &PrRef, head: &str) -> String {
 pub(crate) fn made_for(cwd: &str, pr: &PrRef, head: &str) -> bool {
     std::path::Path::new(cwd).ends_with(
         std::path::Path::new(".worktrees")
-            .join(workforce_desk::worktree::slug(&worktree(pr, head))),
+            .join(workforce_desk::worktree::slug(&plan::review_worktree(pr, head))),
     )
 }
 
@@ -254,7 +272,7 @@ fn number_of(v: &Value) -> Option<i64> {
     })
 }
 
-fn full_name(pr: &PrRef) -> String {
+pub(crate) fn full_name(pr: &PrRef) -> String {
     format!("{}/{}", pr.owner, pr.repo)
 }
 
@@ -522,17 +540,7 @@ impl CrewHub {
         };
         let pull = self.pull_now(&b.service, &r.pr).await?;
         r.head_sha = Self::head_of(&pull)?;
-        r.for_session = self
-            .sessions_of(b.service.agent_id.as_str())
-            .await
-            .into_iter()
-            .find(|(_, origin, branch)| {
-                pull["head_repo"]
-                    .as_str()
-                    .is_some_and(|h| h.eq_ignore_ascii_case(origin))
-                    && pull["head"].as_str() == Some(branch.as_str())
-            })
-            .map(|(id, ..)| id);
+        r.for_session = self.reviewed_work(b.service.agent_id.as_str(), &r.pr, &pull).await;
         kept["review_of"]["head_sha"] = json!(r.head_sha);
         kept["review_of"]["for_session"] = json!(r.for_session);
         Ok(())
@@ -541,6 +549,39 @@ impl CrewHub {
     /// Each session `boss` runs now with its folder's `(origin, branch)`:
     /// Desk's charges are only the live ones, so never one released or
     /// taken back, which is no longer its work.
+    /// The session of `boss`'s whose work `pr` (`pull`, as GitHub has it)
+    /// is: the one on its head branch in its head repository, the one
+    /// whose ticket names it first when more are; none when that still
+    /// leaves more than one.
+    async fn reviewed_work(&self, boss: &str, pr: &PrRef, pull: &Value) -> Option<Uuid> {
+        let on: Vec<Uuid> = self
+            .sessions_of(boss)
+            .await
+            .into_iter()
+            .filter(|(_, origin, branch)| {
+                pull["head_repo"]
+                    .as_str()
+                    .is_some_and(|h| h.eq_ignore_ascii_case(origin))
+                    && pull["head"].as_str() == Some(branch.as_str())
+            })
+            .map(|(id, ..)| id)
+            .collect();
+        if let [one] = on[..] {
+            return Some(one);
+        }
+        let mut naming = Vec::new();
+        for id in on {
+            let tickets = self.desk.store().session_tickets(id).await.unwrap_or_default();
+            if tickets.iter().any(|t| names_pull(t, pr)) {
+                naming.push(id);
+            }
+        }
+        match naming[..] {
+            [one] => Some(one),
+            _ => None,
+        }
+    }
+
     async fn sessions_of(&self, boss: &str) -> Vec<(Uuid, String, String)> {
         let mut out = Vec::new();
         for c in self.desk.charges().into_iter().filter(|c| c.boss == boss) {
@@ -574,6 +615,24 @@ impl CrewHub {
     /// Records the verdict of review session `id` that `boss`, as
     /// `service`, runs, once its turn has ended: the review kept, and its
     /// final reply.
+    /// The review `boss`'s review session `id` gave, as Desk recorded it
+    /// once the session was done ([`Self::record_of`]): none until then.
+    pub(super) async fn recorded_by(&self, boss: &str, id: Uuid) -> Option<PrReview> {
+        let store = self.desk.store();
+        let link = store
+            .pr_review_of(id)
+            .await
+            .ok()
+            .flatten()
+            .filter(|l| l.boss == boss && l.settled)?;
+        store
+            .pr_review_newest(boss, &link.pr)
+            .await
+            .ok()
+            .flatten()
+            .filter(|r| r.by_session == id)
+    }
+
     pub(super) async fn record_of(
         &self,
         service: &AgentService,
@@ -584,24 +643,25 @@ impl CrewHub {
             .desk
             .view(id)
             .map_err(|_| "That review session isn't in Desk now.")?;
-        if !self
-            .desk
-            .charge_of(id)
-            .is_some_and(|c| c.live() && c.boss == boss)
-        {
-            return Err(
-                "It isn't a session you run: only your own review sessions are recorded.".into(),
-            );
-        }
-        let pr = self
+        let link = self
             .desk
             .store()
             .pr_review_of(id)
             .await
             .map_err(|e| format!("Desk couldn't read what it reviews: {e}"))?
             .filter(|l| l.boss == boss)
-            .map(|l| l.pr)
             .ok_or("It wasn't started to review a pull request: start a review with crew.start_session and review_of.")?;
+        // Closed before Desk recorded it, its reply is still read.
+        if !self
+            .desk
+            .charge_of(id)
+            .is_some_and(|c| c.boss == boss && (c.live() || !link.settled))
+        {
+            return Err(
+                "It isn't a session you run: only your own review sessions are recorded.".into(),
+            );
+        }
+        let pr = link.pr;
         if v.state.busy() {
             return Err("It's still reviewing: record its verdict once its turn has ended.".into());
         }
@@ -652,10 +712,16 @@ impl CrewHub {
         self.desk
             .view(id)
             .map_err(|_| self.not_ours(&b.seen.scope))?;
-        let (review, _) = self
-            .record_of(&b.service, b.service.agent_id.as_str(), id)
-            .await
-            .map_err(|e| e.to_string())?;
+        let boss = b.service.agent_id.as_str();
+        let review = match self.recorded_by(boss, id).await {
+            Some(review) => review,
+            None => {
+                self.record_of(&b.service, boss, id)
+                    .await
+                    .map_err(|e| e.to_string())?
+                    .0
+            }
+        };
         Ok(json!({
             "recorded": match review.clean {
                 true => "clean",
@@ -927,7 +993,7 @@ pub(super) mod tests {
 
     #[test]
     fn a_review_desk_starts_reads_its_head_in_its_own_worktree_and_says_what_to_change() {
-        assert_eq!(worktree(&pr(), HEAD), "review-7-1111111");
+        assert_eq!(plan::review_worktree(&pr(), HEAD), "review-7-1111111");
         assert!(made_for(
             "/dev/web/.worktrees/review-7-1111111",
             &pr(),

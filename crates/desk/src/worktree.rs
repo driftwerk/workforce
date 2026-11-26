@@ -6,10 +6,17 @@ use eyre::{Context, Result};
 use tokio::process::Command;
 
 async fn git(dir: &Path, args: &[&str]) -> Result<String> {
+    git_with(dir, args, &[]).await
+}
+
+/// [`git`], with `env` set for it.
+async fn git_with(dir: &Path, args: &[&str], env: &[(&str, &str)]) -> Result<String> {
     let out = Command::new("git")
         .arg("-C")
         .arg(dir)
         .args(args)
+        .envs(env.iter().copied())
+        .kill_on_drop(true)
         .output()
         .await
         .context("running git")?;
@@ -73,7 +80,7 @@ async fn create_from(cwd: &Path, branch: &str, start: Option<&str>) -> Result<Pa
     if name.is_empty() {
         eyre::bail!("branch name {branch:?} has no usable characters");
     }
-    git(Path::new("."), &["check-ref-format", "--branch", branch]).await?;
+    git(cwd, &["check-ref-format", "--branch", branch]).await?;
     let root = PathBuf::from(git(cwd, &["rev-parse", "--show-toplevel"]).await?);
     let path = root.join(".worktrees").join(&name);
     if path.exists() {
@@ -110,9 +117,16 @@ async fn create_from(cwd: &Path, branch: &str, start: Option<&str>) -> Result<Pa
 /// the main checkout of `cwd`'s repository, never inside a linked
 /// worktree: what a review reads its pull request's head in. A `commit`
 /// the repository hasn't got is fetched from `origin`'s `from` into
-/// `refs/remotes/origin/`, so it is seen as pushed. One already there at
-/// `commit` is found again; one at another commit is refused.
-pub async fn detached(cwd: &Path, name: &str, commit: &str, from: &str) -> Result<PathBuf> {
+/// `refs/remotes/origin/`, so it is seen as pushed; never waiting on a
+/// password or a host key, and for at most [`FETCH_WITHIN`]. One already
+/// there, detached at `commit`, is found again; anything else there is
+/// refused. `true` beside its path: this call made it.
+pub async fn detached(
+    cwd: &Path,
+    name: &str,
+    commit: &str,
+    from: &str,
+) -> Result<(PathBuf, bool)> {
     let slugged = slug(name);
     if slugged.is_empty() {
         eyre::bail!("worktree name {name:?} has no usable characters");
@@ -122,9 +136,15 @@ pub async fn detached(cwd: &Path, name: &str, commit: &str, from: &str) -> Resul
     if path.exists() {
         let at = git(&path, &["rev-parse", "--show-toplevel", "HEAD"]).await?;
         let here = std::fs::canonicalize(&path).context("reading the worktree")?;
+        let on = git(&path, &["branch", "--show-current"]).await?;
         return match at.lines().collect::<Vec<_>>()[..] {
-            [top, head] if Path::new(top) == here && head == commit => Ok(path),
-            _ => eyre::bail!("{} already exists, not at {commit}", path.display()),
+            [top, head] if Path::new(top) == here && head == commit && on.is_empty() => {
+                Ok((path, false))
+            }
+            _ => eyre::bail!(
+                "{} already exists, not detached at {commit}",
+                path.display()
+            ),
         };
     }
     if git(&root, &["cat-file", "-e", &format!("{commit}^{{commit}}")])
@@ -135,19 +155,29 @@ pub async fn detached(cwd: &Path, name: &str, commit: &str, from: &str) -> Resul
             "+{from}:refs/remotes/origin/{}",
             from.trim_start_matches("refs/")
         );
-        git(
-            &root,
-            &[
-                "-c",
-                "credential.interactive=never",
-                "fetch",
-                "-q",
-                "origin",
-                &into,
+        let own_ssh = git(&root, &["config", "core.sshCommand"]).await.is_ok()
+            || std::env::var_os("GIT_SSH_COMMAND").is_some();
+        let unasked: &[(&str, &str)] = match own_ssh {
+            true => &[("GIT_TERMINAL_PROMPT", "0")],
+            false => &[
+                ("GIT_TERMINAL_PROMPT", "0"),
+                ("GIT_SSH_COMMAND", "ssh -o BatchMode=yes"),
             ],
-        )
-        .await
-        .with_context(|| format!("{commit} isn't here and couldn't be fetched"))?;
+        };
+        let args = [
+            "-c",
+            "credential.interactive=never",
+            "fetch",
+            "-q",
+            "origin",
+            &into,
+        ];
+        let fetch = git_with(&root, &args, unasked);
+        tokio::time::timeout(FETCH_WITHIN, fetch)
+            .await
+            .map_err(|_| eyre::eyre!("fetching it took over {}s", FETCH_WITHIN.as_secs()))
+            .and_then(|r| r)
+            .with_context(|| format!("{commit} isn't here and couldn't be fetched"))?;
     }
     git(
         &root,
@@ -160,12 +190,19 @@ pub async fn detached(cwd: &Path, name: &str, commit: &str, from: &str) -> Resul
         ],
     )
     .await?;
-    Ok(path)
+    Ok((path, true))
 }
 
-/// Removes the worktree [`detached`] made at `path`: refused, and kept,
-/// while it holds changes of its own.
-pub async fn remove(path: &Path) -> Result<()> {
+/// How long [`detached`] waits on fetching a head it hasn't got.
+pub const FETCH_WITHIN: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Removes the worktree [`detached`] made at `path` for `commit`: refused,
+/// and kept, while it holds changes of its own or is no longer at it.
+pub async fn remove(path: &Path, commit: &str) -> Result<()> {
+    let head = git(path, &["rev-parse", "HEAD"]).await?;
+    if head != commit {
+        eyre::bail!("{} moved on from {commit} to {head}", path.display());
+    }
     let root = main_checkout(path).await?;
     git(&root, &["worktree", "remove", &path.to_string_lossy()])
         .await
@@ -394,9 +431,10 @@ mod tests {
         let second = git(&repo, &["rev-parse", "HEAD"]).await.unwrap();
         let ticket = create(&repo, "des-2").await.unwrap();
 
-        let made = detached(&ticket, "review 7 abc", &first, PULL)
+        let (made, fresh) = detached(&ticket, "review 7 abc", &first, PULL)
             .await
             .unwrap();
+        assert!(fresh, "made by this call");
         assert_eq!(made, repo.join(".worktrees/review-7-abc"));
         assert_eq!(git(&made, &["rev-parse", "HEAD"]).await.unwrap(), first);
         assert_eq!(
@@ -406,11 +444,16 @@ mod tests {
         );
         assert_eq!(
             detached(&repo, "review 7 abc", &first, PULL).await.unwrap(),
-            made
+            (made.clone(), false),
+            "found again, not made"
         );
         assert!(detached(&repo, "review 7 abc", &second, PULL)
             .await
             .is_err());
+        assert!(
+            detached(&repo, "des 2", &second, PULL).await.is_err(),
+            "a ticket's own worktree, on its branch at that commit"
+        );
         std::fs::create_dir_all(repo.join(".worktrees/plain")).unwrap();
         assert!(
             detached(&repo, "plain", &second, PULL).await.is_err(),
@@ -421,9 +464,17 @@ mod tests {
             .is_err());
 
         std::fs::write(made.join("notes.md"), "x").unwrap();
-        assert!(remove(&made).await.is_err(), "it holds changes");
+        assert!(remove(&made, &first).await.is_err(), "it holds changes");
         std::fs::remove_file(made.join("notes.md")).unwrap();
-        remove(&made).await.unwrap();
+        git(&made, &["checkout", "-q", "--detach", &second])
+            .await
+            .unwrap();
+        assert!(
+            remove(&made, &first).await.is_err(),
+            "no longer at the head it was made for"
+        );
+        assert!(made.exists());
+        remove(&made, &second).await.unwrap();
         assert!(!made.exists());
     }
 
@@ -487,7 +538,7 @@ mod tests {
             .unwrap();
         let head = git(&other, &["rev-parse", "HEAD"]).await.unwrap();
 
-        let made = detached(&repo, "review 7", &head, PULL).await.unwrap();
+        let (made, _) = detached(&repo, "review 7", &head, PULL).await.unwrap();
         assert_eq!(git(&made, &["rev-parse", "HEAD"]).await.unwrap(), head);
         assert_eq!(
             git(&repo, &["rev-parse", "refs/remotes/origin/pull/7/head"])

@@ -1736,6 +1736,29 @@ pub struct ReviewLink {
     pub pr: PrRef,
     pub head_sha: Option<String>,
     pub for_session: Option<Uuid>,
+    /// Desk is done with it: its verdict recorded, or nothing left to
+    /// record ([`crate::store::DeskStore::pr_review_settle`]).
+    pub settled: bool,
+}
+
+/// The worktree a review of `pr` at `head` reads it in, under its
+/// repository's `.worktrees/`: `review-<number>-<short head>`.
+pub fn review_worktree(pr: &PrRef, head: &str) -> String {
+    format!("review-{}-{}", pr.number, &head[..head.len().min(7)])
+}
+
+/// Why a session's own merge of a pull request is refused while a boss
+/// acting fully has it.
+pub const OWN_MERGE: &str = "At Act fully a pull request is merged only by your boss, with \
+crew.github_merge, once a clean review is recorded at its head.";
+
+/// What a session does instead of merging its own pull request.
+pub const OWN_MERGE_INSTEAD: &str = "Don't merge it yourself: tell your boss on your Desk line \
+that it is ready to merge; your boss merges it once it has a clean review at its head.";
+
+/// [`OWN_MERGE`] and [`OWN_MERGE_INSTEAD`], as a refused call says them.
+pub fn own_merge_refused() -> String {
+    format!("{OWN_MERGE} {OWN_MERGE_INSTEAD}")
 }
 
 impl ReviewOf {

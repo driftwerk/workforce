@@ -58,9 +58,6 @@ pub(crate) const SETTLE: chrono::Duration = chrono::Duration::minutes(10);
 const IDLE_HOURS: i64 = 24;
 /// How long the person's last input keeps a session theirs here.
 const HANDS_OFF_HOURS: i64 = 2;
-/// How long the person's last input keeps a session theirs from any close
-/// of its boss's, asked for or not: they are in it.
-pub(super) const PERSON_NOW_MINUTES: i64 = 15;
 /// The most pull requests one session's account names that are read.
 const PULLS_MAX: usize = 5;
 
@@ -490,6 +487,21 @@ impl CrewHub {
         let Some((service, o)) = self.overseer_named(boss) else {
             return Some("No boss runs it now.".into());
         };
+        // A review stays open until Desk is done with it: its verdict
+        // recorded, or the head it read moved on.
+        let link = match self.desk.store().pr_review_of(v.id).await {
+            Ok(link) => link,
+            Err(e) => {
+                tracing::info!(session = %v.id, error = %format!("{e:#}"), "what a session reviews couldn't be read; it isn't closed");
+                return Some("What it reviews couldn't be read, so it stays open for now.".into());
+            }
+        };
+        if link.as_ref().is_some_and(|l| l.head_sha.is_some() && !l.settled) {
+            return Some(
+                "Its review isn't recorded yet: it stays open until Desk records it, or its pull request moves past the head it read."
+                    .into(),
+            );
+        }
         // At Act fully a request the boss decides itself is cancelled as it
         // closes ([`Self::cancel_to_close`]); Desk refuses any other.
         let cancels = v.pending.is_some() && self.level_now(boss, &o).0 == Level::Full;
@@ -526,7 +538,7 @@ impl CrewHub {
                 self.close_settle.lock().num_minutes().max(1)
             ));
         }
-        let now = chrono::Duration::minutes(PERSON_NOW_MINUTES);
+        let now = chrono::Duration::minutes(workforce_desk::charge::PERSON_NOW_MINUTES);
         if self.person_in_for(v.id, Utc::now() - now, self.answer_gap(&o)) {
             return Some("The person is in it now, so it's theirs to close.".into());
         }
@@ -562,8 +574,7 @@ impl CrewHub {
         let (open, kept) = self.left_behind(&service, v).await;
         // A newer session carries its ticket, and its pull requests with it;
         // a review session's pull request was never its work.
-        let reviews = matches!(self.desk.store().pr_review_of(v.id).await, Ok(Some(_)));
-        let open = match reviews || self.superseded(v.id).await {
+        let open = match link.is_some() || self.superseded(v.id).await {
             true => Vec::new(),
             false => open,
         };

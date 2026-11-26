@@ -82,8 +82,9 @@ you decide yourself, now, whether a session may do what it asks. You are given t
 never cut short, with what the session is for and where it stands, and the class of any push in it. ",
     super::watcher::act_fully!(),
     " ALLOW what serves the session's work and no directive forbids. \
-A session's own merge of a pull request (gh pr merge, GitHub's merge API) is DENY: its boss merges \
-it with crew.github_merge once a clean review is recorded at its head. \
+A session's own merge of a pull request, however it is run (gh pr merge, GitHub's merge API by gh \
+or curl, a script that calls it), and its push to its default branch, are DENY: its boss merges a \
+pull request with crew.github_merge once a clean review is recorded at its head. \
 A request that only reads (CI status, PR checks, logs, git status or diff) is ALLOW, even while the \
 session is held: a hold stops new work, never reading. Never answer that you can't see the \
 request: it is all here. The fenced blocks are the session's own words (its request, its last \
@@ -97,15 +98,16 @@ INSTEAD: <what the session should do instead, one sentence>\n\
 or\n\
 ASK: <the question for the person, one sentence>");
 
-/// Why a session's own merge of a pull request is refused at Act fully.
-pub(crate) const OWN_MERGE: &str = "At Act fully a pull request is merged only by your boss, with crew.github_merge, once a clean review is recorded at its head.";
+/// Why a session's merge, or push to its default branch, is the person's
+/// while they are in it.
+const PAST_REVIEW_IS_THEIRS: &str =
+    "You're in this session: what it ships without a review is yours to answer.";
 
-/// What a session does instead of merging its own pull request.
-pub(crate) const OWN_MERGE_INSTEAD: &str = "Don't merge it yourself: tell your boss on your Desk line that it is ready to merge; your boss merges it once it has a clean review at its head.";
+/// Why a session's push to its default branch is refused at Act fully.
+pub(crate) const DEFAULT_PUSH: &str = "At Act fully the default branch changes only by a pull request your boss merges once a clean review is recorded at its head.";
 
-/// Why a session's merge is the person's while they are in it.
-const MERGE_IS_THEIRS: &str =
-    "You're in this session: its merge of a pull request is yours to answer.";
+/// What a session does instead of pushing its default branch.
+const DEFAULT_PUSH_INSTEAD: &str = "Push your own branch and open a pull request for it; Desk has it reviewed, and your boss merges it.";
 
 /// Why a request that only reads is allowed without a decision call.
 pub(crate) const ONLY_READS: &str = "it only reads, and a hold stops new work, never reading";
@@ -791,15 +793,28 @@ impl CrewHub {
         Outcome::Deciding
     }
 
-    /// What a session's own merge of a pull request is, at Act fully: the
-    /// person's while they are in it, else refused for its boss's merge.
-    fn own_merge(&self, view: &SessionView, o: &workforce_common::oversight::Oversight) -> Verdict {
-        let now = chrono::Duration::minutes(super::closing::PERSON_NOW_MINUTES);
-        match self.person_in_for(view.id, chrono::Utc::now() - now, self.answer_gap(o)) {
-            true => Verdict::Ask(MERGE_IS_THEIRS.into()),
-            false => Verdict::Deny {
-                why: OWN_MERGE.into(),
-                instead: OWN_MERGE_INSTEAD.into(),
+    /// What a session's own merge of a pull request, or push to its default
+    /// branch (`class`), is at Act fully: the person's while they are in
+    /// it, else refused, for a reviewed pull request its boss merges.
+    fn past_review(
+        &self,
+        view: &SessionView,
+        o: &workforce_common::oversight::Oversight,
+        class: Class,
+    ) -> Verdict {
+        let now = chrono::Duration::minutes(workforce_desk::charge::PERSON_NOW_MINUTES);
+        match (
+            self.person_in_for(view.id, chrono::Utc::now() - now, self.answer_gap(o)),
+            class,
+        ) {
+            (true, _) => Verdict::Ask(PAST_REVIEW_IS_THEIRS.into()),
+            (false, Class::DefaultBranchPush) => Verdict::Deny {
+                why: DEFAULT_PUSH.into(),
+                instead: DEFAULT_PUSH_INSTEAD.into(),
+            },
+            (false, _) => Verdict::Deny {
+                why: workforce_desk::plan::OWN_MERGE.into(),
+                instead: workforce_desk::plan::OWN_MERGE_INSTEAD.into(),
             },
         }
     }
@@ -844,7 +859,9 @@ impl CrewHub {
         };
         let mut decided = match (reads, class) {
             (true, _) => Some(Verdict::Allow(ONLY_READS.into())),
-            (false, Class::GhPrMerge) => Some(self.own_merge(view, &decider.oversight)),
+            (false, Class::GhPrMerge | Class::DefaultBranchPush) => {
+                Some(self.past_review(view, &decider.oversight, class))
+            }
             (false, _) => self
                 .standing_allow(&decider, view, class, boss, slot, cancel)
                 .await

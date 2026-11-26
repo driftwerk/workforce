@@ -49,7 +49,7 @@
 use std::path::{Component, Path, PathBuf};
 
 mod class;
-pub use class::{class_of, Class, Repo};
+pub use class::{class_of, merges_a_pull, Class, Repo};
 
 /// Where a command is judged.
 pub struct Here<'a> {

@@ -1022,6 +1022,32 @@ impl Desk {
 }
 
 impl Desk {
+    /// Why `id`'s call of `tool` with `input` is refused before it runs,
+    /// whatever its mode or its own allow rules say: a merge of a pull
+    /// request ([`crate::computer::boss::merges_a_pull`]) while a boss
+    /// acting fully has it and the person isn't in it. That boss merges
+    /// it, once a clean review is recorded at its head.
+    pub(crate) fn own_merge_refused(&self, id: Uuid, tool: &str, input: &serde_json::Value) -> Option<String> {
+        let command = input["command"].as_str().filter(|_| tool == "Bash")?;
+        if !crate::computer::boss::merges_a_pull(command) {
+            return None;
+        }
+        let boss = self.charge_of(id).filter(Charge::live)?.boss;
+        let fully = match crate::grant::is_served(&boss) {
+            true => self
+                .0
+                .served_full
+                .lock()
+                .clone()
+                .is_some_and(|j| j.full_of(&boss).is_some()),
+            false => self.0.state.lock().charges.full.contains_key(&boss),
+        };
+        let now = Utc::now() - chrono::Duration::minutes(charge::PERSON_NOW_MINUTES);
+        let person_in = self.last_input_of(id).is_some_and(|at| at > now)
+            || self.wheel_of(id).is_some_and(Wheel::person);
+        (fully && !person_in).then(crate::plan::own_merge_refused)
+    }
+
     /// Whether a call of `id` Desk doesn't judge safe is asked, for `boss`
     /// (served from a grant) to decide: while it is at Act fully in force,
     /// a live grant of it holds the session, and the session's mode, as

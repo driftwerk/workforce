@@ -2801,7 +2801,7 @@ impl CrewHub {
 
     /// The plan, ticket and key of the plan's ticket `session` (one on this
     /// computer) is linked to, or is being started on, if any.
-    async fn plan_ticket_of(&self, session: Uuid) -> Option<(Uuid, Uuid, String)> {
+    pub(super) async fn plan_ticket_of(&self, session: Uuid) -> Option<(Uuid, Uuid, String)> {
         let store = self.desk.store();
         let linked = store.linked_tickets(&[session]).await.ok()?;
         let starting = store.starting().await.unwrap_or_default();

@@ -52,6 +52,7 @@ pub mod engine;
 pub mod engine_accounts;
 pub mod find;
 mod first_run;
+mod gh_shim;
 pub mod floor;
 pub mod folders;
 pub mod gist;
