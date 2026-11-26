@@ -13,6 +13,7 @@ use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 use parking_lot::Mutex;
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 use workforce_common::oversight::Oversight;
 use workforce_desk::computer::boss::Class;
@@ -32,6 +33,41 @@ impl Standings {
     pub(super) fn forget(&self, boss: &str) {
         self.0.lock().retain(|(b, _), _| b != boss);
     }
+
+    /// Whether any boss's verdict on `session` is kept, or being asked for.
+    #[cfg(test)]
+    pub(super) fn holds(&self, session: Uuid) -> bool {
+        self.0.lock().keys().any(|(_, id)| *id == session)
+    }
+
+    /// Whether a verdict on `session` is given, and none is being asked for.
+    #[cfg(test)]
+    pub(super) fn given(&self, session: Uuid) -> bool {
+        let all = self.0.lock();
+        let of: Vec<&Entry> = all
+            .iter()
+            .filter(|((_, id), _)| *id == session)
+            .map(|(_, e)| e)
+            .collect();
+        !of.is_empty() && of.iter().all(|e| matches!(e, Entry::Given(_)))
+    }
+}
+
+impl CrewHub {
+    /// Drops the verdicts of sessions no longer on Desk.
+    fn standings_prune(&self) {
+        let ids: Vec<Uuid> = self.standings.0.lock().keys().map(|(_, id)| *id).collect();
+        let gone: Vec<Uuid> = ids
+            .into_iter()
+            .filter(|id| self.desk.view(*id).is_err())
+            .collect();
+        if !gone.is_empty() {
+            self.standings
+                .0
+                .lock()
+                .retain(|(_, id), _| !gone.contains(id));
+        }
+    }
 }
 
 enum Entry {
@@ -49,29 +85,10 @@ struct Standing {
     allows: HashMap<Class, String>,
 }
 
-/// Words that make a directive hold only sometimes: what it allows then
-/// can't stand for every request.
-const CONDITIONAL: &[&str] = &[
-    "unless",
-    "until",
-    "except",
-    "only if",
-    "after",
-    "before",
-    "today",
-    "tonight",
-    "tomorrow",
-    "this week",
-    "weekend",
-    "monday",
-    "tuesday",
-    "wednesday",
-    "thursday",
-    "friday",
-    "saturday",
-    "sunday",
-    "o'clock",
-];
+/// Words that make a directive hold only sometimes, as the design names
+/// them (with a time of day, `6pm`): what it allows then can't stand for
+/// every request.
+const CONDITIONAL: &[&str] = &["unless", "until", "only if", "this week", "o'clock"];
 
 /// Whether one of the person's own directives in `words` (each a `- `
 /// line) holds only sometimes.
@@ -131,7 +148,7 @@ fn allows_of(text: &str) -> HashMap<Class, String> {
     text.lines()
         .filter_map(|l| {
             let (class, rest) = l.trim().trim_matches('`').split_once(':')?;
-            let class = Class::parse(class).filter(|c| c.cacheable(true))?;
+            let class = Class::parse(class.trim()).ok().filter(|c| c.cacheable())?;
             let why = rest
                 .trim()
                 .strip_prefix("allow")
@@ -175,8 +192,11 @@ impl CrewHub {
         view: &SessionView,
         class: Class,
         boss: &str,
+        slot: &Arc<tokio::sync::Semaphore>,
+        cancel: &CancellationToken,
     ) -> Option<String> {
-        if !class.cacheable(true) || self.minds.person_in_turn(boss) {
+        self.standings_prune();
+        if !class.cacheable() || self.minds.person_in_turn(boss) {
             return None;
         }
         if !matches!(self.hold_on(view.id).await, Ok(None)) {
@@ -204,8 +224,17 @@ impl CrewHub {
                     all.insert(key.clone(), Entry::Asking(version));
                     let crew = Arc::clone(self);
                     let (view, boss) = (view.clone(), boss.to_string());
+                    let (slot, cancel) = (Arc::clone(slot), cancel.clone());
+                    // One of the boss's calls at a time, as its decisions
+                    // are, and none once its decide loop ends.
                     tokio::spawn(async move {
-                        let given = crew.ask_standing(&view, &boss, version, &words).await;
+                        let given = tokio::select! {
+                            () = cancel.cancelled() => None,
+                            given = async {
+                                let _slot = slot.acquire().await;
+                                crew.ask_standing(&view, &boss, version, &words).await
+                            } => given,
+                        };
                         let mut all = crew.standings.0.lock();
                         if matches!(all.get(&key), Some(Entry::Asking(v)) if *v == version) {
                             match given {
@@ -301,6 +330,16 @@ mod tests {
         ] {
             assert!(
                 conditional(&format!("The person's standing orders:\n{words}")),
+                "{words}"
+            );
+        }
+        for words in [
+            "- “push after review, before lunch” (at 10:02)",
+            "- “commit everything except the docs” (at 10:02)",
+            "- “we ship on Friday, so keep it tidy today” (at 10:02)",
+        ] {
+            assert!(
+                !conditional(&format!("The person's standing orders:\n{words}")),
                 "{words}"
             );
         }

@@ -1515,12 +1515,15 @@ impl Follower {
                 let params = v.get("params").cloned().unwrap_or(Value::Null);
                 let ours = |thread: &str| self.thread.as_deref() == Some(thread);
                 if owner_of(method) != Owner::Desk {
-                    let thread = params
-                        .get("threadId")
-                        .and_then(Value::as_str)
-                        .map(str::to_string)
-                        .or_else(|| self.thread.clone())
-                        .filter(|t| ours(t));
+                    // Its thread as it names it (`conversationId` on the
+                    // legacy approvals): one naming none (a sign-in's
+                    // refresh, the time) is no thread's wait, and no
+                    // `serverRequest/resolved`, which names a thread, ends it.
+                    let thread = ["threadId", "conversationId"]
+                        .iter()
+                        .find_map(|k| params.get(*k).and_then(Value::as_str))
+                        .filter(|t| ours(t))
+                        .map(str::to_string);
                     let seen = thread.map(|thread| Seen {
                         thread,
                         event: CodexEvent::Elsewhere {
@@ -3033,8 +3036,9 @@ pub(crate) mod tests {
     }
 
     /// Every request 0.166's app-server sends is Desk's to answer, its
-    /// TUI's, or none Desk knows: each is seen, and only Desk's are open
-    /// for Desk to answer.
+    /// TUI's, or none Desk knows: each the thread's is seen, and only
+    /// Desk's are open for Desk to answer. One naming no thread is none
+    /// of its session's waits.
     #[test]
     fn every_request_0_166_sends_is_desks_or_its_tuis_and_any_other_is_unknown() {
         let mut f = Follower::new(Some("t1".into()), None);
@@ -3057,6 +3061,7 @@ pub(crate) mod tests {
                     event: CodexEvent::Elsewhere { known: true, .. },
                     ..
                 }] => "Tui".into(),
+                [] => "No thread's".into(),
                 other => panic!("{method}: {other:?}"),
             };
             kinds.push((method, kind));
@@ -3074,6 +3079,21 @@ pub(crate) mod tests {
             "{owners:?}"
         );
         assert_eq!(kinds[4].1, "Permissions");
+        let unthreaded: Vec<&str> = kinds
+            .iter()
+            .filter(|(_, k)| k == "No thread's")
+            .map(|(m, _)| m.as_str())
+            .collect();
+        assert_eq!(
+            unthreaded,
+            ["account/chatgptAuthTokens/refresh", "attestation/generate"]
+        );
+        assert!(kinds
+            .iter()
+            .any(|(m, k)| m == "execCommandApproval" && k == "Tui"));
+        let (seen, _) =
+            f.heard(&json!({"id": 31, "method": "item/tool/call", "params": {"threadId": "t2"}}));
+        assert_eq!(seen, [], "another thread's");
         let (seen, _) =
             f.heard(&json!({"id": 30, "method": "item/someday/new", "params": {"threadId": "t1"}}));
         assert_eq!(

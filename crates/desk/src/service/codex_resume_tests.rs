@@ -145,6 +145,17 @@ async fn started_with(
     dir: &Path,
     approve_for_me: bool,
 ) -> (Desk, crate::model::SessionView) {
+    let (d, s, _) = followed(pool, dir, approve_for_me).await;
+    (d, s)
+}
+
+/// [`started_with`], and its app-server's end, which Desk's observer
+/// follows its thread on.
+async fn followed(
+    pool: PostgresPool,
+    dir: &Path,
+    approve_for_me: bool,
+) -> (Desk, crate::model::SessionView, WebSocketStream<UnixStream>) {
     DeskStore::migrate(&pool).await.unwrap();
     let d = desk_on(pool, dir, CancellationToken::new()).await;
     let server = serve(dir);
@@ -172,7 +183,7 @@ async fn started_with(
         "{:?}",
         tui_starts(dir)
     );
-    (d, s)
+    (d, s, ws)
 }
 
 async fn desk_on(pool: PostgresPool, dir: &Path, cancel: CancellationToken) -> Desk {
@@ -666,11 +677,195 @@ async fn a_codex_session_keeps_its_mode_through_every_start_and_a_refusal_is_sai
     .await;
 }
 
-/// A session adopted before Desk read which sessions bosses run was taken
-/// to be under one: once they are read, what it runs in is read again
-/// from them, and it is never started again for that.
+/// Crew, at `level`, as the hub says its overseer is.
+fn crew_at(d: &Desk, level: &str) {
+    d.set_bosses(vec![super::scopes::Boss {
+        agent: "crew".into(),
+        name: "Crew".into(),
+        scope: crate::scope::Scope::Ungrouped,
+        level: level.into(),
+    }]);
+}
+
+async fn taken_on(d: &Desk, id: Uuid) {
+    d.take_on(
+        id,
+        &crate::crew::Party::manager("crew", "Crew"),
+        crate::charge::How::Handed,
+        &Default::default(),
+        &By::you(),
+    )
+    .await
+    .unwrap();
+}
+
+/// A boss that only suggests leaves a session's requests to the person:
+/// its charge changes nothing of what Codex runs it in. Set to Act, it
+/// decides them: started again in place, once its turn ends, and what its
+/// boss says to it meanwhile waits for that, never read in the old ones.
 #[tokio::test]
-async fn a_codex_session_adopted_before_charges_were_read_is_read_again_not_started_again() {
+async fn only_a_boss_that_decides_its_requests_changes_what_codex_runs_it_in() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let dir = dir.path().canonicalize().unwrap();
+        let (d, s, mut ws) = followed(pool, &dir, true).await;
+        crew_at(&d, "suggest");
+        taken_on(&d, s.id).await;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(tui_starts(&dir).len(), 1, "nothing started again");
+        assert!(!d.permissions_due(s.id));
+
+        // Set to Act mid-turn: started again only once the turn ends.
+        say(&mut ws, status("active")).await;
+        until(|| d.view(s.id).unwrap().state == SessionState::Working).await;
+        crew_at(&d, "act");
+        assert!(d.permissions_due(s.id));
+        let told = d
+            .line_send(
+                super::line::Sender::Overseer(By::manager("crew", "Crew", "go on")),
+                crate::line::Send::Tell {
+                    to: crate::line::Target::Session(s.id),
+                    text: "carry on with the tests".into(),
+                    when: crate::line::When::Queue,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            d.line_gate(&d.view(s.id).unwrap(), &told),
+            Some(crate::line::Wait::Restarting)
+        );
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(tui_starts(&dir).len(), 1, "not mid-turn");
+        let server = serve(&dir);
+        say(&mut ws, status("idle")).await;
+        let mut ws = server.await.unwrap();
+        assert_eq!(
+            resumed(&mut ws, json!({"thread": {"id": "t1"}})).await,
+            in_mode(&dir, "on-request", "workspace-write"),
+            "its boss's now: Codex's reviewer stands down"
+        );
+        until(|| tui_starts(&dir).len() == 2).await;
+        until(|| !d.permissions_due(s.id)).await;
+    })
+    .await;
+}
+
+/// Taken on before its thread is up, a session is left until it is; one
+/// whose thread never ran a turn (no rollout to resume) is started afresh
+/// in what it now runs in, never refused nor left stopped.
+#[tokio::test]
+async fn a_codex_session_with_no_turn_yet_is_started_afresh_once_it_is_up() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let dir = dir.path().canonicalize().unwrap();
+        DeskStore::migrate(&pool).await.unwrap();
+        let d = desk_on(pool, &dir, CancellationToken::new()).await;
+        let server = serve(&dir);
+        let s = d.create(codex_session(&dir, false), None).await.unwrap();
+        let mut ws = server.await.unwrap();
+        taken_on(&d, s.id).await;
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        assert_eq!(d.view(s.id).unwrap().state, SessionState::Starting);
+        assert_eq!(tui_starts(&dir).len(), 1, "not while it starts");
+
+        let server = serve(&dir);
+        let rollout = dir.join("rollout-t1.jsonl");
+        say(
+            &mut ws,
+            json!({"method": "thread/started", "params": {"thread": {"id": "t1",
+            "environments": [{"cwd": dir}], "path": rollout}}}),
+        )
+        .await;
+        say(&mut ws, status("idle")).await;
+        let _ws = server.await.unwrap();
+        until(|| tui_starts(&dir).len() == 2).await;
+        let again = tui_starts(&dir)[1].clone();
+        assert!(again.starts_with("--remote"), "a new thread: {again}");
+        assert!(again.contains("approvals_reviewer=user"), "{again}");
+        until(|| d.view(s.id).unwrap().live).await;
+        let v = d.view(s.id).unwrap();
+        assert!(v.failure.is_none() && v.exited.is_none(), "{v:?}");
+        let afresh = d
+            .activity(crate::crew::Filter::All, None, 50)
+            .await
+            .unwrap()
+            .events
+            .into_iter()
+            .any(|e| e.text.contains("Started it afresh"));
+        assert!(afresh);
+    })
+    .await;
+}
+
+/// A start in new permissions that Codex refuses is said on its card, and
+/// the session is left stopped for whoever starts it next; the failure is
+/// gone once a start runs, and what Codex then says it runs the thread in,
+/// when that isn't what Desk asked, is said.
+#[tokio::test]
+async fn a_failed_start_in_new_permissions_is_said_once_and_a_mismatch_is_said() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let dir = dir.path().canonicalize().unwrap();
+        let (d, s) = started_with(pool, &dir, true).await;
+        let mut events = d.events();
+        let lost = json!({"code": -32603, "message": "no rollout found for thread id t1"});
+        taken_on(&d, s.id).await;
+        let mut ws = serve(&dir).await.unwrap();
+        resumed(&mut ws, lost).await;
+        until(|| d.view(s.id).unwrap().failure.is_some()).await;
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        assert!(!d.view(s.id).unwrap().live, "left stopped");
+        assert!(
+            !dir.join("listen").exists(),
+            "never started again on its own"
+        );
+
+        let runs = json!({"thread": {"id": "t1"}, "approvalsReviewer": "auto_review",
+            "sandbox": {"type": "workspaceWrite", "networkAccess": false}});
+        started_again(&d, &dir, &[runs], move |d| async move {
+            d.resume(s.id, None, Some(By::you())).await.map(drop)
+        })
+        .await;
+        until(|| d.view(s.id).unwrap().failure.is_none()).await;
+
+        let mut said = 0;
+        let mut before = false;
+        while let Ok(e) = events.try_recv() {
+            if let crate::model::DeskEvent::Session { session } = e {
+                let now = session.id == s.id
+                    && matches!(&session.failure, Some(crate::limit::TurnFailure::Failed(why))
+                        if why.contains("couldn't apply this session's permissions"));
+                said += usize::from(now && !before);
+                before = now;
+            }
+        }
+        assert_eq!(said, 1, "said once");
+        let note = async || {
+            d.activity(crate::crew::Filter::All, None, 50)
+                .await
+                .unwrap()
+                .events
+                .into_iter()
+                .any(|e| {
+                    e.text
+                        .contains("other permissions than Desk asked: reviewer auto_review")
+                })
+        };
+        let end = tokio::time::Instant::now() + Duration::from_secs(5);
+        while !note().await {
+            assert!(tokio::time::Instant::now() < end, "the mismatch is said");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await;
+}
+
+/// A session adopted from an earlier run of Desk runs in what Codex says
+/// its thread runs in: never started again before that is said, nor after
+/// when it is what it should run in now; started again in place when not.
+#[tokio::test]
+async fn an_adopted_codex_session_runs_in_what_codex_says_until_that_differs() {
     with_test_pool(build_pool, |pool| async move {
         let dir = tempfile::tempdir().unwrap();
         let dir = dir.path().canonicalize().unwrap();
@@ -681,17 +876,50 @@ async fn a_codex_session_adopted_before_charges_were_read_is_read_again_not_star
             (l.permissions, l.settled)
         };
         let own = crate::codex::Permissions::of(None, true, false);
+        let charged = crate::codex::Permissions::of(None, true, true);
         assert_eq!(link(&d), (own, true));
-        {
+        let adopted = |d: &Desk| {
             let mut st = d.0.state.lock();
             let l = st.live.get_mut(&s.id).unwrap()._codex.as_mut().unwrap();
-            l.permissions = crate::codex::Permissions::of(None, true, true);
+            l.permissions = charged;
             l.settled = false;
-        }
+        };
+        let runs = |reviewer: &str| crate::codex::Runs {
+            reviewer: Some(reviewer.into()),
+            sandbox: Some("workspaceWrite".into()),
+            network: Some(false),
+        };
+
+        // Not yet said: left as it is.
+        adopted(&d);
+        assert!(!d.permissions_due(s.id));
         d.modes_changed();
-        until(|| link(&d) == (own, true)).await;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(tui_starts(&dir).len(), 1);
+
+        // Said to run in what it should now: kept so.
+        d.codex_runs(s.id, &runs("auto_review"));
+        assert_eq!(link(&d), (own, true));
         tokio::time::sleep(Duration::from_millis(500)).await;
         assert_eq!(tui_starts(&dir).len(), 1, "never started again");
+
+        // Said to run under a boss no longer there: started again in its own.
+        adopted(&d);
+        let (asked, _) = started_again(
+            &d,
+            &dir,
+            &[json!({"thread": {"id": "t1"}})],
+            move |d| async move {
+                d.codex_runs(s.id, &runs("user"));
+                Ok(())
+            },
+        )
+        .await;
+        let mut back = in_mode(&dir, "on-request", "workspace-write");
+        back["approvalsReviewer"] = json!("auto_review");
+        assert_eq!(asked, [back]);
+        until(|| tui_starts(&dir).len() == 2).await;
+        until(|| link(&d) == (own, true)).await;
     })
     .await;
 }

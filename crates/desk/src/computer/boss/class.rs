@@ -2,35 +2,35 @@
 //! ([`Class`]): narrow, since an escalated command runs outside the
 //! sandbox once allowed. A command is split as the allowlist splits it,
 //! each `sh -c`, `bash -lc` and `eval` script walked again, each git alias
-//! resolved, and its riskiest part is its class. What can't be read for
-//! certain is [`Class::Other`].
+//! resolved, and its riskiest part is its class. Each tool's flags are read
+//! against the few it is known by in its class: a flag outside them, and
+//! whatever can't be read for certain, is [`Class::Other`].
 
 use std::collections::HashMap;
 
 use super::{push, split, Cmd, Here, PushKind, Walk, Word};
 
-/// A command's kind, in order of risk.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum Class {
-    LocalGit,
-    GhRead,
-    FetchPull,
-    Commit,
-    TestBuild,
-    PackageInstall,
-    GhPrCreate,
-    OwnBranchPush,
-    ProdRead,
-    TagPush,
-    DefaultBranchPush,
-    GhPrMerge,
-    Deploy,
-    RemoteDelete,
-    ForcePush,
-    Other,
-}
+crate::model::text_enum!(Class {
+    LocalGit => "local_git",
+    GhRead => "gh_read",
+    FetchPull => "fetch_pull",
+    Commit => "commit",
+    TestBuild => "test_build",
+    PackageInstall => "package_install",
+    GhPrCreate => "gh_pr_create",
+    OwnBranchPush => "own_branch_push",
+    ProdRead => "prod_read",
+    TagPush => "tag_push",
+    DefaultBranchPush => "default_branch_push",
+    GhPrMerge => "gh_pr_merge",
+    Deploy => "deploy",
+    RemoteDelete => "remote_delete",
+    ForcePush => "force_push",
+    Other => "other",
+});
 
 impl Class {
+    /// What a standing verdict may answer, at Act fully.
     pub const CACHEABLE: [Class; 8] = [
         Class::OwnBranchPush,
         Class::Commit,
@@ -42,49 +42,8 @@ impl Class {
         Class::PackageInstall,
     ];
 
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::LocalGit => "local_git",
-            Self::GhRead => "gh_read",
-            Self::FetchPull => "fetch_pull",
-            Self::Commit => "commit",
-            Self::TestBuild => "test_build",
-            Self::PackageInstall => "package_install",
-            Self::GhPrCreate => "gh_pr_create",
-            Self::OwnBranchPush => "own_branch_push",
-            Self::ProdRead => "prod_read",
-            Self::TagPush => "tag_push",
-            Self::DefaultBranchPush => "default_branch_push",
-            Self::GhPrMerge => "gh_pr_merge",
-            Self::Deploy => "deploy",
-            Self::RemoteDelete => "remote_delete",
-            Self::ForcePush => "force_push",
-            Self::Other => "other",
-        }
-    }
-
-    pub fn parse(s: &str) -> Option<Self> {
-        Self::CACHEABLE
-            .into_iter()
-            .chain([
-                Self::ProdRead,
-                Self::TagPush,
-                Self::DefaultBranchPush,
-                Self::GhPrMerge,
-                Self::Deploy,
-                Self::RemoteDelete,
-                Self::ForcePush,
-                Self::Other,
-            ])
-            .find(|c| c.as_str() == s.trim())
-    }
-
-    /// Whether a standing verdict may answer it: at Act fully, every
-    /// cacheable class; at Act, never what runs the workspace's or a
-    /// registry's code (tests and builds, installs).
-    pub fn cacheable(self, fully: bool) -> bool {
+    pub fn cacheable(self) -> bool {
         Self::CACHEABLE.contains(&self)
-            && (fully || !matches!(self, Self::TestBuild | Self::PackageInstall))
     }
 }
 
@@ -104,7 +63,7 @@ impl From<PushKind> for Class {
 /// What the session's repository says, beyond [`Here`], for a command's
 /// class.
 pub struct Repo<'a> {
-    /// Its git aliases, by name (`git config --get-regexp ^alias\.`).
+    /// Its git aliases, by name (`git config -z --get-regexp ^alias\.`).
     pub aliases: &'a HashMap<String, String>,
     /// Whether a name is one of its local branches
     /// (`rev-parse --verify refs/heads/<name>`).
@@ -130,9 +89,157 @@ const PLAIN_ENV: &[&str] = &[
     "RUST_BACKTRACE",
     "RUST_LOG",
     "GIT_TERMINAL_PROMPT",
-    "GIT_PAGER",
-    "PAGER",
 ];
+
+/// Git's own commands: an alias by one of their names is never run
+/// (git runs its own), so it is never read in its place.
+const GIT_BUILTINS: &[&str] = &[
+    "add",
+    "am",
+    "annotate",
+    "apply",
+    "archive",
+    "bisect",
+    "blame",
+    "branch",
+    "bundle",
+    "cat-file",
+    "check-attr",
+    "check-ignore",
+    "checkout",
+    "checkout-index",
+    "cherry",
+    "cherry-pick",
+    "clean",
+    "clone",
+    "commit",
+    "commit-tree",
+    "config",
+    "count-objects",
+    "describe",
+    "diff",
+    "diff-files",
+    "diff-index",
+    "diff-tree",
+    "difftool",
+    "fetch",
+    "filter-branch",
+    "for-each-ref",
+    "format-patch",
+    "fsck",
+    "gc",
+    "grep",
+    "hash-object",
+    "help",
+    "init",
+    "log",
+    "ls-files",
+    "ls-remote",
+    "ls-tree",
+    "maintenance",
+    "merge",
+    "merge-base",
+    "mergetool",
+    "mv",
+    "notes",
+    "prune",
+    "pull",
+    "push",
+    "range-diff",
+    "read-tree",
+    "rebase",
+    "reflog",
+    "remote",
+    "repack",
+    "replace",
+    "reset",
+    "restore",
+    "rev-list",
+    "rev-parse",
+    "revert",
+    "rm",
+    "shortlog",
+    "show",
+    "show-ref",
+    "sparse-checkout",
+    "stash",
+    "status",
+    "submodule",
+    "switch",
+    "symbolic-ref",
+    "tag",
+    "update-index",
+    "update-ref",
+    "version",
+    "worktree",
+    "write-tree",
+];
+
+/// A command's flags read against what a tool is known by: each flag
+/// that takes a value, and each that doesn't.
+struct Known<'a> {
+    valued: &'a [&'a str],
+    bare: &'a [&'a str],
+}
+
+/// One flag as given, and its value when it takes one.
+type Flag<'a> = (&'a str, Option<&'a str>);
+
+impl Known<'_> {
+    /// `args`' flags and operands, every flag one it knows (`--name=v`,
+    /// `--name v`, `-xv`, `-x v`, `-abc` of bare ones), all after `--`
+    /// operands; none when a flag is unknown or wants a value it lacks.
+    fn read<'a>(&self, args: &[&'a str]) -> Option<(Vec<Flag<'a>>, Vec<&'a str>)> {
+        let (mut flags, mut ops) = (Vec::new(), Vec::new());
+        let mut it = args.iter().copied();
+        while let Some(a) = it.next() {
+            if a == "--" {
+                ops.extend(it.by_ref());
+                break;
+            }
+            if let Some(long) = a.strip_prefix("--") {
+                let (name, value) = match long.split_once('=') {
+                    Some((n, v)) => (&a[..n.len() + 2], Some(v)),
+                    None => (a, None),
+                };
+                match value {
+                    Some(v) if self.valued.contains(&name) => flags.push((name, Some(v))),
+                    None if self.bare.contains(&name) => flags.push((name, None)),
+                    None if self.valued.contains(&name) => flags.push((name, Some(it.next()?))),
+                    _ => return None,
+                }
+            } else if a.len() > 1 && a.starts_with('-') {
+                // Its first letter, `-x`, when it has a value attached.
+                let cut = a.char_indices().nth(2).map_or(a.len(), |(i, _)| i);
+                let (name, attached) = a.split_at(cut);
+                if self.bare.contains(&a) {
+                    flags.push((a, None));
+                } else if self.valued.contains(&a) {
+                    flags.push((a, Some(it.next()?)));
+                } else if self.valued.contains(&name) {
+                    flags.push((name, Some(attached.strip_prefix('=').unwrap_or(attached))));
+                } else if a[1..].chars().all(|c| {
+                    let mut one = String::from("-");
+                    one.push(c);
+                    self.bare.contains(&one.as_str())
+                }) {
+                    // `-abc`: each a bare flag.
+                    flags.push((a, None));
+                } else {
+                    return None;
+                }
+            } else {
+                ops.push(a);
+            }
+        }
+        Some((flags, ops))
+    }
+
+    /// Whether every flag of `args` is one it knows.
+    fn all(&self, args: &[&str]) -> bool {
+        self.read(args).is_some()
+    }
+}
 
 /// `command`'s class, run where `here` and `repo` say: its riskiest part's.
 pub fn class_of(command: &str, here: &Here<'_>, repo: &Repo<'_>) -> Class {
@@ -230,12 +337,72 @@ fn is_c_flag(flag: &str) -> bool {
         .is_some_and(|f| f.ends_with('c') && f.chars().all(|c| matches!(c, 'c' | 'l' | 'i')))
 }
 
-fn operands<'a>(args: &[&'a str]) -> Vec<&'a str> {
-    args.iter()
-        .copied()
-        .filter(|a| !a.starts_with('-'))
-        .collect()
+/// Whether `flag` is `--amend`, as git reads a long option from any
+/// prefix of it that names no other (`--am`, `--ame`).
+fn amends(flag: &str) -> bool {
+    flag.len() >= 4 && "--amend".starts_with(flag)
 }
+
+/// What `git diff`, `log` and `show` are known by: what they print,
+/// never where (`--output`), what they read outside the repository
+/// (`--no-index`), or a driver they run (`--ext-diff`, `--textconv`).
+const GIT_READS: Known = Known {
+    valued: &[
+        "--format",
+        "--pretty",
+        "--since",
+        "--until",
+        "--after",
+        "--before",
+        "--author",
+        "--grep",
+        "--max-count",
+        "-n",
+        "-U",
+        "--unified",
+        "--color",
+        "--stat",
+        "--diff-filter",
+        "--date",
+        "--abbrev",
+    ],
+    bare: &[
+        "--stat",
+        "--shortstat",
+        "--numstat",
+        "--summary",
+        "--name-only",
+        "--name-status",
+        "--oneline",
+        "-p",
+        "--patch",
+        "--no-patch",
+        "-s",
+        "--cached",
+        "--staged",
+        "--graph",
+        "--decorate",
+        "--no-decorate",
+        "--all",
+        "--color",
+        "--no-color",
+        "-w",
+        "--word-diff",
+        "--no-ext-diff",
+        "--no-textconv",
+        "--reverse",
+        "--first-parent",
+        "--no-merges",
+        "--merges",
+        "--quiet",
+        "-q",
+        "--exit-code",
+        "--check",
+        "--raw",
+        "--full-index",
+        "--abbrev-commit",
+    ],
+};
 
 fn git(args: &[&str], here: &Here<'_>, repo: &Repo<'_>, depth: usize, moved: bool) -> Class {
     let args = match args {
@@ -250,7 +417,11 @@ fn git(args: &[&str], here: &Here<'_>, repo: &Repo<'_>, depth: usize, moved: boo
     if sub.starts_with('-') {
         return Class::Other;
     }
-    if let Some(alias) = repo.aliases.get(*sub) {
+    if let Some(alias) = repo
+        .aliases
+        .get(*sub)
+        .filter(|_| !GIT_BUILTINS.contains(sub))
+    {
         let tail = rest
             .iter()
             .map(|a| shell_word(a))
@@ -261,6 +432,8 @@ fn git(args: &[&str], here: &Here<'_>, repo: &Repo<'_>, depth: usize, moved: boo
             None => classed(&format!("git {alias} {tail}"), here, repo, depth + 1),
         };
     }
+    // A git command by a digit-run like `log -5`: its count.
+    let counts = |a: &&str| a.len() > 1 && a[1..].chars().all(|c| c.is_ascii_digit());
     let flags: Vec<&str> = rest
         .iter()
         .copied()
@@ -273,6 +446,7 @@ fn git(args: &[&str], here: &Here<'_>, repo: &Repo<'_>, depth: usize, moved: boo
     };
     let from_own =
         |remote: Option<&&str>| remote.is_none_or(|r| *r == "origin" || repo.upstream == Some(*r));
+    let known = |k: Known| k.all(rest);
     match *sub {
         "push" => {
             let words: Vec<Word> = rest
@@ -291,9 +465,49 @@ fn git(args: &[&str], here: &Here<'_>, repo: &Repo<'_>, depth: usize, moved: boo
             };
             push(&walk, &words).0.into()
         }
-        "commit" if !flags.iter().any(|f| f.starts_with("--amend")) => Class::Commit,
-        "commit" if !repo.head_pushed => Class::Commit,
-        "add" | "status" | "diff" | "log" | "show" => Class::LocalGit,
+        "commit" if !flags.iter().any(|f| amends(f)) || !repo.head_pushed => Class::Commit,
+        "diff" | "log" | "show" => {
+            let rest: Vec<&str> = rest.iter().copied().filter(|a| !counts(a)).collect();
+            match GIT_READS.all(&rest) {
+                true => Class::LocalGit,
+                false => Class::Other,
+            }
+        }
+        "status"
+            if known(Known {
+                valued: &["--untracked-files", "-u", "--porcelain", "--ignored"],
+                bare: &[
+                    "-s",
+                    "--short",
+                    "-b",
+                    "--branch",
+                    "--porcelain",
+                    "--long",
+                    "-v",
+                    "--ignored",
+                    "-u",
+                ],
+            }) =>
+        {
+            Class::LocalGit
+        }
+        "add"
+            if known(Known {
+                valued: &[],
+                bare: &[
+                    "-A",
+                    "--all",
+                    "-u",
+                    "--update",
+                    "-N",
+                    "--intent-to-add",
+                    "-v",
+                    "--verbose",
+                ],
+            }) =>
+        {
+            Class::LocalGit
+        }
         "branch" => {
             let lists = flags
                 .iter()
@@ -356,6 +570,13 @@ fn git(args: &[&str], here: &Here<'_>, repo: &Repo<'_>, depth: usize, moved: boo
     }
 }
 
+fn operands<'a>(args: &[&'a str]) -> Vec<&'a str> {
+    args.iter()
+        .copied()
+        .filter(|a| !a.starts_with('-'))
+        .collect()
+}
+
 /// A word as the shell would read it back as one.
 fn shell_word(w: &str) -> String {
     match w
@@ -367,79 +588,374 @@ fn shell_word(w: &str) -> String {
     }
 }
 
+/// What `gh`'s reading commands are known by.
+const GH_READS: Known = Known {
+    valued: &[
+        "--json",
+        "--jq",
+        "-q",
+        "--template",
+        "-t",
+        "--state",
+        "-s",
+        "--limit",
+        "-L",
+        "--author",
+        "-A",
+        "--label",
+        "-l",
+        "--base",
+        "-B",
+        "--head",
+        "-H",
+        "--repo",
+        "-R",
+        "--search",
+        "-S",
+        "--branch",
+        "-b",
+        "--workflow",
+        "-w",
+        "--event",
+        "-e",
+        "--status",
+        "--user",
+        "-u",
+        "--job",
+        "-j",
+        "--attempt",
+        "-a",
+        "--interval",
+        "-i",
+        "--assignee",
+        "--commit",
+    ],
+    bare: &[
+        "--comments",
+        "-c",
+        "--name-only",
+        "--patch",
+        "--color",
+        "--required",
+        "--watch",
+        "--fail-fast",
+        "--exit-status",
+        "--log",
+        "--log-failed",
+        "--verbose",
+        "-v",
+        "--draft",
+        "-d",
+        "--all",
+    ],
+};
+
 fn gh(args: &[&str], here: &Here<'_>) -> Class {
-    let has = |names: &[&str]| {
-        args.iter().any(|a| {
-            names
-                .iter()
-                .any(|n| a == n || a.starts_with(&format!("{n}=")))
-        })
-    };
+    let is = |c: Class, ok: bool| if ok { c } else { Class::Other };
     match args {
-        ["pr", "view" | "checks" | "diff" | "list", ..]
-        | ["run", "view" | "list" | "watch", ..]
-        | ["issue", "view" | "list", ..] => Class::GhRead,
+        ["pr", "view" | "checks" | "diff" | "list", rest @ ..]
+        | ["run", "view" | "list" | "watch", rest @ ..]
+        | ["issue", "view" | "list", rest @ ..] => is(Class::GhRead, GH_READS.all(rest)),
         ["pr", "create", rest @ ..] => {
-            let head = rest
-                .iter()
-                .position(|a| *a == "--head" || *a == "-H")
-                .and_then(|i| rest.get(i + 1))
-                .copied()
-                .or_else(|| rest.iter().find_map(|a| a.strip_prefix("--head=")));
-            let own = head.is_none_or(|h| here.branch == Some(h));
-            match own && !has(&["--repo", "-R"]) {
-                true => Class::GhPrCreate,
-                false => Class::Other,
-            }
+            let known = Known {
+                valued: &[
+                    "--title",
+                    "-t",
+                    "--body",
+                    "-b",
+                    "--body-file",
+                    "-F",
+                    "--base",
+                    "-B",
+                    "--head",
+                    "-H",
+                    "--label",
+                    "-l",
+                    "--reviewer",
+                    "-r",
+                    "--assignee",
+                    "-a",
+                    "--milestone",
+                    "-m",
+                    "--project",
+                    "-p",
+                    "--template",
+                    "-T",
+                ],
+                bare: &[
+                    "--draft",
+                    "-d",
+                    "--fill",
+                    "--fill-first",
+                    "--fill-verbose",
+                    "-f",
+                    "--dry-run",
+                ],
+            };
+            let own = known.read(rest).is_some_and(|(flags, _)| {
+                flags
+                    .iter()
+                    .filter(|(n, _)| matches!(*n, "--head" | "-H"))
+                    .all(|(_, h)| here.branch.is_some() && *h == here.branch)
+            });
+            is(Class::GhPrCreate, own)
         }
         ["pr", "merge", ..] => Class::GhPrMerge,
         ["api", rest @ ..] => {
-            let method = rest
-                .iter()
-                .position(|a| *a == "-X" || *a == "--method")
-                .and_then(|i| rest.get(i + 1))
-                .copied()
-                .or_else(|| rest.iter().find_map(|a| a.strip_prefix("--method=")));
-            // A field or input makes gh send a POST unless a GET is named.
-            let sends = has(&["-f", "-F", "--field", "--raw-field", "--input"]);
-            let reads = match method {
-                Some(m) => m.eq_ignore_ascii_case("GET"),
-                None => !sends,
+            let known = Known {
+                valued: &[
+                    "-X",
+                    "--method",
+                    "-f",
+                    "--raw-field",
+                    "-F",
+                    "--field",
+                    "-H",
+                    "--header",
+                    "--jq",
+                    "-q",
+                    "--template",
+                    "-t",
+                    "--cache",
+                    "--hostname",
+                    "-p",
+                    "--preview",
+                ],
+                bare: &[
+                    "--paginate",
+                    "--slurp",
+                    "-i",
+                    "--include",
+                    "--silent",
+                    "--verbose",
+                ],
             };
-            match reads && operands(rest).first().is_none_or(|p| *p != "graphql") {
-                true => Class::GhRead,
-                false => Class::Other,
-            }
+            let Some((flags, ops)) = known.read(rest) else {
+                return Class::Other;
+            };
+            let methods: Vec<&str> = flags
+                .iter()
+                .filter(|(n, _)| matches!(*n, "-X" | "--method"))
+                .filter_map(|(_, v)| *v)
+                .collect();
+            // A field makes gh send a POST unless a GET is named, and the
+            // last method named is the one it sends.
+            let fields = flags
+                .iter()
+                .any(|(n, _)| matches!(*n, "-f" | "--raw-field" | "-F" | "--field"));
+            let reads = match methods.last() {
+                Some(m) => m.eq_ignore_ascii_case("GET"),
+                None => !fields,
+            };
+            let graphql = ops
+                .first()
+                .is_none_or(|e| e.trim_start_matches('/') == "graphql");
+            is(Class::GhRead, reads && ops.len() == 1 && !graphql)
         }
         ["workflow", "run", ..] | ["release", "create", ..] => Class::Deploy,
         _ => Class::Other,
     }
 }
 
-/// A test, build or check, its tool invoked directly with nothing that
-/// sets what it runs.
+/// What a test run takes after its `--`: test names, and what only says
+/// how the tests run.
+const TEST_ARGS: Known = Known {
+    valued: &["--test-threads", "--skip"],
+    bare: &[
+        "--nocapture",
+        "--show-output",
+        "--ignored",
+        "--include-ignored",
+        "--exact",
+        "-q",
+        "--quiet",
+    ],
+};
+
+/// What cargo's builds and tests are known by.
+const CARGO: Known = Known {
+    valued: &[
+        "-p",
+        "--package",
+        "--features",
+        "-F",
+        "--bin",
+        "--test",
+        "--example",
+        "--bench",
+        "-j",
+        "--jobs",
+        "--message-format",
+        "--target",
+        "--profile",
+        "--exclude",
+        "-E",
+    ],
+    bare: &[
+        "--workspace",
+        "--all",
+        "--all-targets",
+        "--all-features",
+        "--no-default-features",
+        "--release",
+        "-r",
+        "--lib",
+        "--bins",
+        "--tests",
+        "--examples",
+        "--benches",
+        "--doc",
+        "-q",
+        "--quiet",
+        "-v",
+        "--verbose",
+        "--locked",
+        "--frozen",
+        "--offline",
+        "--no-fail-fast",
+        "--no-run",
+        "--check",
+        "--keep-going",
+    ],
+};
+
+/// `go`'s flags: one dash or two, a value after `=` or as the next word.
+fn go_known(args: &[&str], valued: &[&str], bare: &[&str]) -> bool {
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        let Some(flag) = a.strip_prefix("--").or_else(|| a.strip_prefix('-')) else {
+            continue;
+        };
+        match flag.split_once('=') {
+            Some((n, _)) if valued.contains(&n) => {}
+            None if valued.contains(&flag) => {
+                if it.next().is_none() {
+                    return false;
+                }
+            }
+            None if bare.contains(&flag) => {}
+            _ => return false,
+        }
+    }
+    true
+}
+
+/// A test, build or check, its tool invoked directly with only flags that
+/// say what to build or test: never one that names a runner, a config, a
+/// plugin or a registry, or that writes elsewhere.
 fn build(program: &str, args: &[&str]) -> Option<Class> {
-    let sets_runner = args
-        .iter()
-        .any(|a| *a == "--config" || a.starts_with("--config=") || *a == "-Z");
     let built = match (program, args) {
-        ("cargo", [sub, ..]) => {
-            matches!(
+        ("cargo", [sub, rest @ ..])
+            if matches!(
                 *sub,
                 "test" | "build" | "check" | "clippy" | "fmt" | "nextest"
-            ) && !sets_runner
+            ) =>
+        {
+            let (own, after) = match rest.iter().position(|a| *a == "--") {
+                Some(i) => (&rest[..i], &rest[i + 1..]),
+                None => (rest, &[][..]),
+            };
+            let after_ok = match *sub {
+                "clippy" => Known {
+                    valued: &["-D", "-W", "-A"],
+                    bare: &[],
+                }
+                .read(after)
+                .is_some_and(|(_, ops)| ops.is_empty()),
+                "fmt" => after.is_empty() || after == ["--check"],
+                _ => TEST_ARGS.all(after),
+            };
+            let nextest = *sub == "nextest";
+            let own = match nextest {
+                true => own.first() == Some(&"run") && CARGO.all(&own[1..]),
+                false => CARGO.all(own),
+            };
+            own && after_ok
         }
-        ("npm", ["ci", ..]) => true,
-        ("pnpm" | "yarn", ["install", rest @ ..]) => rest.contains(&"--frozen-lockfile"),
-        ("pytest", _) => true,
-        ("python" | "python3", ["-m", "pytest", ..]) => true,
-        ("go", [sub, ..]) => matches!(*sub, "test" | "build" | "vet"),
-        ("tsc" | "eslint", _) => true,
+        ("npm", ["ci", rest @ ..]) => Known {
+            valued: &[],
+            bare: &[
+                "--ignore-scripts",
+                "--no-audit",
+                "--no-fund",
+                "--prefer-offline",
+                "--silent",
+            ],
+        }
+        .all(rest),
+        ("pnpm" | "yarn", ["install", rest @ ..]) => {
+            rest.contains(&"--frozen-lockfile")
+                && Known {
+                    valued: &[],
+                    bare: &[
+                        "--frozen-lockfile",
+                        "--ignore-scripts",
+                        "--prefer-offline",
+                        "--silent",
+                    ],
+                }
+                .all(rest)
+        }
+        ("pytest", rest) | ("python" | "python3", ["-m", "pytest", rest @ ..]) => Known {
+            valued: &["-k", "-m", "--maxfail", "--tb", "-r", "-n", "--durations"],
+            bare: &[
+                "-q",
+                "-v",
+                "-vv",
+                "-x",
+                "-s",
+                "--lf",
+                "--ff",
+                "--no-header",
+                "-l",
+            ],
+        }
+        .all(rest),
+        ("go", [sub, rest @ ..]) if matches!(*sub, "test" | "build" | "vet") => go_known(
+            rest,
+            &[
+                "run", "count", "timeout", "tags", "p", "parallel", "skip", "bench",
+            ],
+            &[
+                "v", "race", "short", "cover", "failfast", "json", "trimpath",
+            ],
+        ),
+        ("tsc", rest) => Known {
+            valued: &["-p", "--project"],
+            bare: &["--noEmit", "--pretty"],
+        }
+        .all(rest),
+        ("eslint", rest) => Known {
+            valued: &["--max-warnings", "--ext"],
+            bare: &["--quiet", "--cache", "--no-eslintrc"],
+        }
+        .all(rest),
         ("prettier", rest) => {
-            rest.contains(&"--check") && !rest.iter().any(|a| a.starts_with("--write"))
+            let known = Known {
+                valued: &["--log-level"],
+                bare: &["--check", "-c", "--list-different", "-l"],
+            };
+            known
+                .read(rest)
+                .is_some_and(|(flags, _)| flags.iter().any(|(n, _)| matches!(*n, "--check" | "-c")))
         }
-        ("mvn", [sub, ..]) => matches!(*sub, "test" | "verify"),
-        ("gradle", [sub, ..]) => matches!(*sub, "test" | "build"),
+        ("mvn", [sub, rest @ ..]) if matches!(*sub, "test" | "verify") => Known {
+            valued: &["-pl", "--projects", "-T"],
+            bare: &["-q", "-B", "--batch-mode", "-am", "-o", "--offline"],
+        }
+        .all(rest),
+        ("gradle", [sub, rest @ ..]) if matches!(*sub, "test" | "build") => Known {
+            valued: &["--tests"],
+            bare: &[
+                "--offline",
+                "-q",
+                "--quiet",
+                "--info",
+                "--stacktrace",
+                "--no-daemon",
+            ],
+        }
+        .all(rest),
         _ => false,
     };
     built.then_some(Class::TestBuild)
@@ -466,30 +982,63 @@ fn registry_name(op: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || "-_.@~^<>=![],".contains(c))
 }
 
-/// An install of named packages from the default registry.
+/// An install of named packages from the default registry, with only the
+/// flags that say how they are kept: never a file of them (`-r`, `-c`), a
+/// path (`-e`), or another index or registry.
 fn install(program: &str, args: &[&str]) -> Option<Class> {
-    let elsewhere = args.iter().any(|a| {
-        [
-            "--registry",
-            "--index-url",
-            "-i",
-            "--extra-index-url",
-            "--git",
-            "--path",
-            "--index",
-        ]
-        .iter()
-        .any(|f| a == f || a.starts_with(&format!("{f}=")))
-    });
-    let named = |ops: &[&str]| !ops.is_empty() && ops.iter().all(|o| registry_name(o));
+    let named = |known: Known, rest: &[&str]| {
+        known
+            .read(rest)
+            .is_some_and(|(_, ops)| !ops.is_empty() && ops.iter().all(|o| registry_name(o)))
+    };
     let installs = match (program, args) {
-        ("npm", ["install" | "i" | "add", rest @ ..])
-        | ("pnpm" | "yarn", ["add", rest @ ..])
-        | ("cargo" | "uv", ["add", rest @ ..])
-        | ("pip" | "pip3", ["install", rest @ ..]) => named(&operands(rest)),
+        ("npm", ["install" | "i" | "add", rest @ ..]) => named(
+            Known {
+                valued: &[],
+                bare: &[
+                    "-D",
+                    "--save-dev",
+                    "-S",
+                    "--save",
+                    "-E",
+                    "--save-exact",
+                    "--no-save",
+                ],
+            },
+            rest,
+        ),
+        ("pnpm" | "yarn", ["add", rest @ ..]) => named(
+            Known {
+                valued: &[],
+                bare: &["-D", "--dev", "--save-dev", "-E", "--exact"],
+            },
+            rest,
+        ),
+        ("cargo", ["add", rest @ ..]) => named(
+            Known {
+                valued: &["-F", "--features", "-p", "--package"],
+                bare: &["--dev", "--build", "--no-default-features", "--optional"],
+            },
+            rest,
+        ),
+        ("uv", ["add", rest @ ..]) => named(
+            Known {
+                valued: &[],
+                bare: &["--dev"],
+            },
+            rest,
+        ),
+        ("pip" | "pip3", ["install", rest @ ..]) => named(
+            Known {
+                valued: &[],
+                bare: &["-U", "--upgrade", "-q", "--quiet"],
+            },
+            rest,
+        ),
         ("go", ["get", rest @ ..]) => {
             let ops = operands(rest);
-            !ops.is_empty()
+            go_known(rest, &[], &["u", "t", "d"])
+                && !ops.is_empty()
                 && ops.iter().all(|o| {
                     o.split_once('@').is_some_and(|(m, v)| {
                         !m.is_empty() && !v.is_empty() && !m.starts_with('.') && !m.contains(':')
@@ -498,7 +1047,7 @@ fn install(program: &str, args: &[&str]) -> Option<Class> {
         }
         _ => false,
     };
-    (installs && !elsewhere).then_some(Class::PackageInstall)
+    installs.then_some(Class::PackageInstall)
 }
 
 /// What publishes, deploys, or reads production.
@@ -583,7 +1132,7 @@ mod tests {
             ("git push upstream feat/x", Class::Other),
         ] {
             assert_eq!(class(command), want, "{command}");
-            assert!(!want.cacheable(true), "{command}");
+            assert!(!want.cacheable(), "{command}");
         }
     }
 
@@ -749,17 +1298,182 @@ mod tests {
     }
 
     #[test]
-    fn at_act_no_tests_builds_or_installs_are_answered_from_a_standing_verdict() {
+    fn a_class_is_its_name_and_only_ordinary_steps_are_answered_standing() {
         for c in Class::CACHEABLE {
-            assert!(c.cacheable(true), "{c:?}");
-            assert_eq!(
-                c.cacheable(false),
-                !matches!(c, Class::TestBuild | Class::PackageInstall),
-                "{c:?}"
-            );
-            assert_eq!(Class::parse(c.as_str()), Some(c));
+            assert!(c.cacheable(), "{c:?}");
+            assert_eq!(Class::parse(c.as_str()).ok(), Some(c));
         }
-        assert!(!Class::Other.cacheable(true));
-        assert_eq!(Class::parse("other"), Some(Class::Other));
+        assert!(!Class::Other.cacheable());
+        assert_eq!(Class::parse("other").ok(), Some(Class::Other));
+    }
+
+    fn with_aliases(command: &str, aliases: &[(&str, &str)]) -> Class {
+        let home = Path::new("/Users/sam");
+        let own = Path::new("/Users/sam/dev/acme-web");
+        let scratch = [PathBuf::from("/tmp")];
+        let withheld = [PathBuf::from("/Users/sam/Library/Application Support/Desk")];
+        let real = fake_real;
+        let here = here(home, own, &scratch, &withheld, &real, "feat/x");
+        let aliases: HashMap<String, String> = aliases
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        let repo = Repo {
+            aliases: &aliases,
+            is_branch: &|_| false,
+            head_pushed: false,
+            upstream: Some("origin"),
+        };
+        class_of(command, &here, &repo)
+    }
+
+    /// Git never runs an alias named after one of its own commands.
+    #[test]
+    fn an_alias_named_after_a_git_command_is_never_read_for_it() {
+        let aliases = [("push", "status"), ("commit", "status"), ("diff", "!true")];
+        assert_eq!(
+            with_aliases("git push -f origin main", &aliases),
+            Class::ForcePush
+        );
+        assert_eq!(with_aliases("git commit -m x", &aliases), Class::Commit);
+        assert_eq!(with_aliases("git diff --output=/x", &aliases), Class::Other);
+        assert_eq!(with_aliases("git st", &[("st", "status")]), Class::LocalGit);
+    }
+
+    #[test]
+    fn gh_reads_every_spelling_of_a_method_field_and_flag() {
+        for c in [
+            "gh api -XPUT repos/acme/web/pulls/1/merge",
+            "gh api -XDELETE repos/acme/web/git/refs/heads/main",
+            "gh api -X GET -X POST repos/acme/web/issues",
+            "gh api --method=GET --method=PATCH repos/acme/web",
+            "gh api -ftitle=x repos/acme/web/issues",
+            "gh api -H x graphql -fquery=mutation{x}",
+            "gh api /graphql",
+            "gh api --input body.json repos/acme/web/issues",
+            "gh pr create -Hmain",
+            "gh pr create --head=main",
+            "gh pr create -Rother/repo",
+            "gh pr create --repo other/repo",
+            "gh pr create --web",
+            "gh pr view 12 --web",
+            "gh run view 3 --repo",
+        ] {
+            assert_eq!(class(c), Class::Other, "{c}");
+        }
+        for c in [
+            "gh api -XGET repos/acme/web/pulls",
+            "gh api -X POST -X GET repos/acme/web/pulls -f state=open",
+            "gh api -H 'Accept: x' repos/acme/web/pulls --jq '.[].title'",
+            "gh pr view 12 --json title,body -q .title",
+            "gh pr view 12 -Racme/web",
+            "gh run list --limit 5",
+        ] {
+            assert_eq!(class(c), Class::GhRead, "{c}");
+        }
+        assert_eq!(class("gh pr create -Hfeat/x --fill"), Class::GhPrCreate);
+        assert_eq!(
+            class("gh pr create --head=feat/x -t x -b y"),
+            Class::GhPrCreate
+        );
+    }
+
+    #[test]
+    fn git_reads_only_print_where_they_run() {
+        for c in [
+            "git diff --output=/Users/sam/.zshrc",
+            "git log --output /x",
+            "git diff --no-index /etc/passwd /dev/null",
+            "git diff --ext-diff",
+            "git show --textconv HEAD:x",
+            "git log -c core.pager=x",
+            "git status --untracked-files=all --porcelain=v2 --exec",
+            "git add -p",
+            "git add --chmod=+x run.sh",
+        ] {
+            assert_eq!(class(c), Class::Other, "{c}");
+        }
+        for c in [
+            "git diff --stat HEAD~1",
+            "git diff --cached",
+            "git log -5 --oneline",
+            "git log -n 3 --format=%H",
+            "git log --since=2.weeks --author=sam",
+            "git show --stat HEAD",
+            "git status --porcelain",
+            "git status -sb",
+            "git status --porcelain=v2",
+            "git add -A",
+            "git add src/x.rs",
+        ] {
+            assert_eq!(class(c), Class::LocalGit, "{c}");
+        }
+    }
+
+    #[test]
+    fn an_amend_is_seen_by_any_prefix_git_reads_it_from() {
+        for c in [
+            "git commit --amend --no-edit",
+            "git commit --amen",
+            "git commit --ame -m x",
+            "git commit --am",
+        ] {
+            assert_eq!(class_with(c, true), Class::Other, "{c}");
+            assert_eq!(class_with(c, false), Class::Commit, "{c}");
+        }
+        assert_eq!(class_with("git commit --all -m x", true), Class::Commit);
+    }
+
+    #[test]
+    fn a_pager_set_before_a_command_is_never_plain() {
+        for c in ["PAGER='sh -c x' git log", "GIT_PAGER=x git diff"] {
+            assert_eq!(class(c), Class::Other, "{c}");
+        }
+    }
+
+    #[test]
+    fn a_build_or_install_flag_that_names_a_runner_a_file_or_a_registry_is_other() {
+        for c in [
+            "pip install -r requirements.txt",
+            "pip install -c constraints.txt requests",
+            "pip install -e .",
+            "pip install --find-links=https://x/ requests",
+            "uv add --default-index=https://x/ httpx",
+            "npm ci --registry=https://x/",
+            "pnpm install --frozen-lockfile --registry=https://x/",
+            "npm install -g left-pad",
+            "go test -exec /tmp/x ./...",
+            "go build -toolexec /tmp/x ./...",
+            "go test -o /tmp/x ./...",
+            "eslint -c /tmp/x.js .",
+            "prettier --plugin /tmp/x.js --check .",
+            "pytest -c /tmp/x.ini",
+            "pytest -p evil",
+            "prettier --check -w .",
+            "cargo test -- --logfile /tmp/x",
+            "cargo clippy -- --cfg x",
+            "mvn test -Dx=y",
+            "gradle test -I init.gradle",
+        ] {
+            assert_eq!(class(c), Class::Other, "{c}");
+        }
+        for c in [
+            "go test -run TestX -count=1 ./...",
+            "cargo test -p x -- --nocapture --test-threads=1",
+            "cargo clippy --all-targets -- -D warnings",
+            "cargo nextest run --workspace",
+            "pytest -q -k smoke tests/",
+            "eslint --max-warnings 0 src",
+            "prettier --check src",
+        ] {
+            assert_eq!(class(c), Class::TestBuild, "{c}");
+        }
+        for c in [
+            "npm install -D left-pad",
+            "pip install -U requests",
+            "cargo add -F derive serde",
+        ] {
+            assert_eq!(class(c), Class::PackageInstall, "{c}");
+        }
     }
 }

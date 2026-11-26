@@ -685,9 +685,11 @@ struct CodexLink {
     line_steers: mpsc::UnboundedSender<(Uuid, String)>,
     /// What Desk launched it in; none, the person's own.
     permissions: Option<codex::Permissions>,
+    /// The mode it was launched in, from which `permissions` came.
+    mode: Option<crate::mode::Mode>,
     /// Whether `permissions` is known to be what it runs in: one adopted
-    /// before Desk knew which sessions bosses run is read again once it
-    /// does, never started again for it.
+    /// from an earlier run of Desk runs in what Codex says its thread runs
+    /// in ([`Desk::codex_runs`]), never started again before that is said.
     settled: bool,
     /// Whether its network is on, as Codex said it runs its thread.
     network: Option<bool>,
@@ -2387,13 +2389,14 @@ impl Desk {
                     let socket = server.meta["socket"].as_str().map(PathBuf::from);
                     let (server_pty, _) = holder.adopt(&server, history, None);
                     let server = Server::Held(Arc::new(server_pty));
-                    let permissions =
-                        self.codex_permissions(id, self.kept_mode(id).await, record.approve_for_me);
+                    let mode = self.kept_mode(id).await;
+                    let permissions = self.codex_permissions(id, mode, record.approve_for_me);
                     socket.map(|socket| {
                         let follower = self.codex_follower(record.cli_session_id.clone());
                         let mut link =
                             self.observe_codex(id, server, socket, follower.at_once(), permissions);
-                        link.settled = self.charges_loaded();
+                        link.mode = mode;
+                        link.settled = false;
                         link
                     })
                 }
@@ -4274,6 +4277,25 @@ impl Desk {
                     Some(why),
                 ),
             },
+            // A thread Codex never wrote a turn of has no rollout to resume
+            // from: a new one, as nothing of it is lost.
+            Engine::Codex
+                if r.transcript
+                    .as_deref()
+                    .is_some_and(|t| !Path::new(t).is_file()) =>
+            {
+                (
+                    SessionRecord {
+                        cli_session_id: None,
+                        transcript: None,
+                        ..r
+                    },
+                    Some(
+                        "Started it afresh: it had no turn of its conversation to go on from."
+                            .to_string(),
+                    ),
+                )
+            }
             _ => (r, None),
         };
         if r.cli_session_id.is_none() && afresh.is_none() {
@@ -4294,9 +4316,13 @@ impl Desk {
             };
         }
         let carried = r.cli_session_id.clone();
+        let fresh = afresh.is_some();
         self.change(id, |r, _| {
-            if r.engine == Engine::Devin {
+            if r.engine == Engine::Devin || fresh {
                 r.cli_session_id = carried;
+            }
+            if r.engine == Engine::Codex && fresh {
+                r.transcript = None;
             }
             r.origin = Origin::Desk;
             r.external_pid = None;
@@ -5958,7 +5984,8 @@ impl Desk {
                 // default.
                 let reset = (start_in == modes::StartIn::Reset && thread.is_some())
                     .then_some(crate::mode::Mode::Default);
-                let permissions = self.codex_permissions(r.id, mode.or(reset), r.approve_for_me);
+                let mode = mode.or(reset);
+                let permissions = self.codex_permissions(r.id, mode, r.approve_for_me);
                 let follower = self.codex_follower(thread.map(str::to_string));
                 let (follower, primed) = match thread {
                     Some(thread) => {
@@ -5968,7 +5995,16 @@ impl Desk {
                     }
                     None => (follower, None),
                 };
-                let link = self.observe_codex(r.id, server, socket.clone(), follower, permissions);
+                let mut link =
+                    self.observe_codex(r.id, server, socket.clone(), follower, permissions);
+                link.mode = mode;
+                // Started in what it now runs in: a start that couldn't
+                // apply them before is over.
+                self.change_unseen(r.id, |st| {
+                    if st.turn_failures.get(&r.id).is_some_and(modes::unapplied) {
+                        st.turn_failures.remove(&r.id);
+                    }
+                });
                 if let Some(primed) = primed {
                     if let Err(why) = codex_primed(primed).await {
                         link.stop();
@@ -6348,34 +6384,56 @@ impl Desk {
         Ok(Server::Held(pty))
     }
 
-    /// What follows a Codex session's `thread` (none until its first is
-    /// started).
     /// What a Codex session `id` runs in where Desk sets it
-    /// ([`codex::Permissions::of`]): under a boss's charge while one holds
-    /// it, or while Desk can't yet read which sessions bosses run.
+    /// ([`codex::Permissions::of`]): charged while a boss that decides its
+    /// requests (at Act or Act fully) runs it, or while Desk can't yet read
+    /// which sessions bosses run. A boss that only suggests leaves them to
+    /// the person, as an uncharged session's are.
     pub(crate) fn codex_permissions(
         &self,
         id: Uuid,
         mode: Option<crate::mode::Mode>,
         approve_for_me: bool,
     ) -> Option<codex::Permissions> {
-        let charged = !self.charges_loaded() || self.charge_of(id).is_some_and(|c| c.live());
+        let charged = !self.charges_loaded()
+            || self
+                .charge_of(id)
+                .is_some_and(|c| c.live() && self.boss_decides_requests(&c.boss));
         codex::Permissions::of(mode, approve_for_me, charged)
     }
 
     /// What Codex says `id`'s thread runs in: kept, and said in Activity
-    /// when it isn't what Desk asked for.
+    /// when it isn't what Desk asked for. One adopted from an earlier run
+    /// of Desk is taken to run in whichever of its permissions, charged or
+    /// not, Codex says, else in the person's own; it is started again only
+    /// when that isn't what it should run in now.
     fn codex_runs(&self, id: Uuid, runs: &codex::Runs) {
         let asked = {
-            let mut st = self.0.state.lock();
+            let mut guard = self.0.state.lock();
+            let st = &mut *guard;
+            let approve_for_me = st.records.get(&id).is_some_and(|r| r.approve_for_me);
             let Some(link) = st.live.get_mut(&id).and_then(|l| l._codex.as_mut()) else {
                 return;
             };
             link.network = runs.network;
-            link.permissions.filter(|_| link.settled)
+            match link.settled {
+                true => link.permissions,
+                false => {
+                    let mode = link.mode;
+                    link.permissions = [true, false]
+                        .into_iter()
+                        .filter_map(|charged| codex::Permissions::of(mode, approve_for_me, charged))
+                        .find(|p| runs.differs(p).is_none());
+                    link.settled = true;
+                    None
+                }
+            }
         };
-        let differs = asked.as_ref().and_then(|a| runs.differs(a));
-        if let (Some(differs), Ok(view)) = (differs, self.view(id)) {
+        let Some(asked) = asked else {
+            self.modes_changed();
+            return;
+        };
+        if let (Some(differs), Ok(view)) = (runs.differs(&asked), self.view(id)) {
             tracing::warn!(%id, %differs, "codex runs its thread in other permissions than Desk asked");
             let me = Party::session(&view);
             self.note(Event::new(
@@ -6387,6 +6445,29 @@ impl Desk {
         }
     }
 
+    /// Whether `id` runs in other Codex permissions than Desk would start
+    /// it in now, in the mode it was started in: a charge taken or
+    /// released, a boss's level changed. Never before Desk knows which
+    /// sessions bosses run, nor while what an adopted one runs in is unsaid.
+    pub(crate) fn permissions_due(&self, id: Uuid) -> bool {
+        let launched = {
+            let st = self.0.state.lock();
+            let link = st.live.get(&id).and_then(|l| l._codex.as_ref());
+            link.filter(|link| link.settled)
+                .map(|link| (link.permissions, link.mode))
+                .zip(st.records.get(&id).map(|r| r.approve_for_me))
+        };
+        let Some(((permissions, mode), approve_for_me)) = launched else {
+            return false;
+        };
+        self.charges_loaded()
+            && self
+                .codex_permissions(id, mode, approve_for_me)
+                .is_some_and(|now| Some(now) != permissions)
+    }
+
+    /// What follows a Codex session's `thread` (none until its first is
+    /// started).
     fn codex_follower(&self, thread: Option<String>) -> codex::Follower {
         codex::Follower::new(thread, self.0.env.get("HOME").map(PathBuf::from))
     }
@@ -6431,6 +6512,7 @@ impl Desk {
             steers,
             line_steers,
             permissions,
+            mode: None,
             settled: true,
             network: None,
         }
@@ -8261,15 +8343,13 @@ impl Desk {
                 self.codex_wait_arm(id);
                 continue;
             }
-            if let CodexEvent::Answered(_) | CodexEvent::Late(_) = &event {
+            if let CodexEvent::Answered(request) | CodexEvent::Late(request) = &event {
                 self.change(id, |r, l| {
                     if let Some(l) = l {
                         codex_wait::clear_wait(r, l);
                     }
                 });
                 self.codex_wait_arm(id);
-            }
-            if let CodexEvent::Answered(request) | CodexEvent::Late(request) = &event {
                 // Said once Codex is told, or that its terminal had answered.
                 let sent = self
                     .0
@@ -13000,6 +13080,7 @@ mod codex_stop_tests {
             steers: mpsc::unbounded_channel().0,
             line_steers: mpsc::unbounded_channel().0,
             permissions: None,
+            mode: None,
             settled: true,
             network: None,
         };

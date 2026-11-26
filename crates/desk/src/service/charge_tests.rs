@@ -1871,3 +1871,11 @@ async fn a_review_session_is_asked_for_its_verdict_and_linked_to_its_pull_reques
     })
     .await;
 }
+
+/// An alias is read whole, a value of many lines too, as `-z` gives it.
+#[test]
+fn a_git_alias_is_read_whole_however_many_lines_it_has() {
+    let aliases = super::aliases_of("alias.st\nstatus\0alias.pf\n!f() {\n  git push -f\n}; f\0");
+    assert_eq!(aliases["st"], "status");
+    assert_eq!(aliases["pf"], "!f() {\n  git push -f\n}; f");
+}

@@ -1015,6 +1015,7 @@ impl CrewHub {
                 | Wait::Paused
                 | Wait::PersonDriving
                 | Wait::ModeEnding
+                | Wait::Restarting
                 | Wait::Awaited,
             ) => return None,
         })

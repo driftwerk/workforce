@@ -274,6 +274,9 @@ impl Desk {
                     "Its turn ended asking you something: answer that, and this goes in after."
                 }
                 line::Wait::ModeEnding => "Desk is putting it back in its own mode first.",
+                line::Wait::Restarting => {
+                    "Desk is starting it again in the permissions it now runs in first."
+                }
                 line::Wait::Dialog
                 | line::Wait::Stopped
                 | line::Wait::Working

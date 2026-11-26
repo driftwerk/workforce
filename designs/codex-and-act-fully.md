@@ -52,7 +52,7 @@ Line numbers are from origin/main 6d0970bc6. D = `crates/desk/src`, H = `crates/
 3. **There's no rule for which wins** when the person's mode, Approve for me and a boss's charge disagree.
 
 ### Change
-- **`Mode::codex_permissions(self, charged: bool, approve_for_me: bool) -> Permissions`** replaces the tuple and the separate reviewer rule. `Permissions` gains `network: Network` (`Person | On`). `charged` means a boss's live charge holds the session (`charge_of(id).is_some_and(Charge::live)`). The table:
+- **`Mode::codex_permissions(self, charged: bool, approve_for_me: bool) -> Permissions`** replaces the tuple and the separate reviewer rule. `Permissions` gains `network: Network` (`Person | On`). `charged` means a live charge holds the session for a boss that decides its requests, at Act or Act fully (`charge_of(id).is_some_and(|c| c.live() && boss_decides_requests(&c.boss))`). A boss at Suggest takes a charge but leaves the requests to the person, so its sessions run as uncharged ones do. Until Desk has read its charges, every session counts as charged. A change of a boss's level restarts its sessions as a charge change does. The table:
 
   | Mode | uncharged: approval / sandbox / network / reviewer | under a boss charge (Act or Act fully) |
   |---|---|---|
@@ -218,7 +218,7 @@ Line numbers are from origin/main 6d0970bc6. D = `crates/desk/src`, H = `crates/
      - **A chat with the boss suspends the cache.** From the moment the person sends the boss a chat message until that turn ends, the fast path is suspended for every session the boss runs, since the turn may record an order. The turn's end re-reads `directive_words`.
      - A directive that is conditional ("unless", "until", "only if") or timed ("after 6pm", "this week") makes the verdict Ask for every class it could touch. When the classifier can't tell which classes, it is Ask for all of them.
      - The cache is in memory. The verdicts are recorded as `BossDecision`s and are re-asked after a restart.
-     - **At Act,** `TestBuild` and `PackageInstall` are never cached (they run unsandboxed code from the workspace or a registry). At Act fully they are.
+     - **The fast path is Act fully's alone.** At Act a boss's requests never reach `decide_request` (the decide loop takes only an unbound boss's), so no verdict stands there. That includes `TestBuild` and `PackageInstall`, which run unsandboxed code from the workspace or a registry. At Act fully they are cached with the rest.
   4. **Where the fast path runs.** It runs inside `boss_decides` (D/service/charge.rs:1349), after the hard refusals: agent settings (:1380), budget and breaker, and the person driving. So it can never answer what those refuse.
      - A session under an active `Hold` (part 4) never takes the fast path: every request goes to the model, with the hold in its prompt.
      - A cached Allow is answered within one 2 s sweep, with no model call. It is recorded as the boss's decision, naming the standing verdict and the class.
@@ -460,7 +460,7 @@ Line numbers are from origin/main 6d0970bc6. D = `crates/desk/src`, H = `crates/
      - a held session never takes the fast path;
      - a changed directive source bumps the version and re-asks;
      - a conditional directive gives Ask;
-     - at Act, `TestBuild` and `PackageInstall` are never answered from the cache;
+     - at Act, no request is answered from the cache;
      - a hard refusal (agent settings, budget) wins over a cached Allow.
    - **Slots:** a resumed Review session at N brings the plan to N+1 with no stop and no new start, until the count is below N.
    - **`crew.record_review`** refuses when:

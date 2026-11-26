@@ -32,6 +32,15 @@ const READ_BACK: Duration = Duration::from_secs(15);
 /// while one is mid-turn.
 const RESTORE_EVERY: Duration = Duration::from_secs(1);
 
+/// How a Codex session's failure to start again in its new permissions
+/// begins, as its card says it.
+const UNAPPLIED: &str = "Desk couldn't apply this session's permissions";
+
+/// Whether `f` is a failure to start again in new permissions.
+pub(super) fn unapplied(f: &crate::limit::TurnFailure) -> bool {
+    matches!(f, crate::limit::TurnFailure::Failed(why) if why.starts_with(UNAPPLIED))
+}
+
 /// How long a session gets to stop before Desk starts it again.
 const STOP_WITHIN: Duration = Duration::from_secs(10);
 
@@ -322,7 +331,7 @@ impl Desk {
                     .collect()
             };
             let changed: Vec<(Uuid, Restart)> = self
-                .permissions_changed(&kept)
+                .permissions_changed()
                 .into_iter()
                 .filter(|id| !running.iter().any(|(r, _)| r == id))
                 .map(|id| (id, Restart::Permissions))
@@ -337,10 +346,13 @@ impl Desk {
             let mut waiting = false;
             for (id, why) in running {
                 let Ok(view) = self.view(id) else { continue };
-                // Mid-turn, waiting on an answer, or the person typing into
-                // it: once that is over.
+                // Mid-turn, waiting on an answer, the person typing into it,
+                // or not yet up: once that is over.
                 if view.pending.is_some()
-                    || matches!(view.state, S::Working | S::Blocked | S::Asking)
+                    || matches!(
+                        view.state,
+                        S::Working | S::Blocked | S::Asking | S::Starting
+                    )
                     || self.person_driving(id)
                 {
                     waiting = true;
@@ -373,14 +385,16 @@ impl Desk {
                         waiting = true;
                     }
                     (Err(e), Restart::Permissions) => {
-                        tracing::warn!(%id, error = %e, "a Codex session didn't start again in its new permissions; trying again");
+                        // Still running (it didn't stop in time): tried again.
+                        // Else stopped, it waits on whoever starts it next.
+                        tracing::warn!(%id, error = %e, "a Codex session didn't start again in its new permissions");
                         waiting = true;
-                        self.0.state.lock().turn_failures.insert(
-                            id,
-                            crate::limit::TurnFailure::Failed(format!(
-                                "Desk couldn't apply this session's permissions: {e}"
-                            )),
-                        );
+                        // Said once, however often it is tried again.
+                        self.change_unseen(id, |st| {
+                            st.turn_failures.entry(id).or_insert_with(|| {
+                                crate::limit::TurnFailure::Failed(format!("{UNAPPLIED}: {e}"))
+                            });
+                        });
                     }
                 }
             }
@@ -390,47 +404,21 @@ impl Desk {
         }
     }
 
-    /// The running Codex sessions whose permissions, as Desk would start
-    /// them now ([`Desk::codex_permissions`]), aren't those they were
-    /// started in: a charge taken or released, a boss's grant changed.
-    /// One Desk now leaves to the person's own runs on as it is.
-    fn permissions_changed(&self, kept: &HashMap<Uuid, Kept>) -> Vec<Uuid> {
-        type Running = (Uuid, bool, Option<crate::codex::Permissions>, bool);
-        let running: Vec<Running> = {
+    /// The running Codex sessions whose permissions aren't what Desk would
+    /// start them in now ([`Desk::permissions_due`]). One Desk now leaves
+    /// to the person's own runs on as it is.
+    fn permissions_changed(&self) -> Vec<Uuid> {
+        let running: Vec<Uuid> = {
             let st = self.0.state.lock();
             st.live
                 .iter()
-                .filter_map(|(id, l)| {
-                    let link = l._codex.as_ref()?;
-                    let r = st.records.get(id)?;
-                    Some((*id, r.approve_for_me, link.permissions, link.settled))
-                })
+                .filter(|(_, l)| l._codex.is_some())
+                .map(|(id, _)| *id)
                 .collect()
         };
-        let loaded = self.charges_loaded();
         running
             .into_iter()
-            .filter(|(id, approve_for_me, launched, settled)| {
-                let mode = kept
-                    .get(id)
-                    .filter(|k| k.holds() && (k.mode.asks() || self.unbound_runs(*id, &k.boss)))
-                    .map(|k| k.mode);
-                let now = self.codex_permissions(*id, mode, *approve_for_me);
-                if *settled {
-                    return now.is_some_and(|now| Some(now) != *launched);
-                }
-                // Adopted before charges were read: it runs in what it was
-                // started in then, which is what they say now.
-                if loaded {
-                    let mut st = self.0.state.lock();
-                    if let Some(link) = st.live.get_mut(id).and_then(|l| l._codex.as_mut()) {
-                        link.permissions = now;
-                        link.settled = true;
-                    }
-                }
-                false
-            })
-            .map(|(id, ..)| id)
+            .filter(|id| self.permissions_due(*id))
             .collect()
     }
 

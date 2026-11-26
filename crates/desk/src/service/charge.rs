@@ -1098,7 +1098,10 @@ impl Desk {
         boss: &str,
     ) -> crate::computer::boss::Class {
         use crate::computer::boss::{Class, Repo};
-        let Some(pending) = self.pending_of(id, approval).filter(|p| p.tool == "Bash") else {
+        let Some(pending) = self
+            .pending_of(id, approval)
+            .filter(|p| p.request.as_ref().is_some_and(|r| r.tool == "Bash"))
+        else {
             return Class::Other;
         };
         let Ok((facts, bounds)) = self.judged_facts(id, &pending, boss) else {
@@ -1107,14 +1110,16 @@ impl Desk {
         let Some(cwd) = facts.cwd.clone().filter(|_| facts.branch.is_some()) else {
             return Class::Other;
         };
-        let aliases: HashMap<String, String> =
-            git_lines(&cwd, &["config", "--get-regexp", r"^alias\."])
-                .into_iter()
-                .filter_map(|l| {
-                    let (k, v) = l.split_once(char::is_whitespace)?;
-                    Some((k.strip_prefix("alias.")?.to_string(), v.trim().to_string()))
-                })
-                .collect();
+        let aliases = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&cwd)
+            .args(["config", "-z", "--get-regexp", r"^alias\."])
+            .stdin(std::process::Stdio::null())
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| aliases_of(&String::from_utf8_lossy(&o.stdout)))
+            .unwrap_or_default();
         let is_branch = |b: &str| {
             git_line(
                 &cwd,
@@ -2307,6 +2312,17 @@ fn git_line_within(
     child.stdout.take()?.read_to_string(&mut out).ok()?;
     let line = out.lines().next().unwrap_or_default().trim().to_string();
     (!line.is_empty()).then_some(line)
+}
+
+/// Git's aliases from `git config -z --get-regexp ^alias\.`: each entry
+/// its key, a newline, then its value whole, however many lines it has.
+fn aliases_of(z: &str) -> HashMap<String, String> {
+    z.split('\0')
+        .filter_map(|e| {
+            let (k, v) = e.split_once('\n')?;
+            Some((k.strip_prefix("alias.")?.to_string(), v.to_string()))
+        })
+        .collect()
 }
 
 /// Every line git prints in `dir`; none when it can't say.

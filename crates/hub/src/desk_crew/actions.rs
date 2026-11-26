@@ -1171,6 +1171,7 @@ impl CrewHub {
                 Wait::Draft => "the person's draft is waiting in its prompt: it gets this once they send or clear it".into(),
                 Wait::Paused => "Desk's breaker paused it: it gets it once the person lets it go on".into(),
                 Wait::ModeEnding => "Desk starts it again in its own mode first, then it gets it".into(),
+                Wait::Restarting => "Desk starts it again in the permissions it now runs in first, then it gets it".into(),
                 Wait::PersonDriving => "the person is driving it, so your message waits until they stop giving it input for a little while or hand it back".into(),
                 Wait::NextCall => "it reads it with its next tool call's result".into(),
                 Wait::Awaited => "its call waiting on that question takes it as its answer".into(),

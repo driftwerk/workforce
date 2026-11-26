@@ -594,8 +594,8 @@ impl CrewHub {
                 && (p.tool != "Input" || p.detail.contains("permission"));
             if !prompt {
                 return waits(match view.engine {
-                    // Desk answers each of Codex's approvals and questions:
-                    // what waits in its terminal is none of them.
+                    // Desk holds nothing it answers while Codex waits: what
+                    // waits is its TUI's own, or a request Desk doesn't know.
                     workforce_desk::engine::Engine::Codex => {
                         "it waits in its own terminal on something Desk doesn't answer".into()
                     }
@@ -645,7 +645,7 @@ impl CrewHub {
                 () = cancel.cancelled() => return,
                 d = async {
                     let _slot = slot.acquire().await;
-                    crew.decide_request(&view, &p, &boss).await
+                    crew.decide_request(&view, &p, &boss, &slot, &cancel).await
                 } => d,
             };
             let (why, again, retry) = match decided {
@@ -785,6 +785,8 @@ impl CrewHub {
         view: &SessionView,
         p: &PendingApproval,
         boss: &str,
+        slot: &Arc<tokio::sync::Semaphore>,
+        cancel: &CancellationToken,
     ) -> Outcome {
         // This hub's own boss, or one on another hub served from a grant
         // here, whose call is made on its own hub ([`super::remote_decide`]).
@@ -818,7 +820,7 @@ impl CrewHub {
         let mut decided = match reads {
             true => Some(Verdict::Allow(ONLY_READS.into())),
             false => self
-                .standing_allow(&decider, view, class, boss)
+                .standing_allow(&decider, view, class, boss, slot, cancel)
                 .await
                 .map(Verdict::Allow),
         };

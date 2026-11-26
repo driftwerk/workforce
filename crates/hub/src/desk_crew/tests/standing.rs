@@ -5,6 +5,7 @@
 //! of its own, and one of a class never cached (a push to the default
 //! branch) always reaches the boss's own decision.
 
+use super::act_fully::git;
 use super::decides_at_once::{asked, behavior, calls_about, decides, THEIRS};
 use super::*;
 
@@ -15,35 +16,16 @@ const STANDING: &str = "Give your standing verdict";
 /// default on an `origin` beside it, which it returns.
 fn on_a_branch(base: &std::path::Path) -> tempfile::TempDir {
     let origin = tempfile::tempdir().unwrap();
-    let run = |at: &std::path::Path, args: &[&str]| {
-        let out = std::process::Command::new("git")
-            .arg("-C")
-            .arg(at)
-            .args(args)
-            .output()
-            .unwrap();
-        assert!(out.status.success(), "{args:?}: {out:?}");
-    };
-    run(origin.path(), &["init", "-q", "--bare", "-b", "main"]);
+    git(origin.path(), &["init", "-q", "--bare", "-b", "main"]);
     for args in [
         &["init", "-q", "-b", "main"][..],
-        &[
-            "-c",
-            "user.name=t",
-            "-c",
-            "user.email=t@t",
-            "commit",
-            "-q",
-            "--allow-empty",
-            "-m",
-            "x",
-        ],
+        &["commit", "-q", "--allow-empty", "-m", "x"],
         &["remote", "add", "origin", &origin.path().to_string_lossy()],
         &["push", "-q", "origin", "main"],
         &["remote", "set-head", "origin", "main"],
         &["switch", "-q", "-c", "feat/x"],
     ] {
-        run(base, args);
+        git(base, args);
     }
     origin
 }
@@ -54,7 +36,7 @@ async fn a_standing_verdict_allows_its_class_at_once_and_never_a_push_to_main() 
         let dir = tempfile::tempdir().unwrap();
         let base = std::fs::canonicalize(dir.path()).unwrap();
         let _origin = on_a_branch(&base);
-        let (_overseer, _crew, d, llm) = overseeing(&base, pool, "ok", THEIRS, &[]).await;
+        let (_overseer, crew, d, llm) = overseeing(&base, pool, "ok", THEIRS, &[]).await;
         d.boss_bounds_with(workforce_desk::charge::Bounds {
             home: base.clone(),
             ..Default::default()
@@ -91,7 +73,8 @@ async fn a_standing_verdict_allows_its_class_at_once_and_never_a_push_to_main() 
         assert_eq!(decided("git commit -m first").await, "allow");
         assert_eq!(calls_about(&llm, "git commit -m first").await.len(), 1);
         eventually("its standing verdicts", async || {
-            (calls_about(&llm, STANDING).await.len() == 1).then_some(())
+            (calls_about(&llm, STANDING).await.len() == 1 && crew.standings.given(s.id))
+                .then_some(())
         })
         .await;
 
@@ -105,6 +88,21 @@ async fn a_standing_verdict_allows_its_class_at_once_and_never_a_push_to_main() 
         let call = calls_about(&llm, "git push origin main").await;
         assert_eq!(call.len(), 1);
         assert!(call[0].contains("default_branch_push"), "its class is said");
+
+        // Desk's own refusal (an agent's own settings, as the hub serves
+        // them) wins over a standing allow of its class: never allowed.
+        let settings = crew
+            .services()
+            .iter()
+            .flat_map(|s| crate::desk_computer::own_config(&s.workspace))
+            .next()
+            .expect("the agent's own settings");
+        let held = asked(&url, &format!("git add {}", settings.display()));
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        if held.is_finished() {
+            let answer = held.await.unwrap();
+            assert_ne!(behavior(&answer), "allow", "{answer}");
+        }
     })
     .await;
 }
@@ -141,14 +139,15 @@ async fn a_standing_verdict_gives_way_to_the_person_a_hold_a_conditional_directi
             assert_eq!(behavior(&answer), "allow", "{command}: {answer}");
             calls_about(&llm, command).await.len()
         };
-        let verdicts = async |n: usize| {
+        let verdicts = async |n: usize, of: uuid::Uuid| {
             eventually("its standing verdicts", async || {
-                (calls_about(&llm, STANDING).await.len() == n).then_some(())
+                (calls_about(&llm, STANDING).await.len() == n && crew.standings.given(of))
+                    .then_some(())
             })
             .await
         };
         assert_eq!(decided("git commit -m c1").await, 1);
-        verdicts(1).await;
+        verdicts(1, s.id).await;
         assert_eq!(decided("git commit -m c2").await, 0, "standing");
 
         // The person's words to it since: asked again.
@@ -158,7 +157,7 @@ async fn a_standing_verdict_gives_way_to_the_person_a_hold_a_conditional_directi
         )
         .await;
         assert_eq!(decided("git commit -m c3").await, 1);
-        verdicts(2).await;
+        verdicts(2, s.id).await;
         assert_eq!(decided("git commit -m c4").await, 0);
 
         // The boss in a turn with the person: its own call, and once the
@@ -167,7 +166,7 @@ async fn a_standing_verdict_gives_way_to_the_person_a_hold_a_conditional_directi
         assert_eq!(decided("git commit -m c5").await, 1);
         drop(turn);
         assert_eq!(decided("git commit -m c6").await, 1);
-        verdicts(3).await;
+        verdicts(3, s.id).await;
         assert_eq!(decided("git commit -m c7").await, 0);
 
         // Held: every request is the boss's own call.
@@ -202,7 +201,7 @@ async fn a_standing_verdict_gives_way_to_the_person_a_hold_a_conditional_directi
         .expect("decided within seconds")
         .unwrap();
         assert_eq!(behavior(&first), "allow", "{first}");
-        verdicts(4).await;
+        verdicts(4, other.id).await;
         d.set_breaker_rules(workforce_desk::Rules { loops: true })
             .await
             .unwrap();
@@ -250,6 +249,14 @@ async fn a_standing_verdict_gives_way_to_the_person_a_hold_a_conditional_directi
         assert_eq!(decided("git commit -m c10").await, 1);
         tokio::time::sleep(Duration::from_secs(1)).await;
         assert_eq!(calls_about(&llm, STANDING).await.len(), before, "none asked");
+
+        // A session gone from Desk: its verdicts go with it.
+        assert!(crew.standings.holds(other.id));
+        d.remove(other.id, workforce_desk::Removal::default())
+            .await
+            .unwrap();
+        decided("git commit -m c12").await;
+        assert!(!crew.standings.holds(other.id));
 
     })
     .await;
