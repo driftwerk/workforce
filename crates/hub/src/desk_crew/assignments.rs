@@ -76,6 +76,27 @@ const JOB_EXAMPLE: &str =
 /// the machine to compare a request with (R5).
 pub(super) const HELD_JOBS: &str = "held_jobs";
 
+/// `input` carrying the jobs `held` in `field`, for `machine` to compare a
+/// request with (R5), when they fit in its call (`carries`); else as it
+/// is, and the machine leaves a request that can't be undone to the person,
+/// as when the jobs couldn't be read.
+pub(super) fn with_held(
+    mut input: Value,
+    field: &str,
+    held: &[Assignment],
+    machine: &str,
+    carries: impl FnOnce(&Value) -> bool,
+) -> Value {
+    input[field] = json!(held);
+    if !carries(&input) {
+        tracing::warn!(%machine, held = held.len(), "the jobs a boss holds don't fit in its call to a machine: sent without them, so the machine leaves what can't be undone to the person");
+        if let Some(o) = input.as_object_mut() {
+            o.remove(field);
+        }
+    }
+    input
+}
+
 /// What a boss's order says of the job it hands out: the job it declares,
 /// never one read from its words.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -1164,8 +1185,8 @@ impl CrewHub {
     }
 
     /// The irreversible jobs `boss` keeps, for a call relayed to a machine
-    /// to carry ([`HELD_JOBS`]): the machine compares a request there with
-    /// them (R5).
+    /// to carry ([`HELD_JOBS`]), each as the machine compares a request
+    /// there with it (R5, [`Assignment::compared`]).
     /// `Err` when they couldn't be read: then nothing is relayed that the
     /// machine would allow on an empty list.
     pub(super) async fn held_irreversible(&self, boss: &str) -> Result<Vec<Assignment>, String> {
@@ -1173,7 +1194,12 @@ impl CrewHub {
             .store()
             .assignments_live_of(boss)
             .await
-            .map(|l| l.into_iter().filter(|a| a.irreversible).collect())
+            .map(|l| {
+                l.into_iter()
+                    .filter(|a| a.irreversible)
+                    .map(Assignment::compared)
+                    .collect()
+            })
             .map_err(|e| {
                 tracing::warn!(error = %format!("{e:#}"), "a boss's irreversible jobs couldn't be read to relay");
                 "Desk couldn't read which jobs your sessions hold just now".to_string()
@@ -2168,6 +2194,21 @@ pub(super) fn assignments_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_jobs_held_go_with_a_call_to_a_machine_only_when_they_fit() {
+        let held: Vec<Assignment> = (0..3)
+            .map(|_| Assignment::new("desk", Uuid::new_v4(), "Dispatch release 4 now."))
+            .collect();
+        let input = json!({"decideId": "d", "text": "ALLOW: Sam ordered it"});
+        let fits = |most: usize| move |v: &Value| v.to_string().len() <= most;
+        let with = with_held(input.clone(), "heldJobs", &held, "devbox", fits(usize::MAX));
+        assert_eq!(with["text"], input["text"]);
+        let read: Vec<Assignment> = serde_json::from_value(with["heldJobs"].clone()).unwrap();
+        assert_eq!(read, held);
+        let without = with_held(input.clone(), "heldJobs", &held, "devbox", fits(200));
+        assert_eq!(without, input, "sent, without them");
+    }
 
     #[test]
     fn a_stand_down_is_answered_by_a_reply_or_its_quoted_mark_only() {

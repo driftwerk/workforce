@@ -670,6 +670,138 @@ async fn the_home_takes_its_bosss_decisions_from_its_machines_and_answers_each_w
     .await;
 }
 
+/// On the Mac: Sarah holding many jobs that can't be undone, each with a
+/// long brief, still answers devbox, with each job as devbox compares a
+/// request with it; an answer that may not have reached devbox is said in
+/// her DM, once.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_homes_answer_reaches_its_machine_however_many_long_jobs_its_boss_holds() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (sarah, crew, d, llm) = overseeing(dir.path(), pool, "ok", SARAH_FULL, &[]).await;
+        super::decides_at_once::decides(&llm, "git tag v9", "ALLOW: it tags the release").await;
+        super::decides_at_once::decides(&llm, "git push --tags", "ALLOW: it pushes the tags").await;
+        let remote = uuid::Uuid::new_v4();
+        d.change_layout(|l| l.create("acme", "Acme", &[format!("session:devbox/{remote}")], None))
+            .await
+            .unwrap();
+        crew.read_spent_today(&crew.overseers()).await;
+        *crew.relay_wait.lock() = Duration::from_millis(400);
+        let agent = crew
+            .overseer_for(&workforce_common::oversight::Scope::Group("acme".into()))
+            .expect("Sarah oversees Acme")
+            .0
+            .agent_id
+            .as_str()
+            .to_string();
+        let brief = format!(
+            "Dispatch release 4 now.\n{}",
+            "Watch it through and send Desk each run id. ".repeat(2_500)
+        );
+        let mut jobs = Vec::new();
+        for n in 0..10 {
+            let mut a =
+                workforce_desk::assignment::Assignment::new(&agent, uuid::Uuid::new_v4(), &brief);
+            a.job_key = Some(format!("acme/api/release/{n}"));
+            a.irreversible = true;
+            a.claims = true;
+            let kept = d.store().assignment_reserve(&a, None).await.unwrap();
+            assert!(
+                matches!(
+                    kept,
+                    workforce_desk::assignment_store::Reserved::Kept { .. }
+                ),
+                "{kept:?}"
+            );
+            jobs.push(a);
+        }
+        assert!(
+            json!(jobs).to_string().len() > 1024 * 1024,
+            "far over a call"
+        );
+        let (answered_id, lost_id) = (uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+        let seen: Arc<parking_lot::Mutex<Vec<RelayCall>>> = Arc::default();
+        let handed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        // Desk's native side, and devbox, standing in: devbox never answers
+        // the second decision's answer.
+        let poller = {
+            let (crew, seen, handed) = (Arc::clone(&crew), Arc::clone(&seen), Arc::clone(&handed));
+            tokio::spawn(async move {
+                loop {
+                    for c in crew.relay_take(Duration::from_millis(200)).await {
+                        seen.lock().push(c.clone());
+                        let in_force = c.input["inForce"] == true;
+                        let mut body = match c.tool.as_str() {
+                            TAKE if in_force
+                                && !handed.swap(true, std::sync::atomic::Ordering::SeqCst) =>
+                            {
+                                json!({"full": true, "decisions": [
+                                    {"decideId": answered_id, "prompt": format!(
+                                        "{} decide `git tag v9`", super::super::decide::MARK)},
+                                    {"decideId": lost_id, "prompt": format!(
+                                        "{} decide `git push --tags`", super::super::decide::MARK)},
+                                ]})
+                            }
+                            TAKE => json!({"full": in_force, "decisions": []}),
+                            _ if c.input["decideId"] == json!(lost_id.to_string()) => continue,
+                            _ => json!({"taken": true}),
+                        };
+                        if c.tool == TAKE {
+                            body["countFrom"] = c.input["countFrom"].clone();
+                            body["spentUsd"] = json!(0.0);
+                        }
+                        crew.relay_answer(
+                            c.id,
+                            RelayAnswer {
+                                status: ServedStatus::Ok,
+                                body,
+                            },
+                        );
+                    }
+                }
+            })
+        };
+        let decided = |id: uuid::Uuid| {
+            let seen = Arc::clone(&seen);
+            async move {
+                eventually("its answer relayed", async || {
+                    seen.lock()
+                        .iter()
+                        .find(|c| c.tool == DECIDED && c.input["decideId"] == json!(id.to_string()))
+                        .cloned()
+                })
+                .await
+            }
+        };
+        let ok = decided(answered_id).await;
+        assert_eq!(ok.input["text"], "ALLOW: it tags the release");
+        let held: Vec<workforce_desk::assignment::Assignment> =
+            serde_json::from_value(ok.input["heldJobs"].clone())
+                .expect("the jobs, as devbox reads them");
+        assert_eq!(held.len(), jobs.len());
+        for (h, a) in held.iter().zip(&jobs) {
+            assert_eq!((h.id, h.session, &h.job_key), (a.id, a.session, &a.job_key));
+            assert!(h.irreversible && h.state.live());
+            assert_eq!(h.about(), a.about());
+            assert!(h.text.len() < 100, "{}", h.text);
+        }
+        // Devbox didn't answer: said in her DM, once.
+        decided(lost_id).await;
+        let notice = [
+            "On devbox: Desk decided a session's request there",
+            "may not have reached it",
+        ];
+        eventually("said in her DM", async || {
+            (super::decides_at_once::said(&sarah, &notice) > 0).then_some(())
+        })
+        .await;
+        tokio::time::sleep(Duration::from_millis(800)).await;
+        assert_eq!(super::decides_at_once::said(&sarah, &notice), 1);
+        poller.abort();
+    })
+    .await;
+}
+
 /// On devbox: a request that can't be taken back, beside a job Sarah's home
 /// says one of her sessions holds, is the person's to allow, by her relayed
 /// approve or by her home's decision; and so when her home doesn't say.
@@ -734,17 +866,18 @@ async fn a_request_beside_a_job_the_home_holds_is_the_persons_on_the_machine() {
         let app = super::super::relay::routes(Arc::clone(&crew.state), Arc::clone(&crew));
         let token = crew.state.auth_token.clone();
         // Release 4, held by another of Sarah's sessions at home.
+        // As her home sends it: as devbox compares a request with it.
         let mut home = workforce_desk::assignment::Assignment::new(
             "desk",
             uuid::Uuid::new_v4(),
-            "Dispatch release 4 now.",
+            &format!("Dispatch release 4 now.\n{}", "Watch it through. ".repeat(1_000)),
         );
         home.job_key = Some("acme/api/release/4".into());
         home.job = Some("release 4 of acme/api".into());
         home.irreversible = true;
         home.claims = true;
         home.state = workforce_desk::assignment::AssignmentState::Open;
-        let held = json!([home]);
+        let held = json!([home.compared()]);
 
         // Her relayed approve: with the job, or without the jobs, the
         // person's; with none held, allowed.

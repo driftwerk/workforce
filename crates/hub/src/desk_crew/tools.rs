@@ -1089,7 +1089,15 @@ impl CrewTool {
         // The machine compares a request with the jobs kept here (R5).
         if name == "crew.approve" {
             match crew.held_irreversible(agent).await {
-                Ok(held) => sent[super::assignments::HELD_JOBS] = json!(held),
+                Ok(held) => {
+                    sent = super::assignments::with_held(
+                        sent,
+                        super::assignments::HELD_JOBS,
+                        &held,
+                        machine,
+                        |v| super::relay::carries(machine, &g, name, v, agent, &ceiling),
+                    );
+                }
                 Err(why) => {
                     return Some(Err(format!(
                         "Not allowed: {why}, so this can't be checked against them. It's the person's to answer."

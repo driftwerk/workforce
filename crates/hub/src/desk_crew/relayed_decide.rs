@@ -37,6 +37,7 @@ use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 use workforce_common::oversight::{Level, Oversight};
+use workforce_desk::crew::MachineRefused;
 use workforce_desk::grant::BossRef;
 
 use super::left::Left;
@@ -1121,6 +1122,7 @@ async fn take(
             prompt.to_string(),
             Call::of(d["kind"].as_str()),
             Arc::clone(&pumps),
+            Arc::clone(&told),
         ));
     }
 }
@@ -1136,6 +1138,7 @@ async fn decide_one(
     prompt: String,
     call: Option<Call>,
     pumps: Pumps,
+    told: Arc<Mutex<Told>>,
 ) {
     let (machine, group) = &k;
     let agent = service.agent_id.as_str().to_string();
@@ -1209,24 +1212,43 @@ async fn decide_one(
         }
         d => d,
     };
-    let mut input = match decided {
+    let input = match decided {
         Ok(text) => json!({"decideId": id,
                            "text": text.chars().take(MAX_ANSWER).collect::<String>()}),
         Err((code, why)) => json!({"decideId": id, "error": why, "code": code.as_str()}),
     };
-    // The jobs the boss holds here, for the machine to compare the request
-    // with (R5); none said when they couldn't be read, and the machine then
-    // leaves an irreversible one to the person.
-    if let Ok(held) = crew.held_irreversible(&agent).await {
-        input["heldJobs"] = json!(held);
-    }
-    tracing::info!(%machine, %group, %agent, ok = input.get("text").is_some(), "a relayed boss decided a machine's request");
     let ceiling = crew.ceiling_now(&agent, &o);
-    if let Err(why) = crew
-        .relay(machine, group, DECIDED, input, &agent, &ceiling)
+    // The jobs the boss holds here, for the machine to compare the request
+    // with (R5); none said when they couldn't be read or don't fit, and the
+    // machine then leaves an irreversible one to the person.
+    let input = match crew.held_irreversible(&agent).await {
+        Ok(held) => super::assignments::with_held(input, "heldJobs", &held, machine, |v| {
+            super::relay::carries(machine, group, DECIDED, v, &agent, &ceiling)
+        }),
+        Err(_) => input,
+    };
+    tracing::info!(%machine, %group, %agent, ok = input.get("text").is_some(), "a relayed boss decided a machine's request");
+    let Err(why) = crew
+        .relay_as(machine, group, DECIDED, input, &agent, &ceiling)
         .await
-    {
-        tracing::warn!(%machine, %group, why, "a relayed decision's answer didn't reach its machine");
+    else {
+        return;
+    };
+    tracing::warn!(%machine, %group, why = %why, "a relayed decision's answer didn't reach its machine");
+    // Its session there may wait on it: said to the person, once.
+    let once = id
+        .parse()
+        .is_ok_and(|id| told.lock().says(&agent, id, Instant::now()));
+    if once {
+        let reached = match why {
+            MachineRefused::Unknown(_) => "may not have reached it",
+            _ => "didn't reach it",
+        };
+        crew.tell_dm(
+            &agent,
+            &format!("On {machine}: Desk decided a session's request there, but its answer {reached}, so the request may still wait for you in that session."),
+        )
+        .await;
     }
 }
 

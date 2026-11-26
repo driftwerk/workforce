@@ -91,6 +91,54 @@ pub struct RelayCall {
     pub left_ms: u64,
 }
 
+impl RelayCall {
+    /// `agent`'s call of `tool` to `machine`'s sessions of `group`, at
+    /// `ceiling`.
+    fn of(
+        machine: &str,
+        group: &str,
+        tool: &str,
+        input: Value,
+        agent: &str,
+        ceiling: &super::served::Ceiling,
+    ) -> Self {
+        Self {
+            id: Uuid::new_v4(),
+            machine: machine.to_string(),
+            group: group.to_string(),
+            tool: tool.to_string(),
+            input,
+            boss: BossRef::Local {
+                agent: agent.to_string(),
+            }
+            .key(),
+            link_id: RELAY_LINK,
+            level: ceiling.level,
+            act: ceiling.relayed_act(),
+            left_ms: 0,
+        }
+    }
+
+    /// Whether it is small enough to carry ([`MOST_CALL`]).
+    fn carried(&self) -> bool {
+        serde_json::to_vec(self).is_ok_and(|b| b.len() <= MOST_CALL)
+    }
+}
+
+/// Whether `input` is small enough to carry in `agent`'s call of `tool` to
+/// `machine`'s sessions of `group`: [`CrewHub::relay_as`] refuses one that
+/// isn't, before it is queued.
+pub(super) fn carries(
+    machine: &str,
+    group: &str,
+    tool: &str,
+    input: &Value,
+    agent: &str,
+    ceiling: &super::served::Ceiling,
+) -> bool {
+    RelayCall::of(machine, group, tool, input.clone(), agent, ceiling).carried()
+}
+
 /// What a machine answered.
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -234,25 +282,10 @@ impl CrewHub {
         if !self.relay.polling() {
             return Err(unreached());
         }
-        let id = Uuid::new_v4();
         let wait = *self.relay_wait.lock();
-        let call = RelayCall {
-            id,
-            machine: machine.to_string(),
-            group: group.to_string(),
-            tool: tool.to_string(),
-            input,
-            boss: BossRef::Local {
-                agent: agent.to_string(),
-            }
-            .key(),
-            link_id: RELAY_LINK,
-            level: ceiling.level,
-            act: ceiling.relayed_act(),
-            left_ms: 0,
-        };
+        let call = RelayCall::of(machine, group, tool, input, agent, ceiling);
         // Too large to carry: never queued, so nothing of it is done.
-        if serde_json::to_vec(&call).map_or(usize::MAX, |b| b.len()) > MOST_CALL {
+        if !call.carried() {
             return Err(MachineRefused::Refused(format!(
                 "That call is too large to send to {machine}; send less in it."
             )));
