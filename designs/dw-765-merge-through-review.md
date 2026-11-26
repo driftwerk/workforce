@@ -43,9 +43,10 @@ Below Act fully nothing changes, because the boss can't merge there.
 
 **How it starts.** Desk builds the boss's own `Action::StartSession` and runs it through `gate` → `perform` as the boss, the way the plan watch already resumes sessions (`start_again`).
 - **Folder:** the implementing session's folder.
-- **Worktree:** `review-<number>-<short head>`, created **detached at the reviewed head** by a new `worktree::detached(cwd, name, commit)`.
+- **Worktree:** `review-<number>-<short head>`, created **detached at the reviewed head** by a new `worktree::detached(cwd, name, commit, from)`.
   - It goes in the main checkout's `.worktrees/`, rooted at the parent of `--git-common-dir`, so a plan ticket's own worktree never nests one.
   - One already there at that commit is reused, which covers a start that was cut off. One at another commit is refused.
+  - A head the repository hasn't got (pushed from another clone, GitHub's "Update branch", a bot) is fetched first from `origin`'s `refs/pull/<n>/head` into `refs/remotes/origin/pull/<n>/head`, so the review can read it and its closing sees it as pushed.
   - Desk's start path picks this whenever `review_of` names a worktree. The review's folder is therefore at exactly the head it reviews, which is what `crew.record_review` checks, and it never touches the implementing session's checkout.
 - **Desk's own `.worktrees/` is nobody's work.** `workspace::status_of` drops it from `uncommitted`, as it drops `.DS_Store`. Otherwise a review worktree, or a plan ticket's, would keep the main checkout's session from ever closing.
 - **Goal:** `review::goal(pr, key)`, and Desk's `REVIEW_VERDICT` is appended as before.
@@ -115,9 +116,10 @@ After the merge, `Landed::Merged` and the close sweep carry on as they do now, a
 - **Decision** (`decide.rs::decide_request`, reached only at Act fully):
   - while the person is in the session (`person_in_for`, as `close_held` reads it), its merge is theirs. It is left to them, never denied over their own word;
   - otherwise a `GhPrMerge` request is denied by the boss's decision without a model call. `Verdict::Deny` is recorded as the boss's decision, as every verdict is.
-  - Why: "At Act fully a pull request merges only through your boss (crew.github_merge), once Desk has a clean review at its head."
+  - Why: "At Act fully a pull request is merged only by your boss, with crew.github_merge, once a clean review is recorded at its head."
   - Instead: "Don't merge it yourself: tell your boss on your Desk line that it is ready to merge; your boss merges it once it has a clean review at its head."
 - Below Act fully, Act's judge already gives a merge to the person, and that is unchanged.
+- **Its reach:** the refusal answers a merge the session asks permission for. A session whose mode or own allowlist lets it run `gh pr merge` without asking never reaches the boss's decision. Desk-driven review and the boss's wording (never tell a session to merge) are what keep such a session from being asked to. An unquoted `gh api repos/{owner}/{repo}/…/merge` doesn't split as a plain command, so it is `Other`: the boss's model decides it, and `SYSTEM` tells it to deny.
 
 ### 5. Wording
 
@@ -152,7 +154,8 @@ After the merge, `Landed::Merged` and the close sweep carry on as they do now, a
 - **`worktree::detached`** (unit, real git):
   - made at the commit;
   - found again at that commit;
-  - refused when present at another.
+  - refused when present at another;
+  - a head the repository hasn't got is fetched from `origin`'s pull ref and kept under `refs/remotes/origin/`.
 - **Store** (Postgres):
   - V095 applies twice;
   - a link keeps its head and `for_session`;
