@@ -71,24 +71,28 @@ fn where_of(t: &PlanTicket) -> Where {
 }
 
 /// A plan's ticket that failed to start: how often, why last, and when it
-/// is tried next. Forgotten once it starts, where it runs changes, or its
-/// plan's scope does (an edit within it, as a reorder, isn't enough).
-#[derive(Debug, Clone)]
+/// is tried next. Forgotten once it starts, where it runs changes, or the
+/// person changes its plan's scope (an edit within it, as a reorder, isn't
+/// enough, nor the boss's change of it). Kept over a restart.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub(crate) struct Failed {
     plan: Uuid,
     /// Where it ran: its engine, folder and view, as they were.
     runs: Where,
-    /// The plan's newest change of scope then.
+    /// The person's newest change of the plan's scope then.
     scope: i32,
     count: u32,
-    next: Instant,
+    next: chrono::DateTime<chrono::Utc>,
     why: String,
 }
 
+/// Where [`Failed`] is kept over a restart.
+const PLAN_FAILED: &str = "hub.crew.plan_failed";
+
 impl Failed {
-    /// Whether its failures still count for `t`, its plan's newest change of
-    /// scope being `scope`: nothing about where it runs, or the plan's
-    /// scope, changed since.
+    /// Whether its failures still count for `t`, the person's newest change
+    /// of its plan's scope being `scope`: nothing about where it runs, or
+    /// the plan's scope as the person changed it, changed since.
     fn still(&self, scope: i32, t: &PlanTicket) -> bool {
         self.scope == scope && self.runs == where_of(t)
     }
@@ -2263,8 +2267,9 @@ impl CrewHub {
                 // is tried afresh once the plan changes.
                 let mut rows = tickets.clone();
                 let scope = self.last_scope(p.id).await;
-                {
+                let forgot = {
                     let mut failed = self.plan_failed.lock();
+                    let was = failed.len();
                     failed.retain(|id, f| {
                         f.plan != p.id
                             || tickets
@@ -2272,11 +2277,16 @@ impl CrewHub {
                                 .find(|t| t.id == *id)
                                 .is_some_and(|t| f.still(scope, t))
                     });
+                    let now = chrono::Utc::now();
                     for t in &mut rows {
-                        if failed.get(&t.id).is_some_and(|f| Instant::now() < f.next) {
+                        if failed.get(&t.id).is_some_and(|f| now < f.next) {
                             t.starting = true;
                         }
                     }
+                    failed.len() != was
+                };
+                if forgot {
+                    self.keep_plan_failed().await;
                 }
                 // A ticket waiting on its clone holds no slot: it is asked
                 // after on its own, and starts with the rest once ready.
@@ -2308,7 +2318,9 @@ impl CrewHub {
                 for s in plan::next_starts(&p, &rows, room, standing) {
                     match self.desk.plan_start(&p, &s, &boss, &by).await {
                         Ok(started) => {
-                            self.plan_failed.lock().remove(&s.ticket);
+                            if self.plan_failed.lock().remove(&s.ticket).is_some() {
+                                self.keep_plan_failed().await;
+                            }
                             self.plan_waiting.lock().remove(&s.ticket);
                             if let Some(m) = &started.machine {
                                 let ticket = tickets.iter().find(|t| t.id == s.ticket);
@@ -2396,7 +2408,8 @@ impl CrewHub {
         }
     }
 
-    /// The newest revision of plan `id` that changed its scope.
+    /// The newest revision of plan `id` in which the person changed its
+    /// scope.
     async fn last_scope(&self, id: Uuid) -> i32 {
         self.desk
             .store()
@@ -2404,7 +2417,7 @@ impl CrewHub {
             .await
             .unwrap_or_default()
             .iter()
-            .filter(|r| r.change == plan::Change::Scope)
+            .filter(|r| r.change == plan::Change::Scope && r.by.kind == PartyKind::You)
             .map(|r| r.revision)
             .max()
             .unwrap_or(1)
@@ -2425,20 +2438,25 @@ impl CrewHub {
         let again = !matches!(e, workforce_desk::DeskError::WorktreeTaken(_));
         let why = plain(e);
         let (ticket, key) = (t.id, t.name());
+        let on = match (again, &t.machine) {
+            (false, Some(m)) => format!(" on {m}"),
+            _ => String::new(),
+        };
         tracing::warn!(plan = %p.id, ticket = %ticket, key = %key, error = %why, "a plan's ticket didn't start");
         let (count, tell) = {
             let mut failed = self.plan_failed.lock();
+            let now = chrono::Utc::now();
             let f = failed.entry(ticket).or_insert_with(|| Failed {
                 plan: p.id,
                 runs: where_of(t),
                 scope,
                 count: 0,
-                next: Instant::now(),
+                next: now,
                 why: String::new(),
             });
             f.count += 1;
             let wait = self.timing.minute * 2u32.saturating_pow(f.count - 1).min(64);
-            f.next = Instant::now() + wait;
+            f.next = now + chrono::Duration::from_std(wait).unwrap_or_default();
             let tell = f.why != why;
             f.why.clone_from(&why);
             (f.count, tell)
@@ -2446,17 +2464,42 @@ impl CrewHub {
         if tell {
             self.plan_failures
                 .lock()
-                .push((p.id, format!("{key} didn't start: {why}")));
+                .push((p.id, format!("{key} didn't start{on}: {why}")));
         }
         if !again || count >= FAILS_BEFORE_PAUSE {
             let said = match again {
                 true => format!("{key} couldn't start {count} times: {why}"),
-                false => format!("{key} can't start: {why}"),
+                false => format!("{key} can't start{on}: {why}"),
             };
             if let Err(e) = self.desk.pause_plan_failing(p.id, &said).await {
                 tracing::warn!(plan = %p.id, error = %e, "a plan that keeps failing wasn't paused");
             }
             self.plan_failed.lock().remove(&ticket);
+        }
+        self.keep_plan_failed().await;
+    }
+
+    /// What failed to start before a restart, as [`Self::keep_plan_failed`]
+    /// kept it.
+    pub(super) async fn load_plan_failed(&self) {
+        match self.desk.store().state(PLAN_FAILED).await {
+            Ok(Some(kept)) => match serde_json::from_value(kept.value) {
+                Ok(kept) => *self.plan_failed.lock() = kept,
+                Err(e) => {
+                    tracing::warn!(error = %e, "what failed to start before a restart couldn't be read: counted afresh");
+                }
+            },
+            Ok(None) => {}
+            Err(e) => {
+                tracing::warn!(error = %format!("{e:#}"), "what failed to start before a restart wasn't read: counted afresh");
+            }
+        }
+    }
+
+    async fn keep_plan_failed(&self) {
+        let value = serde_json::to_value(&*self.plan_failed.lock()).unwrap_or_default();
+        if let Err(e) = self.desk.store().put_state(PLAN_FAILED, &value).await {
+            tracing::warn!(error = %format!("{e:#}"), "what failed to start wasn't kept");
         }
     }
 
@@ -3097,6 +3140,7 @@ pub(super) fn plan_loop(
                 () = tokio::time::sleep(Duration::from_millis(200)) => {}
             }
         }
+        crew.load_plan_failed().await;
         let mut gathering: HashMap<Uuid, Gathered> = HashMap::new();
         let at = chrono::Local::now().format("%H:%M");
         for (_, (plan, lines)) in crew.reconcile_plans().await {
@@ -3296,7 +3340,7 @@ mod tests {
             runs: where_of(&t),
             scope: 3,
             count: 4,
-            next: Instant::now(),
+            next: chrono::Utc::now(),
             why: "gone".into(),
         };
         // A reorder or a title is no change for it.

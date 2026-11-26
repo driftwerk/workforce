@@ -3259,22 +3259,33 @@ async fn a_machine_ticket_whose_worktree_there_is_taken_pauses_its_plan_once() {
         );
         let (id, key) = approved_on_devbox(&overseer, &d).await;
         let why = paused_failing(&d, id).await;
-        assert_eq!(
-            why,
-            format!("{key} can't start: devbox didn't start {key}: {held}")
-        );
+        assert_eq!(why, format!("{key} can't start on devbox: {held}"));
         assert!(d.plan_needs().iter().any(|n| n.ask.contains(&why)));
+        let told = format!("{key} didn't start on devbox: {held}");
         eventually("the boss told", async || {
-            (said(&llm, &format!("{key} didn't start")).await >= 1).then_some(())
+            (said(&llm, &told).await >= 1).then_some(())
         })
         .await;
         tokio::time::sleep(Duration::from_millis(1_500)).await;
         assert_eq!(starts.lock().len(), 1, "never tried again by itself");
-        assert_eq!(said(&llm, &format!("{key} didn't start")).await, 1);
+        assert_eq!(said(&llm, &told).await, 1);
         assert_eq!(
             d.plan(id).await.unwrap().tickets[0].ticket.ticket.state,
             TicketState::Todo
         );
+        // Continued with it still taken, it is tried once more and pauses
+        // again: no loop.
+        let revision = d.plan(id).await.unwrap().summary.plan.revision;
+        d.decide_plan(id, revision, true, None, &By::you())
+            .await
+            .unwrap();
+        eventually("tried once more", async || {
+            (starts.lock().len() == 2).then_some(())
+        })
+        .await;
+        assert_eq!(paused_failing(&d, id).await, why);
+        tokio::time::sleep(Duration::from_millis(1_500)).await;
+        assert_eq!(starts.lock().len(), 2, "not tried again by itself");
         poller.abort();
     })
     .await;
@@ -3306,6 +3317,97 @@ async fn a_machine_ticket_that_keeps_failing_to_start_backs_off_and_pauses() {
                 n + 2
             );
         }
+        poller.abort();
+    })
+    .await;
+}
+
+/// The boss's changes of its plan, as it hears of a ticket failing to
+/// start, don't count its failures afresh: it still pauses at the fifth.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_bosss_changes_between_failures_still_pause_at_the_fifth() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (overseer, state, d, _llm) = hub_with(dir.path(), pool, ACTS).await;
+        let crew = CrewHub::start(state, d.clone(), FAST, CancellationToken::new());
+        let (poller, starts) = refusing_devbox(&crew, json!({ "error": "the disk is full" }));
+        let (id, key) = approved_on_devbox(&overseer, &d).await;
+        for n in 1..=3 {
+            eventually("a failed start", async || {
+                (starts.lock().len() >= n).then_some(())
+            })
+            .await;
+            d.change_plan(
+                id,
+                workforce_desk::PlanEdit {
+                    goal: Some(format!("Fix the CRM's bugs, take {n}")),
+                    ..Default::default()
+                },
+                Engine::Claude,
+                false,
+                &By::manager("desk", "Desk", "It didn't start."),
+            )
+            .await
+            .unwrap();
+        }
+        let why = paused_failing(&d, id).await;
+        assert!(
+            why.starts_with(&format!("{key} couldn't start 5 times:")),
+            "{why}"
+        );
+        assert_eq!(starts.lock().len(), 5);
+        poller.abort();
+    })
+    .await;
+}
+
+/// A restart of the hub keeps how often a ticket failed to start: its plan
+/// still pauses at the fifth, not five more.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_restart_keeps_how_often_a_ticket_failed_to_start() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (overseer, state, d, _llm) = hub_with(dir.path(), pool, ACTS).await;
+        let first_cancel = CancellationToken::new();
+        let first = CrewHub::start(state.clone(), d.clone(), FAST, first_cancel.clone());
+        let refusal = json!({ "error": "the disk is full" });
+        let (poller, before) = refusing_devbox(&first, refusal.clone());
+        let (id, key) = approved_on_devbox(&overseer, &d).await;
+        eventually("two failed starts", async || {
+            (before.lock().len() >= 2).then_some(())
+        })
+        .await;
+        first_cancel.cancel();
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        poller.abort();
+        // What was kept: a start cut off by the restart, its answer never
+        // read, isn't counted.
+        let kept = d
+            .store()
+            .state("hub.crew.plan_failed")
+            .await
+            .unwrap()
+            .expect("kept")
+            .value;
+        let counted = kept
+            .as_object()
+            .unwrap()
+            .values()
+            .map(|f| f["count"].as_u64().unwrap())
+            .sum::<u64>() as usize;
+        assert!(counted >= 2, "{kept}");
+        let second = CrewHub::start(state, d.clone(), FAST, CancellationToken::new());
+        let (poller, after) = refusing_devbox(&second, refusal);
+        let why = paused_failing(&d, id).await;
+        assert!(
+            why.starts_with(&format!("{key} couldn't start 5 times:")),
+            "{why}"
+        );
+        assert_eq!(
+            after.lock().len(),
+            5 - counted,
+            "{counted} kept over the restart"
+        );
         poller.abort();
     })
     .await;

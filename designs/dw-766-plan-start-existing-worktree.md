@@ -100,3 +100,52 @@ D/service/plans.rs:
 H/tests/plans.rs:
 - `a_machine_ticket_whose_worktree_there_is_taken_pauses_its_plan_once`: devbox answers `session_start` with 409 `worktree_taken`: the plan pauses at once saying why, one start was sent, the boss is told once.
 - `a_machine_ticket_that_keeps_failing_to_start_backs_off_and_pauses`: devbox refuses every start plainly: the starts come further apart each time and the plan pauses at the 5th.
+
+## After review
+
+An independent review of the first cut found 13 things. Each is fixed in
+this PR, with a test.
+
+1. **A resume can't share a worktree.** Resuming a stopped session into a
+   worktree a later start has taken is refused, naming the holder. The same
+   check under the state lock as a start, leaving out the resumed session.
+2. **A session the terminal keeper still runs holds its worktree.** An
+   Interrupted session whose process the keeper still runs (`held_untaken`)
+   counts as a holder. The keeper is asked before the lock is taken.
+3. **The boss's changes don't count failures afresh.** The count resets only
+   on the person's change of the plan's scope, or on a change of where the
+   ticket runs. The boss changing the goal each time it hears "didn't start"
+   was the likely cause of the loop every ~60 s.
+4. **Links are resolved.** Both a session's folder and the worktree are
+   canonicalised before they are compared, falling back to the raw path.
+5. **No repo-wide prune.** A worktree git still lists, its folder gone, is
+   made again with `worktree add --force` over its own entry, and only that
+   entry. A locked one is never forced: it is Taken, saying to unlock it.
+6. **The listing is read with `-z`** (git 2.36 and later), falling back to
+   the line form on older git. Paths are canonicalised in `create`, so the
+   parser stays pure.
+7. **git's own "already exists" or "is already checked out"** from `worktree
+   add`, after the list was read, is Taken.
+8. **A retry on a machine re-reads its sessions** when the start comes back
+   Taken. When the ticket's own session from the first try is there, it is
+   taken up, not paused on.
+9. **The pause reads "{key} can't start on {machine}: {why}"**, with no
+   repeated key.
+10. **Continue while still taken** tries once more and pauses again: no
+    loop.
+11. **A ticket moved back to To do while its session idles.** This happens
+    routinely: a move to To do by the person, the boss or board sync
+    unassigns the ticket and only tells the session to stop, so it rests
+    Idle in the worktree. A boss's start now stops its own resting session
+    of the same name first: Idle or Done, live in Desk, not in a terminal,
+    and still in that boss's charge. It waits up to 10 s for it to stop.
+    Anything else still pauses.
+12. **One git test helper** (`worktree::test_repo`) is shared by the
+    worktree and plan tests.
+13. **Failures are kept over a restart.** They are kept in Desk's state
+    store (`hub.crew.plan_failed`), so no migration is needed. The next try
+    is a wall-clock time.
+
+The Desk app shows `worktree_taken` as "That branch's copy is in use by
+another session", with a button to open the holding session when Desk lists
+it.

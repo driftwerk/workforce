@@ -56,58 +56,103 @@ pub enum Unmade {
 
 /// `branch`'s worktree, `<repo>/.worktrees/<slug>`: the one there already
 /// when it is that branch's, as git lists it (its uncommitted work kept);
-/// else made (new from HEAD, or the existing branch). A folder there that
-/// isn't, or the branch checked out elsewhere, is [`Unmade::Taken`].
+/// else made (new from HEAD, or the existing branch), over git's entry for
+/// a folder deleted by hand. A folder there that isn't, a locked entry, or
+/// the branch checked out elsewhere, is [`Unmade::Taken`].
 pub async fn create(cwd: &Path, branch: &str) -> Result<PathBuf, Unmade> {
     let (root, path) = located(cwd, branch).await?;
-    let there = path.exists();
-    if !there {
-        git(&root, &["worktree", "prune"]).await?;
-    }
-    let list = listed(&git(&root, &["worktree", "list", "--porcelain"]).await?);
-    match standing(&list, &canonical(&path), there, branch) {
-        Standing::Own => Ok(path),
-        Standing::Taken(why) => Err(Unmade::Taken(why)),
-        Standing::Free => {
-            add(&root, &path, branch, None).await?;
-            Ok(path)
-        }
+    let list: Vec<Listed> = worktrees(&root)
+        .await?
+        .into_iter()
+        .map(|w| Listed {
+            path: canonical(&w.path),
+            ..w
+        })
+        .collect();
+    let force = match standing(&list, &canonical(&path), path.exists(), branch) {
+        Standing::Own => return Ok(path),
+        Standing::Taken(why) => return Err(Unmade::Taken(why)),
+        Standing::Free => false,
+        Standing::Stale => true,
+    };
+    add(&root, &path, branch, None, force)
+        .await
+        .map_err(unmade)?;
+    Ok(path)
+}
+
+/// `root`'s worktrees as git lists them: NUL-separated where git can
+/// (2.36 and later), else by line.
+async fn worktrees(root: &Path) -> Result<Vec<Listed>> {
+    match git(root, &["worktree", "list", "--porcelain", "-z"]).await {
+        Ok(out) => Ok(listed(&out, '\0')),
+        Err(_) => git(root, &["worktree", "list", "--porcelain"])
+            .await
+            .map(|out| listed(&out, '\n')),
     }
 }
 
-/// A worktree as `git worktree list --porcelain` says it: its folder and
-/// its branch, none when detached.
+/// A worktree as `git worktree list --porcelain` says it: its folder, its
+/// branch (none when detached), and whether it is locked.
 #[derive(Debug, PartialEq)]
 struct Listed {
     path: PathBuf,
     branch: Option<String>,
+    locked: bool,
 }
 
-fn listed(porcelain: &str) -> Vec<Listed> {
+/// The worktrees of a porcelain listing whose fields end in `sep`, each
+/// worktree's fields closed by an empty one.
+fn listed(porcelain: &str, sep: char) -> Vec<Listed> {
     porcelain
-        .split("\n\n")
-        .filter_map(|block| {
-            let path = block.lines().find_map(|l| l.strip_prefix("worktree "))?;
-            let branch = block
-                .lines()
-                .find_map(|l| l.strip_prefix("branch "))
+        .split(sep)
+        .collect::<Vec<_>>()
+        .split(|f| f.is_empty())
+        .filter_map(|fields| {
+            let path = fields.iter().find_map(|f| f.strip_prefix("worktree "))?;
+            let branch = fields
+                .iter()
+                .find_map(|f| f.strip_prefix("branch "))
                 .map(|b| b.strip_prefix("refs/heads/").unwrap_or(b).to_string());
             Some(Listed {
-                path: canonical(Path::new(path)),
+                path: PathBuf::from(path),
                 branch,
+                locked: fields
+                    .iter()
+                    .any(|f| *f == "locked" || f.starts_with("locked ")),
             })
         })
         .collect()
 }
 
-fn canonical(path: &Path) -> PathBuf {
+/// `path` with its links resolved, or as it is when it can't be.
+pub fn canonical(path: &Path) -> PathBuf {
     std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+/// A failed `git worktree add`: [`Unmade::Taken`] when what is in its way
+/// came about since the worktrees were read.
+fn unmade(e: eyre::Report) -> Unmade {
+    let said = e.to_string();
+    match [
+        "already exists",
+        "is already checked out",
+        "is already used by worktree",
+    ]
+    .iter()
+    .any(|s| said.contains(s))
+    {
+        true => Unmade::Taken(said),
+        false => Unmade::Failed(e),
+    }
 }
 
 /// What `path`, `branch`'s worktree folder, is now.
 #[derive(Debug, PartialEq)]
 enum Standing {
     Free,
+    /// Gone, though git still lists it: made again over its entry.
+    Stale,
     Own,
     Taken(String),
 }
@@ -118,22 +163,26 @@ fn standing(list: &[Listed], path: &Path, there: bool, branch: &str) -> Standing
         .iter()
         .find(|w| w.path != path && w.branch.as_deref() == Some(branch));
     let shown = path.display();
-    match (there, at.map(|w| w.branch.as_deref()), elsewhere) {
-        (true, Some(Some(b)), _) if b == branch => Standing::Own,
-        (true, Some(Some(other)), _) => Standing::Taken(format!(
+    match (there, at, elsewhere) {
+        (true, Some(w), _) if w.branch.as_deref() == Some(branch) => Standing::Own,
+        (true, Some(Listed { branch: Some(other), .. }), _) => Standing::Taken(format!(
             "{shown} is there already on {other}, not {branch}: move it away, or check out {branch} in it"
         )),
-        (true, Some(None), _) => Standing::Taken(format!(
+        (true, Some(_), _) => Standing::Taken(format!(
             "{shown} is there already with no branch checked out, not {branch}: move it away, or check out {branch} in it"
         )),
         (true, None, _) => Standing::Taken(format!(
             "{shown} is there already and isn't a worktree of its repository: move it away"
         )),
+        (false, Some(w), _) if w.locked => Standing::Taken(format!(
+            "{shown} is gone, but git keeps it as a locked worktree: unlock it (git worktree unlock) or remove it"
+        )),
         (false, _, Some(w)) => Standing::Taken(format!(
             "{branch} is checked out already in {}: Desk works on it only in {shown}",
             w.path.display()
         )),
-        (false, _, None) => Standing::Free,
+        (false, Some(_), None) => Standing::Stale,
+        (false, None, None) => Standing::Free,
     }
 }
 
@@ -173,10 +222,15 @@ async fn located(cwd: &Path, branch: &str) -> Result<(PathBuf, PathBuf)> {
 }
 
 /// Adds the worktree `path` on `branch`: the existing branch, or a new one
-/// from `start` (HEAD when none). A new one asked of an existing branch is
-/// refused.
-async fn add(root: &Path, path: &Path, branch: &str, start: Option<&str>) -> Result<()> {
-    let path_arg = path.to_string_lossy().into_owned();
+/// from `start` (HEAD when none); `force` over git's entry for it, its
+/// folder gone. A new one asked of an existing branch is refused.
+async fn add(
+    root: &Path,
+    path: &Path,
+    branch: &str,
+    start: Option<&str>,
+    force: bool,
+) -> Result<()> {
     let exists = git(
         root,
         &[
@@ -188,15 +242,19 @@ async fn add(root: &Path, path: &Path, branch: &str, start: Option<&str>) -> Res
     )
     .await
     .is_ok();
-    match (exists, start) {
-        (true, Some(_)) => eyre::bail!("a branch called {branch} already exists"),
-        (true, None) => git(root, &["worktree", "add", &path_arg, branch]).await?,
-        (false, None) => git(root, &["worktree", "add", "-b", branch, &path_arg]).await?,
-        (false, Some(start)) => {
-            git(root, &["worktree", "add", "-b", branch, &path_arg, start]).await?
-        }
-    };
-    Ok(())
+    if exists && start.is_some() {
+        eyre::bail!("a branch called {branch} already exists");
+    }
+    let path_arg = path.to_string_lossy();
+    let args: Vec<&str> = ["worktree", "add"]
+        .into_iter()
+        .chain(force.then_some("--force"))
+        .chain((!exists).then_some(["-b", branch]).into_iter().flatten())
+        .chain([path_arg.as_ref()])
+        .chain(exists.then_some(branch))
+        .chain(start)
+        .collect();
+    git(root, &args).await.map(drop)
 }
 
 async fn create_from(cwd: &Path, branch: &str, start: &str) -> Result<PathBuf> {
@@ -204,7 +262,7 @@ async fn create_from(cwd: &Path, branch: &str, start: &str) -> Result<PathBuf> {
     if path.exists() {
         eyre::bail!("{} already exists", path.display());
     }
-    add(&root, &path, branch, Some(start)).await?;
+    add(&root, &path, branch, Some(start), false).await?;
     Ok(path)
 }
 
@@ -308,6 +366,27 @@ fn main_repo(dir: &std::path::Path, dot: &std::path::Path) -> Option<String> {
     Some(root.to_string_lossy().into_owned())
 }
 
+/// A repository at `dir` with one commit on `main`, for tests.
+#[cfg(test)]
+pub(crate) async fn test_repo(dir: &Path) {
+    for args in [
+        vec!["init", "-q", "-b", "main"],
+        vec![
+            "-c",
+            "user.email=d@e",
+            "-c",
+            "user.name=d",
+            "commit",
+            "-q",
+            "--allow-empty",
+            "-m",
+            "init",
+        ],
+    ] {
+        git(dir, &args).await.unwrap();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -349,7 +428,7 @@ mod tests {
     async fn creates_a_worktree_on_a_new_branch() {
         let dir = tempfile::tempdir().unwrap();
         let repo = dir.path();
-        init(repo).await;
+        test_repo(repo).await;
         let wt = create(repo, "desk/auth-fix").await.unwrap();
         assert!(wt.ends_with(".worktrees/desk-auth-fix"));
         assert_eq!(
@@ -357,25 +436,6 @@ mod tests {
             "desk/auth-fix"
         );
         assert!(create(repo, "bad..name").await.is_err());
-    }
-
-    async fn init(repo: &Path) {
-        for args in [
-            vec!["init", "-q", "-b", "main"],
-            vec![
-                "-c",
-                "user.email=d@e",
-                "-c",
-                "user.name=d",
-                "commit",
-                "-q",
-                "--allow-empty",
-                "-m",
-                "init",
-            ],
-        ] {
-            git(repo, &args).await.unwrap();
-        }
     }
 
     fn taken(e: Unmade) -> String {
@@ -391,7 +451,7 @@ mod tests {
     async fn a_branchs_own_worktree_is_reused_with_its_work() {
         let dir = tempfile::tempdir().unwrap();
         let repo = dir.path();
-        init(repo).await;
+        test_repo(repo).await;
         let first = create(repo, "man-515").await.unwrap();
         std::fs::write(first.join("half-done.rs"), "fn wip() {}").unwrap();
         let again = create(repo, "man-515").await.unwrap();
@@ -413,7 +473,7 @@ mod tests {
     async fn a_folder_that_isnt_the_branchs_worktree_is_taken() {
         let dir = tempfile::tempdir().unwrap();
         let repo = dir.path();
-        init(repo).await;
+        test_repo(repo).await;
         let root = PathBuf::from(git(repo, &["rev-parse", "--show-toplevel"]).await.unwrap());
         std::fs::create_dir_all(root.join(".worktrees/man-1")).unwrap();
         let plain = taken(create(repo, "man-1").await.unwrap_err());
@@ -475,7 +535,7 @@ mod tests {
     async fn a_deleted_worktree_still_registered_is_made_again() {
         let dir = tempfile::tempdir().unwrap();
         let repo = dir.path();
-        init(repo).await;
+        test_repo(repo).await;
         let first = create(repo, "man-9").await.unwrap();
         std::fs::remove_dir_all(&first).unwrap();
         let again = create(repo, "man-9").await.unwrap();
@@ -486,27 +546,70 @@ mod tests {
         );
     }
 
+    /// A worktree git keeps locked, its folder gone, is never made over.
+    #[tokio::test]
+    async fn a_locked_worktree_whose_folder_is_gone_is_taken() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        test_repo(repo).await;
+        let first = create(repo, "man-8").await.unwrap();
+        git(repo, &["worktree", "lock", &first.to_string_lossy()])
+            .await
+            .unwrap();
+        std::fs::remove_dir_all(&first).unwrap();
+        let locked = taken(create(repo, "man-8").await.unwrap_err());
+        assert!(locked.contains("locked worktree"), "{locked}");
+        assert!(!first.exists());
+    }
+
     #[test]
-    fn a_worktree_list_says_each_folder_and_its_branch() {
-        let list = listed(
-            "worktree /dev/atlas\nHEAD 1111\nbranch refs/heads/main\n\n\
-             worktree /dev/atlas/.worktrees/man-5\nHEAD 2222\ndetached\n\n\
-             worktree /gone/man-6\nHEAD 3333\nbranch refs/heads/man-6\nprunable gitdir file points to non-existent location",
-        );
+    fn a_worktree_list_says_each_folder_its_branch_and_its_lock() {
+        let fields = [
+            "worktree /dev/atlas",
+            "HEAD 1111",
+            "branch refs/heads/main",
+            "",
+            "worktree /dev/atlas/.worktrees/man-5",
+            "HEAD 2222",
+            "detached",
+            "",
+            "worktree /gone/man-6",
+            "HEAD 3333",
+            "branch refs/heads/man-6",
+            "prunable gitdir file points to non-existent location",
+            "",
+            "worktree /dev/atlas/.worktrees/man-7",
+            "HEAD 4444",
+            "branch refs/heads/man-7",
+            "locked on a stick",
+            "",
+        ];
+        let by_line = listed(fields.join("\n").trim_end(), '\n');
+        let by_nul = listed(&fields.join("\0"), '\0');
+        assert_eq!(by_line, by_nul);
+        let list = by_nul;
         assert_eq!(
             list,
             vec![
                 Listed {
                     path: "/dev/atlas".into(),
-                    branch: Some("main".into())
+                    branch: Some("main".into()),
+                    locked: false,
                 },
                 Listed {
                     path: "/dev/atlas/.worktrees/man-5".into(),
-                    branch: None
+                    branch: None,
+                    locked: false,
                 },
                 Listed {
                     path: "/gone/man-6".into(),
-                    branch: Some("man-6".into())
+                    branch: Some("man-6".into()),
+                    locked: false,
+                },
+                Listed {
+                    path: "/dev/atlas/.worktrees/man-7".into(),
+                    branch: Some("man-7".into()),
+                    locked: true,
                 },
             ]
         );
@@ -515,11 +618,35 @@ mod tests {
             standing(&list, at, false, "man-6"),
             Standing::Taken(why) if why.contains("checked out already in /gone/man-6")
         ));
-        assert_eq!(standing(&list, at, false, "man-7"), Standing::Free);
+        assert_eq!(standing(&list, at, false, "man-9"), Standing::Free);
         let own = Path::new("/dev/atlas/.worktrees/man-5");
         assert!(matches!(
             standing(&list, own, true, "man-5"),
             Standing::Taken(why) if why.contains("no branch checked out")
+        ));
+        assert_eq!(standing(&list, own, false, "man-5"), Standing::Stale);
+        let locked = Path::new("/dev/atlas/.worktrees/man-7");
+        assert!(matches!(
+            standing(&list, locked, false, "man-7"),
+            Standing::Taken(why) if why.contains("locked")
+        ));
+        assert_eq!(standing(&list, locked, true, "man-7"), Standing::Own);
+    }
+
+    /// What git finds in a worktree's way after the list was read is
+    /// taken; anything else failed.
+    #[test]
+    fn a_worktree_git_finds_in_the_way_is_taken() {
+        for said in [
+            "git worktree add: fatal: '/r/.worktrees/x' already exists",
+            "git worktree add: fatal: 'x' is already checked out at '/r/y'",
+            "git worktree add: fatal: 'x' is already used by worktree at '/r/y'",
+        ] {
+            assert!(matches!(unmade(eyre::eyre!("{said}")), Unmade::Taken(w) if w == said));
+        }
+        assert!(matches!(
+            unmade(eyre::eyre!("git worktree add: fatal: not a git repository")),
+            Unmade::Failed(_)
         ));
     }
 
@@ -547,7 +674,7 @@ mod tests {
     async fn a_fresh_copy_takes_the_first_name_no_branch_or_copy_has() {
         let dir = tempfile::tempdir().unwrap();
         let repo = dir.path();
-        init(repo).await;
+        test_repo(repo).await;
         // Someone's own branch of that name, with no copy.
         git(repo, &["branch", "desk/fix-login"]).await.unwrap();
         let (first, branch) = create_fresh(repo, "desk/fix-login").await.unwrap();

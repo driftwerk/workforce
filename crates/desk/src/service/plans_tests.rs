@@ -2775,16 +2775,6 @@ fn assert_keys_once(detail: &PlanDetail) {
     assert_eq!(keys.len(), sent.as_object().unwrap().len(), "{keys:?}");
 }
 
-fn git_in(dir: &Path, args: &[&str]) {
-    let out = std::process::Command::new("git")
-        .arg("-C")
-        .arg(dir)
-        .args(args)
-        .output()
-        .unwrap();
-    assert!(out.status.success(), "git {args:?}: {out:?}");
-}
-
 /// A ticket whose worktree is there from an earlier start of it starts in
 /// that worktree, its uncommitted work kept; a start on its branch while
 /// its session runs there is refused as taken, and one after it closed
@@ -2793,21 +2783,7 @@ fn git_in(dir: &Path, args: &[&str]) {
 async fn a_plans_ticket_starts_in_its_own_worktree_from_before() {
     with_test_pool(build_pool, |pool| async move {
         let dir = tempfile::tempdir().unwrap();
-        git_in(dir.path(), &["init", "-q", "-b", "main"]);
-        git_in(
-            dir.path(),
-            &[
-                "-c",
-                "user.email=d@e",
-                "-c",
-                "user.name=d",
-                "commit",
-                "-q",
-                "--allow-empty",
-                "-m",
-                "init",
-            ],
-        );
+        crate::worktree::test_repo(dir.path()).await;
         let d = desk(pool, dir.path()).await;
         let p = d
             .propose_plan(new_plan(dir.path(), &[("a", &[])]), &sarah(), &by_sarah())

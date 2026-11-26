@@ -142,6 +142,7 @@ mod unread;
 mod urgent;
 #[cfg(test)]
 mod urgent_tests;
+mod worktree_hold;
 
 use transition::Transition;
 
@@ -1847,14 +1848,6 @@ async fn reopened_turns(
             (HashMap::new(), Vec::new())
         }
     }
-}
-
-/// The running session working in `folder` or below it, when one is.
-fn running_in<'a>(
-    mut records: impl Iterator<Item = &'a SessionRecord>,
-    folder: &Path,
-) -> Option<&'a SessionRecord> {
-    records.find(|r| r.state.is_running() && Path::new(&r.cwd).starts_with(folder))
 }
 
 /// For each of `records` at work, the latest of its turns `logged` has open.
@@ -3946,6 +3939,10 @@ impl Desk {
             ),
             None => (cwd, None),
         };
+        let hold = match &branch {
+            Some(_) => Some(self.worktree_hold(&cwd, boss.map(|b| (name, b))).await),
+            None => None,
+        };
         let ready = match deps {
             true => {
                 let at = deps::canonical(&cwd).await;
@@ -4006,16 +4003,8 @@ impl Desk {
         };
         let placing = {
             let mut st = self.0.state.lock();
-            if let Some(holder) = record
-                .branch
-                .as_ref()
-                .and_then(|_| running_in(st.records.values(), &cwd))
-            {
-                return Err(DeskError::WorktreeTaken(format!(
-                    "{} is in use: {} still runs in it",
-                    cwd.display(),
-                    holder.display_name.as_deref().unwrap_or(&holder.name)
-                )));
+            if let Some(e) = hold.as_ref().and_then(|h| h.refuses(&st, id)) {
+                return Err(e);
             }
             st.records.insert(id, record.clone());
             boss.map(|boss| self.reserve_charge(&mut st, id, boss, group.as_deref()))
@@ -4316,6 +4305,10 @@ impl Desk {
             }
             self.end_held(id).await?;
         }
+        let hold = match worktree_hold::in_worktree(&r) {
+            true => Some(self.worktree_hold(Path::new(&r.cwd), None).await),
+            false => None,
+        };
         let _starting = Starting::of(self, id)?;
         // Devin's conversation, as Devin still lists it in its folder; a new
         // one, the person told why, when it doesn't.
@@ -4345,6 +4338,9 @@ impl Desk {
         }
         {
             let mut st = self.0.state.lock();
+            if let Some(e) = hold.as_ref().and_then(|h| h.refuses(&st, id)) {
+                return Err(e);
+            }
             if by.is_some() {
                 st.acted.insert(id);
             }
