@@ -286,6 +286,10 @@ pub enum Wait {
     /// It still runs in a mode that doesn't ask, set by a boss no longer
     /// unbound over it: Desk starts it again in its own mode first.
     ModeEnding,
+    /// It still runs in the permissions it was started in, which no longer
+    /// fit who decides what it asks (a boss took it on, say): Desk starts
+    /// it again in place in those it runs in now first.
+    Restarting,
     /// Sent now into its running turn: it reads it with its next tool
     /// call's result (or, if the turn ends first, at the idle).
     NextCall,
@@ -302,9 +306,12 @@ impl Wait {
     /// or Desk itself lets it go: no one need move it.
     pub fn on_purpose(self) -> bool {
         match self {
-            Self::Typing | Self::Draft | Self::Paused | Self::PersonDriving | Self::ModeEnding => {
-                true
-            }
+            Self::Typing
+            | Self::Draft
+            | Self::Paused
+            | Self::PersonDriving
+            | Self::ModeEnding
+            | Self::Restarting => true,
             Self::Stopped
             | Self::Working
             | Self::Asking

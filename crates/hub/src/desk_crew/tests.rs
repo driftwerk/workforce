@@ -2079,6 +2079,7 @@ mod ships;
 mod act_fully_budget;
 
 mod decides_at_once;
+mod standing;
 
 mod answers_questions;
 mod assignments;

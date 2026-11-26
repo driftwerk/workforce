@@ -748,6 +748,26 @@ pub fn push_kind(
     )
 }
 
+/// The class of the command of `facts` ([`boss::class_of`]), in its
+/// repository as `repo` says: [`boss::Class::Other`] for anything but a
+/// command.
+pub fn class_of(
+    facts: &Facts,
+    bounds: &Bounds,
+    real: &dyn Fn(&Path) -> Option<PathBuf>,
+    repo: &boss::Repo<'_>,
+) -> boss::Class {
+    let What::Command(command) = &facts.what else {
+        return boss::Class::Other;
+    };
+    let own = real(&facts.own);
+    boss::class_of(
+        command,
+        &here_of(facts, bounds, own.as_deref(), real, &|_| false),
+        repo,
+    )
+}
+
 /// Whether a boss may answer a request with `facts` itself, in `bounds`:
 /// only what Desk reads in full and judges safe ([`boss::judge`] for
 /// commands). `real` says where a path leads through existing symlinks.

@@ -115,6 +115,12 @@ impl Minds {
             .unwrap_or(false)
     }
 
+    /// Whether one of the person's turns in `boss`'s DM runs, however long
+    /// ago it began.
+    pub(super) fn person_in_turn(&self, boss: &str) -> bool {
+        self.person.lock().contains_key(boss)
+    }
+
     /// Whether one of the person's turns in `boss`'s DM runs, begun within
     /// [`PERSON_YIELD`].
     fn person_running(&self, boss: &str) -> bool {
@@ -158,6 +164,9 @@ impl Drop for PersonTurn {
             t.remove(&self.mark);
             if t.is_empty() {
                 person.remove(&self.boss);
+                // What they said in it may change what the boss's standing
+                // verdicts rest on.
+                crew.standings.forget(&self.boss);
             }
         }
     }

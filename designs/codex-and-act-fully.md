@@ -52,7 +52,7 @@ Line numbers are from origin/main 6d0970bc6. D = `crates/desk/src`, H = `crates/
 3. **There's no rule for which wins** when the person's mode, Approve for me and a boss's charge disagree.
 
 ### Change
-- **`Mode::codex_permissions(self, charged: bool, approve_for_me: bool) -> Permissions`** replaces the tuple and the separate reviewer rule. `Permissions` gains `network: Network` (`Person | On`). `charged` means a boss's live charge holds the session (`charge_of(id).is_some_and(Charge::live)`). The table:
+- **`Mode::codex_permissions(self, charged: bool, approve_for_me: bool) -> Permissions`** replaces the tuple and the separate reviewer rule. `Permissions` gains `network: Network` (`Person | On`). `charged` means a live charge holds the session for a boss that decides its requests, at Act or Act fully (`charge_of(id).is_some_and(|c| c.live() && boss_decides_requests(&c.boss))`). Act and Act fully count alike, so a budget lapse from Act fully to Act restarts nothing. A boss at Suggest takes a charge but leaves the requests to the person, so its sessions run as uncharged ones do. A boss Desk doesn't know (served from another hub's grant, or before the hub has said its bosses) counts as charged, so its requests never go to Codex's own reviewer. Until Desk has read its charges, every session counts as charged. A change of a boss's level restarts its sessions only when it changes their `Permissions`, as a charge change does. The table:
 
   | Mode | uncharged: approval / sandbox / network / reviewer | under a boss charge (Act or Act fully) |
   |---|---|---|
@@ -76,7 +76,10 @@ Line numbers are from origin/main 6d0970bc6. D = `crates/desk/src`, H = `crates/
 - **Commits still escalate.** `workspace-write` keeps `.git` read-only, so `git commit` asks for approval in every mode. *(review M11)* That is deliberate: Desk does not widen the sandbox with `runtime_workspace_roots`, since a writable `.git` would let hooks and config changes skip the boss as well. Under a charge, a commit is an ordinary class that part 3's fast path answers at once. In Auto uncharged, Codex's reviewer answers it.
 - **When a charge is taken or released, Desk restarts a running session in place between turns,** only when its newly computed `Permissions` differ from those it launched with (kept on `Live`). A stopped session simply resumes with the new ones. A grant or charge edit that leaves `Permissions` unchanged restarts nothing. as `set_mode` already does (D/service/modes.rs:410-460, through `start_again`).
   - A `--remote` TUI re-sends its own approval and reviewer settings with every turn *(source: `tui/src/user_turn_submission.rs:127-133`)*. So the app-server's live thread settings can't be changed under it: the TUI's settings are the ones that count. A restart makes the new TUI join a thread that Desk resumed with the new `Permissions`, so the TUI holds them from then on.
-  - Mid-turn, or while a request waits, the restart waits for the turn's end. It is triggered by the queue that `modes_changed` (D/service/charge.rs, `put_charge`) already drives, so no new trigger is added.
+  - Mid-turn, or while a request waits, the restart waits for the turn's end. A turn that ended asking is over: the restart goes ahead, and the boss's answer is held (`Wait::Restarting`) until the session runs in its new `Permissions`.
+  - A session adopted from an earlier run of Desk runs in what its resume response says. When that response names neither reviewer nor sandbox, it is taken after 30 s to run in what Desk would start it in now, and is not restarted for it. That is provisional: the first time Codex does say, what it says counts, and the session is restarted if that isn't what it should run in now.
+  - A Codex thread that never ran a turn has no rollout, and Codex refuses to resume it. When Desk has no prompt or reply of the session, and Codex's refusal says "no rollout found" or Desk knows no rollout file of it, Desk starts it afresh in its new `Permissions` and says so; the refused attempt is not reported as a failure. A session that ran a turn keeps Codex's refusal, so a lost rollout never silently drops its conversation.
+  - Mid-turn: the restart waits. It is triggered by the queue that `modes_changed` (D/service/charge.rs, `put_charge`) already drives, so no new trigger is added.
   - The resume response's `sandbox` and `approvalsReviewer` are the truth, as above.
   - A refused restart is a `TurnFailure`: "Desk couldn't apply this session's permissions".
   - `thread/settings/update` and the `experimentalApi` capability are not used.
@@ -182,8 +185,9 @@ Line numbers are from origin/main 6d0970bc6. D = `crates/desk/src`, H = `crates/
        - `stash`, `stash push`, `stash list`, `stash show`, `stash pop` and `stash apply`;
        - `rebase` onto the session's base, and `merge` of the base.
 
-       These are `Other`: `reset --hard`, `clean`, any `checkout` with `--` or of a non-branch (`.` and paths included), `stash drop`, `stash clear`, and `branch -d` / `-D`.
-     - **Git aliases** are resolved before classifying. An alias starting with `!` is a shell command: it is walked and classified as shell, so `!git push -f` is `ForcePush`.
+       These are `Other`: `reset --hard`, `clean`, any `checkout`, `switch` or `branch` with `--`, any `checkout` of a non-branch (`.` and paths included), `stash drop`, `stash clear`, and `branch -d` / `-D`.
+     - **Git aliases** are resolved before classifying. An alias starting with `!` is a shell command: it is walked and classified as shell, so `!git push -f` is `ForcePush`. Git never runs an alias named after one of its own commands or one on its path, so neither does the classifier: the names come from `git --list-cmds=main,others`, run the way the session runs commands: through its login shell (`-lc`), in its folder, with its environment. It runs only when a command uses an alias, and is never cached. When that can't list them within 5 s, no alias is read and an aliased command is `Other`.
+     - **Every flag is read.** Each git, `gh`, build and install command is checked against an allowlist of the flags it is known by (bundled short flags included). Any other flag makes it `Other`.
      - **`Commit`** is `git commit` with any message options, with or without `--amend`. `--amend` on a commit that is already pushed is `Other`: Desk reads whether `HEAD` is reachable from `@{push}`.
      - **`FetchPull`** is `git fetch` and `git pull` (`--rebase` or `--ff-only`) from `origin`, or the branch's own upstream.
      - **`GhPrCreate`** is `gh pr create` with its head as the session's own branch.
@@ -197,7 +201,7 @@ Line numbers are from origin/main 6d0970bc6. D = `crates/desk/src`, H = `crates/
 
        Each must be invoked directly, with no `-c` / `--config` that sets a runner or command. `npm test`, `npm run test`, `pnpm test` and `yarn test` run a package script, so they are `Other`.
 
-       **Accepted risk** *(review L3)*: `TestBuild` runs workspace-defined code (`build.rs`, test code, conftest, lifecycle hooks of a lockfile install). At Act fully it is accepted as part of what Act fully allows. At Act it is never cached.
+       **Accepted risk** *(review L3)*: `TestBuild` runs workspace-defined code (`build.rs`, test code, conftest, lifecycle hooks of a lockfile install). At Act fully it is accepted as part of what Act fully allows; the fast path never runs at Act. A build's output that its project file can send anywhere is not accepted: `tsc` is `TestBuild` only with `--noEmit`, since a `tsconfig.json`'s `outDir` can point outside the workspace. What remains is accepted with `build.rs`: with `incremental` on, even `tsc --noEmit` writes its `.tsbuildinfo` where the `tsconfig.json`'s `tsBuildInfoFile` says.
      - **`PackageInstall`** is a registry install of named packages: `npm install <name>[@version]`, `pnpm add <name>`, `yarn add <name>`, `cargo add <name>`, `pip install <name>[==version]`, `uv add <name>`, `go get <module>@<version>`. A URL, path, git (`git+…`, `github:`) or tarball source is `Other`, as is `--index-url` / `--registry` pointing somewhere other than the default.
      - **Always `Other`,** never cached:
        - `make`, `just`, `npm run`, `pnpm run`, `yarn <script>`;
@@ -218,7 +222,7 @@ Line numbers are from origin/main 6d0970bc6. D = `crates/desk/src`, H = `crates/
      - **A chat with the boss suspends the cache.** From the moment the person sends the boss a chat message until that turn ends, the fast path is suspended for every session the boss runs, since the turn may record an order. The turn's end re-reads `directive_words`.
      - A directive that is conditional ("unless", "until", "only if") or timed ("after 6pm", "this week") makes the verdict Ask for every class it could touch. When the classifier can't tell which classes, it is Ask for all of them.
      - The cache is in memory. The verdicts are recorded as `BossDecision`s and are re-asked after a restart.
-     - **At Act,** `TestBuild` and `PackageInstall` are never cached (they run unsandboxed code from the workspace or a registry). At Act fully they are.
+     - **The fast path is Act fully's alone.** At Act a boss's requests never reach `decide_request` (the decide loop takes only an unbound boss's), so no verdict stands there. That includes `TestBuild` and `PackageInstall`, which run unsandboxed code from the workspace or a registry. At Act fully they are cached with the rest.
   4. **Where the fast path runs.** It runs inside `boss_decides` (D/service/charge.rs:1349), after the hard refusals: agent settings (:1380), budget and breaker, and the person driving. So it can never answer what those refuse.
      - A session under an active `Hold` (part 4) never takes the fast path: every request goes to the model, with the hold in its prompt.
      - A cached Allow is answered within one 2 s sweep, with no model call. It is recorded as the boss's decision, naming the standing verdict and the class.
@@ -460,7 +464,7 @@ Line numbers are from origin/main 6d0970bc6. D = `crates/desk/src`, H = `crates/
      - a held session never takes the fast path;
      - a changed directive source bumps the version and re-asks;
      - a conditional directive gives Ask;
-     - at Act, `TestBuild` and `PackageInstall` are never answered from the cache;
+     - at Act, no request is answered from the cache;
      - a hard refusal (agent settings, budget) wins over a cached Allow.
    - **Slots:** a resumed Review session at N brings the plan to N+1 with no stop and no new start, until the count is below N.
    - **`crew.record_review`** refuses when:

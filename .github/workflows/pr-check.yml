@@ -452,6 +452,25 @@ jobs:
         with:
           shared-key: desk-postgres
           save-if: ${{ github.ref == 'refs/heads/main' }}
+      # The real Codex CLI, for the tests that run Desk against it: its
+      # sandbox is bubblewrap in an unprivileged user namespace, which the
+      # runner's AppArmor refuses until told otherwise. Required, so a
+      # missing CLI fails the run instead of skipping them. Its npm
+      # install's scripts are never handed the run's token.
+      - env:
+          GITHUB_TOKEN: ''
+        run: |
+          set -euo pipefail
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          command -v bwrap >/dev/null || {
+            sudo apt-get update -q
+            sudo apt-get install -y -q bubblewrap
+          }
+          unshare -Ur true
+          npm i -g --prefix "$RUNNER_TEMP/codex" @openai/codex@0.166.0
+          "$RUNNER_TEMP/codex/bin/codex" --version
+          echo "WORKFORCE_CODEX_BIN=$RUNNER_TEMP/codex/bin/codex" >> "$GITHUB_ENV"
+          echo "WORKFORCE_CODEX_REQUIRED=1" >> "$GITHUB_ENV"
       # A skipped test passes, so the run is told not to skip, and the log
       # must show the tests ran.
       - run: |

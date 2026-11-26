@@ -23,7 +23,8 @@ pub struct Boss {
     pub agent: String,
     pub name: String,
     pub scope: Scope,
-    /// `watch`, `suggest` or `act`.
+    /// `watch`, `suggest`, `act`, or `full` (Act fully, while it is in
+    /// force: the hub says `act` for one whose budget lapsed).
     pub level: String,
 }
 
@@ -329,7 +330,16 @@ impl Desk {
     /// The overseers there are now, each with its scope: the hub says, each
     /// time it reads its agents' `[oversight]`.
     pub fn set_bosses(&self, bosses: Vec<Boss>) {
-        self.0.scopes.lock().bosses = Some(bosses);
+        let changed = {
+            let mut scopes = self.0.scopes.lock();
+            let changed = scopes.bosses.as_ref() != Some(&bosses);
+            scopes.bosses = Some(bosses);
+            changed
+        };
+        // A boss's level decides what its Codex sessions run in.
+        if changed {
+            self.modes_changed();
+        }
     }
 
     /// The overseers there are: as the hub said last, else the crew's one
@@ -396,6 +406,18 @@ impl Desk {
             .into_iter()
             .find(|b| b.agent == agent)
             .is_some_and(|b| b.level != "watch")
+    }
+
+    /// Whether the boss `agent` decides its sessions' requests: at Act or
+    /// Act fully, alike. One Desk doesn't know as a boss here (served from
+    /// another hub's grant, or before the hub says) holds a charge only to
+    /// run its sessions, so it is taken to: its requests are never left to
+    /// Codex's own reviewer.
+    pub(crate) fn boss_decides_requests(&self, agent: &str) -> bool {
+        self.bosses()
+            .into_iter()
+            .find(|b| b.agent == agent)
+            .is_none_or(|b| matches!(b.level.as_str(), "act" | "full"))
     }
 
     /// The scope the overseer `agent` oversees, while it does.

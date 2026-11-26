@@ -62,6 +62,7 @@ mod breaker;
 mod charge;
 pub use charge::{ChargeView, DialogAnswerer};
 mod codex_terminals;
+mod codex_wait;
 mod copies;
 mod deps;
 mod devin_sessions;
@@ -91,6 +92,8 @@ mod asks_tests;
 mod breaker_tests;
 #[cfg(test)]
 mod codex_asks_tests;
+#[cfg(test)]
+mod codex_real_tests;
 #[cfg(test)]
 mod codex_resume_tests;
 mod ledger;
@@ -331,6 +334,8 @@ pub(crate) struct Live {
     /// an MCP server's request), by its request's id: only the terminal
     /// answers it.
     codex_question: Option<(Value, PendingApproval)>,
+    /// What Codex waits on that Desk doesn't answer.
+    codex_wait: codex_wait::CodexWait,
     /// Its boss approved the plan it presents (that plan, in full, and
     /// when): that plan's permission check is allowed in the person's
     /// place, once, while they aren't in control. Gone when the person
@@ -665,6 +670,14 @@ impl Server {
     }
 }
 
+/// How long an adopted Codex session waits for Codex to say what its
+/// thread runs in before it is taken to run in what it should.
+const SETTLE_WITHIN: Duration = if cfg!(test) {
+    Duration::from_millis(1500)
+} else {
+    Duration::from_secs(30)
+};
+
 /// A Codex session's app-server and observer; dropping it stops the
 /// observer, and the app-server when it is the hub's own.
 struct CodexLink {
@@ -678,6 +691,28 @@ struct CodexLink {
     steers: mpsc::UnboundedSender<String>,
     /// The person's line messages (row and text) said into its running turn.
     line_steers: mpsc::UnboundedSender<(Uuid, String)>,
+    /// What Desk launched it in; none, the person's own.
+    permissions: Option<codex::Permissions>,
+    /// The mode it was launched in, from which `permissions` came.
+    mode: Option<crate::mode::Mode>,
+    /// How Desk knows `permissions` is what it runs in.
+    settled: Settled,
+    /// Whether its network is on, as Codex said it runs its thread.
+    network: Option<bool>,
+}
+
+/// How Desk knows what a Codex session runs in: one adopted from an
+/// earlier run of Desk runs in what Codex says its thread runs in
+/// ([`Desk::codex_runs`]), never started again before that is said.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Settled {
+    /// Adopted, and Codex hasn't said yet.
+    Unsaid,
+    /// Codex said nothing in time: taken to be what it should run in, until
+    /// Codex first says.
+    Taken,
+    /// Desk asked for it, or Codex said it.
+    Said,
 }
 
 impl CodexLink {
@@ -1044,6 +1079,19 @@ const STOP_LOOKS: u32 = 10;
 
 /// Whether a Codex session's app-server took Desk's resume of its thread
 /// ([`codex::Follower::resuming`]), in time; why not, in words.
+/// Whether Codex's `refusal` to resume `r` is of a thread that never ran a
+/// turn: none Desk heard of, and no rollout of it, by Codex's word or as
+/// Desk knows its path.
+fn codex_unwritten(r: &SessionRecord, refusal: &str) -> bool {
+    r.engine == Engine::Codex
+        && r.last_prompt.is_none()
+        && r.last_reply.is_none()
+        && (refusal.contains(codex::NO_ROLLOUT)
+            || r.transcript
+                .as_deref()
+                .is_none_or(|t| !Path::new(t).is_file()))
+}
+
 async fn codex_primed(primed: oneshot::Receiver<Result<(), String>>) -> Result<(), String> {
     match tokio::time::timeout(PRIMED_WITHIN, primed).await {
         Ok(Ok(taken)) => taken,
@@ -1652,9 +1700,7 @@ fn asking(p: &PendingApproval) -> String {
         "Plan" => "wants its plan approved".into(),
         "Bash" => format!("wants to run {}", crew::clip(&detail, 160)),
         "Edit" | "Write" | "MultiEdit" => format!("wants to edit {}", crew::clip(&detail, 160)),
-        _ if !p.answerable && p.detail == "Answer in the terminal" => {
-            "is waiting for an answer in its terminal".into()
-        }
+        _ if p.in_terminal() => "is waiting for an answer in its terminal".into(),
         _ => format!("wants to use {}", crew::clip(&p.tool, 160)),
     }
 }
@@ -2376,9 +2422,16 @@ impl Desk {
                     let socket = server.meta["socket"].as_str().map(PathBuf::from);
                     let (server_pty, _) = holder.adopt(&server, history, None);
                     let server = Server::Held(Arc::new(server_pty));
+                    let mode = self.kept_mode(id).await;
+                    let permissions = self.codex_permissions(id, mode, record.approve_for_me);
                     socket.map(|socket| {
                         let follower = self.codex_follower(record.cli_session_id.clone());
-                        self.observe_codex(id, server, socket, follower.at_once())
+                        let mut link =
+                            self.observe_codex(id, server, socket, follower.at_once(), permissions);
+                        link.mode = mode;
+                        link.settled = Settled::Unsaid;
+                        self.settle_unsaid(id);
+                        link
                     })
                 }
                 other => {
@@ -2439,6 +2492,7 @@ impl Desk {
                     held: None,
                     open_question: None,
                     codex_question: None,
+                    codex_wait: Default::default(),
                     plan_approved: None,
                     flights: HashMap::new(),
                     behind: Vec::new(),
@@ -2536,6 +2590,7 @@ impl Desk {
         view.exited = state.exited.get(&r.id).cloned();
         view.deps = state.deps.get(&r.id).map(|k| k.deps.clone());
         view.mode = live.and(state.modes_started.get(&r.id).copied());
+        view.network = live.and_then(|l| l._codex.as_ref()).and_then(|c| c.network);
         view.waits_on_you = Self::waits_on_you(state, &view);
         view.boss_has = Self::boss_has(state, &view);
         view.waits = Self::waits_in(state, r.id);
@@ -4331,7 +4386,29 @@ impl Desk {
             (Some(n), None) => Some(n.clone()),
             (None, p) => p.clone(),
         };
-        let launched = self.launch(&r, afresh.is_none(), told.as_deref()).await;
+        let mut launched = self.launch(&r, afresh.is_none(), told.as_deref()).await;
+        // A Codex thread that never ran a turn has no rollout, and Codex
+        // won't resume it: nothing of it is lost, so it starts afresh, in
+        // what it runs in now. One that ran a turn keeps Codex's refusal.
+        let unwritten =
+            matches!(&launched, Err(DeskError::Conflict(why)) if codex_unwritten(&r, why));
+        let afresh = match afresh {
+            None if unwritten => {
+                tracing::info!(target: crate::STARTS, session = %id, "a Codex thread with no turn has no rollout: started afresh");
+                self.change(id, |r, _| {
+                    r.cli_session_id = None;
+                    r.transcript = None;
+                });
+                let r = SessionRecord {
+                    cli_session_id: None,
+                    transcript: None,
+                    ..r.clone()
+                };
+                launched = self.launch(&r, false, told.as_deref()).await;
+                Some("Started it afresh: its conversation had no turn to go on from.".to_string())
+            }
+            afresh => afresh,
+        };
         self.0.state.lock().modes_carried.remove(&id);
         {
             let mut st = self.0.state.lock();
@@ -4897,15 +4974,9 @@ impl Desk {
                 .position(|a| a.pending.id == approval)
                 .ok_or_else(|| DeskError::Conflict(ALREADY_ANSWERED.into()))?;
             if decision == Decision::Terminal {
-                // Its terminal asks it too: Desk just stops offering it.
-                let asked = live.codex_asks.remove(at);
-                if live.pending.as_ref().is_some_and(|p| p.id == approval) {
-                    live.pending = Some(PendingApproval {
-                        answerable: false,
-                        ..asked.pending
-                    });
-                }
-                return self.view_after(seen, id);
+                return Err(DeskError::Invalid(
+                    "Desk answers this one: allow or deny it here, or in its terminal".into(),
+                ));
             }
             let asked = &live.codex_asks[at];
             // A boss allows only what Desk saw whole: a request whose
@@ -5946,7 +6017,8 @@ impl Desk {
                 // default.
                 let reset = (start_in == modes::StartIn::Reset && thread.is_some())
                     .then_some(crate::mode::Mode::Default);
-                let permissions = codex::Permissions::of(mode.or(reset), r.approve_for_me);
+                let mode = mode.or(reset);
+                let permissions = self.codex_permissions(r.id, mode, r.approve_for_me);
                 let follower = self.codex_follower(thread.map(str::to_string));
                 let (follower, primed) = match thread {
                     Some(thread) => {
@@ -5956,11 +6028,24 @@ impl Desk {
                     }
                     None => (follower, None),
                 };
-                let link = self.observe_codex(r.id, server, socket.clone(), follower);
+                let mut link =
+                    self.observe_codex(r.id, server, socket.clone(), follower, permissions);
+                link.mode = mode;
+                // Started in what it now runs in: a start that couldn't
+                // apply them before is over.
+                self.change_unseen(r.id, |st| {
+                    if st.turn_failures.get(&r.id).is_some_and(modes::unapplied) {
+                        st.turn_failures.remove(&r.id);
+                    }
+                });
                 if let Some(primed) = primed {
                     if let Err(why) = codex_primed(primed).await {
                         link.stop();
                         let said = format!("Codex didn't resume its conversation: {why}");
+                        // Started afresh instead: no end of it to tell.
+                        if codex_unwritten(r, &why) {
+                            return Err(DeskError::Conflict(said));
+                        }
                         self.exited_now(
                             r.id,
                             Exited {
@@ -6134,6 +6219,7 @@ impl Desk {
                 held: None,
                 open_question: None,
                 codex_question: None,
+                codex_wait: Default::default(),
                 plan_approved: None,
                 flights: HashMap::new(),
                 behind: Vec::new(),
@@ -6335,6 +6421,126 @@ impl Desk {
         Ok(Server::Held(pty))
     }
 
+    /// What a Codex session `id` runs in where Desk sets it
+    /// ([`codex::Permissions::of`]): charged while a boss that decides its
+    /// requests (at Act or Act fully) runs it, or while Desk can't yet read
+    /// which sessions bosses run. A boss that only suggests leaves them to
+    /// the person, as an uncharged session's are.
+    pub(crate) fn codex_permissions(
+        &self,
+        id: Uuid,
+        mode: Option<crate::mode::Mode>,
+        approve_for_me: bool,
+    ) -> Option<codex::Permissions> {
+        let charged = !self.charges_loaded()
+            || self
+                .charge_of(id)
+                .is_some_and(|c| c.live() && self.boss_decides_requests(&c.boss));
+        codex::Permissions::of(mode, approve_for_me, charged)
+    }
+
+    /// What Codex says `id`'s thread runs in: kept, and said in Activity
+    /// when it isn't what Desk asked for. One adopted from an earlier run
+    /// of Desk is taken to run in whichever of its permissions, charged or
+    /// not, Codex says, else in the person's own; it is started again only
+    /// when that isn't what it should run in now.
+    fn codex_runs(&self, id: Uuid, runs: &codex::Runs) {
+        let asked = {
+            let mut guard = self.0.state.lock();
+            let st = &mut *guard;
+            let approve_for_me = st.records.get(&id).is_some_and(|r| r.approve_for_me);
+            let Some(link) = st.live.get_mut(&id).and_then(|l| l._codex.as_mut()) else {
+                return;
+            };
+            link.network = runs.network;
+            match link.settled {
+                Settled::Said => link.permissions,
+                // What it was taken to run in gives way to what Codex says:
+                // started again when that isn't what it should run in now.
+                Settled::Unsaid | Settled::Taken => {
+                    let mode = link.mode;
+                    link.permissions = [true, false]
+                        .into_iter()
+                        .filter_map(|charged| codex::Permissions::of(mode, approve_for_me, charged))
+                        .find(|p| runs.differs(p).is_none());
+                    link.settled = Settled::Said;
+                    None
+                }
+            }
+        };
+        let Some(asked) = asked else {
+            self.modes_changed();
+            return;
+        };
+        if let (Some(differs), Ok(view)) = (runs.differs(&asked), self.view(id)) {
+            tracing::warn!(%id, %differs, "codex runs its thread in other permissions than Desk asked");
+            let me = Party::session(&view);
+            self.note(Event::new(
+                Kind::Failed,
+                me.clone(),
+                Some(me),
+                format!("Codex runs it in other permissions than Desk asked: {differs}"),
+            ));
+        }
+    }
+
+    /// Settles an adopted session `id` whose thread Codex hasn't said it
+    /// runs in within [`SETTLE_WITHIN`] (a resume that names no
+    /// reviewer nor sandbox, a thread not yet started): taken to run in
+    /// what Desk would start it in now, never started again for it, until
+    /// Codex first says otherwise.
+    fn settle_unsaid(&self, id: Uuid) {
+        let d = self.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(SETTLE_WITHIN).await;
+            let unsettled = {
+                let st = d.0.state.lock();
+                st.live
+                    .get(&id)
+                    .and_then(|l| l._codex.as_ref())
+                    .filter(|link| link.settled == Settled::Unsaid)
+                    .map(|link| link.mode)
+                    .zip(st.records.get(&id).map(|r| r.approve_for_me))
+            };
+            let Some((mode, approve_for_me)) = unsettled else {
+                return;
+            };
+            let now = d.codex_permissions(id, mode, approve_for_me);
+            let mut st = d.0.state.lock();
+            if let Some(link) = st
+                .live
+                .get_mut(&id)
+                .and_then(|l| l._codex.as_mut())
+                .filter(|link| link.settled == Settled::Unsaid)
+            {
+                tracing::info!(%id, "codex never said what an adopted session's thread runs in: taken to run in what it should");
+                link.permissions = now;
+                link.settled = Settled::Taken;
+            }
+        });
+    }
+
+    /// Whether `id` runs in other Codex permissions than Desk would start
+    /// it in now, in the mode it was started in: a charge taken or
+    /// released, a boss's level changed. Never before Desk knows which
+    /// sessions bosses run, nor while what an adopted one runs in is unsaid.
+    pub(crate) fn permissions_due(&self, id: Uuid) -> bool {
+        let launched = {
+            let st = self.0.state.lock();
+            let link = st.live.get(&id).and_then(|l| l._codex.as_ref());
+            link.filter(|link| link.settled != Settled::Unsaid)
+                .map(|link| (link.permissions, link.mode))
+                .zip(st.records.get(&id).map(|r| r.approve_for_me))
+        };
+        let Some(((permissions, mode), approve_for_me)) = launched else {
+            return false;
+        };
+        self.charges_loaded()
+            && self
+                .codex_permissions(id, mode, approve_for_me)
+                .is_some_and(|now| Some(now) != permissions)
+    }
+
     /// What follows a Codex session's `thread` (none until its first is
     /// started).
     fn codex_follower(&self, thread: Option<String>) -> codex::Follower {
@@ -6351,6 +6557,7 @@ impl Desk {
         server: Server,
         socket: PathBuf,
         follower: codex::Follower,
+        permissions: Option<codex::Permissions>,
     ) -> CodexLink {
         let watch = self.0.cancel.child_token();
         let (tx, rx) = mpsc::channel(64);
@@ -6379,6 +6586,10 @@ impl Desk {
             replies,
             steers,
             line_steers,
+            permissions,
+            mode: None,
+            settled: Settled::Said,
+            network: None,
         }
     }
 
@@ -8197,7 +8408,23 @@ impl Desk {
                 self.line_turn_started(id);
                 continue;
             }
+            if let CodexEvent::Elsewhere {
+                request,
+                method,
+                known,
+            } = event
+            {
+                self.codex_elsewhere(id, request, method, known);
+                self.codex_wait_arm(id);
+                continue;
+            }
             if let CodexEvent::Answered(request) | CodexEvent::Late(request) = &event {
+                self.change(id, |r, l| {
+                    if let Some(l) = l {
+                        codex_wait::clear_wait(r, l);
+                    }
+                });
+                self.codex_wait_arm(id);
                 // Said once Codex is told, or that its terminal had answered.
                 let sent = self
                     .0
@@ -8269,13 +8496,8 @@ impl Desk {
                 }
                 continue;
             }
-            if let CodexEvent::Reviewer(reviewer) = &event {
-                // Approve for me is the TUI's to set: if Codex says otherwise,
-                // the session's word for it is wrong.
-                let on = self.record(id).is_ok_and(|r| r.approve_for_me);
-                if on != (reviewer == "auto_review") {
-                    tracing::warn!(%id, %reviewer, approve_for_me = on, "codex runs with other approvals than the session says");
-                }
+            if let CodexEvent::Runs(runs) = &event {
+                self.codex_runs(id, runs);
                 continue;
             }
             if let CodexEvent::Reviewed { what, verdict } = &event {
@@ -8421,28 +8643,20 @@ impl Desk {
                         r.restore_offer = false;
                         if let Some(l) = l {
                             r.asked = None;
-                            // A repeated notice is the same request, still asked.
+                            // A repeated notice is the same request, still
+                            // asked; what it waits on that Desk doesn't
+                            // answer shows only once it has waited a while
+                            // ([`codex_wait`]).
                             let asked = l.pending.take();
                             if !waiting {
                                 l.codex_asks.clear();
                                 l.codex_question = None;
                             }
-                            l.pending = waiting.then(|| {
-                                asked.unwrap_or_else(|| PendingApproval {
-                                    id: Uuid::new_v4(),
-                                    tool: l.current_tool.clone().unwrap_or_else(|| "Codex".into()),
-                                    detail: "Answer in the terminal".into(),
-                                    since: Utc::now(),
-                                    answerable: false,
-                                    choices: Vec::new(),
-                                    why: None,
-                                    options: None,
-                                    request: None,
-                                    call: None,
-                                    agent: None,
-                                    cli_session: None,
-                                })
-                            });
+                            l.codex_wait.waiting = waiting;
+                            l.pending = asked.filter(|_| waiting);
+                            if !waiting {
+                                codex_wait::clear_wait(r, l);
+                            }
                         }
                     }
                     CodexEvent::Idle => {
@@ -8470,6 +8684,7 @@ impl Desk {
                             l.pending = None;
                             l.codex_asks.clear();
                             l.codex_question = None;
+                            l.codex_wait = Default::default();
                             l.background = std::mem::take(&mut l.background).looked_if(
                                 running,
                                 None,
@@ -8480,8 +8695,11 @@ impl Desk {
                     }
                     CodexEvent::Prompt(p) => {
                         r.last_prompt = asked_of(Some(p)).or(r.last_prompt.take());
-                        if let Some(l) = l.filter(|_| !delivery) {
-                            l.prompts += 1;
+                        if let Some(l) = l {
+                            codex_wait::clear_wait(r, l);
+                            if !delivery {
+                                l.prompts += 1;
+                            }
                         }
                     }
                     CodexEvent::Tool(t) => {
@@ -8511,7 +8729,9 @@ impl Desk {
                     }
                     CodexEvent::Resolved(request) => {
                         if let Some(l) = l {
+                            l.codex_wait.resolved(&request);
                             codex_resolved(r, l, &request);
+                            codex_wait::clear_wait(r, l);
                         }
                     }
                     CodexEvent::Answered(_) | CodexEvent::Late(_) | CodexEvent::Failed(_) => {}
@@ -8520,10 +8740,12 @@ impl Desk {
                     | CodexEvent::Usage(_)
                     | CodexEvent::SteerRefused(_)
                     | CodexEvent::Reviewed { .. }
-                    | CodexEvent::Reviewer(_)
+                    | CodexEvent::Runs(_)
+                    | CodexEvent::Elsewhere { .. }
                     | CodexEvent::TurnStarted => {}
                 }
             });
+            self.codex_wait_arm(id);
             if let (Some(reader), Some(end), Some(reply)) = (reader, read, said_whole) {
                 self.read_later(id, end, reader, reply);
             }
@@ -8534,7 +8756,11 @@ impl Desk {
         // Its server went away: what it asked can't be answered from Desk.
         self.change(id, |r, l| {
             if let Some(l) = l {
-                if !l.codex_asks.is_empty() || l.codex_question.is_some() {
+                l.codex_wait = Default::default();
+                if !l.codex_asks.is_empty()
+                    || l.codex_question.is_some()
+                    || l.pending.as_ref().is_some_and(PendingApproval::in_terminal)
+                {
                     l.codex_asks.clear();
                     l.codex_question = None;
                     codex_front(r, l);
@@ -12928,6 +13154,10 @@ mod codex_stop_tests {
             replies: mpsc::unbounded_channel().0,
             steers: mpsc::unbounded_channel().0,
             line_steers: mpsc::unbounded_channel().0,
+            permissions: None,
+            mode: None,
+            settled: Settled::Said,
+            network: None,
         };
         (link, pid, hdir)
     }

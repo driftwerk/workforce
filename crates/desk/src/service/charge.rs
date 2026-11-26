@@ -146,9 +146,13 @@ impl Desk {
                     }
                     (c.session, c)
                 });
-                let mut st = self.0.state.lock();
-                st.charges.rows = rows.collect();
-                st.charges.loaded = true;
+                {
+                    let mut st = self.0.state.lock();
+                    st.charges.rows = rows.collect();
+                    st.charges.loaded = true;
+                }
+                // What a Codex session started in before is known now.
+                self.modes_changed();
                 true
             }
             Err(e) => {
@@ -339,6 +343,10 @@ impl Desk {
         // request is a dialog only its terminal answers.
         let Some(p) = view.pending.as_ref() else {
             return match view.state {
+                // Codex says it waits before what it waits on comes, and
+                // after Desk answered: it shows in its terminal only once
+                // nothing Desk answers has come for a while.
+                SessionState::Blocked if view.engine == crate::model::Engine::Codex => None,
                 SessionState::Blocked => Some("Only its terminal can answer this.".into()),
                 SessionState::Asking if Self::wheel_now(st, c).person() => {
                     Some("You're driving it.".into())
@@ -1079,6 +1087,75 @@ impl Desk {
         }
     }
 
+    /// The class of `id`'s open request `approval`, read as
+    /// [`Self::push_kind`] reads it for `boss`, in its folder's repository
+    /// as it is now ([`crate::computer::boss::Class`]): anything but a
+    /// command Desk read in full is [`crate::computer::boss::Class::Other`].
+    pub fn request_class(
+        &self,
+        id: Uuid,
+        approval: Uuid,
+        boss: &str,
+    ) -> crate::computer::boss::Class {
+        use crate::computer::boss::{Class, Repo};
+        let Some(pending) = self
+            .pending_of(id, approval)
+            .filter(|p| p.request.as_ref().is_some_and(|r| r.tool == "Bash"))
+        else {
+            return Class::Other;
+        };
+        let Ok((facts, bounds)) = self.judged_facts(id, &pending, boss) else {
+            return Class::Other;
+        };
+        let Some(cwd) = facts.cwd.clone().filter(|_| facts.branch.is_some()) else {
+            return Class::Other;
+        };
+        let aliases = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&cwd)
+            .args(["config", "-z", "--get-regexp", r"^alias\."])
+            .stdin(std::process::Stdio::null())
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| aliases_of(&String::from_utf8_lossy(&o.stdout)))
+            .unwrap_or_default();
+        let is_branch = |b: &str| {
+            git_line(
+                &cwd,
+                &["rev-parse", "-q", "--verify", &format!("refs/heads/{b}")],
+            )
+            .is_some()
+        };
+        let head_pushed = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&cwd)
+            .args(["merge-base", "--is-ancestor", "HEAD", "@{push}"])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success());
+        let upstream = git_line(&cwd, &["rev-parse", "--abbrev-ref", "@{upstream}"]);
+        // Read only once an alias is met, and then once.
+        let env = self.with_added(&self.0.state.lock().session_env.clone());
+        let listed = std::cell::OnceCell::new();
+        let git_has = |name: &str| {
+            listed
+                .get_or_init(|| git_commands(&self.0.shell, std::path::Path::new(&cwd), &env))
+                .as_ref()
+                .map(|c: &HashSet<String>| c.contains(name))
+        };
+        let repo = Repo {
+            aliases: &aliases,
+            git_has: &git_has,
+            is_branch: &is_branch,
+            head_pushed,
+            upstream: upstream.as_deref().and_then(|u| u.split('/').next()),
+        };
+        charge::class_of(&facts, &bounds, &crate::computer::boss::resolve_real, &repo)
+    }
+
     /// Whether `boss` may let `pending`, a request of `id`, go on itself:
     /// what Desk reads in full and judges safe.
     fn boss_judges(
@@ -1431,8 +1508,10 @@ impl Desk {
             {
                 return refuse("it's asking something of its own; that's the person's to answer");
             }
+            // Codex's front request is one of its asks: cancelled once.
             l.pending
                 .iter()
+                .filter(|p| !l.codex_asks.iter().any(|a| a.pending.id == p.id))
                 .map(|p| (p.clone(), false))
                 .chain(l.codex_asks.iter().map(|a| (a.pending.clone(), true)))
                 .collect()
@@ -2243,6 +2322,70 @@ fn git_line_within(
     child.stdout.take()?.read_to_string(&mut out).ok()?;
     let line = out.lines().next().unwrap_or_default().trim().to_string();
     (!line.is_empty()).then_some(line)
+}
+
+/// Git's own commands and those it finds where a session finds them: in
+/// `cwd`, through its login `shell` (`-lc`, as Codex runs its commands)
+/// with `env`, so an external `git-<name>` on a path the shell's profile
+/// sets counts. None when that shell can't say within [`GIT_WITHIN`].
+fn git_commands(
+    shell: &str,
+    cwd: &std::path::Path,
+    env: &std::collections::BTreeMap<String, String>,
+) -> Option<HashSet<String>> {
+    use std::io::Read;
+    let mut child = std::process::Command::new(shell)
+        .args(["-lc", "git --list-cmds=main,others"])
+        .current_dir(cwd)
+        .env_clear()
+        .envs(env)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .ok()?;
+    let until = std::time::Instant::now() + GIT_WITHIN;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) if status.success() => break,
+            Ok(Some(_)) | Err(_) => return None,
+            Ok(None) if std::time::Instant::now() >= until => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(25)),
+        }
+    }
+    let mut out = String::new();
+    child.stdout.take()?.read_to_string(&mut out).ok()?;
+    let commands = commands_of(&out);
+    (!commands.is_empty()).then_some(commands)
+}
+
+/// How long a session's login shell has to say git's commands.
+const GIT_WITHIN: Duration = Duration::from_secs(5);
+
+/// The commands `git --list-cmds` says, one a line.
+fn commands_of(listed: &str) -> HashSet<String> {
+    listed
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// Git's aliases from `git config -z --get-regexp ^alias\.`: each entry
+/// its key, a newline, then its value whole, however many lines it has.
+fn aliases_of(z: &str) -> HashMap<String, String> {
+    z.split('\0')
+        .filter_map(|e| {
+            let (k, v) = e.split_once('\n')?;
+            Some((k.strip_prefix("alias.")?.to_string(), v.to_string()))
+        })
+        .collect()
 }
 
 /// Every line git prints in `dir`; none when it can't say.

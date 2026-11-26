@@ -48,6 +48,9 @@
 
 use std::path::{Component, Path, PathBuf};
 
+mod class;
+pub use class::{class_of, Class, Repo};
+
 /// Where a command is judged.
 pub struct Here<'a> {
     /// Where it starts; `None`: not known.
@@ -3824,7 +3827,7 @@ pub(crate) mod tests {
     /// As the kernel resolves: `l` in the folder links to the next
     /// repository, `out` to a file that isn't there, and `..` after what
     /// doesn't exist can't be told.
-    fn fake_real(p: &Path) -> Option<PathBuf> {
+    pub(super) fn fake_real(p: &Path) -> Option<PathBuf> {
         let exists = |p: &Path| EXISTING.iter().any(|e| Path::new(e).starts_with(p));
         let mut out = PathBuf::from("/");
         for c in p.components() {
@@ -3847,7 +3850,7 @@ pub(crate) mod tests {
         Some(out)
     }
 
-    fn here<'a>(
+    pub(super) fn here<'a>(
         home: &'a Path,
         own: &'a Path,
         scratch: &'a [PathBuf],

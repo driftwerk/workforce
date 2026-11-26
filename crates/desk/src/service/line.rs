@@ -1939,6 +1939,11 @@ impl Desk {
         if self.mode_ending(view.id) {
             return Some(Wait::ModeEnding);
         }
+        // Nor in the permissions it was started in, once they no longer
+        // fit: never read, nor cut off as it is started again.
+        if self.permissions_due(view.id) {
+            return Some(Wait::Restarting);
+        }
         let boss = m.from.kind == PartyKind::Manager;
         // Its reply still read for whether it asks: its turn is open until
         // that is said, and what the boss said before it never answers it.

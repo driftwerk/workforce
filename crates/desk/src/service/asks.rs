@@ -17,12 +17,8 @@ use serde_json::Value;
 
 use super::{Behind, Desk, Live, OpenTurn, Persist, Raised, State};
 use crate::floor::{Answer, Subject, Turn, TurnOp, Wait};
-use crate::model::{Engine, PendingApproval, SessionState};
+use crate::model::{Engine, PendingApproval, SessionState, IN_TERMINAL};
 use crate::store::DeskStore;
-
-/// What a session asks that only its terminal shows, when nothing says
-/// what it is.
-const IN_TERMINAL: &str = "Answer in the terminal";
 
 /// One open ask, as kept.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

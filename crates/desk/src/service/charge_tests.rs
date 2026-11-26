@@ -1871,3 +1871,58 @@ async fn a_review_session_is_asked_for_its_verdict_and_linked_to_its_pull_reques
     })
     .await;
 }
+
+/// An alias is read whole, a value of many lines too, as `-z` gives it.
+#[test]
+fn a_git_alias_is_read_whole_however_many_lines_it_has() {
+    let aliases = super::aliases_of("alias.st\nstatus\0alias.pf\n!f() {\n  git push -f\n}; f\0");
+    assert_eq!(aliases["st"], "status");
+    assert_eq!(aliases["pf"], "!f() {\n  git push -f\n}; f");
+}
+
+/// Git's command list is read a command a line, whatever surrounds it.
+#[test]
+fn git_says_its_commands_a_line_each() {
+    let listed = super::commands_of("add\npush\n  send-pack \n\nlfs\n");
+    assert_eq!(
+        listed,
+        ["add", "push", "send-pack", "lfs"].map(String::from).into()
+    );
+}
+
+/// Git says its own commands, and those a session's login shell finds,
+/// in its folder: a path its profile adds, or a relative one, included.
+#[cfg(unix)]
+#[test]
+fn git_says_its_own_commands_and_those_the_sessions_shell_finds() {
+    use std::os::unix::fs::PermissionsExt;
+    let home = tempfile::tempdir().unwrap();
+    let work = tempfile::tempdir().unwrap();
+    let external = |dir: &std::path::Path, name: &str| {
+        std::fs::create_dir_all(dir).unwrap();
+        let at = dir.join(name);
+        std::fs::write(&at, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&at, std::fs::Permissions::from_mode(0o755)).unwrap();
+    };
+    external(&home.path().join("profiled"), "git-profiled");
+    external(&work.path().join("bin"), "git-here");
+    // Only a login shell reads it.
+    std::fs::write(
+        home.path().join(".profile"),
+        format!("PATH=\"{}/profiled:$PATH\"\n", home.path().display()),
+    )
+    .unwrap();
+    let env = std::collections::BTreeMap::from([
+        ("HOME".to_string(), home.path().display().to_string()),
+        ("PATH".to_string(), "bin:/usr/bin:/bin".to_string()),
+    ]);
+    let commands =
+        super::git_commands("/bin/sh", work.path(), &env).expect("git says its commands");
+    assert!(commands.contains("push") && commands.contains("send-pack"));
+    assert!(commands.contains("profiled"), "one its profile's path has");
+    assert!(commands.contains("here"), "one a relative path finds there");
+    assert_eq!(
+        super::git_commands("/nonexistent/sh", work.path(), &env),
+        None
+    );
+}
