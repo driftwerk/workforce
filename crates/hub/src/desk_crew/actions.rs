@@ -674,7 +674,8 @@ pub(super) fn charge_plain(e: workforce_desk::DeskError) -> String {
     match e {
         workforce_desk::DeskError::Conflict(why)
         | workforce_desk::DeskError::Invalid(why)
-        | workforce_desk::DeskError::NotHeld(why) => why,
+        | workforce_desk::DeskError::NotHeld(why)
+        | workforce_desk::DeskError::WorktreeTaken(why) => why,
         e
         @ (workforce_desk::DeskError::CrossesBoss | workforce_desk::DeskError::TooLong { .. }) => {
             e.to_string()
@@ -752,7 +753,8 @@ pub(super) fn board_plain(e: workforce_desk::DeskError) -> String {
     match e {
         workforce_desk::DeskError::Conflict(why)
         | workforce_desk::DeskError::Invalid(why)
-        | workforce_desk::DeskError::NotHeld(why) => why,
+        | workforce_desk::DeskError::NotHeld(why)
+        | workforce_desk::DeskError::WorktreeTaken(why) => why,
         e
         @ (workforce_desk::DeskError::CrossesBoss | workforce_desk::DeskError::TooLong { .. }) => {
             e.to_string()

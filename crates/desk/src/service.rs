@@ -261,6 +261,11 @@ pub enum DeskError {
     /// answered as a 409 with its own `code`, so the start waits for it.
     #[error("{0}")]
     NotHeld(String),
+    /// A start's worktree is held by something else ([`worktree::Unmade::Taken`]):
+    /// answered as a 409 with its own `code`, so a plan pauses on it rather
+    /// than trying it again.
+    #[error("{0}")]
+    WorktreeTaken(String),
     /// A grant asked to last longer than this engine gives, `most` hours.
     /// Answered as a 400 with its own `code` and `mostHours`.
     #[error("{why}")]
@@ -1842,6 +1847,14 @@ async fn reopened_turns(
             (HashMap::new(), Vec::new())
         }
     }
+}
+
+/// The running session working in `folder` or below it, when one is.
+fn running_in<'a>(
+    mut records: impl Iterator<Item = &'a SessionRecord>,
+    folder: &Path,
+) -> Option<&'a SessionRecord> {
+    records.find(|r| r.state.is_running() && Path::new(&r.cwd).starts_with(folder))
 }
 
 /// For each of `records` at work, the latest of its turns `logged` has open.
@@ -3925,9 +3938,10 @@ impl Desk {
                 (path, Some(branch))
             }
             Some(branch) => (
-                worktree::create(&cwd, branch)
-                    .await
-                    .map_err(|e| DeskError::Invalid(e.to_string()))?,
+                worktree::create(&cwd, branch).await.map_err(|e| match e {
+                    worktree::Unmade::Taken(why) => DeskError::WorktreeTaken(why),
+                    worktree::Unmade::Failed(e) => DeskError::Invalid(e.to_string()),
+                })?,
                 Some(branch.to_string()),
             ),
             None => (cwd, None),
@@ -3992,6 +4006,17 @@ impl Desk {
         };
         let placing = {
             let mut st = self.0.state.lock();
+            if let Some(holder) = record
+                .branch
+                .as_ref()
+                .and_then(|_| running_in(st.records.values(), &cwd))
+            {
+                return Err(DeskError::WorktreeTaken(format!(
+                    "{} is in use: {} still runs in it",
+                    cwd.display(),
+                    holder.display_name.as_deref().unwrap_or(&holder.name)
+                )));
+            }
             st.records.insert(id, record.clone());
             boss.map(|boss| self.reserve_charge(&mut st, id, boss, group.as_deref()))
         };

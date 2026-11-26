@@ -437,7 +437,8 @@ fn plain(e: workforce_desk::DeskError) -> String {
     match e {
         workforce_desk::DeskError::Conflict(why)
         | workforce_desk::DeskError::Invalid(why)
-        | workforce_desk::DeskError::NotHeld(why) => why,
+        | workforce_desk::DeskError::NotHeld(why)
+        | workforce_desk::DeskError::WorktreeTaken(why) => why,
         e
         @ (workforce_desk::DeskError::CrossesBoss | workforce_desk::DeskError::TooLong { .. }) => {
             e.to_string()
@@ -2348,7 +2349,7 @@ impl CrewHub {
                                 tracing::warn!(plan = %p.id, ticket = %s.ticket, error = %e, "a ticket no longer in its plan didn't start");
                                 continue;
                             };
-                            self.start_failed(&p, t, scope, &plain(e)).await;
+                            self.start_failed(&p, t, scope, e).await;
                         }
                     }
                 }
@@ -2368,7 +2369,7 @@ impl CrewHub {
                         Err(workforce_desk::StartRefused::Failed(e)) => {
                             self.plan_waiting.lock().remove(&id);
                             if let Some(t) = tickets.iter().find(|t| t.id == id) {
-                                self.start_failed(&p, t, scope, &plain(e)).await;
+                                self.start_failed(&p, t, scope, e).await;
                             }
                         }
                     }
@@ -2409,11 +2410,20 @@ impl CrewHub {
             .unwrap_or(1)
     }
 
-    /// `ticket` of `p` failed to start, saying `why`. Its boss is told once
-    /// for each thing that keeps it from starting; it is tried again after
-    /// a wait that doubles each time; after [`FAILS_BEFORE_PAUSE`] tries the
-    /// plan pauses, and the person reads why on the Floor.
-    async fn start_failed(&self, p: &Plan, t: &PlanTicket, scope: i32, why: &str) {
+    /// `ticket` of `p` failed to start with `e`. Its boss is told once for
+    /// each thing that keeps it from starting; it is tried again after a
+    /// wait that doubles each time; after [`FAILS_BEFORE_PAUSE`] tries the
+    /// plan pauses, and the person reads why on the Floor. One no retry
+    /// changes (its worktree held by something else) pauses it at once.
+    async fn start_failed(
+        &self,
+        p: &Plan,
+        t: &PlanTicket,
+        scope: i32,
+        e: workforce_desk::DeskError,
+    ) {
+        let again = !matches!(e, workforce_desk::DeskError::WorktreeTaken(_));
+        let why = plain(e);
         let (ticket, key) = (t.id, t.name());
         tracing::warn!(plan = %p.id, ticket = %ticket, key = %key, error = %why, "a plan's ticket didn't start");
         let (count, tell) = {
@@ -2430,7 +2440,7 @@ impl CrewHub {
             let wait = self.timing.minute * 2u32.saturating_pow(f.count - 1).min(64);
             f.next = Instant::now() + wait;
             let tell = f.why != why;
-            f.why = why.to_string();
+            f.why.clone_from(&why);
             (f.count, tell)
         };
         if tell {
@@ -2438,8 +2448,11 @@ impl CrewHub {
                 .lock()
                 .push((p.id, format!("{key} didn't start: {why}")));
         }
-        if count >= FAILS_BEFORE_PAUSE {
-            let said = format!("{key} couldn't start {count} times: {why}");
+        if !again || count >= FAILS_BEFORE_PAUSE {
+            let said = match again {
+                true => format!("{key} couldn't start {count} times: {why}"),
+                false => format!("{key} can't start: {why}"),
+            };
             if let Err(e) = self.desk.pause_plan_failing(p.id, &said).await {
                 tracing::warn!(plan = %p.id, error = %e, "a plan that keeps failing wasn't paused");
             }

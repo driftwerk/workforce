@@ -1516,6 +1516,9 @@ impl Crew for CrewHub {
             _ if a.body["code"] == workforce_desk::grant::NOT_HELD => {
                 Err(MachineRefused::NotHeld(why()))
             }
+            _ if a.body["code"] == workforce_desk::worktree::TAKEN => {
+                Err(MachineRefused::WorktreeTaken(why()))
+            }
             _ => Err(MachineRefused::Refused(why())),
         }
     }

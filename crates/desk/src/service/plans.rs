@@ -3246,6 +3246,9 @@ impl Desk {
             crew::MachineRefused::Refused(why) => sure(DeskError::Invalid(format!(
                 "{machine} didn't start {key}: {why}"
             ))),
+            crew::MachineRefused::WorktreeTaken(why) => sure(DeskError::WorktreeTaken(format!(
+                "{machine} didn't start {key}: {why}"
+            ))),
             e @ crew::MachineRefused::Unknown(_) => failed(DeskError::Invalid(e.to_string()), true),
             e => sure(DeskError::Invalid(e.to_string())),
         };
@@ -3450,20 +3453,10 @@ impl Desk {
             )));
         };
         // Its own worktree, when another of the plan's tickets works in the
-        // same folder and it is a repository: made once, and found again by
-        // a start cut off after.
-        let worktree = worktree && crate::worktree::in_repo(Path::new(&folder)).await;
-        let (cwd, branch) = match worktree {
-            false => (folder, None),
-            true => {
-                let branch = branch_for(&key);
-                let made = crate::worktree::existing(Path::new(&folder), &branch).await;
-                match made {
-                    Some(path) => (path.to_string_lossy().into_owned(), None),
-                    None => (folder, Some(branch)),
-                }
-            }
-        };
+        // same folder and it is a repository: made once, and started in
+        // again by each later start of it.
+        let branch = (worktree && crate::worktree::in_repo(Path::new(&folder)).await)
+            .then(|| branch_for(&key));
         let group = p
             .group
             .clone()
@@ -3473,7 +3466,7 @@ impl Desk {
             engine,
             view: runs.view,
             name: key.clone(),
-            cwd,
+            cwd: folder,
             goal: board::goal_of(&key, t),
             worktree: branch,
             prompt: Some(format!(

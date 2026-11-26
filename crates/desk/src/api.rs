@@ -101,6 +101,13 @@ impl IntoResponse for DeskError {
                 )
                     .into_response()
             }
+            DeskError::WorktreeTaken(_) => {
+                return (
+                    StatusCode::CONFLICT,
+                    Json(json!({ "error": self.to_string(), "code": crate::worktree::TAKEN })),
+                )
+                    .into_response()
+            }
             DeskError::Invalid(_) => StatusCode::BAD_REQUEST,
             DeskError::TooLong { most, .. } => {
                 let most = *most;
@@ -2586,6 +2593,20 @@ mod tests {
         assert_eq!(body["code"], GRANT_TOO_LONG);
         assert_eq!(body["mostHours"], 12);
         assert!(body["error"].as_str().unwrap().contains("1 to 12 hours"));
+    }
+
+    #[tokio::test]
+    async fn a_start_whose_worktree_is_taken_says_so_by_its_code() {
+        use super::{DeskError, IntoResponse, StatusCode};
+        let res = DeskError::WorktreeTaken("/dev/atlas/.worktrees/man-5 is in use".into())
+            .into_response();
+        assert_eq!(res.status(), StatusCode::CONFLICT);
+        let bytes = axum::body::to_bytes(res.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["code"], crate::worktree::TAKEN);
+        assert_eq!(body["error"], "/dev/atlas/.worktrees/man-5 is in use");
     }
 
     #[tokio::test]

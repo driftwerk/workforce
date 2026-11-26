@@ -2774,3 +2774,102 @@ fn assert_keys_once(detail: &PlanDetail) {
     }
     assert_eq!(keys.len(), sent.as_object().unwrap().len(), "{keys:?}");
 }
+
+fn git_in(dir: &Path, args: &[&str]) {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "git {args:?}: {out:?}");
+}
+
+/// A ticket whose worktree is there from an earlier start of it starts in
+/// that worktree, its uncommitted work kept; a start on its branch while
+/// its session runs there is refused as taken, and one after it closed
+/// starts in it again.
+#[tokio::test]
+async fn a_plans_ticket_starts_in_its_own_worktree_from_before() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        git_in(dir.path(), &["init", "-q", "-b", "main"]);
+        git_in(
+            dir.path(),
+            &[
+                "-c",
+                "user.email=d@e",
+                "-c",
+                "user.name=d",
+                "commit",
+                "-q",
+                "--allow-empty",
+                "-m",
+                "init",
+            ],
+        );
+        let d = desk(pool, dir.path()).await;
+        let p = d
+            .propose_plan(new_plan(dir.path(), &[("a", &[])]), &sarah(), &by_sarah())
+            .await
+            .unwrap();
+        let p = d.approve_plan(p.summary.plan.id, 1, &By::you()).await.unwrap();
+        let key = p.tickets[0].ticket.key.clone().unwrap();
+        let branch = branch_for(&key);
+        let before = crate::worktree::create(dir.path(), &branch).await.unwrap();
+        std::fs::write(before.join("half-done.rs"), "fn wip() {}").unwrap();
+        let start = Start {
+            repo: None,
+            ticket: p.tickets[0].ticket.ticket.id,
+            engine: Engine::Claude,
+            folder: dir.path().to_string_lossy().into_owned(),
+            view: None,
+            worktree: true,
+        };
+        let s = d
+            .plan_start(&p.summary.plan, &start, &sarah(), &by_sarah())
+            .await
+            .unwrap();
+        let v = d.view(s.id).unwrap();
+        assert_eq!(Path::new(&v.cwd), before);
+        assert_eq!(v.branch.as_deref(), Some(branch.as_str()));
+        assert_eq!(
+            std::fs::read_to_string(before.join("half-done.rs")).unwrap(),
+            "fn wip() {}"
+        );
+
+        let beside = || NewSession {
+            fresh_worktree: false,
+            engine: Engine::Claude,
+            view: None,
+            name: "beside".into(),
+            cwd: dir.path().to_string_lossy().into_owned(),
+            goal: String::new(),
+            worktree: Some(branch.clone()),
+            prompt: None,
+            approvals: None,
+            approve_for_me: false,
+            fast: false,
+            model: None,
+            account: None,
+            env: Default::default(),
+            group: None,
+            review_of: None,
+        };
+        let taken = d.create(beside(), Some(By::you())).await.unwrap_err();
+        assert!(
+            matches!(&taken, DeskError::WorktreeTaken(why) if why.contains("is in use") && why.contains(&key)),
+            "{taken:?}"
+        );
+        d.end(s.id, Some(By::you())).await.unwrap();
+        super::super::tests::eventually("its session closed", async || {
+            d.view(s.id)
+                .is_ok_and(|v| !v.state.is_running())
+                .then_some(())
+        })
+        .await;
+        let again = d.create(beside(), Some(By::you())).await.unwrap();
+        assert_eq!(Path::new(&again.cwd), before);
+    })
+    .await;
+}
