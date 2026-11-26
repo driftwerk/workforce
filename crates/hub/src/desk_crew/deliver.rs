@@ -10,9 +10,10 @@
 //! place the person always allows from their own turns. Its prompt is not
 //! the person's own words, so it is read at paired trust.
 
+use std::future::Future;
 use std::sync::Arc;
 
-use eyre::{bail, Result};
+use eyre::Result;
 use workforce_agent::tools::approval::SelfServe;
 use workforce_common::channels::desk::{DeskPlace, DeskScope, DeskTarget};
 use workforce_common::channels::DESK_CHANNEL;
@@ -46,6 +47,23 @@ pub(super) fn stopped(e: &eyre::Report) -> bool {
     e.chain().any(|c| c.is::<TurnStopped>())
 }
 
+tokio::task_local! {
+    /// Set around a crew turn whose caller is told once its prompt is kept
+    /// in the session, before it runs ([`told_when_asked`]).
+    static ASKED: std::cell::RefCell<Option<tokio::sync::oneshot::Sender<()>>>;
+}
+
+/// Runs `turn`, sending on `asked` once the crew turn in it has kept its
+/// prompt; dropped unsent when it never does.
+pub(super) async fn told_when_asked<F: Future>(
+    asked: tokio::sync::oneshot::Sender<()>,
+    turn: F,
+) -> F::Output {
+    ASKED
+        .scope(std::cell::RefCell::new(Some(asked)), turn)
+        .await
+}
+
 impl CrewHub {
     /// Runs `prompt` as a turn in `service`'s Desk DM with `owner`, at `hop`
     /// hand-offs; `listed` are the requests a wake-up names. A prompt with
@@ -63,6 +81,36 @@ impl CrewHub {
     ) -> Result<(String, String)> {
         self.run_turn(service, owner, DESK_CHANNEL, prompt, hop, listed, author)
             .await
+    }
+
+    /// Runs `turn` in `service`'s DM with `owner`, and again each time
+    /// another turn held the DM, once it lets go
+    /// ([`crate::live_turns::when_free`]): for as long as anything waits for
+    /// a boss's mind, and not once the hub drains.
+    pub(crate) async fn run_dm_turn_queued<T, Fut>(
+        &self,
+        service: &AgentService,
+        owner: &str,
+        turn: impl FnMut() -> Fut,
+    ) -> Result<T>
+    where
+        Fut: Future<Output = Result<T>>,
+    {
+        crate::live_turns::when_free(
+            service,
+            || {
+                service
+                    .sessions
+                    .find(DESK_CHANNEL, owner)
+                    .ok()
+                    .flatten()
+                    .map(|s| s.id)
+            },
+            self.mind_wait_max(),
+            self.state.drain_token.cancelled(),
+            turn,
+        )
+        .await
     }
 
     /// [`Self::run_dm_turn`] for a message a boss (`author`) sent on in
@@ -134,12 +182,6 @@ impl CrewHub {
         // the answer. The person's next connect rolls a stale one.
         let session = service.sessions.get_or_create(channel, owner, agent_id)?;
         let sid = session.id.clone();
-        if hop > 0 {
-            self.hops.lock().insert(sid.clone(), hop);
-        }
-        if let Some(listed) = listed {
-            self.listed.lock().insert(sid.clone(), listed);
-        }
         // What another overseer sent on is never the person's word, unless
         // it was sent in answer to theirs: then their own words, relayed,
         // are what this turn answers.
@@ -164,11 +206,14 @@ impl CrewHub {
             .await
         {
             Ok(begun) => begun,
-            Err(busy) => {
-                self.hops.lock().remove(&sid);
-                bail!("{busy}");
-            }
+            Err(busy) => return Err(busy.into()),
         };
+        if hop > 0 {
+            self.hops.lock().insert(sid.clone(), hop);
+        }
+        if let Some(listed) = listed {
+            self.listed.lock().insert(sid.clone(), listed);
+        }
         // Started holding the boss's mind: its tools hold it too. Marked
         // once the turn is its own, never while the session is busy with
         // another.
@@ -264,6 +309,9 @@ impl CrewHub {
         ))
         .await?;
         let session_id = progress.session_id.clone();
+        if let Some(asked) = ASKED.try_with(|a| a.take()).ok().flatten() {
+            let _ = asked.send(());
+        }
         let tx = if session_id == sid {
             tx
         } else {

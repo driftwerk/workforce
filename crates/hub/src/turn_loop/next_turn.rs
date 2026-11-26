@@ -8,15 +8,15 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use workforce_agent::tools::approval::SelfServe;
-use workforce_common::channels::desk::{DeskPlace, DeskTurn, DeskTurnContext};
+use workforce_common::channels::desk::{DeskPlace, DeskSpeaker, DeskTurn, DeskTurnContext};
+use workforce_common::trust::TrustLevel;
 
 use crate::hub_core::live_turns::{Ending, Heard};
 use crate::serve::AgentService;
 
-/// How many times the next turn is tried while the turn before it still
-/// holds the session, and how long apart.
-const TRIES: usize = 40;
-const APART: Duration = Duration::from_millis(250);
+/// How long the next turn waits for the turns before it to let the session
+/// go.
+const WAIT: Duration = Duration::from_secs(20 * 60);
 
 /// What a turn does with the follow-ups its run never read: those to keep
 /// with the ones it read (before its answer), and those to keep after its
@@ -48,6 +48,47 @@ pub(crate) fn unread_plan(desk: Option<&DeskTurnContext>, unread: Vec<Heard>) ->
             after: Vec::new(),
         },
     }
+}
+
+/// The Desk turn the follow-ups a turn took in are heard in, and the trust
+/// they are kept at: its own, at the turn's `trust`, or, for a turn of the
+/// person's DM that came from no Desk (the crew's own), the person's turn
+/// there, at theirs.
+pub(crate) fn heard_in(
+    desk: Option<&DeskTurnContext>,
+    channel: &str,
+    trust: Option<TrustLevel>,
+) -> (Option<DeskTurnContext>, Option<TrustLevel>) {
+    match desk {
+        Some(desk) => (Some(desk.clone()), trust),
+        None if channel == workforce_common::channels::DESK_CHANNEL => {
+            (Some(persons_dm_turn(channel)), None)
+        }
+        None => (None, trust),
+    }
+}
+
+/// The person's own turn in their DM on `channel`.
+fn persons_dm_turn(channel: &str) -> DeskTurnContext {
+    DeskTurnContext::new(
+        DeskTurn {
+            place: DeskPlace::Dm { thread: None },
+            speaker: DeskSpeaker::Person,
+            hop: 0,
+            context: Vec::new(),
+            message: None,
+            spoken: false,
+            voice: None,
+            members: Vec::new(),
+            edit: None,
+            starts_thread: false,
+        },
+        channel,
+        None,
+        false,
+        None,
+        uuid::Uuid::new_v4().to_string(),
+    )
 }
 
 /// The id a follow-up is known by as the next turn's question.
@@ -110,7 +151,7 @@ pub(crate) struct NextTurn {
     pub channel: String,
     pub user: String,
     pub run_as: String,
-    pub trust_level: Option<workforce_common::trust::TrustLevel>,
+    pub trust_level: Option<TrustLevel>,
     pub desk: DeskTurnContext,
     pub prompt: String,
 }
@@ -120,24 +161,24 @@ pub(crate) struct NextTurn {
 /// the answer. No client is needed: a Desk that is there reads it by its
 /// ids, and one that comes later reads it from the conversation.
 pub(crate) async fn answer_left(service: Arc<AgentService>, next: NextTurn) {
-    for _ in 0..TRIES {
-        match attempt(&service, &next).await {
-            Ok(answer) => {
-                announce(&service, &next, &answer).await;
-                return;
-            }
-            Err(e) if held(&e) => tokio::time::sleep(APART).await,
-            Err(e) if e.downcast_ref::<NothingHeld>().is_some() => {
-                tracing::info!(session = %next.session_id, "a follow-up its turn never read was answered meanwhile; nothing to run");
-                return;
-            }
-            Err(e) => {
-                tracing::warn!(session = %next.session_id, error = %e, "answering a follow-up its turn never read failed");
-                return;
-            }
+    let (service, next) = (&service, &next);
+    match crate::live_turns::when_free(
+        service,
+        || Some(next.session_id.clone()),
+        WAIT,
+        crate::shutdown::begun(),
+        move || attempt(service, next),
+    )
+    .await
+    {
+        Ok(answer) => announce(service, next, &answer).await,
+        Err(e) if e.downcast_ref::<NothingHeld>().is_some() => {
+            tracing::info!(session = %next.session_id, "a follow-up its turn never read was answered meanwhile; nothing to run");
+        }
+        Err(e) => {
+            tracing::warn!(session = %next.session_id, error = %e, "answering a follow-up its turn never read failed");
         }
     }
-    tracing::info!(session = %next.session_id, tries = TRIES, "a follow-up its turn never read is left unanswered: the session stayed held");
 }
 
 async fn attempt(service: &Arc<AgentService>, next: &NextTurn) -> eyre::Result<String> {
@@ -184,16 +225,6 @@ async fn attempt(service: &Arc<AgentService>, next: &NextTurn) -> eyre::Result<S
         Ending::Stopped => Err(crate::hub_core::live_turns::TurnStopped.into()),
         Ending::Failed(e) => Err(eyre::eyre!("the next turn did not finish: {e}")),
     }
-}
-
-/// Whether another turn still holds the session, on this instance or another.
-fn held(error: &eyre::Report) -> bool {
-    error
-        .downcast_ref::<crate::session_turn_claim::TurnClaimHeld>()
-        .is_some()
-        || error
-            .downcast_ref::<crate::hub_core::live_turns::TurnBusy>()
-            .is_some()
 }
 
 async fn announce(service: &AgentService, next: &NextTurn, answer: &str) {

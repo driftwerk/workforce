@@ -68,6 +68,9 @@ pub enum What {
     /// A boss's message waiting to go into `session` was taken back unsent
     /// by the person.
     TakenBack,
+    /// A boss's message to another agent (`boss`: the sender) never reached
+    /// it.
+    Undelivered,
 }
 
 impl What {
@@ -81,7 +84,9 @@ impl What {
             | What::SessionAsked
             | What::HandedBack
             | What::PersonAnswered => true,
-            What::Fact | What::Order | What::Withdrawn | What::TakenBack => false,
+            What::Fact | What::Order | What::Withdrawn | What::TakenBack | What::Undelivered => {
+                false
+            }
         }
     }
 
@@ -97,6 +102,7 @@ impl What {
             What::PersonAnswered => "person_answered",
             What::Withdrawn => "withdrawn",
             What::TakenBack => "taken_back",
+            What::Undelivered => "undelivered",
         }
     }
 
@@ -112,6 +118,7 @@ impl What {
             "person_answered" => What::PersonAnswered,
             "withdrawn" => What::Withdrawn,
             "taken_back" => What::TakenBack,
+            "undelivered" => What::Undelivered,
             _ => return None,
         })
     }
@@ -196,6 +203,9 @@ impl Happened {
             ),
             What::TakenBack => format!(
                 "{at} the person took back your message “{text}” before it went in: it was never delivered"
+            ),
+            What::Undelivered => format!(
+                "{at} your message {text} never reached it, so nothing was done on it: send it again if it still matters"
             ),
         }
     }
@@ -598,6 +608,10 @@ mod tests {
             What::Fact,
             What::Order,
             What::HandedBack,
+            What::PersonAnswered,
+            What::Withdrawn,
+            What::TakenBack,
+            What::Undelivered,
         ] {
             assert_eq!(What::parse(w.as_str()), Some(w));
         }

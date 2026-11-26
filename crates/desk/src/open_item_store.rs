@@ -17,7 +17,8 @@ use crate::store::DeskStore;
 const COLUMNS: &str = "id, boss, owner, kind, session, line_message, text, holding_up, \
      recommendation, options, generalizes, done_when, dedupe_key, opened_at, last_said_at, \
      said_count, changed_at, state, closed_at, closed_by, closed_why, raised_at, sessions, \
-     prefer_scope, question, points, recommended, not_blocking, cant_decide, due_at, chased_at";
+     prefer_scope, question, points, recommended, not_blocking, cant_decide, due_at, chased_at, \
+     delivered_at";
 
 fn item(r: &Row) -> Result<OpenItem> {
     Ok(OpenItem {
@@ -57,6 +58,7 @@ fn item(r: &Row) -> Result<OpenItem> {
         cant_decide: r.try_get(28)?,
         due_at: r.try_get(29)?,
         chased_at: r.try_get(30)?,
+        delivered_at: r.try_get(31)?,
     })
 }
 
@@ -460,6 +462,61 @@ impl DeskStore {
             .collect()
     }
 
+    /// The items the person answered on their buttons from `since` until
+    /// `before` whose answers never reached their bosses: none of whose
+    /// proposals was applied, and none asking what an open item asks now,
+    /// oldest first.
+    pub async fn items_answered_between(
+        &self,
+        since: DateTime<Utc>,
+        before: DateTime<Utc>,
+    ) -> Result<Vec<OpenItem>> {
+        let client = self.pool().get().await?;
+        client
+            .query(
+                &format!(
+                    "SELECT {COLUMNS} FROM boss_open_items WHERE state = 'closed' \
+                     AND closed_by = 'person' AND starts_with(closed_why, $3) \
+                     AND closed_at >= $1 AND closed_at < $2 AND applied_at IS NULL \
+                     AND delivered_at IS NULL AND NOT EXISTS (SELECT 1 FROM boss_open_items o \
+                     WHERE o.boss = boss_open_items.boss AND o.dedupe_key = boss_open_items.dedupe_key \
+                     AND o.state <> 'closed') ORDER BY closed_at, id"
+                ),
+                &[&since, &before, &crate::goal::YOU_ANSWERED],
+            )
+            .await?
+            .iter()
+            .map(item)
+            .collect()
+    }
+
+    /// The person's answer to `item` reached its boss.
+    pub async fn item_delivered(&self, item: Uuid) -> Result<()> {
+        let client = self.pool().get().await?;
+        client
+            .execute(
+                "UPDATE boss_open_items SET delivered_at = now() WHERE id = $1 \
+                 AND state = 'closed' AND delivered_at IS NULL",
+                &[&item],
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// Whether a proposal of question `item`'s was applied.
+    pub async fn item_applied(&self, item: Uuid) -> Result<bool> {
+        let client = self.pool().get().await?;
+        Ok(client
+            .query_opt(
+                "SELECT applied_at IS NOT NULL AS applied FROM boss_open_items WHERE id = $1",
+                &[&item],
+            )
+            .await?
+            .map(|r| r.try_get("applied"))
+            .transpose()?
+            .unwrap_or(false))
+    }
+
     /// Holds the session question `message` until the person has left its
     /// session: kept across restarts.
     pub async fn held_question_put(&self, message: Uuid) -> Result<()> {
@@ -680,7 +737,8 @@ impl DeskStore {
         let n = client
             .execute(
                 "UPDATE boss_open_items SET state = 'open', closed_at = NULL, closed_by = NULL, \
-                 closed_why = NULL, changed_at = now() WHERE id = $1 AND state = 'closed' \
+                 closed_why = NULL, delivered_at = NULL, changed_at = now() \
+                 WHERE id = $1 AND state = 'closed' \
                  AND NOT EXISTS (SELECT 1 FROM boss_open_items o WHERE o.boss = boss_open_items.boss \
                  AND o.dedupe_key = boss_open_items.dedupe_key AND o.state <> 'closed')",
                 &[&id],
