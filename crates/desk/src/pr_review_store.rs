@@ -253,10 +253,16 @@ mod tests {
                 head_sha: Some("a".repeat(40)),
                 for_session: Some(work),
             };
-            assert_eq!(store.pr_review_of(session).await.unwrap(), Some(linked.clone()));
+            assert_eq!(
+                store.pr_review_of(session).await.unwrap(),
+                Some(linked.clone())
+            );
             assert_eq!(store.pr_reviews_for(work).await.unwrap(), vec![linked]);
             assert_eq!(
-                store.pr_reviews_at("sarah", &pr(42), &"a".repeat(40)).await.unwrap(),
+                store
+                    .pr_reviews_at("sarah", &pr(42), &"a".repeat(40))
+                    .await
+                    .unwrap(),
                 vec![session]
             );
             assert!(store

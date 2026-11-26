@@ -3923,9 +3923,14 @@ impl Desk {
             &new.review_of,
         ) {
             (Some(name), Some(r)) => (
-                worktree::detached(&cwd, name, &r.head_sha, &format!("refs/pull/{}/head", r.pr.number))
-                    .await
-                    .map_err(|e| DeskError::Invalid(e.to_string()))?,
+                worktree::detached(
+                    &cwd,
+                    name,
+                    &r.head_sha,
+                    &format!("refs/pull/{}/head", r.pr.number),
+                )
+                .await
+                .map_err(|e| DeskError::Invalid(e.to_string()))?,
                 None,
             ),
             (Some(base), None) if new.fresh_worktree => {
@@ -4059,17 +4064,22 @@ impl Desk {
 
     /// Refuses a second review of `r`'s pull request at its head while a
     /// review session `boss` started there is still open.
-    async fn no_review_open_at(&self, boss: &str, r: &crate::plan::ReviewOf) -> Result<(), DeskError> {
+    async fn no_review_open_at(
+        &self,
+        boss: &str,
+        r: &crate::plan::ReviewOf,
+    ) -> Result<(), DeskError> {
         let started = self
             .0
             .store
             .pr_reviews_at(boss, &r.pr, &r.head_sha)
             .await
             .map_err(DeskError::Internal)?;
-        match started
-            .into_iter()
-            .find_map(|s| self.view(s).ok().filter(|v| v.state != SessionState::Closed))
-        {
+        match started.into_iter().find_map(|s| {
+            self.view(s)
+                .ok()
+                .filter(|v| v.state != SessionState::Closed)
+        }) {
             Some(v) => Err(DeskError::Conflict(format!(
                 "{} reviews {}/{}#{} at that head already: nudge it, or record its verdict",
                 v.label(),

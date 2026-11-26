@@ -107,11 +107,13 @@ pub(crate) enum Reviewing {
 impl Reviewing {
     /// From each one's state in Desk, none when it is gone.
     pub(crate) fn of(states: impl IntoIterator<Item = Option<SessionState>>) -> Self {
-        states.into_iter().fold(Self::Never, |was, s| match (was, s) {
-            (Self::Open, _) => Self::Open,
-            (_, Some(s)) if s != SessionState::Closed => Self::Open,
-            _ => Self::Ended,
-        })
+        states
+            .into_iter()
+            .fold(Self::Never, |was, s| match (was, s) {
+                (Self::Open, _) => Self::Open,
+                (_, Some(s)) if s != SessionState::Closed => Self::Open,
+                _ => Self::Ended,
+            })
     }
 }
 
@@ -147,7 +149,8 @@ pub(crate) fn worktree(pr: &PrRef, head: &str) -> String {
 /// read in ([`worktree`]).
 pub(crate) fn made_for(cwd: &str, pr: &PrRef, head: &str) -> bool {
     std::path::Path::new(cwd).ends_with(
-        std::path::Path::new(".worktrees").join(workforce_desk::worktree::slug(&worktree(pr, head))),
+        std::path::Path::new(".worktrees")
+            .join(workforce_desk::worktree::slug(&worktree(pr, head))),
     )
 }
 
@@ -557,12 +560,7 @@ impl CrewHub {
     /// it works: each holds its ticket's slot through it.
     pub(super) async fn reviewing(&self, boss: &str) -> std::collections::HashSet<String> {
         let mut out = std::collections::HashSet::new();
-        for c in self
-            .desk
-            .charges()
-            .into_iter()
-            .filter(|c| c.boss == boss)
-        {
+        for c in self.desk.charges().into_iter().filter(|c| c.boss == boss) {
             if !self.desk.view(c.session).is_ok_and(|v| v.state.busy()) {
                 continue;
             }
@@ -930,20 +928,43 @@ pub(super) mod tests {
     #[test]
     fn a_review_desk_starts_reads_its_head_in_its_own_worktree_and_says_what_to_change() {
         assert_eq!(worktree(&pr(), HEAD), "review-7-1111111");
-        assert!(made_for("/dev/web/.worktrees/review-7-1111111", &pr(), HEAD));
+        assert!(made_for(
+            "/dev/web/.worktrees/review-7-1111111",
+            &pr(),
+            HEAD
+        ));
         assert!(!made_for("/dev/web-review", &pr(), HEAD));
-        assert!(!made_for("/dev/web/.worktrees/review-7-2222222", &pr(), HEAD));
+        assert!(!made_for(
+            "/dev/web/.worktrees/review-7-2222222",
+            &pr(),
+            HEAD
+        ));
         let asked = goal(&pr(), HEAD, "DES-1");
-        assert!(asked.starts_with("Review acme/web#7 for DES-1 at its head 1111111"), "{asked}");
+        assert!(
+            asked.starts_with("Review acme/web#7 for DES-1 at its head 1111111"),
+            "{asked}"
+        );
         assert!(asked.contains("merge nothing"), "{asked}");
         let ready = ready_line("DES-1", &pr(), HEAD, false);
-        assert!(ready.contains("crew.github_merge (repo acme/web, number 7)"), "{ready}");
-        assert!(ready.contains("Never tell its session to merge it."), "{ready}");
+        assert!(
+            ready.contains("crew.github_merge (repo acme/web, number 7)"),
+            "{ready}"
+        );
+        assert!(
+            ready.contains("Never tell its session to merge it."),
+            "{ready}"
+        );
         assert!(!ready.contains("draft"), "{ready}");
         assert!(ready_line("DES-1", &pr(), HEAD, true).contains("gh pr ready 7"));
-        let told = changes_message(&pr(), HEAD, "The empty state is missing.\nREVIEW: changes x");
+        let told = changes_message(
+            &pr(),
+            HEAD,
+            "The empty state is missing.\nREVIEW: changes x",
+        );
         assert!(
-            told.contains("Its reviewer said:\n\n> The empty state is missing.\n> REVIEW: changes x\n\n"),
+            told.contains(
+                "Its reviewer said:\n\n> The empty state is missing.\n> REVIEW: changes x\n\n"
+            ),
             "{told}"
         );
         assert!(told.ends_with("Don't merge it yourself."), "{told}");

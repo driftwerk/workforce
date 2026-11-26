@@ -733,7 +733,9 @@ impl CrewHub {
         match review::step(&head, newest.as_ref(), at_head) {
             Step::Merge => self.ready_once(id, key, &pr, &head, pull.draft),
             Step::Settled | Step::Underway => {}
-            Step::Lost => self.unreviewed_once(id, key, &pr, &head, "its review ended with no verdict"),
+            Step::Lost => {
+                self.unreviewed_once(id, key, &pr, &head, "its review ended with no verdict")
+            }
             Step::Start => self.start_review(service, o, id, key, v, pr, head).await,
         }
     }
@@ -810,11 +812,19 @@ impl CrewHub {
             _ => Err("you may not start sessions yourself".into()),
         };
         match started {
-            Ok(done) => tracing::info!(%key, pr = %review::named(&pr), %done, "a pull request's review started"),
+            Ok(done) => {
+                tracing::info!(%key, pr = %review::named(&pr), %done, "a pull request's review started")
+            }
             Err(e) => {
                 tracing::info!(%key, pr = %review::named(&pr), error = %e, "a pull request's review didn't start");
                 self.plan_watch.lock().done.remove(&once);
-                self.unreviewed_once(id, key, &pr, &head, &format!("Desk couldn't start one: {e}"));
+                self.unreviewed_once(
+                    id,
+                    key,
+                    &pr,
+                    &head,
+                    &format!("Desk couldn't start one: {e}"),
+                );
             }
         }
     }
@@ -855,14 +865,27 @@ impl CrewHub {
                     match done.clean {
                         true => {
                             let draft = self
-                                .pull(service, &format!("{}/{}", done.pr.owner, done.pr.repo), done.pr.number.unsigned_abs())
+                                .pull(
+                                    service,
+                                    &format!("{}/{}", done.pr.owner, done.pr.repo),
+                                    done.pr.number.unsigned_abs(),
+                                )
                                 .await
                                 .is_some_and(|p| p.draft);
                             self.ready_once(id, key, &done.pr, &done.head_sha, draft);
                         }
                         false => {
-                            self.changes_asked(service, o, id, key, v, &done.pr, &done.head_sha, &said)
-                                .await
+                            self.changes_asked(
+                                service,
+                                o,
+                                id,
+                                key,
+                                v,
+                                &done.pr,
+                                &done.head_sha,
+                                &said,
+                            )
+                            .await
                         }
                     }
                     self.close_review(service, o, &r, &l.pr, head).await;
@@ -890,7 +913,11 @@ impl CrewHub {
                         }
                         false => self.wake_plan(
                             id,
-                            format!("{key}: its review {} ended again with no verdict line. {}", r.label(), review::NO_VERDICT),
+                            format!(
+                                "{key}: its review {} ended again with no verdict line. {}",
+                                r.label(),
+                                review::NO_VERDICT
+                            ),
                         ),
                     }
                 }
@@ -927,10 +954,7 @@ impl CrewHub {
             message: review::changes_message(pr, head, said),
             reply_to: None,
         };
-        let by = self.by_at_level(
-            self.by_boss(service, "Its review asked for changes."),
-            o,
-        );
+        let by = self.by_at_level(self.by_boss(service, "Its review asked for changes."), o);
         match self.perform(&action, by).await {
             Ok(_) => self.wake_plan(id, review::changes_line(key, pr, head)),
             Err(e) => {
@@ -961,7 +985,8 @@ impl CrewHub {
         let by = self.by_at_level(self.by_boss(service, "Its review is done."), o);
         match self.perform(&Action::Close { session: r.id }, by).await {
             Ok(_) if review::made_for(&r.cwd, pr, head) => {
-                if let Err(e) = workforce_desk::worktree::remove(std::path::Path::new(&r.cwd)).await {
+                if let Err(e) = workforce_desk::worktree::remove(std::path::Path::new(&r.cwd)).await
+                {
                     tracing::info!(session = %r.id, error = %e, "a closed review's worktree stays");
                 }
             }

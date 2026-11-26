@@ -104,7 +104,8 @@ pub(crate) const OWN_MERGE: &str = "At Act fully a pull request is merged only b
 pub(crate) const OWN_MERGE_INSTEAD: &str = "Don't merge it yourself: tell your boss on your Desk line that it is ready to merge; your boss merges it once it has a clean review at its head.";
 
 /// Why a session's merge is the person's while they are in it.
-const MERGE_IS_THEIRS: &str = "You're in this session: its merge of a pull request is yours to answer.";
+const MERGE_IS_THEIRS: &str =
+    "You're in this session: its merge of a pull request is yours to answer.";
 
 /// Why a request that only reads is allowed without a decision call.
 pub(crate) const ONLY_READS: &str = "it only reads, and a hold stops new work, never reading";

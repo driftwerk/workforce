@@ -26,18 +26,18 @@ use workforce_desk::model::SessionView;
 use workforce_desk::plan::{PrRef, PrReview};
 
 use super::super::directives::NAME as DIRECTIVES;
+use super::super::github_seen::Pull;
 use super::super::review::{tests::github, MERGE, NO_VERDICT, RECORD};
 use super::act_fully::{git, repo};
 use super::goals::{boss_over, run};
 use super::plan_watch::{asked_with, turn_ends};
 use super::plans::started;
-use super::super::github_seen::Pull;
+use super::unbound::UNBOUND;
+use super::*;
 use workforce_desk::board::TicketState;
 use workforce_desk::model::SessionState;
 use workforce_desk::plan::{Draft, DraftTicket, ReviewLink};
 use workforce_desk::NewPlan;
-use super::unbound::UNBOUND;
-use super::*;
 
 const MERGED: &str = "3333333333333333333333333333333333333333";
 
@@ -69,7 +69,8 @@ async fn shipping_with(
         ..Default::default()
     };
     let d = desk_on(pool, options, floor).await;
-    let (overseer, crew, d, llm) = boss_over(base, d, oversight, gh, CancellationToken::new()).await;
+    let (overseer, crew, d, llm) =
+        boss_over(base, d, oversight, gh, CancellationToken::new()).await;
     crew.read_spent_today(&crew.overseers()).await;
     // As the hub sets it at start.
     d.boss_bounds_with(workforce_desk::charge::Bounds {
@@ -571,7 +572,9 @@ impl Github {
             .mount(&server)
             .await;
         Mock::given(method("GET"))
-            .and(path_regex(r"^/repos/acme/web/commits/[0-9a-f]{40}/check-runs$"))
+            .and(path_regex(
+                r"^/repos/acme/web/commits/[0-9a-f]{40}/check-runs$",
+            ))
             .respond_with(
                 ResponseTemplate::new(200).set_body_json(json!({"check_runs": [
                     {"name": "Test", "status": "completed", "conclusion": "success"},
@@ -615,7 +618,13 @@ async fn a_plan_of_two(
     base: &Path,
     pool: workforce_postgres::PostgresPool,
     gh: &Github,
-) -> (Arc<AgentService>, Arc<CrewHub>, Desk, MockServer, SessionView) {
+) -> (
+    Arc<AgentService>,
+    Arc<CrewHub>,
+    Desk,
+    MockServer,
+    SessionView,
+) {
     let one_at_a_time = format!("{UNBOUND}[oversight.work]\nparallel = 1\n");
     let (overseer, crew, d, llm) = shipping_with(base, pool, &gh.server, &one_at_a_time).await;
     *crew.close_settle.lock() = chrono::Duration::zero();
@@ -666,7 +675,12 @@ async fn reviewed_by_desk(d: &Desk, head: &str) -> SessionView {
     .await;
     assert_eq!(r.name, "Review DES-1");
     assert_eq!(r.branch, None, "detached");
-    assert!(r.cwd.ends_with(&format!(".worktrees/review-7-{}", &head[..7])), "{}", r.cwd);
+    assert!(
+        r.cwd
+            .ends_with(&format!(".worktrees/review-7-{}", &head[..7])),
+        "{}",
+        r.cwd
+    );
     assert_eq!(head_of(Path::new(&r.cwd)), head, "at the head it reviews");
     r
 }
@@ -731,7 +745,11 @@ async fn a_green_pull_request_is_reviewed_by_desk_merged_by_the_boss_and_the_nex
         let claude = Claude::started(&base, review.id).await;
         claude.asked(review.last_prompt.as_deref().unwrap()).await;
         claude
-            .replies(&d, review.id, &format!("It reads well.\n\nREVIEW: clean {head}"))
+            .replies(
+                &d,
+                review.id,
+                &format!("It reads well.\n\nREVIEW: clean {head}"),
+            )
             .await;
         eventually("the boss to merge #7", async || {
             gh.merged.load(Ordering::SeqCst).then_some(())
@@ -744,7 +762,10 @@ async fn a_green_pull_request_is_reviewed_by_desk_merged_by_the_boss_and_the_nex
             .unwrap()
             .unwrap();
         assert!(recorded.clean);
-        assert_eq!((recorded.head_sha.as_str(), recorded.by_session), (head.as_str(), review.id));
+        assert_eq!(
+            (recorded.head_sha.as_str(), recorded.by_session),
+            (head.as_str(), review.id)
+        );
         let put: Vec<Value> = gh
             .server
             .received_requests()
@@ -755,19 +776,21 @@ async fn a_green_pull_request_is_reviewed_by_desk_merged_by_the_boss_and_the_nex
             .map(|r| serde_json::from_slice(&r.body).unwrap())
             .collect();
         assert_eq!(put.len(), 1);
-        assert_eq!((put[0]["sha"].as_str(), put[0]["merge_method"].as_str()), (Some(head.as_str()), Some("squash")));
+        assert_eq!(
+            (put[0]["sha"].as_str(), put[0]["merge_method"].as_str()),
+            (Some(head.as_str()), Some("squash"))
+        );
 
         eventually("the next ticket to start", async || {
             started(&d).into_iter().find(|v| v.name == "DES-2")
         })
         .await;
         closed(&d, &review).await;
-        let des1 = d
-            .store()
-            .linked_tickets(&[first.id])
-            .await
-            .unwrap();
-        assert!(des1.iter().all(|t| t.state == TicketState::Done), "{des1:?}");
+        let des1 = d.store().linked_tickets(&[first.id]).await.unwrap();
+        assert!(
+            des1.iter().all(|t| t.state == TicketState::Done),
+            "{des1:?}"
+        );
     })
     .await;
 }
@@ -802,8 +825,16 @@ async fn a_review_asking_for_changes_goes_to_its_session_and_the_next_head_is_re
                 .find(|m| m.text.contains("asked for changes"))
         })
         .await;
-        assert!(told.text.contains("> The empty state is missing."), "{}", told.text);
-        assert!(told.text.contains("Don't merge it yourself."), "{}", told.text);
+        assert!(
+            told.text.contains("> The empty state is missing."),
+            "{}",
+            told.text
+        );
+        assert!(
+            told.text.contains("Don't merge it yourself."),
+            "{}",
+            told.text
+        );
         let recorded = d
             .store()
             .pr_review_newest("desk", &PrRef::new("acme", "web", 7))
@@ -868,7 +899,10 @@ async fn a_sessions_own_merge_is_refused_at_once_for_its_bosss_merge() {
                 && message.contains(super::super::decide::OWN_MERGE_INSTEAD),
             "{message}"
         );
-        assert!(calls_about(&llm, "gh pr merge").await.is_empty(), "no model asked");
+        assert!(
+            calls_about(&llm, "gh pr merge").await.is_empty(),
+            "no model asked"
+        );
     })
     .await;
 }

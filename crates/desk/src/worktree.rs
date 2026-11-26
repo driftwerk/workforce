@@ -131,14 +131,33 @@ pub async fn detached(cwd: &Path, name: &str, commit: &str, from: &str) -> Resul
         .await
         .is_err()
     {
-        let into = format!("+{from}:refs/remotes/origin/{}", from.trim_start_matches("refs/"));
-        git(&root, &["-c", "credential.interactive=never", "fetch", "-q", "origin", &into])
-            .await
-            .with_context(|| format!("{commit} isn't here and couldn't be fetched"))?;
+        let into = format!(
+            "+{from}:refs/remotes/origin/{}",
+            from.trim_start_matches("refs/")
+        );
+        git(
+            &root,
+            &[
+                "-c",
+                "credential.interactive=never",
+                "fetch",
+                "-q",
+                "origin",
+                &into,
+            ],
+        )
+        .await
+        .with_context(|| format!("{commit} isn't here and couldn't be fetched"))?;
     }
     git(
         &root,
-        &["worktree", "add", "--detach", &path.to_string_lossy(), commit],
+        &[
+            "worktree",
+            "add",
+            "--detach",
+            &path.to_string_lossy(),
+            commit,
+        ],
     )
     .await?;
     Ok(path)
@@ -155,11 +174,14 @@ pub async fn remove(path: &Path) -> Result<()> {
 
 /// The main checkout of `cwd`'s repository, from a linked worktree too.
 async fn main_checkout(cwd: &Path) -> Result<PathBuf> {
-    let common = std::fs::canonicalize(cwd.join(git(cwd, &["rev-parse", "--git-common-dir"]).await?))
-        .context("finding the repository")?;
+    let common =
+        std::fs::canonicalize(cwd.join(git(cwd, &["rev-parse", "--git-common-dir"]).await?))
+            .context("finding the repository")?;
     match (common.file_name(), common.parent()) {
         (Some(n), Some(parent)) if n == ".git" => Ok(parent.to_path_buf()),
-        _ => Ok(PathBuf::from(git(cwd, &["rev-parse", "--show-toplevel"]).await?)),
+        _ => Ok(PathBuf::from(
+            git(cwd, &["rev-parse", "--show-toplevel"]).await?,
+        )),
     }
 }
 
@@ -372,7 +394,9 @@ mod tests {
         let second = git(&repo, &["rev-parse", "HEAD"]).await.unwrap();
         let ticket = create(&repo, "des-2").await.unwrap();
 
-        let made = detached(&ticket, "review 7 abc", &first, PULL).await.unwrap();
+        let made = detached(&ticket, "review 7 abc", &first, PULL)
+            .await
+            .unwrap();
         assert_eq!(made, repo.join(".worktrees/review-7-abc"));
         assert_eq!(git(&made, &["rev-parse", "HEAD"]).await.unwrap(), first);
         assert_eq!(
@@ -380,14 +404,21 @@ mod tests {
             "",
             "detached"
         );
-        assert_eq!(detached(&repo, "review 7 abc", &first, PULL).await.unwrap(), made);
-        assert!(detached(&repo, "review 7 abc", &second, PULL).await.is_err());
+        assert_eq!(
+            detached(&repo, "review 7 abc", &first, PULL).await.unwrap(),
+            made
+        );
+        assert!(detached(&repo, "review 7 abc", &second, PULL)
+            .await
+            .is_err());
         std::fs::create_dir_all(repo.join(".worktrees/plain")).unwrap();
         assert!(
             detached(&repo, "plain", &second, PULL).await.is_err(),
             "a folder that isn't its worktree"
         );
-        assert!(detached(&repo, "review 8", &"0".repeat(40), PULL).await.is_err());
+        assert!(detached(&repo, "review 8", &"0".repeat(40), PULL)
+            .await
+            .is_err());
 
         std::fs::write(made.join("notes.md"), "x").unwrap();
         assert!(remove(&made).await.is_err(), "it holds changes");
@@ -404,26 +435,52 @@ mod tests {
     async fn a_head_the_repository_hasnt_got_is_fetched_from_origin() {
         let dir = tempfile::tempdir().unwrap();
         let base = std::fs::canonicalize(dir.path()).unwrap();
-        let (origin, repo, other) = (base.join("origin.git"), base.join("web"), base.join("other"));
+        let (origin, repo, other) = (
+            base.join("origin.git"),
+            base.join("web"),
+            base.join("other"),
+        );
         git(&base, &["init", "-q", "--bare", &origin.to_string_lossy()])
             .await
             .unwrap();
         let commit = |at: PathBuf, m: &'static str| async move {
             git(
                 &at,
-                &["-c", "user.email=d@e", "-c", "user.name=d", "commit", "-q", "--allow-empty", "-m", m],
+                &[
+                    "-c",
+                    "user.email=d@e",
+                    "-c",
+                    "user.name=d",
+                    "commit",
+                    "-q",
+                    "--allow-empty",
+                    "-m",
+                    m,
+                ],
             )
             .await
             .unwrap();
         };
         for at in [&repo, &other] {
-            git(&base, &["clone", "-q", &origin.to_string_lossy(), &at.to_string_lossy()])
-                .await
-                .unwrap();
+            git(
+                &base,
+                &[
+                    "clone",
+                    "-q",
+                    &origin.to_string_lossy(),
+                    &at.to_string_lossy(),
+                ],
+            )
+            .await
+            .unwrap();
         }
         commit(repo.clone(), "one").await;
-        git(&repo, &["push", "-q", "origin", "HEAD:main"]).await.unwrap();
-        git(&other, &["pull", "-q", "origin", "main"]).await.unwrap();
+        git(&repo, &["push", "-q", "origin", "HEAD:main"])
+            .await
+            .unwrap();
+        git(&other, &["pull", "-q", "origin", "main"])
+            .await
+            .unwrap();
         commit(other.clone(), "from elsewhere").await;
         git(&other, &["push", "-q", "origin", &format!("HEAD:{PULL}")])
             .await
