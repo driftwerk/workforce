@@ -1070,7 +1070,7 @@ fn worded(line: &str) -> &str {
 }
 
 /// The first sentence (or line) of `text`, flattened and clipped to `max`
-/// characters.
+/// characters. What it reads, [`one_line_read`] keeps: they change together.
 pub fn one_line(text: &str, max: usize) -> String {
     let line = text
         .lines()

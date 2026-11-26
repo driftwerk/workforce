@@ -1084,27 +1084,30 @@ impl CrewTool {
             return Some(Ok(json!({ "done": said })));
         }
         // Taken over: its new holder checks it hasn't been started.
-        let mut sent =
+        let sent =
             super::assignments::relayed_input(&sent, assigned.as_ref().and_then(|a| a.guard));
-        // The machine compares a request with the jobs kept here (R5).
-        if name == "crew.approve" {
-            match crew.held_irreversible(agent).await {
-                Ok(held) => {
-                    sent = super::assignments::with_held(
-                        sent,
-                        super::assignments::HELD_JOBS,
-                        &held,
-                        machine,
-                        |v| super::relay::carries(machine, &g, name, v, agent, &ceiling),
-                    );
-                }
+        // The machine compares a request with the jobs kept here (R5); left
+        // out when there are too many to send with it.
+        let (sent, unheld) = match name {
+            "crew.approve" => match crew.held_irreversible(agent).await {
+                Ok(held) => match super::assignments::with_held(
+                    sent,
+                    super::assignments::HELD_JOBS,
+                    &held,
+                    machine,
+                    |v| super::relay::carries(machine, &g, name, v, agent, &ceiling),
+                ) {
+                    Ok(sent) => (sent, false),
+                    Err(sent) => (sent, true),
+                },
                 Err(why) => {
                     return Some(Err(format!(
                         "Not allowed: {why}, so this can't be checked against them. It's the person's to answer."
                     )))
                 }
-            }
-        }
+            },
+            _ => (sent, false),
+        };
         // Its account is its history there and what Desk sees inside it,
         // asked at once.
         let inside = async {
@@ -1145,7 +1148,13 @@ impl CrewTool {
                 );
                 match a.status {
                     super::served::ServedStatus::Refused => {
-                        Err(super::relay::older(machine, name, &a).unwrap_or(said))
+                        let why = super::relay::older(machine, name, &a).unwrap_or(said);
+                        Err(match unheld {
+                            true => format!(
+                                "{why} Your sessions hold too many jobs that can't be undone to send with it, so {machine} couldn't check it against them. It's the person's to answer."
+                            ),
+                            false => why,
+                        })
                     }
                     super::served::ServedStatus::Ok if cited => {
                         Ok(json!({ "done": said, "note": uncited }))

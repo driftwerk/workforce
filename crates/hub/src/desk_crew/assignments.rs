@@ -77,24 +77,28 @@ const JOB_EXAMPLE: &str =
 pub(super) const HELD_JOBS: &str = "held_jobs";
 
 /// `input` carrying the jobs `held` in `field`, for `machine` to compare a
-/// request with (R5), when they fit in its call (`carries`); else as it
-/// is, and the machine leaves a request that can't be undone to the person,
-/// as when the jobs couldn't be read.
+/// request with (R5), when they fit in its call (`carries`); else `Err`
+/// with it as it is, and the machine leaves a request that can't be undone
+/// to the person, as when the jobs couldn't be read. All or none: a
+/// request's repository is known only there, and a job whose repository
+/// isn't known conflicts with every request, so no part of them is safe
+/// to leave out.
 pub(super) fn with_held(
     mut input: Value,
     field: &str,
     held: &[Assignment],
     machine: &str,
     carries: impl FnOnce(&Value) -> bool,
-) -> Value {
+) -> Result<Value, Value> {
     input[field] = json!(held);
-    if !carries(&input) {
-        tracing::warn!(%machine, held = held.len(), "the jobs a boss holds don't fit in its call to a machine: sent without them, so the machine leaves what can't be undone to the person");
-        if let Some(o) = input.as_object_mut() {
-            o.remove(field);
-        }
+    if carries(&input) {
+        return Ok(input);
     }
-    input
+    tracing::warn!(%machine, held = held.len(), "the jobs a boss holds don't fit in its call to a machine: sent without them, so the machine leaves what can't be undone to the person");
+    if let Some(o) = input.as_object_mut() {
+        o.remove(field);
+    }
+    Err(input)
 }
 
 /// What a boss's order says of the job it hands out: the job it declares,
@@ -2202,12 +2206,12 @@ mod tests {
             .collect();
         let input = json!({"decideId": "d", "text": "ALLOW: Sam ordered it"});
         let fits = |most: usize| move |v: &Value| v.to_string().len() <= most;
-        let with = with_held(input.clone(), "heldJobs", &held, "devbox", fits(usize::MAX));
+        let with = with_held(input.clone(), "heldJobs", &held, "devbox", fits(usize::MAX)).unwrap();
         assert_eq!(with["text"], input["text"]);
         let read: Vec<Assignment> = serde_json::from_value(with["heldJobs"].clone()).unwrap();
         assert_eq!(read, held);
         let without = with_held(input.clone(), "heldJobs", &held, "devbox", fits(200));
-        assert_eq!(without, input, "sent, without them");
+        assert_eq!(without, Err(input), "sent, without them");
     }
 
     #[test]

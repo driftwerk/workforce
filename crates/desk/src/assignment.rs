@@ -186,12 +186,58 @@ impl Assignment {
 
     /// It as a machine compares a request with it (R5): what it is, who
     /// holds it, and of its text only what [`Self::about`] reads, so a boss
-    /// holding many long briefs still fits in a call to the machine.
+    /// holding many long briefs still fits in a call to the machine. Each
+    /// field is named, so one added is decided here: kept when R5 or
+    /// `about` reads it, else cleared.
     pub fn compared(self) -> Self {
+        let Self {
+            id,
+            boss,
+            session,
+            machine,
+            text,
+            job,
+            job_key,
+            targets,
+            irreversible,
+            urgent,
+            claims,
+            state,
+            sent_at,
+            delivered_at,
+            acked_at,
+            closed_at,
+            line_message: _,
+            repo: _,
+            closed_by: _,
+            closed_why: _,
+            replaces: _,
+            turn: _,
+            item: _,
+            stand_down: _,
+            answer: _,
+            action: _,
+            basis: _,
+        } = self;
         Self {
-            text: crate::crew::one_line_read(&self.text, ABOUT_CHARS).to_string(),
+            id,
+            boss,
+            session,
+            machine,
             line_message: None,
+            text: crate::crew::one_line_read(&text, ABOUT_CHARS).to_string(),
+            job,
+            job_key,
             repo: None,
+            targets,
+            irreversible,
+            urgent,
+            claims,
+            state,
+            sent_at,
+            delivered_at,
+            acked_at,
+            closed_at,
             closed_by: None,
             closed_why: None,
             replaces: None,
@@ -201,7 +247,6 @@ impl Assignment {
             answer: None,
             action: None,
             basis: None,
-            ..self
         }
     }
 

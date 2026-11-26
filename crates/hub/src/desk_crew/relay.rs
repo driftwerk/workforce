@@ -119,9 +119,11 @@ impl RelayCall {
         }
     }
 
-    /// Whether it is small enough to carry ([`MOST_CALL`]).
+    /// Whether it is small enough to carry ([`MOST_CALL`]), however long is
+    /// left to wait for it when it is taken ([`Ticketed::left`]).
     fn carried(&self) -> bool {
-        serde_json::to_vec(self).is_ok_and(|b| b.len() <= MOST_CALL)
+        let most_left = u64::MAX.to_string().len() - self.left_ms.to_string().len();
+        serde_json::to_vec(self).is_ok_and(|b| b.len() + most_left <= MOST_CALL)
     }
 }
 

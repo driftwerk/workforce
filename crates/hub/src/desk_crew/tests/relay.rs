@@ -720,13 +720,18 @@ async fn a_job_held_here_or_on_a_machine_is_one_job_and_an_approval_there_carrie
                         if !takes.contains(&c.tool.as_str()) {
                             seen.lock().push(c.clone());
                         }
-                        crew.relay_answer(
-                            c.id,
-                            RelayAnswer {
+                        // Devbox, without the jobs held here: the person's.
+                        let answer = match c.tool == "crew.approve" && c.input.get("held_jobs").is_none() {
+                            true => RelayAnswer {
+                                status: ServedStatus::Refused,
+                                body: json!({"error": "Not allowed: its home didn't say which jobs its sessions hold, and this looks like it can't be taken back."}),
+                            },
+                            false => RelayAnswer {
                                 status: ServedStatus::Ok,
                                 body: json!({"done": "told it"}),
                             },
-                        );
+                        };
+                        crew.relay_answer(c.id, answer);
                     }
                 }
             })
@@ -815,9 +820,6 @@ async fn a_job_held_here_or_on_a_machine_is_one_job_and_an_approval_there_carrie
             .collect();
         assert!(held.contains(&"acme/api/release/4".to_string()), "{held:?}");
         assert!(held.contains(&"acme/api/release/5".to_string()), "{held:?}");
-        poller.abort();
-
-        // Left being sent: kept, as it carries no line message here.
         let machine = d
             .store()
             .assignments_of("desk", true)
@@ -826,6 +828,38 @@ async fn a_job_held_here_or_on_a_machine_is_one_job_and_an_approval_there_carrie
             .into_iter()
             .find(|a| a.machine.is_some())
             .unwrap();
+
+        // More held here than the call carries: sent without them, and
+        // devbox's refusal says why.
+        let more = super::relayed_decide::holding(
+            &d,
+            sarah.agent_id.as_str(),
+            500,
+            "Dispatch release 6 now.",
+            12,
+        )
+        .await;
+        assert!(super::relayed_decide::too_many(&more));
+        let r = tool("crew.approve")
+            .execute(json!({"session_id": format!("devbox/{remote}"),
+                            "approval_id": uuid::Uuid::new_v4().to_string(), "reason": "Ok."}))
+            .await
+            .unwrap();
+        let why = r.error.unwrap_or_default();
+        assert!(
+            why.contains("Your sessions hold too many jobs that can't be undone to send with it, so devbox couldn't check it against them. It's the person's to answer."),
+            "{why}"
+        );
+        let sent = seen
+            .lock()
+            .iter()
+            .rfind(|c| c.tool == "crew.approve")
+            .cloned()
+            .unwrap();
+        assert!(sent.input.get("held_jobs").is_none(), "{}", sent.input);
+        poller.abort();
+
+        // Left being sent: kept, as it carries no line message here.
         raw.get()
             .await
             .unwrap()
