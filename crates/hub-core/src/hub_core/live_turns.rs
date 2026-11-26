@@ -436,15 +436,28 @@ impl LiveTurns {
         ))
     }
 
-    /// Steer the live turn for `session_id`. A stop resolves once the turn has
-    /// settled. A follow-up from another Desk place than the turn's is
-    /// refused as [`Applied::Busy`], so two threads' asks never merge into
-    /// one turn, and so is one sent to queue, which waits for the turn.
     /// Whether a turn is live for `session_id` on this instance.
     pub fn running(&self, session_id: &str) -> bool {
         self.turns.lock().contains_key(session_id)
     }
 
+    /// Once the turn live now for `session_id` on this instance ends: at
+    /// once when none is.
+    pub async fn ended(&self, session_id: &str) {
+        let settled = self
+            .turns
+            .lock()
+            .get(session_id)
+            .map(|entry| entry.settled.clone());
+        if let Some(settled) = settled {
+            settled.cancelled().await;
+        }
+    }
+
+    /// Steer the live turn for `session_id`. A stop resolves once the turn has
+    /// settled. A follow-up from another Desk place than the turn's is
+    /// refused as [`Applied::Busy`], so two threads' asks never merge into
+    /// one turn, and so is one sent to queue, which waits for the turn.
     pub async fn apply(&self, session_id: &str, control: Control) -> Applied {
         let Some(entry) = self.turns.lock().get(session_id).cloned() else {
             return Applied::NotLive;
@@ -773,6 +786,25 @@ mod tests {
             .begin("s1", SelfServe::Answerable, None, None)
             .await
             .is_ok());
+    }
+
+    #[tokio::test]
+    async fn ended_waits_for_the_live_turn_to_let_go() {
+        let turns = LiveTurns::new("allan");
+        turns.ended("s1").await;
+        let (turn, _inbox) = begin(&turns, "s1").await;
+        let waiting = tokio::spawn({
+            let turns = Arc::clone(&turns);
+            async move { turns.ended("s1").await }
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!waiting.is_finished(), "a live turn holds it");
+        drop(turn);
+        tokio::time::timeout(Duration::from_secs(1), waiting)
+            .await
+            .expect("the dropped turn lets it go")
+            .unwrap();
+        assert!(!turns.running("s1"));
     }
 
     #[tokio::test]

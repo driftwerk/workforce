@@ -1185,57 +1185,170 @@ async fn a_short_agreement_counts_only_after_the_bosss_last_message() {
     .await;
 }
 
-/// A click that lands while a turn runs in the boss's DM can't reach it:
-/// the item is open again and the person is told to answer it again.
+/// `text` asked of the person with buttons by `boss`: its item.
+async fn asked_with_buttons(
+    boss: &AgentService,
+    d: &workforce_desk::Desk,
+    text: &str,
+) -> uuid::Uuid {
+    let r = run(
+        boss,
+        "crew.ask_person",
+        json!({ "text": text, "options": ["Merge", "Hold"] }),
+    )
+    .await;
+    assert!(r.success, "{r:?}");
+    d.store()
+        .items_not_closed(Some("desk"))
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|i| i.text == text)
+        .unwrap()
+        .id
+}
+
+/// The person's `answer` to `asked` as it reaches `boss` in its DM.
+fn answer_said(asked: &str, answer: &str) -> String {
+    format!("{}{asked}”: {answer}", workforce_desk::goal::ANSWER_LEAD)
+}
+
+/// Whether `said`, the person's, is in `boss`'s DM.
+fn in_dm(boss: &AgentService, said: &str) -> bool {
+    boss.sessions
+        .find(DESK_CHANNEL, PERSON)
+        .unwrap()
+        .is_some_and(|s| {
+            s.messages.iter().any(|m| {
+                m.role == workforce_common::session::MessageRole::User && m.content.contains(said)
+            })
+        })
+}
+
+/// Whether the person was told an answer to `asked` bounced.
+fn bounced(boss: &AgentService, asked: &str) -> bool {
+    posted(boss, &format!("Your answer to “{asked}” didn't reach")) > 0
+}
+
+/// The boss's DM with the person, once it is there and free.
+async fn free_dm(boss: &AgentService) -> String {
+    dm_idle(boss).await;
+    boss.sessions
+        .find(DESK_CHANNEL, PERSON)
+        .unwrap()
+        .unwrap()
+        .id
+}
+
+/// Clicks that land while a turn that can't take them in runs in the
+/// boss's DM wait for it: each item stays answered, nothing bounces back,
+/// and every answer reaches the boss once the turn ends.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_click_the_boss_cant_take_reopens_its_item_and_says_so() {
+async fn clicks_while_the_boss_is_mid_turn_all_reach_it_once_the_turn_ends() {
     with_test_pool(workforce_desk::store::build_pool, |pool| async move {
         use workforce_desk::open_item::OpenState;
         let dir = tempfile::tempdir().unwrap();
         let base = std::fs::canonicalize(dir.path()).unwrap();
         let gh = github().await;
         let (overseer, crew, d, _llm) = boss_on(&base, pool, ACTS, &gh).await;
-        let r = run(
-            &overseer,
-            "crew.ask_person",
-            json!({ "text": "Shall I merge the docs fix?", "options": ["Merge", "Hold"] }),
-        )
-        .await;
-        assert!(r.success, "{r:?}");
-        let item = d
-            .store()
-            .items_not_closed(Some("desk"))
-            .await
-            .unwrap()
-            .into_iter()
-            .find(|i| i.text == "Shall I merge the docs fix?")
-            .unwrap()
-            .id;
-        let dm = overseer
-            .sessions
-            .find(DESK_CHANNEL, PERSON)
-            .unwrap()
-            .unwrap();
-        let running = overseer
-            .begin_live_turn(
-                &dm.id,
-                workforce_agent::tools::approval::SelfServe::answerable_if(false),
-                None,
-            )
-            .await
-            .unwrap();
-        assert_eq!(crew.answer_item(item, "Merge").await.unwrap(), "Answered.");
-        eventually("the item open again", async || {
-            let i = d.store().open_item(item).await.unwrap()?;
-            (i.state == OpenState::Open).then_some(())
-        })
-        .await;
-        eventually("the person told", async || {
-            (posted(&overseer, "didn't reach") > 0).then_some(())
-        })
-        .await;
-        assert!(posted(&overseer, "so it is still open: answer it again") > 0);
+        let asks = [
+            "Shall I merge the docs fix?",
+            "Shall I merge the guide fix?",
+        ];
+        let mut items = Vec::new();
+        for ask in asks {
+            items.push(asked_with_buttons(&overseer, &d, ask).await);
+        }
+        let dm = free_dm(&overseer).await;
+        let (running, _) = hold_session(&overseer, &dm).await;
+        for item in &items {
+            assert_eq!(crew.answer_item(*item, "Merge").await.unwrap(), "Answered.");
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        for (ask, item) in asks.iter().zip(&items) {
+            assert!(
+                !in_dm(&overseer, &answer_said(ask, "Merge")),
+                "held behind the running turn"
+            );
+            let i = d.store().open_item(*item).await.unwrap().unwrap();
+            assert_eq!(i.state, OpenState::Closed);
+        }
         drop(running);
+        for ask in asks {
+            eventually("the answer reaches the boss", async || {
+                in_dm(&overseer, &answer_said(ask, "Merge")).then_some(())
+            })
+            .await;
+        }
+        dm_idle(&overseer).await;
+        for (ask, item) in asks.iter().zip(&items) {
+            let i = d.store().open_item(*item).await.unwrap().unwrap();
+            assert_eq!(i.state, OpenState::Closed);
+            assert!(!bounced(&overseer, ask));
+        }
+    })
+    .await;
+}
+
+/// Clicks that land while a turn that takes follow-ups runs in the boss's
+/// DM join it, as the person's typed words do: all of them in that one
+/// turn, and a click then "hold off" reach the boss in that order.
+#[tokio::test(flavor = "multi_thread")]
+async fn clicks_while_the_boss_is_mid_turn_join_that_turn_in_the_order_given() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        use crate::hub_core::live_turns::Control;
+        use workforce_agent::runner::InjectedMessage;
+        let dir = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(dir.path()).unwrap();
+        let gh = github().await;
+        let (overseer, crew, d, _llm) = boss_on(&base, pool, ACTS, &gh).await;
+        let asks = [
+            "Shall I merge the docs fix?",
+            "Shall I merge the guide fix?",
+        ];
+        let mut items = Vec::new();
+        for ask in asks {
+            items.push(asked_with_buttons(&overseer, &d, ask).await);
+        }
+        let dm = free_dm(&overseer).await;
+        let (_running, mut inbox) = hold_session(&overseer, &dm).await;
+        for item in &items {
+            assert_eq!(crew.answer_item(*item, "Merge").await.unwrap(), "Answered.");
+        }
+        let typed = InjectedMessage::UserMessage {
+            text: "actually, hold off".into(),
+            user: PERSON.into(),
+            external_id: None,
+        };
+        let follow_up = Control::FollowUp {
+            message: typed,
+            place: Some(workforce_common::channels::desk::DeskPlace::Dm { thread: None }),
+            queue: false,
+        };
+        let said = |m: Option<InjectedMessage>| match m {
+            Some(InjectedMessage::UserMessage { text, .. }) => text,
+            other => panic!("not the person's words: {other:?}"),
+        };
+        let mut heard = Vec::new();
+        for _ in asks {
+            heard.push(said(
+                tokio::time::timeout(Duration::from_secs(10), inbox.rx.recv())
+                    .await
+                    .unwrap(),
+            ));
+        }
+        heard.sort();
+        assert!(overseer.live_turns.apply(&dm, follow_up).await.applied());
+        heard.push(said(inbox.rx.recv().await));
+        assert_eq!(
+            heard,
+            [
+                answer_said(asks[0], "Merge"),
+                answer_said(asks[1], "Merge"),
+                "actually, hold off".to_string()
+            ]
+        );
+        assert!(asks.iter().all(|ask| !bounced(&overseer, ask)));
     })
     .await;
 }

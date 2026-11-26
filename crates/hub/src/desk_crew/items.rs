@@ -22,8 +22,8 @@
 //! for a day. Needs-you posts go out at once: never through the check-in
 //! budget or the watcher's held lines.
 
-use std::collections::HashMap;
-use std::sync::Arc;
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, LazyLock};
 
 use chrono::{DateTime, Utc};
 use serde_json::{json, Value};
@@ -75,6 +75,31 @@ pub const OPEN_DESCRIPTION: &str = "What you owe the person now (\"what's open?\
 
 /// A promise to report back what a session says to a status question.
 const REPLIED: &str = "replied";
+
+/// When this process's first crew started: an answer given before it was
+/// given to the process before, the only one that could have lost it.
+static STARTED: LazyLock<DateTime<Utc>> = LazyLock::new(Utc::now);
+
+/// The person's answers on their way to their bosses in this process, by
+/// [`answer_id`]: never taken for lost while they are.
+static DELIVERING: LazyLock<parking_lot::Mutex<HashSet<Uuid>>> = LazyLock::new(Default::default);
+
+/// Holds an answer in [`DELIVERING`] while it lives.
+struct Delivering(Uuid);
+
+impl Delivering {
+    fn begin(item: &OpenItem) -> Self {
+        let id = answer_id(item);
+        DELIVERING.lock().insert(id);
+        Self(id)
+    }
+}
+
+impl Drop for Delivering {
+    fn drop(&mut self) {
+        DELIVERING.lock().remove(&self.0);
+    }
+}
 
 /// What such a promise says before what it reports.
 const REPORT_BACK: &str = "Report back ";
@@ -1475,22 +1500,154 @@ impl CrewHub {
         let Some(owner) = self.person(Some(&service)) else {
             return Ok("Answered.".into());
         };
-        let message = format!(
-            "{}{}”: {answer}",
-            workforce_desk::goal::ANSWER_LEAD,
-            closed.text
-        );
         let crew = self.me();
+        let answer = answer.to_string();
+        let held = (
+            crate::shutdown::Settling::begin(),
+            Delivering::begin(&closed),
+        );
         tokio::spawn(async move {
-            if let Err(e) = crew
-                .run_dm_turn(&service, &owner, &message, 0, None, Some(Speaker::you()))
-                .await
-            {
-                tracing::warn!(agent_id = %service.agent_id, error = %e, "the person's answer didn't reach the boss");
-                crew.answer_lost(&service, &owner, &closed).await;
-            }
+            let _held = held;
+            crew.answer_delivered(&service, &owner, &closed, &answer)
+                .await;
         });
         Ok("Answered.".into())
+    }
+
+    /// The person's `answer` to `closed` goes to its boss as their message:
+    /// into the turn running in its DM, as their follow-ups do, else as the
+    /// DM's next turn once any other turn there lets go, and is noted on
+    /// the item as delivered (a turn of its own, once it has kept it). One already in the DM, before the offer or
+    /// after it (taken in by a turn whose reply was late), isn't said again. One that can't get there is
+    /// [`Self::answer_lost`]; one settled meanwhile goes no further.
+    pub(super) async fn answer_delivered(
+        &self,
+        service: &Arc<crate::serve::AgentService>,
+        owner: &str,
+        closed: &OpenItem,
+        answer: &str,
+    ) {
+        let message = answer_message(closed, answer);
+        let (me, message) = (self, message.as_str());
+        let delivered = self
+            .run_dm_turn_queued(service, owner, move || async move {
+                if !me.still_owed(closed).await {
+                    return Ok(false);
+                }
+                let held = || reached(service, owner, closed, answer).unwrap_or(false);
+                if held() || me.offered(service, owner, closed, message).await || held() {
+                    return Ok(true);
+                }
+                let (asked, kept) = tokio::sync::oneshot::channel();
+                let turn = super::deliver::told_when_asked(
+                    asked,
+                    me.run_dm_turn(service, owner, message, 0, None, Some(Speaker::you())),
+                );
+                let noted = async {
+                    if kept.await.is_ok() {
+                        me.noted_delivered(closed).await;
+                    }
+                };
+                tokio::join!(turn, noted).0.map(|_| true)
+            })
+            .await;
+        match delivered {
+            Ok(true) => self.noted_delivered(closed).await,
+            Err(e) if !super::deliver::stopped(&e) => {
+                tracing::warn!(agent_id = %service.agent_id, error = %e, "the person's answer didn't reach the boss");
+                self.answer_lost(service, owner, closed).await;
+            }
+            Ok(false) | Err(_) => {}
+        }
+    }
+
+    /// Notes on `closed` that the person's answer to it reached its boss.
+    async fn noted_delivered(&self, closed: &OpenItem) {
+        if let Err(e) = self.desk.store().item_delivered(closed.id).await {
+            tracing::warn!(item = %closed.id, error = %format!("{e:#}"), "noting an answer reached its boss failed");
+        }
+    }
+
+    /// Offers `message`, the person's answer to `closed`, to the turn running
+    /// in `service`'s DM with `owner`, as a follow-up they type there is,
+    /// under the answer's own id: whether it took it in.
+    async fn offered(
+        &self,
+        service: &crate::serve::AgentService,
+        owner: &str,
+        closed: &OpenItem,
+        message: &str,
+    ) -> bool {
+        let Some(dm) = service.sessions.find(DESK_CHANNEL, owner).ok().flatten() else {
+            return false;
+        };
+        let follow_up = workforce_nats::chat::TurnControl::FollowUp {
+            text: message.to_string(),
+            user: owner.to_string(),
+            place: Some(DeskPlace::Dm { thread: None }),
+            queue: false,
+            id: Some(answer_id(closed).to_string()),
+        };
+        let taken = crate::gateway::steer(service.nats().as_ref(), service, &dm.id, follow_up)
+            .await
+            .applied();
+        if taken {
+            self.picture_person_told(service.agent_id.as_str(), message);
+        }
+        taken
+    }
+
+    /// Whether the person's answer `closed` still waits for its boss: the
+    /// item stands as it was closed with it, then, and nothing it proposed
+    /// was applied since. What can't be read is taken to wait.
+    async fn still_owed(&self, closed: &OpenItem) -> bool {
+        let store = self.desk.store();
+        let stands = store.open_item(closed.id).await.map_or(true, |now| {
+            now.is_some_and(|i| {
+                i.state == OpenState::Closed
+                    && i.closed_why == closed.closed_why
+                    && i.closed_at == closed.closed_at
+            })
+        });
+        stands && !store.item_applied(closed.id).await.unwrap_or(false)
+    }
+
+    /// The person's answers given before `before` (this process's start),
+    /// within the longest an answer waits for its boss, that never reached
+    /// it: the hub stopped while they waited. Each is [`Self::answer_lost`].
+    pub(super) async fn answers_lost_before(&self, before: DateTime<Utc>) {
+        let since = before - chrono::Duration::from_std(self.mind_wait_max()).unwrap_or_default();
+        let answered = match self
+            .desk
+            .store()
+            .items_answered_between(since, before)
+            .await
+        {
+            Ok(answered) => answered,
+            Err(e) => {
+                tracing::warn!(error = %format!("{e:#}"), "reading the person's answers at start failed");
+                return;
+            }
+        };
+        let lost: Vec<_> = answered
+            .into_iter()
+            .filter_map(|item| {
+                let answer = item
+                    .closed_why
+                    .as_deref()?
+                    .strip_prefix(workforce_desk::goal::YOU_ANSWERED)?
+                    .to_string();
+                let (service, _) = self.overseer_named(&item.boss)?;
+                let owner = self.person(Some(&service))?;
+                (goes_to_boss(&item, &answer)
+                    && !DELIVERING.lock().contains(&answer_id(&item))
+                    && !reached(&service, &owner, &item, &answer).unwrap_or(true))
+                .then_some((service, owner, item))
+            })
+            .collect();
+        for (service, owner, item) in lost {
+            self.answer_lost(&service, &owner, &item).await;
+        }
     }
 
     /// The person's answer to `closed` didn't reach its boss: never lost,
@@ -1501,6 +1658,10 @@ impl CrewHub {
         owner: &str,
         closed: &OpenItem,
     ) {
+        if !self.still_owed(closed).await {
+            tracing::info!(item = %closed.id, "an answer that didn't reach its boss was settled meanwhile");
+            return;
+        }
         let reopened = self
             .desk
             .store()
@@ -2071,7 +2232,9 @@ pub(super) fn items_loop(
     cancel: CancellationToken,
 ) -> impl std::future::Future<Output = ()> {
     let mut events = crew.desk.events();
+    let started = *STARTED;
     async move {
+        crew.answers_lost_before(started).await;
         let mut every = tokio::time::interval(crew.timing.minute);
         every.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let sweep_after = chrono::Duration::from_std(crew.timing.minute)
@@ -2106,6 +2269,52 @@ pub(super) fn items_loop(
             }
         }
     }
+}
+
+/// The person's `answer` to `item` as it is said to its boss in their DM.
+fn answer_message(item: &OpenItem, answer: &str) -> String {
+    format!(
+        "{}{}”: {answer}",
+        workforce_desk::goal::ANSWER_LEAD,
+        item.text
+    )
+}
+
+/// Whether the person's `answer` to `item` is for its boss: not a session's
+/// wait or question it goes to, nor a preference it keeps or forgets.
+fn goes_to_boss(item: &OpenItem, answer: &str) -> bool {
+    !waiting::is_waiting(&item.dedupe_key)
+        && item.line_message.is_none()
+        && super::preferences::overrule_of(item, answer).is_none()
+}
+
+/// The id the person's answer to `item` is said to its boss under: the
+/// same for each try at it, and new each time the item is answered.
+pub(super) fn answer_id(item: &OpenItem) -> Uuid {
+    let at = item.closed_at.map_or(0, |at| at.timestamp_micros());
+    Uuid::new_v5(&item.id, &at.to_be_bytes())
+}
+
+/// Whether the person's `answer` to `item` is in `service`'s DM with
+/// `owner` since they gave it: under its [`answer_id`], or in its words.
+fn reached(
+    service: &crate::serve::AgentService,
+    owner: &str,
+    item: &OpenItem,
+    answer: &str,
+) -> eyre::Result<bool> {
+    let (id, said) = (answer_id(item).to_string(), answer_message(item, answer));
+    Ok(service
+        .sessions
+        .find(DESK_CHANNEL, owner)?
+        .is_some_and(|dm| {
+            dm.messages.iter().any(|m| {
+                m.role == workforce_common::session::MessageRole::User
+                    && (m.external_id.as_deref() == Some(id.as_str())
+                        || (item.closed_at.is_none_or(|at| m.timestamp >= at)
+                            && m.content.contains(&said)))
+            })
+        }))
 }
 
 /// Whether `message` to a session only asks it something: it opens with a
@@ -2221,6 +2430,7 @@ mod tests {
                     cant_decide: None,
                     due_at: None,
                     chased_at: None,
+                    delivered_at: None,
                 }
             })
             .collect();
@@ -2272,6 +2482,7 @@ mod tests {
             cant_decide: None,
             due_at: None,
             chased_at: None,
+            delivered_at: None,
         }
     }
 

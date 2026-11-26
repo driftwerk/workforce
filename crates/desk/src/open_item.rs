@@ -169,6 +169,9 @@ pub struct OpenItem {
     /// When its boss was told to go and get it itself.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub chased_at: Option<DateTime<Utc>>,
+    /// When the person's answer on its buttons reached its boss.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivered_at: Option<DateTime<Utc>>,
 }
 
 /// An item to open (or, when one with its key is open, to update).
@@ -847,6 +850,7 @@ mod tests {
             cant_decide: None,
             due_at: None,
             chased_at: None,
+            delivered_at: None,
         }
     }
 

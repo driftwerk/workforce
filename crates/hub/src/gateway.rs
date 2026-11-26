@@ -1673,14 +1673,15 @@ fn asked_already(service: &AgentService, session_id: &str, id: &str) -> bool {
 /// join it or wait for it. Attachments never join one (an injected message
 /// is text-only), unless sent to queue. An edit never joins or waits on a
 /// live turn: it starts its own, which a live one refuses busy, so it can't
-/// set aside a reply still being written.
+/// set aside a reply still being written. Nor does another agent's hand-off:
+/// a live turn keeps what joins it as the person's.
 fn steers(
     desk: Option<&workforce_common::channels::desk::DeskTurnContext>,
     has_attachments: bool,
     queued: bool,
 ) -> bool {
-    let edits = desk.is_some_and(|d| d.turn.edit.is_some());
-    !edits && (!has_attachments || queued)
+    let own_turn = desk.is_none_or(|d| d.turn.edit.is_none() && !d.turn.is_hand_off());
+    own_turn && (!has_attachments || queued)
 }
 
 /// What a declared Desk connection is offered, on its `connected`. The hub
@@ -1989,12 +1990,13 @@ mod desk_frame_tests {
     }
 
     #[test]
-    fn an_edit_is_never_steered_into_a_live_turn_nor_queued_for_one() {
-        use workforce_common::channels::desk::{DeskEdit, DeskTurnContext};
-        let context = |edit: Option<DeskEdit>| {
+    fn an_edit_or_a_hand_off_is_never_steered_into_a_live_turn_nor_queued_for_one() {
+        use workforce_common::channels::desk::{DeskEdit, DeskSpeaker, DeskTurnContext};
+        let with = |edit: Option<DeskEdit>, speaker: DeskSpeaker| {
             DeskTurnContext::new(
                 DeskTurn {
                     edit,
+                    speaker,
                     ..DeskTurn::legacy("desk").unwrap()
                 },
                 "desk",
@@ -2004,15 +2006,26 @@ mod desk_frame_tests {
                 "reply-1".into(),
             )
         };
+        let context = |edit: Option<DeskEdit>| with(edit, DeskSpeaker::Person);
         let plain = context(None);
         let edit = context(Some(DeskEdit {
             replaces: "m-1".into(),
         }));
+        let hand_off = with(
+            None,
+            DeskSpeaker::Agent {
+                name: "Scout".into(),
+            },
+        );
         assert!(steers(Some(&plain), false, false));
         assert!(steers(None, true, true));
         assert!(!steers(None, true, false), "files never join a live turn");
         for (files, queued) in [(false, false), (false, true), (true, true)] {
             assert!(!steers(Some(&edit), files, queued));
+            assert!(
+                !steers(Some(&hand_off), files, queued),
+                "kept as the person's"
+            );
         }
         // Outside the DM it never gets this far.
         assert_eq!(

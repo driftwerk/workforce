@@ -343,6 +343,7 @@ mod tests {
             cant_decide: None,
             due_at: None,
             chased_at: None,
+            delivered_at: None,
         }
     }
 

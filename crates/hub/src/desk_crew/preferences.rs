@@ -725,12 +725,7 @@ impl CrewHub {
         closed: &OpenItem,
         answer: &str,
     ) -> Option<String> {
-        let pref: Uuid = closed.dedupe_key.strip_prefix(OVERRULED)?.parse().ok()?;
-        let state = match answer.trim() {
-            a if a.eq_ignore_ascii_case(KEEP_IT) => PrefState::Active,
-            a if a.eq_ignore_ascii_case(FORGET_IT) => PrefState::Retired,
-            _ => return None,
-        };
+        let (pref, state) = overrule_of(closed, answer)?;
         match self.desk.store().preference_set_state(pref, state).await {
             Ok(Some(p)) => Some(match state {
                 PrefState::Active => format!("Kept: when {}, {}.", p.when_text, p.then_text),
@@ -807,6 +802,19 @@ impl CrewHub {
 pub(crate) struct PrefsContext {
     pub listed: String,
     pub how: String,
+}
+
+/// The preference `answer` keeps or forgets, when `closed` asks whether to
+/// change one the person undid ("Should I change that preference?"), and
+/// how; none for any other item or answer.
+pub(super) fn overrule_of(closed: &OpenItem, answer: &str) -> Option<(Uuid, PrefState)> {
+    let pref = closed.dedupe_key.strip_prefix(OVERRULED)?.parse().ok()?;
+    let state = match answer.trim() {
+        a if a.eq_ignore_ascii_case(KEEP_IT) => PrefState::Active,
+        a if a.eq_ignore_ascii_case(FORGET_IT) => PrefState::Retired,
+        _ => return None,
+    };
+    Some((pref, state))
 }
 
 #[cfg(test)]

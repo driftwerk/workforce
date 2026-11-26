@@ -267,7 +267,7 @@ impl CrewHub {
     ) -> impl Future<Output = F::Output> + 'a {
         let f = Box::pin(f);
         async move {
-            let wait = *self.minds.wait_max.lock();
+            let wait = self.mind_wait_max();
             match self.mind_held(boss, what, wait, f).await {
                 Ok(out) => out,
                 Err(f) => {
@@ -455,6 +455,12 @@ impl CrewHub {
     /// [`PERSON_YIELD`]).
     pub(super) fn mind_may_start(&self, boss: &str, due: Instant) -> bool {
         self.mind_free(boss) || (due.elapsed() >= STARVE && !self.minds.person_running(boss))
+    }
+
+    /// The longest anything waits for a boss's mind: [`WAIT_MAX`], shorter
+    /// in tests.
+    pub(super) fn mind_wait_max(&self) -> Duration {
+        *self.minds.wait_max.lock()
     }
 
     /// What `boss`'s mind is doing, while held.
