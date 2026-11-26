@@ -1252,7 +1252,13 @@ async fn a_click_while_the_boss_is_mid_turn_reaches_it_once_the_turn_ends() {
             d.store().open_item(item).await.unwrap().unwrap().state,
             OpenState::Closed
         );
-        assert_eq!(posted(&overseer, "didn't reach"), 0);
+        assert_eq!(
+            posted(
+                &overseer,
+                "Your answer to “Shall I merge the docs fix?” didn't reach"
+            ),
+            0
+        );
     })
     .await;
 }
