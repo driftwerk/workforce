@@ -773,37 +773,40 @@ async fn a_codex_session_that_ended_asking_starts_again_in_new_permissions() {
         let (d, s) = started_with(pool, &dir, true).await;
         d.change(s.id, |r, _| r.state = SessionState::Asking);
         let told = Arc::new(parking_lot::Mutex::new(None));
-        let (asked, _) = started_again(
-            &d,
-            &dir,
-            &[json!({"thread": {"id": "t1"}})],
-            {
-                let told = told.clone();
-                move |d| async move {
-                    taken_on(&d, s.id).await;
-                    let answer = d
-                        .line_send(
-                            super::line::Sender::Overseer(By::manager("crew", "Crew", "go on")),
-                            crate::line::Send::Tell {
-                                to: crate::line::Target::Session(s.id),
-                                text: "yes, use the staging database".into(),
-                                when: crate::line::When::Queue,
-                            },
-                        )
-                        .await
-                        .unwrap();
-                    // Held while in the old ones, or not yet up in the new.
-                    let view = d.view(s.id).unwrap();
-                    assert!(
-                        d.line_gate(&view, &answer) == Some(crate::line::Wait::Restarting)
-                            || view.state == SessionState::Starting,
-                        "held for the restart"
-                    );
-                    *told.lock() = Some(answer);
-                    Ok(())
-                }
-            },
-        )
+        let (asked, _) = started_again(&d, &dir, &[json!({"thread": {"id": "t1"}})], {
+            let told = told.clone();
+            move |d| async move {
+                taken_on(&d, s.id).await;
+                let answer = d
+                    .line_send(
+                        super::line::Sender::Overseer(By::manager("crew", "Crew", "go on")),
+                        crate::line::Send::Tell {
+                            to: crate::line::Target::Session(s.id),
+                            text: "yes, use the staging database".into(),
+                            when: crate::line::When::Queue,
+                        },
+                    )
+                    .await
+                    .unwrap();
+                // Held while it runs in the old ones; never read by
+                // them once they are ended for the new.
+                let view = d.view(s.id).unwrap();
+                let ended =
+                    d.0.state
+                        .lock()
+                        .live
+                        .get(&s.id)
+                        .is_none_or(|l| l._codex.is_none());
+                assert!(
+                    d.line_gate(&view, &answer) == Some(crate::line::Wait::Restarting)
+                        || view.state == SessionState::Starting
+                        || ended,
+                    "held for the restart"
+                );
+                *told.lock() = Some(answer);
+                Ok(())
+            }
+        })
         .await;
         assert_eq!(asked, [in_mode(&dir, "on-request", "workspace-write")]);
         until(|| tui_starts(&dir).len() == 2).await;
