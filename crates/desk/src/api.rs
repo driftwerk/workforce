@@ -84,48 +84,47 @@ pub const GRANT_TOO_LONG: &str = "grant_too_long";
 
 impl IntoResponse for DeskError {
     fn into_response(self) -> Response {
-        let status = match &self {
-            DeskError::NotFound => StatusCode::NOT_FOUND,
-            DeskError::Conflict(_) => StatusCode::CONFLICT,
-            DeskError::CrossesBoss => {
-                return (
+        let status =
+            match &self {
+                DeskError::NotFound => StatusCode::NOT_FOUND,
+                DeskError::Conflict(_) => StatusCode::CONFLICT,
+                DeskError::CrossesBoss => {
+                    return (
+                        StatusCode::CONFLICT,
+                        Json(json!({ "error": self.to_string(), "code": CROSSES_BOSS })),
+                    )
+                        .into_response()
+                }
+                DeskError::NotHeld(_) => {
+                    return (
+                        StatusCode::CONFLICT,
+                        Json(json!({ "error": self.to_string(), "code": crate::grant::NOT_HELD })),
+                    )
+                        .into_response()
+                }
+                DeskError::WorktreeTaken { why, holder } => return (
                     StatusCode::CONFLICT,
-                    Json(json!({ "error": self.to_string(), "code": CROSSES_BOSS })),
+                    Json(json!({ "error": why, "code": crate::worktree::TAKEN, "holder": holder })),
                 )
-                    .into_response()
-            }
-            DeskError::NotHeld(_) => {
-                return (
-                    StatusCode::CONFLICT,
-                    Json(json!({ "error": self.to_string(), "code": crate::grant::NOT_HELD })),
-                )
-                    .into_response()
-            }
-            DeskError::WorktreeTaken(_) => {
-                return (
-                    StatusCode::CONFLICT,
-                    Json(json!({ "error": self.to_string(), "code": crate::worktree::TAKEN })),
-                )
-                    .into_response()
-            }
-            DeskError::Invalid(_) => StatusCode::BAD_REQUEST,
-            DeskError::TooLong { most, .. } => {
-                let most = *most;
-                return (
-                    StatusCode::BAD_REQUEST,
-                    Json(json!({
-                        "error": self.to_string(),
-                        "code": GRANT_TOO_LONG,
-                        "mostHours": most,
-                    })),
-                )
-                    .into_response();
-            }
-            DeskError::Internal(e) => {
-                tracing::error!(error = format!("{e:#}"), "desk request failed");
-                StatusCode::INTERNAL_SERVER_ERROR
-            }
-        };
+                    .into_response(),
+                DeskError::Invalid(_) => StatusCode::BAD_REQUEST,
+                DeskError::TooLong { most, .. } => {
+                    let most = *most;
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(json!({
+                            "error": self.to_string(),
+                            "code": GRANT_TOO_LONG,
+                            "mostHours": most,
+                        })),
+                    )
+                        .into_response();
+                }
+                DeskError::Internal(e) => {
+                    tracing::error!(error = format!("{e:#}"), "desk request failed");
+                    StatusCode::INTERNAL_SERVER_ERROR
+                }
+            };
         (status, Json(json!({ "error": self.to_string() }))).into_response()
     }
 }
@@ -2598,8 +2597,12 @@ mod tests {
     #[tokio::test]
     async fn a_start_whose_worktree_is_taken_says_so_by_its_code() {
         use super::{DeskError, IntoResponse, StatusCode};
-        let res = DeskError::WorktreeTaken("/dev/atlas/.worktrees/man-5 is in use".into())
-            .into_response();
+        let holder = uuid::Uuid::new_v4();
+        let res = DeskError::WorktreeTaken {
+            why: "/dev/atlas/.worktrees/man-5 is in use".into(),
+            holder: Some(holder),
+        }
+        .into_response();
         assert_eq!(res.status(), StatusCode::CONFLICT);
         let bytes = axum::body::to_bytes(res.into_body(), usize::MAX)
             .await
@@ -2607,6 +2610,17 @@ mod tests {
         let body: Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(body["code"], crate::worktree::TAKEN);
         assert_eq!(body["error"], "/dev/atlas/.worktrees/man-5 is in use");
+        assert_eq!(body["holder"], holder.to_string());
+        let held_by_nothing = DeskError::WorktreeTaken {
+            why: "a folder is there".into(),
+            holder: None,
+        }
+        .into_response();
+        let bytes = axum::body::to_bytes(held_by_nothing.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(body["holder"].is_null());
     }
 
     #[tokio::test]

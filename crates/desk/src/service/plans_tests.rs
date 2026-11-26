@@ -2834,7 +2834,7 @@ async fn a_plans_ticket_starts_in_its_own_worktree_from_before() {
         };
         let taken = d.create(beside(), Some(By::you())).await.unwrap_err();
         assert!(
-            matches!(&taken, DeskError::WorktreeTaken(why) if why.contains("is in use") && why.contains(&key)),
+            matches!(&taken, DeskError::WorktreeTaken { why, .. } if why.contains("is in use") && why.contains(&key)),
             "{taken:?}"
         );
         d.end(s.id, Some(By::you())).await.unwrap();

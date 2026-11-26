@@ -2,12 +2,16 @@
 //! resume shares it with.
 
 use std::collections::HashSet;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 
+use chrono::Utc;
+use tokio::sync::broadcast::error::RecvError;
 use uuid::Uuid;
 
 use super::{Desk, DeskError, State};
+use crate::board::Ticket;
+use crate::charge::{How, Wheel, HOLD};
 use crate::crew::{By, Party};
 use crate::model::{SessionRecord, SessionState};
 use crate::worktree;
@@ -20,9 +24,20 @@ fn within(r: &SessionRecord, folder: &Path) -> bool {
     worktree::canonical(Path::new(&r.cwd)).starts_with(folder)
 }
 
-/// Whether `r` works in one of Desk's worktrees.
-pub(super) fn in_worktree(r: &SessionRecord) -> bool {
-    r.branch.is_some() || worktree::project_of(&r.cwd) != r.cwd
+/// The worktree `path` is in or below: `<repo>/.worktrees/<slug>`.
+fn root_of(path: &Path) -> Option<PathBuf> {
+    let parts: Vec<Component> = path.components().collect();
+    let at = parts.iter().position(|c| c.as_os_str() == ".worktrees")?;
+    parts.get(at + 1)?;
+    Some(parts[..=at + 1].iter().collect())
+}
+
+/// The worktree a session working in `cwd` holds, by the same rule for a
+/// start and a resume: the Desk worktree its folder (links resolved) is
+/// in, or, one made on a `branch` elsewhere, its folder.
+pub(super) fn held_folder(cwd: &Path, branch: bool) -> Option<PathBuf> {
+    let at = worktree::canonical(cwd);
+    root_of(&at).or_else(|| branch.then_some(at))
 }
 
 /// What a start or resume in a worktree is checked against, under the lock
@@ -46,25 +61,20 @@ impl Hold {
                         || self.kept.contains(&r.id))
                     && within(r, &self.folder)
             })
-            .map(|h| {
-                DeskError::WorktreeTaken(format!(
+            .map(|h| DeskError::WorktreeTaken {
+                why: format!(
                     "{} is in use: {} still runs in it",
                     self.folder.display(),
                     h.display_name.as_deref().unwrap_or(&h.name)
-                ))
+                ),
+                holder: Some(h.id),
             })
     }
 }
 
 impl Desk {
-    /// The hold on `cwd`, a worktree, once `own`'s session there (its name
-    /// and boss), resting from an earlier start of the same work, has
-    /// stopped ([`Self::free_for`]).
-    pub(super) async fn worktree_hold(&self, cwd: &Path, own: Option<(&str, &Party)>) -> Hold {
-        let folder = worktree::canonical(cwd);
-        if let Some((name, boss)) = own {
-            self.free_for(&folder, name, boss).await;
-        }
+    /// The hold on `folder`, a worktree ([`held_folder`]).
+    pub(super) async fn worktree_hold(&self, folder: PathBuf) -> Hold {
         let kept = self.kept_in(&folder).await;
         Hold { folder, kept }
     }
@@ -90,39 +100,73 @@ impl Desk {
             .collect()
     }
 
-    /// Frees `folder` (canonical) of `boss`'s own earlier session of the
-    /// same work (`name`) resting there, idle or done, in its charge still:
-    /// stopped, so this start takes its place rather than being refused.
-    async fn free_for(&self, folder: &Path, name: &str, boss: &Party) {
+    /// Frees `tree`, the worktree a plan's ticket `t` (`key`) starts in
+    /// again, of the session an earlier start of it left resting there: one
+    /// of that name its boss started and still runs, at the boss's wheel
+    /// with nothing from the person for [`HOLD`], asking nothing, idle or
+    /// done, in Desk and not in a terminal, no longer `t`'s (it was moved
+    /// back to To do). Stopped, so this start takes its place rather than
+    /// being refused; any other is left alone, and the start refused.
+    pub(super) async fn free_resting(
+        &self,
+        tree: &Path,
+        key: &str,
+        t: &Ticket,
+        boss: &Party,
+    ) -> Result<(), DeskError> {
+        let folder = worktree::canonical(tree);
+        let now = Utc::now();
         let resting = {
             let st = self.0.state.lock();
             st.records
                 .values()
-                .find(|r| {
-                    r.name == name
+                .filter(|r| {
+                    r.name == key
                         && matches!(r.state, SessionState::Idle | SessionState::Done)
-                        && within(r, folder)
+                        && r.asked.is_none()
+                        && within(r, &folder)
                         && st.live.get(&r.id).is_some_and(|l| l.terminal.is_none())
+                        && st
+                            .charges
+                            .driven
+                            .get(&r.id)
+                            .is_none_or(|at| now - *at >= HOLD)
+                        && t.assignee.as_ref().is_none_or(|a| a.id != r.id.to_string())
                 })
                 .map(|r| r.id)
+                .collect::<Vec<_>>()
         };
-        let Some(id) = resting.filter(|id| {
-            self.charge_of(*id)
-                .is_some_and(|c| c.live() && c.boss == boss.id)
+        let Some(id) = resting.into_iter().find(|id| {
+            self.charge_of(*id).is_some_and(|c| {
+                c.live()
+                    && c.boss == boss.id
+                    && c.how == How::Started
+                    && c.wheel == Wheel::Boss
+                    && c.wheel_since.is_none_or(|at| now - at >= HOLD)
+            })
         }) else {
-            return;
+            return Ok(());
         };
-        let by = By::desk(&format!("{name} starts again in its worktree"));
+        let mut events = self.events();
+        let by = By::desk(&format!("{key} starts again in its worktree"));
         if let Err(e) = self.stop(id, Some(by)) {
             tracing::info!(session = %id, error = %e, "an earlier session in a worktree wasn't stopped for its start again");
-            return;
+            return Ok(());
         }
         let deadline = tokio::time::Instant::now() + STOP_WAIT;
-        while self.record(id).is_ok_and(|r| r.state.is_running())
-            && tokio::time::Instant::now() < deadline
-        {
-            tokio::time::sleep(Duration::from_millis(40)).await;
+        let late = || {
+            DeskError::Invalid(format!(
+                "{key}'s earlier session in {} didn't stop in time",
+                folder.display()
+            ))
+        };
+        while self.record(id).is_ok_and(|r| r.state.is_running()) {
+            match tokio::time::timeout_at(deadline, events.recv()).await {
+                Err(_) | Ok(Err(RecvError::Closed)) => return Err(late()),
+                Ok(Ok(_) | Err(RecvError::Lagged(_))) => {}
+            }
         }
+        Ok(())
     }
 }
 

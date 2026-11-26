@@ -6,7 +6,9 @@ use eyre::{Context, Result};
 use tokio::process::Command;
 
 async fn git(dir: &Path, args: &[&str]) -> Result<String> {
+    // git's own words, untranslated: [`unmade`] reads them.
     let out = Command::new("git")
+        .env("LC_ALL", "C")
         .arg("-C")
         .arg(dir)
         .args(args)
@@ -65,6 +67,7 @@ pub async fn create(cwd: &Path, branch: &str) -> Result<PathBuf, Unmade> {
         .await?
         .into_iter()
         .map(|w| Listed {
+            gone: !w.path.exists(),
             path: canonical(&w.path),
             ..w
         })
@@ -93,12 +96,14 @@ async fn worktrees(root: &Path) -> Result<Vec<Listed>> {
 }
 
 /// A worktree as `git worktree list --porcelain` says it: its folder, its
-/// branch (none when detached), and whether it is locked.
+/// branch (none when detached), and whether it is locked; and whether its
+/// folder is gone, as [`create`] finds it.
 #[derive(Debug, PartialEq)]
 struct Listed {
     path: PathBuf,
     branch: Option<String>,
     locked: bool,
+    gone: bool,
 }
 
 /// The worktrees of a porcelain listing whose fields end in `sep`, each
@@ -120,6 +125,7 @@ fn listed(porcelain: &str, sep: char) -> Vec<Listed> {
                 locked: fields
                     .iter()
                     .any(|f| *f == "locked" || f.starts_with("locked ")),
+                gone: false,
             })
         })
         .collect()
@@ -151,7 +157,8 @@ fn unmade(e: eyre::Report) -> Unmade {
 #[derive(Debug, PartialEq)]
 enum Standing {
     Free,
-    /// Gone, though git still lists it: made again over its entry.
+    /// Its entry, or `branch`'s elsewhere, is of a folder gone and not
+    /// locked: made again over it.
     Stale,
     Own,
     Taken(String),
@@ -177,6 +184,11 @@ fn standing(list: &[Listed], path: &Path, there: bool, branch: &str) -> Standing
         (false, Some(w), _) if w.locked => Standing::Taken(format!(
             "{shown} is gone, but git keeps it as a locked worktree: unlock it (git worktree unlock) or remove it"
         )),
+        (false, _, Some(w)) if w.gone && w.locked => Standing::Taken(format!(
+            "{branch} is checked out in {}, which is gone, but git keeps it as a locked worktree: unlock it (git worktree unlock) or remove it",
+            w.path.display()
+        )),
+        (false, _, Some(w)) if w.gone => Standing::Stale,
         (false, _, Some(w)) => Standing::Taken(format!(
             "{branch} is checked out already in {}: Desk works on it only in {shown}",
             w.path.display()
@@ -210,7 +222,7 @@ pub async fn state_of(cwd: &Path) -> (Option<String>, Option<String>, Vec<String
 
 /// `branch`'s worktree folder in `cwd`'s repository: its root, and
 /// `<root>/.worktrees/<slug>`.
-async fn located(cwd: &Path, branch: &str) -> Result<(PathBuf, PathBuf)> {
+pub(crate) async fn located(cwd: &Path, branch: &str) -> Result<(PathBuf, PathBuf)> {
     let name = slug(branch);
     if name.is_empty() {
         eyre::bail!("branch name {branch:?} has no usable characters");
@@ -562,6 +574,43 @@ mod tests {
         assert!(!first.exists());
     }
 
+    /// A branch checked out in a worktree elsewhere whose folder is gone,
+    /// not locked, is made again in its own place; locked, it is taken.
+    #[tokio::test]
+    async fn a_branch_in_a_gone_worktree_elsewhere_is_made_again_here() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        test_repo(repo).await;
+        for (branch, locked) in [("man-6", false), ("man-7", true)] {
+            let elsewhere = repo.join(format!("elsewhere-{branch}"));
+            let at = elsewhere.to_string_lossy().into_owned();
+            git(repo, &["worktree", "add", "-b", branch, &at])
+                .await
+                .unwrap();
+            if locked {
+                git(repo, &["worktree", "lock", &at]).await.unwrap();
+            }
+            std::fs::remove_dir_all(&elsewhere).unwrap();
+            match locked {
+                false => {
+                    let made = create(repo, branch).await.unwrap();
+                    assert!(made.ends_with(format!(".worktrees/{branch}")));
+                    assert_eq!(
+                        git(&made, &["branch", "--show-current"]).await.unwrap(),
+                        branch
+                    );
+                }
+                true => {
+                    let why = taken(create(repo, branch).await.unwrap_err());
+                    assert!(
+                        why.contains("which is gone") && why.contains("locked"),
+                        "{why}"
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn a_worktree_list_says_each_folder_its_branch_and_its_lock() {
         let fields = [
@@ -595,21 +644,25 @@ mod tests {
                     path: "/dev/atlas".into(),
                     branch: Some("main".into()),
                     locked: false,
+                    gone: false,
                 },
                 Listed {
                     path: "/dev/atlas/.worktrees/man-5".into(),
                     branch: None,
                     locked: false,
+                    gone: false,
                 },
                 Listed {
                     path: "/gone/man-6".into(),
                     branch: Some("man-6".into()),
                     locked: false,
+                    gone: false,
                 },
                 Listed {
                     path: "/dev/atlas/.worktrees/man-7".into(),
                     branch: Some("man-7".into()),
                     locked: true,
+                    gone: false,
                 },
             ]
         );

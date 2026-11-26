@@ -149,3 +149,41 @@ this PR, with a test.
 The Desk app shows `worktree_taken` as "That branch's copy is in use by
 another session", with a button to open the holding session when Desk lists
 it.
+
+## After re-review
+
+- **11, narrowed.** Only a plan's own start of a ticket, on this
+  computer, frees the worktree (`plan_spawn` → `free_resting`). It never
+  runs for other starts, such as crew hand-outs. It stops the earlier
+  session only when all of these hold:
+  - its name is the ticket's key;
+  - it is Idle or Done, and has no open ask;
+  - it is live in Desk, not in a terminal;
+  - the boss started it and still runs it, at the boss's wheel;
+  - the person hasn't prompted it within `HOLD`;
+  - it is no longer the ticket's assignee.
+
+  Anything else is left alone and the start is refused, naming it. The
+  stop is Desk's own (`stopping`), so it is never an end on its own: no
+  hold-back and no repeats. It waits on Desk's session events, and
+  answers a plain Invalid (which backs off) if the session hasn't
+  stopped in 10 s.
+
+  A plan ticket on a machine still pauses. The machine's Desk isn't told
+  to free the worktree.
+- **Same rule for start and resume.** Both check the worktree the folder
+  is in, `<repo>/.worktrees/<slug>` with links resolved (or the folder
+  itself for a branch made elsewhere). A start with or without a branch
+  is checked. A resume with no one behind it, Desk's own restore at
+  boot, isn't checked: it brings back what ran together. A review start
+  isn't checked either, since it reads beside the session that works
+  there.
+- A branch checked out in a worktree elsewhere whose folder is gone is
+  made again here (`--force`). If that entry is locked, it is Taken.
+- git runs with `LC_ALL=C`, so its words match.
+- Writes of the kept failures go one at a time. On load, entries for
+  plans gone since are dropped, and each next try is clamped to its wait
+  from now.
+- The 409 carries `holder`, the holding session's id. Desk opens that
+  session, and with no holder it says something else is in the branch's
+  folder.

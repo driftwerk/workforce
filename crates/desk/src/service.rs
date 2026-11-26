@@ -262,11 +262,12 @@ pub enum DeskError {
     /// answered as a 409 with its own `code`, so the start waits for it.
     #[error("{0}")]
     NotHeld(String),
-    /// A start's worktree is held by something else ([`worktree::Unmade::Taken`]):
-    /// answered as a 409 with its own `code`, so a plan pauses on it rather
-    /// than trying it again.
-    #[error("{0}")]
-    WorktreeTaken(String),
+    /// A start's worktree is held by something else ([`worktree::Unmade::Taken`]),
+    /// or by the session (`holder`) still running in it: answered as a 409
+    /// with its own `code` and `holder`, so a plan pauses on it rather than
+    /// trying it again.
+    #[error("{why}")]
+    WorktreeTaken { why: String, holder: Option<Uuid> },
     /// A grant asked to last longer than this engine gives, `most` hours.
     /// Answered as a 400 with its own `code` and `mostHours`.
     #[error("{why}")]
@@ -3932,15 +3933,18 @@ impl Desk {
             }
             Some(branch) => (
                 worktree::create(&cwd, branch).await.map_err(|e| match e {
-                    worktree::Unmade::Taken(why) => DeskError::WorktreeTaken(why),
+                    worktree::Unmade::Taken(why) => DeskError::WorktreeTaken { why, holder: None },
                     worktree::Unmade::Failed(e) => DeskError::Invalid(e.to_string()),
                 })?,
                 Some(branch.to_string()),
             ),
             None => (cwd, None),
         };
-        let hold = match &branch {
-            Some(_) => Some(self.worktree_hold(&cwd, boss.map(|b| (name, b))).await),
+        // A review reads a worktree beside the session that works in it.
+        let held =
+            worktree_hold::held_folder(&cwd, branch.is_some()).filter(|_| new.review_of.is_none());
+        let hold = match held {
+            Some(folder) => Some(self.worktree_hold(folder).await),
             None => None,
         };
         let ready = match deps {
@@ -4305,9 +4309,14 @@ impl Desk {
             }
             self.end_held(id).await?;
         }
-        let hold = match worktree_hold::in_worktree(&r) {
-            true => Some(self.worktree_hold(Path::new(&r.cwd), None).await),
-            false => None,
+        // Desk's own restore at its start (no one) brings back what ran
+        // together before; anyone's resume is checked.
+        let held = by
+            .as_ref()
+            .and_then(|_| worktree_hold::held_folder(Path::new(&r.cwd), r.branch.is_some()));
+        let hold = match held {
+            Some(folder) => Some(self.worktree_hold(folder).await),
+            None => None,
         };
         let _starting = Starting::of(self, id)?;
         // Devin's conversation, as Devin still lists it in its folder; a new

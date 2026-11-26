@@ -9,6 +9,7 @@ use workforce_postgres::test_support::with_test_pool;
 
 use super::super::tests::{desk, eventually, options};
 use super::*;
+use crate::board::Ticket;
 use crate::model::{Engine, NewSession};
 use crate::service::HolderOptions;
 use crate::store::{build_pool, DeskStore};
@@ -36,7 +37,7 @@ fn on(repo: &Path, name: &str, branch: Option<&str>) -> NewSession {
 
 fn taken_by(e: DeskError, holder: &str) {
     assert!(
-        matches!(&e, DeskError::WorktreeTaken(why) if why.contains(&format!("{holder} still runs in it"))),
+        matches!(&e, DeskError::WorktreeTaken { why, holder: Some(_) } if why.contains(&format!("{holder} still runs in it"))),
         "{e:?}"
     );
 }
@@ -71,9 +72,12 @@ async fn a_resume_into_a_worktree_another_session_took_is_refused() {
             .await
             .unwrap();
         assert_eq!(second.cwd, first.cwd, "the stopped one held it no more");
-        taken_by(d.resume(first.id, None, None).await.unwrap_err(), "second");
+        taken_by(
+            d.resume(first.id, None, Some(By::you())).await.unwrap_err(),
+            "second",
+        );
         stopped(&d, second.id).await;
-        d.resume(first.id, None, None).await.unwrap();
+        d.resume(first.id, None, Some(By::you())).await.unwrap();
     })
     .await;
 }
@@ -143,9 +147,40 @@ async fn a_session_in_a_worktree_through_a_link_holds_it() {
     .await;
 }
 
-/// A boss's own earlier session of the same work, resting in its worktree,
-/// is stopped for the boss's start of it again; one at work there isn't,
-/// and the start is refused.
+fn todo(key_session: Option<Uuid>) -> Ticket {
+    let now = chrono::Utc::now();
+    Ticket {
+        id: Uuid::new_v4(),
+        board: Uuid::nil(),
+        number: 4,
+        title: "Fix the login".into(),
+        body: String::new(),
+        state: crate::board::TicketState::Todo,
+        rank: crate::board::RANK_STEP,
+        assignee: key_session.map(|id| Party {
+            kind: crate::crew::PartyKind::Session,
+            id: id.to_string(),
+            ..Party::you()
+        }),
+        needs: vec![],
+        links: vec![],
+        external: None,
+        created_by: Party::you(),
+        pinned: false,
+        snoozed_until: None,
+        upstream_rank: None,
+        snoozed_at: None,
+        state_at: now,
+        created_at: now,
+        updated_at: now,
+        version: 0,
+    }
+}
+
+/// A boss's own earlier session of a plan's ticket, resting in its
+/// worktree since the ticket went back to To do, is stopped for its start
+/// again, as Desk's stop: never as an end on its own, which would hold its
+/// ticket back. One at work there isn't, and the start is refused.
 #[tokio::test]
 async fn a_bosss_own_resting_session_gives_way_to_its_start_again() {
     with_test_pool(build_pool, |pool| async move {
@@ -157,6 +192,11 @@ async fn a_bosss_own_resting_session_gives_way_to_its_start_again() {
             .create_for(on(repo.path(), "MAN-4", Some("man-4")), &sarah(), by())
             .await
             .unwrap();
+        let tree = std::path::PathBuf::from(&earlier.cwd);
+        d.free_resting(&tree, "MAN-4", &todo(None), &sarah())
+            .await
+            .unwrap();
+        assert!(d.record(earlier.id).unwrap().state.is_running(), "at work");
         taken_by(
             d.create_for(on(repo.path(), "MAN-4", Some("man-4")), &sarah(), by())
                 .await
@@ -164,13 +204,124 @@ async fn a_bosss_own_resting_session_gives_way_to_its_start_again() {
             "MAN-4",
         );
         d.change(earlier.id, |r, _| r.state = SessionState::Idle);
+        d.free_resting(&tree, "MAN-4", &todo(None), &sarah())
+            .await
+            .unwrap();
+        let r = d.record(earlier.id).unwrap();
+        assert_eq!(r.state, SessionState::Stopped);
+        assert!(!d.0.state.lock().exited.contains_key(&earlier.id));
+        assert!(d.view(earlier.id).unwrap().ended_as_started().is_none());
         let again = d
             .create_for(on(repo.path(), "MAN-4", Some("man-4")), &sarah(), by())
             .await
             .unwrap();
         assert_eq!(again.cwd, earlier.cwd);
-        assert!(!d.record(earlier.id).unwrap().state.is_running());
-        assert_ne!(d.record(earlier.id).unwrap().state, SessionState::Closed);
+    })
+    .await;
+}
+
+/// A resting session in the worktree is left alone, and the start
+/// refused, when it isn't the boss's own earlier session of the ticket
+/// gone back to To do: another boss's, one the person took back, one in a
+/// terminal, one the person spoke to lately, one asking, or one still the
+/// ticket's.
+#[tokio::test]
+async fn a_resting_session_not_left_by_the_tickets_start_is_left_alone() {
+    with_test_pool(build_pool, |pool| async move {
+        let (home, repo) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        crate::worktree::test_repo(repo.path()).await;
+        let d = desk(pool, home.path()).await;
+        let by = || By::manager("sarah", "Sarah", "Its plan starts it.");
+        type Unlike = fn(&Desk, Uuid) -> (Party, Option<Uuid>);
+        let cases: [(&str, Unlike); 7] = [
+            ("another boss's", |_, _| {
+                (Party::manager("tom", "Tom"), None)
+            }),
+            ("taken back", |d, id| {
+                let mut st = d.0.state.lock();
+                let c = st.charges.rows.get_mut(&id).unwrap();
+                c.released_at = Some(chrono::Utc::now());
+                c.released_by = Some(crate::charge::ReleasedBy::Person);
+                (sarah(), None)
+            }),
+            ("in a terminal", |d, id| {
+                d.0.state.lock().live.get_mut(&id).unwrap().terminal = Some(Uuid::new_v4());
+                (sarah(), None)
+            }),
+            ("spoken to lately", |d, id| {
+                d.0.state
+                    .lock()
+                    .charges
+                    .driven
+                    .insert(id, chrono::Utc::now());
+                (sarah(), None)
+            }),
+            ("at the person's wheel", |d, id| {
+                let mut st = d.0.state.lock();
+                let c = st.charges.rows.get_mut(&id).unwrap();
+                c.wheel = crate::charge::Wheel::Person;
+                c.wheel_since = Some(chrono::Utc::now());
+                (sarah(), None)
+            }),
+            ("asking", |d, id| {
+                d.change(id, |r, _| r.state = SessionState::Asking);
+                (sarah(), None)
+            }),
+            ("still the ticket's", |_, id| (sarah(), Some(id))),
+        ];
+        for (n, (what, unlike)) in cases.into_iter().enumerate() {
+            let branch = format!("man-{}", 10 + n);
+            let s = d
+                .create_for(on(repo.path(), "MAN-4", Some(&branch)), &sarah(), by())
+                .await
+                .unwrap();
+            d.change(s.id, |r, _| r.state = SessionState::Idle);
+            let (boss, assigned) = unlike(&d, s.id);
+            let tree = std::path::PathBuf::from(&s.cwd);
+            d.free_resting(&tree, "MAN-4", &todo(assigned), &boss)
+                .await
+                .unwrap();
+            assert!(
+                d.record(s.id).unwrap().state.is_running(),
+                "{what}: left alone"
+            );
+            assert!(
+                matches!(
+                    d.create_for(on(repo.path(), "MAN-4", Some(&branch)), &sarah(), by())
+                        .await
+                        .unwrap_err(),
+                    DeskError::WorktreeTaken { holder: Some(h), .. } if h == s.id
+                ),
+                "{what}: refused, naming it"
+            );
+        }
+    })
+    .await;
+}
+
+/// Desk's own restore at its start brings back sessions that ran together
+/// in a worktree; anyone's resume there is checked.
+#[tokio::test]
+async fn desks_own_restore_brings_back_sessions_sharing_a_worktree() {
+    with_test_pool(build_pool, |pool| async move {
+        let (home, repo) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        crate::worktree::test_repo(repo.path()).await;
+        let d = desk(pool, home.path()).await;
+        let first = d
+            .create(on(repo.path(), "first", Some("man-20")), None)
+            .await
+            .unwrap();
+        // Started there by hand, in a folder below it.
+        let below = std::path::Path::new(&first.cwd).join("src");
+        std::fs::create_dir_all(&below).unwrap();
+        stopped(&d, first.id).await;
+        let second = d.create(on(&below, "second", None), None).await.unwrap();
+        taken_by(
+            d.resume(first.id, None, Some(By::you())).await.unwrap_err(),
+            "second",
+        );
+        d.resume(first.id, None, None).await.unwrap();
+        assert!(d.record(second.id).unwrap().state.is_running());
     })
     .await;
 }

@@ -39,7 +39,7 @@ pub struct DialogAnswerer {
 /// person last gave each session input Desk doesn't see in its terminal.
 #[derive(Default)]
 pub(crate) struct Charges {
-    rows: HashMap<Uuid, Charge>,
+    pub(super) rows: HashMap<Uuid, Charge>,
     /// The person's own prompts and composer messages, by session.
     pub(super) driven: HashMap<Uuid, DateTime<Utc>>,
     /// What each boss that took a session on is called, by agent id.

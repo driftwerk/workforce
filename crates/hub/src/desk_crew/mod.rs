@@ -326,6 +326,9 @@ pub struct CrewHub {
     /// The plan tickets whose session failed to start: each is tried again
     /// after a wait that doubles.
     plan_failed: Mutex<HashMap<uuid::Uuid, plan::Failed>>,
+    /// One write of [`Self::plan_failed`] at a time, so an older one never
+    /// lands last.
+    plan_failed_kept: tokio::sync::Mutex<()>,
     /// What the plan watchdog did, once each ([`plan_watch`]).
     plan_watch: Mutex<plan_watch::Watch>,
     /// What the goal checks keep between looks ([`goal_check`]).
@@ -845,6 +848,7 @@ impl CrewHub {
             work: Mutex::default(),
             starting: tokio::sync::Mutex::new(()),
             plan_failed: Mutex::default(),
+            plan_failed_kept: tokio::sync::Mutex::default(),
             plan_watch: Mutex::default(),
             goal_checks: Mutex::default(),
             jobs_read: measure::JobsRead::default(),

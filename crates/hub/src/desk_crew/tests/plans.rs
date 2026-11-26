@@ -3396,6 +3396,20 @@ async fn a_restart_keeps_how_often_a_ticket_failed_to_start() {
             .map(|f| f["count"].as_u64().unwrap())
             .sum::<u64>() as usize;
         assert!(counted >= 2, "{kept}");
+        // A clock that jumped (a next try a century off) waits no longer
+        // than its wait; a plan gone since is forgotten.
+        let mut kept = kept;
+        for f in kept.as_object_mut().unwrap().values_mut() {
+            f["next"] = json!("2126-01-01T00:00:00Z");
+        }
+        let mut gone = kept.as_object().unwrap().values().next().unwrap().clone();
+        gone["plan"] = json!(uuid::Uuid::new_v4());
+        let gone_ticket = uuid::Uuid::new_v4().to_string();
+        kept[&gone_ticket] = gone;
+        d.store()
+            .put_state("hub.crew.plan_failed", &kept)
+            .await
+            .unwrap();
         let second = CrewHub::start(state, d.clone(), FAST, CancellationToken::new());
         let (poller, after) = refusing_devbox(&second, refusal);
         let why = paused_failing(&d, id).await;
@@ -3408,6 +3422,14 @@ async fn a_restart_keeps_how_often_a_ticket_failed_to_start() {
             5 - counted,
             "{counted} kept over the restart"
         );
+        let now = d
+            .store()
+            .state("hub.crew.plan_failed")
+            .await
+            .unwrap()
+            .expect("kept")
+            .value;
+        assert!(now.get(&gone_ticket).is_none(), "{now}");
         poller.abort();
     })
     .await;

@@ -3246,7 +3246,9 @@ impl Desk {
             crew::MachineRefused::Refused(why) => sure(DeskError::Invalid(format!(
                 "{machine} didn't start {key}: {why}"
             ))),
-            crew::MachineRefused::WorktreeTaken(why) => sure(DeskError::WorktreeTaken(why)),
+            crew::MachineRefused::WorktreeTaken(why) => {
+                sure(DeskError::WorktreeTaken { why, holder: None })
+            }
             e @ crew::MachineRefused::Unknown(_) => failed(DeskError::Invalid(e.to_string()), true),
             e => sure(DeskError::Invalid(e.to_string())),
         };
@@ -3366,7 +3368,7 @@ impl Desk {
                     .await
                     .ok()
                     .and_then(|listed| there(&listed))
-                    .ok_or_else(|| sure(DeskError::WorktreeTaken(why)));
+                    .ok_or_else(|| sure(DeskError::WorktreeTaken { why, holder: None }));
             }
             made => made.map_err(refused)?,
         };
@@ -3474,6 +3476,13 @@ impl Desk {
         // again by each later start of it.
         let branch = (worktree && crate::worktree::in_repo(Path::new(&folder)).await)
             .then(|| branch_for(&key));
+        // Its session from an earlier start, resting there since it was
+        // moved back to To do, gives way.
+        if let Some(b) = &branch {
+            if let Ok((_, tree)) = crate::worktree::located(Path::new(&folder), b).await {
+                self.free_resting(&tree, &key, t, boss).await?;
+            }
+        }
         let group = p
             .group
             .clone()

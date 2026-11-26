@@ -442,7 +442,7 @@ fn plain(e: workforce_desk::DeskError) -> String {
         workforce_desk::DeskError::Conflict(why)
         | workforce_desk::DeskError::Invalid(why)
         | workforce_desk::DeskError::NotHeld(why)
-        | workforce_desk::DeskError::WorktreeTaken(why) => why,
+        | workforce_desk::DeskError::WorktreeTaken { why, .. } => why,
         e
         @ (workforce_desk::DeskError::CrossesBoss | workforce_desk::DeskError::TooLong { .. }) => {
             e.to_string()
@@ -2435,7 +2435,7 @@ impl CrewHub {
         scope: i32,
         e: workforce_desk::DeskError,
     ) {
-        let again = !matches!(e, workforce_desk::DeskError::WorktreeTaken(_));
+        let again = !matches!(e, workforce_desk::DeskError::WorktreeTaken { .. });
         let why = plain(e);
         let (ticket, key) = (t.id, t.name());
         let on = match (again, &t.machine) {
@@ -2455,8 +2455,7 @@ impl CrewHub {
                 why: String::new(),
             });
             f.count += 1;
-            let wait = self.timing.minute * 2u32.saturating_pow(f.count - 1).min(64);
-            f.next = now + chrono::Duration::from_std(wait).unwrap_or_default();
+            f.next = now + self.wait_after(f.count);
             let tell = f.why != why;
             f.why.clone_from(&why);
             (f.count, tell)
@@ -2480,23 +2479,46 @@ impl CrewHub {
     }
 
     /// What failed to start before a restart, as [`Self::keep_plan_failed`]
-    /// kept it.
+    /// kept it: of plans still there, each tried next no later than its
+    /// wait from now, whatever the clock did meanwhile.
     pub(super) async fn load_plan_failed(&self) {
-        match self.desk.store().state(PLAN_FAILED).await {
+        let kept: HashMap<Uuid, Failed> = match self.desk.store().state(PLAN_FAILED).await {
             Ok(Some(kept)) => match serde_json::from_value(kept.value) {
-                Ok(kept) => *self.plan_failed.lock() = kept,
+                Ok(kept) => kept,
                 Err(e) => {
                     tracing::warn!(error = %e, "what failed to start before a restart couldn't be read: counted afresh");
+                    return;
                 }
             },
-            Ok(None) => {}
+            Ok(None) => return,
             Err(e) => {
                 tracing::warn!(error = %format!("{e:#}"), "what failed to start before a restart wasn't read: counted afresh");
+                return;
             }
+        };
+        let now = chrono::Utc::now();
+        let mut still = HashMap::new();
+        for (ticket, mut f) in kept {
+            if self.desk.plan(f.plan).await.is_err() {
+                continue;
+            }
+            f.next = f.next.min(now + self.wait_after(f.count));
+            still.insert(ticket, f);
         }
+        *self.plan_failed.lock() = still;
+        self.keep_plan_failed().await;
     }
 
+    /// How long a ticket waits after its `count`th failed start.
+    fn wait_after(&self, count: u32) -> chrono::Duration {
+        let wait = self.timing.minute * 2u32.saturating_pow(count.saturating_sub(1)).min(64);
+        chrono::Duration::from_std(wait).unwrap_or_default()
+    }
+
+    /// Keeps [`Self::plan_failed`] over a restart: one write at a time, of
+    /// what it is when its turn comes.
     async fn keep_plan_failed(&self) {
+        let _turn = self.plan_failed_kept.lock().await;
         let value = serde_json::to_value(&*self.plan_failed.lock()).unwrap_or_default();
         if let Err(e) = self.desk.store().put_state(PLAN_FAILED, &value).await {
             tracing::warn!(error = %format!("{e:#}"), "what failed to start wasn't kept");
