@@ -670,6 +670,168 @@ async fn the_home_takes_its_bosss_decisions_from_its_machines_and_answers_each_w
     .await;
 }
 
+/// `agent` holding `n` more live jobs that can't be undone, each with
+/// `brief` and `targets` targets, as kept on the Mac.
+pub(super) async fn holding(
+    d: &Desk,
+    agent: &str,
+    n: usize,
+    brief: &str,
+    targets: usize,
+) -> Vec<workforce_desk::assignment::Assignment> {
+    let mut jobs = Vec::new();
+    for _ in 0..n {
+        let mut a = workforce_desk::assignment::Assignment::new(agent, uuid::Uuid::new_v4(), brief);
+        a.job_key = Some(format!("acme/api/release/{}", a.id.simple()));
+        a.targets = (0..targets)
+            .map(|t| format!("run:{}{t:04}", a.id.as_u128() % 1_000_000_000))
+            .collect();
+        a.irreversible = true;
+        a.claims = true;
+        let kept = d.store().assignment_reserve(&a, None).await.unwrap();
+        assert!(
+            matches!(
+                kept,
+                workforce_desk::assignment_store::Reserved::Kept { .. }
+            ),
+            "{kept:?}"
+        );
+        jobs.push(a);
+    }
+    jobs
+}
+
+/// Whether `jobs`, as a machine compares a request with them, are more than
+/// one call carries.
+pub(super) fn too_many(jobs: &[workforce_desk::assignment::Assignment]) -> bool {
+    let compared: Vec<_> = jobs
+        .iter()
+        .cloned()
+        .map(workforce_desk::assignment::Assignment::compared)
+        .collect();
+    json!(compared).to_string().len() > 256 * 1024
+}
+
+/// On the Mac: Sarah holding many jobs that can't be undone, each with a
+/// long brief, still answers devbox, with each job as devbox compares a
+/// request with it; with more than its call carries, without them (devbox
+/// then leaves what can't be undone to the person). An answer that may not
+/// have reached devbox is said in her DM, once.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_homes_answer_reaches_its_machine_however_many_long_jobs_its_boss_holds() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (sarah, crew, d, llm) = overseeing(dir.path(), pool, "ok", SARAH_FULL, &[]).await;
+        super::decides_at_once::decides(&llm, "git tag v9", "ALLOW: it tags the release").await;
+        super::decides_at_once::decides(&llm, "git push --tags", "ALLOW: it pushes the tags").await;
+        let remote = uuid::Uuid::new_v4();
+        d.change_layout(|l| l.create("acme", "Acme", &[format!("session:devbox/{remote}")], None))
+            .await
+            .unwrap();
+        crew.read_spent_today(&crew.overseers()).await;
+        *crew.relay_wait.lock() = Duration::from_millis(400);
+        let agent = crew
+            .overseer_for(&workforce_common::oversight::Scope::Group("acme".into()))
+            .expect("Sarah oversees Acme")
+            .0
+            .agent_id
+            .as_str()
+            .to_string();
+        let brief = format!(
+            "Dispatch release 4 now.\n{}",
+            "Watch it through and send Desk each run id. ".repeat(2_500)
+        );
+        let jobs = holding(&d, &agent, 10, &brief, 0).await;
+        assert!(json!(jobs).to_string().len() > 1024 * 1024, "far over a call");
+        let (answered_id, lost_id, unheld_id) =
+            (uuid::Uuid::new_v4(), uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+        let decision = |id: uuid::Uuid, request: &str| {
+            json!({"decideId": id, "prompt": format!("{} decide `{request}`", super::super::decide::MARK)})
+        };
+        let seen: Arc<parking_lot::Mutex<Vec<RelayCall>>> = Arc::default();
+        let queued: Arc<parking_lot::Mutex<Vec<Value>>> = Arc::new(parking_lot::Mutex::new(vec![
+            decision(answered_id, "git tag v9"),
+            decision(lost_id, "git push --tags"),
+        ]));
+        // Desk's native side, and devbox, standing in: devbox hands what is
+        // queued, and never answers the lost decision's answer.
+        let poller = {
+            let (crew, seen, queued) = (Arc::clone(&crew), Arc::clone(&seen), Arc::clone(&queued));
+            tokio::spawn(async move {
+                loop {
+                    for c in crew.relay_take(Duration::from_millis(200)).await {
+                        seen.lock().push(c.clone());
+                        let in_force = c.input["inForce"] == true;
+                        let mut body = match c.tool.as_str() {
+                            TAKE if in_force => json!({"full": true,
+                                                       "decisions": std::mem::take(&mut *queued.lock())}),
+                            TAKE => json!({"full": false, "decisions": []}),
+                            _ if c.input["decideId"] == json!(lost_id.to_string()) => continue,
+                            _ => json!({"taken": true}),
+                        };
+                        if c.tool == TAKE {
+                            body["countFrom"] = c.input["countFrom"].clone();
+                            body["spentUsd"] = json!(0.0);
+                        }
+                        crew.relay_answer(
+                            c.id,
+                            RelayAnswer {
+                                status: ServedStatus::Ok,
+                                body,
+                            },
+                        );
+                    }
+                }
+            })
+        };
+        let decided = |id: uuid::Uuid| {
+            let seen = Arc::clone(&seen);
+            async move {
+                eventually("its answer relayed", async || {
+                    seen.lock()
+                        .iter()
+                        .find(|c| c.tool == DECIDED && c.input["decideId"] == json!(id.to_string()))
+                        .cloned()
+                })
+                .await
+            }
+        };
+        let ok = decided(answered_id).await;
+        assert_eq!(ok.input["text"], "ALLOW: it tags the release");
+        let held: Vec<workforce_desk::assignment::Assignment> =
+            serde_json::from_value(ok.input["heldJobs"].clone())
+                .expect("the jobs, as devbox reads them");
+        assert_eq!(held.len(), jobs.len());
+        for (h, a) in held.iter().zip(&jobs) {
+            assert_eq!((h.id, h.session, &h.job_key), (a.id, a.session, &a.job_key));
+            assert!(h.irreversible && h.state.live());
+            assert_eq!(h.about(), a.about());
+            assert!(h.text.len() < 100, "{}", h.text);
+        }
+        // Devbox didn't answer: said in her DM, once.
+        decided(lost_id).await;
+        let notice = [
+            "On devbox: Desk decided a session's request there",
+            "may not have reached it",
+        ];
+        eventually("said in her DM", async || {
+            (super::decides_at_once::said(&sarah, &notice) > 0).then_some(())
+        })
+        .await;
+
+        // More than its call carries: answered, without them.
+        let more = holding(&d, &agent, 500, "Dispatch release 5 now.", 12).await;
+        assert!(too_many(&more));
+        queued.lock().push(decision(unheld_id, "git tag v9"));
+        let unheld = decided(unheld_id).await;
+        assert_eq!(unheld.input["text"], "ALLOW: it tags the release");
+        assert!(unheld.input.get("heldJobs").is_none(), "{}", unheld.input);
+        assert_eq!(super::decides_at_once::said(&sarah, &notice), 1, "said once");
+        poller.abort();
+    })
+    .await;
+}
+
 /// On devbox: a request that can't be taken back, beside a job Sarah's home
 /// says one of her sessions holds, is the person's to allow, by her relayed
 /// approve or by her home's decision; and so when her home doesn't say.
@@ -734,17 +896,18 @@ async fn a_request_beside_a_job_the_home_holds_is_the_persons_on_the_machine() {
         let app = super::super::relay::routes(Arc::clone(&crew.state), Arc::clone(&crew));
         let token = crew.state.auth_token.clone();
         // Release 4, held by another of Sarah's sessions at home.
+        // As her home sends it: as devbox compares a request with it.
         let mut home = workforce_desk::assignment::Assignment::new(
             "desk",
             uuid::Uuid::new_v4(),
-            "Dispatch release 4 now.",
+            &format!("Dispatch release 4 now.\n{}", "Watch it through. ".repeat(1_000)),
         );
         home.job_key = Some("acme/api/release/4".into());
         home.job = Some("release 4 of acme/api".into());
         home.irreversible = true;
         home.claims = true;
         home.state = workforce_desk::assignment::AssignmentState::Open;
-        let held = json!([home]);
+        let held = json!([home.compared()]);
 
         // Her relayed approve: with the job, or without the jobs, the
         // person's; with none held, allowed.
@@ -753,22 +916,22 @@ async fn a_request_beside_a_job_the_home_holds_is_the_persons_on_the_machine() {
         let command = "echo Dispatch release 4 now";
         let asked = ask(&url, command);
         let a1 = pending(&d, started, command).await;
-        let approve = |jobs: Option<Value>| {
+        let approve = |approval: uuid::Uuid, jobs: Option<Value>| {
             let (app, token) = (app.clone(), token.clone());
             let mut input = json!({"session_id": started.to_string(),
-                                   "approval_id": a1.to_string(), "reason": "Sam ordered it."});
+                                   "approval_id": approval.to_string(), "reason": "Sam ordered it."});
             if let Some(j) = jobs {
                 input["held_jobs"] = j;
             }
             async move { post(&app, &token, relayed("crew.approve", input, "local:sarah", "full")).await }
         };
         for jobs in [Some(held.clone()), None] {
-            let out = approve(jobs).await;
+            let out = approve(a1, jobs).await;
             assert_ne!(out["status"], "ok", "{out}");
             assert!(out.to_string().contains("Not allowed"), "{out}");
         }
         assert!(!asked.is_finished(), "nothing allowed it");
-        let out = approve(Some(json!([]))).await;
+        let out = approve(a1, Some(json!([]))).await;
         assert_eq!(out["status"], "ok", "{out}");
         let answered = asked.await.unwrap();
         assert_eq!(
@@ -791,30 +954,34 @@ async fn a_request_beside_a_job_the_home_holds_is_the_persons_on_the_machine() {
             }
         };
         take().await;
-        let command = "gh workflow run release.yml -f release=5";
-        let asked = ask(&url, command);
-        pending(&d, started, command).await;
-        let given = eventually("the request handed to her home", async || {
-            take().await["body"]["decisions"]
-                .as_array()
-                .and_then(|d| d.first().cloned())
-        })
-        .await;
-        let out = post(
-            &app,
-            &token,
-            relayed(
-                DECIDED,
-                json!({"decideId": given["decideId"], "text": "ALLOW: Sam ordered it",
-                       "heldJobs": held}),
-                "local:sarah",
-                "full",
-            ),
-        )
-        .await;
-        assert_eq!(out["status"], "ok", "{out}");
-        waits_on_person(&d, started).await;
-        assert!(!asked.is_finished(), "nothing allowed it");
+        // With the job, or without the jobs (too many to send with it).
+        for (revision, release, jobs) in [(3, 5, Some(held.clone())), (5, 6, None)] {
+            let command = format!("printf 'Dispatch release {release} now' > dispatched.txt");
+            let asked = ask(&url, &command);
+            let a = pending(&d, started, &command).await;
+            let given = eventually("the request handed to her home", async || {
+                take().await["body"]["decisions"]
+                    .as_array()
+                    .and_then(|d| d.first().cloned())
+            })
+            .await;
+            let mut input = json!({"decideId": given["decideId"], "text": "ALLOW: Sam ordered it"});
+            if let Some(j) = jobs {
+                input["heldJobs"] = j;
+            }
+            let out = post(&app, &token, relayed(DECIDED, input, "local:sarah", "full")).await;
+            assert_eq!(out["status"], "ok", "{out}");
+            waits_on_person(&d, started).await;
+            assert!(!asked.is_finished(), "nothing allowed it");
+            // Let go at Act, then at Act fully again.
+            put(revision, "act").await;
+            let out = approve(a, Some(json!([]))).await;
+            assert_eq!(out["status"], "ok", "{out}");
+            asked.await.unwrap();
+            put(revision + 1, "full").await;
+            crew.read_spent_today(&crew.overseers()).await;
+            take().await;
+        }
     })
     .await;
 }

@@ -1062,12 +1062,19 @@ pub fn shown_name(id: &str, name: Option<&str>, boss: bool) -> String {
     }
 }
 
+/// `line` from its first word: its leading space and marks gone.
+fn worded(line: &str) -> &str {
+    line.trim_start()
+        .trim_start_matches(['#', '>', '-', '*'])
+        .trim_start()
+}
+
 /// The first sentence (or line) of `text`, flattened and clipped to `max`
-/// characters.
+/// characters. What it reads, [`one_line_read`] keeps: they change together.
 pub fn one_line(text: &str, max: usize) -> String {
     let line = text
         .lines()
-        .map(|l| l.trim().trim_start_matches(['#', '>', '-', '*']).trim())
+        .map(|l| worded(l).trim_end())
         .find(|l| !l.is_empty())
         .unwrap_or_default();
     let sentence = line
@@ -1082,6 +1089,23 @@ pub fn one_line(text: &str, max: usize) -> String {
         .map(|(i, c)| &line[..i + c.len_utf8()])
         .unwrap_or(line);
     clip(sentence, max)
+}
+
+/// The least of `text` that [`one_line`] reads the same at `max`: the line
+/// it reads, through its first `max` characters and the next that isn't a
+/// space.
+pub fn one_line_read(text: &str, max: usize) -> &str {
+    text.lines()
+        .find(|l| !worded(l).trim_end().is_empty())
+        .map_or("", |line| {
+            let rest = worded(line);
+            let end = rest
+                .char_indices()
+                .skip(max)
+                .find(|(_, c)| !c.is_whitespace())
+                .map_or(rest.len(), |(i, c)| i + c.len_utf8());
+            &line[..line.len() - rest.len() + end]
+        })
 }
 
 /// `text`'s first line cut to `max` words, with an ellipsis when cut.
@@ -1685,6 +1709,37 @@ mod tests {
             "Compare spend."
         );
         assert_eq!(one_line("abcdefghij", 5), "abcd…");
+    }
+
+    #[test]
+    fn what_one_line_reads_is_read_the_same_and_no_more() {
+        let long = "x".repeat(5_000);
+        for text in [
+            "",
+            "\n  \n",
+            "## Plan\nCompare spend. Then report.",
+            "# - Release 4 of acme/api.\nThen tell Sam.",
+            "  > Dispatch release 4 now and watch it until it's green, then close it",
+            "abcde. fghij",
+            "abcd.efghij klm",
+            "abcd      efghij",
+            "abcd.     efghij",
+            "ééééé ééééé ééééé",
+            "---\n\n* Ship it? Yes.",
+            &format!("Do it now. {long}"),
+            &format!("{long}\n{long}"),
+        ] {
+            for max in [1, 4, 5, 6, 60] {
+                let read = one_line_read(text, max);
+                assert_eq!(
+                    one_line(read, max),
+                    one_line(text, max),
+                    "{text:?} at {max}"
+                );
+                assert!(read.chars().count() <= max + 16, "{read:?}");
+            }
+        }
+        assert_eq!(one_line_read("abcd      efghij", 5), "abcd      e");
     }
 
     #[test]

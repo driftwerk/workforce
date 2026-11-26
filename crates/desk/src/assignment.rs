@@ -82,6 +82,9 @@ pub fn named(given: &str, ids: &[Uuid]) -> Option<Uuid> {
     }
 }
 
+/// How many characters of its text [`Assignment::about`] shows.
+const ABOUT_CHARS: usize = 60;
+
 /// One assignment, as kept.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -178,7 +181,73 @@ impl Assignment {
         if let Some(t) = strongest(&self.parsed_targets()) {
             return t.said();
         }
-        crate::crew::one_line(&self.text, 60)
+        crate::crew::one_line(&self.text, ABOUT_CHARS)
+    }
+
+    /// It as a machine compares a request with it (R5): what it is, who
+    /// holds it, and of its text only what [`Self::about`] reads, so a boss
+    /// holding many long briefs still fits in a call to the machine. Each
+    /// field is named, so one added is decided here: kept when R5 or
+    /// `about` reads it, else cleared.
+    pub fn compared(self) -> Self {
+        let Self {
+            id,
+            boss,
+            session,
+            machine,
+            text,
+            job,
+            job_key,
+            targets,
+            irreversible,
+            urgent,
+            claims,
+            state,
+            sent_at,
+            delivered_at,
+            acked_at,
+            closed_at,
+            line_message: _,
+            repo: _,
+            closed_by: _,
+            closed_why: _,
+            replaces: _,
+            turn: _,
+            item: _,
+            stand_down: _,
+            answer: _,
+            action: _,
+            basis: _,
+        } = self;
+        Self {
+            id,
+            boss,
+            session,
+            machine,
+            line_message: None,
+            text: crate::crew::one_line_read(&text, ABOUT_CHARS).to_string(),
+            job,
+            job_key,
+            repo: None,
+            targets,
+            irreversible,
+            urgent,
+            claims,
+            state,
+            sent_at,
+            delivered_at,
+            acked_at,
+            closed_at,
+            closed_by: None,
+            closed_why: None,
+            replaces: None,
+            turn: None,
+            item: None,
+            stand_down: None,
+            answer: None,
+            action: None,
+            basis: None,
+        }
     }
 
     /// Its targets, read back.
@@ -1146,6 +1215,54 @@ mod tests {
     const URGENT_4: &str = "URGENT, one job: start Harbor production release 4 (leads step 2) and watch it through. Sam, the owner, ordered every production release out tonight";
     const DISPATCH_3: &str = "Dispatch the real release 3 promote now at exactly f40816536a2fa8d947706f7f7a2c3f6d951a0123, with the same workflow and inputs as dry run 44380837640 and dry run off, and send Desk the run id";
     const URGENT_3: &str = "URGENT, one job, from Desk for Sam (owner): start Harbor production release 3 now and watch it through.";
+
+    #[test]
+    fn a_job_compared_on_a_machine_is_about_the_same_and_holds_the_same() {
+        let brief = format!("# - {URGENT_4}.\n\n{}", DISPATCH_3.repeat(400));
+        let mut named = Assignment::new("desk", Uuid::new_v4(), &brief);
+        named.job = Some("release 4 of harbor/monorepo".into());
+        let mut targeted = Assignment::new("desk", Uuid::new_v4(), OWN_4);
+        targeted.targets = keys(OWN_4);
+        for mut a in [
+            named,
+            targeted,
+            Assignment::new("desk", Uuid::new_v4(), &brief),
+            Assignment::new("desk", Uuid::new_v4(), &"é".repeat(10_000)),
+            Assignment::new("desk", Uuid::new_v4(), ""),
+        ] {
+            a.machine = Some("devbox".into());
+            a.job_key = Some("harbor/monorepo/release/4".into());
+            a.irreversible = true;
+            a.claims = true;
+            a.state = AssignmentState::Open;
+            a.closed_why = Some(brief.clone());
+            a.answer = Some(brief.clone());
+            let compared = a.clone().compared();
+            assert!(compared.text.chars().count() <= ABOUT_CHARS + 8);
+            assert_eq!(
+                (compared.closed_why.as_ref(), compared.answer.as_ref()),
+                (None, None)
+            );
+            let read: Assignment =
+                serde_json::from_value(serde_json::to_value(&compared).unwrap()).unwrap();
+            assert_eq!(read, compared);
+            assert_eq!(read.about(), a.about());
+            assert_eq!(
+                (
+                    read.id,
+                    read.session,
+                    read.machine,
+                    read.job_key,
+                    read.targets
+                ),
+                (a.id, a.session, a.machine, a.job_key, a.targets)
+            );
+            assert_eq!(
+                (read.irreversible, read.claims, read.state, read.boss),
+                (a.irreversible, a.claims, a.state, a.boss)
+            );
+        }
+    }
 
     #[test]
     fn the_nights_orders_name_their_release_and_cant_be_taken_back() {

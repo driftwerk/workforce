@@ -37,6 +37,7 @@ use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 use workforce_common::oversight::{Level, Oversight};
+use workforce_desk::crew::MachineRefused;
 use workforce_desk::grant::BossRef;
 
 use super::left::Left;
@@ -820,6 +821,64 @@ impl Told {
     }
 }
 
+/// The Mac's answers to a machine's decisions that didn't, or may not
+/// have, reached it, as it says them in the boss's DM: each once, within
+/// their own [`NOTES_PER_MINUTE`]; past that counted, and each count said
+/// once there is room, never lost.
+#[derive(Default)]
+struct Unanswered {
+    told: Told,
+    /// Those not said yet, by boss and machine.
+    more: HashMap<(String, String), usize>,
+}
+
+impl Unanswered {
+    /// Whether `agent`'s answer `id` that didn't reach `machine` is to be
+    /// said now; one there isn't room for is counted.
+    fn says(&mut self, agent: &str, machine: &str, id: Uuid, now: Instant) -> bool {
+        if self.told.said(id) {
+            return false;
+        }
+        let say = self.told.says(agent, id, now);
+        if !say {
+            *self
+                .more
+                .entry((agent.to_string(), machine.to_string()))
+                .or_default() += 1;
+        }
+        say
+    }
+
+    /// The counts there is room to say now, by boss and machine: each
+    /// taken once.
+    fn due(&mut self, now: Instant) -> Vec<((String, String), usize)> {
+        let told = &mut self.told;
+        let mut due = Vec::new();
+        self.more.retain(|k, n| {
+            let say = told.says(&k.0, Uuid::new_v4(), now);
+            if say {
+                due.push((k.clone(), *n));
+            }
+            !say
+        });
+        due
+    }
+}
+
+/// What the boss's DM says of an answer that didn't reach `machine`.
+fn unanswered(machine: &str, why: &MachineRefused) -> String {
+    let reached = match why {
+        MachineRefused::Unknown(_) => "may not have reached it",
+        _ => "didn't reach it",
+    };
+    format!("On {machine}: Desk decided a session's request there, but its answer {reached}, so the request may still wait for you in that session.")
+}
+
+/// What the boss's DM says of `n` more answers that didn't reach `machine`.
+fn unanswered_more(machine: &str, n: usize) -> String {
+    format!("On {machine}: {n} more of Desk's answers to its sessions' requests didn't, or may not have, reached it, so those requests may still wait for you there.")
+}
+
 impl Pump {
     /// How many decision calls there is room for now: at once, and within
     /// the minute's.
@@ -915,12 +974,17 @@ impl CrewHub {
 pub(crate) async fn pump_loop(crew: Arc<CrewHub>, cancel: CancellationToken) {
     let pumps: Pumps = Arc::default();
     let told: Arc<Mutex<Told>> = Arc::default();
+    let lost: Arc<Mutex<Unanswered>> = Arc::default();
     let mut tick = tokio::time::interval(TAKE_EVERY / 4);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         tokio::select! {
             () = cancel.cancelled() => return,
             _ = tick.tick() => {}
+        }
+        for ((agent, machine), n) in lost.lock().due(Instant::now()) {
+            let crew = Arc::clone(&crew);
+            tokio::spawn(async move { crew.tell_dm(&agent, &unanswered_more(&machine, n)).await });
         }
         // What each pump keeps (the notices said and still to be said taken)
         // waits for the link to come back.
@@ -957,6 +1021,7 @@ pub(crate) async fn pump_loop(crew: Arc<CrewHub>, cancel: CancellationToken) {
                     in_force,
                     Arc::clone(&pumps),
                     Arc::clone(&told),
+                    Arc::clone(&lost),
                 ));
             }
         }
@@ -976,6 +1041,7 @@ async fn take(
     in_force: bool,
     pumps: Pumps,
     told: Arc<Mutex<Told>>,
+    lost: Arc<Mutex<Unanswered>>,
 ) {
     let (machine, group) = &k;
     let agent = service.agent_id.as_str().to_string();
@@ -1121,6 +1187,7 @@ async fn take(
             prompt.to_string(),
             Call::of(d["kind"].as_str()),
             Arc::clone(&pumps),
+            Arc::clone(&lost),
         ));
     }
 }
@@ -1136,6 +1203,7 @@ async fn decide_one(
     prompt: String,
     call: Option<Call>,
     pumps: Pumps,
+    lost: Arc<Mutex<Unanswered>>,
 ) {
     let (machine, group) = &k;
     let agent = service.agent_id.as_str().to_string();
@@ -1209,24 +1277,43 @@ async fn decide_one(
         }
         d => d,
     };
-    let mut input = match decided {
+    let input = match decided {
         Ok(text) => json!({"decideId": id,
                            "text": text.chars().take(MAX_ANSWER).collect::<String>()}),
         Err((code, why)) => json!({"decideId": id, "error": why, "code": code.as_str()}),
     };
-    // The jobs the boss holds here, for the machine to compare the request
-    // with (R5); none said when they couldn't be read, and the machine then
-    // leaves an irreversible one to the person.
-    if let Ok(held) = crew.held_irreversible(&agent).await {
-        input["heldJobs"] = json!(held);
-    }
-    tracing::info!(%machine, %group, %agent, ok = input.get("text").is_some(), "a relayed boss decided a machine's request");
     let ceiling = crew.ceiling_now(&agent, &o);
-    if let Err(why) = crew
-        .relay(machine, group, DECIDED, input, &agent, &ceiling)
+    // The jobs the boss holds here, for the machine to compare the request
+    // with (R5); none said when they couldn't be read or don't fit, and the
+    // machine then leaves an irreversible one to the person.
+    let input = match crew.held_irreversible(&agent).await {
+        Ok(held) => super::assignments::with_held(input, "heldJobs", &held, machine, |v| {
+            super::relay::carries(machine, group, DECIDED, v, &agent, &ceiling)
+        })
+        .unwrap_or_else(|without| without),
+        Err(_) => input,
+    };
+    tracing::info!(%machine, %group, %agent, ok = input.get("text").is_some(), "a relayed boss decided a machine's request");
+    match crew
+        .relay_as(machine, group, DECIDED, input, &agent, &ceiling)
         .await
     {
-        tracing::warn!(%machine, %group, why, "a relayed decision's answer didn't reach its machine");
+        Ok(a) if a.status == ServedStatus::Ok => {}
+        // Its wait there ran out first: the machine settled the request as
+        // one its home didn't answer.
+        Ok(a) => {
+            tracing::info!(%machine, %group, body = %a.body, "a machine no longer waited for a relayed decision's answer");
+        }
+        Err(why) => {
+            tracing::warn!(%machine, %group, why = %why, "a relayed decision's answer didn't reach its machine");
+            // Its session there may wait on it: said to the person, once.
+            let say = id
+                .parse()
+                .is_ok_and(|id| lost.lock().says(&agent, machine, id, Instant::now()));
+            if say {
+                crew.tell_dm(&agent, &unanswered(machine, &why)).await;
+            }
+        }
     }
 }
 
@@ -1243,6 +1330,50 @@ mod tests {
             others: others.iter().map(|(g, u)| (g.to_string(), *u)).collect(),
             takes: HashSet::new(),
         }
+    }
+
+    #[test]
+    fn an_answer_that_didnt_reach_its_machine_is_said_once_and_none_is_lost_to_the_pace() {
+        const WHY: &str = "send less in it";
+        let now = Instant::now();
+        let mut lost = Unanswered::default();
+        let ids: Vec<Uuid> = (0..NOTES_PER_MINUTE + 3).map(|_| Uuid::new_v4()).collect();
+        let said = ids
+            .iter()
+            .filter(|id| lost.says("sarah", "devbox", **id, now))
+            .count();
+        assert_eq!(said, NOTES_PER_MINUTE);
+        assert!(!lost.says("sarah", "devbox", ids[0], now), "said once");
+        assert!(lost.due(now).is_empty(), "no room yet");
+        let later = now + Duration::from_secs(61);
+        assert_eq!(
+            lost.due(later),
+            vec![(("sarah".into(), "devbox".into()), 3)]
+        );
+        assert!(lost.due(later).is_empty(), "each count said once");
+        for (why, said) in [
+            (
+                MachineRefused::Unreached(WHY.into()),
+                "its answer didn't reach it",
+            ),
+            (
+                MachineRefused::Refused(WHY.into()),
+                "its answer didn't reach it",
+            ),
+            (
+                MachineRefused::Unknown(WHY.into()),
+                "its answer may not have reached it",
+            ),
+        ] {
+            let words = unanswered("devbox", &why);
+            assert!(words.starts_with("On devbox: Desk decided a session's request there"));
+            assert!(words.contains(said), "{words}");
+            assert!(!words.contains(WHY), "{words}");
+        }
+        assert_eq!(
+            unanswered_more("devbox", 3),
+            "On devbox: 3 more of Desk's answers to its sessions' requests didn't, or may not have, reached it, so those requests may still wait for you there."
+        );
     }
 
     #[test]
