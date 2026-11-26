@@ -1517,8 +1517,8 @@ impl CrewHub {
     /// The person's `answer` to `closed` goes to its boss as their message:
     /// into the turn running in its DM, as their follow-ups do, else as the
     /// DM's next turn once any other turn there lets go, and is noted on
-    /// the item as delivered. One already in the DM (taken in by a turn whose
-    /// reply was late) isn't said again. One that can't get there is
+    /// the item as delivered. One already in the DM, before the offer or
+    /// after it (taken in by a turn whose reply was late), isn't said again. One that can't get there is
     /// [`Self::answer_lost`]; one settled meanwhile goes no further.
     pub(super) async fn answer_delivered(
         &self,
@@ -1534,9 +1534,8 @@ impl CrewHub {
                 if !me.still_owed(closed).await {
                     return Ok(false);
                 }
-                if reached(service, owner, closed, answer).unwrap_or(false)
-                    || me.offered(service, owner, closed, message).await
-                {
+                let held = || reached(service, owner, closed, answer).unwrap_or(false);
+                if held() || me.offered(service, owner, closed, message).await || held() {
                     return Ok(true);
                 }
                 me.run_dm_turn(service, owner, message, 0, None, Some(Speaker::you()))
