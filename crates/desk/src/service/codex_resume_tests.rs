@@ -4,7 +4,6 @@
 //! stays up.
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::time::Duration;
 
 use serde_json::{json, Value};
@@ -16,7 +15,7 @@ use workforce_postgres::{test_support::with_test_pool, PostgresPool};
 
 use super::codex_asks_tests::{codex_session, until};
 use super::tests::options;
-use super::{Desk, DeskError};
+use super::{Desk, DeskError, Settled};
 use crate::codex::tests::{next_sent, say};
 use crate::crew::By;
 use crate::mode::Mode;
@@ -261,6 +260,8 @@ async fn a_codex_session_runs_in_its_own_mode_unless_one_that_doesnt_ask_is_kept
         let dir = tempfile::tempdir().unwrap();
         let dir = dir.path().canonicalize().unwrap();
         let (d, s) = started(pool.clone(), &dir).await;
+        // It ran a turn: a refusal to resume it stands.
+        d.change(s.id, |r, _| r.last_reply = Some("done".into()));
         let ok = json!({"thread": {"id": "t1"}});
         let tui_has_no_permissions = || {
             tui_starts(&dir)
@@ -772,46 +773,43 @@ async fn a_codex_session_that_ended_asking_starts_again_in_new_permissions() {
         let dir = dir.path().canonicalize().unwrap();
         let (d, s) = started_with(pool, &dir, true).await;
         d.change(s.id, |r, _| r.state = SessionState::Asking);
-        let told = Arc::new(parking_lot::Mutex::new(None));
-        let (asked, _) = started_again(&d, &dir, &[json!({"thread": {"id": "t1"}})], {
-            let told = told.clone();
-            move |d| async move {
-                taken_on(&d, s.id).await;
-                let answer = d
-                    .line_send(
-                        super::line::Sender::Overseer(By::manager("crew", "Crew", "go on")),
-                        crate::line::Send::Tell {
-                            to: crate::line::Target::Session(s.id),
-                            text: "yes, use the staging database".into(),
-                            when: crate::line::When::Queue,
-                        },
-                    )
-                    .await
-                    .unwrap();
-                // Held while it runs in the old ones; never read by
-                // them once they are ended for the new.
-                let view = d.view(s.id).unwrap();
-                let ended =
-                    d.0.state
-                        .lock()
-                        .live
-                        .get(&s.id)
-                        .is_none_or(|l| l._codex.is_none());
-                assert!(
-                    d.line_gate(&view, &answer) == Some(crate::line::Wait::Restarting)
-                        || view.state == SessionState::Starting
-                        || ended,
-                    "held for the restart"
-                );
-                *told.lock() = Some(answer);
-                Ok(())
-            }
-        })
+        // Its boss only suggests, then decides while the person drives it:
+        // its permissions are due, and its restart waits on them.
+        crew_at(&d, "suggest");
+        taken_on(&d, s.id).await;
+        d.drive(s.id).await.unwrap();
+        crew_at(&d, "full");
+        assert!(d.permissions_due(s.id));
+        let answer = d
+            .line_send(
+                super::line::Sender::Overseer(By::manager("crew", "Crew", "go on")),
+                crate::line::Send::Tell {
+                    to: crate::line::Target::Session(s.id),
+                    text: "yes, use the staging database".into(),
+                    when: crate::line::When::Queue,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            d.line_gate(&d.view(s.id).unwrap(), &answer),
+            Some(crate::line::Wait::Restarting),
+            "held for the restart"
+        );
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(tui_starts(&dir).len(), 1, "not while the person drives");
+
+        // Handed back: started again though it is asking.
+        let (asked, _) = started_again(
+            &d,
+            &dir,
+            &[json!({"thread": {"id": "t1"}})],
+            move |d| async move { d.hand_back(s.id).await.map(|_| ()) },
+        )
         .await;
         assert_eq!(asked, [in_mode(&dir, "on-request", "workspace-write")]);
         until(|| tui_starts(&dir).len() == 2).await;
         until(|| !d.permissions_due(s.id)).await;
-        let answer = told.lock().clone().unwrap();
         assert_ne!(
             d.line_gate(&d.view(s.id).unwrap(), &answer),
             Some(crate::line::Wait::Restarting),
@@ -849,7 +847,8 @@ async fn a_codex_session_with_no_turn_yet_is_started_afresh_once_it_is_up() {
         say(&mut ws, status("idle")).await;
         let mut ws = server.await.unwrap();
         let fresh = serve(&dir);
-        let unwritten = json!({"code": -32600, "message": "no rollout found for thread id t1"});
+        // Refused in words Desk doesn't read: no turn, no path, all the same.
+        let unwritten = json!({"code": -32600, "message": "thread t1 not found"});
         resumed(&mut ws, unwritten).await;
         let _ws = fresh.await.unwrap();
         until(|| tui_starts(&dir).len() == 2).await;
@@ -859,14 +858,22 @@ async fn a_codex_session_with_no_turn_yet_is_started_afresh_once_it_is_up() {
         until(|| d.view(s.id).unwrap().live).await;
         let v = d.view(s.id).unwrap();
         assert!(v.failure.is_none() && v.exited.is_none(), "{v:?}");
-        let afresh = d
+        let said: Vec<String> = d
             .activity(crate::crew::Filter::All, None, 50)
             .await
             .unwrap()
             .events
             .into_iter()
-            .any(|e| e.text.contains("Started it afresh"));
-        assert!(afresh);
+            .map(|e| e.text)
+            .collect();
+        assert!(
+            said.iter().any(|t| t.contains("Started it afresh")),
+            "{said:?}"
+        );
+        assert!(
+            !said.iter().any(|t| t.contains("didn't resume")),
+            "no failure said of it: {said:?}"
+        );
     })
     .await;
 }
@@ -881,6 +888,8 @@ async fn a_failed_start_in_new_permissions_is_said_once_and_a_mismatch_is_said()
         let dir = tempfile::tempdir().unwrap();
         let dir = dir.path().canonicalize().unwrap();
         let (d, s) = started_with(pool, &dir, true).await;
+        // It ran a turn: a refusal to resume it stands.
+        d.change(s.id, |r, _| r.last_reply = Some("done".into()));
         let mut events = d.events();
         let lost = json!({"code": -32603, "message": "thread t1 could not be loaded"});
         taken_on(&d, s.id).await;
@@ -937,7 +946,8 @@ async fn a_failed_start_in_new_permissions_is_said_once_and_a_mismatch_is_said()
 /// A session adopted from an earlier run of Desk runs in what Codex says
 /// its thread runs in: never started again before that is said, nor after
 /// when it is what it should run in now; started again in place when not.
-/// Never said, it is taken in time to run in what it should.
+/// Never said, it is taken in time to run in what it should, until Codex
+/// first says otherwise.
 #[tokio::test]
 async fn an_adopted_codex_session_runs_in_what_codex_says_until_that_differs() {
     with_test_pool(build_pool, |pool| async move {
@@ -951,12 +961,12 @@ async fn an_adopted_codex_session_runs_in_what_codex_says_until_that_differs() {
         };
         let own = crate::codex::Permissions::of(None, true, false);
         let charged = crate::codex::Permissions::of(None, true, true);
-        assert_eq!(link(&d), (own, true));
+        assert_eq!(link(&d), (own, Settled::Said));
         let adopted = |d: &Desk| {
             let mut st = d.0.state.lock();
             let l = st.live.get_mut(&s.id).unwrap()._codex.as_mut().unwrap();
             l.permissions = charged;
-            l.settled = false;
+            l.settled = Settled::Unsaid;
         };
         let runs = |reviewer: &str| crate::codex::Runs {
             reviewer: Some(reviewer.into()),
@@ -971,22 +981,23 @@ async fn an_adopted_codex_session_runs_in_what_codex_says_until_that_differs() {
         tokio::time::sleep(Duration::from_millis(500)).await;
         assert_eq!(tui_starts(&dir).len(), 1);
 
+        // Said to run in what it should now: kept so.
+        d.codex_runs(s.id, &runs("auto_review"));
+        assert_eq!(link(&d), (own, Settled::Said));
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(tui_starts(&dir).len(), 1, "never started again");
+
         // Never said: taken to run in what it should, in time.
+        adopted(&d);
         d.settle_unsaid(s.id);
         tokio::time::sleep(Duration::from_millis(500)).await;
-        assert_eq!(link(&d), (charged, false), "not yet");
-        until(|| link(&d) == (own, true)).await;
+        assert_eq!(link(&d), (charged, Settled::Unsaid), "not yet");
+        until(|| link(&d) == (own, Settled::Taken)).await;
+        assert!(!d.permissions_due(s.id));
         assert_eq!(tui_starts(&dir).len(), 1, "never started again");
 
-        // Said to run in what it should now: kept so.
-        adopted(&d);
-        d.codex_runs(s.id, &runs("auto_review"));
-        assert_eq!(link(&d), (own, true));
-        tokio::time::sleep(Duration::from_millis(500)).await;
-        assert_eq!(tui_starts(&dir).len(), 1, "never started again");
-
-        // Said to run under a boss no longer there: started again in its own.
-        adopted(&d);
+        // Then said to run under a boss no longer there: started again in
+        // its own.
         let (asked, _) = started_again(
             &d,
             &dir,
@@ -1001,7 +1012,7 @@ async fn an_adopted_codex_session_runs_in_what_codex_says_until_that_differs() {
         back["approvalsReviewer"] = json!("auto_review");
         assert_eq!(asked, [back]);
         until(|| tui_starts(&dir).len() == 2).await;
-        until(|| link(&d) == (own, true)).await;
+        until(|| link(&d) == (own, Settled::Said)).await;
     })
     .await;
 }

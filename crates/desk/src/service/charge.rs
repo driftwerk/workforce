@@ -12,7 +12,6 @@
 //! lets what waited go once the wheel is back.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
@@ -1138,13 +1137,18 @@ impl Desk {
             .status()
             .is_ok_and(|s| s.success());
         let upstream = git_line(&cwd, &["rev-parse", "--abbrev-ref", "@{upstream}"]);
-        let path = self
-            .with_added(&self.0.state.lock().session_env.clone())
-            .remove("PATH");
-        let commands = git_commands(path.as_deref());
+        // Read only once an alias is met, and then once.
+        let env = self.with_added(&self.0.state.lock().session_env.clone());
+        let listed = std::cell::OnceCell::new();
+        let git_has = |name: &str| {
+            listed
+                .get_or_init(|| git_commands(&self.0.shell, std::path::Path::new(&cwd), &env))
+                .as_ref()
+                .map(|c: &HashSet<String>| c.contains(name))
+        };
         let repo = Repo {
             aliases: &aliases,
-            git_commands: commands.as_deref(),
+            git_has: &git_has,
             is_branch: &is_branch,
             head_pushed,
             upstream: upstream.as_deref().and_then(|u| u.split('/').next()),
@@ -2320,39 +2324,48 @@ fn git_line_within(
     (!line.is_empty()).then_some(line)
 }
 
-/// Git's own commands and those it finds on `path`, the one sessions run
-/// with (an external `git-lfs` runs before an alias by its name): read once
-/// git says them for that path, none while it can't.
-fn git_commands(path: Option<&str>) -> Option<Arc<HashSet<String>>> {
-    static KNOWN: OnceLock<parking_lot::Mutex<HashMap<Option<String>, Arc<HashSet<String>>>>> =
-        OnceLock::new();
-    let known = KNOWN.get_or_init(Default::default);
-    let key = path.map(str::to_string);
-    if let Some(commands) = known.lock().get(&key) {
-        return Some(commands.clone());
-    }
-    let mut git = std::process::Command::new("git");
-    if let Some(path) = path {
-        // The session's `git`, found on its own path.
-        git.env("PATH", path);
-    }
-    // Away from any repository: a broken one here fails the listing.
-    let out = git
-        .arg("--list-cmds=main,others")
-        .current_dir(std::env::temp_dir())
-        .env_remove("GIT_DIR")
+/// Git's own commands and those it finds where a session finds them: in
+/// `cwd`, through its login `shell` (`-lc`, as Codex runs its commands)
+/// with `env`, so an external `git-<name>` on a path the shell's profile
+/// sets counts. None when that shell can't say within [`GIT_WITHIN`].
+fn git_commands(
+    shell: &str,
+    cwd: &std::path::Path,
+    env: &std::collections::BTreeMap<String, String>,
+) -> Option<HashSet<String>> {
+    use std::io::Read;
+    let mut child = std::process::Command::new(shell)
+        .args(["-lc", "git --list-cmds=main,others"])
+        .current_dir(cwd)
+        .env_clear()
+        .envs(env)
+        .env("GIT_TERMINAL_PROMPT", "0")
         .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
-        .output()
-        .ok()
-        .filter(|o| o.status.success())?;
-    let commands = commands_of(&String::from_utf8_lossy(&out.stdout));
-    (!commands.is_empty()).then(|| {
-        let commands = Arc::new(commands);
-        known.lock().insert(key, commands.clone());
-        commands
-    })
+        .spawn()
+        .ok()?;
+    let until = std::time::Instant::now() + GIT_WITHIN;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) if status.success() => break,
+            Ok(Some(_)) | Err(_) => return None,
+            Ok(None) if std::time::Instant::now() >= until => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(25)),
+        }
+    }
+    let mut out = String::new();
+    child.stdout.take()?.read_to_string(&mut out).ok()?;
+    let commands = commands_of(&out);
+    (!commands.is_empty()).then_some(commands)
 }
+
+/// How long a session's login shell has to say git's commands.
+const GIT_WITHIN: Duration = Duration::from_secs(5);
 
 /// The commands `git --list-cmds` says, one a line.
 fn commands_of(listed: &str) -> HashSet<String> {

@@ -695,12 +695,24 @@ struct CodexLink {
     permissions: Option<codex::Permissions>,
     /// The mode it was launched in, from which `permissions` came.
     mode: Option<crate::mode::Mode>,
-    /// Whether `permissions` is known to be what it runs in: one adopted
-    /// from an earlier run of Desk runs in what Codex says its thread runs
-    /// in ([`Desk::codex_runs`]), never started again before that is said.
-    settled: bool,
+    /// How Desk knows `permissions` is what it runs in.
+    settled: Settled,
     /// Whether its network is on, as Codex said it runs its thread.
     network: Option<bool>,
+}
+
+/// How Desk knows what a Codex session runs in: one adopted from an
+/// earlier run of Desk runs in what Codex says its thread runs in
+/// ([`Desk::codex_runs`]), never started again before that is said.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Settled {
+    /// Adopted, and Codex hasn't said yet.
+    Unsaid,
+    /// Codex said nothing in time: taken to be what it should run in, until
+    /// Codex first says.
+    Taken,
+    /// Desk asked for it, or Codex said it.
+    Said,
 }
 
 impl CodexLink {
@@ -1067,6 +1079,19 @@ const STOP_LOOKS: u32 = 10;
 
 /// Whether a Codex session's app-server took Desk's resume of its thread
 /// ([`codex::Follower::resuming`]), in time; why not, in words.
+/// Whether Codex's `refusal` to resume `r` is of a thread that never ran a
+/// turn: none Desk heard of, and no rollout of it, by Codex's word or as
+/// Desk knows its path.
+fn codex_unwritten(r: &SessionRecord, refusal: &str) -> bool {
+    r.engine == Engine::Codex
+        && r.last_prompt.is_none()
+        && r.last_reply.is_none()
+        && (refusal.contains(codex::NO_ROLLOUT)
+            || r.transcript
+                .as_deref()
+                .is_none_or(|t| !Path::new(t).is_file()))
+}
+
 async fn codex_primed(primed: oneshot::Receiver<Result<(), String>>) -> Result<(), String> {
     match tokio::time::timeout(PRIMED_WITHIN, primed).await {
         Ok(Ok(taken)) => taken,
@@ -2404,7 +2429,7 @@ impl Desk {
                         let mut link =
                             self.observe_codex(id, server, socket, follower.at_once(), permissions);
                         link.mode = mode;
-                        link.settled = false;
+                        link.settled = Settled::Unsaid;
                         self.settle_unsaid(id);
                         link
                     })
@@ -4365,16 +4390,11 @@ impl Desk {
         // A Codex thread that never ran a turn has no rollout, and Codex
         // won't resume it: nothing of it is lost, so it starts afresh, in
         // what it runs in now. One that ran a turn keeps Codex's refusal.
-        let unwritten = matches!(&launched, Err(DeskError::Conflict(why))
-            if why.contains(codex::NO_ROLLOUT));
+        let unwritten =
+            matches!(&launched, Err(DeskError::Conflict(why)) if codex_unwritten(&r, why));
         let afresh = match afresh {
-            None if r.engine == Engine::Codex
-                && unwritten
-                && r.last_prompt.is_none()
-                && r.last_reply.is_none() =>
-            {
+            None if unwritten => {
                 tracing::info!(target: crate::STARTS, session = %id, "a Codex thread with no turn has no rollout: started afresh");
-                self.0.state.lock().exited.remove(&id);
                 self.change(id, |r, _| {
                     r.cli_session_id = None;
                     r.transcript = None;
@@ -6022,6 +6042,10 @@ impl Desk {
                     if let Err(why) = codex_primed(primed).await {
                         link.stop();
                         let said = format!("Codex didn't resume its conversation: {why}");
+                        // Started afresh instead: no end of it to tell.
+                        if codex_unwritten(r, &why) {
+                            return Err(DeskError::Conflict(said));
+                        }
                         self.exited_now(
                             r.id,
                             Exited {
@@ -6430,14 +6454,16 @@ impl Desk {
             };
             link.network = runs.network;
             match link.settled {
-                true => link.permissions,
-                false => {
+                Settled::Said => link.permissions,
+                // What it was taken to run in gives way to what Codex says:
+                // started again when that isn't what it should run in now.
+                Settled::Unsaid | Settled::Taken => {
                     let mode = link.mode;
                     link.permissions = [true, false]
                         .into_iter()
                         .filter_map(|charged| codex::Permissions::of(mode, approve_for_me, charged))
                         .find(|p| runs.differs(p).is_none());
-                    link.settled = true;
+                    link.settled = Settled::Said;
                     None
                 }
             }
@@ -6461,7 +6487,8 @@ impl Desk {
     /// Settles an adopted session `id` whose thread Codex hasn't said it
     /// runs in within [`SETTLE_WITHIN`] (a resume that names no
     /// reviewer nor sandbox, a thread not yet started): taken to run in
-    /// what Desk would start it in now, never started again for it.
+    /// what Desk would start it in now, never started again for it, until
+    /// Codex first says otherwise.
     fn settle_unsaid(&self, id: Uuid) {
         let d = self.clone();
         tokio::spawn(async move {
@@ -6471,7 +6498,7 @@ impl Desk {
                 st.live
                     .get(&id)
                     .and_then(|l| l._codex.as_ref())
-                    .filter(|link| !link.settled)
+                    .filter(|link| link.settled == Settled::Unsaid)
                     .map(|link| link.mode)
                     .zip(st.records.get(&id).map(|r| r.approve_for_me))
             };
@@ -6484,11 +6511,11 @@ impl Desk {
                 .live
                 .get_mut(&id)
                 .and_then(|l| l._codex.as_mut())
-                .filter(|link| !link.settled)
+                .filter(|link| link.settled == Settled::Unsaid)
             {
                 tracing::info!(%id, "codex never said what an adopted session's thread runs in: taken to run in what it should");
                 link.permissions = now;
-                link.settled = true;
+                link.settled = Settled::Taken;
             }
         });
     }
@@ -6501,7 +6528,7 @@ impl Desk {
         let launched = {
             let st = self.0.state.lock();
             let link = st.live.get(&id).and_then(|l| l._codex.as_ref());
-            link.filter(|link| link.settled)
+            link.filter(|link| link.settled != Settled::Unsaid)
                 .map(|link| (link.permissions, link.mode))
                 .zip(st.records.get(&id).map(|r| r.approve_for_me))
         };
@@ -6561,7 +6588,7 @@ impl Desk {
             line_steers,
             permissions,
             mode: None,
-            settled: true,
+            settled: Settled::Said,
             network: None,
         }
     }
@@ -13129,7 +13156,7 @@ mod codex_stop_tests {
             line_steers: mpsc::unbounded_channel().0,
             permissions: None,
             mode: None,
-            settled: true,
+            settled: Settled::Said,
             network: None,
         };
         (link, pid, hdir)

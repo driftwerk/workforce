@@ -6,7 +6,7 @@
 //! against the few it is known by in its class: a flag outside them, and
 //! whatever can't be read for certain, is [`Class::Other`].
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use super::{push, split, Cmd, Here, PushKind, Walk, Word};
 
@@ -65,11 +65,10 @@ impl From<PushKind> for Class {
 pub struct Repo<'a> {
     /// Its git aliases, by name (`git config -z --get-regexp ^alias\.`).
     pub aliases: &'a HashMap<String, String>,
-    /// Git's own commands and those it finds on its path
-    /// (`git --list-cmds=main,others`): an alias by one of their names is
-    /// never run, git runs its own. None when git couldn't say: then no
-    /// alias is read at all.
-    pub git_commands: Option<&'a HashSet<String>>,
+    /// Whether git runs a command of its own by a name, as the session's
+    /// shell finds it (`git --list-cmds=main,others`): an alias by one is
+    /// never run. None when that can't be told: then no alias is read.
+    pub git_has: &'a dyn Fn(&str) -> Option<bool>,
     /// Whether a name is one of its local branches
     /// (`rev-parse --verify refs/heads/<name>`).
     pub is_branch: &'a dyn Fn(&str) -> bool,
@@ -347,16 +346,13 @@ fn git(args: &[&str], here: &Here<'_>, repo: &Repo<'_>, depth: usize, moved: boo
     if sub.starts_with('-') {
         return Class::Other;
     }
-    let own = |c: &HashSet<String>| c.contains(*sub);
-    if let Some(alias) = repo
-        .aliases
-        .get(*sub)
-        .filter(|_| !repo.git_commands.is_some_and(own))
-    {
-        // Which of its names are git's own can't be told: nor what runs.
-        if repo.git_commands.is_none() {
-            return Class::Other;
-        }
+    let alias = match repo.aliases.get(*sub).map(|a| ((repo.git_has)(sub), a)) {
+        // Whether git runs its own by that name can't be told: nor what runs.
+        Some((None, _)) => return Class::Other,
+        Some((Some(false), alias)) => Some(alias),
+        Some((Some(true), _)) | None => None,
+    };
+    if let Some(alias) = alias {
         let tail = rest
             .iter()
             .map(|a| shell_word(a))
@@ -468,7 +464,9 @@ fn git(args: &[&str], here: &Here<'_>, repo: &Repo<'_>, depth: usize, moved: boo
         {
             Class::LocalGit
         }
-        "branch" => match (Known {
+        // What follows a `--` are paths, whatever they are named: a
+        // checkout of them discards their changes.
+        "branch" if !rest.contains(&"--") => match (Known {
             valued: &[],
             bare: &["-a", "-r", "-v", "-vv", "--list", "--show-current"],
         })
@@ -477,7 +475,7 @@ fn git(args: &[&str], here: &Here<'_>, repo: &Repo<'_>, depth: usize, moved: boo
             Some((_, ops)) if ops.len() <= 1 => Class::LocalGit,
             _ => Class::Other,
         },
-        "switch" => match (Known {
+        "switch" if !rest.contains(&"--") => match (Known {
             valued: &["-c", "--create"],
             bare: &[],
         })
@@ -487,7 +485,7 @@ fn git(args: &[&str], here: &Here<'_>, repo: &Repo<'_>, depth: usize, moved: boo
             Some((flags, ops)) if flags.len() == 1 && ops.is_empty() => Class::LocalGit,
             _ => Class::Other,
         },
-        "checkout" => match (Known {
+        "checkout" if !rest.contains(&"--") => match (Known {
             valued: &["-b"],
             bare: &[],
         })
@@ -1072,6 +1070,7 @@ fn shipping(program: &str, args: &[&str]) -> Option<Class> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
     use std::path::{Path, PathBuf};
 
     use super::*;
@@ -1089,10 +1088,9 @@ mod tests {
             ("up".to_string(), "push origin feat/x".to_string()),
             ("st".to_string(), "status".to_string()),
         ]);
-        let commands = git_commands();
         let repo = Repo {
             aliases: &aliases,
-            git_commands: Some(&commands),
+            git_has: &|c| Some(git_commands().contains(c)),
             is_branch: &|b| b == "feat/y" || b == "main",
             head_pushed,
             upstream: Some("origin"),
@@ -1195,6 +1193,10 @@ mod tests {
             "git switch -C feat/y",
             "git switch --detach main",
             "git checkout -f feat/y",
+            "git checkout -- main",
+            "git checkout -b x -- main",
+            "git switch -- main",
+            "git branch -- feat/z",
             "git checkout -B feat/y",
             "git checkout --orphan x",
             "git stash push --include-untracked -m x",
@@ -1364,13 +1366,13 @@ mod tests {
     }
 
     fn with_aliases(command: &str, aliases: &[(&str, &str)]) -> Class {
-        with_commands(command, aliases, Some(&git_commands()))
+        with_commands(command, aliases, &|c| Some(git_commands().contains(c)))
     }
 
     fn with_commands(
         command: &str,
         aliases: &[(&str, &str)],
-        git_commands: Option<&HashSet<String>>,
+        git_has: &dyn Fn(&str) -> Option<bool>,
     ) -> Class {
         let home = Path::new("/Users/sam");
         let own = Path::new("/Users/sam/dev/acme-web");
@@ -1384,7 +1386,7 @@ mod tests {
             .collect();
         let repo = Repo {
             aliases: &aliases,
-            git_commands,
+            git_has,
             is_branch: &|_| false,
             head_pushed: false,
             upstream: Some("origin"),
@@ -1406,7 +1408,7 @@ mod tests {
             Class::Other
         );
         assert_eq!(
-            with_commands("git st", &[("st", "status")], None),
+            with_commands("git st", &[("st", "status")], &|_| None),
             Class::Other
         );
         let aliases = [("push", "status"), ("commit", "status"), ("diff", "!true")];

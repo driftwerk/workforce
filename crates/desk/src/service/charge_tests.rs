@@ -1890,21 +1890,39 @@ fn git_says_its_commands_a_line_each() {
     );
 }
 
-/// Git says its own commands, and those on the path sessions run with,
-/// wherever Desk runs.
+/// Git says its own commands, and those a session's login shell finds,
+/// in its folder: a path its profile adds, or a relative one, included.
 #[cfg(unix)]
 #[test]
-fn git_says_its_own_commands_and_those_on_the_sessions_path() {
-    let bin = tempfile::tempdir().unwrap();
-    let theirs = bin.path().join("git-theirs");
-    std::fs::write(&theirs, "#!/bin/sh\n").unwrap();
-    let mut perms = std::fs::metadata(&theirs).unwrap().permissions();
-    std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
-    std::fs::set_permissions(&theirs, perms).unwrap();
-    let path = format!("{}:/usr/bin:/bin", bin.path().display());
-    let commands = super::git_commands(Some(&path)).expect("git says its commands");
+fn git_says_its_own_commands_and_those_the_sessions_shell_finds() {
+    use std::os::unix::fs::PermissionsExt;
+    let home = tempfile::tempdir().unwrap();
+    let work = tempfile::tempdir().unwrap();
+    let external = |dir: &std::path::Path, name: &str| {
+        std::fs::create_dir_all(dir).unwrap();
+        let at = dir.join(name);
+        std::fs::write(&at, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&at, std::fs::Permissions::from_mode(0o755)).unwrap();
+    };
+    external(&home.path().join("profiled"), "git-profiled");
+    external(&work.path().join("bin"), "git-here");
+    // Only a login shell reads it.
+    std::fs::write(
+        home.path().join(".profile"),
+        format!("PATH=\"{}/profiled:$PATH\"\n", home.path().display()),
+    )
+    .unwrap();
+    let env = std::collections::BTreeMap::from([
+        ("HOME".to_string(), home.path().display().to_string()),
+        ("PATH".to_string(), "bin:/usr/bin:/bin".to_string()),
+    ]);
+    let commands =
+        super::git_commands("/bin/sh", work.path(), &env).expect("git says its commands");
     assert!(commands.contains("push") && commands.contains("send-pack"));
-    assert!(commands.contains("theirs"), "one on the session's path");
-    let own = super::git_commands(None).expect("on Desk's own path");
-    assert!(!own.contains("theirs"));
+    assert!(commands.contains("profiled"), "one its profile's path has");
+    assert!(commands.contains("here"), "one a relative path finds there");
+    assert_eq!(
+        super::git_commands("/nonexistent/sh", work.path(), &env),
+        None
+    );
 }
