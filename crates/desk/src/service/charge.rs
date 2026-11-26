@@ -12,6 +12,7 @@
 //! lets what waited go once the wheel is back.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
@@ -1139,6 +1140,7 @@ impl Desk {
         let upstream = git_line(&cwd, &["rev-parse", "--abbrev-ref", "@{upstream}"]);
         let repo = Repo {
             aliases: &aliases,
+            git_commands: git_commands(),
             is_branch: &is_branch,
             head_pushed,
             upstream: upstream.as_deref().and_then(|u| u.split('/').next()),
@@ -2312,6 +2314,37 @@ fn git_line_within(
     child.stdout.take()?.read_to_string(&mut out).ok()?;
     let line = out.lines().next().unwrap_or_default().trim().to_string();
     (!line.is_empty()).then_some(line)
+}
+
+/// Git's own commands and those it finds on its path, read once git says
+/// them: none while it can't.
+fn git_commands() -> Option<&'static HashSet<String>> {
+    static COMMANDS: OnceLock<HashSet<String>> = OnceLock::new();
+    if let Some(known) = COMMANDS.get() {
+        return Some(known);
+    }
+    // Away from any repository: a broken one here fails the listing.
+    let out = std::process::Command::new("git")
+        .arg("--list-cmds=main,others")
+        .current_dir(std::env::temp_dir())
+        .env_remove("GIT_DIR")
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()
+        .filter(|o| o.status.success())?;
+    let commands = commands_of(&String::from_utf8_lossy(&out.stdout));
+    (!commands.is_empty()).then(|| COMMANDS.get_or_init(|| commands))
+}
+
+/// The commands `git --list-cmds` says, one a line.
+fn commands_of(listed: &str) -> HashSet<String> {
+    listed
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .map(str::to_string)
+        .collect()
 }
 
 /// Git's aliases from `git config -z --get-regexp ^alias\.`: each entry

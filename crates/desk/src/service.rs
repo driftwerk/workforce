@@ -670,6 +670,14 @@ impl Server {
     }
 }
 
+/// How long an adopted Codex session waits for Codex to say what its
+/// thread runs in before it is taken to run in what it should.
+const SETTLE_WITHIN: Duration = if cfg!(test) {
+    Duration::from_millis(1500)
+} else {
+    Duration::from_secs(30)
+};
+
 /// A Codex session's app-server and observer; dropping it stops the
 /// observer, and the app-server when it is the hub's own.
 struct CodexLink {
@@ -2397,6 +2405,7 @@ impl Desk {
                             self.observe_codex(id, server, socket, follower.at_once(), permissions);
                         link.mode = mode;
                         link.settled = false;
+                        self.settle_unsaid(id);
                         link
                     })
                 }
@@ -4277,25 +4286,6 @@ impl Desk {
                     Some(why),
                 ),
             },
-            // A thread Codex never wrote a turn of has no rollout to resume
-            // from: a new one, as nothing of it is lost.
-            Engine::Codex
-                if r.transcript
-                    .as_deref()
-                    .is_some_and(|t| !Path::new(t).is_file()) =>
-            {
-                (
-                    SessionRecord {
-                        cli_session_id: None,
-                        transcript: None,
-                        ..r
-                    },
-                    Some(
-                        "Started it afresh: it had no turn of its conversation to go on from."
-                            .to_string(),
-                    ),
-                )
-            }
             _ => (r, None),
         };
         if r.cli_session_id.is_none() && afresh.is_none() {
@@ -4316,13 +4306,9 @@ impl Desk {
             };
         }
         let carried = r.cli_session_id.clone();
-        let fresh = afresh.is_some();
         self.change(id, |r, _| {
-            if r.engine == Engine::Devin || fresh {
+            if r.engine == Engine::Devin {
                 r.cli_session_id = carried;
-            }
-            if r.engine == Engine::Codex && fresh {
-                r.transcript = None;
             }
             r.origin = Origin::Desk;
             r.external_pid = None;
@@ -4375,7 +4361,34 @@ impl Desk {
             (Some(n), None) => Some(n.clone()),
             (None, p) => p.clone(),
         };
-        let launched = self.launch(&r, afresh.is_none(), told.as_deref()).await;
+        let mut launched = self.launch(&r, afresh.is_none(), told.as_deref()).await;
+        // A Codex thread that never ran a turn has no rollout, and Codex
+        // won't resume it: nothing of it is lost, so it starts afresh, in
+        // what it runs in now. One that ran a turn keeps Codex's refusal.
+        let unwritten = matches!(&launched, Err(DeskError::Conflict(why))
+            if why.contains(codex::NO_ROLLOUT));
+        let afresh = match afresh {
+            None if r.engine == Engine::Codex
+                && unwritten
+                && r.last_prompt.is_none()
+                && r.last_reply.is_none() =>
+            {
+                tracing::info!(target: crate::STARTS, session = %id, "a Codex thread with no turn has no rollout: started afresh");
+                self.0.state.lock().exited.remove(&id);
+                self.change(id, |r, _| {
+                    r.cli_session_id = None;
+                    r.transcript = None;
+                });
+                let r = SessionRecord {
+                    cli_session_id: None,
+                    transcript: None,
+                    ..r.clone()
+                };
+                launched = self.launch(&r, false, told.as_deref()).await;
+                Some("Started it afresh: its conversation had no turn to go on from.".to_string())
+            }
+            afresh => afresh,
+        };
         self.0.state.lock().modes_carried.remove(&id);
         {
             let mut st = self.0.state.lock();
@@ -6443,6 +6456,41 @@ impl Desk {
                 format!("Codex runs it in other permissions than Desk asked: {differs}"),
             ));
         }
+    }
+
+    /// Settles an adopted session `id` whose thread Codex hasn't said it
+    /// runs in within [`SETTLE_WITHIN`] (a resume that names no
+    /// reviewer nor sandbox, a thread not yet started): taken to run in
+    /// what Desk would start it in now, never started again for it.
+    fn settle_unsaid(&self, id: Uuid) {
+        let d = self.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(SETTLE_WITHIN).await;
+            let unsettled = {
+                let st = d.0.state.lock();
+                st.live
+                    .get(&id)
+                    .and_then(|l| l._codex.as_ref())
+                    .filter(|link| !link.settled)
+                    .map(|link| link.mode)
+                    .zip(st.records.get(&id).map(|r| r.approve_for_me))
+            };
+            let Some((mode, approve_for_me)) = unsettled else {
+                return;
+            };
+            let now = d.codex_permissions(id, mode, approve_for_me);
+            let mut st = d.0.state.lock();
+            if let Some(link) = st
+                .live
+                .get_mut(&id)
+                .and_then(|l| l._codex.as_mut())
+                .filter(|link| !link.settled)
+            {
+                tracing::info!(%id, "codex never said what an adopted session's thread runs in: taken to run in what it should");
+                link.permissions = now;
+                link.settled = true;
+            }
+        });
     }
 
     /// Whether `id` runs in other Codex permissions than Desk would start

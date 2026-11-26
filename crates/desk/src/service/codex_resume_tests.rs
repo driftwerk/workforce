@@ -321,7 +321,7 @@ async fn a_codex_session_runs_in_its_own_mode_unless_one_that_doesnt_ask_is_kept
             async move { d.resume(s.id, None, Some(By::you())).await }
         });
         let mut ws = server.await.unwrap();
-        let lost = json!({"code": -32603, "message": "no rollout found for thread id t1"});
+        let lost = json!({"code": -32603, "message": "thread t1 could not be loaded"});
         assert_eq!(resumed(&mut ws, lost).await, reset);
         assert!(failed.await.unwrap().is_err());
         let (asked, _) = started_again(&d, &dir, std::slice::from_ref(&ok), move |d| async move {
@@ -641,7 +641,9 @@ async fn a_codex_session_keeps_its_mode_through_every_start_and_a_refusal_is_sai
         assert_eq!(tui_starts(&dir).len(), starts);
 
         // The person still may; and what Codex's app-server refuses is said
-        // the same way, its TUI never started.
+        // the same way, its TUI never started. Its thread ran a turn: with
+        // its rollout gone, that refusal stands, never a new conversation.
+        d.change(s.id, |r, _| r.last_reply = Some("done".into()));
         let server = serve(&dir);
         let theirs = tokio::spawn({
             let d = d.clone();
@@ -700,9 +702,10 @@ async fn taken_on(d: &Desk, id: Uuid) {
 }
 
 /// A boss that only suggests leaves a session's requests to the person:
-/// its charge changes nothing of what Codex runs it in. Set to Act, it
+/// its charge changes nothing of what Codex runs it in. At Act fully it
 /// decides them: started again in place, once its turn ends, and what its
 /// boss says to it meanwhile waits for that, never read in the old ones.
+/// Act fully lapsing to Act, and back, changes nothing again.
 #[tokio::test]
 async fn only_a_boss_that_decides_its_requests_changes_what_codex_runs_it_in() {
     with_test_pool(build_pool, |pool| async move {
@@ -715,10 +718,10 @@ async fn only_a_boss_that_decides_its_requests_changes_what_codex_runs_it_in() {
         assert_eq!(tui_starts(&dir).len(), 1, "nothing started again");
         assert!(!d.permissions_due(s.id));
 
-        // Set to Act mid-turn: started again only once the turn ends.
+        // At Act fully, mid-turn: started again only once the turn ends.
         say(&mut ws, status("active")).await;
         until(|| d.view(s.id).unwrap().state == SessionState::Working).await;
-        crew_at(&d, "act");
+        crew_at(&d, "full");
         assert!(d.permissions_due(s.id));
         let told = d
             .line_send(
@@ -747,13 +750,46 @@ async fn only_a_boss_that_decides_its_requests_changes_what_codex_runs_it_in() {
         );
         until(|| tui_starts(&dir).len() == 2).await;
         until(|| !d.permissions_due(s.id)).await;
+
+        // Its budget lapsed (the hub says Act), and back: the same.
+        for level in ["act", "full"] {
+            crew_at(&d, level);
+            assert!(!d.permissions_due(s.id), "{level}");
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            assert_eq!(tui_starts(&dir).len(), 2, "{level}: nothing started again");
+        }
+    })
+    .await;
+}
+
+/// A turn that ended asking is between turns: taken on then, it is started
+/// again in place, the boss's answer waiting for that.
+#[tokio::test]
+async fn a_codex_session_that_ended_asking_starts_again_in_new_permissions() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let dir = dir.path().canonicalize().unwrap();
+        let (d, s) = started_with(pool, &dir, true).await;
+        d.change(s.id, |r, _| r.state = SessionState::Asking);
+        let (asked, _) = started_again(
+            &d,
+            &dir,
+            &[json!({"thread": {"id": "t1"}})],
+            move |d| async move {
+                taken_on(&d, s.id).await;
+                Ok(())
+            },
+        )
+        .await;
+        assert_eq!(asked, [in_mode(&dir, "on-request", "workspace-write")]);
+        until(|| tui_starts(&dir).len() == 2).await;
     })
     .await;
 }
 
 /// Taken on before its thread is up, a session is left until it is; one
-/// whose thread never ran a turn (no rollout to resume) is started afresh
-/// in what it now runs in, never refused nor left stopped.
+/// whose thread never ran a turn, which Codex won't resume (no rollout), is
+/// started afresh in what it now runs in, never refused nor left stopped.
 #[tokio::test]
 async fn a_codex_session_with_no_turn_yet_is_started_afresh_once_it_is_up() {
     with_test_pool(build_pool, |pool| async move {
@@ -770,15 +806,18 @@ async fn a_codex_session_with_no_turn_yet_is_started_afresh_once_it_is_up() {
         assert_eq!(tui_starts(&dir).len(), 1, "not while it starts");
 
         let server = serve(&dir);
-        let rollout = dir.join("rollout-t1.jsonl");
         say(
             &mut ws,
             json!({"method": "thread/started", "params": {"thread": {"id": "t1",
-            "environments": [{"cwd": dir}], "path": rollout}}}),
+            "environments": [{"cwd": dir}], "path": null}}}),
         )
         .await;
         say(&mut ws, status("idle")).await;
-        let _ws = server.await.unwrap();
+        let mut ws = server.await.unwrap();
+        let fresh = serve(&dir);
+        let unwritten = json!({"code": -32600, "message": "no rollout found for thread id t1"});
+        resumed(&mut ws, unwritten).await;
+        let _ws = fresh.await.unwrap();
         until(|| tui_starts(&dir).len() == 2).await;
         let again = tui_starts(&dir)[1].clone();
         assert!(again.starts_with("--remote"), "a new thread: {again}");
@@ -809,7 +848,7 @@ async fn a_failed_start_in_new_permissions_is_said_once_and_a_mismatch_is_said()
         let dir = dir.path().canonicalize().unwrap();
         let (d, s) = started_with(pool, &dir, true).await;
         let mut events = d.events();
-        let lost = json!({"code": -32603, "message": "no rollout found for thread id t1"});
+        let lost = json!({"code": -32603, "message": "thread t1 could not be loaded"});
         taken_on(&d, s.id).await;
         let mut ws = serve(&dir).await.unwrap();
         resumed(&mut ws, lost).await;
@@ -864,6 +903,7 @@ async fn a_failed_start_in_new_permissions_is_said_once_and_a_mismatch_is_said()
 /// A session adopted from an earlier run of Desk runs in what Codex says
 /// its thread runs in: never started again before that is said, nor after
 /// when it is what it should run in now; started again in place when not.
+/// Never said, it is taken in time to run in what it should.
 #[tokio::test]
 async fn an_adopted_codex_session_runs_in_what_codex_says_until_that_differs() {
     with_test_pool(build_pool, |pool| async move {
@@ -897,7 +937,15 @@ async fn an_adopted_codex_session_runs_in_what_codex_says_until_that_differs() {
         tokio::time::sleep(Duration::from_millis(500)).await;
         assert_eq!(tui_starts(&dir).len(), 1);
 
+        // Never said: taken to run in what it should, in time.
+        d.settle_unsaid(s.id);
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(link(&d), (charged, false), "not yet");
+        until(|| link(&d) == (own, true)).await;
+        assert_eq!(tui_starts(&dir).len(), 1, "never started again");
+
         // Said to run in what it should now: kept so.
+        adopted(&d);
         d.codex_runs(s.id, &runs("auto_review"));
         assert_eq!(link(&d), (own, true));
         tokio::time::sleep(Duration::from_millis(500)).await;

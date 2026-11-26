@@ -1879,3 +1879,20 @@ fn a_git_alias_is_read_whole_however_many_lines_it_has() {
     assert_eq!(aliases["st"], "status");
     assert_eq!(aliases["pf"], "!f() {\n  git push -f\n}; f");
 }
+
+/// Git's command list is read a command a line, whatever surrounds it.
+#[test]
+fn git_says_its_commands_a_line_each() {
+    let listed = super::commands_of("add\npush\n  send-pack \n\nlfs\n");
+    assert_eq!(
+        listed,
+        ["add", "push", "send-pack", "lfs"].map(String::from).into()
+    );
+}
+
+/// Git says its own commands, and those on its path, wherever Desk runs.
+#[test]
+fn git_says_its_own_commands() {
+    let commands = super::git_commands().expect("git says its commands");
+    assert!(commands.contains("push") && commands.contains("send-pack"));
+}

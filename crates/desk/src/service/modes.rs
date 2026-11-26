@@ -347,12 +347,13 @@ impl Desk {
             for (id, why) in running {
                 let Ok(view) = self.view(id) else { continue };
                 // Mid-turn, waiting on an answer, the person typing into it,
-                // or not yet up: once that is over.
+                // or not yet up: once that is over. A turn that ended asking
+                // is over: its answer waits on its new permissions
+                // (`Wait::Restarting`), never the other way round.
+                let asking = view.state == S::Asking && !matches!(why, Restart::Permissions);
                 if view.pending.is_some()
-                    || matches!(
-                        view.state,
-                        S::Working | S::Blocked | S::Asking | S::Starting
-                    )
+                    || asking
+                    || matches!(view.state, S::Working | S::Blocked | S::Starting)
                     || self.person_driving(id)
                 {
                     waiting = true;

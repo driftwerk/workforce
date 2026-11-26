@@ -23,7 +23,8 @@ pub struct Boss {
     pub agent: String,
     pub name: String,
     pub scope: Scope,
-    /// `watch`, `suggest` or `act`.
+    /// `watch`, `suggest`, `act`, or `full` (Act fully, while it is in
+    /// force: the hub says `act` for one whose budget lapsed).
     pub level: String,
 }
 
@@ -408,13 +409,15 @@ impl Desk {
     }
 
     /// Whether the boss `agent` decides its sessions' requests: at Act or
-    /// Act fully. One Desk doesn't know as a boss here (served from a
-    /// grant, or before the hub says) is taken to.
+    /// Act fully, alike. One Desk doesn't know as a boss here (served from
+    /// another hub's grant, or before the hub says) holds a charge only to
+    /// run its sessions, so it is taken to: its requests are never left to
+    /// Codex's own reviewer.
     pub(crate) fn boss_decides_requests(&self, agent: &str) -> bool {
         self.bosses()
             .into_iter()
             .find(|b| b.agent == agent)
-            .is_none_or(|b| b.level == "act")
+            .is_none_or(|b| matches!(b.level.as_str(), "act" | "full"))
     }
 
     /// The scope the overseer `agent` oversees, while it does.

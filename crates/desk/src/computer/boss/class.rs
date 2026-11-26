@@ -6,7 +6,7 @@
 //! against the few it is known by in its class: a flag outside them, and
 //! whatever can't be read for certain, is [`Class::Other`].
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use super::{push, split, Cmd, Here, PushKind, Walk, Word};
 
@@ -65,6 +65,11 @@ impl From<PushKind> for Class {
 pub struct Repo<'a> {
     /// Its git aliases, by name (`git config -z --get-regexp ^alias\.`).
     pub aliases: &'a HashMap<String, String>,
+    /// Git's own commands and those it finds on its path
+    /// (`git --list-cmds=main,others`): an alias by one of their names is
+    /// never run, git runs its own. None when git couldn't say: then no
+    /// alias is read at all.
+    pub git_commands: Option<&'a HashSet<String>>,
     /// Whether a name is one of its local branches
     /// (`rev-parse --verify refs/heads/<name>`).
     pub is_branch: &'a dyn Fn(&str) -> bool,
@@ -91,90 +96,6 @@ const PLAIN_ENV: &[&str] = &[
     "GIT_TERMINAL_PROMPT",
 ];
 
-/// Git's own commands: an alias by one of their names is never run
-/// (git runs its own), so it is never read in its place.
-const GIT_BUILTINS: &[&str] = &[
-    "add",
-    "am",
-    "annotate",
-    "apply",
-    "archive",
-    "bisect",
-    "blame",
-    "branch",
-    "bundle",
-    "cat-file",
-    "check-attr",
-    "check-ignore",
-    "checkout",
-    "checkout-index",
-    "cherry",
-    "cherry-pick",
-    "clean",
-    "clone",
-    "commit",
-    "commit-tree",
-    "config",
-    "count-objects",
-    "describe",
-    "diff",
-    "diff-files",
-    "diff-index",
-    "diff-tree",
-    "difftool",
-    "fetch",
-    "filter-branch",
-    "for-each-ref",
-    "format-patch",
-    "fsck",
-    "gc",
-    "grep",
-    "hash-object",
-    "help",
-    "init",
-    "log",
-    "ls-files",
-    "ls-remote",
-    "ls-tree",
-    "maintenance",
-    "merge",
-    "merge-base",
-    "mergetool",
-    "mv",
-    "notes",
-    "prune",
-    "pull",
-    "push",
-    "range-diff",
-    "read-tree",
-    "rebase",
-    "reflog",
-    "remote",
-    "repack",
-    "replace",
-    "reset",
-    "restore",
-    "rev-list",
-    "rev-parse",
-    "revert",
-    "rm",
-    "shortlog",
-    "show",
-    "show-ref",
-    "sparse-checkout",
-    "stash",
-    "status",
-    "submodule",
-    "switch",
-    "symbolic-ref",
-    "tag",
-    "update-index",
-    "update-ref",
-    "version",
-    "worktree",
-    "write-tree",
-];
-
 /// A command's flags read against what a tool is known by: each flag
 /// that takes a value, and each that doesn't.
 struct Known<'a> {
@@ -185,11 +106,14 @@ struct Known<'a> {
 /// One flag as given, and its value when it takes one.
 type Flag<'a> = (&'a str, Option<&'a str>);
 
-impl Known<'_> {
+impl<'k> Known<'k> {
     /// `args`' flags and operands, every flag one it knows (`--name=v`,
     /// `--name v`, `-xv`, `-x v`, `-abc` of bare ones), all after `--`
     /// operands; none when a flag is unknown or wants a value it lacks.
-    fn read<'a>(&self, args: &[&'a str]) -> Option<(Vec<Flag<'a>>, Vec<&'a str>)> {
+    fn read<'a>(&self, args: &[&'a str]) -> Option<(Vec<Flag<'a>>, Vec<&'a str>)>
+    where
+        'k: 'a,
+    {
         let (mut flags, mut ops) = (Vec::new(), Vec::new());
         let mut it = args.iter().copied();
         while let Some(a) = it.next() {
@@ -209,24 +133,30 @@ impl Known<'_> {
                     _ => return None,
                 }
             } else if a.len() > 1 && a.starts_with('-') {
-                // Its first letter, `-x`, when it has a value attached.
-                let cut = a.char_indices().nth(2).map_or(a.len(), |(i, _)| i);
-                let (name, attached) = a.split_at(cut);
                 if self.bare.contains(&a) {
                     flags.push((a, None));
                 } else if self.valued.contains(&a) {
                     flags.push((a, Some(it.next()?)));
-                } else if self.valued.contains(&name) {
-                    flags.push((name, Some(attached.strip_prefix('=').unwrap_or(attached))));
-                } else if a[1..].chars().all(|c| {
-                    let mut one = String::from("-");
-                    one.push(c);
-                    self.bare.contains(&one.as_str())
-                }) {
-                    // `-abc`: each a bare flag.
-                    flags.push((a, None));
                 } else {
-                    return None;
+                    // `-abc`, `-xv`, `-am v`: bare letters, up to one that
+                    // takes a value, attached or after it; each told by its
+                    // own name.
+                    let short = |c: char| format!("-{c}");
+                    let named =
+                        |of: &[&'k str], c: char| of.iter().copied().find(|n| *n == short(c));
+                    for (i, c) in a[1..].char_indices() {
+                        if let Some(n) = named(self.bare, c) {
+                            flags.push((n, None));
+                            continue;
+                        }
+                        let n = named(self.valued, c)?;
+                        let value = match &a[1 + i + c.len_utf8()..] {
+                            "" => it.next()?,
+                            v => v.strip_prefix('=').unwrap_or(v),
+                        };
+                        flags.push((n, Some(value)));
+                        break;
+                    }
                 }
             } else {
                 ops.push(a);
@@ -417,11 +347,16 @@ fn git(args: &[&str], here: &Here<'_>, repo: &Repo<'_>, depth: usize, moved: boo
     if sub.starts_with('-') {
         return Class::Other;
     }
+    let own = |c: &HashSet<String>| c.contains(*sub);
     if let Some(alias) = repo
         .aliases
         .get(*sub)
-        .filter(|_| !GIT_BUILTINS.contains(sub))
+        .filter(|_| !repo.git_commands.is_some_and(own))
     {
+        // Which of its names are git's own can't be told: nor what runs.
+        if repo.git_commands.is_none() {
+            return Class::Other;
+        }
         let tail = rest
             .iter()
             .map(|a| shell_word(a))
@@ -434,12 +369,6 @@ fn git(args: &[&str], here: &Here<'_>, repo: &Repo<'_>, depth: usize, moved: boo
     }
     // A git command by a digit-run like `log -5`: its count.
     let counts = |a: &&str| a.len() > 1 && a[1..].chars().all(|c| c.is_ascii_digit());
-    let flags: Vec<&str> = rest
-        .iter()
-        .copied()
-        .filter(|a| a.starts_with('-'))
-        .collect();
-    let ops = operands(rest);
     let is_base = |b: &str| {
         here.default_branch
             .is_some_and(|d| b == d || b.strip_prefix("origin/") == Some(d))
@@ -465,7 +394,38 @@ fn git(args: &[&str], here: &Here<'_>, repo: &Repo<'_>, depth: usize, moved: boo
             };
             push(&walk, &words).0.into()
         }
-        "commit" if !flags.iter().any(|f| amends(f)) || !repo.head_pushed => Class::Commit,
+        "commit" => {
+            // `--amend` as git reads it from any prefix of it.
+            let rest: Vec<&str> = rest
+                .iter()
+                .map(|a| if amends(a) { "--amend" } else { a })
+                .collect();
+            let read = Known {
+                valued: &["-m", "--message", "-F", "--file", "--author", "--date"],
+                bare: &[
+                    "-a",
+                    "--all",
+                    "-q",
+                    "--quiet",
+                    "-v",
+                    "--verbose",
+                    "-s",
+                    "--signoff",
+                    "--amend",
+                    "--no-edit",
+                    "--allow-empty",
+                ],
+            }
+            .read(&rest);
+            match read {
+                Some((flags, _))
+                    if !repo.head_pushed || !flags.iter().any(|(n, _)| *n == "--amend") =>
+                {
+                    Class::Commit
+                }
+                _ => Class::Other,
+            }
+        }
         "diff" | "log" | "show" => {
             let rest: Vec<&str> = rest.iter().copied().filter(|a| !counts(a)).collect();
             match GIT_READS.all(&rest) {
@@ -508,59 +468,89 @@ fn git(args: &[&str], here: &Here<'_>, repo: &Repo<'_>, depth: usize, moved: boo
         {
             Class::LocalGit
         }
-        "branch" => {
-            let lists = flags
-                .iter()
-                .all(|f| matches!(*f, "-a" | "-r" | "-v" | "-vv" | "--list" | "--show-current"));
-            match (lists, ops.as_slice()) {
-                (true, [] | [_]) => Class::LocalGit,
-                _ => Class::Other,
-            }
-        }
-        "switch" => match (flags.as_slice(), ops.as_slice()) {
-            ([] | ["-c" | "--create"], [_]) => Class::LocalGit,
+        "branch" => match (Known {
+            valued: &[],
+            bare: &["-a", "-r", "-v", "-vv", "--list", "--show-current"],
+        })
+        .read(rest)
+        {
+            Some((_, ops)) if ops.len() <= 1 => Class::LocalGit,
             _ => Class::Other,
         },
-        "checkout" => match (flags.as_slice(), ops.as_slice()) {
-            (["-b"], [_]) => Class::LocalGit,
-            ([], [x]) if (repo.is_branch)(x) => Class::LocalGit,
+        "switch" => match (Known {
+            valued: &["-c", "--create"],
+            bare: &[],
+        })
+        .read(rest)
+        {
+            Some((flags, ops)) if flags.is_empty() && ops.len() == 1 => Class::LocalGit,
+            Some((flags, ops)) if flags.len() == 1 && ops.is_empty() => Class::LocalGit,
             _ => Class::Other,
         },
-        "stash" => match rest {
-            [] | ["list" | "show" | "pop" | "apply"] => Class::LocalGit,
-            ["push", more @ ..]
-                if more
-                    .iter()
-                    .all(|m| matches!(*m, "-m" | "--message") || !m.starts_with('-')) =>
+        "checkout" => match (Known {
+            valued: &["-b"],
+            bare: &[],
+        })
+        .read(rest)
+        {
+            Some((flags, ops)) if flags.len() == 1 && ops.is_empty() => Class::LocalGit,
+            Some((flags, ops))
+                if flags.is_empty() && matches!(ops[..], [x] if (repo.is_branch)(x)) =>
             {
                 Class::LocalGit
             }
             _ => Class::Other,
         },
-        "rebase" | "merge" => match (flags.as_slice(), ops.as_slice()) {
-            ([] | ["--ff-only"], [b]) if is_base(b) => Class::LocalGit,
+        "stash" => match rest {
+            [] | ["list" | "show" | "pop" | "apply"] => Class::LocalGit,
+            ["push", more @ ..]
+                if Known {
+                    valued: &["-m", "--message"],
+                    bare: &[],
+                }
+                .all(more) =>
+            {
+                Class::LocalGit
+            }
             _ => Class::Other,
         },
-        "fetch" => {
-            let plain = flags
-                .iter()
-                .all(|f| matches!(*f, "--prune" | "-p" | "--tags" | "-q" | "--quiet"));
-            match (plain, ops.as_slice()) {
-                (true, [] | [_]) if from_own(ops.first()) => Class::FetchPull,
-                (true, [_, branch]) if from_own(ops.first()) && !branch.contains(':') => {
-                    Class::FetchPull
-                }
-                _ => Class::Other,
+        "rebase" | "merge" => match (Known {
+            valued: &[],
+            bare: &["--ff-only"],
+        })
+        .read(rest)
+        {
+            Some((flags, ops))
+                if (*sub == "merge" || flags.is_empty())
+                    && matches!(ops[..], [b] if is_base(b)) =>
+            {
+                Class::LocalGit
             }
-        }
-        "pull" => {
-            let how = flags.iter().any(|f| matches!(*f, "--rebase" | "--ff-only"));
-            let plain = flags
-                .iter()
-                .all(|f| matches!(*f, "--rebase" | "--ff-only" | "-q" | "--quiet"));
-            match (how && plain, ops.as_slice()) {
-                (true, [] | [_]) if from_own(ops.first()) => Class::FetchPull,
-                (true, [_, branch]) if from_own(ops.first()) && !branch.contains(':') => {
+            _ => Class::Other,
+        },
+        "fetch" | "pull" => {
+            let read = match *sub {
+                "fetch" => Known {
+                    valued: &[],
+                    bare: &["--prune", "-p", "--tags", "-q", "--quiet"],
+                },
+                _ => Known {
+                    valued: &[],
+                    bare: &["--rebase", "--ff-only", "-q", "--quiet"],
+                },
+            }
+            .read(rest);
+            let Some((flags, ops)) = read else {
+                return Class::Other;
+            };
+            // A pull says how it joins what it fetches: never a merge.
+            let how = *sub == "fetch"
+                || flags
+                    .iter()
+                    .any(|(n, _)| matches!(*n, "--rebase" | "--ff-only"));
+            match ops[..] {
+                [] | [_] if how && from_own(ops.first()) => Class::FetchPull,
+                [_, branch] if how && from_own(ops.first()) && !branch.contains(':') => {
                     Class::FetchPull
                 }
                 _ => Class::Other,
@@ -920,11 +910,15 @@ fn build(program: &str, args: &[&str]) -> Option<Class> {
                 "v", "race", "short", "cover", "failfast", "json", "trimpath",
             ],
         ),
-        ("tsc", rest) => Known {
-            valued: &["-p", "--project"],
-            bare: &["--noEmit", "--pretty"],
+        // Never where its project says it writes (`outDir`): only a check.
+        ("tsc", rest) => {
+            rest.contains(&"--noEmit")
+                && Known {
+                    valued: &["-p", "--project"],
+                    bare: &["--noEmit", "--pretty"],
+                }
+                .all(rest)
         }
-        .all(rest),
         ("eslint", rest) => Known {
             valued: &["--max-warnings", "--ext"],
             bare: &["--quiet", "--cache", "--no-eslintrc"],
@@ -1095,8 +1089,10 @@ mod tests {
             ("up".to_string(), "push origin feat/x".to_string()),
             ("st".to_string(), "status".to_string()),
         ]);
+        let commands = git_commands();
         let repo = Repo {
             aliases: &aliases,
+            git_commands: Some(&commands),
             is_branch: &|b| b == "feat/y" || b == "main",
             head_pushed,
             upstream: Some("origin"),
@@ -1164,6 +1160,59 @@ mod tests {
         assert_eq!(class("CI=1 cargo test"), Class::TestBuild);
         assert_eq!(class("cargo test > /tmp/out"), Class::Other);
         assert_eq!(class("cargo test 2>&1"), Class::TestBuild);
+    }
+
+    /// Every flag of a git command is one it is known by: any other is
+    /// what it might do, never read past.
+    #[test]
+    fn git_reads_every_flag_of_what_keeps_work_and_branches() {
+        for (c, class_is) in [
+            ("git commit -am 'x y'", Class::Commit),
+            ("git commit -sm x", Class::Commit),
+            ("git commit -mx", Class::Commit),
+            ("git commit --message=x --no-edit", Class::Commit),
+            ("git branch -vv", Class::LocalGit),
+            ("git switch --create=feat/z", Class::LocalGit),
+            ("git checkout -bfeat/z", Class::LocalGit),
+            ("git stash push --message wip", Class::LocalGit),
+            ("git merge --ff-only origin/main", Class::LocalGit),
+            ("git fetch -pq origin", Class::FetchPull),
+            ("git pull -q --ff-only origin main", Class::FetchPull),
+            ("tsc --noEmit -p tsconfig.json", Class::TestBuild),
+        ] {
+            assert_eq!(class(c), class_is, "{c}");
+        }
+        for c in [
+            "git commit --no-verify -m x",
+            "git commit -n -m x",
+            "git commit -anm x",
+            "git commit --template=/x -m x",
+            "git commit --fixup=HEAD~1",
+            "git commit --al -m x",
+            "git branch -f feat/y main",
+            "git branch --set-upstream-to=evil/main",
+            "git switch --discard-changes feat/y",
+            "git switch -C feat/y",
+            "git switch --detach main",
+            "git checkout -f feat/y",
+            "git checkout -B feat/y",
+            "git checkout --orphan x",
+            "git stash push --include-untracked -m x",
+            "git rebase --exec 'rm -rf /' main",
+            "git rebase --onto main x",
+            "git rebase --ff-only main",
+            "git merge -s ours origin/main",
+            "git merge --no-verify origin/main",
+            "git fetch --upload-pack=/x origin",
+            "git fetch --recurse-submodules origin",
+            "git pull --rebase --upload-pack=/x origin main",
+            "git pull --rebase -s ours origin main",
+            "tsc",
+            "tsc -p tsconfig.json",
+            "tsc --outDir /x --noEmit",
+        ] {
+            assert_eq!(class(c), Class::Other, "{c}");
+        }
     }
 
     #[test]
@@ -1307,7 +1356,22 @@ mod tests {
         assert_eq!(Class::parse("other").ok(), Some(Class::Other));
     }
 
+    /// Some of git's commands, as `git --list-cmds=main,others` names them.
+    fn git_commands() -> HashSet<String> {
+        ["push", "commit", "diff", "status", "send-pack", "lfs"]
+            .map(String::from)
+            .into()
+    }
+
     fn with_aliases(command: &str, aliases: &[(&str, &str)]) -> Class {
+        with_commands(command, aliases, Some(&git_commands()))
+    }
+
+    fn with_commands(
+        command: &str,
+        aliases: &[(&str, &str)],
+        git_commands: Option<&HashSet<String>>,
+    ) -> Class {
         let home = Path::new("/Users/sam");
         let own = Path::new("/Users/sam/dev/acme-web");
         let scratch = [PathBuf::from("/tmp")];
@@ -1320,6 +1384,7 @@ mod tests {
             .collect();
         let repo = Repo {
             aliases: &aliases,
+            git_commands,
             is_branch: &|_| false,
             head_pushed: false,
             upstream: Some("origin"),
@@ -1327,9 +1392,23 @@ mod tests {
         class_of(command, &here, &repo)
     }
 
-    /// Git never runs an alias named after one of its own commands.
+    /// Git never runs an alias named after one of its own commands, nor
+    /// one it finds on its path; where git can't say which those are, no
+    /// alias is read.
     #[test]
     fn an_alias_named_after_a_git_command_is_never_read_for_it() {
+        assert_eq!(
+            with_aliases("git send-pack origin main", &[("send-pack", "status")]),
+            Class::Other
+        );
+        assert_eq!(
+            with_aliases("git lfs push origin", &[("lfs", "status")]),
+            Class::Other
+        );
+        assert_eq!(
+            with_commands("git st", &[("st", "status")], None),
+            Class::Other
+        );
         let aliases = [("push", "status"), ("commit", "status"), ("diff", "!true")];
         assert_eq!(
             with_aliases("git push -f origin main", &aliases),

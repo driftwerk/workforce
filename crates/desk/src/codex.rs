@@ -136,6 +136,10 @@ impl Permissions {
     }
 }
 
+/// How Codex starts its refusal to resume a thread it never wrote a turn
+/// of (CLI 0.166, `core/src/thread_manager.rs`).
+pub const NO_ROLLOUT: &str = "no rollout found for thread id";
+
 /// The setting that turns a workspace-write sandbox's network on.
 const NETWORK_ON: &str = "sandbox_workspace_write.network_access=true";
 
