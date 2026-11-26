@@ -59,6 +59,12 @@ pub(crate) struct Lines {
     /// them (or, for a stop its boss lifts, their boss does): each a need
     /// of the person's on the Floor, said once.
     stalled: HashMap<Uuid, Stalled>,
+    /// The keystroke each session's line was last said to wait on: each new
+    /// one is logged once.
+    typing: HashMap<Uuid, DateTime<Utc>>,
+    /// When each session's line is next looked at again, for a hold that is
+    /// up then ([`Desk::line_wake_at`]).
+    wakes: HashMap<Uuid, DateTime<Utc>>,
     /// Why each session's waiting rows were last kept from its Desk plugin,
     /// by row: each new reason is logged once.
     skipped: HashMap<Uuid, HashMap<Uuid, Wait>>,
@@ -102,12 +108,23 @@ impl Handoff {
 /// judges each of its waiting rows by.
 pub(super) struct LineAt {
     view: SessionView,
-    /// The person typed in its terminal since their last prompt.
-    typed: bool,
+    /// The person's keystroke in its terminal that holds it.
+    typed: Option<line::Keystroke>,
+    /// The person's draft waits in its prompt.
+    draft: Option<DraftHold>,
     /// Desk's plugin was heard from in it.
     plugin: bool,
     /// The row handed to Desk's plugin that it hasn't said went in.
     ahead: Option<Uuid>,
+}
+
+/// How the person's draft in a session's prompt holds its line.
+#[derive(Debug, Clone, Copy)]
+enum DraftHold {
+    /// As their input, until the hold of the boss that runs it is up.
+    Until(DateTime<Utc>),
+    /// Past that, while its screen still shows it.
+    Shown,
 }
 
 /// A session the loop guard stopped.
@@ -218,6 +235,12 @@ const HANDED_FOR: chrono::Duration = chrono::Duration::minutes(2);
 const MARK_WITHIN: chrono::Duration = chrono::Duration::minutes(1);
 /// How often stale hand-offs and waiting messages are looked at.
 const PUMP_EVERY: Duration = Duration::from_secs(30);
+/// How long after a hold is up its line is looked at again: past it on
+/// any clock.
+const WAKE_AFTER: chrono::Duration = chrono::Duration::milliseconds(100);
+/// How often a line a draft past its hold holds is looked at again: once
+/// its screen no longer shows the draft (cleared by hand), it goes in.
+const DRAFT_LOOK_EVERY: chrono::Duration = chrono::Duration::seconds(5);
 /// How many thread rows a page holds at most.
 const THREAD_MAX: i64 = 200;
 /// What a session the person took back from its boss is told as it tells
@@ -563,14 +586,83 @@ impl Desk {
         self.0.state.lock().lines.spoke.get(&id).copied()
     }
 
-    /// Whether the person has typed in `id`'s terminal since they last
-    /// gave it a prompt: what they type there waits to be sent, and Desk
-    /// types nothing in over it until their next prompt.
-    fn typed_since_idle(&self, id: Uuid) -> bool {
+    /// The person's keystroke in `id`'s terminal that holds what Desk would
+    /// type in there now, if one does: within the hold of the boss that
+    /// runs it, since its last turn started.
+    pub fn line_keystroke(&self, id: Uuid) -> Option<line::Keystroke> {
         let st = self.0.state.lock();
-        let typed = st.live.get(&id).and_then(|l| l.pty.typed_at());
-        let spoke = st.lines.spoke.get(&id).copied();
-        typed.is_some_and(|t| spoke.is_none_or(|s| t > s))
+        let pty = &st.live.get(&id)?.pty;
+        line::keystroke(
+            pty.typed_at(),
+            pty.turned_at(),
+            Desk::hold_on(&st, id),
+            Utc::now(),
+        )
+    }
+
+    /// How the person's draft in `id`'s prompt holds what Desk would type
+    /// in there, if it does: within the hold of the boss that runs it, and
+    /// past that while its screen still shows it.
+    fn line_draft_held(&self, id: Uuid) -> Option<DraftHold> {
+        let st = self.0.state.lock();
+        let pty = &st.live.get(&id)?.pty;
+        let ends = pty.draft_at()? + Desk::hold_on(&st, id);
+        match ends > Utc::now() {
+            true => Some(DraftHold::Until(ends)),
+            false => pty.draft_shown().then_some(DraftHold::Shown),
+        }
+    }
+
+    /// A turn started in `id`, whoever prompted it: what waited in its
+    /// prompt went in with it.
+    pub(super) fn line_turn_started(&self, id: Uuid) {
+        if let Some(l) = self.0.state.lock().live.get(&id) {
+            l.pty.turn_started();
+        }
+    }
+
+    /// `id`'s line waits on the person's keystroke `k`: said once for each,
+    /// with its age, and the line looked at again once its hold is up.
+    fn line_typing(&self, id: Uuid, k: line::Keystroke) {
+        if self.0.state.lock().lines.typing.insert(id, k.at) != Some(k.at) {
+            let now = Utc::now();
+            tracing::info!(
+                session = %id,
+                typed_ms_ago = (now - k.at).num_milliseconds(),
+                holds_ms = (k.ends - now).num_milliseconds(),
+                "a message waits on the person's keystroke in its terminal"
+            );
+        }
+        self.line_wake_at(id, k.ends);
+    }
+
+    /// `id`'s line is looked at again just after `at`, when a hold on it is
+    /// up, unless it already is by then: a look that finds it still held
+    /// wakes it again.
+    fn line_wake_at(&self, id: Uuid, at: DateTime<Utc>) {
+        {
+            let wakes = &mut self.0.state.lock().lines.wakes;
+            if wakes.get(&id).is_some_and(|w| *w <= at) {
+                return;
+            }
+            wakes.insert(id, at);
+        }
+        let desk = self.clone();
+        let after = (at - Utc::now() + WAKE_AFTER).to_std().unwrap_or_default();
+        tokio::spawn(async move {
+            tokio::select! {
+                _ = desk.0.cancel.cancelled() => {}
+                _ = tokio::time::sleep(after) => {
+                    {
+                        let wakes = &mut desk.0.state.lock().lines.wakes;
+                        if wakes.get(&id) == Some(&at) {
+                            wakes.remove(&id);
+                        }
+                    }
+                    desk.line_pump(id).await;
+                }
+            }
+        });
     }
 
     /// Rows put back in the queue from a hand-off, told of. A boss's tell to
@@ -2022,7 +2114,8 @@ impl Desk {
     /// `view`'s line as `inbox` (what waits for it) has it now.
     pub(super) fn line_at(&self, view: SessionView, inbox: &[LineMessage]) -> LineAt {
         LineAt {
-            typed: self.typed_since_idle(view.id),
+            typed: self.line_keystroke(view.id),
+            draft: self.line_draft_held(view.id),
             plugin: self.plugin_heard(view.id),
             ahead: inbox
                 .iter()
@@ -2063,7 +2156,7 @@ impl Desk {
         if self.steer_reserved(view.id, m) {
             return Some(Wait::NextCall);
         }
-        match line::deliverable(view, at.typed, at.plugin) {
+        match line::deliverable(view, at.typed.is_some(), at.draft.is_some(), at.plugin) {
             // A turn Esc ended: the plugin takes it now.
             Err(Wait::Working)
                 if at.plugin && view.caps.line == Deliver::Submit && !self.in_a_turn(view) =>
@@ -2360,7 +2453,16 @@ impl Desk {
             if self.line_overtaken(&m).await {
                 continue;
             }
-            let now = line::deliverable(&at.view, at.typed, at.plugin);
+            let now =
+                line::deliverable(&at.view, at.typed.is_some(), at.draft.is_some(), at.plugin);
+            match (now, at.typed, at.draft) {
+                (Err(Wait::Typing), Some(k), _) => self.line_typing(id, k),
+                (Err(Wait::Draft), _, Some(DraftHold::Until(ends))) => self.line_wake_at(id, ends),
+                (Err(Wait::Draft), _, Some(DraftHold::Shown)) => {
+                    self.line_wake_at(id, Utc::now() + DRAFT_LOOK_EVERY)
+                }
+                _ => {}
+            }
             let held = matches!(now, Err(Wait::Stopped));
             let wanted = if held {
                 Delivery::Held
@@ -2579,6 +2681,8 @@ impl Desk {
         st.lines.plugin.remove(&id);
         st.lines.prompted.remove(&id);
         st.lines.skipped.remove(&id);
+        st.lines.typing.remove(&id);
+        st.lines.wakes.remove(&id);
         st.lines
             .for_you
             .retain(|_, m| m.from_session() != Some(id) && m.to_session() != Some(id));
@@ -2964,7 +3068,7 @@ impl Desk {
         let pty = self.attach(id)?;
         pty.write(&draft_bytes(&text))?;
         // Theirs, waiting in the prompt: nothing is typed in over it.
-        pty.person_typed();
+        pty.drafted(&text);
         Ok(view)
     }
 

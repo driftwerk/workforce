@@ -405,6 +405,22 @@ async fn github_turning_green() -> wiremock::MockServer {
     gh
 }
 
+/// acme/web's CI on main, red in `gh` until now, green from now on.
+async fn ci_turns_green(gh: &wiremock::MockServer) {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, ResponseTemplate};
+    let now = chrono::Utc::now().to_rfc3339();
+    Mock::given(method("GET"))
+        .and(path("/repos/acme/web/actions/runs"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "total_count": 1, "workflow_runs": [{ "id": 9, "name": "CI", "head_branch": "main",
+            "status": "completed", "conclusion": "success", "run_number": 9,
+            "created_at": now, "run_started_at": now, "updated_at": now }] })))
+        .with_priority(1)
+        .mount(gh)
+        .await;
+}
+
 /// A session of the boss's on `folder`, working on `goal`.
 async fn session_on(
     boss: &AgentService,
@@ -455,11 +471,20 @@ async fn asked(d: &Desk, id: uuid::Uuid) -> uuid::Uuid {
 /// The person writes `text` in a thread of `boss`'s DM.
 fn person_says_in_a_thread(boss: &AgentService, text: &str) {
     let channel = workforce_core::desk::dm_thread_channel(&uuid::Uuid::new_v4().to_string());
+    says_in_thread(boss, &channel, text, true);
+}
+
+/// The person, else the boss, writes `text` in the DM thread `channel`.
+fn says_in_thread(boss: &AgentService, channel: &str, text: &str, person: bool) {
     let mut thread = boss
         .sessions
-        .get_or_create(&channel, PERSON, "desk")
+        .get_or_create(channel, PERSON, "desk")
         .unwrap();
-    thread.add_user_message(text, None);
+    if person {
+        thread.add_user_message(text, None);
+    } else {
+        thread.add_assistant_message(text, 0);
+    }
     boss.sessions.save(&thread).unwrap();
     boss.sessions
         .append_to_archive(&thread.id, thread.messages.last().unwrap())
@@ -663,6 +688,243 @@ async fn a_goal_the_person_changes_themselves_applies_on_their_words() {
         let p = d.plan(id).await.unwrap().summary.plan;
         assert_eq!(p.goal, "Keep the docs build green and fast");
         assert!(!p.awaiting(), "their own words approve it");
+    })
+    .await;
+}
+
+/// The boss proposes a new goal and result in its DM, as a table; the
+/// person's plain "yes" right after it replaces both (DW-757), as their
+/// "ok" in a thread does to one proposed there, and the goal checks then
+/// measure the new result. A reply that isn't plainly to that proposal,
+/// or a goal it didn't say, still refuses.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_persons_plain_yes_to_the_bosss_proposal_in_the_dm_replaces_the_goal() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(dir.path()).unwrap();
+        let gh = github().await;
+        let (overseer, crew, d, _llm) = boss_on(&base, pool, ACTS, &gh).await;
+        let s = session_on(&overseer, &d, &base.to_string_lossy(), "Fix the docs build").await;
+        let id = agreed_plan(&overseer, &s, judged()).await;
+        let goal = "Keep acme/web's CI green on main";
+        let proposal = "**Proposed done-when goal:**\n\n| Goal | Done when |\n|---|---|\n| Keep acme/web’s CI green on main | **Done when CI on main is green** |\n\nYes, or change it?";
+        let change = |goal: &str, said: &str| {
+            json!({ "plan_id": id.to_string(), "goal": goal, "result": green("acme/web", 1),
+                    "person_said": said, "why": "They agreed." })
+        };
+        let pause = || tokio::time::sleep(Duration::from_millis(20));
+
+        pause().await;
+        boss_says(&overseer, proposal);
+        pause().await;
+        person_says(&overseer, "yes");
+        pause().await;
+        person_says(&overseer, "hmm, wait a moment");
+        let r = run(&overseer, "crew.plan_update", change(goal, "yes")).await;
+        assert!(!r.success, "more came after the yes: {r:?}");
+        let why = r.error.unwrap();
+        assert!(why.contains("Propose the change to them in your DM"), "{why}");
+        assert!(why.contains("never about this check"), "{why}");
+
+        // A "no", a yes to a message that asked more, and a yes on another
+        // item's buttons don't agree to it.
+        let button = format!("{}Shall I merge #5?”: Yes", workforce_desk::goal::ANSWER_LEAD);
+        let asks_more = format!("Shall I merge #5 first?\n\n{proposal}");
+        for (asked, reply, why) in [
+            (proposal, "no", "Propose the change"),
+            (asks_more.as_str(), "yes", "asked more than this change"),
+            (proposal, button.as_str(), "Propose the change"),
+        ] {
+            pause().await;
+            boss_says(&overseer, asked);
+            pause().await;
+            person_says(&overseer, reply);
+            let r = run(&overseer, "crew.plan_update", change(goal, "yes")).await;
+            assert!(!r.success, "{reply}: {r:?}");
+            let err = r.error.unwrap();
+            assert!(err.contains(why), "{reply}: {err}");
+        }
+
+        pause().await;
+        boss_says(&overseer, proposal);
+        pause().await;
+        person_says(&overseer, "Yes.");
+        let r = run(&overseer, "crew.plan_update", change("Ship the docs", "yes")).await;
+        assert!(!r.success, "{r:?}");
+        let why = r.error.unwrap();
+        assert!(why.contains("doesn't say the goal “Ship the docs”"), "{why}");
+        assert_eq!(d.plan(id).await.unwrap().summary.plan.goal, "Keep the docs build green");
+
+        let r = run(&overseer, "crew.plan_update", change(goal, "yes")).await;
+        assert!(r.success, "{r:?}");
+        let p = d.plan(id).await.unwrap().summary.plan;
+        assert_eq!(p.goal, goal);
+        assert_eq!(p.result.as_ref().map(|r| r.words.as_str()), Some("Done when CI on main is green"));
+        assert!(!p.awaiting(), "their yes applies it");
+        assert!(p.met.is_none(), "red as it was changed");
+
+        // Proposed in a thread of the DM, answered there.
+        let thread = workforce_core::desk::dm_thread_channel(&uuid::Uuid::new_v4().to_string());
+        let wider = "Keep acme/web's CI green on main and the docs built";
+        let in_thread = format!("How about this goal?\n\n| Goal |\n|---|\n| {wider} |");
+        pause().await;
+        says_in_thread(&overseer, &thread, &in_thread, false);
+        pause().await;
+        says_in_thread(&overseer, &thread, "ok", true);
+        pause().await;
+        says_in_thread(&overseer, &thread, "and the API docs too?", true);
+        let r = run(&overseer, "crew.plan_update", change(wider, "ok")).await;
+        assert!(!r.success, "more came after the ok: {r:?}");
+        pause().await;
+        says_in_thread(&overseer, &thread, &in_thread, false);
+        pause().await;
+        says_in_thread(&overseer, &thread, "ok", true);
+        let r = run(&overseer, "crew.plan_update", change(wider, "ok")).await;
+        assert!(r.success, "{r:?}");
+        let p = d.plan(id).await.unwrap().summary.plan;
+        assert_eq!(p.goal, wider);
+        assert!(!p.awaiting(), "their ok applies it");
+        // The DM's yes, applied already, doesn't change it back.
+        let r = run(&overseer, "crew.plan_update", change(goal, "yes")).await;
+        assert!(!r.success, "{r:?}");
+        assert_eq!(d.plan(id).await.unwrap().summary.plan.goal, wider);
+
+        ci_turns_green(&gh).await;
+        crew.plan_turn_now(id, vec!["A turn of its session ended.".into()])
+            .await;
+        let p = d.plan(id).await.unwrap().summary.plan;
+        assert_eq!(
+            p.met.as_ref().map(|m| m.by),
+            Some(workforce_desk::goal::MetBy::Result),
+            "measured by the new result"
+        );
+    })
+    .await;
+}
+
+/// The person's replies on every path: an answer to the boss's question,
+/// a first goal agreed and work started on their word. A "no" never says
+/// yes, whatever its length; one that is neither is said to be unclear; a
+/// short yes counts in its many words, and a longer one on its own words.
+const REPLIES: [(&str, Option<&str>); 6] = [
+    ("no", Some("doesn't agree to it")),
+    ("not yet", Some("doesn't agree to it")),
+    (
+        "hmm",
+        Some("couldn't read the person's “hmm” as a clear yes"),
+    ),
+    ("ok", None),
+    ("go for it", None),
+    ("Yes, that looks right to me", None),
+];
+
+/// Replies that ask for a change to what was put to them: never a yes to
+/// it as it stands, answering or agreeing work.
+const CHANGES_IT: [(&str, Option<&str>); 2] = [
+    (
+        "Sure, drop the staging part",
+        Some("couldn't read the person's “Sure, drop the staging part” as a clear yes"),
+    ),
+    (
+        "Yes start it, skip the deploy step",
+        Some("couldn't read the person's “Yes start it, skip the deploy step” as a clear yes"),
+    ),
+];
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_no_never_answers_or_agrees_on_any_path_and_a_longer_yes_does() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(dir.path()).unwrap();
+        let folder = base.to_string_lossy().to_string();
+        let gh = github().await;
+        let (overseer, crew, d, _llm) = boss_on(&base, pool, ACTS, &gh).await;
+        let pause = || tokio::time::sleep(Duration::from_millis(20));
+        let check = |r: &workforce_agent::tools::ToolResult, said: &str, refused: Option<&str>| {
+            match refused {
+                Some(why) => {
+                    assert!(!r.success, "{said}: {r:?}");
+                    let err = r.error.clone().unwrap();
+                    assert!(err.contains(why), "{said}: {err}");
+                }
+                None => assert!(r.success, "{said}: {r:?}"),
+            }
+        };
+        let s = session_on(&overseer, &d, &folder, "Fix the docs build").await;
+        let id = agreed_plan(&overseer, &s, judged()).await;
+        let ask = async |to: &str, options: Value| {
+            let r = run(
+                &overseer,
+                "crew.ask_person",
+                json!({ "text": format!("Shall the goal be: {to}?"), "plan_id": id.to_string(),
+                        "proposal": { "goal": to }, "options": options, "recommended": "Apply goal" }),
+            )
+            .await;
+            assert!(r.success, "{r:?}");
+            asked(&d, id).await
+        };
+        let apply = async |to: &str, said: &str| {
+            run(
+                &overseer,
+                "crew.plan_update",
+                json!({ "plan_id": id.to_string(), "goal": to, "person_said": said, "why": "Their answer." }),
+            )
+            .await
+        };
+
+        // Its buttons are Yes and No, whatever the boss labels them, and a
+        // click of Yes applies it. Each click is made with the DM idle, as
+        // a person's click lands between the boss's turns.
+        let to = "Keep the docs build green, clicked yes";
+        let item = ask(to, json!(["Apply goal", "Hold, I'll look"])).await;
+        let i = d.store().open_item(item).await.unwrap().unwrap();
+        assert_eq!(i.options, ["Yes", "No"]);
+        pause().await;
+        dm_idle(&overseer).await;
+        crew.answer_item(item, "Yes").await.unwrap();
+        check(&apply(to, "Yes").await, "Yes", None);
+        // A click of No refuses it.
+        let to = "Keep the docs build green, clicked no";
+        let item = ask(to, json!(["Apply goal"])).await;
+        pause().await;
+        dm_idle(&overseer).await;
+        crew.answer_item(item, "No").await.unwrap();
+        check(&apply(to, "No").await, "No", Some("doesn't agree to it"));
+        dm_idle(&overseer).await;
+
+        for (n, (said, refused)) in REPLIES.into_iter().chain(CHANGES_IT).enumerate() {
+            let to = format!("Keep the docs build green, step {n}");
+            let item = ask(&to, json!([])).await;
+            pause().await;
+            person_says(&overseer, said);
+            check(&apply(&to, said).await, said, refused);
+            if refused.is_some() {
+                let _ = d
+                    .store()
+                    .item_close(item, workforce_desk::open_item::ClosedBy::Boss, "Not a yes.")
+                    .await;
+            }
+        }
+        assert_eq!(
+            d.plan(id).await.unwrap().summary.plan.goal,
+            "Keep the docs build green, step 5"
+        );
+
+        for field in ["agreed", "start_now"] {
+            for (n, (said, refused)) in REPLIES.into_iter().chain(CHANGES_IT).enumerate() {
+                pause().await;
+                person_says(&overseer, said);
+                let r = run(
+                    &overseer,
+                    "crew.plan",
+                    json!({ "goal": format!("Make suite {field} {n} green"), field: { "person_said": said },
+                            "result": judged(),
+                            "tickets": [{ "title": format!("Fix suite {field} {n}"), "folder": folder }] }),
+                )
+                .await;
+                check(&r, said, refused);
+            }
+        }
     })
     .await;
 }
@@ -919,6 +1181,71 @@ async fn a_short_agreement_counts_only_after_the_bosss_last_message() {
         desk_posts(&overseer, "**Update.** acme-web finished its tests.").await;
         let r = run(&overseer, "crew.plan", plan).await;
         assert!(r.success, "{r:?}");
+    })
+    .await;
+}
+
+/// A click that lands while a turn runs in the boss's DM can't reach it:
+/// the item is open again and the person is told to answer it again.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_click_the_boss_cant_take_reopens_its_item_and_says_so() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        use workforce_desk::open_item::OpenState;
+        let dir = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(dir.path()).unwrap();
+        let gh = github().await;
+        let (overseer, crew, d, _llm) = boss_on(&base, pool, ACTS, &gh).await;
+        let r = run(
+            &overseer,
+            "crew.ask_person",
+            json!({ "text": "Shall I merge the docs fix?", "options": ["Merge", "Hold"] }),
+        )
+        .await;
+        assert!(r.success, "{r:?}");
+        let item = d
+            .store()
+            .items_not_closed(Some("desk"))
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|i| i.text == "Shall I merge the docs fix?")
+            .unwrap()
+            .id;
+        let dm = overseer
+            .sessions
+            .find(DESK_CHANNEL, PERSON)
+            .unwrap()
+            .unwrap();
+        let running = overseer
+            .begin_live_turn(
+                &dm.id,
+                workforce_agent::tools::approval::SelfServe::answerable_if(false),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(crew.answer_item(item, "Merge").await.unwrap(), "Answered.");
+        eventually("the item open again", async || {
+            let i = d.store().open_item(item).await.unwrap()?;
+            (i.state == OpenState::Open).then_some(())
+        })
+        .await;
+        eventually("the person told", async || {
+            (posted(&overseer, "didn't reach") > 0).then_some(())
+        })
+        .await;
+        assert!(posted(&overseer, "so it is still open: answer it again") > 0);
+        drop(running);
+    })
+    .await;
+}
+
+/// Once no turn runs in `boss`'s DM: a click's answer reaches the boss in
+/// a turn of its own there, which another turn running would hold up.
+async fn dm_idle(boss: &AgentService) {
+    eventually("the DM to be idle", async || {
+        let dm = boss.sessions.find(DESK_CHANNEL, PERSON).ok().flatten()?;
+        (!boss.live_turns.running(&dm.id)).then_some(())
     })
     .await;
 }

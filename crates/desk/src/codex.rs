@@ -640,6 +640,8 @@ pub enum CodexEvent {
         waiting: bool,
     },
     Idle,
+    /// A turn of its thread started (`turn/started`), whoever prompted it.
+    TurnStarted,
     Prompt(String),
     Tool(String),
     /// A tool call it ran failed (a command's non-zero exit, a failed MCP
@@ -1203,6 +1205,7 @@ pub fn interpret(method: &str, params: &Value) -> Option<Seen> {
             };
             seen(s("/threadId"), event)
         }
+        "turn/started" => seen(s("/threadId"), CodexEvent::TurnStarted),
         "item/started" => {
             let event = match params.pointer("/item/type").and_then(Value::as_str)? {
                 "userMessage" => CodexEvent::Prompt(

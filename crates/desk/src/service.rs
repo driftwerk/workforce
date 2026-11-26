@@ -7331,6 +7331,7 @@ impl Desk {
 
     /// A turn started on `p`: the person's own words when `person`.
     fn prompted(&self, id: Uuid, p: String, person: bool) {
+        self.line_turn_started(id);
         // Asked again: how its last turn failed is behind it.
         self.0.state.lock().turn_failures.remove(&id);
         self.change(id, |r, l| {
@@ -8246,6 +8247,10 @@ impl Desk {
             if ours.as_deref().is_some_and(|t| t != thread) {
                 continue;
             }
+            if matches!(event, CodexEvent::TurnStarted) {
+                self.line_turn_started(id);
+                continue;
+            }
             if let CodexEvent::Elsewhere {
                 request,
                 method,
@@ -8581,7 +8586,8 @@ impl Desk {
                     | CodexEvent::SteerRefused(_)
                     | CodexEvent::Reviewed { .. }
                     | CodexEvent::Runs(_)
-                    | CodexEvent::Elsewhere { .. } => {}
+                    | CodexEvent::Elsewhere { .. }
+                    | CodexEvent::TurnStarted => {}
                 }
             });
             self.codex_wait_arm(id);

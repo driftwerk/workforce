@@ -1010,7 +1010,12 @@ impl CrewHub {
             ),
             None => ("it was free to take it, and nothing took it in".to_string(), false),
             Some(
-                Wait::Typing | Wait::Paused | Wait::PersonDriving | Wait::ModeEnding | Wait::Awaited,
+                Wait::Typing
+                | Wait::Draft
+                | Wait::Paused
+                | Wait::PersonDriving
+                | Wait::ModeEnding
+                | Wait::Awaited,
             ) => return None,
         })
     }

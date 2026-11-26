@@ -665,3 +665,60 @@ fn a_suggested_interrupts_stand_down_mark_is_read_whole_or_refused() {
         assert_eq!(only_turn_of(&bad), Err(Unreadable), "{bad}");
     }
 }
+
+/// A nudge the person's keystroke holds tells the boss how long ago they
+/// typed and when it goes in; one their draft holds says it is a draft,
+/// never typing.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_nudge_held_by_the_persons_keystroke_or_draft_says_which_and_until_when() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(dir.path()).unwrap();
+        let (overseer, _crew, d, _llm) = overseeing(&base, pool, "ok", LETS, &[]).await;
+        eventually("the overseer's tools", async || {
+            overseer.tools.has("crew.nudge").then_some(())
+        })
+        .await;
+        let at_prompt = async |name: &str| {
+            let s = new_session(&d, &base, name).await;
+            let url = hook_url(&base, s.id).await;
+            hook(
+                &url,
+                json!({"hook_event_name": "SessionStart", "session_id": s.id.to_string()}),
+            )
+            .await;
+            eventually("it idles", async || {
+                (d.view(s.id).ok()?.state == SessionState::Idle).then_some(())
+            })
+            .await;
+            s.id
+        };
+
+        let s = at_prompt("typed-in").await;
+        let pty = d.attach(s).unwrap();
+        let (viewer, _, _) = pty.attach();
+        viewer.claim();
+        viewer.input(b"hm").unwrap();
+        let out = nudge(&overseer, s, "Run the tests.", false).await;
+        let said = out["done"].as_str().unwrap_or_default();
+        assert!(
+            said.starts_with("told typed-in: queued, not yet delivered; the person typed in its terminal ")
+                && said.contains(" s ago: it goes in within ")
+                && said.contains(" s, unless they type on."),
+            "{out}"
+        );
+
+        let t = at_prompt("drafted").await;
+        d.line_draft(t, "About your questions:").unwrap();
+        let out = nudge(&overseer, t, "Run the tests.", false).await;
+        assert!(
+            queued(
+                &out,
+                "told drafted",
+                "the person's draft is waiting in its prompt: it gets this once they send or clear it"
+            ),
+            "{out}"
+        );
+    })
+    .await;
+}

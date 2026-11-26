@@ -265,8 +265,12 @@ pub enum Wait {
     Stopped,
     /// It is working: it gets this when its turn ends.
     Working,
-    /// The person is typing in its terminal.
+    /// The person typed in its terminal within their hold, since its last
+    /// turn started.
     Typing,
+    /// The person's draft, put in its prompt by Desk, waits there unsent:
+    /// it gets this once a turn starts.
+    Draft,
     /// Desk's breaker paused it: only the person's own messages go in.
     Paused,
     /// Its turn ended asking the person something: only they, the boss
@@ -298,7 +302,9 @@ impl Wait {
     /// or Desk itself lets it go: no one need move it.
     pub fn on_purpose(self) -> bool {
         match self {
-            Self::Typing | Self::Paused | Self::PersonDriving | Self::ModeEnding => true,
+            Self::Typing | Self::Draft | Self::Paused | Self::PersonDriving | Self::ModeEnding => {
+                true
+            }
             Self::Stopped
             | Self::Working
             | Self::Asking
@@ -777,20 +783,22 @@ pub fn holds_for_person(text: &str) -> bool {
     })
 }
 
-/// What tells a session to hold, wait or not push, as whole words: "keep
-/// the hold in place", "hold off", "wait until", "do not push".
-const HOLDS_SESSION: [&str; 20] = [
+/// What tells a session to hold, as whole words, whatever follows: "keep
+/// the hold in place", "hold off", "stand by".
+const HOLDS_SESSION: [&str; 6] = [
     "hold",
     "on hold",
     "hold off",
-    "hold here",
     "stay held",
-    "wait until",
-    "wait till",
-    "wait before",
-    "wait here",
     "stand by",
     "stay put",
+];
+
+/// What tells a session to wait, pause or not push, merge or rerun: a
+/// hold only when it is open-ended or waits on a person ([`OPEN_ENDED`],
+/// [`holds_for_person`]). "Wait until CI is green" is the work.
+const HOLDS_IF_OPEN: [&str; 13] = [
+    "wait",
     "pause",
     "do not push",
     "don't push",
@@ -799,7 +807,25 @@ const HOLDS_SESSION: [&str; 20] = [
     "stop pushing",
     "do not merge",
     "don't merge",
+    "dont merge",
     "do not rerun",
+    "don't rerun",
+    "dont rerun",
+];
+
+/// What, later in its sentence, leaves a wait or a "don't" open-ended.
+const OPEN_ENDED: [&str; 11] = [
+    "until i say",
+    "until you say",
+    "until they say",
+    "until i tell you",
+    "till i say",
+    "until further notice",
+    "till further notice",
+    "until told",
+    "until you're told",
+    "for now",
+    "yet",
 ];
 
 /// What before a hold's words lifts it, or says there is none: "no need
@@ -820,26 +846,52 @@ const NO_HOLD: [&str; 12] = [
 ];
 
 /// Whether `text`, a boss's words to a session, hold it: tell it to hold,
-/// wait or not push. At Act fully such words are only ever a directive's
+/// or to wait or not push with no end but someone's word. At Act fully such words are only ever a directive's
 /// hold (25 Nov 19:08: "Keep the hold in place … do not push, rerun", and
 /// no directive asked for it).
 pub fn holds_session(text: &str) -> bool {
     let lower = plain(text);
-    HOLDS_SESSION.iter().any(|h| {
-        lower.match_indices(h).any(|(at, _)| {
-            let before = &lower[..at];
-            let after = &lower[at + h.len()..];
-            let whole = !before
-                .chars()
-                .next_back()
-                .is_some_and(char::is_alphanumeric)
-                && !after.starts_with(char::is_alphanumeric);
-            let lifted = after.trim_start().starts_with("is lifted")
-                || after.trim_start().starts_with("is over")
-                || (!h.starts_with("do") && NO_HOLD.iter().any(|n| before.ends_with(n)));
-            whole && !lifted
+    let for_person = holds_for_person(text);
+    let said = |phrases: &[&str], open_only: bool| {
+        phrases.iter().any(|h| {
+            lower.match_indices(h).any(|(at, _)| {
+                let before = &lower[..at];
+                let after = &lower[at + h.len()..];
+                if !whole_at(before, after) {
+                    return false;
+                }
+                let lifted = after.trim_start().starts_with("is lifted")
+                    || after.trim_start().starts_with("is over")
+                    || (!h.starts_with("do") && NO_HOLD.iter().any(|n| before.ends_with(n)));
+                if lifted {
+                    return false;
+                }
+                if !open_only {
+                    return true;
+                }
+                let sentence = after
+                    .split(['.', '!', '?', ';', '\n'])
+                    .next()
+                    .unwrap_or_default();
+                for_person
+                    || OPEN_ENDED.iter().any(|o| {
+                        sentence
+                            .match_indices(o)
+                            .any(|(i, _)| whole_at(&sentence[..i], &sentence[i + o.len()..]))
+                    })
+            })
         })
-    })
+    };
+    said(&HOLDS_SESSION, false) || said(&HOLDS_IF_OPEN, true)
+}
+
+/// Whether words found between `before` and `after` stand whole.
+fn whole_at(before: &str, after: &str) -> bool {
+    !before
+        .chars()
+        .next_back()
+        .is_some_and(char::is_alphanumeric)
+        && !after.starts_with(char::is_alphanumeric)
 }
 
 /// Who replies to a line message: a session, the overseer (its agent id),
@@ -1189,12 +1241,45 @@ fn turn_wait(recipient: &SessionView) -> Wait {
     }
 }
 
+/// The person's last keystroke in a session's terminal, while it holds what
+/// Desk would type in there.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Keystroke {
+    pub at: DateTime<Utc>,
+    /// When its hold is up, unless they type on.
+    pub ends: DateTime<Utc>,
+}
+
+/// The keystroke at `typed` as it holds a session at `now`: one after its
+/// last turn started (at `turned`), within `hold`, as the wheel reads the
+/// person's input ([`crate::charge::wheel`]).
+pub fn keystroke(
+    typed: Option<DateTime<Utc>>,
+    turned: Option<DateTime<Utc>>,
+    hold: chrono::Duration,
+    now: DateTime<Utc>,
+) -> Option<Keystroke> {
+    typed
+        .filter(|t| turned.is_none_or(|s| *t > s))
+        .map(|at| Keystroke {
+            at,
+            ends: at + hold,
+        })
+        .filter(|k| k.ends > now)
+}
+
 /// How a message reaches `recipient` now, or why it must wait. `typed` is
-/// whether the person typed in its terminal since their last prompt;
-/// `plugin` whether Desk's plugin was heard from in it. A Claude Code
-/// session whose plugin hasn't been heard (one started under an older
-/// Desk) is typed into at its prompt instead, as before there was a line.
-pub fn deliverable(recipient: &SessionView, typed: bool, plugin: bool) -> Result<Deliver, Wait> {
+/// whether a keystroke in its terminal holds it ([`keystroke`]); `drafted`
+/// whether the person's draft waits in its prompt; `plugin` whether Desk's
+/// plugin was heard from in it. A Claude Code session whose plugin hasn't
+/// been heard (one started under an older Desk) is typed into at its
+/// prompt instead, as before there was a line.
+pub fn deliverable(
+    recipient: &SessionView,
+    typed: bool,
+    drafted: bool,
+    plugin: bool,
+) -> Result<Deliver, Wait> {
     if !recipient.live {
         return Err(Wait::Stopped);
     }
@@ -1209,6 +1294,9 @@ pub fn deliverable(recipient: &SessionView, typed: bool, plugin: bool) -> Result
         Deliver::Submit if plugin && in_turn(recipient.state) => Err(turn_wait(recipient)),
         Deliver::Submit if plugin => Ok(Deliver::Submit),
         Deliver::Submit | Deliver::Paste => match recipient.state {
+            SessionState::Idle | SessionState::Done | SessionState::Asking if drafted => {
+                Err(Wait::Draft)
+            }
             SessionState::Idle | SessionState::Done | SessionState::Asking if typed => {
                 Err(Wait::Typing)
             }
@@ -1874,13 +1962,16 @@ mod tests {
     fn words_that_hold_a_session_are_told_from_the_work() {
         for held in [
             "Keep the hold in place on MAN-839: do not push, rerun or merge until I say.",
+            "Keep the hold in place … do not push, rerun",
             "Hold off on the merge.",
             "Stay on hold for now.",
-            "Wait until the release window opens.",
             "Don't push yet.",
-            "Do not merge it.",
-            "Pause here.",
+            "Do not merge until further notice.",
+            "Pause for now.",
+            "Wait until I say.",
+            "Don't merge: wait for the person to approve the migration.",
             "Stand by.",
+            "Stay put.",
         ] {
             assert!(holds_session(held), "{held}");
         }
@@ -1896,6 +1987,13 @@ mod tests {
             "Keep a firm handhold on the API.",
             "Don't wait for me: push it.",
             "The upload paused mid-way; retry it.",
+            "Wait until CI is green, then merge.",
+            "Don't merge it yourself: I merge it with crew.github_merge.",
+            "Don't push until the tests pass.",
+            "Pause the watcher, then rerun the migration.",
+            "Wait until the release window opens.",
+            "Do not merge it.",
+            "Yet another test failed: don't push the fix without it.",
         ] {
             assert!(!holds_session(not), "{not}");
         }
@@ -2318,21 +2416,48 @@ mod tests {
     }
 
     #[test]
+    fn a_keystroke_holds_a_session_only_within_its_hold_and_since_its_last_turn() {
+        let now = Utc::now();
+        let ago = |s: i64| Some(now - chrono::Duration::seconds(s));
+        let hold = crate::charge::HOLD;
+        assert_eq!(keystroke(None, None, hold, now), None);
+        assert_eq!(
+            keystroke(ago(40), None, hold, now),
+            Some(Keystroke {
+                at: now - chrono::Duration::seconds(40),
+                ends: now + chrono::Duration::seconds(80),
+            })
+        );
+        assert_eq!(keystroke(ago(120), None, hold, now), None, "its hold is up");
+        assert_eq!(keystroke(ago(3600), ago(7200), hold, now), None);
+        assert_eq!(
+            keystroke(ago(40), ago(30), hold, now),
+            None,
+            "a turn took it"
+        );
+        assert!(keystroke(ago(20), ago(30), hold, now).is_some());
+        assert!(keystroke(ago(200), None, chrono::Duration::minutes(5), now).is_some());
+    }
+
+    #[test]
     fn a_message_waits_until_its_recipient_can_take_it() {
         let mut codex = session("acme-api", Engine::Codex);
-        assert_eq!(deliverable(&codex, false, false), Ok(Deliver::Paste));
-        assert_eq!(deliverable(&codex, true, false), Err(Wait::Typing));
+        assert_eq!(deliverable(&codex, false, false, false), Ok(Deliver::Paste));
+        assert_eq!(deliverable(&codex, true, false, false), Err(Wait::Typing));
+        // A draft waits in its prompt, typed on or not: never typing.
+        assert_eq!(deliverable(&codex, false, true, false), Err(Wait::Draft));
+        assert_eq!(deliverable(&codex, true, true, false), Err(Wait::Draft));
         codex.state = SessionState::Working;
-        assert_eq!(deliverable(&codex, false, false), Err(Wait::Working));
+        assert_eq!(deliverable(&codex, false, false, false), Err(Wait::Working));
         codex.live = false;
-        assert_eq!(deliverable(&codex, false, false), Err(Wait::Stopped));
+        assert_eq!(deliverable(&codex, false, false, false), Err(Wait::Stopped));
         // Claude Code's plugin is handed it at the idle, typed in there or
         // not: inside a turn Desk keeps it.
         let mut claude = session("acme-web", Engine::Claude);
         claude.state = SessionState::Working;
-        assert_eq!(deliverable(&claude, true, true), Err(Wait::Working));
+        assert_eq!(deliverable(&claude, true, false, true), Err(Wait::Working));
         claude.state = SessionState::Blocked;
-        assert_eq!(deliverable(&claude, false, true), Err(Wait::Dialog));
+        assert_eq!(deliverable(&claude, false, false, true), Err(Wait::Dialog));
         claude.state = SessionState::Working;
         claude.pending = Some(crate::model::PendingApproval {
             id: Uuid::new_v4(),
@@ -2348,29 +2473,35 @@ mod tests {
             agent: None,
             cli_session: None,
         });
-        assert_eq!(deliverable(&claude, false, true), Err(Wait::Dialog));
-        assert_eq!(deliverable(&claude, false, false), Err(Wait::Dialog));
+        assert_eq!(deliverable(&claude, false, false, true), Err(Wait::Dialog));
+        assert_eq!(deliverable(&claude, false, false, false), Err(Wait::Dialog));
         for state in [SessionState::Asking, SessionState::Idle] {
             claude.state = state;
             assert_eq!(
-                deliverable(&claude, false, true),
+                deliverable(&claude, false, false, true),
                 Err(Wait::Dialog),
                 "{state:?}"
             );
             assert_eq!(
-                deliverable(&claude, false, false),
+                deliverable(&claude, false, false, false),
                 Err(Wait::Dialog),
                 "{state:?}"
             );
         }
         claude.pending = None;
         claude.state = SessionState::Idle;
-        assert_eq!(deliverable(&claude, true, true), Ok(Deliver::Submit));
+        assert_eq!(deliverable(&claude, true, false, true), Ok(Deliver::Submit));
         claude.state = SessionState::Working;
         // Without Desk's plugin heard in it, typed in at its prompt.
-        assert_eq!(deliverable(&claude, false, false), Err(Wait::Working));
+        assert_eq!(
+            deliverable(&claude, false, false, false),
+            Err(Wait::Working)
+        );
         claude.state = SessionState::Idle;
-        assert_eq!(deliverable(&claude, false, false), Ok(Deliver::Paste));
+        assert_eq!(
+            deliverable(&claude, false, false, false),
+            Ok(Deliver::Paste)
+        );
     }
 
     #[test]

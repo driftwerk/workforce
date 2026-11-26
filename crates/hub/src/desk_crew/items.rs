@@ -132,7 +132,7 @@ pub fn schema(name: &str) -> Value {
             "kind": { "type": "string", "enum": ["ask", "confirm", "todo"], "description": "ask (default), confirm a decision you took, or todo: what only the person can physically do (one line, no answers; they mark it Done)" },
             "cant_decide": { "type": "string", "description": "At Act fully: why the person's own instructions (their orders, preferences, the session's instructions) don't cover this and you can't decide it yourself. Touching production or staging is no reason by itself. Without it, at Act fully you decide and act instead of asking" },
             "session_id": { "type": "string", "description": "The session it is about, if one (from crew.overview)" },
-            "options": { "type": "array", "items": { "type": "string" }, "description": "The answers to offer, as buttons" },
+            "options": { "type": "array", "items": { "type": "string" }, "description": "The answers to offer, as buttons. A question with a proposal is answered Yes or No: those are its buttons" },
             "recommendation": { "type": "string" },
             "holding_up": { "type": "string", "description": "What waits on the answer, e.g. \"Billing migration is paused on this\"" },
             "generalizes": { "type": "string", "description": "The kind of case an answer would settle from then on" },
@@ -492,8 +492,16 @@ impl CrewHub {
                 })
                 .unwrap_or_default()
         };
-        new.options = list("options");
-        let recommended = match some("recommended") {
+        // A question proposing a change to a goal is answered yes or no:
+        // its proposal says what a yes applies, whatever the boss labels.
+        let proposes = about_goal.as_ref().is_some_and(|(_, p)| !p.is_empty());
+        new.options = match proposes {
+            true => workforce_desk::goal::GOAL_ANSWERS
+                .map(str::to_string)
+                .to_vec(),
+            false => list("options"),
+        };
+        let recommended = match some("recommended").filter(|_| !proposes) {
             None => None,
             Some(r) => {
                 // One of the options it offers: these, else those it

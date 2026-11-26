@@ -682,95 +682,121 @@ enum Ran {
     Failed(String),
 }
 
-/// The person's own messages in `service`'s DM with `person` since
-/// `since`, oldest first, among its newest `look` messages: read from the
-/// DM itself, so none is lost to a rotation or a compaction. Desk's own
-/// notes in it are not theirs.
-pub(super) fn person_messages(
+/// One conversation of `service`'s DM with a person, the DM itself or a
+/// thread of it: what the person wrote and what the boss replied in turns
+/// of its own, each with when.
+#[derive(Default)]
+pub(super) struct Talk {
+    /// The person's own messages: Desk's notes in it are not theirs.
+    pub theirs: Vec<(DateTime<Utc>, String)>,
+    /// The boss's replies: Desk's posts by it (plan cards, updates,
+    /// notices, a turn's failure) aren't its words to answer.
+    pub boss: Vec<(DateTime<Utc>, String)>,
+}
+
+/// The conversation on `channel` of `service`'s DM with `person`, newer
+/// than `since`, among its newest `look` messages: read from the
+/// conversation itself, so none is lost to a rotation or a compaction.
+fn talk_on(
     service: &AgentService,
     person: &str,
+    channel: &str,
     since: DateTime<Utc>,
     look: usize,
-) -> Vec<(DateTime<Utc>, String)> {
+) -> Talk {
     use workforce_desk::conversations::{Author, SpeakerKind};
     let speaker = workforce_desk::Speaker::agent(service.agent_id.as_str(), &name_of(service));
     let page = match crate::desk_conversations::page(
         service.sessions.as_ref(),
         &speaker,
         person,
-        workforce_common::channels::DESK_CHANNEL,
+        channel,
         workforce_desk::Cursor::Newest,
         look,
     ) {
         Ok(p) => p,
         Err(e) => {
-            tracing::info!(error = %e, "the person's DM words couldn't be read");
-            return Vec::new();
+            tracing::info!(error = %e, channel, "a DM conversation couldn't be read");
+            return Talk::default();
         }
     };
-    page.messages
+    let (theirs, boss): (Vec<_>, Vec<_>) = page
+        .messages
         .into_iter()
-        .filter(|m| m.at > since)
-        .filter(|m| m.from == Author::User && m.author.kind == SpeakerKind::You)
-        .filter(|m| !crate::desk_surface::hub_note(m.text.trim()) && !m.text.trim().is_empty())
-        .map(|m| (m.at, m.text))
-        .collect()
+        .filter(|m| m.at > since && !m.text.trim().is_empty())
+        .filter(|m| match m.from {
+            Author::User => {
+                m.author.kind == SpeakerKind::You && !crate::desk_surface::hub_note(m.text.trim())
+            }
+            Author::Agent => m
+                .mark
+                .as_ref()
+                .is_none_or(|k| k.delivery.is_none() && !k.failed),
+        })
+        .partition(|m| m.from == Author::User);
+    let lines = |said: Vec<workforce_desk::conversations::Said>| {
+        said.into_iter().map(|m| (m.at, m.text)).collect()
+    };
+    Talk {
+        theirs: lines(theirs),
+        boss: lines(boss),
+    }
 }
 
-/// When `service` last replied in its DM with `person` in a turn of its
-/// own, among the `look` newest messages there: Desk's posts by it (plan
-/// cards, updates, notices, a turn's failure) aren't its words to answer.
-pub(super) fn boss_last_said(
+/// The person's own messages in `service`'s DM with `person` since
+/// `since`, oldest first, among its newest `look` messages.
+pub(super) fn person_messages(
+    service: &AgentService,
+    person: &str,
+    since: DateTime<Utc>,
+    look: usize,
+) -> Vec<(DateTime<Utc>, String)> {
+    talk_on(
+        service,
+        person,
+        workforce_common::channels::DESK_CHANNEL,
+        since,
+        look,
+    )
+    .theirs
+}
+
+/// What `service` replied in its DM with `person` in turns of its own,
+/// and when, among the `look` newest messages there.
+pub(super) fn boss_said(
     service: &AgentService,
     person: &str,
     look: usize,
-) -> Option<DateTime<Utc>> {
-    use workforce_desk::conversations::Author;
-    let speaker = workforce_desk::Speaker::agent(service.agent_id.as_str(), &name_of(service));
-    match crate::desk_conversations::page(
-        service.sessions.as_ref(),
-        &speaker,
+) -> Vec<(DateTime<Utc>, String)> {
+    let all = DateTime::<Utc>::MIN_UTC;
+    talk_on(
+        service,
         person,
         workforce_common::channels::DESK_CHANNEL,
-        workforce_desk::Cursor::Newest,
+        all,
         look,
-    ) {
-        Ok(page) => page
-            .messages
-            .into_iter()
-            .filter(|m| m.from == Author::Agent && !m.text.trim().is_empty())
-            .filter(|m| {
-                m.mark
-                    .as_ref()
-                    .is_none_or(|k| k.delivery.is_none() && !k.failed)
-            })
-            .map(|m| m.at)
-            .max(),
-        Err(e) => {
-            tracing::info!(error = %e, "the boss's DM couldn't be read");
-            None
-        }
-    }
+    )
+    .boss
 }
 
 /// The threads read for the person's words, at most: the ones last
 /// written to.
 const THREADS_READ: usize = 20;
 
-/// The person's own messages in the threads of `service`'s DM with
-/// `person` written to since `since`, newer than it: their replies there,
-/// as [`person_messages`] reads the DM itself.
-pub(super) fn person_thread_messages(
+/// The threads of `service`'s DM with `person` written to since `since`,
+/// each newer than it, as [`talk_on`] reads them.
+fn thread_talks(
     service: &AgentService,
     person: &str,
     since: DateTime<Utc>,
     look: usize,
-) -> Vec<(DateTime<Utc>, String)> {
-    use workforce_desk::conversations::{Author, SpeakerKind};
-    let store = service.sessions.as_ref();
+) -> Vec<Talk> {
     // Threads' channels are `desk:thread:<message id>`, all under one prefix.
     let threads_on = workforce_core::desk::DESK_THREAD_PREFIX.trim_end_matches(':');
-    let mut threads: Vec<_> = match store.list_for_owner_on(person, threads_on, 2_000) {
+    let mut threads: Vec<_> = match service
+        .sessions
+        .list_for_owner_on(person, threads_on, 2_000)
+    {
         Ok(all) => all
             .into_iter()
             .filter(|s| {
@@ -785,35 +811,46 @@ pub(super) fn person_thread_messages(
         }
     };
     threads.sort_by_key(|s| std::cmp::Reverse(s.updated_at));
-    let speaker = workforce_desk::Speaker::agent(service.agent_id.as_str(), &name_of(service));
-    let mut out = Vec::new();
-    for head in threads.into_iter().take(THREADS_READ) {
-        let page = match crate::desk_conversations::page(
-            store,
-            &speaker,
-            person,
-            &head.channel,
-            workforce_desk::Cursor::Newest,
-            look,
-        ) {
-            Ok(p) => p,
-            Err(e) => {
-                tracing::info!(error = %e, "a DM thread's words couldn't be read");
-                continue;
-            }
-        };
-        out.extend(
-            page.messages
-                .into_iter()
-                .filter(|m| m.at > since)
-                .filter(|m| m.from == Author::User && m.author.kind == SpeakerKind::You)
-                .filter(|m| {
-                    !crate::desk_surface::hub_note(m.text.trim()) && !m.text.trim().is_empty()
-                })
-                .map(|m| (m.at, m.text)),
-        );
-    }
-    out
+    threads
+        .into_iter()
+        .take(THREADS_READ)
+        .map(|head| talk_on(service, person, &head.channel, since, look))
+        .collect()
+}
+
+/// The person's own messages in the threads of `service`'s DM with
+/// `person` written to since `since`, newer than it: their replies there,
+/// as [`person_messages`] reads the DM itself.
+pub(super) fn person_thread_messages(
+    service: &AgentService,
+    person: &str,
+    since: DateTime<Utc>,
+    look: usize,
+) -> Vec<(DateTime<Utc>, String)> {
+    thread_talks(service, person, since, look)
+        .into_iter()
+        .flat_map(|t| t.theirs)
+        .collect()
+}
+
+/// The DM of `service`'s with `person` and each of its threads written to
+/// since `since`, newer than it.
+pub(super) fn dm_talks(
+    service: &AgentService,
+    person: &str,
+    since: DateTime<Utc>,
+    look: usize,
+) -> Vec<Talk> {
+    let dm = talk_on(
+        service,
+        person,
+        workforce_common::channels::DESK_CHANNEL,
+        since,
+        look,
+    );
+    std::iter::once(dm)
+        .chain(thread_talks(service, person, since, look))
+        .collect()
 }
 
 /// The person's own words in `service`'s DM with `person` since `since`
