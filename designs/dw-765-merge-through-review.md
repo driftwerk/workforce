@@ -156,14 +156,12 @@ After the merge, `Landed::Merged` and the close sweep carry on as they do now, a
 - **Store** (Postgres):
   - V095 applies twice;
   - a link keeps its head and `for_session`;
-  - `pr_reviews_for` and `pr_review_started` read them back.
+  - `pr_review_of`, `pr_reviews_for` and `pr_reviews_at` read them back, and `pr_review_unlink` forgets one.
 - **Desk start path** (`charge_tests`):
   - a review start with a worktree is made detached at the head and linked with head and `for_session`;
-  - a second review start at the same head is refused while the first is open, and allowed once it is closed;
-  - a review start whose launch fails leaves no link.
+  - a second review start at the same head is refused while the first is open, and allowed once it is closed, its worktree found again.
 - **`status_of`** (unit): Desk's `.worktrees/` isn't uncommitted work.
-- **Slots** (unit): a Review ticket whose review session works is held.
-- **Decision** (hub, `decides_at_once`-style): a session's `gh pr merge` at Act fully is denied at once with the `crew.github_merge` instead, and the boss's model is never asked.
+- **Decision** (hub, `tests/ships.rs`): a session's `gh pr merge` at Act fully is denied at once with the `crew.github_merge` instead, and the boss's model is never asked.
 - **Lifecycle** (hub, `tests/ships.rs`, from the ticket), run at Act fully:
   - a plan of two tickets in `acme/web`, parallel 1;
   - DES-1's session opens #7 on `dw-761`, CI is green, and its turn ends;

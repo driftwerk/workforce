@@ -256,6 +256,9 @@ fn same_dir(dir: &Path, own: &str, common: &str) -> bool {
     }
 }
 
+/// Where Desk keeps a checkout's worktrees, as `git status` names it.
+const DESK_WORKTREES: &str = ".worktrees/";
+
 /// A repository's branch, HEAD, upstream and changed paths from
 /// `git status --porcelain=v2 -z --branch`.
 fn status_of(status: &str) -> Repo {
@@ -291,8 +294,9 @@ fn status_of(status: &str) -> Repo {
             .flatten()
             .filter_map(changed_path)
             // Finder's own files are nobody's work (the person's global
-            // ignore isn't read by a hardened git).
-            .filter(|p| !p.ends_with(".DS_Store"))
+            // ignore isn't read by a hardened git), nor are the worktrees
+            // Desk keeps in a checkout.
+            .filter(|p| !p.ends_with(".DS_Store") && *p != DESK_WORKTREES)
             .map(str::to_string)
             .collect(),
         ..Repo::default()
@@ -466,6 +470,8 @@ mod tests {
         );
         std::fs::write(work.join("a.txt"), "a").unwrap();
         std::fs::write(work.join(".DS_Store"), "x").unwrap();
+        std::fs::create_dir_all(work.join(".worktrees/review-7")).unwrap();
+        std::fs::write(work.join(".worktrees/review-7/x.ts"), "x").unwrap();
         assert_eq!(
             folder(w).await,
             Folder::Uncommitted(1),

@@ -136,7 +136,7 @@ pub mod update_store;
 pub mod update_write;
 pub mod usage;
 mod vt;
-mod worktree;
+pub mod worktree;
 
 pub use adopt::HubInternal;
 pub use api::{router, sessions_router, Authorize};

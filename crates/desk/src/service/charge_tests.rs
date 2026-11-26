@@ -1820,7 +1820,7 @@ async fn a_boss_acting_fully_cancels_only_the_requests_it_decides() {
 /// the head it was given, and linked to that pull request before it runs.
 #[tokio::test]
 async fn a_review_session_is_asked_for_its_verdict_and_linked_to_its_pull_request() {
-    use crate::plan::{review_instruction, PrRef, ReviewOf};
+    use crate::plan::{review_instruction, PrRef, ReviewLink, ReviewOf};
     with_test_pool(build_pool, |pool| async move {
         let dir = tempfile::tempdir().unwrap();
         let d = desk(pool, dir.path()).await;
@@ -1833,9 +1833,11 @@ async fn a_review_session_is_asked_for_its_verdict_and_linked_to_its_pull_reques
         let by = || By::manager("sarah", "Sarah", "Review it.");
         let mut new = start_in(dir.path(), None);
         new.prompt = Some("Review pull request 42.".into());
+        let work = Uuid::new_v4();
         new.review_of = Some(ReviewOf {
             pr: pr.clone(),
             head_sha: head.into(),
+            for_session: Some(work),
         });
         let s = d.create_for(new, &sarah(), by()).await.unwrap();
         assert_eq!(
@@ -1847,7 +1849,13 @@ async fn a_review_session_is_asked_for_its_verdict_and_linked_to_its_pull_reques
         );
         assert_eq!(
             d.store().pr_review_of(s.id).await.unwrap(),
-            Some((sarah().id, pr.clone()))
+            Some(ReviewLink {
+                session: s.id,
+                boss: sarah().id,
+                pr: pr.clone(),
+                head_sha: Some(head.into()),
+                for_session: Some(work),
+            })
         );
 
         let mut plain = start_in(dir.path(), None);
@@ -1863,11 +1871,74 @@ async fn a_review_session_is_asked_for_its_verdict_and_linked_to_its_pull_reques
         short.review_of = Some(ReviewOf {
             pr,
             head_sha: head[..12].into(),
+            for_session: None,
         });
         assert!(matches!(
             d.create_for(short, &sarah(), by()).await,
             Err(DeskError::Invalid(_))
         ));
+    })
+    .await;
+}
+
+/// A review the boss names a worktree for is read in one detached at the
+/// head it reviews; a second review of that head is refused while the
+/// first is open, and may start once it is closed.
+#[tokio::test]
+async fn a_review_reads_its_head_in_a_detached_worktree_and_one_head_has_one_open_review() {
+    use crate::plan::{PrRef, ReviewOf};
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(dir.path()).unwrap();
+        let repo = base.join("web");
+        std::fs::create_dir_all(&repo).unwrap();
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(["-c", "user.email=d@e", "-c", "user.name=d"])
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "{out:?}");
+            String::from_utf8(out.stdout).unwrap().trim().to_string()
+        };
+        git(&["init", "-q", "-b", "main"]);
+        git(&["commit", "-q", "--allow-empty", "-m", "one"]);
+        let head = git(&["rev-parse", "HEAD"]);
+        git(&["commit", "-q", "--allow-empty", "-m", "two"]);
+        let d = desk(pool, &base).await;
+        let by = || By::manager("sarah", "Sarah", "Review it.");
+        let review = || {
+            let mut new = start_in(&repo, None);
+            new.worktree = Some("review-7".into());
+            new.review_of = Some(ReviewOf {
+                pr: PrRef::new("acme", "web", 7),
+                head_sha: head.clone(),
+                for_session: None,
+            });
+            new
+        };
+        let s = d.create_for(review(), &sarah(), by()).await.unwrap();
+        let folder = repo.join(".worktrees/review-7");
+        assert_eq!(s.cwd, folder.to_string_lossy());
+        assert_eq!(s.branch, None);
+        let at = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&folder)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .unwrap();
+        assert_eq!(String::from_utf8(at.stdout).unwrap().trim(), head);
+
+        let again = d.create_for(review(), &sarah(), by()).await.unwrap_err();
+        assert!(
+            matches!(&again, DeskError::Conflict(why) if why.contains("at that head already")),
+            "{again:?}"
+        );
+        d.end(s.id, Some(by())).await.unwrap();
+        let next = d.create_for(review(), &sarah(), by()).await.unwrap();
+        assert_eq!(next.cwd, s.cwd, "its worktree found again at the head");
     })
     .await;
 }

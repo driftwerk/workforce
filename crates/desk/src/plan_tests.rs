@@ -1762,6 +1762,7 @@ fn a_review_names_its_pull_request_and_a_full_head() {
             number,
         },
         head_sha: head.into(),
+        for_session: None,
     };
     assert_eq!(of("acme", 42, HEAD).check(), Ok(()));
     assert!(of("acme", 42, &HEAD[..12]).check().is_err());

@@ -738,11 +738,21 @@ fn gh(args: &[&str], here: &Here<'_>) -> Class {
             let graphql = ops
                 .first()
                 .is_none_or(|e| e.trim_start_matches('/') == "graphql");
-            is(Class::GhRead, reads && ops.len() == 1 && !graphql)
+            match ops[..] {
+                [e] if !reads && merges(e) => Class::GhPrMerge,
+                _ => is(Class::GhRead, reads && ops.len() == 1 && !graphql),
+            }
         }
         ["workflow", "run", ..] | ["release", "create", ..] => Class::Deploy,
         _ => Class::Other,
     }
+}
+
+/// Whether `endpoint` is GitHub's merge of a pull request
+/// (`repos/<owner>/<repo>/pulls/<number>/merge`).
+fn merges(endpoint: &str) -> bool {
+    let parts: Vec<&str> = endpoint.trim_matches('/').split('/').collect();
+    matches!(parts[..], ["repos", _, _, "pulls", n, "merge"] if !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
 }
 
 /// What a test run takes after its `--`: test names, and what only says
@@ -1294,7 +1304,19 @@ mod tests {
         assert_eq!(class("gh pr create --fill"), Class::GhPrCreate);
         assert_eq!(class("gh pr create --head feat/x"), Class::GhPrCreate);
         assert_eq!(class("gh pr create --head main"), Class::Other);
-        assert_eq!(class("gh pr merge 12 --squash"), Class::GhPrMerge);
+        for c in [
+            "gh pr merge 12 --squash",
+            "gh api -X PUT repos/acme/web/pulls/12/merge",
+            "gh api -XPUT /repos/acme/web/pulls/12/merge -f merge_method=squash",
+            "gh api repos/{owner}/{repo}/pulls/12/merge -f sha=abc",
+        ] {
+            assert_eq!(class(c), Class::GhPrMerge, "{c}");
+        }
+        assert_eq!(class("gh api repos/acme/web/pulls/12/merge"), Class::GhRead);
+        assert_eq!(
+            class("gh api -X PUT repos/acme/web/pulls/12/reviews"),
+            Class::Other
+        );
         assert_eq!(class("gh workflow run deploy.yml"), Class::Deploy);
     }
 
@@ -1424,7 +1446,6 @@ mod tests {
     #[test]
     fn gh_reads_every_spelling_of_a_method_field_and_flag() {
         for c in [
-            "gh api -XPUT repos/acme/web/pulls/1/merge",
             "gh api -XDELETE repos/acme/web/git/refs/heads/main",
             "gh api -X GET -X POST repos/acme/web/issues",
             "gh api --method=GET --method=PATCH repos/acme/web",

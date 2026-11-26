@@ -1715,13 +1715,27 @@ impl PrRef {
 }
 
 /// What a review session is started to review: a pull request, at its
-/// head as it starts, which its verdict names ([`REVIEW_VERDICT`]).
+/// head as it starts, which its verdict names ([`REVIEW_VERDICT`]), and
+/// the session whose work it is, when its boss runs one.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ReviewOf {
     #[serde(flatten)]
     pub pr: PrRef,
     pub head_sha: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub for_session: Option<Uuid>,
+}
+
+/// A review session as Desk linked it: the pull request it reviews, at
+/// the head it was started at, for the session whose work that is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReviewLink {
+    pub session: Uuid,
+    pub boss: String,
+    pub pr: PrRef,
+    pub head_sha: Option<String>,
+    pub for_session: Option<Uuid>,
 }
 
 impl ReviewOf {

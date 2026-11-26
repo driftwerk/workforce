@@ -366,7 +366,7 @@ pub(crate) fn model_on(engine: Engine, asked: Option<&str>, o: &Oversight) -> Op
 }
 
 /// A review's pull request as said (`{repo, number}`), at the head Desk
-/// read of it, when it has.
+/// read of it and for the session whose work it is, when it has.
 fn review_of(v: &Value) -> Result<workforce_desk::plan::ReviewOf, String> {
     let (owner, repo) =
         workforce_desk::goal::github_repo(v["repo"].as_str().unwrap_or_default())
@@ -378,6 +378,7 @@ fn review_of(v: &Value) -> Result<workforce_desk::plan::ReviewOf, String> {
     Ok(workforce_desk::plan::ReviewOf {
         pr: workforce_desk::plan::PrRef::new(owner, repo, number),
         head_sha: v["head_sha"].as_str().unwrap_or_default().to_string(),
+        for_session: v["for_session"].as_str().and_then(|s| s.parse().ok()),
     })
 }
 

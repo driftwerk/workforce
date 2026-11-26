@@ -106,6 +106,52 @@ async fn create_from(cwd: &Path, branch: &str, start: Option<&str>) -> Result<Pa
     Ok(path)
 }
 
+/// Creates `<repo>/.worktrees/<slug>` for `name`, detached at `commit`, in
+/// the main checkout of `cwd`'s repository, never inside a linked
+/// worktree: what a review reads its pull request's head in. One already
+/// there at `commit` is found again; one at another commit is refused.
+pub async fn detached(cwd: &Path, name: &str, commit: &str) -> Result<PathBuf> {
+    let slugged = slug(name);
+    if slugged.is_empty() {
+        eyre::bail!("worktree name {name:?} has no usable characters");
+    }
+    let root = main_checkout(cwd).await?;
+    let path = root.join(".worktrees").join(&slugged);
+    if path.exists() {
+        let at = git(&path, &["rev-parse", "--show-toplevel", "HEAD"]).await?;
+        let here = std::fs::canonicalize(&path).context("reading the worktree")?;
+        return match at.lines().collect::<Vec<_>>()[..] {
+            [top, head] if Path::new(top) == here && head == commit => Ok(path),
+            _ => eyre::bail!("{} already exists, not at {commit}", path.display()),
+        };
+    }
+    git(
+        &root,
+        &["worktree", "add", "--detach", &path.to_string_lossy(), commit],
+    )
+    .await?;
+    Ok(path)
+}
+
+/// Removes the worktree [`detached`] made at `path`: refused, and kept,
+/// while it holds changes of its own.
+pub async fn remove(path: &Path) -> Result<()> {
+    let root = main_checkout(path).await?;
+    git(&root, &["worktree", "remove", &path.to_string_lossy()])
+        .await
+        .map(drop)
+}
+
+/// The main checkout of `cwd`'s repository, from a linked worktree too.
+async fn main_checkout(cwd: &Path) -> Result<PathBuf> {
+    let common = std::fs::canonicalize(cwd.join(git(cwd, &["rev-parse", "--git-common-dir"]).await?))
+        .context("finding the repository")?;
+    match (common.file_name(), common.parent()) {
+        (Some(n), Some(parent)) if n == ".git" => Ok(parent.to_path_buf()),
+        _ => Ok(PathBuf::from(git(cwd, &["rev-parse", "--show-toplevel"]).await?)),
+    }
+}
+
 /// The most names [`create_fresh`] tries.
 pub const FRESH_TRIES: usize = 50;
 
@@ -283,6 +329,60 @@ mod tests {
         );
         assert!(create(repo, "desk/auth-fix").await.is_err());
         assert!(create(repo, "bad..name").await.is_err());
+    }
+
+    /// A review's worktree is detached at the commit it reads, in the
+    /// main checkout even from a linked worktree, found again there at that
+    /// commit, and refused at another.
+    #[tokio::test]
+    async fn a_detached_worktree_is_made_at_its_commit_in_the_main_checkout() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = std::fs::canonicalize(dir.path()).unwrap();
+        git(&repo, &["init", "-q", "-b", "main"]).await.unwrap();
+        for m in ["one", "two"] {
+            git(
+                &repo,
+                &[
+                    "-c",
+                    "user.email=d@e",
+                    "-c",
+                    "user.name=d",
+                    "commit",
+                    "-q",
+                    "--allow-empty",
+                    "-m",
+                    m,
+                ],
+            )
+            .await
+            .unwrap();
+        }
+        let first = git(&repo, &["rev-parse", "HEAD~1"]).await.unwrap();
+        let second = git(&repo, &["rev-parse", "HEAD"]).await.unwrap();
+        let ticket = create(&repo, "des-2").await.unwrap();
+
+        let made = detached(&ticket, "review 7 abc", &first).await.unwrap();
+        assert_eq!(made, repo.join(".worktrees/review-7-abc"));
+        assert_eq!(git(&made, &["rev-parse", "HEAD"]).await.unwrap(), first);
+        assert_eq!(
+            git(&made, &["branch", "--show-current"]).await.unwrap(),
+            "",
+            "detached"
+        );
+        assert_eq!(detached(&repo, "review 7 abc", &first).await.unwrap(), made);
+        assert!(detached(&repo, "review 7 abc", &second).await.is_err());
+        std::fs::create_dir_all(repo.join(".worktrees/plain")).unwrap();
+        assert!(
+            detached(&repo, "plain", &second).await.is_err(),
+            "a folder that isn't its worktree"
+        );
+        assert!(detached(&repo, "review 8", &"0".repeat(40)).await.is_err());
+
+        std::fs::write(made.join("notes.md"), "x").unwrap();
+        assert!(remove(&made).await.is_err(), "it holds changes");
+        std::fs::remove_file(made.join("notes.md")).unwrap();
+        remove(&made).await.unwrap();
+        assert!(!made.exists());
     }
 
     #[test]

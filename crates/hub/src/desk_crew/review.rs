@@ -1,15 +1,20 @@
-//! Act fully ships (DW-761): a pull request's review is recorded from its
-//! review session, as Desk reads it, and a green pull request with a clean
-//! review at its head is merged by the boss itself.
+//! Act fully ships (DW-761), and every merge goes through review (DW-765):
+//! a pull request's review is recorded from its review session, as Desk
+//! reads it, and a green pull request with a clean review at its head is
+//! merged by the boss itself.
 //!
-//! - **`crew.start_session` with `review_of`** starts a review session of
-//!   a pull request at its head now, read on GitHub as the person: Desk
-//!   asks it for its verdict line ([`plan::REVIEW_VERDICT`]) and links it
-//!   to the pull request.
+//! - **Desk starts the review** of a plan ticket's pull request once it is
+//!   green at a head with none ([`step`], from the plan watch), in a
+//!   worktree detached at that head, and records its verdict once its turn
+//!   ends; the boss starts one itself with `crew.start_session` and
+//!   `review_of` for any other. Desk asks it for its verdict line
+//!   ([`plan::REVIEW_VERDICT`]) and links it to the pull request, its head
+//!   and the session whose work it is.
 //! - **`crew.record_review(session_id)`** takes nothing else: the session
 //!   is one the boss runs, linked to its pull request; its folder's HEAD is
 //!   the pull request's head; the verdict is the last `REVIEW:` line of its
-//!   final reply, read from its transcript, naming that head.
+//!   final reply, read from its transcript, naming that head
+//!   ([`CrewHub::record_of`], which the plan watch records with too).
 //! - **`crew.github_merge(repo, number)`**, at Act fully only: its head is
 //!   the branch of a session the boss runs, in that session's own
 //!   repository; it is open, not a draft, mergeable, every check passed,
@@ -25,6 +30,7 @@ use uuid::Uuid;
 use workforce_common::oversight::Level;
 use workforce_desk::crew::{self, Kind, Party};
 use workforce_desk::decision::{BossDecision, How, Need};
+use workforce_desk::model::SessionState;
 use workforce_desk::plan::{self, PrRef, PrReview};
 use workforce_desk::TranscriptAsk;
 
@@ -32,16 +38,176 @@ use super::actions::Action;
 use super::github::{self, GithubAccess, GithubError};
 use super::tools::Bound;
 use super::workspace::{self, Workspace};
-use super::CrewHub;
+use super::{AgentService, CrewHub};
 
 pub(super) const RECORD: &str = "crew.record_review";
 pub(super) const MERGE: &str = "crew.github_merge";
 
-pub(super) const RECORD_DESCRIPTION: &str = "Record the verdict of a review session you started with crew.start_session and review_of (session_id), once its turn has ended: Desk reads its final reply's REVIEW line, and checks its folder is at the pull request's head. A clean review at the head is what crew.github_merge needs.";
+pub(super) const RECORD_DESCRIPTION: &str = "Record the verdict of a review session (session_id), once its turn has ended: Desk reads its final reply's REVIEW line, and checks its folder is at the pull request's head. Desk records the reviews it starts itself; this is for one you started with crew.start_session and review_of. A clean review at the head is what crew.github_merge needs.";
 pub(super) const MERGE_DESCRIPTION: &str = "Merge a pull request (repo as owner/name, number), at Act fully: its head is the branch of a session you run, in that session's own repository; it is open, not a draft, mergeable, every check passed, and crew.record_review recorded a clean review at its head. Desk squashes where the repository allows it, else merges; you're told why when it won't.";
 
 /// A review session's final reply with no verdict line.
 pub(crate) const NO_VERDICT: &str = "Its final reply has no REVIEW line: nudge it to end with `REVIEW: clean|changes <sha>`, then record again.";
+
+/// Why a review wasn't recorded.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Unrecorded {
+    /// Its final reply has no verdict line ([`NO_VERDICT`]).
+    NoVerdict,
+    /// Its folder, or the pull request, moved on from what it reviewed.
+    Moved(String),
+    No(String),
+}
+
+impl std::fmt::Display for Unrecorded {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::NoVerdict => NO_VERDICT,
+            Self::Moved(why) | Self::No(why) => why,
+        })
+    }
+}
+
+impl From<String> for Unrecorded {
+    fn from(why: String) -> Self {
+        Self::No(why)
+    }
+}
+
+impl From<&str> for Unrecorded {
+    fn from(why: &str) -> Self {
+        Self::No(why.into())
+    }
+}
+
+/// What Desk does of a pull request green at a head.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Step {
+    /// A clean review is recorded at its head: its boss merges it.
+    Merge,
+    /// Its review at its head asked for changes.
+    Settled,
+    /// Its review at its head is open.
+    Underway,
+    /// Each review started at its head ended with no verdict.
+    Lost,
+    /// No review was started at its head.
+    Start,
+}
+
+/// The review sessions started at a pull request's head, as Desk has
+/// them now.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Reviewing {
+    Never,
+    Open,
+    Ended,
+}
+
+impl Reviewing {
+    /// From each one's state in Desk, none when it is gone.
+    pub(crate) fn of(states: impl IntoIterator<Item = Option<SessionState>>) -> Self {
+        states.into_iter().fold(Self::Never, |was, s| match (was, s) {
+            (Self::Open, _) => Self::Open,
+            (_, Some(s)) if s != SessionState::Closed => Self::Open,
+            _ => Self::Ended,
+        })
+    }
+}
+
+/// What Desk does of a pull request green at `head`, with `newest` the
+/// newest review its boss recorded of it and `at_head` its review
+/// sessions started at that head.
+pub(crate) fn step(head: &str, newest: Option<&PrReview>, at_head: Reviewing) -> Step {
+    match (newest.filter(|r| r.head_sha == head), at_head) {
+        (Some(r), _) if r.clean => Step::Merge,
+        (Some(_), _) => Step::Settled,
+        (None, Reviewing::Open) => Step::Underway,
+        (None, Reviewing::Ended) => Step::Lost,
+        (None, Reviewing::Never) => Step::Start,
+    }
+}
+
+/// The short form of commit `sha`.
+pub(crate) fn short(sha: &str) -> &str {
+    &sha[..sha.len().min(7)]
+}
+
+/// `owner/repo#number`.
+pub(crate) fn named(pr: &PrRef) -> String {
+    format!("{}#{}", full_name(pr), pr.number)
+}
+
+/// The worktree a review of `pr` at `head` reads it in.
+pub(crate) fn worktree(pr: &PrRef, head: &str) -> String {
+    format!("review-{}-{}", pr.number, short(head))
+}
+
+/// Whether `cwd` is the worktree Desk makes a review of `pr` at `head`
+/// read in ([`worktree`]).
+pub(crate) fn made_for(cwd: &str, pr: &PrRef, head: &str) -> bool {
+    std::path::Path::new(cwd).ends_with(
+        std::path::Path::new(".worktrees").join(workforce_desk::worktree::slug(&worktree(pr, head))),
+    )
+}
+
+/// What a review session Desk starts for ticket `key` is asked.
+pub(crate) fn goal(pr: &PrRef, head: &str, key: &str) -> String {
+    format!(
+        "Review {} for {key} at its head {}: this folder is checked out there. Read its changes against its base branch (gh pr diff {}), run its tests, and check it does what {key} asks. Change, commit, push and merge nothing: say what needs changing.",
+        named(pr),
+        short(head),
+        pr.number
+    )
+}
+
+/// What a plan's turn is told once `pr` is green with a clean review at
+/// `head`, for ticket `key`.
+pub(crate) fn ready_line(key: &str, pr: &PrRef, head: &str, draft: bool) -> String {
+    format!(
+        "{key}: Desk recorded a clean review of {} at {}, and its checks passed. Merge it yourself with {MERGE} (repo {}, number {}) unless one of the person's directives says otherwise, then move {key} to Done (crew.move_ticket). Never tell its session to merge it.{}",
+        named(pr),
+        short(head),
+        full_name(pr),
+        pr.number,
+        match draft {
+            true => format!(" It's a draft: have its session mark it ready (gh pr ready {}) first.", pr.number),
+            false => String::new(),
+        }
+    )
+}
+
+/// What a plan's turn is told once `pr`'s review at `head` asked for
+/// changes, which Desk gave ticket `key`'s session.
+pub(crate) fn changes_line(key: &str, pr: &PrRef, head: &str) -> String {
+    format!(
+        "{key}: the review of {} at {} asked for changes; Desk gave them to {key}'s session. Its next head is reviewed again.",
+        named(pr),
+        short(head)
+    )
+}
+
+/// What ticket `key`'s session is told of the changes its review at
+/// `head` asked for, `said` its reviewer's final reply.
+pub(crate) fn changes_message(pr: &PrRef, head: &str, said: &str) -> String {
+    let quoted: Vec<String> = said.trim().lines().map(|l| format!("> {l}")).collect();
+    format!(
+        "Desk's review of {} at {} asked for changes. Its reviewer said:\n\n{}\n\nMake them and push: Desk has the new head reviewed again, and your boss merges it once a review is clean. Don't merge it yourself.",
+        named(pr),
+        short(head),
+        quoted.join("\n")
+    )
+}
+
+/// What a plan's turn is told when ticket `key`'s `pr` is green at `head`
+/// with no review Desk could start (`why`), or none that said a verdict.
+pub(crate) fn unreviewed_line(key: &str, pr: &PrRef, head: &str, why: &str) -> String {
+    format!(
+        "{key}: {} is green at {} with no review ({why}). Start one with crew.start_session and review_of if it still needs one.",
+        named(pr),
+        short(head)
+    )
+}
 
 /// What GitHub not having worked out mergeability yet is, after its tries.
 pub(crate) const UNDECIDED: &str = "GitHub hasn't decided mergeability yet; try again";
@@ -92,16 +258,18 @@ fn full_name(pr: &PrRef) -> String {
 /// A review's verdict, read from its final reply (`reply`), checked
 /// against its folder's HEAD (`folder`) and the pull request's (`head`):
 /// clean or not.
-pub(crate) fn verdict_at(reply: &str, folder: &str, head: &str) -> Result<bool, String> {
+pub(crate) fn verdict_at(reply: &str, folder: &str, head: &str) -> Result<bool, Unrecorded> {
     if folder != head {
-        return Err(format!(
+        return Err(Unrecorded::Moved(format!(
             "Its folder is at {folder}, the PR is at {head}: it didn't review the PR's head."
-        ));
+        )));
     }
-    let (clean, sha) = plan::review_verdict(reply).ok_or(NO_VERDICT)?;
+    let (clean, sha) = plan::review_verdict(reply).ok_or(Unrecorded::NoVerdict)?;
     match sha == head {
         true => Ok(clean),
-        false => Err(format!("the review was of {sha}, the PR is at {head}")),
+        false => Err(Unrecorded::Moved(format!(
+            "the review was of {sha}, the PR is at {head}"
+        ))),
     }
 }
 
@@ -197,7 +365,7 @@ pub(crate) fn ready(
     match review {
         None => {
             return no(format!(
-                "No review is recorded at its head {head}: start one with crew.start_session and review_of, then crew.record_review."
+                "No review is recorded at its head {head}: Desk reviews a plan ticket's pull request once its checks pass; for another, start one with crew.start_session and review_of, then crew.record_review."
             ))
         }
         Some(r) if r.head_sha != head => {
@@ -297,27 +465,36 @@ pub(crate) async fn merge(
 }
 
 impl CrewHub {
-    fn access<'a>(b: &'a Bound) -> GithubAccess<'a> {
+    fn access(service: &AgentService) -> GithubAccess<'_> {
         GithubAccess {
-            vault: b.service.vault.clone(),
-            global: b.service.global_vault.clone(),
-            config: &b.service.config,
-            registry: &b.service.tools,
+            vault: service.vault.clone(),
+            global: service.global_vault.clone(),
+            config: &service.config,
+            registry: &service.tools,
         }
     }
 
-    /// A pull request's head now, read on GitHub as the person.
-    async fn pr_head(b: &Bound, pr: &PrRef) -> Result<String, String> {
-        let (_, got) = github::calls_as_person(
-            &Self::access(b),
+    /// A pull request as GitHub says it now (`get_pull`), read as the
+    /// person.
+    async fn pull_now(&self, service: &AgentService, pr: &PrRef) -> Result<Value, String> {
+        let access = Self::access(service);
+        let read = github::calls_as_person(
+            &access,
             vec![(
                 "github.get_pull",
                 json!({ "owner": pr.owner, "repo": pr.repo, "number": pr.number }),
             )],
-        )
-        .await
-        .map_err(|e| e.to_string())?;
-        got[0]["head_sha"]
+        );
+        let (_, mut got) = self
+            .as_person(service, read)
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(got.swap_remove(0))
+    }
+
+    /// A pull request's head, as `pull` (its `get_pull`) says it.
+    fn head_of(pull: &Value) -> Result<String, String> {
+        pull["head_sha"]
             .as_str()
             .filter(|h| plan::is_sha(h))
             .map(str::to_string)
@@ -325,9 +502,9 @@ impl CrewHub {
     }
 
     /// A start of a review session, `review_of` as the boss said it
-    /// (`{repo, number}`), at the pull request's head now: the head is
-    /// GitHub's, never the boss's, in the action and in `kept`, the input
-    /// a suggestion of it keeps.
+    /// (`{repo, number}`), at the pull request's head now, for the session
+    /// whose branch it is: both GitHub's, never the boss's, in the action
+    /// and in `kept`, the input a suggestion of it keeps.
     pub(super) async fn review_head(
         &self,
         b: &Bound,
@@ -340,15 +517,28 @@ impl CrewHub {
         else {
             return Ok(());
         };
-        r.head_sha = self.as_person(&b.service, Self::pr_head(b, &r.pr)).await?;
+        let pull = self.pull_now(&b.service, &r.pr).await?;
+        r.head_sha = Self::head_of(&pull)?;
+        r.for_session = self
+            .sessions_of(b.service.agent_id.as_str())
+            .await
+            .into_iter()
+            .find(|(_, origin, branch)| {
+                pull["head_repo"]
+                    .as_str()
+                    .is_some_and(|h| h.eq_ignore_ascii_case(origin))
+                    && pull["head"].as_str() == Some(branch.as_str())
+            })
+            .map(|(id, ..)| id);
         kept["review_of"]["head_sha"] = json!(r.head_sha);
+        kept["review_of"]["for_session"] = json!(r.for_session);
         Ok(())
     }
 
-    /// The `(origin, branch)` of each session `boss` runs now, as its folder
-    /// is: Desk's charges are only the live ones, so never one released or
+    /// Each session `boss` runs now with its folder's `(origin, branch)`:
+    /// Desk's charges are only the live ones, so never one released or
     /// taken back, which is no longer its work.
-    async fn branches_of(&self, boss: &str) -> Vec<(String, String)> {
+    async fn sessions_of(&self, boss: &str) -> Vec<(Uuid, String, String)> {
         let mut out = Vec::new();
         for c in self.desk.charges().into_iter().filter(|c| c.boss == boss) {
             let Ok(v) = self.desk.view(c.session) else {
@@ -356,29 +546,46 @@ impl CrewHub {
             };
             if let Workspace::Repo(r) = workspace::workspace_of(&v.cwd).await {
                 if let (Some(origin), Some(branch)) = (r.origin, r.branch) {
-                    out.push((origin, branch));
+                    out.push((c.session, origin, branch));
                 }
             }
         }
         out
     }
 
-    /// `crew.record_review`, for the boss `b`.
-    pub(super) async fn record_review_tool(
+    /// The sessions whose work a review session `boss` runs reviews while
+    /// it works: each holds its ticket's slot through it.
+    pub(super) async fn reviewing(&self, boss: &str) -> std::collections::HashSet<String> {
+        let mut out = std::collections::HashSet::new();
+        for c in self
+            .desk
+            .charges()
+            .into_iter()
+            .filter(|c| c.boss == boss)
+        {
+            if !self.desk.view(c.session).is_ok_and(|v| v.state.busy()) {
+                continue;
+            }
+            if let Ok(Some(l)) = self.desk.store().pr_review_of(c.session).await {
+                out.extend(l.for_session.map(|s| s.to_string()));
+            }
+        }
+        out
+    }
+
+    /// Records the verdict of review session `id` that `boss`, as
+    /// `service`, runs, once its turn has ended: the review kept, and its
+    /// final reply.
+    pub(super) async fn record_of(
         &self,
-        b: &Bound,
-        input: &Value,
-    ) -> Result<Value, String> {
-        let boss = b.service.agent_id.as_str();
-        let id: Uuid = input["session_id"]
-            .as_str()
-            .and_then(|s| s.trim().parse().ok())
-            .ok_or("Say which review session (session_id).")?;
-        self.session_seen(id, &b.seen)?;
+        service: &AgentService,
+        boss: &str,
+        id: Uuid,
+    ) -> Result<(PrReview, String), Unrecorded> {
         let v = self
             .desk
             .view(id)
-            .map_err(|_| self.not_ours(&b.seen.scope))?;
+            .map_err(|_| "That review session isn't in Desk now.")?;
         if !self
             .desk
             .charge_of(id)
@@ -394,13 +601,13 @@ impl CrewHub {
             .pr_review_of(id)
             .await
             .map_err(|e| format!("Desk couldn't read what it reviews: {e}"))?
-            .filter(|(by, _)| by == boss)
-            .map(|(_, pr)| pr)
+            .filter(|l| l.boss == boss)
+            .map(|l| l.pr)
             .ok_or("It wasn't started to review a pull request: start a review with crew.start_session and review_of.")?;
         if v.state.busy() {
             return Err("It's still reviewing: record its verdict once its turn has ended.".into());
         }
-        let head = self.as_person(&b.service, Self::pr_head(b, &pr)).await?;
+        let head = Self::head_of(&self.pull_now(service, &pr).await?)?;
         let folder = match workspace::workspace_of(&v.cwd).await {
             Workspace::Repo(r) => r.head,
             _ => None,
@@ -414,12 +621,13 @@ impl CrewHub {
             .exchanges
             .first()
             .and_then(|x| x["answer"].as_str())
-            .unwrap_or_default();
-        let clean = verdict_at(reply, &folder, &head)?;
+            .unwrap_or_default()
+            .to_string();
+        let clean = verdict_at(&reply, &folder, &head)?;
         let review = PrReview {
             boss: boss.to_string(),
-            pr: pr.clone(),
-            head_sha: head.clone(),
+            pr,
+            head_sha: head,
             clean,
             by_session: id,
             at: chrono::Utc::now(),
@@ -429,14 +637,34 @@ impl CrewHub {
             .pr_review_put(&review)
             .await
             .map_err(|e| format!("Desk couldn't keep the review: {e}"))?;
-        let verdict = match clean {
-            true => "clean",
-            false => "changes",
-        };
+        Ok((review, reply))
+    }
+
+    /// `crew.record_review`, for the boss `b`.
+    pub(super) async fn record_review_tool(
+        &self,
+        b: &Bound,
+        input: &Value,
+    ) -> Result<Value, String> {
+        let id: Uuid = input["session_id"]
+            .as_str()
+            .and_then(|s| s.trim().parse().ok())
+            .ok_or("Say which review session (session_id).")?;
+        self.session_seen(id, &b.seen)?;
+        self.desk
+            .view(id)
+            .map_err(|_| self.not_ours(&b.seen.scope))?;
+        let (review, _) = self
+            .record_of(&b.service, b.service.agent_id.as_str(), id)
+            .await
+            .map_err(|e| e.to_string())?;
         Ok(json!({
-            "recorded": verdict,
-            "pull_request": format!("{}#{}", full_name(&pr), pr.number),
-            "head_sha": head,
+            "recorded": match review.clean {
+                true => "clean",
+                false => "changes",
+            },
+            "pull_request": named(&review.pr),
+            "head_sha": review.head_sha,
         }))
     }
 
@@ -468,13 +696,18 @@ impl CrewHub {
             .pr_review_newest(boss, &pr)
             .await
             .map_err(|e| format!("Desk couldn't read its review: {e}"))?;
-        let branches = self.branches_of(boss).await;
-        let named = format!("{}#{}", full_name(&pr), pr.number);
+        let branches: Vec<(String, String)> = self
+            .sessions_of(boss)
+            .await
+            .into_iter()
+            .map(|(_, origin, branch)| (origin, branch))
+            .collect();
+        let named = named(&pr);
         let actor = Party::manager(boss, &super::name_of(&b.service));
         let merged = self
             .as_person(
                 &b.service,
-                merge(&Self::access(b), &pr, review.as_ref(), &branches),
+                merge(&Self::access(&b.service), &pr, review.as_ref(), &branches),
             )
             .await;
         match merged {
@@ -655,15 +888,65 @@ pub(super) mod tests {
         );
         assert_eq!(
             verdict_at(&said(&format!("clean {OLD}")), HEAD, HEAD),
-            Err(format!("the review was of {OLD}, the PR is at {HEAD}"))
+            Err(Unrecorded::Moved(format!(
+                "the review was of {OLD}, the PR is at {HEAD}"
+            )))
         );
         assert_eq!(
             verdict_at("All good, ship it.", HEAD, HEAD),
-            Err(NO_VERDICT.to_string())
+            Err(Unrecorded::NoVerdict)
         );
-        assert!(verdict_at(&said(&format!("clean {HEAD}")), OLD, HEAD)
-            .unwrap_err()
-            .contains(&format!("Its folder is at {OLD}, the PR is at {HEAD}")));
+        assert_eq!(Unrecorded::NoVerdict.to_string(), NO_VERDICT);
+        let moved = verdict_at(&said(&format!("clean {HEAD}")), OLD, HEAD).unwrap_err();
+        assert!(
+            matches!(&moved, Unrecorded::Moved(why) if why.starts_with(&format!("Its folder is at {OLD}, the PR is at {HEAD}"))),
+            "{moved:?}"
+        );
+    }
+
+    #[test]
+    fn a_green_head_is_merged_once_reviewed_clean_and_reviewed_once_else() {
+        use SessionState::*;
+        let clean = review(HEAD, true);
+        let changes = review(HEAD, false);
+        let older = review(OLD, true);
+        for at in [Reviewing::Never, Reviewing::Open, Reviewing::Ended] {
+            assert_eq!(step(HEAD, Some(&clean), at), Step::Merge, "{at:?}");
+            assert_eq!(step(HEAD, Some(&changes), at), Step::Settled, "{at:?}");
+        }
+        assert_eq!(step(HEAD, Some(&older), Reviewing::Open), Step::Underway);
+        assert_eq!(step(HEAD, None, Reviewing::Open), Step::Underway);
+        assert_eq!(step(HEAD, Some(&older), Reviewing::Ended), Step::Lost);
+        assert_eq!(step(HEAD, Some(&older), Reviewing::Never), Step::Start);
+        assert_eq!(step(HEAD, None, Reviewing::Never), Step::Start);
+
+        assert_eq!(Reviewing::of([]), Reviewing::Never);
+        assert_eq!(Reviewing::of([None, Some(Closed)]), Reviewing::Ended);
+        assert_eq!(Reviewing::of([Some(Idle), None]), Reviewing::Open);
+        assert_eq!(Reviewing::of([None, Some(Working)]), Reviewing::Open);
+        assert_eq!(Reviewing::of([Some(Stopped)]), Reviewing::Open);
+    }
+
+    #[test]
+    fn a_review_desk_starts_reads_its_head_in_its_own_worktree_and_says_what_to_change() {
+        assert_eq!(worktree(&pr(), HEAD), "review-7-1111111");
+        assert!(made_for("/dev/web/.worktrees/review-7-1111111", &pr(), HEAD));
+        assert!(!made_for("/dev/web-review", &pr(), HEAD));
+        assert!(!made_for("/dev/web/.worktrees/review-7-2222222", &pr(), HEAD));
+        let asked = goal(&pr(), HEAD, "DES-1");
+        assert!(asked.starts_with("Review acme/web#7 for DES-1 at its head 1111111"), "{asked}");
+        assert!(asked.contains("merge nothing"), "{asked}");
+        let ready = ready_line("DES-1", &pr(), HEAD, false);
+        assert!(ready.contains("crew.github_merge (repo acme/web, number 7)"), "{ready}");
+        assert!(ready.contains("Never tell its session to merge it."), "{ready}");
+        assert!(!ready.contains("draft"), "{ready}");
+        assert!(ready_line("DES-1", &pr(), HEAD, true).contains("gh pr ready 7"));
+        let told = changes_message(&pr(), HEAD, "The empty state is missing.\nREVIEW: changes x");
+        assert!(
+            told.contains("Its reviewer said:\n\n> The empty state is missing.\n> REVIEW: changes x\n\n"),
+            "{told}"
+        );
+        assert!(told.ends_with("Don't merge it yourself."), "{told}");
     }
 
     /// GitHub as `get_pull`, `get_repo` and its checks read `acme/web#7`

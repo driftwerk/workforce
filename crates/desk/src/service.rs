@@ -3856,6 +3856,9 @@ impl Desk {
         check_env(&new.env)?;
         if let Some(r) = &new.review_of {
             r.check().map_err(DeskError::Invalid)?;
+            if let Some(b) = boss {
+                self.no_review_open_at(&b.id, r).await?;
+            }
         }
         let view = new
             .view
@@ -3912,25 +3915,32 @@ impl Desk {
         if !cwd.is_dir() {
             return Err(DeskError::Invalid(format!("{} is not a folder", new.cwd)));
         }
-        let (cwd, branch) = match new
-            .worktree
-            .as_deref()
-            .map(str::trim)
-            .filter(|b| !b.is_empty())
-        {
-            Some(base) if new.fresh_worktree => {
+        let (cwd, branch) = match (
+            new.worktree
+                .as_deref()
+                .map(str::trim)
+                .filter(|b| !b.is_empty()),
+            &new.review_of,
+        ) {
+            (Some(name), Some(r)) => (
+                worktree::detached(&cwd, name, &r.head_sha)
+                    .await
+                    .map_err(|e| DeskError::Invalid(e.to_string()))?,
+                None,
+            ),
+            (Some(base), None) if new.fresh_worktree => {
                 let (path, branch) = worktree::create_fresh(&cwd, base)
                     .await
                     .map_err(|e| DeskError::Invalid(e.to_string()))?;
                 (path, Some(branch))
             }
-            Some(branch) => (
+            (Some(branch), None) => (
                 worktree::create(&cwd, branch)
                     .await
                     .map_err(|e| DeskError::Invalid(e.to_string()))?,
                 Some(branch.to_string()),
             ),
-            None => (cwd, None),
+            (None, _) => (cwd, None),
         };
         let ready = match deps {
             true => {
@@ -4011,7 +4021,7 @@ impl Desk {
             placed = self
                 .0
                 .store
-                .pr_review_link(id, &b.id, &r.pr)
+                .pr_review_link(id, &b.id, r)
                 .await
                 .map_err(DeskError::Internal);
         }
@@ -4020,6 +4030,11 @@ impl Desk {
             Err(e) => Err(e),
         };
         if let Err(e) = launched {
+            if new.review_of.is_some() {
+                if let Err(e) = self.0.store.pr_review_unlink(id).await {
+                    tracing::warn!(session = %id, error = %e, "a review that didn't start stays linked");
+                }
+            }
             self.0.state.lock().records.remove(&id);
             self.start_unplaced(id, group.is_some(), boss.is_some())
                 .await;
@@ -4040,6 +4055,30 @@ impl Desk {
             self.started_note(&view, boss).await;
         }
         Ok(view)
+    }
+
+    /// Refuses a second review of `r`'s pull request at its head while a
+    /// review session `boss` started there is still open.
+    async fn no_review_open_at(&self, boss: &str, r: &crate::plan::ReviewOf) -> Result<(), DeskError> {
+        let started = self
+            .0
+            .store
+            .pr_reviews_at(boss, &r.pr, &r.head_sha)
+            .await
+            .map_err(DeskError::Internal)?;
+        match started
+            .into_iter()
+            .find_map(|s| self.view(s).ok().filter(|v| v.state != SessionState::Closed))
+        {
+            Some(v) => Err(DeskError::Conflict(format!(
+                "{} reviews {}/{}#{} at that head already: nudge it, or record its verdict",
+                v.label(),
+                r.pr.owner,
+                r.pr.repo,
+                r.pr.number
+            ))),
+            None => Ok(()),
+        }
     }
 
     /// Puts `id`, about to run, in `group` and in `boss`'s charge.

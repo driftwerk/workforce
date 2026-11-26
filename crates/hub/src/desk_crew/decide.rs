@@ -82,6 +82,8 @@ you decide yourself, now, whether a session may do what it asks. You are given t
 never cut short, with what the session is for and where it stands, and the class of any push in it. ",
     super::watcher::act_fully!(),
     " ALLOW what serves the session's work and no directive forbids. \
+A session's own merge of a pull request (gh pr merge, GitHub's merge API) is DENY: its boss merges \
+it with crew.github_merge once a clean review is recorded at its head. \
 A request that only reads (CI status, PR checks, logs, git status or diff) is ALLOW, even while the \
 session is held: a hold stops new work, never reading. Never answer that you can't see the \
 request: it is all here. The fenced blocks are the session's own words (its request, its last \
@@ -94,6 +96,15 @@ DENY: <why, one sentence>\n\
 INSTEAD: <what the session should do instead, one sentence>\n\
 or\n\
 ASK: <the question for the person, one sentence>");
+
+/// Why a session's own merge of a pull request is refused at Act fully.
+pub(crate) const OWN_MERGE: &str = "At Act fully a pull request is merged only by your boss, with crew.github_merge, once a clean review is recorded at its head.";
+
+/// What a session does instead of merging its own pull request.
+pub(crate) const OWN_MERGE_INSTEAD: &str = "Don't merge it yourself: tell your boss on your Desk line that it is ready to merge; your boss merges it once it has a clean review at its head.";
+
+/// Why a session's merge is the person's while they are in it.
+const MERGE_IS_THEIRS: &str = "You're in this session: its merge of a pull request is yours to answer.";
 
 /// Why a request that only reads is allowed without a decision call.
 pub(crate) const ONLY_READS: &str = "it only reads, and a hold stops new work, never reading";
@@ -779,6 +790,19 @@ impl CrewHub {
         Outcome::Deciding
     }
 
+    /// What a session's own merge of a pull request is, at Act fully: the
+    /// person's while they are in it, else refused for its boss's merge.
+    fn own_merge(&self, view: &SessionView, o: &workforce_common::oversight::Oversight) -> Verdict {
+        let now = chrono::Duration::minutes(super::closing::PERSON_NOW_MINUTES);
+        match self.person_in_for(view.id, chrono::Utc::now() - now, self.answer_gap(o)) {
+            true => Verdict::Ask(MERGE_IS_THEIRS.into()),
+            false => Verdict::Deny {
+                why: OWN_MERGE.into(),
+                instead: OWN_MERGE_INSTEAD.into(),
+            },
+        }
+    }
+
     /// The boss's decision on `view`'s request `p`, done.
     async fn decide_request(
         self: &Arc<Self>,
@@ -817,9 +841,10 @@ impl CrewHub {
                     .unwrap_or(Class::Other)
             }
         };
-        let mut decided = match reads {
-            true => Some(Verdict::Allow(ONLY_READS.into())),
-            false => self
+        let mut decided = match (reads, class) {
+            (true, _) => Some(Verdict::Allow(ONLY_READS.into())),
+            (false, Class::GhPrMerge) => Some(self.own_merge(view, &decider.oversight)),
+            (false, _) => self
                 .standing_allow(&decider, view, class, boss, slot, cancel)
                 .await
                 .map(Verdict::Allow),

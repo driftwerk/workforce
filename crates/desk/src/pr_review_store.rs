@@ -1,13 +1,13 @@
 //! Pull request reviews in Postgres: which pull request each review
-//! session was started to review, and by which boss
-//! (`pr_review_sessions`), and what each said of it, once per boss and
-//! head (`pr_reviews`).
+//! session was started to review, by which boss, at which head and for
+//! which session's work (`pr_review_sessions`), and what each said of it,
+//! once per boss and head (`pr_reviews`).
 
 use eyre::Result;
 use tokio_postgres::Row;
 use uuid::Uuid;
 
-use crate::plan::{PrRef, PrReview};
+use crate::plan::{PrRef, PrReview, ReviewLink, ReviewOf};
 use crate::store::DeskStore;
 
 fn review(r: &Row) -> Result<PrReview> {
@@ -25,44 +25,98 @@ fn review(r: &Row) -> Result<PrReview> {
     })
 }
 
+const LINK: &str = "SELECT session_id, boss, owner, repo, number, head_sha, for_session \
+                    FROM pr_review_sessions";
+
+fn link(r: &Row) -> Result<ReviewLink> {
+    Ok(ReviewLink {
+        session: r.try_get(0)?,
+        boss: r.try_get(1)?,
+        pr: PrRef {
+            owner: r.try_get(2)?,
+            repo: r.try_get(3)?,
+            number: r.try_get(4)?,
+        },
+        head_sha: r.try_get(5)?,
+        for_session: r.try_get(6)?,
+    })
+}
+
 impl DeskStore {
-    /// Keeps that `boss` started `session` to review `pr`.
-    pub async fn pr_review_link(&self, session: Uuid, boss: &str, pr: &PrRef) -> Result<()> {
+    /// Keeps that `boss` started `session` to review `of`.
+    pub async fn pr_review_link(&self, session: Uuid, boss: &str, of: &ReviewOf) -> Result<()> {
         let client = self.pool().get().await?;
         client
             .execute(
-                "INSERT INTO pr_review_sessions (session_id, boss, owner, repo, number) \
-                 VALUES ($1, $2, $3, $4, $5) \
+                "INSERT INTO pr_review_sessions \
+                 (session_id, boss, owner, repo, number, head_sha, for_session) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7) \
                  ON CONFLICT (session_id) DO UPDATE \
                  SET boss = EXCLUDED.boss, owner = EXCLUDED.owner, repo = EXCLUDED.repo, \
-                 number = EXCLUDED.number",
-                &[&session, &boss, &pr.owner, &pr.repo, &pr.number],
+                 number = EXCLUDED.number, head_sha = EXCLUDED.head_sha, \
+                 for_session = EXCLUDED.for_session",
+                &[
+                    &session,
+                    &boss,
+                    &of.pr.owner,
+                    &of.pr.repo,
+                    &of.pr.number,
+                    &of.head_sha,
+                    &of.for_session,
+                ],
             )
             .await?;
         Ok(())
     }
 
-    /// The boss that started `session` to review a pull request, and that
-    /// pull request, if it was.
-    pub async fn pr_review_of(&self, session: Uuid) -> Result<Option<(String, PrRef)>> {
+    /// Forgets `session`'s link, for a review that never started.
+    pub async fn pr_review_unlink(&self, session: Uuid) -> Result<()> {
         let client = self.pool().get().await?;
-        let row = client
-            .query_opt(
-                "SELECT boss, owner, repo, number FROM pr_review_sessions WHERE session_id = $1",
+        client
+            .execute(
+                "DELETE FROM pr_review_sessions WHERE session_id = $1",
                 &[&session],
             )
             .await?;
-        row.map(|r| {
-            Ok((
-                r.try_get(0)?,
-                PrRef {
-                    owner: r.try_get(1)?,
-                    repo: r.try_get(2)?,
-                    number: r.try_get(3)?,
-                },
-            ))
-        })
-        .transpose()
+        Ok(())
+    }
+
+    /// The review sessions started for `session`'s work.
+    pub async fn pr_reviews_for(&self, session: Uuid) -> Result<Vec<ReviewLink>> {
+        let client = self.pool().get().await?;
+        client
+            .query(&format!("{LINK} WHERE for_session = $1"), &[&session])
+            .await?
+            .iter()
+            .map(link)
+            .collect()
+    }
+
+    /// The review sessions `boss` started on `pr` at `head`.
+    pub async fn pr_reviews_at(&self, boss: &str, pr: &PrRef, head: &str) -> Result<Vec<Uuid>> {
+        let client = self.pool().get().await?;
+        client
+            .query(
+                "SELECT session_id FROM pr_review_sessions \
+                 WHERE boss = $1 AND owner = $2 AND repo = $3 AND number = $4 AND head_sha = $5",
+                &[&boss, &pr.owner, &pr.repo, &pr.number, &head],
+            )
+            .await?
+            .iter()
+            .map(|r| Ok(r.try_get(0)?))
+            .collect()
+    }
+
+    /// How `session` was linked to the pull request it reviews, if it
+    /// was started to review one.
+    pub async fn pr_review_of(&self, session: Uuid) -> Result<Option<ReviewLink>> {
+        let client = self.pool().get().await?;
+        client
+            .query_opt(&format!("{LINK} WHERE session_id = $1"), &[&session])
+            .await?
+            .as_ref()
+            .map(link)
+            .transpose()
     }
 
     /// Keeps `r`: at a head its boss already reviewed, its verdict replaces
@@ -117,6 +171,7 @@ mod tests {
     use super::*;
 
     const MIGRATION: &str = include_str!("../migrations/V094__act_fully_ships.sql");
+    const HEADS: &str = include_str!("../migrations/V095__pr_review_heads.sql");
 
     fn pr(number: i64) -> PrRef {
         PrRef {
@@ -164,27 +219,67 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_session_is_linked_to_the_pull_request_it_reviews() {
+    async fn the_heads_migration_applies_twice() {
+        with_test_pool(crate::store::build_pool, |pool| async move {
+            DeskStore::with_pool(pool.clone()).await.unwrap();
+            let client = pool.get().await.unwrap();
+            client.batch_execute(HEADS).await.unwrap();
+        })
+        .await;
+    }
+
+    fn of(number: i64, head: char, for_session: Option<Uuid>) -> ReviewOf {
+        ReviewOf {
+            pr: pr(number),
+            head_sha: head.to_string().repeat(40),
+            for_session,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_session_is_linked_to_the_pull_request_it_reviews_at_its_head_for_its_work() {
         with_test_pool(crate::store::build_pool, |pool| async move {
             let store = DeskStore::with_pool(pool).await.unwrap();
-            let session = Uuid::new_v4();
+            let (session, work) = (Uuid::new_v4(), Uuid::new_v4());
             assert_eq!(store.pr_review_of(session).await.unwrap(), None);
             store
-                .pr_review_link(session, "sarah", &pr(42))
+                .pr_review_link(session, "sarah", &of(42, 'a', Some(work)))
                 .await
                 .unwrap();
+            let linked = ReviewLink {
+                session,
+                boss: "sarah".into(),
+                pr: pr(42),
+                head_sha: Some("a".repeat(40)),
+                for_session: Some(work),
+            };
+            assert_eq!(store.pr_review_of(session).await.unwrap(), Some(linked.clone()));
+            assert_eq!(store.pr_reviews_for(work).await.unwrap(), vec![linked]);
             assert_eq!(
-                store.pr_review_of(session).await.unwrap(),
-                Some(("sarah".into(), pr(42)))
+                store.pr_reviews_at("sarah", &pr(42), &"a".repeat(40)).await.unwrap(),
+                vec![session]
             );
+            assert!(store
+                .pr_reviews_at("mia", &pr(42), &"a".repeat(40))
+                .await
+                .unwrap()
+                .is_empty());
+            assert!(store
+                .pr_reviews_at("sarah", &pr(42), &"b".repeat(40))
+                .await
+                .unwrap()
+                .is_empty());
+
             store
-                .pr_review_link(session, "sarah", &pr(43))
+                .pr_review_link(session, "sarah", &of(43, 'b', None))
                 .await
                 .unwrap();
-            assert_eq!(
-                store.pr_review_of(session).await.unwrap(),
-                Some(("sarah".into(), pr(43)))
-            );
+            let again = store.pr_review_of(session).await.unwrap().unwrap();
+            assert_eq!((again.pr, again.for_session), (pr(43), None));
+            assert!(store.pr_reviews_for(work).await.unwrap().is_empty());
+
+            store.pr_review_unlink(session).await.unwrap();
+            assert_eq!(store.pr_review_of(session).await.unwrap(), None);
         })
         .await;
     }

@@ -60,7 +60,7 @@ const IDLE_HOURS: i64 = 24;
 const HANDS_OFF_HOURS: i64 = 2;
 /// How long the person's last input keeps a session theirs from any close
 /// of its boss's, asked for or not: they are in it.
-const PERSON_NOW_MINUTES: i64 = 15;
+pub(super) const PERSON_NOW_MINUTES: i64 = 15;
 /// The most pull requests one session's account names that are read.
 const PULLS_MAX: usize = 5;
 
@@ -560,8 +560,10 @@ impl CrewHub {
             }
         }
         let (open, kept) = self.left_behind(&service, v).await;
-        // A newer session carries its ticket, and its pull requests with it.
-        let open = match self.superseded(v.id).await {
+        // A newer session carries its ticket, and its pull requests with it;
+        // a review session's pull request was never its work.
+        let reviews = matches!(self.desk.store().pr_review_of(v.id).await, Ok(Some(_)));
+        let open = match reviews || self.superseded(v.id).await {
             true => Vec::new(),
             false => open,
         };

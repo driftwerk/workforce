@@ -240,7 +240,7 @@ fn every_act_fully_text_carries_the_one_rule() {
     }
     for words in [
         "pushing the session's own branch",
-        "merging one that is green with a clean review at its head (crew.github_merge)",
+        "merging one that is green with a clean review at its head yourself (crew.github_merge), never by telling its session to",
         "A gate exists only if a directive states it: never invent one",
         "ask them at once with crew.ask_person, naming the directive",
     ] {
@@ -249,6 +249,10 @@ fn every_act_fully_text_carries_the_one_rule() {
     assert!(!super::super::decide::SYSTEM.contains("pushing the default branch"));
     assert!(super::super::orchestrator::LOOP.contains("crew.github_merge"));
     assert!(super::super::orchestrator::LOOP.contains("Never hold a session without a directive"));
+    assert!(super::super::orchestrator::LOOP
+        .contains("Never tell a session to merge its own pull request"));
+    assert!(CrewHub::bound_level_line(Level::Full).contains("never by the session"));
+    assert!(super::super::decide::SYSTEM.contains("A session's own merge of a pull request"));
 }
 
 /// Desk's judgements run at no less than Medium, the person's higher
