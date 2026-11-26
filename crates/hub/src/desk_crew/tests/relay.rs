@@ -2328,7 +2328,7 @@ async fn a_machine_whose_listing_doesnt_say_its_grants_is_never_written_ungroupe
 }
 
 /// A repository at `dir` with one commit on `main`.
-fn git_repo(dir: &std::path::Path) {
+async fn git_repo(dir: &std::path::Path) {
     for args in [
         vec!["init", "-q", "-b", "main"],
         vec![
@@ -2343,11 +2343,12 @@ fn git_repo(dir: &std::path::Path) {
             "init",
         ],
     ] {
-        let out = std::process::Command::new("git")
+        let out = crate::git_hardening::hardened_git()
             .arg("-C")
             .arg(dir)
             .args(&args)
             .output()
+            .await
             .unwrap();
         assert!(out.status.success(), "{out:?}");
     }
@@ -2386,7 +2387,7 @@ async fn started_again_on_devbox(
         tempfile::tempdir().unwrap(),
         tempfile::tempdir().unwrap(),
     );
-    git_repo(repo.path());
+    git_repo(repo.path()).await;
     let (main, state, d, _llm) = super::plans::hub_with(mac_dir.path(), mac_pool, MAIN).await;
     let crew = CrewHub::start(state, d.clone(), FAST, CancellationToken::new());
     let (theirs, _llm) = agent(devbox_dir.path(), "desk", "ok").await;
