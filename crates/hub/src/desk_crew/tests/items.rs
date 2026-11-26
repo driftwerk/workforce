@@ -989,6 +989,47 @@ async fn an_answer_that_reached_its_boss_stays_answered_after_its_dm_rolls_over(
     .await;
 }
 
+/// An answer that runs as the boss's own DM turn is noted delivered as soon
+/// as that turn has kept it, while its model is still answering.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_answer_is_noted_delivered_once_its_own_turn_keeps_it() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, ResponseTemplate};
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (overseer, crew, d, llm) = overseeing(dir.path(), pool, "ok", ACT, &[]).await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_secs(120)))
+            .with_priority(1)
+            .mount(&llm)
+            .await;
+        let closed = answered(&d, "Ship the docs today?").await;
+        let delivering = {
+            let (crew, overseer, closed) =
+                (Arc::clone(&crew), Arc::clone(&overseer), closed.clone());
+            tokio::spawn(async move {
+                crew.answer_delivered(&overseer, PERSON, &closed, "Tomorrow")
+                    .await
+            })
+        };
+        let noted = eventually("noted delivered", async || {
+            d.store()
+                .open_item(closed.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .delivered_at
+        })
+        .await;
+        assert!(noted >= closed.closed_at.unwrap());
+        assert_eq!(said_in_dm(&overseer, &closed), 1);
+        assert!(!delivering.is_finished(), "its turn still runs");
+        delivering.abort();
+    })
+    .await;
+}
+
 /// An answer a turn already took in under its id (its reply came too late
 /// to say so) is known by that id when it is tried again: never said twice.
 #[tokio::test(flavor = "multi_thread")]

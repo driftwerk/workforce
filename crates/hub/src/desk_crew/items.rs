@@ -1517,7 +1517,7 @@ impl CrewHub {
     /// The person's `answer` to `closed` goes to its boss as their message:
     /// into the turn running in its DM, as their follow-ups do, else as the
     /// DM's next turn once any other turn there lets go, and is noted on
-    /// the item as delivered. One already in the DM, before the offer or
+    /// the item as delivered (a turn of its own, once it has kept it). One already in the DM, before the offer or
     /// after it (taken in by a turn whose reply was late), isn't said again. One that can't get there is
     /// [`Self::answer_lost`]; one settled meanwhile goes no further.
     pub(super) async fn answer_delivered(
@@ -1538,22 +1538,33 @@ impl CrewHub {
                 if held() || me.offered(service, owner, closed, message).await || held() {
                     return Ok(true);
                 }
-                me.run_dm_turn(service, owner, message, 0, None, Some(Speaker::you()))
-                    .await
-                    .map(|_| true)
+                let (asked, kept) = tokio::sync::oneshot::channel();
+                let turn = super::deliver::told_when_asked(
+                    asked,
+                    me.run_dm_turn(service, owner, message, 0, None, Some(Speaker::you())),
+                );
+                let noted = async {
+                    if kept.await.is_ok() {
+                        me.noted_delivered(closed).await;
+                    }
+                };
+                tokio::join!(turn, noted).0.map(|_| true)
             })
             .await;
         match delivered {
-            Ok(true) => {
-                if let Err(e) = self.desk.store().item_delivered(closed.id).await {
-                    tracing::warn!(item = %closed.id, error = %format!("{e:#}"), "noting an answer reached its boss failed");
-                }
-            }
+            Ok(true) => self.noted_delivered(closed).await,
             Err(e) if !super::deliver::stopped(&e) => {
                 tracing::warn!(agent_id = %service.agent_id, error = %e, "the person's answer didn't reach the boss");
                 self.answer_lost(service, owner, closed).await;
             }
             Ok(false) | Err(_) => {}
+        }
+    }
+
+    /// Notes on `closed` that the person's answer to it reached its boss.
+    async fn noted_delivered(&self, closed: &OpenItem) {
+        if let Err(e) = self.desk.store().item_delivered(closed.id).await {
+            tracing::warn!(item = %closed.id, error = %format!("{e:#}"), "noting an answer reached its boss failed");
         }
     }
 
@@ -2419,6 +2430,7 @@ mod tests {
                     cant_decide: None,
                     due_at: None,
                     chased_at: None,
+                    delivered_at: None,
                 }
             })
             .collect();
@@ -2470,6 +2482,7 @@ mod tests {
             cant_decide: None,
             due_at: None,
             chased_at: None,
+            delivered_at: None,
         }
     }
 

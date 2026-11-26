@@ -47,6 +47,23 @@ pub(super) fn stopped(e: &eyre::Report) -> bool {
     e.chain().any(|c| c.is::<TurnStopped>())
 }
 
+tokio::task_local! {
+    /// Set around a crew turn whose caller is told once its prompt is kept
+    /// in the session, before it runs ([`told_when_asked`]).
+    static ASKED: std::cell::RefCell<Option<tokio::sync::oneshot::Sender<()>>>;
+}
+
+/// Runs `turn`, sending on `asked` once the crew turn in it has kept its
+/// prompt; dropped unsent when it never does.
+pub(super) async fn told_when_asked<F: Future>(
+    asked: tokio::sync::oneshot::Sender<()>,
+    turn: F,
+) -> F::Output {
+    ASKED
+        .scope(std::cell::RefCell::new(Some(asked)), turn)
+        .await
+}
+
 impl CrewHub {
     /// Runs `prompt` as a turn in `service`'s Desk DM with `owner`, at `hop`
     /// hand-offs; `listed` are the requests a wake-up names. A prompt with
@@ -292,6 +309,9 @@ impl CrewHub {
         ))
         .await?;
         let session_id = progress.session_id.clone();
+        if let Some(asked) = ASKED.try_with(|a| a.take()).ok().flatten() {
+            let _ = asked.send(());
+        }
         let tx = if session_id == sid {
             tx
         } else {

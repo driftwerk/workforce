@@ -17,7 +17,8 @@ use crate::store::DeskStore;
 const COLUMNS: &str = "id, boss, owner, kind, session, line_message, text, holding_up, \
      recommendation, options, generalizes, done_when, dedupe_key, opened_at, last_said_at, \
      said_count, changed_at, state, closed_at, closed_by, closed_why, raised_at, sessions, \
-     prefer_scope, question, points, recommended, not_blocking, cant_decide, due_at, chased_at";
+     prefer_scope, question, points, recommended, not_blocking, cant_decide, due_at, chased_at, \
+     delivered_at";
 
 fn item(r: &Row) -> Result<OpenItem> {
     Ok(OpenItem {
@@ -57,6 +58,7 @@ fn item(r: &Row) -> Result<OpenItem> {
         cant_decide: r.try_get(28)?,
         due_at: r.try_get(29)?,
         chased_at: r.try_get(30)?,
+        delivered_at: r.try_get(31)?,
     })
 }
 

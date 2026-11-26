@@ -1828,6 +1828,7 @@ mod tests {
             cant_decide: None,
             due_at: None,
             chased_at: None,
+            delivered_at: None,
         }
     }
 
@@ -2023,6 +2024,7 @@ mod tests {
             cant_decide: None,
             due_at: None,
             chased_at: None,
+            delivered_at: None,
         };
         // Plainly: its first sentence, no points, nothing recommended.
         let plain = NeedsYou::of(&i, now, false);
