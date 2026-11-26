@@ -187,7 +187,7 @@ async fn attempt(service: &Arc<AgentService>, next: &NextTurn) -> eyre::Result<S
 }
 
 /// Whether another turn still holds the session, on this instance or another.
-fn held(error: &eyre::Report) -> bool {
+pub(crate) fn held(error: &eyre::Report) -> bool {
     error
         .downcast_ref::<crate::session_turn_claim::TurnClaimHeld>()
         .is_some()

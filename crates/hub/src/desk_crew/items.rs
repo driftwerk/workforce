@@ -1475,22 +1475,38 @@ impl CrewHub {
         let Some(owner) = self.person(Some(&service)) else {
             return Ok("Answered.".into());
         };
+        let crew = self.me();
+        let answer = answer.to_string();
+        tokio::spawn(async move {
+            crew.answer_delivered(&service, &owner, &closed, &answer, super::mind::WAIT_MAX)
+                .await;
+        });
+        Ok("Answered.".into())
+    }
+
+    /// The person's `answer` to `closed` goes to its boss as their message,
+    /// once any turn holding its DM lets go, waiting `within` at most; one
+    /// that can't get there is [`Self::answer_lost`].
+    pub(crate) async fn answer_delivered(
+        &self,
+        service: &Arc<crate::serve::AgentService>,
+        owner: &str,
+        closed: &OpenItem,
+        answer: &str,
+        within: std::time::Duration,
+    ) {
         let message = format!(
             "{}{}”: {answer}",
             workforce_desk::goal::ANSWER_LEAD,
             closed.text
         );
-        let crew = self.me();
-        tokio::spawn(async move {
-            if let Err(e) = crew
-                .run_dm_turn(&service, &owner, &message, 0, None, Some(Speaker::you()))
-                .await
-            {
-                tracing::warn!(agent_id = %service.agent_id, error = %e, "the person's answer didn't reach the boss");
-                crew.answer_lost(&service, &owner, &closed).await;
-            }
-        });
-        Ok("Answered.".into())
+        if let Err(e) = self
+            .run_dm_turn_queued(service, owner, &message, Speaker::you(), within)
+            .await
+        {
+            tracing::warn!(agent_id = %service.agent_id, error = %e, "the person's answer didn't reach the boss");
+            self.answer_lost(service, owner, closed).await;
+        }
     }
 
     /// The person's answer to `closed` didn't reach its boss: never lost,

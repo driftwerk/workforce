@@ -11,6 +11,7 @@
 //! the person's own words, so it is read at paired trust.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use eyre::{bail, Result};
 use workforce_agent::tools::approval::SelfServe;
@@ -63,6 +64,35 @@ impl CrewHub {
     ) -> Result<(String, String)> {
         self.run_turn(service, owner, DESK_CHANNEL, prompt, hop, listed, author)
             .await
+    }
+
+    /// [`Self::run_dm_turn`] for `author`'s message, waiting behind any
+    /// other turn that holds the DM: tried again each time the DM lets go,
+    /// for `within` at most, and not once the hub drains.
+    pub(crate) async fn run_dm_turn_queued(
+        &self,
+        service: &Arc<AgentService>,
+        owner: &str,
+        prompt: &str,
+        author: Speaker,
+        within: Duration,
+    ) -> Result<(String, String)> {
+        let deadline = tokio::time::Instant::now() + within;
+        loop {
+            match self
+                .run_dm_turn(service, owner, prompt, 0, None, Some(author.clone()))
+                .await
+            {
+                Err(e) if crate::turn_loop::next_turn::held(&e) => {}
+                ran => return ran,
+            }
+            let dm = service.sessions.find(DESK_CHANNEL, owner)?.map(|s| s.id);
+            tokio::select! {
+                () = self.state.drain_token.cancelled() => bail!("the hub is shutting down"),
+                () = tokio::time::sleep_until(deadline) => bail!("the DM stayed busy"),
+                () = let_go(service, dm.as_deref()) => {}
+            }
+        }
     }
 
     /// [`Self::run_dm_turn`] for a message a boss (`author`) sent on in
@@ -166,7 +196,7 @@ impl CrewHub {
             Ok(begun) => begun,
             Err(busy) => {
                 self.hops.lock().remove(&sid);
-                bail!("{busy}");
+                return Err(busy.into());
             }
         };
         // Started holding the boss's mind: its tools hold it too. Marked
@@ -307,6 +337,18 @@ impl CrewHub {
             answer: answer?,
             acted,
         })
+    }
+}
+
+/// How often a DM held by a turn on another instance is looked at again.
+const RECHECK: Duration = Duration::from_secs(1);
+
+/// Once the turn holding the DM `dm` lets go: its end when it runs here,
+/// else a [`RECHECK`] later.
+async fn let_go(service: &AgentService, dm: Option<&str>) {
+    match dm.filter(|dm| service.live_turns.running(dm)) {
+        Some(dm) => service.live_turns.ended(dm).await,
+        None => tokio::time::sleep(RECHECK).await,
     }
 }
 

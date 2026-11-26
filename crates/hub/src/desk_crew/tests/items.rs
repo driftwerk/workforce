@@ -822,6 +822,92 @@ async fn an_answer_that_doesnt_reach_the_boss_opens_its_item_again() {
     .await;
 }
 
+/// An answer waiting behind a turn in the boss's DM that never lets go,
+/// past its wait or as the hub drains, is never lost: the item is open
+/// again and the person is told.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_answer_the_boss_stays_too_busy_for_opens_its_item_again() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (overseer, crew, d, _llm) = overseeing(
+            dir.path(),
+            pool,
+            "ok",
+            "[oversight]\nenabled = true\nlevel = \"act\"\n",
+            &[],
+        )
+        .await;
+        let dm = overseer
+            .sessions
+            .get_or_create(DESK_CHANNEL, PERSON, overseer.agent_id.as_str())
+            .unwrap();
+        let _running = super::goals::holds(&overseer, &dm.id).await;
+        let answered = async |text: &str| {
+            let i = d
+                .store()
+                .item_open(&NewItem::ask("desk", OpenKind::Ask, None, text))
+                .await
+                .unwrap()
+                .item()
+                .clone();
+            d.store()
+                .item_close(i.id, ClosedBy::Person, "You answered: Tomorrow")
+                .await
+                .unwrap()
+                .unwrap()
+        };
+        let reopened = async |closed: &workforce_desk::open_item::OpenItem| {
+            let again = d.store().open_item(closed.id).await.unwrap().unwrap();
+            assert_eq!(again.state, OpenState::Open);
+            eventually("the person told", async || {
+                dm_posts(
+                    &overseer,
+                    &format!("Your answer to “{}” didn't reach", closed.text),
+                )
+                .into_iter()
+                .next()
+            })
+            .await;
+        };
+
+        let waited = answered("Ship the docs today?").await;
+        crew.answer_delivered(
+            &overseer,
+            PERSON,
+            &waited,
+            "Tomorrow",
+            Duration::from_millis(300),
+        )
+        .await;
+        reopened(&waited).await;
+
+        let drained = answered("Ship the guide today?").await;
+        let delivering = {
+            let (crew, overseer, drained) =
+                (Arc::clone(&crew), Arc::clone(&overseer), drained.clone());
+            tokio::spawn(async move {
+                crew.answer_delivered(
+                    &overseer,
+                    PERSON,
+                    &drained,
+                    "Tomorrow",
+                    Duration::from_secs(600),
+                )
+                .await
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(!delivering.is_finished(), "waits for the DM");
+        crew.state.drain_token.cancel();
+        tokio::time::timeout(Duration::from_secs(5), delivering)
+            .await
+            .expect("a drain ends the wait")
+            .unwrap();
+        reopened(&drained).await;
+    })
+    .await;
+}
+
 const FULL: &str = "[oversight]\nenabled = true\nlevel = \"full\"\n\
                     [oversight.full]\nrepos = [\"acme/acme-web\"]\n";
 

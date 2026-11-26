@@ -1185,10 +1185,11 @@ async fn a_short_agreement_counts_only_after_the_bosss_last_message() {
     .await;
 }
 
-/// A click that lands while a turn runs in the boss's DM can't reach it:
-/// the item is open again and the person is told to answer it again.
+/// A click that lands while a turn runs in the boss's DM waits for it: the
+/// item stays answered, nothing bounces back, and the answer reaches the
+/// boss as the DM's next turn.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_click_the_boss_cant_take_reopens_its_item_and_says_so() {
+async fn a_click_while_the_boss_is_mid_turn_reaches_it_once_the_turn_ends() {
     with_test_pool(workforce_desk::store::build_pool, |pool| async move {
         use workforce_desk::open_item::OpenState;
         let dir = tempfile::tempdir().unwrap();
@@ -1216,28 +1217,60 @@ async fn a_click_the_boss_cant_take_reopens_its_item_and_says_so() {
             .find(DESK_CHANNEL, PERSON)
             .unwrap()
             .unwrap();
-        let running = overseer
-            .begin_live_turn(
-                &dm.id,
-                workforce_agent::tools::approval::SelfServe::answerable_if(false),
-                None,
-            )
-            .await
-            .unwrap();
+        let running = holds(&overseer, &dm.id).await;
         assert_eq!(crew.answer_item(item, "Merge").await.unwrap(), "Answered.");
-        eventually("the item open again", async || {
-            let i = d.store().open_item(item).await.unwrap()?;
-            (i.state == OpenState::Open).then_some(())
-        })
-        .await;
-        eventually("the person told", async || {
-            (posted(&overseer, "didn't reach") > 0).then_some(())
-        })
-        .await;
-        assert!(posted(&overseer, "so it is still open: answer it again") > 0);
+        let answered = format!(
+            "{}Shall I merge the docs fix?”: Merge",
+            workforce_desk::goal::ANSWER_LEAD
+        );
+        let answered = answered.as_str();
+        let reached = || {
+            overseer
+                .sessions
+                .find(DESK_CHANNEL, PERSON)
+                .unwrap()
+                .is_some_and(|s| {
+                    s.messages.iter().any(|m| {
+                        m.role == workforce_common::session::MessageRole::User
+                            && m.content.contains(answered)
+                    })
+                })
+        };
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(!reached(), "held behind the running turn");
+        assert_eq!(
+            d.store().open_item(item).await.unwrap().unwrap().state,
+            OpenState::Closed
+        );
         drop(running);
+        eventually("the answer reaches the boss", async || {
+            reached().then_some(())
+        })
+        .await;
+        dm_idle(&overseer).await;
+        assert_eq!(
+            d.store().open_item(item).await.unwrap().unwrap().state,
+            OpenState::Closed
+        );
+        assert_eq!(posted(&overseer, "didn't reach"), 0);
     })
     .await;
+}
+
+/// A turn of its own in `boss`'s DM session `dm`, begun once no other
+/// holds it.
+pub(super) async fn holds(boss: &AgentService, dm: &str) -> crate::live_turns::LiveTurn {
+    eventually("the DM held", async || {
+        boss.begin_live_turn(
+            dm,
+            workforce_agent::tools::approval::SelfServe::answerable_if(false),
+            None,
+        )
+        .await
+        .ok()
+        .map(|(turn, _inbox)| turn)
+    })
+    .await
 }
 
 /// Once no turn runs in `boss`'s DM: a click's answer reaches the boss in
