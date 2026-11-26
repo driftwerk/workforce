@@ -665,3 +665,33 @@ async fn a_codex_session_keeps_its_mode_through_every_start_and_a_refusal_is_sai
     })
     .await;
 }
+
+/// A session adopted before Desk read which sessions bosses run was taken
+/// to be under one: once they are read, what it runs in is read again
+/// from them, and it is never started again for that.
+#[tokio::test]
+async fn a_codex_session_adopted_before_charges_were_read_is_read_again_not_started_again() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let dir = dir.path().canonicalize().unwrap();
+        let (d, s) = started_with(pool, &dir, true).await;
+        let link = |d: &Desk| {
+            let st = d.0.state.lock();
+            let l = st.live[&s.id]._codex.as_ref().unwrap();
+            (l.permissions, l.settled)
+        };
+        let own = crate::codex::Permissions::of(None, true, false);
+        assert_eq!(link(&d), (own, true));
+        {
+            let mut st = d.0.state.lock();
+            let l = st.live.get_mut(&s.id).unwrap()._codex.as_mut().unwrap();
+            l.permissions = crate::codex::Permissions::of(None, true, true);
+            l.settled = false;
+        }
+        d.modes_changed();
+        until(|| link(&d) == (own, true)).await;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(tui_starts(&dir).len(), 1, "never started again");
+    })
+    .await;
+}

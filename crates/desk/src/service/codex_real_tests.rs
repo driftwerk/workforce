@@ -52,7 +52,8 @@ fn reply(id: &str, item: Value) -> String {
 type Heard = Arc<parking_lot::Mutex<Vec<Value>>>;
 
 /// The stand-in model: asked to make the file, it runs `touch` past the
-/// sandbox; given what it ran, it says it is done; else it says ok.
+/// sandbox; asked for more room, it asks for a folder beside the
+/// workspace; given what came of it, it says it is done; else it says ok.
 async fn model(dir: &Path) -> (String, Heard) {
     let heard = Heard::default();
     let cmd = format!("touch {}", dir.join("made.txt").display());
@@ -69,6 +70,14 @@ async fn model(dir: &Path) -> (String, Heard) {
                         "r2",
                         json!({"type": "message", "role": "assistant", "id": "m2",
                         "content": [{"type": "output_text", "text": "done"}]}),
+                    )
+                } else if text.contains("ask for more room") {
+                    let args = json!({"reason": "Write beside the workspace",
+                        "permissions": {"file_system": {"write": ["../shared"]}}});
+                    reply(
+                        "r3",
+                        json!({"type": "function_call", "call_id": "c3",
+                        "name": "request_permissions", "arguments": args.to_string()}),
                     )
                 } else if text.contains("make the file") {
                     let args = json!({"cmd": cmd, "sandbox_permissions": "require_escalated",
@@ -158,21 +167,45 @@ async fn the_real_codex_asks_desk_and_runs_what_it_allowed() {
         )
         .await
         .unwrap();
-        let mut new = codex_session(&work, false);
-        new.prompt = Some("make the file".into());
-        let s = d.create(new, None).await.unwrap();
-
         // Asked: Blocked on its command, answerable from Desk.
-        until("its request", Duration::from_secs(60), || {
-            d.view(s.id).unwrap().pending.is_some_and(|p| p.answerable)
+        let asks = async |d: &Desk, prompt: &str, tool: &str| {
+            let mut new = codex_session(&work, false);
+            new.prompt = Some(prompt.into());
+            let s = d.create(new, None).await.unwrap();
+            until("its request", Duration::from_secs(60), || {
+                d.view(s.id).unwrap().pending.is_some_and(|p| p.answerable)
+            })
+            .await;
+            let v = d.view(s.id).unwrap();
+            let p = v.pending.clone().unwrap();
+            assert_eq!(v.state, SessionState::Blocked);
+            assert_eq!(p.tool, tool, "{p:?}");
+            (s, p)
+        };
+        let ended = |d: &Desk, id| {
+            let v = d.view(id).unwrap();
+            v.pending.is_none() && !matches!(v.state, SessionState::Working | SessionState::Blocked)
+        };
+
+        // Its permissions request denied: granted nothing, Codex goes on to
+        // the end of its turn.
+        let (denied, p) = asks(&d, "ask for more room", "Permissions").await;
+        assert_eq!(p.choices, [Decision::Allow, Decision::Deny]);
+        d.decide(denied.id, p.id, Decision::Deny, Some(By::you()))
+            .unwrap();
+        until("its turn's end", Duration::from_secs(30), || {
+            ended(&d, denied.id)
         })
         .await;
-        let v = d.view(s.id).unwrap();
-        let p = v.pending.clone().unwrap();
-        assert_eq!(v.state, SessionState::Blocked);
-        assert!(p.detail.contains("touch"), "{p:?}");
-        assert_eq!(p.tool, "Bash");
+        assert!(d.view(denied.id).unwrap().failure.is_none());
+        assert!(heard
+            .lock()
+            .iter()
+            .any(|b| b.to_string().contains("function_call_output")));
+        heard.lock().clear();
 
+        let (s, p) = asks(&d, "make the file", "Bash").await;
+        assert!(p.detail.contains("touch"), "{p:?}");
         // Allowed: it runs within seconds, and the turn ends.
         d.decide(s.id, p.id, Decision::Allow, Some(By::you()))
             .unwrap();
@@ -181,8 +214,7 @@ async fn the_real_codex_asks_desk_and_runs_what_it_allowed() {
         })
         .await;
         until("its turn's end", Duration::from_secs(30), || {
-            let v = d.view(s.id).unwrap();
-            v.pending.is_none() && !matches!(v.state, SessionState::Working | SessionState::Blocked)
+            ended(&d, s.id)
         })
         .await;
         assert!(heard
@@ -230,8 +262,32 @@ async fn the_real_codex_asks_desk_and_runs_what_it_allowed() {
             d.view(s.id).unwrap().live
         })
         .await;
-        assert_eq!(d.record(s.id).unwrap().cli_session_id, Some(thread));
+        assert_eq!(d.record(s.id).unwrap().cli_session_id, Some(thread.clone()));
         tokio::time::sleep(Duration::from_secs(2)).await;
+        assert_eq!(said("other permissions than Desk asked").await, 0);
+
+        // Started again by its boss in what it runs in: the same thread, its
+        // conversation kept, and the same permissions.
+        until("between turns", Duration::from_secs(30), || ended(&d, s.id)).await;
+        d.restart(
+            s.id,
+            Some("say ok".into()),
+            By::manager("crew", "Crew", "it should go on"),
+        )
+        .await
+        .unwrap();
+        until("its next turn", Duration::from_secs(60), || {
+            heard.lock().iter().any(|b| {
+                let b = b.to_string();
+                b.contains("say ok") && b.contains("make the file")
+            })
+        })
+        .await;
+        until("its turn's end", Duration::from_secs(30), || {
+            ended(&d, s.id)
+        })
+        .await;
+        assert_eq!(d.record(s.id).unwrap().cli_session_id, Some(thread));
         assert_eq!(said("other permissions than Desk asked").await, 0);
     })
     .await;
