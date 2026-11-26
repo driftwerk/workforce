@@ -137,24 +137,20 @@ pub(crate) fn short(sha: &str) -> &str {
 
 /// Whether ticket `t` names `pr`: among its links, or in its words.
 fn names_pull(t: &workforce_desk::board::Ticket, pr: &PrRef) -> bool {
-    let url = format!(
-        "github.com/{}/{}/pull/{}",
-        pr.owner, pr.repo, pr.number
-    );
+    let url = format!("github.com/{}/{}/pull/{}", pr.owner, pr.repo, pr.number);
     // Its number whole: #7 is never #70.
     let ends = |text: &str, said: &str| {
-        text.match_indices(said).any(|(at, _)| {
-            !text[at + said.len()..]
-                .starts_with(|c: char| c.is_ascii_digit())
-        })
+        text.match_indices(said)
+            .any(|(at, _)| !text[at + said.len()..].starts_with(|c: char| c.is_ascii_digit()))
     };
     let mentions = |text: &str| {
         let text = text.to_ascii_lowercase();
         ends(&text, &url) || ends(&text, &named(pr))
     };
-    t.links.iter().any(|l| {
-        matches!(l, workforce_desk::board::Link::Pr { url, .. } if mentions(url))
-    }) || mentions(&t.title)
+    t.links
+        .iter()
+        .any(|l| matches!(l, workforce_desk::board::Link::Pr { url, .. } if mentions(url)))
+        || mentions(&t.title)
         || mentions(&t.body)
 }
 
@@ -166,10 +162,9 @@ pub(crate) fn named(pr: &PrRef) -> String {
 /// Whether `cwd` is the worktree Desk makes a review of `pr` at `head`
 /// read in ([`worktree`]).
 pub(crate) fn made_for(cwd: &str, pr: &PrRef, head: &str) -> bool {
-    std::path::Path::new(cwd).ends_with(
-        std::path::Path::new(".worktrees")
-            .join(workforce_desk::worktree::slug(&plan::review_worktree(pr, head))),
-    )
+    std::path::Path::new(cwd).ends_with(std::path::Path::new(".worktrees").join(
+        workforce_desk::worktree::slug(&plan::review_worktree(pr, head)),
+    ))
 }
 
 /// What a review session Desk starts for ticket `key` is asked.
@@ -540,7 +535,9 @@ impl CrewHub {
         };
         let pull = self.pull_now(&b.service, &r.pr).await?;
         r.head_sha = Self::head_of(&pull)?;
-        r.for_session = self.reviewed_work(b.service.agent_id.as_str(), &r.pr, &pull).await;
+        r.for_session = self
+            .reviewed_work(b.service.agent_id.as_str(), &r.pr, &pull)
+            .await;
         kept["review_of"]["head_sha"] = json!(r.head_sha);
         kept["review_of"]["for_session"] = json!(r.for_session);
         Ok(())
@@ -571,7 +568,12 @@ impl CrewHub {
         }
         let mut naming = Vec::new();
         for id in on {
-            let tickets = self.desk.store().session_tickets(id).await.unwrap_or_default();
+            let tickets = self
+                .desk
+                .store()
+                .session_tickets(id)
+                .await
+                .unwrap_or_default();
             if tickets.iter().any(|t| names_pull(t, pr)) {
                 naming.push(id);
             }

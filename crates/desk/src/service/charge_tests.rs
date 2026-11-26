@@ -1974,12 +1974,26 @@ async fn a_review_that_doesnt_start_leaves_no_link_and_no_worktree_it_made() {
         assert!(!folder.exists(), "the worktree it made is removed");
         assert!(d
             .store()
-            .pr_reviews_at(&sarah().id, &crate::plan::PrRef::new("acme", "web", 7), &head)
+            .pr_reviews_at(
+                &sarah().id,
+                &crate::plan::PrRef::new("acme", "web", 7),
+                &head
+            )
             .await
             .unwrap()
             .is_empty());
 
-        git_in(&repo, &["worktree", "add", "-q", "--detach", &folder.to_string_lossy(), &head]);
+        git_in(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "--detach",
+                &folder.to_string_lossy(),
+                &head,
+            ],
+        );
         d.create_for(review(), &sarah(), by()).await.unwrap_err();
         assert!(folder.exists(), "one it found stays");
     })
@@ -2006,7 +2020,10 @@ async fn a_sessions_own_merge_is_refused_before_it_runs_under_a_boss_acting_full
             .await
             .unwrap();
         let merge = "git push && gh pr merge 7 --squash";
-        assert!(!refused(&hook(&d, s.id, call(merge)).await), "she doesn't act fully");
+        assert!(
+            !refused(&hook(&d, s.id, call(merge)).await),
+            "she doesn't act fully"
+        );
 
         d.set_full(HashMap::from([(
             sarah().id,
@@ -2021,7 +2038,10 @@ async fn a_sessions_own_merge_is_refused_before_it_runs_under_a_boss_acting_full
         let why = answer["hookSpecificOutput"]["permissionDecisionReason"]
             .as_str()
             .unwrap_or_default();
-        assert!(why.contains(crate::plan::OWN_MERGE) && why.contains(crate::plan::OWN_MERGE_INSTEAD), "{why}");
+        assert!(
+            why.contains(crate::plan::OWN_MERGE) && why.contains(crate::plan::OWN_MERGE_INSTEAD),
+            "{why}"
+        );
         assert!(!refused(&hook(&d, s.id, call("gh pr view 7")).await));
         let token = d.0.state.lock().live[&s.id].token.clone();
         assert_eq!(
@@ -2032,7 +2052,10 @@ async fn a_sessions_own_merge_is_refused_before_it_runs_under_a_boss_acting_full
         assert_eq!(d.gh_asked(s.id, "not-its-token", "gh pr merge 7"), None);
 
         d.person_typing(s.id).unwrap();
-        assert!(!refused(&hook(&d, s.id, call(merge)).await), "the person is in it");
+        assert!(
+            !refused(&hook(&d, s.id, call(merge)).await),
+            "the person is in it"
+        );
     })
     .await;
 }

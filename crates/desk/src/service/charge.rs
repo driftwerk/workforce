@@ -1027,7 +1027,12 @@ impl Desk {
     /// request ([`crate::computer::boss::merges_a_pull`]) while a boss
     /// acting fully has it and the person isn't in it. That boss merges
     /// it, once a clean review is recorded at its head.
-    pub(crate) fn own_merge_refused(&self, id: Uuid, tool: &str, input: &serde_json::Value) -> Option<String> {
+    pub(crate) fn own_merge_refused(
+        &self,
+        id: Uuid,
+        tool: &str,
+        input: &serde_json::Value,
+    ) -> Option<String> {
         let command = input["command"].as_str().filter(|_| tool == "Bash")?;
         if !crate::computer::boss::merges_a_pull(command) {
             return None;

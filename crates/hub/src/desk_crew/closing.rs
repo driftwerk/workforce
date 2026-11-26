@@ -496,7 +496,10 @@ impl CrewHub {
                 return Some("What it reviews couldn't be read, so it stays open for now.".into());
             }
         };
-        if link.as_ref().is_some_and(|l| l.head_sha.is_some() && !l.settled) {
+        if link
+            .as_ref()
+            .is_some_and(|l| l.head_sha.is_some() && !l.settled)
+        {
             return Some(
                 "Its review isn't recorded yet: it stays open until Desk records it, or its pull request moves past the head it read."
                     .into(),

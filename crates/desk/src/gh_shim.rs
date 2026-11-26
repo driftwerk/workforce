@@ -106,7 +106,9 @@ mod tests {
 
     /// Desk answering every command asked with `answer`; what it was asked
     /// kept in `asked`.
-    async fn desk_saying(answer: &'static str) -> (String, std::sync::Arc<parking_lot::Mutex<Vec<String>>>) {
+    async fn desk_saying(
+        answer: &'static str,
+    ) -> (String, std::sync::Arc<parking_lot::Mutex<Vec<String>>>) {
         let asked = std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
         let kept = asked.clone();
         let app = Router::new().route(
@@ -162,7 +164,11 @@ mod tests {
         assert!(asked.lock().is_empty(), "nothing asked of what can't merge");
         assert_eq!(
             said(&run(&path, &["pr", "merge", "7", "--body", "it's done"]).await),
-            (true, "ran pr merge 7 --body it's done".into(), String::new())
+            (
+                true,
+                "ran pr merge 7 --body it's done".into(),
+                String::new()
+            )
         );
         assert_eq!(
             asked.lock().clone(),
@@ -180,12 +186,19 @@ mod tests {
             (false, String::new(), "gh: Your boss merges it.".into())
         );
 
-        let path = install(&dir.path().join("unasked"), "http://127.0.0.1:9/gh/s/t", &system)
-            .unwrap()
-            .unwrap();
+        let path = install(
+            &dir.path().join("unasked"),
+            "http://127.0.0.1:9/gh/s/t",
+            &system,
+        )
+        .unwrap()
+        .unwrap();
         let (ran, out, why) = said(&run(&path, &["pr", "merge", "7"]).await);
         assert!(!ran && out.is_empty(), "{out}");
-        assert!(why.ends_with("Desk couldn't be asked whether this may run, so it doesn't."), "{why}");
+        assert!(
+            why.ends_with("Desk couldn't be asked whether this may run, so it doesn't."),
+            "{why}"
+        );
 
         assert_eq!(
             install(&dir.path().join("none"), &url, "/nowhere").unwrap(),

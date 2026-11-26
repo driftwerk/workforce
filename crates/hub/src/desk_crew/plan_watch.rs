@@ -912,8 +912,17 @@ impl CrewHub {
                             self.ready_once(*id, key, &done.pr, &done.head_sha, draft);
                         }
                         (false, Some((id, key)), Some(work)) => {
-                            self.changes_asked(service, o, *id, key, work, &done.pr, &done.head_sha, &said)
-                                .await
+                            self.changes_asked(
+                                service,
+                                o,
+                                *id,
+                                key,
+                                work,
+                                &done.pr,
+                                &done.head_sha,
+                                &said,
+                            )
+                            .await
                         }
                         _ => {}
                     }

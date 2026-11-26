@@ -316,7 +316,11 @@ mod tests {
             assert!(store.pr_reviews_unsettled("mia").await.unwrap().is_empty());
 
             store.pr_review_settle(session).await.unwrap();
-            assert!(store.pr_reviews_unsettled("sarah").await.unwrap().is_empty());
+            assert!(store
+                .pr_reviews_unsettled("sarah")
+                .await
+                .unwrap()
+                .is_empty());
             assert_eq!(
                 store.pr_review_of(session).await.unwrap(),
                 Some(ReviewLink {

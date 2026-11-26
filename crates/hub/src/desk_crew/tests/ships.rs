@@ -407,15 +407,15 @@ async fn a_review_is_recorded_only_as_its_session_said_it_at_the_head() {
         );
 
         // Its folder moved on from the head it reviewed.
-        let folder = base.join("web-review");
+        let folder = Path::new(&review.cwd);
         std::fs::write(folder.join("later.ts"), "export {};\n").unwrap();
-        git(&folder, &["add", "later.ts"]);
-        git(&folder, &["commit", "-q", "-m", "Later"]);
+        git(folder, &["add", "later.ts"]);
+        git(folder, &["commit", "-q", "-m", "Later"]);
         let moved = record(review.id).await.unwrap_err();
         assert!(
             moved.starts_with(&format!(
                 "Its folder is at {}, the PR is at {head}",
-                head_of(&folder)
+                head_of(folder)
             )),
             "{moved}"
         );
@@ -992,7 +992,8 @@ async fn a_review_closed_before_it_was_recorded_is_recorded_from_what_it_said() 
         let unrecorded = d.view(review.id).unwrap();
         let held = crew.close_held(&unrecorded, "desk").await;
         assert!(
-            held.as_deref().is_some_and(|h| h.contains("review isn't recorded yet")),
+            held.as_deref()
+                .is_some_and(|h| h.contains("review isn't recorded yet")),
             "{held:?}"
         );
 

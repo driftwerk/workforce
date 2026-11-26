@@ -516,7 +516,14 @@ mod tests {
         std::fs::remove_file(work.join(".DS_Store")).unwrap();
         sh(
             &work,
-            &["worktree", "add", "-q", "--detach", ".worktrees/review-7", "HEAD"],
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "--detach",
+                ".worktrees/review-7",
+                "HEAD",
+            ],
         )
         .await;
         assert!(matches!(

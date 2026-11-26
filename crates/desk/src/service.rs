@@ -6506,7 +6506,9 @@ impl Desk {
                 env.insert("PATH".into(), path);
             }
             Ok(None) => {}
-            Err(e) => tracing::warn!(session = %id, error = %e, "a Codex session's gh runs without Desk's check of its merges"),
+            Err(e) => {
+                tracing::warn!(session = %id, error = %e, "a Codex session's gh runs without Desk's check of its merges")
+            }
         }
         env
     }
@@ -6894,9 +6896,8 @@ impl Desk {
             .live
             .get(&id)
             .is_some_and(|l| l.token == token);
-        authorised.then(|| {
-            self.own_merge_refused(id, "Bash", &serde_json::json!({ "command": command }))
-        })
+        authorised
+            .then(|| self.own_merge_refused(id, "Bash", &serde_json::json!({ "command": command })))
     }
 
     /// Keeps the mode `hook` (its `body`) says session `id` runs in. A tool
@@ -7002,7 +7003,9 @@ impl Desk {
         // said, and so does a merge of its own while a boss acting fully
         // has it; otherwise the call is watched (when loops are).
         let held = match &hook {
-            Hook::ToolStart { tool, call, input, .. } => self
+            Hook::ToolStart {
+                tool, call, input, ..
+            } => self
                 .breaker_tool(id, tool)
                 .or_else(|| self.own_merge_refused(id, &call.tool, input)),
             _ => None,

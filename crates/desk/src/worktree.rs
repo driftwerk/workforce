@@ -121,12 +121,7 @@ async fn create_from(cwd: &Path, branch: &str, start: Option<&str>) -> Result<Pa
 /// password or a host key, and for at most [`FETCH_WITHIN`]. One already
 /// there, detached at `commit`, is found again; anything else there is
 /// refused. `true` beside its path: this call made it.
-pub async fn detached(
-    cwd: &Path,
-    name: &str,
-    commit: &str,
-    from: &str,
-) -> Result<(PathBuf, bool)> {
+pub async fn detached(cwd: &Path, name: &str, commit: &str, from: &str) -> Result<(PathBuf, bool)> {
     let slugged = slug(name);
     if slugged.is_empty() {
         eyre::bail!("worktree name {name:?} has no usable characters");
