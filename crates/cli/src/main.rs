@@ -6417,7 +6417,8 @@ rules:
                     loop {
                         let count = registry_for_slack.active_runner_count().await
                             + workforce_agent::runner::inflight_turns()
-                            + workforce_hub::identity_lifecycle::running();
+                            + workforce_hub::identity_lifecycle::running()
+                            + workforce_hub::shutdown::settling();
                         if count == 0 {
                             break;
                         }
@@ -6432,7 +6433,8 @@ rules:
                 Err(_) => {
                     let remaining = registry_for_slack.active_runner_count().await
                         + workforce_agent::runner::inflight_turns()
-                        + workforce_hub::identity_lifecycle::running();
+                        + workforce_hub::identity_lifecycle::running()
+                        + workforce_hub::shutdown::settling();
                     eprintln!(
                         "{} Drain timeout ({}s) — {} turn(s) still active",
                         style("⚠").yellow().bold(),

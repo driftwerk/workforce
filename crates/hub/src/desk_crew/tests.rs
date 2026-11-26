@@ -431,6 +431,24 @@ pub(crate) async fn eventually<T>(what: &str, mut check: impl AsyncFnMut() -> Op
     panic!("{what} never happened");
 }
 
+/// A turn of its own in `boss`'s session `session`, begun once no other
+/// holds it, with the inbox its follow-ups reach.
+pub(crate) async fn hold_session(
+    boss: &AgentService,
+    session: &str,
+) -> (crate::live_turns::LiveTurn, crate::serve::TurnInbox) {
+    eventually("the session held", async || {
+        boss.begin_live_turn(
+            session,
+            workforce_agent::tools::approval::SelfServe::answerable_if(false),
+            None,
+        )
+        .await
+        .ok()
+    })
+    .await
+}
+
 struct Anyone;
 
 #[async_trait::async_trait]
@@ -1420,6 +1438,81 @@ async fn the_overseer_messages_the_crew_within_the_loop_guard() {
         assert!(held.contains("Loop guard"), "{held}");
         crew.person_spoke();
         assert!(nudge().await.is_ok(), "the person spoke again");
+    })
+    .await;
+}
+
+/// A message to an agent whose DM is mid-turn waits for that turn, the
+/// overseer's taking the agent's mind only once the DM is free, and reaches
+/// it once the turn ends. The person's go-ahead that can't get there is
+/// told to them in that DM.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_message_to_an_agent_mid_turn_waits_for_it_and_a_lost_go_ahead_is_told() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (scout, _s) = agent(dir.path(), "scout", "Nearly done.").await;
+        let dm = scout
+            .sessions
+            .get_or_create(DESK_CHANNEL, PERSON, "scout")
+            .unwrap();
+        scout.sessions.save(&dm).unwrap();
+        let (overseer, crew, _d, _llm) = overseeing(
+            dir.path(),
+            pool,
+            "ok",
+            "[oversight]\nenabled = true\nlevel = \"act\"\n",
+            &[Arc::clone(&scout)],
+        )
+        .await;
+        eventually("the overseer's tools", async || {
+            overseer.tools.has("crew.nudge").then_some(())
+        })
+        .await;
+        let nudge = |message: &str| super::actions::Action::Nudge {
+            to: super::actions::Target::Agent("scout".into()),
+            message: message.into(),
+            reply_to: None,
+        };
+        let in_dm = |said: &str| {
+            scout
+                .sessions
+                .find(DESK_CHANNEL, PERSON)
+                .unwrap()
+                .is_some_and(|dm| dm.messages.iter().any(|m| m.content.contains(said)))
+        };
+
+        let (running, _) = hold_session(&scout, &dm.id).await;
+        let by = crew.by_overseer("Quiet for 40 min.").unwrap();
+        let done = crew
+            .perform(&nudge("How is the staging check going?"), by)
+            .await;
+        assert_eq!(done.as_deref(), Ok("asked Scout"), "{done:?}");
+        let yes = crew.perform(&nudge("Ship the docs fix."), By::you()).await;
+        assert!(yes.is_ok(), "{yes:?}");
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(!in_dm("How is the staging check going?") && !in_dm("Ship the docs fix."));
+        assert!(
+            crew.mind_holder("scout").is_none(),
+            "no mind is held while the DM is busy"
+        );
+        drop(running);
+        for said in ["How is the staging check going?", "Ship the docs fix."] {
+            eventually("the message reaches Scout", async || {
+                in_dm(said).then_some(())
+            })
+            .await;
+        }
+
+        let (_running, _) = hold_session(&scout, &dm.id).await;
+        crew.set_mind_wait_max(Duration::from_millis(300));
+        let yes = crew
+            .perform(&nudge("Merge the guide fix."), By::you())
+            .await;
+        assert!(yes.is_ok(), "{yes:?}");
+        eventually("the person told", async || {
+            in_dm("Your go-ahead “Merge the guide fix.” didn't reach Scout").then_some(())
+        })
+        .await;
     })
     .await;
 }

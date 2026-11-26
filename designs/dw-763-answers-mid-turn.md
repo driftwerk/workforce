@@ -16,41 +16,69 @@ Please ensure the design specifies to not write any comments that are not absolu
 
 ## Design
 
-The answer waits its turn in the background, as `turn_loop::next_turn::answer_left` already does for an unread follow-up. It reaches the boss as a turn of its own in the DM once the DM lets go.
+Revision 2 takes in the independent review of #532 (findings 1-14).
 
-1. **The busy refusal is typed.** `run_turn_with` returns `Err(busy.into())` instead of `bail!("{busy}")`. The message reads the same in logs. `next_turn::held` (TurnBusy or TurnClaimHeld) becomes `pub(crate)` and is the single test for "another turn holds the session". It is reused, not copied.
-2. **`LiveTurns::ended(session_id)`** (hub-core) resolves once no turn is live for the session on this instance, or at once if none is. It awaits the entry's existing `settled` token, which `LiveTurn::drop` cancels after unregistering. No polling is needed on a single instance.
-3. **`CrewHub::run_dm_turn_queued(service, owner, prompt, author, within)`** (`deliver.rs`): it runs `run_dm_turn` and, while the error is `held`, waits for the DM to let go and tries again. The wait is `LiveTurns::ended` when the turn is live here, or a short recheck sleep when another instance holds the claim. It stops at the first of these:
-   - the turn ran: its result is returned;
-   - a non-busy error: returned as is;
-   - `within` passed: an error saying the DM stayed busy;
-   - the hub drains (`GatewayState::drain_token`): an error saying the hub is shutting down.
-4. **`CrewHub::answer_delivered(service, owner, closed, answer, within)`** (`items.rs`) is the body `answer_item` spawns. It builds the `ANSWER_LEAD` message, runs `run_dm_turn_queued` with `Speaker::you()`, and calls `answer_lost` only when that fails. `answer_item` spawns it with `mind::WAIT_MAX`, the bound everything else already uses for a busy boss.
-
-The person's answer is their own turn. It never takes the boss's mind and is never held by the plan guard. `persons` is already true for `Speaker::you()`, so nothing changes there.
+1. **One wait, shared.** `crate::live_turns::when_free(service, session, within, stop, attempt)` runs `attempt` and, each time it fails because another turn holds the session (`session_turn_claim::held`, checked with `chain().any` for `TurnBusy` or `TurnClaimHeld`), waits for the session to be let go, then tries again.
+   - Letting go means the local live turn ending (`LiveTurns::ended`, hub-core, awaiting the entry's `settled` token), then no claim on the session (`turn_claim_holder` is `None`, looked at every 500 ms).
+   - So a retry never sets up a turn (live-turn entry, NATS control subscription, crew wake, typing frame, turn-end hooks) while a claim still holds the session.
+   - It gives up past `within`, or when `stop` resolves.
+   - The crew passes `GatewayState::drain_token` as `stop`. `answer_left` passes a future that never resolves: its follow-up is already saved.
+2. **The busy refusal is typed.** `run_turn_with` returns `TurnBusy` as an error, not a string.
+   - `hops` and `listed` are inserted only once `begin_live_turn` has succeeded.
+   - A refused turn therefore never removes the hop of the turn that won (`MAX_HOPS` holds), and never leaks `listed`.
+3. **`CrewHub::run_dm_turn_queued(service, owner, turn)`** is `when_free` on the boss's DM, looked up again each time, so a rollover is followed. Its bound is the mind's wait (`mind_wait_max`, the one knob tests shorten); its stop is the hub draining. `turn` is a closure, so each caller builds its own turn.
+4. **A button answer** (`answer_delivered`, spawned by `answer_item`) goes into the turn running in the DM first, the way the person's typed follow-up does.
+   - It is sent as `TurnControl::FollowUp` through `gateway::steer`, local or over NATS, with place DM and `queue: false`, and goes into the boss's picture.
+   - Only when no turn takes it in (no live turn, a turn in another place, a turn already answered and wound up) does it run as a DM turn of its own, through `run_dm_turn_queued`.
+   - Clicks during a turn are therefore batched into that turn, in the order they land. A click followed by typed "hold off" reaches the boss in that order.
+   - The message text is unchanged (`ANSWER_LEAD…”: answer`), so `answered_text` still reads it.
+5. **A follow-up injected into a crew turn is the person's.** `next_turn::heard_in` gives a turn on the DM channel with no Desk context (the crew's own turns) the person's DM turn as its context.
+   - Its follow-ups are marked as theirs.
+   - One the run never read becomes the DM's next turn (`answer_left`), as it already does for a Desk turn, instead of being kept unanswered.
+6. **`answer_left`** waits through `when_free` for up to 20 min, event-driven, instead of 40 tries 250 ms apart. A queued turn that takes the session first no longer leaves the person's follow-up unanswered.
+7. **Settled meanwhile.** Before each try, and before reopening, the item is read again (`still_owed`). An answer whose item no longer stands as it closed, or whose proposal was applied (`OpenItemStore::item_applied`), goes no further: it is neither delivered nor reopened.
+8. **Restarts.**
+   - The answer's task holds a `shutdown::Settling` guard. The CLI's drain waits on `shutdown::settling()` alongside in-flight turns, so the reopen-and-tell that a drain triggers completes before the process goes.
+   - A hard kill is covered at the next start. `items_loop` first runs `answers_lost_before(start)`. It reads `OpenItemStore::items_answered_between(start − mind wait, start)`: items the person closed with `You answered: …`, nothing applied.
+   - Each one whose answer is for the boss (`goes_to_boss`: not a session's wait, not a line, not a preference kept or forgotten via `preferences::overrule_of`) and is not in the boss's DM since it was given (`reached`) goes to `answer_lost`.
+   - No schema change.
+9. **Crew messages** (`message_agent`) use `run_dm_turn_queued` on both branches.
+   - The person's go-ahead is queued the same way. If it can't be delivered, the person is told in that agent's DM.
+   - Another boss's message takes the receiver's mind inside each try, so the wait for the DM is outside the mind and never holds it.
+   - The watcher's check-in (`watcher.rs`) is left as is.
 
 ## Edge cases
 
-- **Several answers while busy.** Each waits on its own. After the DM lets go, one wins and the others see busy again and wait again. Every answer is delivered. They are answers to different items, so no order between them is promised and no per-boss queue state is added.
-- **The person types meanwhile.** Their turn and a queued answer race for the free DM. Whichever loses waits. Neither is lost.
-- **The DM rolls over while waiting.** Each attempt resolves the DM through `get_or_create`, and the wait looks the session up again with `sessions.find`.
-- **No retry duplicates a message.** A busy refusal comes before the prompt is saved: `begin_live_turn` refuses it, and the claim is checked before the turn records anything, which `answer_left` already relies on.
-- **The hub restarts mid-wait.** The wait ends as soon as the drain begins: the item is reopened and the person is told, through `answer_lost`. The process keeps running while in-flight turns drain, which is far longer than the reopen takes.
-  - Waiting widens the window in which an answer is in flight from an instant to up to `WAIT_MAX`.
-  - A hard kill (crash, SIGKILL) inside that window still loses the answer: the item stays closed as answered. Making the answer itself durable would need a delivery state on open items. That is out of proportion to this fix and is not added.
-  - `answer_lost`'s wording ("didn't reach … just now") still holds after a long wait: it says when the delivery gave up.
-- **The boss stays busy past the bound, or the agent is gone.** `answer_lost` runs as today: the item reopens when nothing of its key opened since, else the person is asked to say it again.
-- **Other paths do not change.** A session's question (`answer_wait`) and a line ask (`line_answer`) go to the session, not the DM, so they keep their behaviour.
+- **Several clicks during a turn.** All go into that turn, unless it can't take them. Queued ones then each wait, and the first to run opens a turn that the rest join.
+- **A turn from another place, or one already answered**, refuses the follow-up. The answer then waits and runs as the DM's next turn.
+- **Another instance holds the claim.** The follow-up reaches its live turn over NATS. If that instance has no live turn (a stale claim), the answer waits for the claim to go.
+- **No retry duplicates a message.** A busy refusal comes before anything is saved.
+- **Restart sweep, rollover and multi-instance.** The sweep reads only the current DM. A rollover between the answer and the restart makes it reopen an answer that did reach the boss: a repeated question, never a lost one. The crew runs where Desk runs, a single hub, so no other instance holds queued answers.
 
 ## Tests
 
-- hub-core `live_turns`: `ended` resolves at once with no turn, stays pending while one is live, and resolves once it drops.
-- `desk_crew/tests/goals.rs`: the old `a_click_the_boss_cant_take_reopens_its_item_and_says_so` becomes `a_click_while_the_boss_is_mid_turn_reaches_it_once_the_turn_ends`. It holds a live DM turn, clicks, and checks that the item stays closed and nothing says "didn't reach". It then drops the turn and checks that the DM gets the person's answer message (`ANSWER_LEAD…: Merge`).
-- `desk_crew/tests/items.rs`: with the DM held, `answer_delivered` with a short `within` reopens the item and tells the person. With a long `within`, cancelling the drain token does the same.
+- hub `live_turns`:
+  - `let_go` waits for the live turn's end, then for the claim's release;
+  - `when_free` retries after `TurnClaimHeld` and after a busy turn;
+  - it gives up past its wait, or when stopped;
+  - it never retries a real failure.
+- hub-core `live_turns`: `ended`.
+- `turn_loop`:
+  - `answer_left` waits out a turn holding its session;
+  - `heard_in` makes a crew DM turn's unread follow-up the DM's next turn.
+- `desk_crew/tests/goals.rs`:
+  - clicks behind a turn that can't take them all reach the boss once it ends, with no bounce;
+  - clicks into a turn that takes follow-ups join it, ahead of words typed after them.
+- `desk_crew/tests/items.rs` (shared `answered` and `reopened` helpers):
+  - lost answer: the item reopens and the person is told;
+  - busy past the wait, or a drain: reopened and told;
+  - an applied ask goes no further;
+  - the start sweep reopens a lost answer, and leaves one the DM holds and a preference's answer alone.
+- The claim paths are covered through `let_go`/`when_free` with a claim seam. The hub tests' session store always grants claims, so the whole crew path can't hold a claim there.
 
 ## Rules
 
 - No TODOs and no partial implementations.
 - Idiomatic, functional-style Rust that follows the crate's patterns: typed errors downcast with `chain`/`downcast_ref`, `tokio::select!` bounds, the existing `eventually` test helpers.
-- No comments beyond what is strictly needed. No duplicated logic: reuse `next_turn::held`, `answer_lost` and `run_dm_turn`.
+- No comments beyond what is strictly needed. No duplicated logic: one `held`, one `when_free`, and reuse of `answer_lost`, `run_dm_turn` and `gateway::steer`.
 - The Desk app is unchanged: `answer_item` still answers "Answered." at once.

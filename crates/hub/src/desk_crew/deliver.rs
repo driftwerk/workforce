@@ -10,10 +10,10 @@
 //! place the person always allows from their own turns. Its prompt is not
 //! the person's own words, so it is read at paired trust.
 
+use std::future::Future;
 use std::sync::Arc;
-use std::time::Duration;
 
-use eyre::{bail, Result};
+use eyre::Result;
 use workforce_agent::tools::approval::SelfServe;
 use workforce_common::channels::desk::{DeskPlace, DeskScope, DeskTarget};
 use workforce_common::channels::DESK_CHANNEL;
@@ -66,33 +66,34 @@ impl CrewHub {
             .await
     }
 
-    /// [`Self::run_dm_turn`] for `author`'s message, waiting behind any
-    /// other turn that holds the DM: tried again each time the DM lets go,
-    /// for `within` at most, and not once the hub drains.
-    pub(crate) async fn run_dm_turn_queued(
+    /// Runs `turn` in `service`'s DM with `owner`, and again each time
+    /// another turn held the DM, once it lets go
+    /// ([`crate::live_turns::when_free`]): for as long as anything waits for
+    /// a boss's mind, and not once the hub drains.
+    pub(crate) async fn run_dm_turn_queued<T, Fut>(
         &self,
-        service: &Arc<AgentService>,
+        service: &AgentService,
         owner: &str,
-        prompt: &str,
-        author: Speaker,
-        within: Duration,
-    ) -> Result<(String, String)> {
-        let deadline = tokio::time::Instant::now() + within;
-        loop {
-            match self
-                .run_dm_turn(service, owner, prompt, 0, None, Some(author.clone()))
-                .await
-            {
-                Err(e) if crate::turn_loop::next_turn::held(&e) => {}
-                ran => return ran,
-            }
-            let dm = service.sessions.find(DESK_CHANNEL, owner)?.map(|s| s.id);
-            tokio::select! {
-                () = self.state.drain_token.cancelled() => bail!("the hub is shutting down"),
-                () = tokio::time::sleep_until(deadline) => bail!("the DM stayed busy"),
-                () = let_go(service, dm.as_deref()) => {}
-            }
-        }
+        turn: impl FnMut() -> Fut,
+    ) -> Result<T>
+    where
+        Fut: Future<Output = Result<T>>,
+    {
+        crate::live_turns::when_free(
+            service,
+            || {
+                service
+                    .sessions
+                    .find(DESK_CHANNEL, owner)
+                    .ok()
+                    .flatten()
+                    .map(|s| s.id)
+            },
+            self.mind_wait_max(),
+            self.state.drain_token.cancelled(),
+            turn,
+        )
+        .await
     }
 
     /// [`Self::run_dm_turn`] for a message a boss (`author`) sent on in
@@ -164,12 +165,6 @@ impl CrewHub {
         // the answer. The person's next connect rolls a stale one.
         let session = service.sessions.get_or_create(channel, owner, agent_id)?;
         let sid = session.id.clone();
-        if hop > 0 {
-            self.hops.lock().insert(sid.clone(), hop);
-        }
-        if let Some(listed) = listed {
-            self.listed.lock().insert(sid.clone(), listed);
-        }
         // What another overseer sent on is never the person's word, unless
         // it was sent in answer to theirs: then their own words, relayed,
         // are what this turn answers.
@@ -194,11 +189,14 @@ impl CrewHub {
             .await
         {
             Ok(begun) => begun,
-            Err(busy) => {
-                self.hops.lock().remove(&sid);
-                return Err(busy.into());
-            }
+            Err(busy) => return Err(busy.into()),
         };
+        if hop > 0 {
+            self.hops.lock().insert(sid.clone(), hop);
+        }
+        if let Some(listed) = listed {
+            self.listed.lock().insert(sid.clone(), listed);
+        }
         // Started holding the boss's mind: its tools hold it too. Marked
         // once the turn is its own, never while the session is busy with
         // another.
@@ -337,18 +335,6 @@ impl CrewHub {
             answer: answer?,
             acted,
         })
-    }
-}
-
-/// How often a DM held by a turn on another instance is looked at again.
-const RECHECK: Duration = Duration::from_secs(1);
-
-/// Once the turn holding the DM `dm` lets go: its end when it runs here,
-/// else a [`RECHECK`] later.
-async fn let_go(service: &AgentService, dm: Option<&str>) {
-    match dm.filter(|dm| service.live_turns.running(dm)) {
-        Some(dm) => service.live_turns.ended(dm).await,
-        None => tokio::time::sleep(RECHECK).await,
     }
 }
 

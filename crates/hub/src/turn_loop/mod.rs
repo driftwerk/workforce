@@ -5938,13 +5938,14 @@ pub(crate) async fn stream_admitted(
                 // answer and is the conversation's next turn, which the hub
                 // runs; anywhere else it is kept as it always was.
                 let mut next_up = Vec::new();
+                let heard_in = next_turn::heard_in(desk_for_task.as_ref(), &session_key_for_next);
                 match heard_for_task.as_ref() {
                     Some(log) => {
                         let (read, unread) =
                             records::read_by_run(log.take(), &result.injected_user_messages);
-                        records::keep_heard(&mut session, read, trust_level, desk_for_task.as_ref());
-                        let unread = next_turn::unread_plan(desk_for_task.as_ref(), unread);
-                        records::keep_heard(&mut session, unread.now, trust_level, desk_for_task.as_ref());
+                        records::keep_heard(&mut session, read, trust_level, heard_in.as_ref());
+                        let unread = next_turn::unread_plan(heard_in.as_ref(), unread);
+                        records::keep_heard(&mut session, unread.now, trust_level, heard_in.as_ref());
                         next_up = unread.after;
                     }
                     None => {
@@ -5964,7 +5965,7 @@ pub(crate) async fn stream_admitted(
                 }
                 let telemetry_provider = settle_served(&mut session, &result, route, reserved, desk_for_task.as_ref())
                     .map_or(telemetry_provider, str::to_string);
-                records::keep_heard(&mut session, next_up.clone(), trust_level, desk_for_task.as_ref());
+                records::keep_heard(&mut session, next_up.clone(), trust_level, heard_in.as_ref());
                 // Attribute this turn's tool messages to the asker so a shared
                 // session's later replay drops them for every other speaker.
                 if session.is_shared_conversation() {
@@ -5986,7 +5987,7 @@ pub(crate) async fn stream_admitted(
                         warn!(error = %e, "Failed to append to session archive");
                     }
                 }
-                if let Some((desk, prompt)) = desk_for_task
+                if let Some((desk, prompt)) = heard_in
                     .as_ref()
                     .and_then(|desk| next_turn::next_of(desk, &next_up))
                 {

@@ -2283,6 +2283,68 @@ async fn a_follow_up_left_behind_a_rollover_is_not_run() {
     );
 }
 
+/// A follow-up left while the session stays held, however long, is
+/// answered once the turn holding it ends.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_follow_up_waits_out_the_turn_holding_its_session() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (service, _server) =
+        crate::serve::testing::service_on_mock_llm_with(tmp.path(), |config| {
+            config.desk.enabled = true;
+        })
+        .await;
+    let (asked, steered) = (uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+    let session = left_with_follow_up(&service, asked, steered);
+    let (holding, _inbox) = service
+        .begin_live_turn(
+            &session.id,
+            workforce_agent::tools::approval::SelfServe::Unanswerable,
+            None,
+        )
+        .await
+        .unwrap();
+    let answering = tokio::spawn(crate::turn_loop::next_turn::answer_left(
+        std::sync::Arc::clone(&service),
+        next_for(&session.id, asked, steered),
+    ));
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    assert!(!answering.is_finished(), "held by the turn");
+    drop(holding);
+    tokio::time::timeout(std::time::Duration::from_secs(30), answering)
+        .await
+        .expect("answered once the turn ends")
+        .unwrap();
+    let after = service.sessions.get(&session.id).unwrap().unwrap();
+    assert_eq!(after.messages.last().unwrap().content, "done");
+}
+
+/// The follow-ups a turn of the person's DM took in are heard in its Desk
+/// turn, or in the person's DM turn when the crew's own turn came from no
+/// Desk: one it never read is the DM's next turn either way. Off the DM a
+/// turn with no Desk hears them nowhere.
+#[test]
+fn a_crew_turn_in_the_dm_hears_its_follow_ups_as_the_persons() {
+    use workforce_common::channels::desk::{DeskPlace, DeskSpeaker, DESK_CHANNEL};
+    let asked = uuid::Uuid::new_v4();
+    let own = crate::turn_loop::next_turn::heard_in(Some(&dm_turn(asked)), DESK_CHANNEL).unwrap();
+    assert_eq!(own.turn.message, Some(asked));
+    let crews = crate::turn_loop::next_turn::heard_in(None, DESK_CHANNEL).unwrap();
+    assert_eq!(crews.turn.place, DeskPlace::Dm { thread: None });
+    assert_eq!(crews.turn.speaker, DeskSpeaker::Person);
+    let steered = uuid::Uuid::new_v4();
+    let unread = crate::turn_loop::next_turn::unread_plan(
+        Some(&crews),
+        vec![heard_now("and who wrote it?", Some(&steered.to_string()))],
+    );
+    assert!(unread.now.is_empty());
+    let (next, prompt) = crate::turn_loop::next_turn::next_of(&crews, &unread.after).unwrap();
+    assert_eq!(
+        (next.turn.message, prompt.as_str()),
+        (Some(steered), "and who wrote it?")
+    );
+    assert!(crate::turn_loop::next_turn::heard_in(None, "desk:line:1").is_none());
+}
+
 /// How many times the model at `server` was asked for an answer.
 async fn completions(server: &wiremock::MockServer) -> usize {
     server

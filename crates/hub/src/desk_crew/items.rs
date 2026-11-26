@@ -1477,35 +1477,122 @@ impl CrewHub {
         };
         let crew = self.me();
         let answer = answer.to_string();
+        let settling = crate::shutdown::Settling::begin();
         tokio::spawn(async move {
-            crew.answer_delivered(&service, &owner, &closed, &answer, super::mind::WAIT_MAX)
+            let _settling = settling;
+            crew.answer_delivered(&service, &owner, &closed, &answer)
                 .await;
         });
         Ok("Answered.".into())
     }
 
-    /// The person's `answer` to `closed` goes to its boss as their message,
-    /// once any turn holding its DM lets go, waiting `within` at most; one
-    /// that can't get there is [`Self::answer_lost`].
-    pub(crate) async fn answer_delivered(
+    /// The person's `answer` to `closed` goes to its boss as their message:
+    /// into the turn running in its DM, as their follow-ups do, else as the
+    /// DM's next turn once any other turn there lets go. One that can't get
+    /// there is [`Self::answer_lost`]; one settled meanwhile goes no further.
+    pub(super) async fn answer_delivered(
         &self,
         service: &Arc<crate::serve::AgentService>,
         owner: &str,
         closed: &OpenItem,
         answer: &str,
-        within: std::time::Duration,
     ) {
-        let message = format!(
-            "{}{}”: {answer}",
-            workforce_desk::goal::ANSWER_LEAD,
-            closed.text
-        );
-        if let Err(e) = self
-            .run_dm_turn_queued(service, owner, &message, Speaker::you(), within)
+        let message = answer_message(closed, answer);
+        let (me, message) = (self, message.as_str());
+        let delivered = self
+            .run_dm_turn_queued(service, owner, move || async move {
+                if !me.still_owed(closed).await {
+                    return Ok(());
+                }
+                match me.offered(service, owner, message).await {
+                    true => Ok(()),
+                    false => me
+                        .run_dm_turn(service, owner, message, 0, None, Some(Speaker::you()))
+                        .await
+                        .map(drop),
+                }
+            })
+            .await;
+        match delivered {
+            Err(e) if !super::deliver::stopped(&e) => {
+                tracing::warn!(agent_id = %service.agent_id, error = %e, "the person's answer didn't reach the boss");
+                self.answer_lost(service, owner, closed).await;
+            }
+            _ => {}
+        }
+    }
+
+    /// Offers `message`, the person's, to the turn running in `service`'s DM
+    /// with `owner`, as a follow-up they type there is: whether it took it in.
+    async fn offered(
+        &self,
+        service: &crate::serve::AgentService,
+        owner: &str,
+        message: &str,
+    ) -> bool {
+        let Some(dm) = service.sessions.find(DESK_CHANNEL, owner).ok().flatten() else {
+            return false;
+        };
+        let follow_up = workforce_nats::chat::TurnControl::FollowUp {
+            text: message.to_string(),
+            user: owner.to_string(),
+            place: Some(DeskPlace::Dm { thread: None }),
+            queue: false,
+            id: Some(Uuid::new_v4().to_string()),
+        };
+        let taken = crate::gateway::steer(service.nats().as_ref(), service, &dm.id, follow_up)
+            .await
+            .applied();
+        if taken {
+            self.picture_person_told(service.agent_id.as_str(), message);
+        }
+        taken
+    }
+
+    /// Whether the person's answer `closed` still waits for its boss: the
+    /// item stands as it was closed with it, and nothing it proposed was
+    /// applied since. What can't be read is taken to wait.
+    async fn still_owed(&self, closed: &OpenItem) -> bool {
+        let store = self.desk.store();
+        let stands = store.open_item(closed.id).await.map_or(true, |now| {
+            now.is_some_and(|i| i.state == OpenState::Closed && i.closed_why == closed.closed_why)
+        });
+        stands && !store.item_applied(closed.id).await.unwrap_or(false)
+    }
+
+    /// The person's answers given before `before` (this start), within the
+    /// longest an answer waits for its boss, that never reached it: the hub
+    /// stopped while they waited. Each is [`Self::answer_lost`].
+    pub(super) async fn answers_lost_before(&self, before: DateTime<Utc>) {
+        let since = before - chrono::Duration::from_std(self.mind_wait_max()).unwrap_or_default();
+        let answered = match self
+            .desk
+            .store()
+            .items_answered_between(since, before)
             .await
         {
-            tracing::warn!(agent_id = %service.agent_id, error = %e, "the person's answer didn't reach the boss");
-            self.answer_lost(service, owner, closed).await;
+            Ok(answered) => answered,
+            Err(e) => {
+                tracing::warn!(error = %format!("{e:#}"), "reading the person's answers at start failed");
+                return;
+            }
+        };
+        let lost: Vec<_> = answered
+            .into_iter()
+            .filter_map(|item| {
+                let answer = item
+                    .closed_why
+                    .as_deref()?
+                    .strip_prefix(workforce_desk::goal::YOU_ANSWERED)?
+                    .to_string();
+                let (service, _) = self.overseer_named(&item.boss)?;
+                let owner = self.person(Some(&service))?;
+                (goes_to_boss(&item, &answer) && !reached(&service, &owner, &item, &answer))
+                    .then_some((service, owner, item))
+            })
+            .collect();
+        for (service, owner, item) in lost {
+            self.answer_lost(&service, &owner, &item).await;
         }
     }
 
@@ -1517,6 +1604,10 @@ impl CrewHub {
         owner: &str,
         closed: &OpenItem,
     ) {
+        if !self.still_owed(closed).await {
+            tracing::info!(item = %closed.id, "an answer that didn't reach its boss was settled meanwhile");
+            return;
+        }
         let reopened = self
             .desk
             .store()
@@ -2087,7 +2178,9 @@ pub(super) fn items_loop(
     cancel: CancellationToken,
 ) -> impl std::future::Future<Output = ()> {
     let mut events = crew.desk.events();
+    let started = Utc::now();
     async move {
+        crew.answers_lost_before(started).await;
         let mut every = tokio::time::interval(crew.timing.minute);
         every.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let sweep_after = chrono::Duration::from_std(crew.timing.minute)
@@ -2122,6 +2215,46 @@ pub(super) fn items_loop(
             }
         }
     }
+}
+
+/// The person's `answer` to `item` as it is said to its boss in their DM.
+fn answer_message(item: &OpenItem, answer: &str) -> String {
+    format!(
+        "{}{}”: {answer}",
+        workforce_desk::goal::ANSWER_LEAD,
+        item.text
+    )
+}
+
+/// Whether the person's `answer` to `item` is for its boss: not a session's
+/// wait or question it goes to, nor a preference it keeps or forgets.
+fn goes_to_boss(item: &OpenItem, answer: &str) -> bool {
+    !waiting::is_waiting(&item.dedupe_key)
+        && item.line_message.is_none()
+        && super::preferences::overrule_of(item, answer).is_none()
+}
+
+/// Whether the person's `answer` to `item` is in `service`'s DM with
+/// `owner` since they gave it. A DM that can't be read is taken to hold it.
+fn reached(
+    service: &crate::serve::AgentService,
+    owner: &str,
+    item: &OpenItem,
+    answer: &str,
+) -> bool {
+    let said = answer_message(item, answer);
+    service
+        .sessions
+        .find(DESK_CHANNEL, owner)
+        .map_or(true, |dm| {
+            dm.is_some_and(|dm| {
+                dm.messages.iter().any(|m| {
+                    m.role == workforce_common::session::MessageRole::User
+                        && item.closed_at.is_none_or(|at| m.timestamp >= at)
+                        && m.content.contains(&said)
+                })
+            })
+        })
 }
 
 /// Whether `message` to a session only asks it something: it opens with a

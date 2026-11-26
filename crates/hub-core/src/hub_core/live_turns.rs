@@ -436,17 +436,13 @@ impl LiveTurns {
         ))
     }
 
-    /// Steer the live turn for `session_id`. A stop resolves once the turn has
-    /// settled. A follow-up from another Desk place than the turn's is
-    /// refused as [`Applied::Busy`], so two threads' asks never merge into
-    /// one turn, and so is one sent to queue, which waits for the turn.
     /// Whether a turn is live for `session_id` on this instance.
     pub fn running(&self, session_id: &str) -> bool {
         self.turns.lock().contains_key(session_id)
     }
 
-    /// Once no turn is live for `session_id` on this instance: at once when
-    /// none is.
+    /// Once the turn live now for `session_id` on this instance ends: at
+    /// once when none is.
     pub async fn ended(&self, session_id: &str) {
         let settled = self
             .turns
@@ -458,6 +454,10 @@ impl LiveTurns {
         }
     }
 
+    /// Steer the live turn for `session_id`. A stop resolves once the turn has
+    /// settled. A follow-up from another Desk place than the turn's is
+    /// refused as [`Applied::Busy`], so two threads' asks never merge into
+    /// one turn, and so is one sent to queue, which waits for the turn.
     pub async fn apply(&self, session_id: &str, control: Control) -> Applied {
         let Some(entry) = self.turns.lock().get(session_id).cloned() else {
             return Applied::NotLive;

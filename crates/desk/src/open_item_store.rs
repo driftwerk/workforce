@@ -460,6 +460,44 @@ impl DeskStore {
             .collect()
     }
 
+    /// The items the person answered on their buttons from `since` until
+    /// `before`, none of whose proposals was applied, oldest first.
+    pub async fn items_answered_between(
+        &self,
+        since: DateTime<Utc>,
+        before: DateTime<Utc>,
+    ) -> Result<Vec<OpenItem>> {
+        let client = self.pool().get().await?;
+        client
+            .query(
+                &format!(
+                    "SELECT {COLUMNS} FROM boss_open_items WHERE state = 'closed' \
+                     AND closed_by = 'person' AND starts_with(closed_why, $3) \
+                     AND closed_at >= $1 AND closed_at < $2 AND applied_at IS NULL \
+                     ORDER BY closed_at, id"
+                ),
+                &[&since, &before, &crate::goal::YOU_ANSWERED],
+            )
+            .await?
+            .iter()
+            .map(item)
+            .collect()
+    }
+
+    /// Whether a proposal of question `item`'s was applied.
+    pub async fn item_applied(&self, item: Uuid) -> Result<bool> {
+        let client = self.pool().get().await?;
+        Ok(client
+            .query_opt(
+                "SELECT applied_at IS NOT NULL AS applied FROM boss_open_items WHERE id = $1",
+                &[&item],
+            )
+            .await?
+            .map(|r| r.try_get("applied"))
+            .transpose()?
+            .unwrap_or(false))
+    }
+
     /// Holds the session question `message` until the person has left its
     /// session: kept across restarts.
     pub async fn held_question_put(&self, message: Uuid) -> Result<()> {
