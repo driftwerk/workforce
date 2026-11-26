@@ -7,23 +7,56 @@
 //! saved transcript).
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{LazyLock, Mutex};
 use std::time::Duration;
 
 use tokio::sync::Notify;
 use tokio::task::AbortHandle;
+use tokio_util::sync::{CancellationToken, WaitForCancellationFuture};
 
 use crate::agent_registry::AgentRegistry;
 
-static SHUTTING_DOWN: AtomicBool = AtomicBool::new(false);
+static SHUTTING_DOWN: LazyLock<CancellationToken> = LazyLock::new(CancellationToken::new);
 
 pub fn begin() {
-    SHUTTING_DOWN.store(true, Ordering::Relaxed);
+    SHUTTING_DOWN.cancel();
 }
 
 pub fn in_progress() -> bool {
-    SHUTTING_DOWN.load(Ordering::Relaxed)
+    SHUTTING_DOWN.is_cancelled()
+}
+
+/// Resolves once the drain sequence has begun.
+pub fn begun() -> WaitForCancellationFuture<'static> {
+    SHUTTING_DOWN.cancelled()
+}
+
+/// Work still settling what it owes the person, counted by the drain.
+static SETTLING: AtomicUsize = AtomicUsize::new(0);
+
+/// How much work is still settling ([`Settling`]): the drain waits for it,
+/// as it does for in-flight turns.
+pub fn settling() -> usize {
+    SETTLING.load(Ordering::Acquire)
+}
+
+/// Work the drain waits for while it is held, such as an answer of the
+/// person's on its way to their boss: told to them as lost, when the drain
+/// ends its wait, before the process goes.
+pub struct Settling(());
+
+impl Settling {
+    pub fn begin() -> Self {
+        SETTLING.fetch_add(1, Ordering::AcqRel);
+        Self(())
+    }
+}
+
+impl Drop for Settling {
+    fn drop(&mut self) {
+        SETTLING.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 /// How long the drain waits for ended detached work to unwind.

@@ -201,7 +201,7 @@ mod tests {
     use super::*;
 
     const MIGRATION: &str = include_str!("../migrations/V094__act_fully_ships.sql");
-    const HEADS: &str = include_str!("../migrations/V095__pr_review_heads.sql");
+    const HEADS: &str = include_str!("../migrations/V096__pr_review_heads.sql");
 
     fn pr(number: i64) -> PrRef {
         PrRef {

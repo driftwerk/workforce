@@ -41,6 +41,14 @@ impl std::fmt::Display for TurnClaimHeld {
 
 impl std::error::Error for TurnClaimHeld {}
 
+/// Whether `error` is another turn holding the session: live on this
+/// instance, or claimed elsewhere in the fleet.
+pub(crate) fn held(error: &eyre::Report) -> bool {
+    error
+        .chain()
+        .any(|c| c.is::<crate::hub_core::live_turns::TurnBusy>() || c.is::<TurnClaimHeld>())
+}
+
 /// RAII holder of a session's fleet-wide turn claim. Renews in the background
 /// (at TTL/3) for turns that outlive the TTL and releases on drop — covering
 /// early returns, errors, and panics alike. A release with a superseded claim

@@ -756,55 +756,64 @@ async fn an_account_closes_an_ask_only_with_the_switch_on() {
     }
 }
 
+const ACT: &str = "[oversight]\nenabled = true\nlevel = \"act\"\n";
+
+/// `text` asked of the person by the boss, and answered "Tomorrow" on its
+/// buttons: the item as the answer closed it.
+async fn answered(d: &Desk, text: &str) -> workforce_desk::open_item::OpenItem {
+    answered_as(
+        d,
+        NewItem::ask("desk", OpenKind::Ask, None, text),
+        "Tomorrow",
+    )
+    .await
+}
+
+/// `ask`, opened and answered `answer` on its buttons.
+async fn answered_as(d: &Desk, ask: NewItem, answer: &str) -> workforce_desk::open_item::OpenItem {
+    let i = d.store().item_open(&ask).await.unwrap().item().clone();
+    d.store()
+        .item_close(i.id, ClosedBy::Person, &format!("You answered: {answer}"))
+        .await
+        .unwrap()
+        .unwrap()
+}
+
+/// Whether the person was told their answer to `closed` didn't reach the
+/// boss.
+fn told_lost(overseer: &AgentService, closed: &workforce_desk::open_item::OpenItem) -> bool {
+    !dm_posts(
+        overseer,
+        &format!("Your answer to “{}” didn't reach", closed.text),
+    )
+    .is_empty()
+}
+
+/// `closed` is open again, and the person told.
+async fn reopened(d: &Desk, overseer: &AgentService, closed: &workforce_desk::open_item::OpenItem) {
+    let again = d.store().open_item(closed.id).await.unwrap().unwrap();
+    assert_eq!(again.state, OpenState::Open);
+    assert_eq!(again.closed_by, None);
+    eventually("the person told", async || {
+        told_lost(overseer, closed).then_some(())
+    })
+    .await;
+}
+
 /// An answer from its button that doesn't reach the boss is never lost: the
 /// item is open again and the person is told.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_answer_that_doesnt_reach_the_boss_opens_its_item_again() {
     with_test_pool(workforce_desk::store::build_pool, |pool| async move {
         let dir = tempfile::tempdir().unwrap();
-        let (overseer, crew, d, _llm) = overseeing(
-            dir.path(),
-            pool,
-            "ok",
-            "[oversight]\nenabled = true\nlevel = \"act\"\n",
-            &[],
-        )
-        .await;
-        let i = d
-            .store()
-            .item_open(&NewItem::ask(
-                "desk",
-                OpenKind::Ask,
-                None,
-                "Ship the docs today?",
-            ))
-            .await
-            .unwrap()
-            .item()
-            .clone();
-        let closed = d
-            .store()
-            .item_close(i.id, ClosedBy::Person, "You answered: Tomorrow")
-            .await
-            .unwrap()
-            .unwrap();
+        let (overseer, crew, d, _llm) = overseeing(dir.path(), pool, "ok", ACT, &[]).await;
+        let closed = answered(&d, "Ship the docs today?").await;
         crew.answer_lost(&overseer, PERSON, &closed).await;
-        let again = d.store().open_item(i.id).await.unwrap().unwrap();
-        assert_eq!(again.state, OpenState::Open);
-        assert_eq!(again.closed_by, None);
-        eventually("the person told", async || {
-            dm_posts(
-                &overseer,
-                "Your answer to “Ship the docs today?” didn't reach",
-            )
-            .into_iter()
-            .next()
-        })
-        .await;
+        reopened(&d, &overseer, &closed).await;
         // Another of its key opened since: it isn't reopened over it.
         let closed = d
             .store()
-            .item_close(i.id, ClosedBy::Person, "You answered: Tomorrow")
+            .item_close(closed.id, ClosedBy::Person, "You answered: Tomorrow")
             .await
             .unwrap()
             .unwrap();
@@ -818,6 +827,351 @@ async fn an_answer_that_doesnt_reach_the_boss_opens_its_item_again() {
             .await
             .unwrap();
         assert!(!d.store().item_reopen(closed.id).await.unwrap());
+    })
+    .await;
+}
+
+/// An answer waiting behind a turn in the boss's DM that never lets go,
+/// past its wait or as the hub drains, is never lost: the item is open
+/// again and the person is told.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_answer_the_boss_stays_too_busy_for_opens_its_item_again() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (overseer, crew, d, _llm) = overseeing(dir.path(), pool, "ok", ACT, &[]).await;
+        let dm = overseer
+            .sessions
+            .get_or_create(DESK_CHANNEL, PERSON, overseer.agent_id.as_str())
+            .unwrap();
+        let (_running, _) = hold_session(&overseer, &dm.id).await;
+
+        crew.set_mind_wait_max(Duration::from_millis(300));
+        let waited = answered(&d, "Ship the docs today?").await;
+        crew.answer_delivered(&overseer, PERSON, &waited, "Tomorrow")
+            .await;
+        reopened(&d, &overseer, &waited).await;
+
+        crew.set_mind_wait_max(Duration::from_secs(600));
+        let drained = answered(&d, "Ship the guide today?").await;
+        let delivering = {
+            let (crew, overseer, drained) =
+                (Arc::clone(&crew), Arc::clone(&overseer), drained.clone());
+            tokio::spawn(async move {
+                crew.answer_delivered(&overseer, PERSON, &drained, "Tomorrow")
+                    .await
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(!delivering.is_finished(), "waits for the DM");
+        crew.state.drain_token.cancel();
+        tokio::time::timeout(Duration::from_secs(5), delivering)
+            .await
+            .expect("a drain ends the wait")
+            .unwrap();
+        reopened(&d, &overseer, &drained).await;
+    })
+    .await;
+}
+
+/// An answer the boss already took from the item (its proposal applied)
+/// goes no further: not delivered again, and never reopened as lost.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_answer_its_boss_already_applied_goes_no_further() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (overseer, crew, d, _llm) = overseeing(dir.path(), pool, "ok", ACT, &[]).await;
+        let closed = answered(&d, "Ship the docs today?").await;
+        assert!(d.store().ask_applied(closed.id).await.unwrap());
+        crew.answer_delivered(&overseer, PERSON, &closed, "Tomorrow")
+            .await;
+        crew.answer_lost(&overseer, PERSON, &closed).await;
+        let kept = d.store().open_item(closed.id).await.unwrap().unwrap();
+        assert_eq!(kept.state, OpenState::Closed);
+        assert!(!told_lost(&overseer, &closed));
+        let dm = overseer.sessions.find(DESK_CHANNEL, PERSON).unwrap();
+        assert!(dm.is_none_or(|dm| dm
+            .messages
+            .iter()
+            .all(|m| !m.content.contains("Ship the docs today?”: Tomorrow"))));
+    })
+    .await;
+}
+
+/// At start, an answer the person gave before the hub stopped that never
+/// reached its boss is open again and they are told; one the DM holds, and
+/// one kept or forgotten as a preference, are left as they are.
+#[tokio::test(flavor = "multi_thread")]
+async fn answers_a_stop_kept_from_their_boss_are_reopened_at_the_next_start() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (overseer, crew, d, _llm) = overseeing(dir.path(), pool, "ok", ACT, &[]).await;
+        let lost = answered(&d, "Ship the docs today?").await;
+        let reached = answered(&d, "Ship the guide today?").await;
+        let mut dm = overseer
+            .sessions
+            .get_or_create(DESK_CHANNEL, PERSON, overseer.agent_id.as_str())
+            .unwrap();
+        dm.add_user_message(
+            &format!(
+                "{}Ship the guide today?”: Tomorrow",
+                workforce_desk::goal::ANSWER_LEAD
+            ),
+            None,
+        );
+        overseer.sessions.save(&dm).unwrap();
+        let mut keep = NewItem::ask(
+            "desk",
+            OpenKind::Ask,
+            None,
+            "Should I change that preference?",
+        );
+        keep.dedupe_key = format!("overrule:{}", uuid::Uuid::new_v4());
+        let kept = answered_as(&d, keep, "Keep it").await;
+
+        crew.answers_lost_before(chrono::Utc::now()).await;
+        reopened(&d, &overseer, &lost).await;
+        for closed in [&reached, &kept] {
+            let i = d.store().open_item(closed.id).await.unwrap().unwrap();
+            assert_eq!(i.state, OpenState::Closed, "{}", closed.text);
+            assert!(!told_lost(&overseer, closed));
+        }
+    })
+    .await;
+}
+
+/// The person's DM with `overseer`'s boss.
+fn boss_dm(overseer: &AgentService) -> workforce_common::session::Session {
+    overseer
+        .sessions
+        .get_or_create(DESK_CHANNEL, PERSON, overseer.agent_id.as_str())
+        .unwrap()
+}
+
+/// How many of the DM's messages say the person's answer to `closed`.
+fn said_in_dm(overseer: &AgentService, closed: &workforce_desk::open_item::OpenItem) -> usize {
+    let said = format!(
+        "{}{}”: Tomorrow",
+        workforce_desk::goal::ANSWER_LEAD,
+        closed.text
+    );
+    overseer
+        .sessions
+        .find(DESK_CHANNEL, PERSON)
+        .unwrap()
+        .map_or(0, |dm| {
+            dm.messages
+                .iter()
+                .filter(|m| m.content.contains(&said))
+                .count()
+        })
+}
+
+/// An answer that reached its boss is noted so on its item: the DM rolling
+/// over since never has it taken for lost at a start.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_answer_that_reached_its_boss_stays_answered_after_its_dm_rolls_over() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (overseer, crew, d, _llm) = overseeing(dir.path(), pool, "ok", ACT, &[]).await;
+        let closed = answered(&d, "Ship the docs today?").await;
+        crew.answer_delivered(&overseer, PERSON, &closed, "Tomorrow")
+            .await;
+        assert_eq!(said_in_dm(&overseer, &closed), 1);
+        overseer.sessions.delete(&boss_dm(&overseer).id).unwrap();
+        overseer.sessions.save(&boss_dm(&overseer)).unwrap();
+        assert_eq!(said_in_dm(&overseer, &closed), 0, "rolled over");
+
+        crew.answers_lost_before(chrono::Utc::now()).await;
+        let kept = d.store().open_item(closed.id).await.unwrap().unwrap();
+        assert_eq!(kept.state, OpenState::Closed);
+        assert!(!told_lost(&overseer, &closed));
+    })
+    .await;
+}
+
+/// An answer that runs as the boss's own DM turn is noted delivered as soon
+/// as that turn has kept it, while its model is still answering.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_answer_is_noted_delivered_once_its_own_turn_keeps_it() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, ResponseTemplate};
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (overseer, crew, d, llm) = overseeing(dir.path(), pool, "ok", ACT, &[]).await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_secs(120)))
+            .with_priority(1)
+            .mount(&llm)
+            .await;
+        let closed = answered(&d, "Ship the docs today?").await;
+        let delivering = {
+            let (crew, overseer, closed) =
+                (Arc::clone(&crew), Arc::clone(&overseer), closed.clone());
+            tokio::spawn(async move {
+                crew.answer_delivered(&overseer, PERSON, &closed, "Tomorrow")
+                    .await
+            })
+        };
+        let noted = eventually("noted delivered", async || {
+            d.store()
+                .open_item(closed.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .delivered_at
+        })
+        .await;
+        assert!(noted >= closed.closed_at.unwrap());
+        assert_eq!(said_in_dm(&overseer, &closed), 1);
+        assert!(!delivering.is_finished(), "its turn still runs");
+        delivering.abort();
+    })
+    .await;
+}
+
+/// An answer a turn already took in under its id (its reply came too late
+/// to say so) is known by that id when it is tried again: never said twice.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_answer_already_taken_in_is_not_said_again() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (overseer, crew, d, _llm) = overseeing(dir.path(), pool, "ok", ACT, &[]).await;
+        let closed = answered(&d, "Ship the docs today?").await;
+        let mut dm = boss_dm(&overseer);
+        let id = super::super::items::answer_id(&closed).to_string();
+        dm.add_user_message(
+            &format!(
+                "{}Ship the docs today?”: Tomorrow",
+                workforce_desk::goal::ANSWER_LEAD
+            ),
+            Some(&id),
+        );
+        overseer.sessions.save(&dm).unwrap();
+        crew.answer_delivered(&overseer, PERSON, &closed, "Tomorrow")
+            .await;
+        assert_eq!(said_in_dm(&overseer, &closed), 1);
+        let again = d
+            .store()
+            .item_close(closed.id, ClosedBy::Person, "You answered: Tomorrow")
+            .await
+            .unwrap();
+        assert!(again.is_none(), "it stays closed");
+        overseer.sessions.delete(&dm.id).unwrap();
+        overseer.sessions.save(&boss_dm(&overseer)).unwrap();
+        assert_eq!(said_in_dm(&overseer, &closed), 0, "rolled over");
+        crew.answers_lost_before(chrono::Utc::now()).await;
+        assert!(!told_lost(&overseer, &closed), "noted as delivered");
+        assert!(d.store().item_reopen(closed.id).await.unwrap());
+        let anew = d
+            .store()
+            .item_close(closed.id, ClosedBy::Person, "You answered: Tomorrow")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_ne!(
+            super::super::items::answer_id(&closed),
+            super::super::items::answer_id(&anew),
+            "each answer has its own"
+        );
+        crew.answers_lost_before(chrono::Utc::now()).await;
+        reopened(&d, &overseer, &anew).await;
+    })
+    .await;
+}
+
+/// An answer still on its way in this process is never taken for lost: not
+/// while it waits, and not by a crew started again in the process, nor
+/// twice for one whose question is open again by another item.
+#[tokio::test(flavor = "multi_thread")]
+async fn answers_this_process_holds_or_another_item_asks_again_are_never_bounced() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (overseer, crew, d, _llm) = overseeing(dir.path(), pool, "ok", ACT, &[]).await;
+        let (running, _) = hold_session(&overseer, &boss_dm(&overseer).id).await;
+        let waiting = d
+            .store()
+            .item_open(&NewItem::ask(
+                "desk",
+                OpenKind::Ask,
+                None,
+                "Ship the docs today?",
+            ))
+            .await
+            .unwrap()
+            .item()
+            .clone();
+        assert_eq!(
+            crew.answer_item(waiting.id, "Tomorrow").await.as_deref(),
+            Ok("Answered.")
+        );
+        let asked_again = answered(&d, "Ship the notes today?").await;
+        d.store()
+            .item_open(&NewItem::ask(
+                "desk",
+                OpenKind::Ask,
+                None,
+                "Ship the notes today?",
+            ))
+            .await
+            .unwrap();
+        for _ in 0..2 {
+            crew.answers_lost_before(chrono::Utc::now()).await;
+        }
+
+        let queued = answered(&d, "Ship the guide today?").await;
+        let cancel = tokio_util::sync::CancellationToken::new();
+        tokio::spawn(super::super::items::items_loop(
+            Arc::clone(&crew),
+            cancel.clone(),
+        ));
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        cancel.cancel();
+        for closed in [&queued, &asked_again] {
+            let kept = d.store().open_item(closed.id).await.unwrap().unwrap();
+            assert_eq!(kept.state, OpenState::Closed, "{}", closed.text);
+            assert!(!told_lost(&overseer, closed), "{}", closed.text);
+        }
+        let waiting = d.store().open_item(waiting.id).await.unwrap().unwrap();
+        assert_eq!(waiting.state, OpenState::Closed);
+        assert!(!told_lost(&overseer, &waiting));
+        assert_eq!(said_in_dm(&overseer, &waiting), 0, "still waiting");
+        drop(running);
+        eventually("the answer reaches the boss", async || {
+            (said_in_dm(&overseer, &waiting) == 1).then_some(())
+        })
+        .await;
+    })
+    .await;
+}
+
+/// An answer the item has since been answered again over (closed, opened
+/// and closed anew, the same words) is not the one owed: it goes no
+/// further.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_answer_given_again_since_is_no_longer_owed() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (overseer, crew, d, _llm) = overseeing(dir.path(), pool, "ok", ACT, &[]).await;
+        let first = answered(&d, "Ship the docs today?").await;
+        assert!(d.store().item_reopen(first.id).await.unwrap());
+        let second = d
+            .store()
+            .item_close(first.id, ClosedBy::Person, "You answered: Tomorrow")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.closed_why, second.closed_why);
+        crew.answer_lost(&overseer, PERSON, &first).await;
+        crew.answer_delivered(&overseer, PERSON, &first, "Tomorrow")
+            .await;
+        let kept = d.store().open_item(first.id).await.unwrap().unwrap();
+        assert_eq!(
+            (kept.state, kept.closed_at),
+            (OpenState::Closed, second.closed_at)
+        );
+        assert!(!told_lost(&overseer, &first));
+        assert_eq!(said_in_dm(&overseer, &first), 0);
     })
     .await;
 }

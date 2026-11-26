@@ -3335,31 +3335,80 @@ impl CrewHub {
             .then(|| self.persons_words_in_turn(&by.party.id))
             .flatten();
         self.desk.note(event);
+        let lost = format!(
+            "Your go-ahead “{}” didn't reach {name} just now: say it again in this chat.",
+            crew::one_line(text, 200)
+        );
         let crew = self.me();
+        let (sender, to_name, text) = (by.party.id.clone(), name.clone(), text.to_string());
+        let settling = crate::shutdown::Settling::begin();
         tokio::spawn(async move {
-            let turn = async {
-                match theirs {
-                    Some(words) => {
-                        crew.run_dm_turn_for_them(&service, &owner, &message, hop, author, words)
-                            .await
+            let _settling = settling;
+            let to = service.agent_id.as_str().to_string();
+            let (me, service, owner, message, theirs, author, to) = (
+                &*crew,
+                &service,
+                owner.as_str(),
+                message.as_str(),
+                &theirs,
+                &author,
+                to.as_str(),
+            );
+            // Another boss's message is the receiver's own deciding: under
+            // its mind ([`super::mind`]), taken for each try only once its DM
+            // is free, in this task of its own, so the sender never waits on
+            // it. The person's yes is their turn.
+            let ran = me
+                .run_dm_turn_queued(service, owner, move || async move {
+                    let turn = async {
+                        match theirs {
+                            Some(words) => {
+                                me.run_dm_turn_for_them(
+                                    service,
+                                    owner,
+                                    message,
+                                    hop,
+                                    author.clone(),
+                                    words.clone(),
+                                )
+                                .await
+                            }
+                            None => {
+                                me.run_dm_turn(
+                                    service,
+                                    owner,
+                                    message,
+                                    hop,
+                                    None,
+                                    Some(author.clone()),
+                                )
+                                .await
+                            }
+                        }
+                    };
+                    match from_overseer {
+                        true => me.with_mind(to, "a message from the crew", turn).await,
+                        false => turn.await,
                     }
-                    None => {
-                        crew.run_dm_turn(&service, &owner, &message, hop, None, Some(author))
-                            .await
+                })
+                .await;
+            match ran {
+                Err(e) if !super::deliver::stopped(&e) => {
+                    tracing::warn!(agent_id = %service.agent_id, error = %e, "a message to the crew did not reach it");
+                    match from_overseer {
+                        true => me.picture_undelivered(&sender, &to_name, &text),
+                        false => {
+                            if let Err(e) = crate::desk_surface::notice(service, owner, lost).await
+                            {
+                                tracing::warn!(error = %e, "saying a go-ahead didn't reach its agent failed");
+                            }
+                        }
                     }
                 }
-            };
-            // Another boss's message is the receiver's own deciding: under
-            // its mind ([`super::mind`]), in this task of its own, so the
-            // sender never waits on it. The person's yes is their turn.
-            let ran = if from_overseer {
-                let to = service.agent_id.as_str().to_string();
-                crew.with_mind(&to, "a message from the crew", turn).await
-            } else {
-                turn.await
-            };
-            if let Err(e) = ran {
-                tracing::warn!(agent_id = %service.agent_id, error = %e, "a message to the crew did not run");
+                Err(e) => {
+                    tracing::info!(agent_id = %service.agent_id, error = %e, "a message to the crew was stopped with the hub");
+                }
+                Ok(_) => {}
             }
         });
         Ok(format!("{verb} {name}"))

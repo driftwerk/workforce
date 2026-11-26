@@ -99,6 +99,13 @@ impl CrewHub {
             .picture_note(Note::new(What::PersonSaid, words).boss(boss));
     }
 
+    /// `boss`'s message `text` to the agent named `to` never reached it.
+    pub(super) fn picture_undelivered(&self, boss: &str, to: &str, text: &str) {
+        self.desk.picture_note(
+            Note::new(What::Undelivered, format!("to {to} “{}”", text.trim())).boss(boss),
+        );
+    }
+
     /// `boss` told `session` `text` from its turn `turn` (none: not from a
     /// turn of its own, as when the person accepts a suggestion).
     pub(super) fn picture_instruction(
@@ -425,7 +432,7 @@ impl CrewHub {
         let mut out = String::new();
         let mine = self.desk.picture_recent_for(boss, SAID_ROWS);
         if let Some(r) = workforce_desk::picture::render(&mine, tz) {
-            out.push_str("What the person told you lately, and the facts and standing orders that hold, oldest first:\n");
+            out.push_str("What the person told you lately, your messages that never reached the crew, and the facts and standing orders that hold, oldest first:\n");
             out.push_str(&r);
             out.push('\n');
         }
