@@ -164,6 +164,9 @@ impl Drop for PersonTurn {
             t.remove(&self.mark);
             if t.is_empty() {
                 person.remove(&self.boss);
+                // What they said in it may change what the boss's standing
+                // verdicts rest on.
+                crew.standings.forget(&self.boss);
             }
         }
     }

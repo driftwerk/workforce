@@ -27,6 +27,13 @@ use super::CrewHub;
 #[derive(Default)]
 pub(super) struct Standings(Mutex<HashMap<(String, Uuid), Entry>>);
 
+impl Standings {
+    /// Drops `boss`'s verdicts: each session's is asked for again.
+    pub(super) fn forget(&self, boss: &str) {
+        self.0.lock().retain(|(b, _), _| b != boss);
+    }
+}
+
 enum Entry {
     /// Being asked for, under the directives of this hash.
     Asking(u64),
