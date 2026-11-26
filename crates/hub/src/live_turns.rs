@@ -3,6 +3,7 @@
 //! turn lives in is [`crate::hub_core::live_turns`].
 
 use std::future::Future;
+use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::sync::mpsc;
@@ -132,12 +133,18 @@ where
         }
         let session = session();
         let claimed = || {
-            session.as_deref().is_some_and(|s| {
-                service
-                    .sessions
-                    .turn_claim_holder(s)
-                    .is_ok_and(|holder| holder.is_some())
-            })
+            let (sessions, session) = (Arc::clone(&service.sessions), session.clone());
+            async move {
+                tokio::task::spawn_blocking(move || {
+                    session.is_some_and(|s| {
+                        sessions
+                            .turn_claim_holder(&s)
+                            .is_ok_and(|holder| holder.is_some())
+                    })
+                })
+                .await
+                .unwrap_or(false)
+            }
         };
         tokio::select! {
             () = &mut stop => eyre::bail!("the hub is shutting down"),
@@ -150,12 +157,15 @@ where
 /// Once the turn holding `session` lets it go: the end of the one live on
 /// this instance, then the release of any claim on it (`claimed`), looked at
 /// every [`RECHECK`]. With no session to watch, a [`RECHECK`] later.
-async fn let_go(live: &LiveTurns, session: Option<&str>, claimed: impl Fn() -> bool) {
+async fn let_go<Claimed>(live: &LiveTurns, session: Option<&str>, claimed: impl Fn() -> Claimed)
+where
+    Claimed: Future<Output = bool>,
+{
     let Some(session) = session else {
         return tokio::time::sleep(RECHECK).await;
     };
     live.ended(session).await;
-    while claimed() {
+    while claimed().await {
         tokio::time::sleep(RECHECK).await;
     }
 }
@@ -179,7 +189,10 @@ mod tests {
         let claimed = Arc::new(AtomicBool::new(true));
         let waiting = tokio::spawn({
             let (live, claimed) = (Arc::clone(&live), Arc::clone(&claimed));
-            async move { let_go(&live, Some("s1"), || claimed.load(Ordering::Acquire)).await }
+            async move {
+                let claimed = || std::future::ready(claimed.load(Ordering::Acquire));
+                let_go(&live, Some("s1"), claimed).await
+            }
         });
         tokio::time::sleep(Duration::from_millis(100)).await;
         drop(turn);

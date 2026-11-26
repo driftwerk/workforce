@@ -7,23 +7,29 @@
 //! saved transcript).
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{LazyLock, Mutex};
 use std::time::Duration;
 
 use tokio::sync::Notify;
 use tokio::task::AbortHandle;
+use tokio_util::sync::{CancellationToken, WaitForCancellationFuture};
 
 use crate::agent_registry::AgentRegistry;
 
-static SHUTTING_DOWN: AtomicBool = AtomicBool::new(false);
+static SHUTTING_DOWN: LazyLock<CancellationToken> = LazyLock::new(CancellationToken::new);
 
 pub fn begin() {
-    SHUTTING_DOWN.store(true, Ordering::Relaxed);
+    SHUTTING_DOWN.cancel();
 }
 
 pub fn in_progress() -> bool {
-    SHUTTING_DOWN.load(Ordering::Relaxed)
+    SHUTTING_DOWN.is_cancelled()
+}
+
+/// Resolves once the drain sequence has begun.
+pub fn begun() -> WaitForCancellationFuture<'static> {
+    SHUTTING_DOWN.cancelled()
 }
 
 /// Work still settling what it owes the person, counted by the drain.

@@ -2325,12 +2325,17 @@ async fn a_follow_up_waits_out_the_turn_holding_its_session() {
 #[test]
 fn a_crew_turn_in_the_dm_hears_its_follow_ups_as_the_persons() {
     use workforce_common::channels::desk::{DeskPlace, DeskSpeaker, DESK_CHANNEL};
+    use workforce_common::trust::TrustLevel;
+    let heard_in = crate::turn_loop::next_turn::heard_in;
     let asked = uuid::Uuid::new_v4();
-    let own = crate::turn_loop::next_turn::heard_in(Some(&dm_turn(asked)), DESK_CHANNEL).unwrap();
-    assert_eq!(own.turn.message, Some(asked));
-    let crews = crate::turn_loop::next_turn::heard_in(None, DESK_CHANNEL).unwrap();
+    let (own, trust) = heard_in(Some(&dm_turn(asked)), DESK_CHANNEL, Some(TrustLevel::Owner));
+    assert_eq!(own.unwrap().turn.message, Some(asked));
+    assert_eq!(trust, Some(TrustLevel::Owner));
+    let (crews, trust) = heard_in(None, DESK_CHANNEL, Some(TrustLevel::Paired));
+    let crews = crews.unwrap();
     assert_eq!(crews.turn.place, DeskPlace::Dm { thread: None });
     assert_eq!(crews.turn.speaker, DeskSpeaker::Person);
+    assert_eq!(trust, None, "the person's own, never the crew turn's");
     let steered = uuid::Uuid::new_v4();
     let unread = crate::turn_loop::next_turn::unread_plan(
         Some(&crews),
@@ -2342,7 +2347,19 @@ fn a_crew_turn_in_the_dm_hears_its_follow_ups_as_the_persons() {
         (next.turn.message, prompt.as_str()),
         (Some(steered), "and who wrote it?")
     );
-    assert!(crate::turn_loop::next_turn::heard_in(None, "desk:line:1").is_none());
+    let mut dm = Session::new(DESK_CHANNEL, "identity-1", "allan");
+    crate::turn_loop::records::keep_heard(&mut dm, unread.after, trust, Some(&crews));
+    let kept = dm.messages.last().unwrap();
+    assert_eq!(kept.trust_level, None);
+    assert_eq!(kept.external_id, Some(steered.to_string()));
+    let mark = kept.desk.as_ref().unwrap();
+    assert_eq!(
+        (&mark.speaker, mark.room, mark.thread),
+        (&Some(DeskSpeaker::Person), None, None)
+    );
+    let (line, trust) = heard_in(None, "desk:line:1", Some(TrustLevel::Paired));
+    assert!(line.is_none());
+    assert_eq!(trust, Some(TrustLevel::Paired));
 }
 
 /// How many times the model at `server` was asked for an answer.

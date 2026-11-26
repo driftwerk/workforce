@@ -9,6 +9,7 @@ use std::time::Duration;
 
 use workforce_agent::tools::approval::SelfServe;
 use workforce_common::channels::desk::{DeskPlace, DeskSpeaker, DeskTurn, DeskTurnContext};
+use workforce_common::trust::TrustLevel;
 
 use crate::hub_core::live_turns::{Ending, Heard};
 use crate::serve::AgentService;
@@ -49,33 +50,45 @@ pub(crate) fn unread_plan(desk: Option<&DeskTurnContext>, unread: Vec<Heard>) ->
     }
 }
 
-/// The Desk turn the follow-ups a turn took in are heard in: its own, or,
-/// for a turn of the person's DM that came from no Desk (the crew's own),
-/// the person's turn there.
-pub(crate) fn heard_in(desk: Option<&DeskTurnContext>, channel: &str) -> Option<DeskTurnContext> {
-    desk.cloned().or_else(|| {
-        (channel == workforce_common::channels::DESK_CHANNEL).then(|| {
-            DeskTurnContext::new(
-                DeskTurn {
-                    place: DeskPlace::Dm { thread: None },
-                    speaker: DeskSpeaker::Person,
-                    hop: 0,
-                    context: Vec::new(),
-                    message: None,
-                    spoken: false,
-                    voice: None,
-                    members: Vec::new(),
-                    edit: None,
-                    starts_thread: false,
-                },
-                channel,
-                None,
-                false,
-                None,
-                uuid::Uuid::new_v4().to_string(),
-            )
-        })
-    })
+/// The Desk turn the follow-ups a turn took in are heard in, and the trust
+/// they are kept at: its own, at the turn's `trust`, or, for a turn of the
+/// person's DM that came from no Desk (the crew's own), the person's turn
+/// there, at theirs.
+pub(crate) fn heard_in(
+    desk: Option<&DeskTurnContext>,
+    channel: &str,
+    trust: Option<TrustLevel>,
+) -> (Option<DeskTurnContext>, Option<TrustLevel>) {
+    match desk {
+        Some(desk) => (Some(desk.clone()), trust),
+        None if channel == workforce_common::channels::DESK_CHANNEL => {
+            (Some(persons_dm_turn(channel)), None)
+        }
+        None => (None, trust),
+    }
+}
+
+/// The person's own turn in their DM on `channel`.
+fn persons_dm_turn(channel: &str) -> DeskTurnContext {
+    DeskTurnContext::new(
+        DeskTurn {
+            place: DeskPlace::Dm { thread: None },
+            speaker: DeskSpeaker::Person,
+            hop: 0,
+            context: Vec::new(),
+            message: None,
+            spoken: false,
+            voice: None,
+            members: Vec::new(),
+            edit: None,
+            starts_thread: false,
+        },
+        channel,
+        None,
+        false,
+        None,
+        uuid::Uuid::new_v4().to_string(),
+    )
 }
 
 /// The id a follow-up is known by as the next turn's question.
@@ -138,7 +151,7 @@ pub(crate) struct NextTurn {
     pub channel: String,
     pub user: String,
     pub run_as: String,
-    pub trust_level: Option<workforce_common::trust::TrustLevel>,
+    pub trust_level: Option<TrustLevel>,
     pub desk: DeskTurnContext,
     pub prompt: String,
 }
@@ -153,7 +166,7 @@ pub(crate) async fn answer_left(service: Arc<AgentService>, next: NextTurn) {
         service,
         || Some(next.session_id.clone()),
         WAIT,
-        std::future::pending(),
+        crate::shutdown::begun(),
         move || attempt(service, next),
     )
     .await

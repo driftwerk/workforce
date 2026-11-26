@@ -1445,7 +1445,7 @@ async fn the_overseer_messages_the_crew_within_the_loop_guard() {
 /// A message to an agent whose DM is mid-turn waits for that turn, the
 /// overseer's taking the agent's mind only once the DM is free, and reaches
 /// it once the turn ends. The person's go-ahead that can't get there is
-/// told to them in that DM.
+/// told to them in that DM; the overseer's, to the overseer in its picture.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_message_to_an_agent_mid_turn_waits_for_it_and_a_lost_go_ahead_is_told() {
     with_test_pool(workforce_desk::store::build_pool, |pool| async move {
@@ -1513,6 +1513,21 @@ async fn a_message_to_an_agent_mid_turn_waits_for_it_and_a_lost_go_ahead_is_told
             in_dm("Your go-ahead “Merge the guide fix.” didn't reach Scout").then_some(())
         })
         .await;
+
+        let by = crew.by_overseer("Quiet for an hour.").unwrap();
+        let done = crew.perform(&nudge("Rebase the guide."), by).await;
+        assert_eq!(done.as_deref(), Ok("asked Scout"), "{done:?}");
+        assert!(crate::shutdown::settling() >= 1, "the drain waits for it");
+        let told = eventually("the overseer told", async || {
+            crew.desk
+                .picture_recent_for(overseer.agent_id.as_str(), 20)
+                .into_iter()
+                .find(|r| r.what == workforce_desk::picture::What::Undelivered)
+        })
+        .await;
+        assert_eq!(told.text, "to Scout “Rebase the guide.”");
+        assert!(told.said(chrono_tz::UTC).contains("never reached it"));
+        assert!(!in_dm("Rebase the guide."));
     })
     .await;
 }

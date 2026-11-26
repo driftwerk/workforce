@@ -461,7 +461,9 @@ impl DeskStore {
     }
 
     /// The items the person answered on their buttons from `since` until
-    /// `before`, none of whose proposals was applied, oldest first.
+    /// `before` whose answers never reached their bosses: none of whose
+    /// proposals was applied, and none asking what an open item asks now,
+    /// oldest first.
     pub async fn items_answered_between(
         &self,
         since: DateTime<Utc>,
@@ -474,7 +476,9 @@ impl DeskStore {
                     "SELECT {COLUMNS} FROM boss_open_items WHERE state = 'closed' \
                      AND closed_by = 'person' AND starts_with(closed_why, $3) \
                      AND closed_at >= $1 AND closed_at < $2 AND applied_at IS NULL \
-                     ORDER BY closed_at, id"
+                     AND delivered_at IS NULL AND NOT EXISTS (SELECT 1 FROM boss_open_items o \
+                     WHERE o.boss = boss_open_items.boss AND o.dedupe_key = boss_open_items.dedupe_key \
+                     AND o.state <> 'closed') ORDER BY closed_at, id"
                 ),
                 &[&since, &before, &crate::goal::YOU_ANSWERED],
             )
@@ -482,6 +486,19 @@ impl DeskStore {
             .iter()
             .map(item)
             .collect()
+    }
+
+    /// The person's answer to `item` reached its boss.
+    pub async fn item_delivered(&self, item: Uuid) -> Result<()> {
+        let client = self.pool().get().await?;
+        client
+            .execute(
+                "UPDATE boss_open_items SET delivered_at = now() WHERE id = $1 \
+                 AND state = 'closed' AND delivered_at IS NULL",
+                &[&item],
+            )
+            .await?;
+        Ok(())
     }
 
     /// Whether a proposal of question `item`'s was applied.
@@ -718,7 +735,8 @@ impl DeskStore {
         let n = client
             .execute(
                 "UPDATE boss_open_items SET state = 'open', closed_at = NULL, closed_by = NULL, \
-                 closed_why = NULL, changed_at = now() WHERE id = $1 AND state = 'closed' \
+                 closed_why = NULL, delivered_at = NULL, changed_at = now() \
+                 WHERE id = $1 AND state = 'closed' \
                  AND NOT EXISTS (SELECT 1 FROM boss_open_items o WHERE o.boss = boss_open_items.boss \
                  AND o.dedupe_key = boss_open_items.dedupe_key AND o.state <> 'closed')",
                 &[&id],

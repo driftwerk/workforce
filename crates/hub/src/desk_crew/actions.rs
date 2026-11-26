@@ -3339,7 +3339,8 @@ impl CrewHub {
             crew::one_line(text, 200)
         );
         let crew = self.me();
-        let settling = (!from_overseer).then(crate::shutdown::Settling::begin);
+        let (sender, to_name, text) = (by.party.id.clone(), name.clone(), text.to_string());
+        let settling = crate::shutdown::Settling::begin();
         tokio::spawn(async move {
             let _settling = settling;
             let to = service.agent_id.as_str().to_string();
@@ -3390,13 +3391,23 @@ impl CrewHub {
                     }
                 })
                 .await;
-            if let Err(e) = ran {
-                tracing::warn!(agent_id = %service.agent_id, error = %e, "a message to the crew did not run");
-                if !from_overseer && !super::deliver::stopped(&e) {
-                    if let Err(e) = crate::desk_surface::notice(service, owner, lost).await {
-                        tracing::warn!(error = %e, "saying a go-ahead didn't reach its agent failed");
+            match ran {
+                Err(e) if !super::deliver::stopped(&e) => {
+                    tracing::warn!(agent_id = %service.agent_id, error = %e, "a message to the crew did not reach it");
+                    match from_overseer {
+                        true => me.picture_undelivered(&sender, &to_name, &text),
+                        false => {
+                            if let Err(e) = crate::desk_surface::notice(service, owner, lost).await
+                            {
+                                tracing::warn!(error = %e, "saying a go-ahead didn't reach its agent failed");
+                            }
+                        }
                     }
                 }
+                Err(e) => {
+                    tracing::info!(agent_id = %service.agent_id, error = %e, "a message to the crew was stopped with the hub");
+                }
+                Ok(_) => {}
             }
         });
         Ok(format!("{verb} {name}"))
