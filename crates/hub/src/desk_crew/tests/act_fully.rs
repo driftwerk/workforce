@@ -55,8 +55,9 @@ pub(super) fn repo(dir: &Path, origin: &str) {
 }
 
 /// Act fully is unbound: in a repository it names and in one it doesn't,
-/// merging, tagging, publishing and deploying are allowed the moment a
-/// session asks, in a session it runs and in one it doesn't.
+/// tagging, publishing and deploying are allowed the moment a session
+/// asks, in a session it runs and in one it doesn't; a session's own merge
+/// is refused, for its boss merges it (DW-765).
 #[tokio::test(flavor = "multi_thread")]
 async fn act_fully_ships_in_any_repository_at_once() {
     with_test_pool(workforce_desk::store::build_pool, |pool| async move {
@@ -102,7 +103,6 @@ async fn act_fully_ships_in_any_repository_at_once() {
         for s in [named.id, other.id] {
             let url = hook_url(&base, s).await;
             for command in [
-                "gh pr merge 42 --squash",
                 "git tag v1.3.0 && git push origin v1.3.0",
                 "npm publish",
                 "gh workflow run cleanup.yml",
@@ -113,6 +113,11 @@ async fn act_fully_ships_in_any_repository_at_once() {
                     "{command}: {answer}"
                 );
             }
+            let merge = ask(&url, "gh pr merge 42 --squash").await.unwrap();
+            assert_eq!(
+                merge["hookSpecificOutput"]["decision"]["behavior"], "deny",
+                "its boss merges it: {merge}"
+            );
         }
     })
     .await;

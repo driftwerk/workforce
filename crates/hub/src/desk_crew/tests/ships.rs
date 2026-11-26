@@ -33,6 +33,7 @@ use super::plan_watch::{asked_with, turn_ends};
 use super::plans::started;
 use super::super::github_seen::Pull;
 use workforce_desk::board::TicketState;
+use workforce_desk::model::SessionState;
 use workforce_desk::plan::{Draft, DraftTicket, ReviewLink};
 use workforce_desk::NewPlan;
 use super::unbound::UNBOUND;
@@ -83,7 +84,7 @@ async fn shipping_with(
 }
 
 /// `acme/web` checked out at `base/web` on `dw-761`, a commit ahead of
-/// `main`, and a detached worktree of it at that commit in
+/// `main` and pushed, and a detached worktree of it at that commit in
 /// `base/web-review`: its head.
 fn pull_request(base: &Path) -> String {
     let web = base.join("web");
@@ -92,6 +93,7 @@ fn pull_request(base: &Path) -> String {
     std::fs::write(web.join("picker.ts"), "export const picker = 1;\n").unwrap();
     git(&web, &["add", "picker.ts"]);
     git(&web, &["commit", "-q", "-m", "The date picker"]);
+    git(&web, &["update-ref", "refs/remotes/origin/dw-761", "HEAD"]);
     let review = base.join("web-review");
     git(
         &web,
@@ -669,6 +671,17 @@ async fn reviewed_by_desk(d: &Desk, head: &str) -> SessionView {
     r
 }
 
+/// Waits for `review` to be closed and its worktree removed.
+async fn closed(d: &Desk, review: &SessionView) {
+    eventually("the review closed and its worktree removed", async || {
+        (!Path::new(&review.cwd).exists()
+            && d.view(review.id)
+                .map_or(true, |v| v.state == SessionState::Closed))
+        .then_some(())
+    })
+    .await;
+}
+
 /// The ticket's lifecycle (DW-765): its session opens #7 and CI goes
 /// green; Desk starts the review with no model asked; its verdict is
 /// recorded and the review closed; the boss's plan turn is told, merges
@@ -716,7 +729,7 @@ async fn a_green_pull_request_is_reviewed_by_desk_merged_by_the_boss_and_the_nex
         );
 
         let claude = Claude::started(&base, review.id).await;
-        claude.asked("Review acme/web#7.").await;
+        claude.asked(review.last_prompt.as_deref().unwrap()).await;
         claude
             .replies(&d, review.id, &format!("It reads well.\n\nREVIEW: clean {head}"))
             .await;
@@ -748,12 +761,7 @@ async fn a_green_pull_request_is_reviewed_by_desk_merged_by_the_boss_and_the_nex
             started(&d).into_iter().find(|v| v.name == "DES-2")
         })
         .await;
-        eventually("the review closed and its worktree removed", async || {
-            (!Path::new(&review.cwd).exists()
-                && d.view(review.id).map_or(true, |v| v.state == workforce_desk::model::SessionState::Closed))
-            .then_some(())
-        })
-        .await;
+        closed(&d, &review).await;
         let des1 = d
             .store()
             .linked_tickets(&[first.id])
@@ -778,7 +786,7 @@ async fn a_review_asking_for_changes_goes_to_its_session_and_the_next_head_is_re
         turn_ends(&d, &base, &first, "Opened #7; CI is green.").await;
         let review = reviewed_by_desk(&d, &head).await;
         let claude = Claude::started(&base, review.id).await;
-        claude.asked("Review acme/web#7.").await;
+        claude.asked(review.last_prompt.as_deref().unwrap()).await;
         claude
             .replies(
                 &d,
@@ -803,11 +811,13 @@ async fn a_review_asking_for_changes_goes_to_its_session_and_the_next_head_is_re
             .unwrap()
             .unwrap();
         assert!(!recorded.clean);
+        closed(&d, &review).await;
 
         let web = base.join("web");
         std::fs::write(web.join("empty.ts"), "export const empty = 1;\n").unwrap();
         git(&web, &["add", "empty.ts"]);
         git(&web, &["commit", "-q", "-m", "The empty state"]);
+        git(&web, &["update-ref", "refs/remotes/origin/dw-761", "HEAD"]);
         let next = head_of(&web);
         *gh.head.lock() = next.clone();
         crew.pull_seen(

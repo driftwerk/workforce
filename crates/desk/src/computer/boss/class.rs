@@ -1308,7 +1308,7 @@ mod tests {
             "gh pr merge 12 --squash",
             "gh api -X PUT repos/acme/web/pulls/12/merge",
             "gh api -XPUT /repos/acme/web/pulls/12/merge -f merge_method=squash",
-            "gh api repos/{owner}/{repo}/pulls/12/merge -f sha=abc",
+            "gh api 'repos/{owner}/{repo}/pulls/12/merge' -f sha=abc",
         ] {
             assert_eq!(class(c), Class::GhPrMerge, "{c}");
         }
