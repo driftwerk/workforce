@@ -187,3 +187,23 @@ it.
 - The 409 carries `holder`, the holding session's id. Desk opens that
   session, and with no holder it says something else is in the branch's
   folder.
+
+## On a machine
+
+A plan's ticket on a machine is freed the same way.
+- The plan's held start of a ticket in a worktree says `free_resting:
+  true`. Only the hub's plan start sends it.
+- Desk's native side forwards the flag like `deps`.
+- The machine's Desk honours it only in `create_held`, for the boss its
+  plan's grant names. It then runs the same `free_resting` checks against
+  that boss's charge there.
+- Mixed builds are safe both ways. An older machine, or an older Desk app
+  that drops the flag, leaves the session alone, so the start is refused
+  as taken and the plan pauses, as before. An older hub never sends it.
+- When looking for its session on the machine, a held start never takes
+  up by name a session of its key that was resting there (Idle or Done)
+  and made before this start began. That session is an earlier start's,
+  so it gets replaced, not taken over.
+
+A relayed test runs this through the Mac hub, the native-side stand-in
+and devbox's own Desk, both with the flag carried and without it.

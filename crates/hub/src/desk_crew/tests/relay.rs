@@ -963,8 +963,9 @@ const START_FIELDS: [&str; 8] = [
 
 /// Desk's native side for devbox, as it carries each call: devbox's
 /// sessions (each with the grant there that holds it, or none; none said at
-/// all by an `older` Desk there), and each start as Desk sends it (its own fields, and a plan's
-/// grant and the call's boss when it is under one), to devbox's sessions
+/// all by an `older` Desk there), and each start as Desk sends it (its own
+/// fields, a plan's start again freeing its worktree unless `older`, and a
+/// plan's grant and the call's boss when it is under one), to devbox's sessions
 /// route; each crew call to devbox's served route, kept in `carried`.
 fn carrying(
     crew: &Arc<CrewHub>,
@@ -1006,6 +1007,9 @@ fn carrying(
                             .iter()
                             .filter_map(|k| Some((k.to_string(), c.input.get(*k)?.clone())))
                             .collect();
+                        if !older && c.input["free_resting"] == json!(true) {
+                            start.insert("free_resting".into(), true.into());
+                        }
                         if workforce_desk::grant::plan_of(&c.group).is_some() {
                             start.insert("group".into(), c.group.clone().into());
                             start.insert("boss".into(), c.boss.clone().into());
@@ -2321,4 +2325,176 @@ async fn a_machine_whose_listing_doesnt_say_its_grants_is_never_written_ungroupe
         .await;
     })
     .await;
+}
+
+/// A repository at `dir` with one commit on `main`.
+fn git_repo(dir: &std::path::Path) {
+    for args in [
+        vec!["init", "-q", "-b", "main"],
+        vec![
+            "-c",
+            "user.email=d@e",
+            "-c",
+            "user.name=d",
+            "commit",
+            "-q",
+            "--allow-empty",
+            "-m",
+            "init",
+        ],
+    ] {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(&args)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{out:?}");
+    }
+}
+
+/// A plan's ticket on devbox, sent back to To do while its session rests
+/// in its worktree there, starts again in that worktree: the start, as Desk
+/// carries it, says it is its plan's start again, and devbox stops the
+/// boss's own resting session for it. A Desk there older than that (it
+/// carries no such word) leaves the session, and the plan pauses saying
+/// the worktree is taken.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_machine_ticket_started_again_frees_its_worktree_of_its_resting_session() {
+    for older in [false, true] {
+        with_test_pool(workforce_desk::store::build_pool, |mac_pool| async move {
+            with_test_pool(
+                workforce_desk::store::build_pool,
+                |devbox_pool| async move {
+                    started_again_on_devbox(mac_pool, devbox_pool, older).await;
+                },
+            )
+            .await;
+        })
+        .await;
+    }
+}
+
+async fn started_again_on_devbox(
+    mac_pool: workforce_postgres::PostgresPool,
+    devbox_pool: workforce_postgres::PostgresPool,
+    older: bool,
+) {
+    use workforce_desk::board::TicketState;
+    let (mac_dir, devbox_dir, repo) = (
+        tempfile::tempdir().unwrap(),
+        tempfile::tempdir().unwrap(),
+        tempfile::tempdir().unwrap(),
+    );
+    git_repo(repo.path());
+    let (main, state, d, _llm) = super::plans::hub_with(mac_dir.path(), mac_pool, MAIN).await;
+    let crew = CrewHub::start(state, d.clone(), FAST, CancellationToken::new());
+    let (theirs, _llm) = agent(devbox_dir.path(), "desk", "ok").await;
+    write_config(&theirs, MAIN);
+    let there_state = hub(std::slice::from_ref(&theirs));
+    let there = machine_desk(devbox_pool, devbox_dir.path()).await;
+    let there_crew = CrewHub::start(
+        Arc::clone(&there_state),
+        there.clone(),
+        FAST,
+        CancellationToken::new(),
+    );
+    let served = super::super::relay::routes(Arc::clone(&there_state), Arc::clone(&there_crew));
+    let token = there_state.auth_token.clone();
+    let carried: Arc<parking_lot::Mutex<Vec<RelayCall>>> = Arc::default();
+    let poller = carrying(&crew, &there, &served, &token, &carried, older);
+
+    // Two tickets in one folder there: the second works in its own
+    // worktree beside the first.
+    let folder = repo.path().to_string_lossy().into_owned();
+    let tickets = json!([
+        {"title": "Speed up recall", "folder": folder},
+        {"title": "Cache the index", "folder": folder},
+    ]);
+    let r = run(
+        &main,
+        "crew.plan",
+        json!({"result": super::plans::judged(), "goal": "Faster recall", "machine": "devbox", "tickets": tickets}),
+    )
+    .await;
+    assert!(r.success, "{r:?}");
+    let plan: uuid::Uuid = r.output["proposed"]["plan_id"]
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    d.approve_plan(plan, 1, &By::you()).await.unwrap();
+    let key = workforce_desk::grant::plan_key(plan);
+    carry(&crew, &there, &key, 1).await;
+    let doing = |n: usize| {
+        let d = d.clone();
+        async move {
+            let t = d
+                .plan(plan)
+                .await
+                .ok()?
+                .tickets
+                .get(n)?
+                .ticket
+                .ticket
+                .clone();
+            t.assignee
+                .filter(|_| t.state == TicketState::Doing)
+                .map(|a| (t.id, a.id))
+        }
+    };
+    eventually("the first started there", async || doing(0).await).await;
+    let (ticket, first) = eventually("the second started there", async || doing(1).await).await;
+    let (_, first) = super::super::relay::machine_session(&first).unwrap();
+    let earlier = there.view(first).unwrap();
+    assert!(earlier.cwd.contains("/.worktrees/"), "{}", earlier.cwd);
+    assert!(there.charge_of(first).is_some_and(|c| c.live()));
+
+    // Its turn ends and it rests there; the person sends its ticket back.
+    super::plan_watch::turn_ends(&there, devbox_dir.path(), &earlier, "Done for now.").await;
+    d.move_ticket(
+        ticket,
+        workforce_desk::Move {
+            state: TicketState::Todo,
+            before: None,
+            after: None,
+        },
+        &By::you(),
+    )
+    .await
+    .unwrap();
+
+    match older {
+        false => {
+            let (_, again) = eventually("started again there", async || {
+                doing(1)
+                    .await
+                    .filter(|(_, s)| !s.ends_with(&first.to_string()))
+            })
+            .await;
+            let (_, again) = super::super::relay::machine_session(&again).unwrap();
+            let now = there.view(again).unwrap();
+            assert_eq!(now.cwd, earlier.cwd, "in the same worktree");
+            assert_eq!(
+                there.view(first).unwrap().state,
+                workforce_desk::model::SessionState::Stopped
+            );
+            assert!(there.view(first).unwrap().ended_as_started().is_none());
+        }
+        true => {
+            let why = eventually("the plan paused", async || {
+                let p = d.plan(plan).await.ok()?;
+                (p.summary.plan.paused == Some(workforce_desk::plan::Paused::StartFailing))
+                    .then_some(p.summary.paused_why)
+                    .flatten()
+            })
+            .await;
+            assert!(
+                why.contains("can't start on devbox") && why.contains("is in use"),
+                "{why}"
+            );
+            assert!(there.view(first).unwrap().state.is_running(), "left alone");
+        }
+    }
+    poller.abort();
 }

@@ -10,7 +10,6 @@ use tokio::sync::broadcast::error::RecvError;
 use uuid::Uuid;
 
 use super::{Desk, DeskError, State};
-use crate::board::Ticket;
 use crate::charge::{How, Wheel, HOLD};
 use crate::crew::{By, Party};
 use crate::model::{SessionRecord, SessionState};
@@ -100,18 +99,19 @@ impl Desk {
             .collect()
     }
 
-    /// Frees `tree`, the worktree a plan's ticket `t` (`key`) starts in
+    /// Frees `tree`, the worktree a plan's ticket (`key`, its session now
+    /// `assigned`, when it has one) starts in
     /// again, of the session an earlier start of it left resting there: one
     /// of that name its boss started and still runs, at the boss's wheel
     /// with nothing from the person for [`HOLD`], asking nothing, idle or
-    /// done, in Desk and not in a terminal, no longer `t`'s (it was moved
+    /// done, in Desk and not in a terminal, no longer the ticket's (it was moved
     /// back to To do). Stopped, so this start takes its place rather than
     /// being refused; any other is left alone, and the start refused.
     pub(super) async fn free_resting(
         &self,
         tree: &Path,
         key: &str,
-        t: &Ticket,
+        assigned: Option<&str>,
         boss: &Party,
     ) -> Result<(), DeskError> {
         let folder = worktree::canonical(tree);
@@ -131,7 +131,7 @@ impl Desk {
                             .driven
                             .get(&r.id)
                             .is_none_or(|at| now - *at >= HOLD)
-                        && t.assignee.as_ref().is_none_or(|a| a.id != r.id.to_string())
+                        && assigned.is_none_or(|a| a != r.id.to_string())
                 })
                 .map(|r| r.id)
                 .collect::<Vec<_>>()

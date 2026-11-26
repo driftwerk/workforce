@@ -9,7 +9,6 @@ use workforce_postgres::test_support::with_test_pool;
 
 use super::super::tests::{desk, eventually, options};
 use super::*;
-use crate::board::Ticket;
 use crate::model::{Engine, NewSession};
 use crate::service::HolderOptions;
 use crate::store::{build_pool, DeskStore};
@@ -147,36 +146,6 @@ async fn a_session_in_a_worktree_through_a_link_holds_it() {
     .await;
 }
 
-fn todo(key_session: Option<Uuid>) -> Ticket {
-    let now = chrono::Utc::now();
-    Ticket {
-        id: Uuid::new_v4(),
-        board: Uuid::nil(),
-        number: 4,
-        title: "Fix the login".into(),
-        body: String::new(),
-        state: crate::board::TicketState::Todo,
-        rank: crate::board::RANK_STEP,
-        assignee: key_session.map(|id| Party {
-            kind: crate::crew::PartyKind::Session,
-            id: id.to_string(),
-            ..Party::you()
-        }),
-        needs: vec![],
-        links: vec![],
-        external: None,
-        created_by: Party::you(),
-        pinned: false,
-        snoozed_until: None,
-        upstream_rank: None,
-        snoozed_at: None,
-        state_at: now,
-        created_at: now,
-        updated_at: now,
-        version: 0,
-    }
-}
-
 /// A boss's own earlier session of a plan's ticket, resting in its
 /// worktree since the ticket went back to To do, is stopped for its start
 /// again, as Desk's stop: never as an end on its own, which would hold its
@@ -193,7 +162,7 @@ async fn a_bosss_own_resting_session_gives_way_to_its_start_again() {
             .await
             .unwrap();
         let tree = std::path::PathBuf::from(&earlier.cwd);
-        d.free_resting(&tree, "MAN-4", &todo(None), &sarah())
+        d.free_resting(&tree, "MAN-4", None, &sarah())
             .await
             .unwrap();
         assert!(d.record(earlier.id).unwrap().state.is_running(), "at work");
@@ -204,7 +173,7 @@ async fn a_bosss_own_resting_session_gives_way_to_its_start_again() {
             "MAN-4",
         );
         d.change(earlier.id, |r, _| r.state = SessionState::Idle);
-        d.free_resting(&tree, "MAN-4", &todo(None), &sarah())
+        d.free_resting(&tree, "MAN-4", None, &sarah())
             .await
             .unwrap();
         let r = d.record(earlier.id).unwrap();
@@ -278,7 +247,8 @@ async fn a_resting_session_not_left_by_the_tickets_start_is_left_alone() {
             d.change(s.id, |r, _| r.state = SessionState::Idle);
             let (boss, assigned) = unlike(&d, s.id);
             let tree = std::path::PathBuf::from(&s.cwd);
-            d.free_resting(&tree, "MAN-4", &todo(assigned), &boss)
+            let assigned = assigned.map(|id| id.to_string());
+            d.free_resting(&tree, "MAN-4", assigned.as_deref(), &boss)
                 .await
                 .unwrap();
             assert!(

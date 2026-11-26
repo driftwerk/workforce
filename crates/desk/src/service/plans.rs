@@ -3285,14 +3285,19 @@ impl Desk {
         // (a start not held, or a machine that doesn't take its id), one of
         // its key made since: an older session of the same key (the ticket
         // was sent back and started again) is never taken up. Wide enough
-        // for the two computers' clocks to differ. A held start takes up
-        // only one its boss has there: never the person's own of that name.
+        // for the two computers' clocks to differ, so one resting there made
+        // before this start began is an earlier start's, never this one's. A
+        // held start takes up only one its boss has there: never the
+        // person's own of that name.
         let after = since - chrono::Duration::minutes(10);
+        let earlier = |s: &crew::MachineSession, made: chrono::DateTime<chrono::Utc>| {
+            made < since && matches!(s.state.as_str(), "idle" | "done")
+        };
         // There, a boss of this hub goes by its agent's id
         // ([`crate::grant::BossRef::name`]).
         let made_for = |s: &crew::MachineSession| match held {
             Some(_) => {
-                s.created_at.is_some_and(|c| c >= after)
+                s.created_at.is_some_and(|c| c >= after && !earlier(s, c))
                     && s.boss_has.as_deref() == Some(boss.id.as_str())
             }
             None => s.created_at.is_none_or(|c| c >= after),
@@ -3343,6 +3348,12 @@ impl Desk {
         // in the same folder: the machine makes it.
         if worktree {
             body["worktree"] = branch_for(&key).into();
+        }
+        // Held there for its boss, its boss's own earlier session of it
+        // resting in that worktree gives way, as here; a Desk there older
+        // than that ignores it, and the start is refused as taken.
+        if worktree && held.is_some() {
+            body["free_resting"] = true.into();
         }
         body["deps"] = true.into();
         if let Some(model) = &runs.model {
@@ -3480,7 +3491,8 @@ impl Desk {
         // moved back to To do, gives way.
         if let Some(b) = &branch {
             if let Ok((_, tree)) = crate::worktree::located(Path::new(&folder), b).await {
-                self.free_resting(&tree, &key, t, boss).await?;
+                let assigned = t.assignee.as_ref().map(|a| a.id.as_str());
+                self.free_resting(&tree, &key, assigned, boss).await?;
             }
         }
         let group = p

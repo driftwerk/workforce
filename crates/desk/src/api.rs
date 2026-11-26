@@ -786,12 +786,21 @@ struct Start {
     id: Option<Uuid>,
     #[serde(default)]
     deps: bool,
+    /// A plan's start of its ticket again (only its hub's plan runner says
+    /// so): its boss's own earlier session of it, resting in its worktree,
+    /// gives way ([`crate::Desk::create_held`]).
+    #[serde(default)]
+    free_resting: bool,
 }
 
 async fn create(State(s): S, h: HeaderMap, Query(q): Q, Json(start): Json<Start>) -> Response {
     guarded!(s, h, q);
     match (start.boss, start.id) {
-        (Some(boss), id) => s.desk.create_held(start.new, &boss, id, start.deps).await,
+        (Some(boss), id) => {
+            s.desk
+                .create_held(start.new, &boss, id, start.deps, start.free_resting)
+                .await
+        }
         (None, None) => s.desk.create_chosen(start.new, start.deps).await,
         (None, Some(_)) => Err(DeskError::Invalid(
             "Only a plan's ticket started for its boss names its session.".into(),
