@@ -12,7 +12,7 @@
 //! lets what waited go once the wheel is back.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
@@ -1138,9 +1138,13 @@ impl Desk {
             .status()
             .is_ok_and(|s| s.success());
         let upstream = git_line(&cwd, &["rev-parse", "--abbrev-ref", "@{upstream}"]);
+        let path = self
+            .with_added(&self.0.state.lock().session_env.clone())
+            .remove("PATH");
+        let commands = git_commands(path.as_deref());
         let repo = Repo {
             aliases: &aliases,
-            git_commands: git_commands(),
+            git_commands: commands.as_deref(),
             is_branch: &is_branch,
             head_pushed,
             upstream: upstream.as_deref().and_then(|u| u.split('/').next()),
@@ -2316,15 +2320,24 @@ fn git_line_within(
     (!line.is_empty()).then_some(line)
 }
 
-/// Git's own commands and those it finds on its path, read once git says
-/// them: none while it can't.
-fn git_commands() -> Option<&'static HashSet<String>> {
-    static COMMANDS: OnceLock<HashSet<String>> = OnceLock::new();
-    if let Some(known) = COMMANDS.get() {
-        return Some(known);
+/// Git's own commands and those it finds on `path`, the one sessions run
+/// with (an external `git-lfs` runs before an alias by its name): read once
+/// git says them for that path, none while it can't.
+fn git_commands(path: Option<&str>) -> Option<Arc<HashSet<String>>> {
+    static KNOWN: OnceLock<parking_lot::Mutex<HashMap<Option<String>, Arc<HashSet<String>>>>> =
+        OnceLock::new();
+    let known = KNOWN.get_or_init(Default::default);
+    let key = path.map(str::to_string);
+    if let Some(commands) = known.lock().get(&key) {
+        return Some(commands.clone());
+    }
+    let mut git = std::process::Command::new("git");
+    if let Some(path) = path {
+        // The session's `git`, found on its own path.
+        git.env("PATH", path);
     }
     // Away from any repository: a broken one here fails the listing.
-    let out = std::process::Command::new("git")
+    let out = git
         .arg("--list-cmds=main,others")
         .current_dir(std::env::temp_dir())
         .env_remove("GIT_DIR")
@@ -2334,7 +2347,11 @@ fn git_commands() -> Option<&'static HashSet<String>> {
         .ok()
         .filter(|o| o.status.success())?;
     let commands = commands_of(&String::from_utf8_lossy(&out.stdout));
-    (!commands.is_empty()).then(|| COMMANDS.get_or_init(|| commands))
+    (!commands.is_empty()).then(|| {
+        let commands = Arc::new(commands);
+        known.lock().insert(key, commands.clone());
+        commands
+    })
 }
 
 /// The commands `git --list-cmds` says, one a line.

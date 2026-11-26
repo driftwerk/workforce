@@ -1890,9 +1890,21 @@ fn git_says_its_commands_a_line_each() {
     );
 }
 
-/// Git says its own commands, and those on its path, wherever Desk runs.
+/// Git says its own commands, and those on the path sessions run with,
+/// wherever Desk runs.
+#[cfg(unix)]
 #[test]
-fn git_says_its_own_commands() {
-    let commands = super::git_commands().expect("git says its commands");
+fn git_says_its_own_commands_and_those_on_the_sessions_path() {
+    let bin = tempfile::tempdir().unwrap();
+    let theirs = bin.path().join("git-theirs");
+    std::fs::write(&theirs, "#!/bin/sh\n").unwrap();
+    let mut perms = std::fs::metadata(&theirs).unwrap().permissions();
+    std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
+    std::fs::set_permissions(&theirs, perms).unwrap();
+    let path = format!("{}:/usr/bin:/bin", bin.path().display());
+    let commands = super::git_commands(Some(&path)).expect("git says its commands");
     assert!(commands.contains("push") && commands.contains("send-pack"));
+    assert!(commands.contains("theirs"), "one on the session's path");
+    let own = super::git_commands(None).expect("on Desk's own path");
+    assert!(!own.contains("theirs"));
 }
