@@ -3923,7 +3923,7 @@ impl Desk {
             &new.review_of,
         ) {
             (Some(name), Some(r)) => (
-                worktree::detached(&cwd, name, &r.head_sha)
+                worktree::detached(&cwd, name, &r.head_sha, &format!("refs/pull/{}/head", r.pr.number))
                     .await
                     .map_err(|e| DeskError::Invalid(e.to_string()))?,
                 None,

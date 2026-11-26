@@ -108,9 +108,11 @@ async fn create_from(cwd: &Path, branch: &str, start: Option<&str>) -> Result<Pa
 
 /// Creates `<repo>/.worktrees/<slug>` for `name`, detached at `commit`, in
 /// the main checkout of `cwd`'s repository, never inside a linked
-/// worktree: what a review reads its pull request's head in. One already
-/// there at `commit` is found again; one at another commit is refused.
-pub async fn detached(cwd: &Path, name: &str, commit: &str) -> Result<PathBuf> {
+/// worktree: what a review reads its pull request's head in. A `commit`
+/// the repository hasn't got is fetched from `origin`'s `from` into
+/// `refs/remotes/origin/`, so it is seen as pushed. One already there at
+/// `commit` is found again; one at another commit is refused.
+pub async fn detached(cwd: &Path, name: &str, commit: &str, from: &str) -> Result<PathBuf> {
     let slugged = slug(name);
     if slugged.is_empty() {
         eyre::bail!("worktree name {name:?} has no usable characters");
@@ -124,6 +126,15 @@ pub async fn detached(cwd: &Path, name: &str, commit: &str) -> Result<PathBuf> {
             [top, head] if Path::new(top) == here && head == commit => Ok(path),
             _ => eyre::bail!("{} already exists, not at {commit}", path.display()),
         };
+    }
+    if git(&root, &["cat-file", "-e", &format!("{commit}^{{commit}}")])
+        .await
+        .is_err()
+    {
+        let into = format!("+{from}:refs/remotes/origin/{}", from.trim_start_matches("refs/"));
+        git(&root, &["-c", "credential.interactive=never", "fetch", "-q", "origin", &into])
+            .await
+            .with_context(|| format!("{commit} isn't here and couldn't be fetched"))?;
     }
     git(
         &root,
@@ -361,7 +372,7 @@ mod tests {
         let second = git(&repo, &["rev-parse", "HEAD"]).await.unwrap();
         let ticket = create(&repo, "des-2").await.unwrap();
 
-        let made = detached(&ticket, "review 7 abc", &first).await.unwrap();
+        let made = detached(&ticket, "review 7 abc", &first, PULL).await.unwrap();
         assert_eq!(made, repo.join(".worktrees/review-7-abc"));
         assert_eq!(git(&made, &["rev-parse", "HEAD"]).await.unwrap(), first);
         assert_eq!(
@@ -369,20 +380,71 @@ mod tests {
             "",
             "detached"
         );
-        assert_eq!(detached(&repo, "review 7 abc", &first).await.unwrap(), made);
-        assert!(detached(&repo, "review 7 abc", &second).await.is_err());
+        assert_eq!(detached(&repo, "review 7 abc", &first, PULL).await.unwrap(), made);
+        assert!(detached(&repo, "review 7 abc", &second, PULL).await.is_err());
         std::fs::create_dir_all(repo.join(".worktrees/plain")).unwrap();
         assert!(
-            detached(&repo, "plain", &second).await.is_err(),
+            detached(&repo, "plain", &second, PULL).await.is_err(),
             "a folder that isn't its worktree"
         );
-        assert!(detached(&repo, "review 8", &"0".repeat(40)).await.is_err());
+        assert!(detached(&repo, "review 8", &"0".repeat(40), PULL).await.is_err());
 
         std::fs::write(made.join("notes.md"), "x").unwrap();
         assert!(remove(&made).await.is_err(), "it holds changes");
         std::fs::remove_file(made.join("notes.md")).unwrap();
         remove(&made).await.unwrap();
         assert!(!made.exists());
+    }
+
+    const PULL: &str = "refs/pull/7/head";
+
+    /// A head pushed from elsewhere is fetched from `origin` before its
+    /// worktree is made, and kept under `refs/remotes/origin/`.
+    #[tokio::test]
+    async fn a_head_the_repository_hasnt_got_is_fetched_from_origin() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(dir.path()).unwrap();
+        let (origin, repo, other) = (base.join("origin.git"), base.join("web"), base.join("other"));
+        git(&base, &["init", "-q", "--bare", &origin.to_string_lossy()])
+            .await
+            .unwrap();
+        let commit = |at: PathBuf, m: &'static str| async move {
+            git(
+                &at,
+                &["-c", "user.email=d@e", "-c", "user.name=d", "commit", "-q", "--allow-empty", "-m", m],
+            )
+            .await
+            .unwrap();
+        };
+        for at in [&repo, &other] {
+            git(&base, &["clone", "-q", &origin.to_string_lossy(), &at.to_string_lossy()])
+                .await
+                .unwrap();
+        }
+        commit(repo.clone(), "one").await;
+        git(&repo, &["push", "-q", "origin", "HEAD:main"]).await.unwrap();
+        git(&other, &["pull", "-q", "origin", "main"]).await.unwrap();
+        commit(other.clone(), "from elsewhere").await;
+        git(&other, &["push", "-q", "origin", &format!("HEAD:{PULL}")])
+            .await
+            .unwrap();
+        let head = git(&other, &["rev-parse", "HEAD"]).await.unwrap();
+
+        let made = detached(&repo, "review 7", &head, PULL).await.unwrap();
+        assert_eq!(git(&made, &["rev-parse", "HEAD"]).await.unwrap(), head);
+        assert_eq!(
+            git(&repo, &["rev-parse", "refs/remotes/origin/pull/7/head"])
+                .await
+                .unwrap(),
+            head,
+            "seen as pushed"
+        );
+        assert!(
+            detached(&repo, "review 8", &"1".repeat(40), "refs/pull/8/head")
+                .await
+                .is_err(),
+            "a head origin hasn't got either"
+        );
     }
 
     #[test]
