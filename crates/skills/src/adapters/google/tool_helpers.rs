@@ -467,6 +467,10 @@ mod tests {
             .into_iter()
             .find(|t| t.name() == "google.workspaces")
             .unwrap();
+        assert_eq!(
+            t.reach(&json!({})),
+            Some(workforce_agent::tools::Reach::Reads)
+        );
         let answer = as_sam(t.execute(json!({}))).await.unwrap().output;
         assert_eq!(
             answer,

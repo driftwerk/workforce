@@ -2700,4 +2700,28 @@ mod tests {
         let (_, fixed) = plan_caption(long, 480, 480.0 * 0.5, m, Some(50));
         assert_eq!(fixed, 50);
     }
+
+    #[test]
+    fn what_it_makes_stays_with_the_agents_conversation() {
+        let agent_id = || "atlas".to_string();
+        let tools: [&dyn Tool; 3] = [
+            &VideoComposeTool {
+                agent_id: agent_id(),
+            },
+            &TrimVideoTool {
+                agent_id: agent_id(),
+            },
+            &VideoToGifTool {
+                agent_id: agent_id(),
+            },
+        ];
+        for tool in tools {
+            assert_eq!(
+                tool.reach(&serde_json::json!({})),
+                Some(crate::tools::Reach::Stays),
+                "{}",
+                tool.name()
+            );
+        }
+    }
 }

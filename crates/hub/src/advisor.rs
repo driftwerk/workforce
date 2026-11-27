@@ -223,12 +223,13 @@ fn render_panel_for_synth(question: Option<&str>, panel: &[(String, String)]) ->
 /// Build the read-only tool set the advisor's in-process loop exposes
 /// for `source = "model"` and `source = "agent"`. The set is built for each
 /// consultation, so WebSearch is offered only when the person it runs for
-/// has a Brave API key at some vault level (or the install has one). Each
-/// runs under the content guard of the turn that asked.
+/// has a Brave API key at some vault level (or the install has one). They
+/// run under a branch of the asking turn's content guard: held where the
+/// turn is, and armed by what they read without arming the turn.
 pub(crate) fn build_advisor_tools(service: &AgentService) -> Vec<Arc<dyn Tool>> {
     let brave =
         crate::credentials::brave_source(service.vault.clone(), service.global_vault.clone());
-    let guard = workforce_agent::runner::caller_content_guard();
+    let guard = workforce_agent::runner::caller_content_guard().map(|turn| Arc::new(turn.branch()));
     make_advisor_tool_set(
         service.workspace.clone(),
         current_key(&brave).is_some().then_some(brave),

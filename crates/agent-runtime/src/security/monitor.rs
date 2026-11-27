@@ -901,6 +901,13 @@ impl ContentGuard {
         }
     }
 
+    /// A guard for work the turn has done on its own, such as a
+    /// consultation's research: armed and scoped as this one is now, and
+    /// arming apart from it, so what that work reads doesn't arm the turn.
+    pub fn branch(&self) -> Self {
+        Self::new(self.kept_scope())
+    }
+
     /// The kept scope ([`Self::kept_scope`]) of a turn that read outside
     /// content; `None` while it hasn't.
     pub fn armed_scope(&self) -> Option<Box<ContentScope>> {
@@ -2288,6 +2295,35 @@ mod tests {
             "`mystery.tool` isn't known to only read or to stay within the agent's own work. \
              This turn read outside content (from web.fetch), which could be what is asking for this"
         );
+    }
+
+    #[test]
+    fn a_branch_starts_as_the_turn_is_and_arms_apart_from_it() {
+        let turn = ContentGuard::new(delivering("C1"));
+        let quiet = turn.branch();
+        quiet.read_outside("see https://a.example/x", "web.fetch");
+        assert_eq!(
+            turn.armed(),
+            None,
+            "what the branch read leaves the turn as it was"
+        );
+        assert!(turn
+            .check("web.fetch", &json!({ "url": "https://b.example/y" }), None)
+            .is_none());
+        assert!(quiet
+            .check("web.fetch", &json!({ "url": "https://b.example/y" }), None)
+            .is_some());
+        turn.read_outside("see https://a.example/x", "email.read");
+        let armed = turn.branch();
+        assert_eq!(armed.armed().as_deref(), Some("email.read"));
+        assert_eq!(
+            armed.check("web.fetch", &json!({ "url": "https://a.example/x" }), None),
+            None,
+            "the turn's seen URLs come with it"
+        );
+        assert!(armed
+            .check("web.fetch", &json!({ "url": "https://b.example/y" }), None)
+            .is_some());
     }
 
     #[test]
