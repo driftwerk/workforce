@@ -852,8 +852,8 @@ impl CrewHub {
                     (self.desk.clone(), view.id, p.id, boss.to_string());
                 tokio::task::spawn_blocking(move || {
                     let class = desk.request_class(id, approval, &boss);
-                    let past = class != Class::GhPrMerge
-                        && desk.request_pushes_past_review(id, approval, &boss);
+                    let past =
+                        class != Class::GhPrMerge && desk.request_pushes_past_review(id, approval);
                     (class, past)
                 })
                 .await

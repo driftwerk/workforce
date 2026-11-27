@@ -3034,11 +3034,15 @@ fn push_operands<'a>(args: &[&'a str]) -> Vec<&'a str> {
     operands
 }
 
-/// The subcommand and its arguments of `git` given `args`, past git's own
-/// options (`-C <dir>`, `-c <key=value>`, `--git-dir=<dir>`, `--no-pager`).
-fn git_subcommand<'a, 'b>(args: &'b [&'a str]) -> Option<(&'a str, &'b [&'a str])> {
+/// The folder `git` given `args` runs in (its `-C`s, each from the one
+/// before, as given), its subcommand and that subcommand's arguments,
+/// past git's own options (`-c <key=value>`, `--git-dir=<dir>`,
+/// `--no-pager`).
+fn git_subcommand<'a, 'b>(
+    args: &'b [&'a str],
+    dir: Option<PathBuf>,
+) -> Option<(Option<PathBuf>, &'a str, &'b [&'a str])> {
     const VALUED: &[&str] = &[
-        "-C",
         "-c",
         "--git-dir",
         "--work-tree",
@@ -3046,44 +3050,77 @@ fn git_subcommand<'a, 'b>(args: &'b [&'a str]) -> Option<(&'a str, &'b [&'a str]
         "--config-env",
     ];
     match args {
-        [flag, _, rest @ ..] if VALUED.contains(flag) => git_subcommand(rest),
-        [flag, rest @ ..] if flag.starts_with('-') => git_subcommand(rest),
-        [sub, rest @ ..] => Some((sub, rest)),
+        ["-C", to, rest @ ..] => {
+            let dir = dir.map_or_else(|| PathBuf::from(to), |d| d.join(to));
+            git_subcommand(rest, Some(dir))
+        }
+        [flag, _, rest @ ..] if VALUED.contains(flag) => git_subcommand(rest, dir),
+        [flag, rest @ ..] if flag.starts_with('-') => git_subcommand(rest, dir),
+        [sub, rest @ ..] => Some((dir, sub, rest)),
         [] => None,
     }
 }
 
-/// Whether `command` pushes straight to `origin`'s own default branch, as
-/// `origin/HEAD` names it ([`Here::default_branch`]), from the branch the
-/// folder is on, wherever it runs it ([`class::runs`]): a branch that only
-/// reads as one (`release-…`) isn't it.
-pub fn pushes_the_default(command: &str, here: &Here<'_>) -> bool {
-    let (Some(default), Some(branch)) = (here.default_branch, here.branch) else {
+/// A repository a push is made from, as Desk reads it for
+/// [`pushes_a_default`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Pushing {
+    /// The branch its folder is on.
+    pub branch: Option<String>,
+    /// Its default branch (`origin/HEAD`), when it says.
+    pub default_branch: Option<String>,
+    /// Where a bare `git push` sends its branch ([`Here::push_to`]).
+    pub push_to: Option<String>,
+    /// The GitHub repository `origin` pushes to, when its default branch
+    /// is there already.
+    pub pulls_into: Option<crate::repos::Repo>,
+}
+
+/// Whether `command` pushes straight to `origin`'s own default branch of a
+/// repository it pushes from that `counts`, wherever it runs it
+/// ([`class::runs`]): `from` reads that repository, given a push's `git -C`
+/// folder (none: where the command starts). A branch that only reads as
+/// the default one (`release-…`) isn't it.
+pub fn pushes_a_default(
+    command: &str,
+    from: &dyn Fn(Option<&Path>) -> Option<Pushing>,
+    counts: &dyn Fn(&Pushing) -> bool,
+) -> bool {
+    class::runs(command, &|program, args| match git_subcommand(args, None) {
+        Some((dir, "push", rest)) if program == "git" => from(dir.as_deref())
+            .is_some_and(|repo| pushes_its_default(&repo, rest) && counts(&repo)),
+        _ => false,
+    })
+}
+
+/// Whether `git push` given `args`, from `repo`, sends a branch straight
+/// to `origin`'s own default branch.
+fn pushes_its_default(repo: &Pushing, args: &[&str]) -> bool {
+    let (Some(default), Some(branch)) = (repo.default_branch.as_deref(), repo.branch.as_deref())
+    else {
         return false;
     };
     let is_default = |to: &str| to.strip_prefix("refs/heads/").unwrap_or(to) == default;
     let bare = |remote: Option<&str>| {
         remote.is_none_or(|r| r == "origin")
-            && here
+            && repo
                 .push_to
+                .as_deref()
                 .and_then(|to| to.split_once('/'))
                 .is_some_and(|(r, b)| r == "origin" && is_default(b))
     };
-    class::runs(command, &|program, args| match git_subcommand(args) {
-        Some(("push", rest)) if program == "git" => match push_operands(rest).as_slice() {
-            [] => bare(None),
-            [remote] => bare(Some(remote)),
-            [remote, specs @ ..] => {
-                *remote == "origin"
-                    && specs.iter().any(|spec| {
-                        let spec = spec.trim_start_matches('+');
-                        let (src, to) = spec.split_once(':').unwrap_or((spec, spec));
-                        !src.is_empty() && is_default(if to == "HEAD" { branch } else { to })
-                    })
-            }
-        },
-        _ => false,
-    })
+    match push_operands(args).as_slice() {
+        [] => bare(None),
+        [remote] => bare(Some(remote)),
+        [remote, specs @ ..] => {
+            *remote == "origin"
+                && specs.iter().any(|spec| {
+                    let spec = spec.trim_start_matches('+');
+                    let (src, to) = spec.split_once(':').unwrap_or((spec, spec));
+                    !src.is_empty() && is_default(if to == "HEAD" { branch } else { to })
+                })
+        }
+    }
 }
 
 fn gh(walk: &Walk<'_, '_>, args: &[Word]) -> Judged {
@@ -5103,13 +5140,29 @@ pub(crate) mod tests {
         kind_with(command, |_| {})
     }
 
+    /// A repository on `feat/x`, `main` its default, a bare push sending
+    /// its branch to `origin/feat/x`.
+    fn pushing() -> Pushing {
+        Pushing {
+            branch: Some("feat/x".into()),
+            default_branch: Some("main".into()),
+            push_to: Some("origin/feat/x".into()),
+            pulls_into: None,
+        }
+    }
+
+    /// Whether `command`, run where `repo` is, pushes past review.
+    fn past_from(command: &str, repo: &Pushing) -> bool {
+        pushes_a_default(command, &|_| Some(repo.clone()), &|_| true)
+    }
+
     /// Only a push straight to `origin`'s own default branch is one past
     /// review: not a branch that only reads as one, another remote, a
-    /// deletion, a repository that says no default, or a push Desk can't
-    /// read straight.
+    /// deletion, a repository that says no default, or one that isn't
+    /// what counts.
     #[test]
     fn only_a_push_straight_to_origins_own_default_branch_is_past_review() {
-        let past = |command: &str| on_a_branch(|_| {}, |h| pushes_the_default(command, h));
+        let past = |command: &str| past_from(command, &pushing());
         for command in [
             "git push origin main",
             "git push origin HEAD:main",
@@ -5134,30 +5187,67 @@ pub(crate) mod tests {
             "git push origin release-2026",
             "git push upstream main",
             "git push origin :main",
-            "git -C main push origin feat/x",
             "echo git push origin main",
             "sh 'git push origin main'",
             "git push",
         ] {
             assert!(!past(command), "{command}");
         }
-        let on_main = |command: &str, push_to: Option<&'static str>| {
-            on_a_branch(
-                |h| {
-                    h.branch = Some("main");
-                    h.push_to = push_to;
-                },
-                |h| pushes_the_default(command, h),
-            )
+        let on_main = |command: &str, push_to: Option<&str>| {
+            let repo = Pushing {
+                branch: Some("main".into()),
+                push_to: push_to.map(str::to_string),
+                ..pushing()
+            };
+            past_from(command, &repo)
         };
         assert!(on_main("git push", Some("origin/main")));
         assert!(on_main("git push origin HEAD", None));
         assert!(!on_main("git push", None), "where it goes, unsaid");
-        let unsaid = on_a_branch(
-            |h| h.default_branch = None,
-            |h| pushes_the_default("git push origin main", h),
+        let unsaid = Pushing {
+            default_branch: None,
+            ..pushing()
+        };
+        assert!(
+            !past_from("git push origin main", &unsaid),
+            "no origin/HEAD: a new repository's first push"
         );
-        assert!(!unsaid, "no origin/HEAD: a new repository's first push");
+        let counted = |repo: &Pushing| repo.default_branch.as_deref() == Some("main");
+        let trunk = Pushing {
+            default_branch: Some("trunk".into()),
+            ..pushing()
+        };
+        assert!(!pushes_a_default(
+            "git push origin main",
+            &|_| Some(trunk.clone()),
+            &counted
+        ));
+    }
+
+    /// A push is judged in the repository its `git -C` folders lead to,
+    /// each from the one before.
+    #[test]
+    fn a_push_is_judged_where_git_c_runs_it() {
+        let from = |dir: Option<&Path>| {
+            let default = match dir.map(|d| d.to_string_lossy().into_owned()).as_deref() {
+                None => "main",
+                Some("../api/sub") => "trunk",
+                Some(_) => "develop",
+            };
+            Some(Pushing {
+                default_branch: Some(default.into()),
+                ..pushing()
+            })
+        };
+        let past = |command: &str| pushes_a_default(command, &from, &|_| true);
+        assert!(past("git push origin main"));
+        assert!(
+            !past("git -C ../api -C sub push origin main"),
+            "its default is trunk"
+        );
+        assert!(past("git -C ../api -C sub push origin trunk"));
+        assert!(past("git -C /srv/web push origin develop"));
+        assert!(!past("git -C /srv/web push origin main"));
     }
 
     /// Every spelling of a push is classed by what it sends and where, and

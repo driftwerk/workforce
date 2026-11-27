@@ -1218,7 +1218,7 @@ struct Inner {
     store: Arc<DeskStore>,
     env: BTreeMap<String, String>,
     /// Whether [`Self::env`] is the person's login shell's
-    /// ([`LOGIN_ENV_UNREAD`]).
+    /// ([`LOGIN_ENV_READ`]).
     login_read: bool,
     /// The shell terminals run.
     shell: String,
@@ -1311,9 +1311,9 @@ struct Inner {
     /// started there, so one head has one open review.
     review_starts: tokio::sync::Mutex<()>,
     /// Whether GitHub requires a pull request to change a repository's
-    /// branch (`host/owner/name#branch`), and until when that is kept
+    /// (`host/owner/name`) branch, and until when that is kept
     /// ([`Self::requires_pull_requests`]).
-    protections: Mutex<HashMap<String, (std::time::Instant, bool)>>,
+    protections: Mutex<HashMap<(String, String), (std::time::Instant, bool)>>,
     /// Held while the modes Desk keeps are read and written
     /// ([`crate::mode`]).
     modes_write: tokio::sync::Mutex<()>,
@@ -1722,17 +1722,17 @@ fn asking(p: &PendingApproval) -> String {
     }
 }
 
-/// Set in the environment Desk is given when that isn't the person's login
-/// shell's (it couldn't be read), by Desk Helper: never passed on.
-pub const LOGIN_ENV_UNREAD: &str = "DESK_LOGIN_ENV_UNREAD";
+/// Set (to `1`) by Desk Helper in the environment Desk is given when that
+/// is the person's login shell's, as it read it: never passed on.
+pub const LOGIN_ENV_READ: &str = "DESK_LOGIN_ENV_READ";
 
 /// The environment sessions, terminals and the CLIs Desk runs start from:
 /// the hub's, without what a parent Claude Code left in it (`CLAUDE*`) and
-/// without the hub's own secrets, nor [`LOGIN_ENV_UNREAD`].
+/// without the hub's own secrets, nor [`LOGIN_ENV_READ`].
 fn cli_env(base: &BTreeMap<String, String>) -> BTreeMap<String, String> {
     let mut env: BTreeMap<String, String> = base
         .iter()
-        .filter(|(k, _)| !k.starts_with("CLAUDE") && !hub_secret(k) && *k != LOGIN_ENV_UNREAD)
+        .filter(|(k, _)| !k.starts_with("CLAUDE") && !hub_secret(k) && *k != LOGIN_ENV_READ)
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect();
     env.insert("TERM".into(), "xterm-256color".into());
@@ -2041,7 +2041,7 @@ impl Desk {
         let hook_base = format!("http://127.0.0.1:{hook_port}");
         let (persist, persist_rx) = mpsc::unbounded_channel();
         let env = cli_env(&opts.env);
-        let login_read = !opts.env.contains_key(LOGIN_ENV_UNREAD);
+        let login_read = opts.env.get(LOGIN_ENV_READ).is_some_and(|v| v == "1");
         let (ledger, ledger_jobs) =
             ledger::LedgerRun::new(floor.pricer.clone(), floor.redactor.clone());
         let desk = Self(Arc::new(Inner {
@@ -6564,10 +6564,6 @@ impl Desk {
         Ok(Server::Held(pty))
     }
 
-    /// What a Codex session `id`'s app-server runs its commands with:
-    /// Desk's own environment, its `gh` asking Desk before a merge
-    /// ([`crate::gh_shim`]), `token` its credential. Without the shim, as
-    /// it is, and said.
     /// What shell a Codex session `id`'s app-server runs its commands in: a
     /// plain one while a boss that decides its requests has it as it starts
     /// (a plan's or the crew's start), so no profile puts another `gh`
@@ -6575,9 +6571,11 @@ impl Desk {
     /// login shell, as their own sessions keep it. One a boss takes on once
     /// it runs keeps its shell until it starts again: until then a merge it
     /// runs past Desk's `gh` is the boss's model's to refuse, and GitHub's
-    /// protection of the branch. Where Desk's environment isn't the login
-    /// shell's ([`LOGIN_ENV_UNREAD`]) the login shell stays, as without it
-    /// a command wouldn't find the person's tools.
+    /// protection of the branch. Only where Desk Helper says Desk's
+    /// environment is the login shell's ([`LOGIN_ENV_READ`]): elsewhere (a
+    /// hub run by hand, an older Desk Helper, a login shell it couldn't
+    /// read) the login shell stays, as without it a command might not find
+    /// the person's tools.
     fn command_shell(&self, id: Uuid) -> codex::CommandShell {
         let charged = self
             .charge_of(id)
@@ -6585,13 +6583,17 @@ impl Desk {
         match (charged, self.0.login_read) {
             (true, true) => codex::CommandShell::Plain,
             (true, false) => {
-                tracing::warn!(session = %id, "a Codex session a boss runs keeps the login shell: Desk couldn't read the person's login environment, so without it its commands wouldn't find their tools, and a gh their profile puts first runs merges without Desk's check");
+                tracing::warn!(session = %id, "a Codex session a boss runs keeps the login shell: Desk Helper didn't say Desk's environment is the person's login one, so without it its commands might not find their tools, and a gh their profile puts first runs merges without Desk's check");
                 codex::CommandShell::Login
             }
             (false, _) => codex::CommandShell::Login,
         }
     }
 
+    /// What a Codex session `id`'s app-server runs its commands with:
+    /// Desk's own environment, its `gh` asking Desk before a merge
+    /// ([`crate::gh_shim`]), `token` its credential. Without the shim, as
+    /// it is, and said.
     fn gh_shimmed(&self, id: Uuid, token: &str) -> BTreeMap<String, String> {
         let mut env = self.0.env.clone();
         let url = format!("{}/gh/{id}/{token}", self.0.hook_base);

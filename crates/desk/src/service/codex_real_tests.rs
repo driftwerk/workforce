@@ -169,6 +169,7 @@ async fn on_real_codex_on(
         ("PATH".into(), path),
         ("HOME".into(), dir.to_string_lossy().into_owned()),
         ("CODEX_HOME".into(), home.to_string_lossy().into_owned()),
+        (super::LOGIN_ENV_READ.into(), "1".into()),
         ("OPENAI_API_KEY".into(), "sk-test-not-real".into()),
         ("TERM".into(), "xterm-256color".into()),
     ]);

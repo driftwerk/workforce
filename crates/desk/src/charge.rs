@@ -500,9 +500,6 @@ pub struct Facts {
     pub branches: Vec<String>,
     /// The tags at `origin`'s default branch's commit.
     pub tip_tags: Vec<String>,
-    /// The GitHub repository `origin` is, when its default branch is there
-    /// already: where pull requests may be what reaches it.
-    pub pulls_into: Option<crate::repos::Repo>,
     pub what: What,
 }
 
@@ -617,7 +614,6 @@ pub fn facts_of(
         unpushed: true,
         branches: Vec::new(),
         tip_tags: Vec::new(),
-        pulls_into: None,
         what,
     }
 }
@@ -755,25 +751,6 @@ pub fn push_kind(
         command,
         &here_of(facts, bounds, own.as_deref(), real, &|_| false),
     )
-}
-
-/// Whether the command of `facts` pushes straight to its default branch
-/// on a GitHub `origin` that has it ([`Facts::pulls_into`],
-/// [`boss::pushes_the_default`]).
-pub fn pushes_past_review(
-    facts: &Facts,
-    bounds: &Bounds,
-    real: &dyn Fn(&Path) -> Option<PathBuf>,
-) -> bool {
-    let What::Command(command) = &facts.what else {
-        return false;
-    };
-    let own = real(&facts.own);
-    facts.pulls_into.is_some()
-        && boss::pushes_the_default(
-            command,
-            &here_of(facts, bounds, own.as_deref(), real, &|_| false),
-        )
 }
 
 /// The class of the command of `facts` ([`boss::class_of`]), in its
