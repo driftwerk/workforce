@@ -426,7 +426,7 @@ pub(crate) fn not_native(
                 .into_response(),
         );
     }
-    let ours = hubs_own(&state.auth_token, h);
+    let ours = crate::auth::bears_hub_token(state.door(), h);
     // 401: refused before anything is done, so Desk's native side may read
     // the hub's token again and send it once more.
     (!ours).then(|| {

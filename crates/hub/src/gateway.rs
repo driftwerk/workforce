@@ -1347,45 +1347,49 @@ impl WsCaller {
 }
 
 impl From<crate::auth::Admitted> for WsCaller {
+    /// A token that carried no scopes is unrestricted on a socket, as tokens
+    /// minted before scopes were; under the member ceiling it is a member's.
+    /// Paired devices are the primary user: Owner trust, no wrap.
     fn from(admitted: crate::auth::Admitted) -> Self {
+        use crate::auth::CredentialKind;
         let crate::auth::Admitted {
             claims,
             ceiling,
             kind,
         } = admitted;
-        match kind {
-            // Paired devices are the primary user → Owner trust, no wrap.
-            crate::auth::CredentialKind::Device(token_match) => Self {
-                device_id: claims.device_id,
-                scopes: Some(claims.scopes),
-                identity_id: claims.identity_id,
-                token_match: Some(
+        let unrestricted = matches!(
+            kind,
+            CredentialKind::StaticToken | CredentialKind::Jwt { unscoped: true }
+        );
+        let scopes = match (unrestricted, ceiling) {
+            (true, crate::authz::Ceiling::Full) => None,
+            (true, crate::authz::Ceiling::Member) => Some(crate::jwt::scopes_for_role(
+                workforce_identity::types::IdentityRole::Member,
+            )),
+            (false, _) => Some(claims.scopes),
+        };
+        let (token_match, identity_role) = match kind {
+            CredentialKind::Device(token_match) => (
+                Some(
                     match token_match {
                         workforce_pairing::TokenMatch::Current => "current",
                         workforce_pairing::TokenMatch::Previous => "previous",
                     }
                     .to_string(),
                 ),
-                identity_role: "manager".to_string(),
-                ceiling,
-            },
-            crate::auth::CredentialKind::Jwt { unscoped: true }
-            | crate::auth::CredentialKind::StaticToken => Self {
-                device_id: claims.device_id,
-                scopes: None,
-                identity_id: claims.identity_id,
-                token_match: None,
-                identity_role: claims.role.as_str().to_string(),
-                ceiling,
-            },
-            crate::auth::CredentialKind::Jwt { unscoped: false } => Self {
-                device_id: claims.device_id,
-                scopes: Some(claims.scopes),
-                identity_id: claims.identity_id,
-                token_match: None,
-                identity_role: claims.role.as_str().to_string(),
-                ceiling,
-            },
+                "manager".to_string(),
+            ),
+            CredentialKind::StaticToken | CredentialKind::Jwt { .. } => {
+                (None, claims.role.as_str().to_string())
+            }
+        };
+        Self {
+            device_id: claims.device_id,
+            scopes,
+            identity_id: claims.identity_id,
+            token_match,
+            identity_role,
+            ceiling,
         }
     }
 }
@@ -4383,7 +4387,7 @@ async fn ws_local_agent_handler(
             .into_response()
     };
 
-    if crate::auth::constant_time_token_eq(&token, &state.auth_token) {
+    if crate::auth::is_hub_token(state.door(), &token) {
         return refused(
             StatusCode::FORBIDDEN,
             "unbound",
@@ -4391,32 +4395,28 @@ async fn ws_local_agent_handler(
              not the gateway token.",
         );
     }
-    let Some(ref pairing) = state.device_pairing else {
+    if state.device_pairing.is_none() {
         return refused(
             StatusCode::UNAUTHORIZED,
             "unauthorized",
             "Device pairing is not configured on this hub.",
         );
-    };
+    }
     let device =
-        match pairing.validate_token_async(token.to_string()).await {
-            Ok(Some(device)) => device,
-            Ok(None) => return refused(
+        match crate::auth::admit_paired(state.door(), &token).await {
+            Ok(paired) => paired.device,
+            Err(AuthFailure::InvalidCredentials | AuthFailure::SurfaceRefused) => return refused(
                 StatusCode::UNAUTHORIZED,
                 "unauthorized",
                 "Authentication required. Provide a valid device token (?token=...) or pair your \
                  device via /api/pair/device/request.",
             ),
-            Err(e) => {
-                warn!(
-                    error = %e,
-                    "Pairing store error during local agent WebSocket auth — failing closed"
-                );
+            Err(AuthFailure::StoreError) => {
                 return refused(
                     StatusCode::SERVICE_UNAVAILABLE,
                     "service_unavailable",
                     "Authentication backend unavailable — retry shortly.",
-                );
+                )
             }
         };
     if !crate::jwt::has_scope(&device.scopes, crate::jwt::SCOPE_AGENTS) {
@@ -7609,12 +7609,11 @@ async fn admin_reset_model(
     Query(query): Query<WsQuery>,
     State(state): State<Arc<GatewayState>>,
 ) -> impl IntoResponse {
-    // Constant-time + empty-token-safe (audit F2): an unset `auth_token` must
-    // not authenticate a tokenless caller.
-    if !crate::auth::constant_time_token_eq(
-        query.token.as_deref().unwrap_or_default(),
-        &state.auth_token,
-    ) {
+    if !query
+        .token
+        .as_deref()
+        .is_some_and(|token| crate::auth::is_hub_token(state.door(), token))
+    {
         return (
             StatusCode::UNAUTHORIZED,
             Json(serde_json::json!({"error": "unauthorized"})),
@@ -9132,6 +9131,23 @@ async fn pair_revoke_device(
     }
 }
 
+/// The paired device whose token is the request's bearer. A pairing-store
+/// failure is 503: the token's validity is unknown, and the client retries.
+async fn paired_bearer(
+    state: &GatewayState,
+    headers: &axum::http::HeaderMap,
+) -> Result<crate::auth::Paired, StatusCode> {
+    let token = header_bearer(headers).ok_or(StatusCode::UNAUTHORIZED)?;
+    crate::auth::admit_paired(state.door(), token)
+        .await
+        .map_err(|failure| match failure {
+            AuthFailure::StoreError => StatusCode::SERVICE_UNAVAILABLE,
+            AuthFailure::InvalidCredentials | AuthFailure::SurfaceRefused => {
+                StatusCode::UNAUTHORIZED
+            }
+        })
+}
+
 /// A device unpaired itself (Desk's "Disconnect"): only the device whose
 /// token the request carries.
 async fn pair_device_revoke_self(
@@ -9139,16 +9155,7 @@ async fn pair_device_revoke_self(
     State(state): State<Arc<GatewayState>>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     let pairing = state.device_pairing.as_ref().ok_or(StatusCode::NOT_FOUND)?;
-    let token = headers
-        .get("authorization")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "))
-        .ok_or(StatusCode::UNAUTHORIZED)?;
-    let (device, _) = pairing
-        .validate_token_with_match_async(token.to_string())
-        .await
-        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?
-        .ok_or(StatusCode::UNAUTHORIZED)?;
+    let device = paired_bearer(&state, &headers).await?.device;
     let owner = state
         .identity_store
         .as_ref()
@@ -9221,21 +9228,11 @@ async fn pair_device_rotate_self(
     State(state): State<Arc<GatewayState>>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     let pairing = state.device_pairing.as_ref().ok_or(StatusCode::NOT_FOUND)?;
-
-    let token = headers
-        .get("authorization")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "))
-        .ok_or(StatusCode::UNAUTHORIZED)?;
-
-    let (device, kind) = pairing
-        .validate_token_with_match_async(token.to_string())
-        .await
-        // 503 like every other pairing-store failure: the token's validity
-        // is unknown, and the client should retry rather than treat it as
-        // a rotation failure.
-        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?
-        .ok_or(StatusCode::UNAUTHORIZED)?;
+    let crate::auth::Paired {
+        device,
+        token_match: kind,
+        ..
+    } = paired_bearer(&state, &headers).await?;
 
     if !crate::jwt::has_scope(&device.scopes, crate::jwt::SCOPE_PAIR) {
         return Err(StatusCode::FORBIDDEN);
@@ -9273,13 +9270,11 @@ pub(crate) fn check_owner_auth(
     headers: &axum::http::HeaderMap,
     query_token: Option<&str>,
 ) -> bool {
-    let admitted = |token| crate::auth::admit_signed(state.door(), token).and_then(Result::ok);
-    query_token
-        .and_then(admitted)
-        .is_some_and(|a| a.kind == crate::auth::CredentialKind::StaticToken)
+    query_token.is_some_and(|token| crate::auth::is_hub_token(state.door(), token))
         || header_bearer(headers)
-            .and_then(admitted)
-            .is_some_and(|a| a.claims.role.can_manage_system())
+            .and_then(|token| crate::auth::admit_signed(state.door(), token))
+            .and_then(Result::ok)
+            .is_some_and(|admitted| admitted.claims.role.can_manage_system())
 }
 
 /// Choose the audit actor for an admin-surface vault write.

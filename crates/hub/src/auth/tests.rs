@@ -51,6 +51,7 @@ struct Person {
 struct Hub {
     state: Arc<GatewayState>,
     identities: Arc<dyn IdentityStore>,
+    devices: Arc<workforce_pairing::SqlitePairingStore>,
     people: Vec<Person>,
 }
 
@@ -98,6 +99,7 @@ async fn hub() -> Hub {
             ..state
         }),
         identities: fixture.identities,
+        devices,
         people,
     }
 }
@@ -404,4 +406,142 @@ async fn a_refresh_on_the_public_surface_cannot_widen_a_token() {
         jwt::validate_token(&state.config.surface_key(Surface::Public), &refreshed).unwrap();
     assert_eq!(claims.role, IdentityRole::Member);
     assert_eq!(claims.scopes, jwt::scopes_for_role(IdentityRole::Member));
+}
+
+#[tokio::test]
+async fn the_hub_token_is_the_static_token_only_where_the_surface_takes_it() {
+    let hub = hub().await;
+    let takes = |surface, peer, token: &str| {
+        let door = hub.state.door();
+        let token = token.to_string();
+        Arrival::new(surface, peer).scope(async move { is_hub_token(door, &token) })
+    };
+    let loopback = Some(IpAddr::V4(Ipv4Addr::LOCALHOST));
+    let remote = Some(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7)));
+    assert!(takes(Surface::Combined, None, STATIC_TOKEN).await);
+    assert!(takes(Surface::Admin, loopback, STATIC_TOKEN).await);
+    assert!(!takes(Surface::Admin, remote, STATIC_TOKEN).await);
+    assert!(!takes(Surface::Public, loopback, STATIC_TOKEN).await);
+    for other in [
+        "gateway-toke",
+        "",
+        hub.people[0].jwt.as_str(),
+        hub.people[0].device.as_str(),
+    ] {
+        assert!(!takes(Surface::Combined, None, other).await, "{other}");
+    }
+}
+
+#[tokio::test]
+async fn a_paired_device_is_admitted_held_to_its_surface_and_refused_on_the_admin_surface() {
+    let hub = hub().await;
+    let token = format!("wfp_{}", uuid::Uuid::new_v4().simple());
+    let device = workforce_pairing::ApprovedDevice {
+        id: uuid::Uuid::new_v4().to_string(),
+        device_name: "desk".into(),
+        client_id: None,
+        scopes: vec![jwt::SCOPE_WILDCARD.to_string()],
+        token_hash: blake3::hash(token.as_bytes()).to_hex().to_string(),
+        created_at: chrono::Utc::now(),
+        last_used: None,
+        revoked: false,
+        expires_at: None,
+    };
+    workforce_pairing::PairingStore::register_device(hub.devices.as_ref(), &device).unwrap();
+    let paired = |surface| {
+        Arrival::new(surface, Some(IpAddr::V4(Ipv4Addr::LOCALHOST)))
+            .scope(admit_paired(hub.state.door(), &token))
+    };
+
+    let combined = paired(Surface::Combined).await.unwrap();
+    assert_eq!(combined.ceiling, Ceiling::Full);
+    assert_eq!(combined.token_match, TokenMatch::Current);
+    assert_eq!(combined.device.scopes, device.scopes);
+
+    let public = paired(Surface::Public).await.unwrap();
+    assert_eq!(public.ceiling, Ceiling::Member);
+    assert_eq!(
+        public.device.scopes,
+        jwt::scopes_for_role(IdentityRole::Member)
+    );
+
+    assert_eq!(
+        paired(Surface::Admin).await.map(|p| p.ceiling),
+        Err(AuthFailure::SurfaceRefused)
+    );
+    for not_a_device in [STATIC_TOKEN, hub.people[0].jwt.as_str()] {
+        assert_eq!(
+            admit_paired(hub.state.door(), not_a_device)
+                .await
+                .map(|p| p.ceiling),
+            Err(AuthFailure::InvalidCredentials)
+        );
+    }
+}
+
+#[tokio::test]
+async fn only_a_device_token_reaches_a_device_route_and_not_on_the_admin_surface() {
+    let hub = hub().await;
+    let device = bearer(&hub.people[0].device);
+    let on = |surface, headers: axum::http::HeaderMap| {
+        let state = Arc::clone(&hub.state);
+        Arrival::new(surface, Some(IpAddr::V4(Ipv4Addr::LOCALHOST))).scope(async move {
+            crate::api_handlers::remote_mcp_tokens::paired_device(&state, &headers)
+                .await
+                .map(|(_, person)| person)
+                .map_err(|(status, _)| status)
+        })
+    };
+    assert_eq!(
+        on(Surface::Combined, device.clone()).await,
+        Ok(hub.people[0].identity.id)
+    );
+    assert_eq!(
+        on(Surface::Admin, device).await,
+        Err(axum::http::StatusCode::FORBIDDEN)
+    );
+    assert_eq!(
+        on(Surface::Combined, bearer(STATIC_TOKEN)).await,
+        Err(axum::http::StatusCode::FORBIDDEN)
+    );
+}
+
+#[tokio::test]
+async fn a_token_minted_before_scopes_is_unrestricted_on_a_socket_only_under_the_full_ceiling() {
+    let hub = hub().await;
+    let admin = &hub.people[0].identity;
+    let legacy = jwt::refresh_token(
+        hub.state.jwt_config.as_ref().unwrap(),
+        &Claims {
+            sub: admin.display_name.clone(),
+            role: IdentityRole::SystemAdmin,
+            identity_id: Some(admin.id.to_string()),
+            iat: 0,
+            exp: 0,
+            scopes: Vec::new(),
+            device_id: None,
+        },
+    )
+    .unwrap();
+    let socket = |surface| {
+        let state = Arc::clone(&hub.state);
+        let legacy = legacy.clone();
+        Arrival::new(surface, None).scope(async move {
+            crate::gateway::authenticate_ws(&state, &legacy)
+                .await
+                .map(|caller| (caller.scopes, caller.identity_role))
+                .map_err(|refused| refused.status())
+        })
+    };
+    assert_eq!(
+        socket(Surface::Combined).await,
+        Ok((None, "system_admin".to_string()))
+    );
+    assert_eq!(
+        socket(Surface::Public).await,
+        Ok((
+            Some(jwt::scopes_for_role(IdentityRole::Member)),
+            "member".to_string()
+        ))
+    );
 }

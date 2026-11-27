@@ -12,7 +12,7 @@ use subtle::ConstantTimeEq;
 use tracing::warn;
 use workforce_identity::store::IdentityStore;
 use workforce_identity::types::IdentityRole;
-use workforce_pairing::{DevicePairingService, TokenMatch};
+use workforce_pairing::{ApprovedDevice, DevicePairingService, TokenMatch};
 
 use crate::authz::Ceiling;
 use crate::gateway::{AuthFailure, GatewayState};
@@ -77,6 +77,14 @@ pub(crate) struct Admitted {
     pub kind: CredentialKind,
 }
 
+/// An admitted paired device, its scopes already held to `ceiling`.
+#[derive(Debug, Clone)]
+pub(crate) struct Paired {
+    pub device: ApprovedDevice,
+    pub token_match: TokenMatch,
+    pub ceiling: Ceiling,
+}
+
 /// What a credential of `kind` may be on the surface it arrived by. The
 /// combined surface caps nothing, as a hub with one listener always has; the
 /// public surface holds everyone to a member and refuses the static token;
@@ -130,7 +138,9 @@ pub(crate) fn admit_signed(door: Door<'_>, token: &str) -> Option<Result<Admitte
     }))
 }
 
-async fn admit_device(door: Door<'_>, token: &str) -> Result<Admitted, AuthFailure> {
+/// [`admit`] for the routes only a paired device may call: the static token
+/// and JWTs are not taken here.
+pub(crate) async fn admit_paired(door: Door<'_>, token: &str) -> Result<Paired, AuthFailure> {
     let pairing = door.pairing.ok_or(AuthFailure::InvalidCredentials)?;
     let (device, token_match) = pairing
         .validate_token_with_match_async(token.to_string())
@@ -144,24 +154,54 @@ async fn admit_device(door: Door<'_>, token: &str) -> Result<Admitted, AuthFailu
             AuthFailure::StoreError
         })?
         .ok_or(AuthFailure::InvalidCredentials)?;
-    let kind = CredentialKind::Device(token_match);
-    let ceiling = ceiling(crate::surface::current(), kind)?;
+    let ceiling = ceiling(
+        crate::surface::current(),
+        CredentialKind::Device(token_match),
+    )?;
+    Ok(Paired {
+        device: ApprovedDevice {
+            scopes: jwt::capped_scopes(device.scopes, ceiling),
+            ..device
+        },
+        token_match,
+        ceiling,
+    })
+}
+
+/// Whether `token` is the hub's own static token, on a surface that takes it.
+pub(crate) fn is_hub_token(door: Door<'_>, token: &str) -> bool {
+    admit_signed(door, token)
+        .and_then(Result::ok)
+        .is_some_and(|admitted| admitted.kind == CredentialKind::StaticToken)
+}
+
+/// Whether `headers` carry the hub's own static token as their bearer, on a
+/// surface that takes it.
+pub(crate) fn bears_hub_token(door: Door<'_>, headers: &axum::http::HeaderMap) -> bool {
+    crate::gateway::header_bearer(headers).is_some_and(|token| is_hub_token(door, token))
+}
+
+async fn admit_device(door: Door<'_>, token: &str) -> Result<Admitted, AuthFailure> {
+    let Paired {
+        device,
+        token_match,
+        ceiling,
+    } = admit_paired(door, token).await?;
     let identity_id = door
         .identities
         .and_then(|store| crate::device_link::identity_for_device(store.as_ref(), &device.id));
-    let claims = Claims {
-        sub: device.device_name,
-        role: IdentityRole::Member,
-        identity_id,
-        iat: 0,
-        exp: u64::MAX,
-        scopes: device.scopes,
-        device_id: Some(device.id),
-    };
     Ok(Admitted {
-        claims: jwt::capped(claims, ceiling),
+        claims: Claims {
+            sub: device.device_name,
+            role: IdentityRole::Member,
+            identity_id,
+            iat: 0,
+            exp: u64::MAX,
+            scopes: device.scopes,
+            device_id: Some(device.id),
+        },
         ceiling,
-        kind,
+        kind: CredentialKind::Device(token_match),
     })
 }
 

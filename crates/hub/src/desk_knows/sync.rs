@@ -841,15 +841,13 @@ async fn holder(
         }
         None => {}
     }
-    let holds =
-        crate::desk_floor::holds_the_hub(state.identity_store.as_ref(), true, caller.holder());
-    let Some(person) = caller.identity_id else {
+    let Some(person) = caller.identity_id.clone() else {
         return Err(refusal(
             StatusCode::FORBIDDEN,
             "What Desk shares is a person's: ask as yourself, not as the hub",
         ));
     };
-    if !holds {
+    if !crate::desk_floor::holds_the_hub(state.identity_store.as_ref(), true, caller.holder()) {
         return Err(refusal(
             StatusCode::FORBIDDEN,
             "Only the person whose Desk this is links its agents",

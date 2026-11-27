@@ -261,17 +261,26 @@ fn with_current_role(claims: Claims, role: IdentityRole) -> Claims {
 
 /// `claims` held to `ceiling`: under [`Ceiling::Member`], the member role
 /// and no scope the member role lacks.
-pub(super) fn capped(claims: Claims, ceiling: Ceiling) -> Claims {
+fn capped(claims: Claims, ceiling: Ceiling) -> Claims {
     match ceiling {
         Ceiling::Full => claims,
         Ceiling::Member => Claims {
             role: IdentityRole::Member,
-            scopes: scopes_for_role(IdentityRole::Member)
-                .into_iter()
-                .filter(|scope| has_scope(&claims.scopes, scope))
-                .collect(),
+            scopes: capped_scopes(claims.scopes, ceiling),
             ..claims
         },
+    }
+}
+
+/// `scopes` held to `ceiling`: under [`Ceiling::Member`], only those the
+/// member role has, so a wildcard becomes the member scopes.
+pub(super) fn capped_scopes(scopes: Vec<String>, ceiling: Ceiling) -> Vec<String> {
+    match ceiling {
+        Ceiling::Full => scopes,
+        Ceiling::Member => scopes_for_role(IdentityRole::Member)
+            .into_iter()
+            .filter(|scope| has_scope(&scopes, scope))
+            .collect(),
     }
 }
 

@@ -13,7 +13,7 @@ use workforce_identity::remote_mcp_token::{RemoteMcpToken, TokenScope};
 
 use super::identity::{require_auth, require_roles_assign};
 use super::my_settings::enforce_action_rate_limit;
-use crate::gateway::GatewayState;
+use crate::gateway::{AuthFailure, GatewayState};
 use crate::remote_mcp::tokens::{is_expired, RemoteMcpTokenService, TokenError};
 
 type Rejection = (StatusCode, Json<serde_json::Value>);
@@ -233,31 +233,27 @@ pub(crate) async fn paired_device(
     state: &GatewayState,
     headers: &HeaderMap,
 ) -> Result<(workforce_pairing::ApprovedDevice, Uuid), Rejection> {
-    let bearer = headers
-        .get(axum::http::header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|h| h.strip_prefix("Bearer "))
+    let bearer = crate::gateway::header_bearer(headers)
         .ok_or_else(|| err(StatusCode::UNAUTHORIZED, "Unauthorized"))?;
-    let pairing = state.device_pairing.as_ref().ok_or_else(|| {
-        err(
+    if state.device_pairing.is_none() {
+        return Err(err(
             StatusCode::FORBIDDEN,
             "This endpoint takes a paired device's token",
-        )
-    })?;
-    let device = match pairing.validate_token_async(bearer.to_string()).await {
-        Ok(Some(device)) => device,
-        Ok(None) => {
+        ));
+    }
+    let device = match crate::auth::admit_paired(state.door(), bearer).await {
+        Ok(paired) => paired.device,
+        Err(AuthFailure::InvalidCredentials | AuthFailure::SurfaceRefused) => {
             return Err(err(
                 StatusCode::FORBIDDEN,
                 "This endpoint takes a paired device's token",
             ))
         }
-        Err(e) => {
-            tracing::warn!(error = %e, "pairing store error minting a device's remote MCP token");
+        Err(AuthFailure::StoreError) => {
             return Err(err(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "the hub could not check that device",
-            ));
+            ))
         }
     };
     let person = state

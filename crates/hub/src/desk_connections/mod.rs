@@ -2513,18 +2513,17 @@ async fn person(
         }
         None => {}
     }
-    let holds = crate::desk_floor::holds_the_hub(
-        routes.state.identity_store.as_ref(),
-        true,
-        caller.holder(),
-    );
-    let Some(person) = caller.identity_id else {
+    let Some(person) = caller.identity_id.clone() else {
         return Err(refusal(
             StatusCode::FORBIDDEN,
             "Connections are a person's: ask as yourself, not as the hub",
         ));
     };
-    if !holds {
+    if !crate::desk_floor::holds_the_hub(
+        routes.state.identity_store.as_ref(),
+        true,
+        caller.holder(),
+    ) {
         return Err(refusal(
             StatusCode::FORBIDDEN,
             "Only the person whose Desk this is keeps its connections",

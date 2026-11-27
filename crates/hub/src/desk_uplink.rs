@@ -189,7 +189,7 @@ fn not_native(s: &Api, h: &HeaderMap, q: &TokenQuery) -> Option<Response> {
                 .into_response(),
         );
     }
-    (!bearer_is_ours(s, h)).then(|| {
+    (!crate::auth::bears_hub_token(s.state.door(), h)).then(|| {
         (
             StatusCode::FORBIDDEN,
             Json(json!({"error": "only Desk itself holds boss links, with the hub's own token"})),
@@ -405,7 +405,7 @@ async fn forget(
 /// an agent, a session, a member or another device. From the
 /// `Authorization` header alone, as every route here.
 async fn not_the_holders(s: &Api, h: &HeaderMap, q: &TokenQuery) -> Option<Response> {
-    if q.token.is_some() || bearer_is_ours(s, h) {
+    if q.token.is_some() || crate::auth::bears_hub_token(s.state.door(), h) {
         return not_native(s, h, q);
     }
     let refused = |status: StatusCode, why: &str| {
@@ -435,18 +435,6 @@ async fn not_the_holders(s: &Api, h: &HeaderMap, q: &TokenQuery) -> Option<Respo
         );
     }
     refused(StatusCode::UNAUTHORIZED, "not allowed")
-}
-
-/// Whether the request's bearer is the hub's own token, compared in
-/// constant time; an empty one is never it.
-fn bearer_is_ours(s: &Api, h: &HeaderMap) -> bool {
-    h.get(axum::http::header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "))
-        .is_some_and(|given| {
-            !s.state.auth_token.is_empty()
-                && crate::auth::constant_time_token_eq(given, &s.state.auth_token)
-        })
 }
 
 /// This engine's public key, made the first time. Desk's native side asks
