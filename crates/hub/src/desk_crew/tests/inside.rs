@@ -184,6 +184,105 @@ async fn every_facet_is_fenced_and_names_no_secret() {
     .await;
 }
 
+/// crew.history and crew.inside read a session's own transcript: its
+/// prompt, the call it made and its reply, fenced, newest first. Where
+/// Desk can't read one, or it has nothing in it yet, crew.history gives
+/// its screen instead, saying why.
+#[tokio::test(flavor = "multi_thread")]
+async fn crew_history_and_inside_read_its_transcript_and_its_screen_only_without_one() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        let (overseer, llm) = agent(home, "desk", "ok").await;
+        write_config(&overseer, "[oversight]\nenabled = true\nlevel = \"act\"\n");
+        let cli = fake_cli(home);
+        let mut opts = options(home, cli.clone(), cli);
+        opts.env
+            .insert("HOME".into(), home.to_string_lossy().into_owned());
+        let floor = workforce_desk::Floor {
+            redactor: Some(Arc::new(Hides)),
+            ..Default::default()
+        };
+        let d = desk_on(pool, opts, floor).await;
+        CrewHub::start(
+            hub(&[Arc::clone(&overseer)]),
+            d.clone(),
+            FAST,
+            CancellationToken::new(),
+        );
+        eventually("the overseer's tools", async || {
+            overseer.tools.has("crew.history").then_some(())
+        })
+        .await;
+        let history = async |id: uuid::Uuid| {
+            let r = overseer
+                .tools
+                .get("crew.history")
+                .unwrap()
+                .execute(json!({"session_id": id.to_string()}))
+                .await
+                .unwrap();
+            assert!(r.success, "{r:?}");
+            r.output["session"].as_str().unwrap().to_string()
+        };
+
+        let unread = new_session(&d, home, "acme-api").await;
+        let said = history(unread.id).await;
+        assert!(said.starts_with("<<<EXTERNAL_UNTRUSTED_CONTENT_"), "{said}");
+        assert!(said.contains("\"transcript_unread\""), "{said}");
+        assert!(said.contains("\"terminal\""), "{said}");
+
+        let s = new_session(&d, home, "acme-web").await;
+        let project = home.join(".claude/projects/-acme-web");
+        std::fs::create_dir_all(&project).unwrap();
+        let transcript = project.join("cc-acme-web.jsonl");
+        std::fs::write(&transcript, "").unwrap();
+        hook(
+            &hook_url(home, s.id).await,
+            json!({"hook_event_name": "SessionStart", "session_id": "cc-acme-web",
+                "transcript_path": transcript}),
+        )
+        .await;
+        eventually("its transcript", async || {
+            d.view(s.id)
+                .ok()
+                .filter(|v| v.cli_session_id.as_deref() == Some("cc-acme-web"))
+        })
+        .await;
+        // Nothing in it yet: its screen, and why.
+        let said = history(s.id).await;
+        assert!(said.contains("\"transcript_unread\""), "{said}");
+        assert!(said.contains("\"terminal\""), "{said}");
+        std::fs::write(
+            &transcript,
+            include_str!("../../../../desk/fixtures/ledger/claude.jsonl"),
+        )
+        .unwrap();
+        let said = history(s.id).await;
+        assert!(said.contains("\"transcript_newest_first\""), "{said}");
+        for seen in [
+            "Fix the login race in acme-web",
+            "cargo test",
+            "The race is fixed and the tests pass.",
+        ] {
+            assert!(said.contains(seen), "{seen}: {said}");
+        }
+        assert!(!said.contains("\"terminal\""), "{said}");
+        let inside = inside(
+            &overseer,
+            json!({"session_id": s.id.to_string(), "facet": "transcript"}),
+        )
+        .await;
+        let page = inside.output["transcript"].as_str().unwrap();
+        assert!(
+            page.contains("cargo test") && page.contains("The race is fixed"),
+            "{page}"
+        );
+        drop(llm);
+    })
+    .await;
+}
+
 /// A wait said in output Desk found no process of the session's writing
 /// is never stuck: once nothing moves under it, the boss is only told to
 /// look, as for a remote command.
