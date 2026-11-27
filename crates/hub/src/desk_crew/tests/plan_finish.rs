@@ -3,15 +3,17 @@
 //! Desk paused it, are seen on a runner pass; its closing summary is said
 //! once; a plan the person paused is never finished under them; a boss
 //! that only watches has it finished by Desk, in Desk's words; and the
-//! boss ends or removes one only on the person's own words, a finished one
-//! listed on its board as finished.
+//! boss ends or removes one only on the person's own words asking for it,
+//! or their plain reply to its question, a finished one listed on its board
+//! as finished; and one whose finish was refused (a ticket reopened during
+//! its closing turn) is finished on a later pass once settled again.
 
 use super::*;
 use workforce_desk::board::TicketState;
 use workforce_desk::plan::{Paused, PlanState};
 
 use super::decides_at_once::said;
-use super::goals::run;
+use super::goals::{boss_says, run};
 use super::plans::{hub_with, person_says, proposed, ACTS};
 
 const WATCHES: &str = "[oversight]\nenabled = true\nlevel = \"watch\"\n";
@@ -234,6 +236,124 @@ async fn the_boss_ends_and_removes_a_plan_only_on_the_persons_own_words() {
             assert!(d.ticket(t).await.is_ok(), "its tickets are kept");
         }
         assert!(d.plan_tickets(id).await.unwrap().is_empty(), "as no plan's");
+    })
+    .await;
+}
+
+/// The boss's request for `key` (end or remove) of plan `id` on `said`.
+fn ending(id: uuid::Uuid, key: &str, said: &str) -> Value {
+    let mut input = json!({ "plan_id": id.to_string(), "why": "They asked." });
+    input[key] = json!({ "person_said": said });
+    input
+}
+
+/// Lets the next DM message land a moment later than the last.
+async fn then(boss: &AgentService, says: fn(&AgentService, &str), text: &str) {
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    says(boss, text);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_short_quote_ends_a_plan_only_as_the_persons_reply_to_the_bosss_question_about_it() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (overseer, state, d, _llm) = hub_with(dir.path(), pool, ACTS).await;
+        let first = proposed(&d, dir.path(), 1).await.summary.plan.id;
+        d.approve_plan(first, 1, &By::you()).await.unwrap();
+        let second = proposed(&d, dir.path(), 1).await.summary.plan.id;
+        d.approve_plan(second, 1, &By::you()).await.unwrap();
+        let _crew = CrewHub::start(state, d.clone(), FAST, CancellationToken::new());
+        eventually("the plan tools", async || {
+            overseer.tools.has("crew.plan_update").then_some(())
+        })
+        .await;
+        let running = async |id| d.plan(id).await.unwrap().summary.plan.state == PlanState::Running;
+
+        then(&overseer, person_says, "ok").await;
+        let r = run(&overseer, "crew.plan_update", ending(first, "end", "ok")).await;
+        assert!(!r.success, "a bare ok asks for nothing");
+        assert!(r.error.unwrap().contains("doesn't ask for the plan to end"));
+        then(&overseer, person_says, "the tests are green on main").await;
+        let r = run(
+            &overseer,
+            "crew.plan_update",
+            ending(first, "end", "the tests"),
+        )
+        .await;
+        assert!(!r.success, "words that don't ask for it");
+        assert!(running(first).await);
+
+        then(
+            &overseer,
+            boss_says,
+            "Every ticket is done. Shall I end the suite plan?",
+        )
+        .await;
+        then(&overseer, person_says, "yes").await;
+        let r = run(&overseer, "crew.plan_update", ending(first, "end", "yes")).await;
+        assert!(r.success, "{r:?}");
+        assert_eq!(
+            d.plan(first).await.unwrap().summary.plan.state,
+            PlanState::Dropped
+        );
+        let r = run(
+            &overseer,
+            "crew.plan_update",
+            ending(second, "end", "end the"),
+        )
+        .await;
+        assert!(!r.success, "too little of their words");
+        assert!(running(second).await);
+
+        then(&overseer, person_says, "end the Mantis bugs plan").await;
+        let r = run(
+            &overseer,
+            "crew.plan_update",
+            ending(second, "end", "end the Mantis bugs plan"),
+        )
+        .await;
+        assert!(r.success, "{r:?}");
+        assert_eq!(
+            d.plan(second).await.unwrap().summary.plan.state,
+            PlanState::Dropped
+        );
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_plan_whose_ticket_reopened_during_its_closing_turn_finishes_once_settled_again() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (_overseer, state, d, _llm) = hub_with(dir.path(), pool, ACTS).await;
+        let id = settled(&d, dir.path(), 2).await;
+        let ticket = d.plan(id).await.unwrap().tickets[0].ticket.ticket.id;
+        // Moved behind the crew's back, as a lagged event stream misses it.
+        let set = async |state| {
+            let mut t = d.store().ticket(ticket).await.unwrap().unwrap();
+            t.state = state;
+            d.store().put_ticket(&mut t).await.unwrap();
+        };
+        set(TicketState::Doing).await;
+        let crew = CrewHub::start(state, d.clone(), FAST, CancellationToken::new());
+        // Its closing turn ran while it was settled, and ends now it isn't.
+        assert!(crew.closing_started(id));
+        let p = d.plan(id).await.unwrap().summary.plan;
+        crew.close_plan(&p, Some("All done."), &By::desk("Every ticket is settled."))
+            .await;
+        assert_eq!(
+            p.state,
+            d.plan(id).await.unwrap().summary.plan.state,
+            "refused"
+        );
+        assert!(
+            !crew.goal_checks.lock().closing.contains(&id),
+            "its closing is over"
+        );
+
+        set(TicketState::Done).await;
+        crew.run_plans().await;
+        done(&d, id).await;
     })
     .await;
 }

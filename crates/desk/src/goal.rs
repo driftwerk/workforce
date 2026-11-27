@@ -975,9 +975,10 @@ pub enum Said {
     /// however short ("yes"), as does at least 2 words and 6 characters of
     /// a longer one.
     Answering,
-    /// Asking for something to be done, as ending or removing a plan: the
-    /// whole of one of their messages, or at least 2 words and 6 characters
-    /// of it, read as the request it is.
+    /// Asking, unprompted, for a plan to be ended or removed: at least 4
+    /// words and 15 characters of one message that say so ([`asks_to_end`]).
+    /// A shorter reply ("yes") counts only as the answer to the boss's own
+    /// question about it ([`replied_to_end`]).
     Asking,
 }
 
@@ -985,14 +986,14 @@ impl Said {
     /// The fewest words and characters a quote of part of a message has.
     pub fn floor(self) -> (usize, usize) {
         match self {
-            Self::Agreeing | Self::Answering | Self::Asking => (2, 6),
-            Self::Changing => (4, 15),
+            Self::Agreeing | Self::Answering => (2, 6),
+            Self::Changing | Self::Asking => (4, 15),
         }
     }
 
     /// Whether the whole of a message counts, however short.
     fn whole_counts(self) -> bool {
-        matches!(self, Self::Agreeing | Self::Answering | Self::Asking)
+        matches!(self, Self::Agreeing | Self::Answering)
     }
 }
 
@@ -1136,6 +1137,39 @@ pub fn stands_alone(text: &str) -> bool {
     let words = compared_words(text);
     let (least_words, least_chars) = Said::Changing.floor();
     words.len() >= least_words && words.join(" ").chars().count() >= least_chars
+}
+
+/// The words that ask for a plan to end or go: one of them in the
+/// person's words says it.
+const ENDING: [&str; 13] = [
+    "end", "ends", "ending", "stop", "drop", "remove", "finish", "finished", "close", "cancel",
+    "delete", "scrap", "wrap",
+];
+
+/// Whether `text` asks for a plan to be ended or removed: it names it so
+/// (end, stop, drop, remove, finish, close, cancel, delete, scrap, wrap).
+pub fn asks_to_end(text: &str) -> bool {
+    compared_words(text)
+        .iter()
+        .any(|w| ENDING.contains(&w.as_str()))
+}
+
+/// When the person's `quote` is their plain reply ("yes") to the boss's
+/// last message before it in `boss`, which asked them about ending or
+/// removing the plan ([`asks_to_end`]): as [`replied_to`] reads a reply.
+pub fn replied_to_end(
+    theirs: &[(DateTime<Utc>, String)],
+    boss: &[(DateTime<Utc>, String)],
+    quote: &str,
+    since: DateTime<Utc>,
+) -> Result<DateTime<Utc>, NotReplied> {
+    let at = replied_to(theirs, boss, quote, &[], since)?;
+    boss.iter()
+        .filter(|(when, _)| *when < at)
+        .max_by_key(|(when, _)| *when)
+        .filter(|(_, asked)| asks_to_end(asked))
+        .map(|_| at)
+        .ok_or(NotReplied::NothingProposed)
 }
 
 /// Whether the person's message `text` holds `goal` in their own words:

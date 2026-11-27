@@ -255,6 +255,7 @@ impl CrewHub {
             out.push_str("No ticket is ready, being done or blocked.");
         }
         let count = |c: Column| counts.get(&c).copied().unwrap_or(0);
+        let (plans, finished_plans) = self.plans_seen(seen).await;
         Ok(json!({
             "counts": {
                 "ready": count(Column::Ready),
@@ -262,34 +263,28 @@ impl CrewHub {
                 "blocked": count(Column::Blocked),
             },
             "table": reported(&out, "the board's tickets"),
-            "plans": self.plans_seen(seen).await,
-            "finished_plans": self.finished_plans_seen(seen).await,
+            "plans": plans,
+            "finished_plans": finished_plans,
         }))
     }
 
-    /// The plans `seen` sees, finished or not as `finished` says.
-    async fn seen_plans(&self, seen: &Seen, finished: bool) -> Vec<workforce_desk::PlanSummary> {
+    /// The plans `seen` sees, read once: those that haven't ended, with
+    /// where they stand, and those done or ended, still on the board until
+    /// removed (`crew.plan_update` remove).
+    pub(super) async fn plans_seen(&self, seen: &Seen) -> (Value, Value) {
         use workforce_desk::plan::PlanState;
-        match self.desk.plans(None, None).await {
-            Ok(plans) => plans
-                .into_iter()
-                .filter(|s| seen.sees(s.plan.group.as_deref()))
-                .filter(|s| {
-                    matches!(s.plan.state, PlanState::Done | PlanState::Dropped) == finished
-                })
-                .collect(),
+        let plans = match self.desk.plans(None, None).await {
+            Ok(p) => p,
             Err(e) => {
                 tracing::warn!(error = %e, "reading the plans for the overseer failed");
-                Vec::new()
+                return (json!([]), json!([]));
             }
-        }
-    }
-
-    /// The plans `seen` sees that haven't ended, with where they stand.
-    pub(super) async fn plans_seen(&self, seen: &Seen) -> Value {
-        let shown: Vec<Value> = self
-            .seen_plans(seen, false)
-            .await
+        };
+        let (finished, going): (Vec<_>, Vec<_>) = plans
+            .into_iter()
+            .filter(|s| seen.sees(s.plan.group.as_deref()))
+            .partition(|s| matches!(s.plan.state, PlanState::Done | PlanState::Dropped));
+        let going: Vec<Value> = going
             .into_iter()
             .map(|s| {
                 json!({
@@ -303,15 +298,7 @@ impl CrewHub {
                 })
             })
             .collect();
-        json!(shown)
-    }
-
-    /// The plans `seen` sees that are done or ended, still on the board
-    /// until removed (`crew.plan_update` remove).
-    async fn finished_plans_seen(&self, seen: &Seen) -> Value {
-        let shown: Vec<Value> = self
-            .seen_plans(seen, true)
-            .await
+        let finished: Vec<Value> = finished
             .into_iter()
             .map(|s| {
                 json!({
@@ -321,7 +308,7 @@ impl CrewHub {
                 })
             })
             .collect();
-        json!(shown)
+        (json!(going), json!(finished))
     }
 
     /// `line`, the wake for `session`'s turn ending, with its ticket if that

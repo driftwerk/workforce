@@ -1376,7 +1376,7 @@ async fn desk_posts(boss: &AgentService, text: &str) {
 }
 
 /// The boss writes `text` in its DM with the person.
-fn boss_says(boss: &AgentService, text: &str) {
+pub(super) fn boss_says(boss: &AgentService, text: &str) {
     let mut dm = boss
         .sessions
         .get_or_create(DESK_CHANNEL, PERSON, "desk")

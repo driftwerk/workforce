@@ -1156,3 +1156,33 @@ fn a_short_answer_or_agreement_counts_only_when_it_agrees_and_none_that_refuses(
         assert_eq!(by("Yes, that looks right to me"), Ok(at(4)), "{said:?}");
     }
 }
+
+#[test]
+fn a_plan_is_ended_on_the_persons_words_asking_for_it_or_their_reply_to_the_bosss_question() {
+    let said = |texts: &[(i64, &str)]| -> Vec<(DateTime<Utc>, String)> {
+        texts.iter().map(|(m, t)| (at(*m), t.to_string())).collect()
+    };
+    let theirs = said(&[
+        (1, "ok"),
+        (2, "the tests are green"),
+        (3, "Please end the Mantis bugs plan now"),
+    ]);
+    let asking = |quote: &str| said_by(&theirs, quote, at(-60), Said::Asking);
+    assert!(asks_to_end("end the Mantis bugs plan"));
+    assert!(!asks_to_end("ok") && !asks_to_end("the tests"));
+    assert_eq!(asking("end the Mantis bugs plan"), Ok(at(3)));
+    assert_eq!(asking("Please end the Mantis bugs plan now"), Ok(at(3)));
+    assert!(asking("ok").is_err(), "a short whole message isn't asking");
+    assert!(matches!(asking("end the"), Err(NotSaid::TooShort { .. })));
+
+    let boss = said(&[(4, "Every ticket is done. Shall I end the plan?")]);
+    let yes = said(&[(5, "yes")]);
+    assert_eq!(replied_to_end(&yes, &boss, "yes", at(-60)), Ok(at(5)));
+    let other = said(&[(4, "The tests are green. Shall I open the PR?")]);
+    assert_eq!(
+        replied_to_end(&yes, &other, "yes", at(-60)),
+        Err(NotReplied::NothingProposed),
+        "a yes to something else"
+    );
+    assert!(replied_to_end(&said(&[(5, "no")]), &boss, "no", at(-60)).is_err());
+}

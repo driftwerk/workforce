@@ -1,6 +1,7 @@
 //! Plans over HTTP, for the person: the list, one in full, their edit,
-//! pausing, resuming, moving to another group, dropping, ending and removing. Approving a plan, or turning down a
-//! change to one, is the hub holder's alone, through the Floor's
+//! pausing, resuming, moving to another group, dropping, ending and
+//! removing. Approving a plan, or turning down a change to one, is the hub
+//! holder's alone, through the Floor's
 //! `POST /api/desk/needs/decide` (`DecideRef::Plan`). A boss proposes and
 //! changes plans with its crew tools, never here.
 

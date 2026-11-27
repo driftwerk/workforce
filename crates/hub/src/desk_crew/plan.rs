@@ -13,8 +13,9 @@
 //! ticket is settled (seen on every runner pass, whatever was missed: it
 //! writes the closing summary and the plan is done, or with its goal not
 //! read met it may add work or ask the person first), and once after a
-//! restart, with what happened while the hub was down. Its sessions' own turn ends wake it as `[Desk work]` turns
-//! ([`super::work`]), as for any session it runs.
+//! restart, with what happened while the hub was down. Its sessions' own
+//! turn ends wake it as `[Desk work]` turns ([`super::work`]), as for any
+//! session it runs.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
@@ -257,8 +258,9 @@ them in your DM in the words you pass (or crew.ask_person with plan_id and propo
 their reply (person_said), a plain “yes” counting; record what \
 you report as done as facts, a judged part's progress as a checkpoint, and fix where a part is \
 read from with repair once its reads keep failing. When the person asks you to end a plan, \
-give end with their words (person_said): it stops, its tickets stay as they are and its sessions \
-working now carry on as theirs. When they ask to remove one, give remove the same way: a running \
+give end with their words asking for it (person_said: at least 4 words naming end, stop, drop, \
+remove, finish or close; or, to your own question whether to end it, their plain reply): it \
+stops, its tickets stay as they are and its sessions working now carry on as theirs. When they ask to remove one, give remove the same way: a running \
 one is ended first, and its tickets stay on the board as no plan's; crew.board lists finished \
 ones as finished_plans. Either goes in a call of its own. Say why.";
 
@@ -2050,9 +2052,10 @@ impl CrewHub {
                 return;
             }
         };
-        // Its boss asked the person about it: their answer comes first.
+        // Its goal not read met, its boss's turn comes first: once the
+        // person answered its question, and its pause lifted.
         let waits = closing == Some(Closing::AfterTurn)
-            && self.desk.store().plan_asks_open(p.id).await.unwrap_or(true);
+            && (waits_for_lift(p) || self.desk.store().plan_asks_open(p.id).await.unwrap_or(true));
         if closing.is_none() || waits || !self.closing_started(p.id) {
             return;
         }
@@ -2086,6 +2089,7 @@ impl CrewHub {
     /// Forgets what the hub keeps of plan `id`, ended or removed.
     async fn forget_plan(&self, id: Uuid) {
         self.goal_checks_forget(id);
+        self.plan_waiting.lock().retain(|_, (plan, ..)| *plan != id);
         let failed = {
             let mut failed = self.plan_failed.lock();
             let was = failed.len();
@@ -3219,15 +3223,24 @@ impl CrewHub {
             None => "Every ticket is settled.".to_string(),
         };
         // Its boss takes no turn for it (none oversees it, it only watches,
-        // has no person, or Desk's breaker holds it): a finished plan is
-        // finished by Desk, in Desk's words.
+        // has no person, or Desk's breaker holds it), nor closes it past a
+        // budget: a finished plan is finished by Desk, in Desk's words. One
+        // whose goal isn't read met waits for the person's answer to its
+        // boss's question, or for its pause to lift.
+        let turnless = closing.is_some() && waits_for_lift(&p);
         let turn = boss
-            .filter(|_| self.desk.agent_held(&p.boss).is_none())
+            .filter(|_| !turnless && self.desk.agent_held(&p.boss).is_none())
             .and_then(|(service, o)| self.person(Some(&service)).map(|owner| (service, o, owner)));
         let Some((service, o, owner)) = turn else {
-            if closing.is_some() {
-                let by = By::desk(&format!("{ended} No turn of its boss's closes it."));
-                self.close_plan(&p, None, &by).await;
+            match closing {
+                Some(Closing::AfterTurn) if turnless || self.asked_about(id).await => {
+                    self.closing_over(id)
+                }
+                Some(_) => {
+                    let by = By::desk(&format!("{ended} No turn of its boss's closes it."));
+                    self.close_plan(&p, None, &by).await;
+                }
+                None => {}
             }
             return;
         };
@@ -3324,37 +3337,45 @@ impl CrewHub {
     /// with no question of its boss's about it waiting on the person.
     async fn nothing_came_of_it(&self, p: &Plan) -> bool {
         let still = match self.desk.plan(p.id).await {
-            Ok(now) => {
-                let tickets = self.desk.plan_tickets(p.id).await.unwrap_or_default();
-                plan::closing(&now.summary.plan, &tickets) == Some(Closing::AfterTurn)
-            }
-            Err(_) => false,
+            Ok(now) => self
+                .desk
+                .plan_closing(&now.summary.plan)
+                .await
+                .ok()
+                .flatten(),
+            Err(_) => None,
         };
-        if !still {
-            return false;
-        }
-        let asked = self.desk.store().plan_asks_open(p.id).await.unwrap_or(true);
+        still == Some(Closing::AfterTurn) && !self.asked_about(p.id).await
+    }
+
+    /// Whether a question of plan `id`'s boss about it waits on the person:
+    /// its plan, settled with its goal not read met, stays open for their
+    /// answer, as the log says.
+    async fn asked_about(&self, id: Uuid) -> bool {
+        let asked = self.desk.store().plan_asks_open(id).await.unwrap_or(true);
         if asked {
-            tracing::info!(plan = %p.id, "a settled plan whose goal isn't read met stays open: its boss asked the person about it");
+            tracing::info!(plan = %id, "a settled plan whose goal isn't read met stays open: its boss asked the person about it");
         }
-        !asked
+        asked
     }
 
     /// Finishes plan `p` as `by`, and when this made it Done tells the
     /// person once, in its boss's DM: `reply`, its boss's closing summary,
     /// or Desk's own words without one. Its finished sessions are then
-    /// looked at for closing.
-    async fn close_plan(&self, p: &Plan, reply: Option<&str>, by: &By) {
+    /// looked at for closing. Not made Done, its closing may start again.
+    pub(super) async fn close_plan(&self, p: &Plan, reply: Option<&str>, by: &By) {
         let done = match self.desk.finish_plan(p.id, by).await {
             Ok(Some(done)) => done,
-            Ok(None) => return,
+            // Done already, or refused (a ticket reopened meanwhile): a
+            // later pass closes it once nothing is left again.
+            Ok(None) => return self.closing_over(p.id),
             Err(e) => {
                 tracing::info!(plan = %p.id, error = %e, "a finished plan wasn't closed");
-                return;
+                return self.closing_over(p.id);
             }
         };
         tracing::info!(plan = %p.id, by = %by.party.name, "a plan finished");
-        if let Some((service, _)) = self.overseer_named(&p.boss) {
+        if let Some((service, _)) = self.overseer_named(&done.summary.plan.boss) {
             let words = reply
                 .filter(|r| !r.is_empty())
                 .map_or_else(|| finished_words(&done), str::to_string);
@@ -3483,6 +3504,16 @@ impl CrewHub {
         }
         out
     }
+}
+
+/// Whether plan `p` is paused for a budget (its own, its group's or its
+/// boss's): no boss turn closes it past one, so its goal not read met
+/// waits for the pause to lift.
+fn waits_for_lift(p: &Plan) -> bool {
+    matches!(
+        p.paused,
+        Some(plan::Paused::Budget | plan::Paused::BossHeld)
+    )
 }
 
 /// What Desk tells the person of `done`, finished with no closing

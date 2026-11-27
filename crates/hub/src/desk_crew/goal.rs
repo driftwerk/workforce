@@ -85,6 +85,9 @@ pub(super) fn not_said(quote: &str, why: NotSaid, said: Said) -> String {
     let q = crew::one_line(quote, 120);
     let ask = " Or ask them (crew.ask_person with plan_id and proposal) and pass their reply, which counts however short.";
     match (why, said) {
+        (NotSaid::TooShort { words, chars }, Said::Asking) => format!(
+            "“{q}” is too little of what the person wrote to end or remove a plan on its own: quote at least {words} words and {chars} characters of their message asking for it, exactly; or ask them in your DM whether to end it and pass their plain reply."
+        ),
         (NotSaid::TooShort { words, chars }, Said::Changing) => format!(
             "“{q}” is too little of what the person wrote to change their goal on its own: quote at least {words} words and {chars} characters of their message, exactly.{ask}"
         ),
@@ -692,21 +695,46 @@ impl CrewHub {
         })
     }
 
-    /// When the person asked, in `quote`, for what the boss `service` is
-    /// to do: their own words in its DM within a day, whole or in part.
+    /// When the person asked, in `quote`, for the boss `service`'s plan to
+    /// be ended or removed, within a day: their own words saying so
+    /// ([`Said::Asking`]), or their plain reply to its own question about
+    /// it ([`goal::replied_to_end`]).
     pub(super) fn asked_at(
         &self,
         service: &AgentService,
         quote: &str,
     ) -> Result<DateTime<Utc>, String> {
         let now = crew::now();
-        goal::said_by(
-            &self.person_words(service, now - WORDS_LOOKED),
-            quote,
-            now - AGREED_WITHIN,
-            Said::Asking,
-        )
-        .map_err(|e| not_said(quote, e, Said::Asking))
+        let since = now - AGREED_WITHIN;
+        if goal::asks_to_end(quote) {
+            return goal::said_by(
+                &self.person_words(service, now - WORDS_LOOKED),
+                quote,
+                since,
+                Said::Asking,
+            )
+            .map_err(|e| not_said(quote, e, Said::Asking));
+        }
+        let replies: Vec<_> = self
+            .person(Some(service))
+            .map(|person| super::orchestrator::dm_talks(service, &person, since, MESSAGES_READ))
+            .unwrap_or_default()
+            .iter()
+            .map(|talk| goal::replied_to_end(&talk.theirs, &talk.boss, quote, since))
+            .collect();
+        let q = crew::one_line(quote, 120);
+        match replies.iter().filter_map(|r| r.ok()).max() {
+            Some(at) => Ok(at),
+            None => Err(match replies.iter().find_map(|r| match r {
+                Err(NotReplied::Says(says)) => Some(*says),
+                _ => None,
+            }) {
+                Some(says) => not_yes(&q, says),
+                None => format!(
+                    "“{q}” doesn't ask for the plan to end or go: quote the person's own words that do, naming it (end, stop, drop, remove, finish, close), at least 4 words and 15 characters of one message; or ask them in your DM whether to end it and pass their plain reply."
+                ),
+            }),
+        }
     }
 
     /// The person's word for `applying`, a change to plan `p`'s goal, in

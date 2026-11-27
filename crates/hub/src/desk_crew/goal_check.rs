@@ -90,7 +90,7 @@ pub(crate) struct GoalChecks {
     /// Whether a look is under way: the next waits for it.
     looking: bool,
     /// The plans whose closing turn was started.
-    closing: HashSet<Uuid>,
+    pub(super) closing: HashSet<Uuid>,
     /// Each running goal's heads as it was agreed: kept (none), or last
     /// tried at, as GitHub couldn't be asked.
     heads: HashMap<Uuid, Option<DateTime<Utc>>>,

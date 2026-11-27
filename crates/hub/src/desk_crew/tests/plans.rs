@@ -1515,7 +1515,7 @@ async fn capped(d: &Desk, dir: &Path, n: usize, usd: f64) -> uuid::Uuid {
     id
 }
 
-fn proposal(dir: &Path, n: usize) -> NewPlan {
+pub(super) fn proposal(dir: &Path, n: usize) -> NewPlan {
     NewPlan {
         draft: Draft {
             goal: "Make the suite green".into(),
