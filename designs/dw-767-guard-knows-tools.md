@@ -37,6 +37,8 @@ Measured with a temporary harness (the hub's real composed registry from `serve:
 - Connector reads: every `aws.*` tool, `bank.*`, the `xero.*` and `freeagent.*` reads, the Google reads that aren't outside content (calendars, colours, free/busy, contacts, people, Drive listings and metadata, Docs/Slides/Sheets metadata, Gmail labels/drafts/filters/settings, Tasks, Chat space listings), `spotify.devices`, `spotify.now_playing`, the `obscura.*` looks.
 - Rightly held, but said vaguely: `xero.invoice_email`, the Google and Spotify writes, `obscura.click`/`fill`/`type`/…, `watch`, `know_how` `add`, `store`/`pipeline` writes, `github.clone`, `knowledge.index`, `subagent`, `investigate`, `coding.fanout`, `pairing.*` reads, the credential and setup flows.
 
+The person's own Desk arms the guard too. Every `desk_work.*` result and the `[DESK WORK]` digest are fenced with `wrap_external_content` (H/desk_knows/tools.rs `wrapped`), so after reading one of the person's own sessions their later calls are held (Allan, 25 Nov: `subagent` `list`, `view_attachment` `desk:<uuid>`, `advisor`, `compose_video` and a `notes` write, each "processing outside content (desk_work.session)").
+
 MCP servers' own tools (`mcp.<server>.<tool>`), WASM and external skills stay held: what a third-party server claims of its tools (`readOnlyHint`) is its own word.
 
 ## Decisions
@@ -79,11 +81,16 @@ MCP servers' own tools (`mcp.<server>.<tool>`), WASM and external skills stay he
 
    so a person reads what the tool might do and why they are asked.
 
+7. **The person's own Desk is theirs, not outside content.** `desk_knows::tools::wrapped` fences what it reads with `wrap_own_content` (read as data, never as instructions, arming nothing) and with `wrap_external_content` only when the text may carry outside content: it shows an exchange Desk flagged at harvest, it carries a fence of outside content (`monitor::carries_fence`, which `arm_if_fenced` now uses too), or `scan_for_injection` finds it suspicious. That result arms the turn as any fence does. The digest goes through the same rule.
+
+8. **A sub-agent is the agent's own work, guarded as the turn that spawned it.** `subagent` declares `Stays`. Its job runs detached, in a fresh turn, so `AgentJobConfig` gains `armed_by` (what armed the spawning turn's guard, captured by the `subagent` tool like `user_id`), and `ServiceAgentExecutor` runs a job with one under a guard armed by it (`armed_guard`). Every call the sub-agent makes is then held as the spawning turn's would be.
+
 ## Not changed
 
 - A monitor's turn: its tool set (`turn_tools`), its refusing guard and what it tells the owner.
 - What is held for a specific reason, and the order it is decided in.
-- `subagent`, `investigate` and `coding.fanout` stay held: the turns they start don't run under the caller's guard.
+- `investigate` and `coding.fanout` stay held: the turns they start don't run under the caller's guard.
+- A `notes` write after outside content is still held as persistence: what later turns trust. Reading the person's own Desk no longer arms the turn, so it isn't held there.
 - MCP, WASM and external skills' tools stay held.
 
 ## Tests
@@ -100,3 +107,6 @@ MCP servers' own tools (`mcp.<server>.<tool>`), WASM and external skills stay he
 - H (composed): `build_advisor_tools` under an armed turn's guard refuses a `web.fetch` of a URL the turn never saw.
 - R/tools/registry.rs: a connector write wrapped in `ConnectionWrite` answers `reach` as the tool it wraps.
 - S: `XeroTool`/`FreeAgentTool` reads declare `Reads` and writes (`xero.invoice_email`) don't; every `GoogleTool` `READS` name is a real Google tool and none is mutating (the `WRITE_OPS` check); `spotify.devices` reads and `spotify.play` doesn't.
+- H/desk_knows/tools.rs: each `desk_work.*` read of the person's own sessions leaves a guard unarmed; a transcript showing a flagged exchange arms it (`desk_work.transcript`); text carrying a fence, or reading like an injection, is fenced as outside content; the digest is own data.
+- H/subagent_tool.rs: a sub-agent spawned under an armed guard carries `armed_by` to its job; one spawned under none carries none.
+- H (composed): a sub-agent job with `armed_by` whose model asks for a `scheduler` `create` creates no job; after a web read, `subagent` (`list`, `spawn`), `view_attachment` (`desk:<uuid>`), `advisor` and `compose_video` (`segments: "none"`) run, and a `notes` `write_daily` is held as persistence.

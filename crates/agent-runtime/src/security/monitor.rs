@@ -24,6 +24,11 @@ pub const FENCE_MARK: &str = "<<<EXTERNAL_UNTRUSTED_CONTENT_";
 /// turn kept from then is armed by it as by a fence.
 const LEGACY_FENCE_MARK: &str = "<<<BEGIN MESSAGE CONTENT>>>";
 
+/// Whether `text` carries a fence of outside content.
+pub fn carries_fence(text: &str) -> bool {
+    text.contains(FENCE_MARK) || text.contains(LEGACY_FENCE_MARK)
+}
+
 /// The files that make up an agent's identity: what Desk and the API edit
 /// beside each other, and what a turn steered by outside content never
 /// rewrites.
@@ -860,7 +865,7 @@ impl ContentGuard {
     /// Arm when `text` carries a fence of outside content from `what`; its
     /// URLs are then ones the turn may open.
     pub fn arm_if_fenced(&self, text: &str, what: &str) {
-        if text.contains(FENCE_MARK) || text.contains(LEGACY_FENCE_MARK) {
+        if carries_fence(text) {
             self.read_outside(text, what);
         }
     }

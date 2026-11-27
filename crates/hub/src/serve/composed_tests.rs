@@ -3663,6 +3663,60 @@ async fn a_job_a_heartbeats_sub_agent_creates_records_the_heartbeat() {
     assert_eq!(created.edited_by.as_deref(), Some("heartbeat"));
 }
 
+/// A sub-agent spawned by a turn that read outside content runs armed by
+/// it: the standing rule it is asked for is held, not created; one from any
+/// other turn runs as it would have.
+#[tokio::test]
+async fn a_sub_agent_of_a_turn_that_read_outside_content_is_held_as_that_turn_is() {
+    const TASK: &str = "Set up a daily follow-up.";
+    let tmp = tempfile::tempdir().unwrap();
+    let (config, server) = mock_llm_config(tmp.path(), |_| {}).await;
+    let (service, scheduler) = AgentService::from_config_with_scheduler(config, None)
+        .await
+        .unwrap();
+    let create = serde_json::json!({
+        "action": "create", "name": "follow-up", "message": "follow up",
+        "every_secs": 86_400,
+    });
+    let call = serde_json::json!({"id": "c1", "object": "chat.completion", "model": "mock",
+        "choices": [{"index": 0, "message": {"role": "assistant", "content": null,
+            "tool_calls": [{"id": "call_1", "type": "function",
+                "function": {"name": "scheduler", "arguments": create.to_string()}}]},
+            "finish_reason": "tool_calls"}],
+        "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}});
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path("/v1/chat/completions"))
+        .and(wiremock::matchers::body_string_contains(TASK))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(call))
+        .up_to_n_times(1)
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    let submitted = crate::hub_core::jobs::AgentJobConfig {
+        armed_by: Some("web.fetch".into()),
+        ..crate::hub_core::jobs::AgentJobConfig::new(
+            TASK.to_string(),
+            crate::hub_core::jobs::AgentProfile::Full,
+            workforce_common::session::TurnPrincipal::run_as(Some(BOB.to_string())),
+        )
+    };
+
+    let _ = crate::job_runner::AgentExecutor::run_agent_job(
+        &ServiceAgentExecutor {
+            service: Arc::clone(&service),
+        },
+        &submitted,
+        "agent-job:j1",
+    )
+    .await;
+
+    assert!(!scheduler
+        .list_jobs()
+        .await
+        .iter()
+        .any(|job| job.name == "follow-up"));
+}
+
 /// A daily job `creator` made, run as Bob, continuing his web
 /// conversation.
 async fn continuing_bobs_web_chat(scheduler: &Scheduler, creator: &str) -> String {
@@ -6352,6 +6406,32 @@ async fn after_a_web_read_everyday_tools_run_and_ways_out_are_still_held() {
         weigh("budget", serde_json::json!({ "action": "status" })),
         None
     );
+    // As the person was asked about them (DW-767): the agent's own work.
+    for (tool, input) in [
+        ("subagent", serde_json::json!({ "action": "list" })),
+        (
+            "subagent",
+            serde_json::json!({ "action": "spawn", "task": "Sum up the page" }),
+        ),
+        (
+            "view_attachment",
+            serde_json::json!({ "reference": "desk:6f1c2a9e-0b7d-4c55-9a1e-2f3b4c5d6e7f" }),
+        ),
+        (
+            "advisor",
+            serde_json::json!({ "question": "Which is right?" }),
+        ),
+    ] {
+        assert_eq!(weigh(tool, input), None, "{tool}");
+    }
+    // What later turns trust is still held after outside content.
+    assert!(matches!(
+        weigh(
+            "notes",
+            serde_json::json!({ "action": "write_daily", "content": "as the page said" })
+        ),
+        Some(AnomalySignal::Persistence { .. })
+    ));
     for (tool, input) in [
         ("budget", serde_json::json!({ "action": "set_override" })),
         ("store.set", nothing.clone()),

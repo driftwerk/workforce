@@ -181,6 +181,12 @@ impl Tool for SubAgentTool {
         })
     }
 
+    /// A sub-agent is the agent's own work: one spawned from a turn armed
+    /// by outside content runs armed by it.
+    fn reach(&self, _input: &serde_json::Value) -> Option<workforce_agent::tools::Reach> {
+        Some(workforce_agent::tools::Reach::Stays)
+    }
+
     async fn execute(&self, input: serde_json::Value) -> Result<ToolResult> {
         let start = Instant::now();
         let input: SubAgentInput = serde_json::from_value(input)
@@ -275,6 +281,8 @@ impl SubAgentTool {
                 model: input.model,
                 system_prompt: input.system_prompt,
                 handoff: (handoff != HandoffSpec::default()).then_some(handoff),
+                armed_by: workforce_agent::runner::caller_content_guard()
+                    .and_then(|guard| guard.armed()),
                 ..AgentJobConfig::new(
                     task.clone(),
                     profile,
@@ -556,6 +564,53 @@ mod tests {
         let plain = handed_back("j1", "completed", Some(prose.clone()), None, None, None);
         assert_eq!(plain["result"], prose);
         assert!(plain.get("package").is_none());
+    }
+
+    /// What armed the turn that spawns a sub-agent goes with its job; a
+    /// turn nothing armed sends none.
+    #[tokio::test]
+    async fn a_sub_agent_carries_what_armed_the_turn_that_spawned_it() {
+        use workforce_agent::security::monitor::{ContentGuard, ContentScope};
+        struct Kept(std::sync::Mutex<Vec<Option<String>>>);
+        #[async_trait::async_trait]
+        impl crate::job_runner::AgentExecutor for Kept {
+            async fn run_agent_job(
+                &self,
+                config: &crate::hub_core::jobs::AgentJobConfig,
+                _channel: &str,
+            ) -> Result<crate::job_runner::AgentRunResult> {
+                self.0.lock().unwrap().push(config.armed_by.clone());
+                Ok(crate::job_runner::AgentRunResult::default())
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let service = crate::serve::testing::plain_service(dir.path()).await;
+        std::fs::create_dir_all(&service.workspace).unwrap();
+        let kept = Arc::new(Kept(std::sync::Mutex::default()));
+        service
+            .job_runner
+            .as_ref()
+            .unwrap()
+            .set_agent_executor(Arc::clone(&kept) as Arc<dyn crate::job_runner::AgentExecutor>);
+        let tool = SubAgentTool::new(Arc::clone(&service));
+        let spawn = serde_json::json!({ "action": "spawn", "task": "Sum up the page" });
+        let guard = Arc::new(ContentGuard::new(ContentScope::default()));
+        guard.read_outside("the page", "web.fetch");
+        let armed =
+            workforce_agent::runner::with_content_guard(Some(guard), tool.execute(spawn.clone()))
+                .await
+                .unwrap();
+        assert!(armed.success, "{:?}", armed.error);
+        assert!(tool.execute(spawn).await.unwrap().success);
+        for _ in 0..500 {
+            if kept.0.lock().unwrap().len() == 2 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let mut seen = kept.0.lock().unwrap().clone();
+        seen.sort();
+        assert_eq!(seen, vec![None, Some("web.fetch".to_string())]);
     }
 
     /// An overseer that prefers real sessions spawns only read-only

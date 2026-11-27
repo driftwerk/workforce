@@ -1774,6 +1774,31 @@ mod tests {
         }
     }
 
+    /// The video tools make the agent's own file: after a web read they run.
+    #[test]
+    fn the_video_tools_stay_with_the_agent_after_outside_content() {
+        use crate::security::monitor::{Call, ContentGuard, ContentScope};
+        let guard = ContentGuard::new(ContentScope::default());
+        guard.read_outside("the page", "web.fetch");
+        let agent_id = || "a".to_string();
+        let tools: [Box<dyn Tool>; 3] = [
+            Box::new(VideoComposeTool {
+                agent_id: agent_id(),
+            }),
+            Box::new(TrimVideoTool {
+                agent_id: agent_id(),
+            }),
+            Box::new(VideoToGifTool {
+                agent_id: agent_id(),
+            }),
+        ];
+        let input = serde_json::json!({ "segments": "none" });
+        for tool in &tools {
+            let call = Call::new(tool.name(), &input, None).told_by(tool.as_ref());
+            assert!(guard.check_call(&call).is_none(), "{}", tool.name());
+        }
+    }
+
     #[test]
     fn sniff_classifies_common_magics() {
         assert_eq!(sniff_ext(&[0x89, b'P', b'N', b'G', 0x0D]), "png");
