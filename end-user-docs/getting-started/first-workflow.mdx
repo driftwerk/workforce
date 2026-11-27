@@ -70,32 +70,33 @@ Keep this service running in the background. It provides the gateway for workflo
 Then, in another terminal, trigger the workflow. You must provide the required context field: `topic`.
 
 ```bash
-curl -X POST http://localhost:8080/api/v1/workflows/hello-world/run \
+curl -X POST http://localhost:8080/api/workflows/hello-world/run \
   -H "Content-Type: application/json" \
-  -d '{"topic": "Large Language Models"}'
+  -d '{"payload": {"topic": "Large Language Models"}}'
 ```
 
-If successful, the response will contain a unique `instance_id` for this workflow run. Copy this ID.
+The context fields go inside `payload`. If successful, the response contains a unique `instance_id` and `"status": "running"`. Copy the ID.
+{/* CURATOR: needs verification — default host/port and auth header for the gateway. */}
 
 ## 4. Check the Workflow Status
 
 You can view the status of your specific workflow instance using the instance ID:
 
 ```bash
-curl http://localhost:8080/api/v1/workflows/instances/{instance_id}
+workforce workflow status <instance_id>
 ```
 
-You can also list recent workflow instances:
+You can also list recent workflow instances, optionally filtered with `--status` (running, paused, completed, failed, exited) or `--workflow`:
 
 ```bash
-curl http://localhost:8080/api/v1/workflows/instances
+workforce workflow instances
 ```
 
 The service logs in the terminal running `workforce serve` will show each step's execution progress.
 
 ## 5. Understand the Workflow Output
 
-As the workflow runs, its state and results are saved. The `workflow get` command (or the API call) will show the detailed status, including the current step and any variables set.
+As the workflow runs, its state and results are saved. The `workforce workflow status <instance_id>` command shows the detailed status, including the current step and any variables set.
 
 The agent in each step will use available tools and knowledge to complete its task. Once both steps finish, the workflow status changes to `Completed`.
 
@@ -107,7 +108,7 @@ Our simple example is just the beginning. Here are common ways to enhance your w
 Use a step's `branches` field to create different paths based on the step's outcome. For example, you could check the quality of a summary and have the agent rewrite it if needed.
 
 ### Include a Human Approval Gate
-Add `pause = "awaiting human approval"` to a step. The workflow will stop there until you approve or reject it via the API (`POST /api/v1/workflows/instances/{instance_id}/resume` or `/reject`).
+Add `pause = "awaiting human approval"` to a step. The workflow will stop there until you approve or reject it via the API (`POST .../workflow-instances/{instance_id}/resume` or `/reject`).
 
 ### Route Steps to Different Agents
 If you have multiple agents configured, you can assign a specific agent to a step by adding `agent = "agent-name"` to the `[[step]]` block.
