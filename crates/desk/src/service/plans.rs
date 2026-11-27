@@ -899,6 +899,8 @@ impl Desk {
             paused: None,
             paused_why: None,
             paused_until: None,
+            paused_at: None,
+            paused_for: None,
             parallel: new.parallel,
             revision: 1,
             approved_revision: None,

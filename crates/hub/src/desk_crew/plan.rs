@@ -1997,6 +1997,7 @@ impl CrewHub {
         });
         match self.desk.plans(Some(PlanState::Paused), None).await {
             Ok(paused) => {
+                self.forget_asked(paused.iter().map(|s| &s.plan));
                 for s in paused {
                     if self.boss_of_plan(&s.plan).is_some() || !self.follow_group(&s.plan).await {
                         self.lift_hold(&s.plan).await;

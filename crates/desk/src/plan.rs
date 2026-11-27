@@ -44,10 +44,15 @@ pub fn limit_plan(key: &str) -> Option<Uuid> {
     key.strip_prefix(LIMIT_KEY)?.split(':').next()?.parse().ok()
 }
 
-/// The item asking the person about plan `plan`'s plan-limit pause until
-/// `until`: one each time the limit holds it, per window.
-pub fn limit_key(plan: Uuid, until: DateTime<Utc>) -> String {
-    format!("{}{}", limit_prefix(plan), until.timestamp())
+/// The item asking the person about plan `plan`'s plan-limit pause begun
+/// `since`, until `until`: one each pause, and each window it lasts into.
+pub fn limit_key(plan: Uuid, since: DateTime<Utc>, until: DateTime<Utc>) -> String {
+    format!(
+        "{}{}:{}",
+        limit_prefix(plan),
+        since.timestamp_micros(),
+        until.timestamp()
+    )
 }
 
 text_enum!(PlanState {
@@ -149,6 +154,12 @@ pub struct Plan {
     /// Until when it is paused, when that is known: the plan limit's window.
     #[serde(skip_serializing)]
     pub paused_until: Option<DateTime<Utc>>,
+    /// When its pause began.
+    #[serde(skip_serializing)]
+    pub paused_at: Option<DateTime<Utc>>,
+    /// The boss it was paused under.
+    #[serde(skip_serializing)]
+    pub paused_for: Option<String>,
     /// This plan's limit of sessions at once, when lower than its boss's.
     pub parallel: Option<i16>,
     /// Its newest revision.
@@ -206,6 +217,8 @@ impl Plan {
         self.paused = Some(why);
         self.paused_why = said;
         self.paused_until = until;
+        self.paused_at = Some(crate::crew::now());
+        self.paused_for = Some(self.boss.clone());
     }
 
     /// No longer paused, for any reason.
@@ -213,6 +226,25 @@ impl Plan {
         self.paused = None;
         self.paused_why = None;
         self.paused_until = None;
+        self.paused_at = None;
+        self.paused_for = None;
+    }
+
+    /// The item asking the person about its plan-limit pause, while the
+    /// limit pauses it.
+    pub fn limit_key(&self) -> Option<String> {
+        match self.paused {
+            Some(Paused::PlanLimit) => {
+                Some(limit_key(self.id, self.paused_at?, self.paused_until?))
+            }
+            _ => None,
+        }
+    }
+
+    /// Whether the limit paused it under a boss before its own: it was
+    /// passed on since.
+    pub fn paused_for_another(&self) -> bool {
+        self.paused_for.as_ref().is_some_and(|b| *b != self.boss)
     }
 
     /// Whether it may start sessions now, as far as the plan itself says.

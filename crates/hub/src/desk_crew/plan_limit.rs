@@ -3,14 +3,16 @@
 //! The plan guard holds a boss's own wakes while the plan they run on is at
 //! the person's limit. Each wake judged notes what the guard said of it
 //! ([`Noted`]); a plan whose boss's wakes are held pauses (`plan_limit`),
-//! the person is asked once, in plain words, whether to raise the limit,
+//! the person is asked once a pause, in plain words, whether to raise the limit,
 //! and the plan goes on, said, once the limit no longer holds its boss.
 //! Nothing is predicted: only a wake really held pauses a plan, and after a
 //! restart (nothing noted) a paused plan waits for its window to lapse.
 
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 
 use chrono::{DateTime, Duration, Utc};
+use uuid::Uuid;
 use workforce_desk::crew::{self, By};
 use workforce_desk::open_item::{ClosedBy, NewItem, OpenItem, OpenKind};
 use workforce_desk::open_item_store::Opened;
@@ -40,11 +42,11 @@ fn recent() -> Duration {
 }
 
 /// What the plan guard said of the bosses' own wakes, login by login, and
-/// the pauses whose end was said.
+/// the plans the limit pauses whose person was asked, by their ask's key.
 #[derive(Default)]
 pub(super) struct Noted {
     wakes: HashMap<String, Vec<Wake>>,
-    resumed: HashSet<String>,
+    asked: HashMap<Uuid, String>,
 }
 
 /// One of a boss's own wakes as the plan guard judged it: the plan login
@@ -80,7 +82,7 @@ enum Answer {
 
 /// What the person's answer to a plan-limit ask did to their limit.
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub(super) enum Kept {
+enum Kept {
     Raised(u8),
     /// Raised to no more than it already is: nothing changed.
     Already(f64),
@@ -306,30 +308,54 @@ impl CrewHub {
     }
 
     /// Whether the person's plan limit holds `p`'s boss: then `p` is paused
-    /// for it, and the person asked once.
+    /// for it, and the person asked.
     pub(super) async fn held_by_limit(&self, p: &Plan) -> bool {
         let now = Utc::now();
         let Limit::Holds(held) = self.limit_of(&p.boss, now) else {
             return false;
         };
-        let words = paused_words(&held, now, self.desk.timezone());
-        match self.desk.pause_plan_limit(p.id, &words, held.until).await {
-            Ok(_) => self.ask_limit(p, &held, now).await,
-            Err(e) => {
-                tracing::info!(plan = %p.id, error = %e, "a plan the plan limit holds wasn't paused")
-            }
-        }
+        self.pause_for_limit(p, &held, now).await;
         true
     }
 
-    /// Asks the person, once for `p` and the window holding it, whether
-    /// to raise the limit; an ask of an earlier window is closed then.
+    /// Pauses `p` because the limit holds its boss (`held`), its words kept
+    /// current, and asks the person once each pause and window it lasts
+    /// into.
+    pub(super) async fn pause_for_limit(&self, p: &Plan, held: &Held, now: DateTime<Utc>) {
+        let words = paused_words(held, now, self.desk.timezone());
+        let current = p.paused == Some(Paused::PlanLimit)
+            && p.paused_why.as_deref() == Some(&words)
+            && p.paused_until == Some(held.until);
+        let paused = match current {
+            true => Cow::Borrowed(p),
+            false => match self.desk.pause_plan_limit(p.id, &words, held.until).await {
+                Ok((detail, _)) => Cow::Owned(detail.summary.plan),
+                Err(e) => {
+                    tracing::info!(plan = %p.id, error = %e, "a plan the plan limit holds wasn't paused");
+                    return;
+                }
+            },
+        };
+        self.ask_limit(&paused, held, now).await;
+    }
+
+    /// Asks the person, once for `p`'s plan-limit pause and the window
+    /// holding it, whether to raise the limit; an earlier ask of the plan's
+    /// is closed then.
     async fn ask_limit(&self, p: &Plan, held: &Held, now: DateTime<Utc>) {
+        let Some(key) = p.limit_key() else {
+            return;
+        };
+        if self.limits.lock().asked.get(&p.id) == Some(&key) {
+            return;
+        }
         let store = self.desk.store();
-        let key = plan::limit_key(p.id, held.until);
         match store.item_ever_keyed(&p.boss, &key).await {
             Ok(false) => {}
-            Ok(true) => return,
+            Ok(true) => {
+                self.limits.lock().asked.insert(p.id, key);
+                return;
+            }
             Err(e) => {
                 tracing::info!(error = %e, "whether a plan's limit pause was said couldn't be read");
                 return;
@@ -339,7 +365,7 @@ impl CrewHub {
             .item_close_of_key_prefix(
                 &plan::limit_prefix(p.id),
                 ClosedBy::Lapsed,
-                "A newer window holds it.",
+                "A newer pause holds it.",
             )
             .await
         {
@@ -348,7 +374,7 @@ impl CrewHub {
         let raise = raise_to(held);
         let text = told_words(&p.goal, held, raise.is_some(), now, self.desk.timezone());
         let mut new = NewItem::ask(&p.boss, OpenKind::Ask, None, &text);
-        new.dedupe_key = key;
+        new.dedupe_key = key.clone();
         new.options = raise
             .map(raise_label)
             .into_iter()
@@ -357,46 +383,47 @@ impl CrewHub {
         new.cant_decide = Some(CANT_DECIDE.into());
         new.holding_up = Some(format!("{} and its tickets", named(&p.goal)));
         match store.item_open(&new).await {
-            Ok(Opened::New(i)) => {
-                self.post_item(&p.boss, &i, super::items::needs_you(&i), Vec::new())
-                    .await;
+            Ok(opened) => {
+                self.limits.lock().asked.insert(p.id, key);
+                if let Opened::New(i) = opened {
+                    self.post_item(&p.boss, &i, super::items::needs_you(&i), Vec::new())
+                        .await;
+                }
             }
-            Ok(Opened::Again(_)) => {}
             Err(e) => {
                 tracing::warn!(error = %format!("{e:#}"), "asking the person about a plan's limit pause failed")
             }
         }
     }
 
+    /// Forgets what was asked of the plans the limit no longer pauses, of
+    /// all those `paused`.
+    pub(super) fn forget_asked<'a>(&self, paused: impl IntoIterator<Item = &'a Plan>) {
+        let held: HashSet<Uuid> = paused
+            .into_iter()
+            .filter(|p| p.paused == Some(Paused::PlanLimit))
+            .map(|p| p.id)
+            .collect();
+        self.limits.lock().asked.retain(|id, _| held.contains(id));
+    }
+
     /// Resumes `p`, paused by the plan limit, once that no longer holds its
     /// boss (or, with nothing noted lately, once its window lapsed), and
-    /// says so once a pause; while it holds, its words are kept current and
-    /// the person asked of each window.
+    /// tells its boss's person, once a pause, while the boss still runs it;
+    /// while it holds, the pause is kept current.
     pub(super) async fn lift_limit(&self, p: &Plan) {
         let now = Utc::now();
-        let tz = self.desk.timezone();
         let standing = match self.limit_of(&p.boss, now) {
             Limit::Holds(held) => {
-                let words = paused_words(&held, now, tz);
-                let current =
-                    p.paused_why.as_deref() == Some(&words) && p.paused_until == Some(held.until);
-                if !current {
-                    if let Err(e) = self.desk.pause_plan_limit(p.id, &words, held.until).await {
-                        tracing::info!(plan = %p.id, error = %e, "a plan's limit pause wasn't kept current");
-                    }
-                }
-                self.ask_limit(p, &held, now).await;
+                self.pause_for_limit(p, &held, now).await;
                 return;
             }
             Limit::Unknown if p.paused_until.is_some_and(|u| u > now) => return,
-            Limit::Unknown => match self.paused_for_another(p).await {
-                Some(false) => None,
-                Some(true) => {
-                    self.limit_handed_over(p).await;
-                    return;
-                }
-                None => return,
-            },
+            Limit::Unknown if p.paused_for_another() => {
+                self.limit_handed_over(p).await;
+                return;
+            }
+            Limit::Unknown => None,
             Limit::Lifted(standing) => standing,
         };
         match self.desk.resume_plan_limit(p.id).await {
@@ -419,43 +446,18 @@ impl CrewHub {
         {
             tracing::info!(plan = %p.id, error = %e, "a plan's limit asks weren't closed");
         }
-        let pause = plan::limit_key(p.id, p.paused_until.unwrap_or(now));
-        if !self.limits.lock().resumed.insert(pause) {
+        let Some((boss, _)) = self.boss_of_plan(p) else {
             return;
-        }
-        let threshold = self
-            .overseer_named(&p.boss)
-            .and_then(|(s, _)| s.cost_governor.plan_threshold());
+        };
         let text = resumed_words(
             &p.goal,
             standing.as_ref(),
-            threshold,
+            boss.cost_governor.plan_threshold(),
             p.paused_until,
             now,
-            tz,
+            self.desk.timezone(),
         );
         self.tell_dm(&p.boss, &text).await;
-    }
-
-    /// Whether the limit paused `p` for a boss before its own (it was
-    /// passed on since): its ask of that pause was never this boss's. None
-    /// when that can't be read.
-    async fn paused_for_another(&self, p: &Plan) -> Option<bool> {
-        let Some(until) = p.paused_until else {
-            return Some(false);
-        };
-        match self
-            .desk
-            .store()
-            .item_ever_keyed(&p.boss, &plan::limit_key(p.id, until))
-            .await
-        {
-            Ok(own) => Some(!own),
-            Err(e) => {
-                tracing::info!(plan = %p.id, error = %e, "whose limit pause a plan's was couldn't be read");
-                None
-            }
-        }
     }
 
     /// `p`, paused by its former boss's plan limit, once that window lapsed:
@@ -496,36 +498,52 @@ impl CrewHub {
         }
     }
 
-    /// What the person's `answer` to `item`, a plan-limit ask, does to
-    /// their limit, kept before the ask closes: none when it asks nothing
-    /// of the plan limit, refused when the limit couldn't be kept.
-    pub(super) async fn keep_plan_limit(
+    /// What the person is told of their `answer` to `closed`, a plan-limit
+    /// ask they settled: none when it asks nothing of the plan limit. A
+    /// limit that couldn't be kept opens the ask again, refused.
+    pub(super) async fn plan_limit_answer(
+        &self,
+        closed: &OpenItem,
+        answer: &str,
+    ) -> Option<Result<String, String>> {
+        let answer = answer_of(closed, answer)?;
+        Some(match self.keep_plan_limit(closed, answer).await {
+            Ok(kept) => Ok(self.plan_limit_answered(closed, kept).await),
+            Err(e) => {
+                tracing::warn!(error = %e, "the person's plan limit wasn't kept");
+                if let Err(e) = self.desk.store().item_reopen(closed.id).await {
+                    tracing::warn!(error = %format!("{e:#}"), "a plan-limit ask whose answer wasn't kept wasn't opened again");
+                }
+                Err("Desk couldn't change your limit just now. Try again.".into())
+            }
+        })
+    }
+
+    /// What the person's `answer` to `item` does to their limit.
+    async fn keep_plan_limit(
         &self,
         item: &OpenItem,
-        answer: &str,
-    ) -> Option<Result<Kept, String>> {
-        let to = match answer_of(item, answer)? {
-            Answer::Keep => return Some(Ok(Kept::Unchanged)),
+        answer: Answer,
+    ) -> Result<Kept, workforce_desk::DeskError> {
+        let to = match answer {
+            Answer::Keep => return Ok(Kept::Unchanged),
             Answer::Raise(to) => to,
         };
         let threshold = self
             .overseer_named(&item.boss)
             .and_then(|(s, _)| s.cost_governor.plan_threshold());
         if let Some(t) = threshold.filter(|t| *t >= f64::from(to)) {
-            return Some(Ok(Kept::Already(t)));
+            return Ok(Kept::Already(t));
         }
-        Some(match self.desk.set_plan_pause_at(f64::from(to)).await {
-            Ok(_) => Ok(Kept::Raised(to)),
-            Err(e) => {
-                tracing::warn!(error = %e, "the person's plan limit wasn't kept");
-                Err("Desk couldn't change your limit just now. Try again.".into())
-            }
-        })
+        self.desk
+            .set_plan_pause_at(f64::from(to))
+            .await
+            .map(|_| Kept::Raised(to))
     }
 
     /// What the person is told of `kept`, their answer to `closed`: a raise
     /// lifts what it lets go at once.
-    pub(super) async fn plan_limit_answered(&self, closed: &OpenItem, kept: Kept) -> String {
+    async fn plan_limit_answered(&self, closed: &OpenItem, kept: Kept) -> String {
         match kept {
             Kept::Raised(to) => {
                 self.lift_limits().await;
@@ -673,7 +691,7 @@ mod tests {
 
     #[test]
     fn only_an_option_a_plan_limit_ask_offers_is_read_as_its_answer() {
-        let key = plan::limit_key(uuid::Uuid::new_v4(), at(NOW));
+        let key = plan::limit_key(uuid::Uuid::new_v4(), at(NOW), at(NOW));
         let offers = ask(&key, &["Raise to 95%", "Keep"]);
         assert_eq!(answer_of(&offers, "Raise to 95%"), Some(Answer::Raise(95)));
         assert_eq!(

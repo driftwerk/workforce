@@ -547,6 +547,8 @@ fn goal_plan(goal: &str, r: GoalResult) -> Plan {
         paused: None,
         paused_why: None,
         paused_until: None,
+        paused_at: None,
+        paused_for: None,
         parallel: None,
         revision: 1,
         approved_revision: Some(1),

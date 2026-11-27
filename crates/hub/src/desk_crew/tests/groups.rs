@@ -2091,17 +2091,17 @@ async fn a_plan_the_plan_limit_pauses_stays_its_bosss_until_the_limit_lifts() {
         let words =
             "by plan limit until 09:00: your weekly Claude plan is at 88%, over your 80% limit";
         let paused_until = async |until: chrono::DateTime<chrono::Utc>| {
+            let (paused, _) = c.d.pause_plan_limit(id, words, until).await.unwrap();
             let mut ask = workforce_desk::open_item::NewItem::ask(
                 "desk",
                 workforce_desk::open_item::OpenKind::Ask,
                 None,
                 "“Keep Infra green” is paused.",
             );
-            ask.dedupe_key = plan::limit_key(id, until);
+            ask.dedupe_key = paused.summary.plan.limit_key().unwrap();
             ask.options = vec!["Raise to 95%".into(), "Keep".into()];
             ask.cant_decide = Some("Only you can change your plan limit.".into());
             c.d.store().item_open(&ask).await.unwrap();
-            c.d.pause_plan_limit(id, words, until).await.unwrap();
         };
         let login = crate::subscription::test_support::claude_login(&format!(
             "token-{}",
@@ -2163,6 +2163,20 @@ async fn a_plan_the_plan_limit_pauses_stays_its_bosss_until_the_limit_lifts() {
         let s = c.d.plan(id).await.unwrap().summary;
         assert_eq!(s.plan.paused, Some(Paused::NoBoss), "it waits for Continue");
         assert!(s.ask.is_none(), "its limit ask closed");
+        let told = |boss: &AgentService, said: &str| {
+            boss.sessions
+                .find(DESK_CHANNEL, PERSON)
+                .unwrap()
+                .is_some_and(|dm| dm.messages.iter().any(|m| m.content.contains(said)))
+        };
+        eventually("Mia told the plan is hers", async || {
+            told(&c.mia, "This plan is yours now: Mia runs Infra.").then_some(())
+        })
+        .await;
+        assert!(
+            !told(&c.desk, "“Keep Infra green” goes on"),
+            "the boss it passed from isn't told it goes on"
+        );
     })
     .await;
 }

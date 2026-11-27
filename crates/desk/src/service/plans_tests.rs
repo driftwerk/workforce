@@ -2869,6 +2869,11 @@ async fn a_plan_the_plan_limit_pauses_says_until_when_and_carries_only_its_own_a
         assert!(new, "a new pause");
         assert_eq!(paused.summary.plan.paused, Some(Paused::PlanLimit));
         assert_eq!(paused.summary.paused_why.as_deref(), Some(at_88));
+        let pause = paused.summary.plan.limit_key().expect("its pause's key");
+        assert_eq!(
+            paused.summary.plan.paused_for.as_deref(),
+            Some(boss.as_str())
+        );
         let at_91 = "by plan limit until Fri 09:00: your weekly ChatGPT plan is at 91%";
         let (_, new) = d.pause_plan_limit(id, at_91, until).await.unwrap();
         assert!(!new, "paused so already");
@@ -2879,6 +2884,7 @@ async fn a_plan_the_plan_limit_pauses_says_until_when_and_carries_only_its_own_a
             "its words kept current"
         );
         assert_eq!(read.plan.paused_until, Some(until));
+        assert_eq!(read.plan.limit_key(), Some(pause.clone()), "the same pause");
         assert!(read.ask.is_none(), "nothing asked yet");
         d.pass_plan(id, &crate::crew::Party::manager("ada", "Ada"), &By::you())
             .await
@@ -2893,6 +2899,11 @@ async fn a_plan_the_plan_limit_pauses_says_until_when_and_carries_only_its_own_a
             ("ada", Some(Paused::PlanLimit), Some(until)),
             "a plan passed on keeps its limit pause"
         );
+        assert!(
+            read.plan.paused_for_another(),
+            "paused under its former boss"
+        );
+        assert_eq!(read.plan.limit_key(), Some(pause.clone()));
         assert_eq!(read.paused_why.as_deref(), Some(at_91));
 
         let ask = |key: String| {
@@ -2910,11 +2921,8 @@ async fn a_plan_the_plan_limit_pauses_says_until_when_and_carries_only_its_own_a
             d.plan(id).await.unwrap().summary.ask.is_none(),
             "another ask of the plan's isn't its"
         );
-        let crate::open_item_store::Opened::New(limit) = d
-            .store()
-            .item_open(&ask(plan::limit_key(id, until)))
-            .await
-            .unwrap()
+        let crate::open_item_store::Opened::New(limit) =
+            d.store().item_open(&ask(pause.clone())).await.unwrap()
         else {
             panic!("a new ask");
         };
@@ -2937,11 +2945,19 @@ async fn a_plan_the_plan_limit_pauses_says_until_when_and_carries_only_its_own_a
             (None, None, None),
             "resumed, nothing of the pause is left"
         );
+        assert_eq!((read.plan.paused_at, read.plan.paused_for), (None, None));
         assert!(
             read.ask.is_none(),
             "only a plan the limit pauses carries it"
         );
         assert!(!d.resume_plan_limit(id).await.unwrap(), "not paused so");
+        let (again, new) = d.pause_plan_limit(id, at_88, until).await.unwrap();
+        assert!(new);
+        assert!(
+            again.summary.plan.limit_key().is_some_and(|k| k != pause),
+            "a pause of its own, in the same window"
+        );
+        assert!(d.resume_plan_limit(id).await.unwrap());
 
         d.pause_plan(id, Paused::Person, &By::you()).await.unwrap();
         let (_, new) = d.pause_plan_limit(id, at_88, until).await.unwrap();

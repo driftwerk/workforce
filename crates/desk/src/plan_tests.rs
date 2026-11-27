@@ -23,6 +23,8 @@ fn plan(state: PlanState) -> Plan {
         paused: None,
         paused_why: None,
         paused_until: None,
+        paused_at: None,
+        paused_for: None,
         parallel: None,
         revision: 1,
         approved_revision: match state {
