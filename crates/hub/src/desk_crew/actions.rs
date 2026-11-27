@@ -3115,7 +3115,7 @@ impl CrewHub {
                 // Desk's): only the person lets them go on.
                 if let Ok(Some(plan)) = d.store().plan_of_ticket(id).await {
                     if let Ok(Some(p)) = d.store().plan(plan).await {
-                        if let Some((_, ask)) = d.plan_starts_held(p.group.as_deref(), p.id) {
+                        if let Some((_, ask)) = d.plan_starts_held(d.live_group(&p), p.id) {
                             return Err(format!(
                                 "Desk's breaker holds this plan's new sessions: {ask} The person \
                                  can say Continue on Desk's Floor."

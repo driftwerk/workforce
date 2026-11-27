@@ -51,9 +51,11 @@ fn reply(id: &str, item: Value) -> String {
 /// What the stand-in model was sent, each request's body.
 type Heard = Arc<parking_lot::Mutex<Vec<Value>>>;
 
-/// The stand-in model: asked to make the file, it runs `touch` past the
+/// The stand-in model, by what it was sent last: asked to make the file, it runs `touch` past the
 /// sandbox; asked for more room, it asks for a folder beside the
-/// workspace; given what came of it, it says it is done; else it says ok.
+/// workspace; asked to look, it runs `echo` in it; asked to hit the limit,
+/// it refuses with a usage limit; given what came of it, it says it is
+/// done; else it says ok.
 async fn model(dir: &Path) -> (String, Heard) {
     let heard = Heard::default();
     let cmd = format!("touch {}", dir.join("made.txt").display());
@@ -64,7 +66,13 @@ async fn model(dir: &Path) -> (String, Heard) {
             let heard = heard.clone();
             move |body: Bytes| async move {
                 let body: Value = serde_json::from_slice(&body).unwrap_or_default();
-                let text = body.to_string();
+                // What it answers is what it was sent last: the
+                // conversation before is resent with every turn.
+                let text = body["input"]
+                    .as_array()
+                    .and_then(|input| input.last())
+                    .map(Value::to_string)
+                    .unwrap_or_default();
                 heard.lock().push(body);
                 let out = if text.contains("function_call_output") {
                     reply(
@@ -79,6 +87,22 @@ async fn model(dir: &Path) -> (String, Heard) {
                         "r3",
                         json!({"type": "function_call", "call_id": "c3",
                         "name": "request_permissions", "arguments": args.to_string()}),
+                    )
+                } else if text.contains("hit the limit") {
+                    let limit = json!({"error": {"type": "usage_limit_reached",
+                        "message": "The usage limit has been reached", "resets_in_seconds": 3600}});
+                    return (
+                        axum::http::StatusCode::TOO_MANY_REQUESTS,
+                        [("content-type", "application/json")],
+                        limit.to_string(),
+                    )
+                        .into_response();
+                } else if text.contains("look inside") {
+                    let args = json!({"cmd": "echo seen-inside"});
+                    reply(
+                        "r5",
+                        json!({"type": "function_call", "call_id": "c5",
+                        "name": "exec_command", "arguments": args.to_string()}),
                     )
                 } else if text.contains("say which gh") {
                     let args = json!({"cmd": which, "sandbox_permissions": "require_escalated",
@@ -162,7 +186,9 @@ async fn on_real_codex_on(
     let work = dir.join("work");
     std::fs::create_dir_all(&work).unwrap();
     let (url, heard) = model(&work).await;
-    let home = dir.join("codex-home");
+    // Where Codex keeps its rollouts by default, under the session's
+    // home: where Desk reads them.
+    let home = dir.join(".codex");
     codex_home(&home, &url, &work);
     let mut opts = options(dir).with_program(Engine::Codex, bin);
     opts.env = std::collections::BTreeMap::from([
@@ -174,10 +200,14 @@ async fn on_real_codex_on(
         ("TERM".into(), "xterm-256color".into()),
     ]);
     DeskStore::migrate(&pool).await.unwrap();
+    let floor = super::Floor {
+        redactor: Some(super::sight::redactor_for_tests()),
+        ..Default::default()
+    };
     let d = Desk::start(
         DeskStore::from_pool(pool),
         opts,
-        Default::default(),
+        floor,
         CancellationToken::new(),
     )
     .await
@@ -534,7 +564,7 @@ async fn the_real_codex_a_boss_starts_runs_desks_gh_whatever_the_profile_puts_fi
             std::env::var("PATH").unwrap_or_default()
         );
         let (d, work, heard) = on_real_codex_on(pool, &dir, bin, path).await;
-        let config = dir.join("codex-home/config.toml");
+        let config = dir.join(".codex/config.toml");
         let snapshots = std::fs::read_to_string(&config)
             .unwrap()
             .replace("shell_snapshot = false", "shell_snapshot = true");
@@ -578,6 +608,56 @@ async fn the_real_codex_a_boss_starts_runs_desks_gh_whatever_the_profile_puts_fi
         let own = d.create(new(), None).await.unwrap();
         let gh = which_gh(own.id).await;
         assert!(gh.ends_with("profiled/gh"), "the person's own: {gh}");
+    })
+    .await;
+}
+
+/// What the real Codex did is read from its rollout, as the boss reads it
+/// (crew.history, crew.inside): the prompt, the command it ran and its
+/// reply. A turn its model refuses on a usage limit ends done, stopped on
+/// its plan's usage limit, and the next turn's start leaves that behind.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_real_codex_is_seen_inside_and_its_failed_turn_says_how() {
+    let Some(bin) = codex_bin() else {
+        return;
+    };
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let dir = dir.path().canonicalize().unwrap();
+        let (d, work, heard) = on_real_codex(pool, &dir, bin).await;
+        let mut new = codex_session(&work, false);
+        new.prompt = Some("look inside".into());
+        let s = d.create(new, None).await.unwrap();
+        // Where its sandbox can't run it, Codex asks to run it outside.
+        until("its turn's end", Duration::from_secs(60), || {
+            if let Some(p) = d.view(s.id).unwrap().pending.filter(|p| p.answerable) {
+                let _ = d.decide(s.id, p.id, Decision::Allow, Some(By::you()));
+            }
+            !heard.lock().is_empty() && ended(&d, s.id)
+        })
+        .await;
+        let page = d.transcript_page(s.id, Default::default()).await.unwrap();
+        let turn = page.exchanges.first().expect("its turn").to_string();
+        for seen in ["look inside", "echo seen-inside", "done"] {
+            assert!(turn.contains(seen), "{seen}: {turn}");
+        }
+        assert_eq!(d.view(s.id).unwrap().failure, None);
+
+        typed(&d, s.id, &heard, "hit the limit").await;
+        until("its failure", Duration::from_secs(10), || {
+            d.view(s.id).unwrap().failure.is_some()
+        })
+        .await;
+        let v = d.view(s.id).unwrap();
+        assert_eq!(v.state, SessionState::Done);
+        assert!(v.failure.unwrap().limit().is_some());
+        assert_eq!(
+            v.failed.as_deref(),
+            Some("It stopped on its plan's usage limit")
+        );
+
+        typed(&d, s.id, &heard, "say ok").await;
+        assert_eq!(d.view(s.id).unwrap().failure, None);
     })
     .await;
 }

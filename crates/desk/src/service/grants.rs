@@ -946,9 +946,20 @@ impl Desk {
             self.0.scopes.lock().granted = granted;
             return Ok(0);
         }
-        let one = self.0.layout_write.lock().await;
-        let before = self.layout();
-        let layout = grant::layout_of(next.values(), &before).checked_except(&Default::default())?;
+        // A grant taken away deletes its group, which ungroups its plans:
+        // no plan is written meanwhile (plans before the layout).
+        let mut plans = None;
+        let (one, before, layout) = loop {
+            let one = self.0.layout_write.lock().await;
+            let before = self.layout();
+            let layout =
+                grant::layout_of(next.values(), &before).checked_except(&Default::default())?;
+            if plans.is_some() || !super::groups::drops_groups(&before, &layout) {
+                break (one, before, layout);
+            }
+            drop(one);
+            plans = Some(self.0.plan_write.lock().await);
+        };
         let named: Vec<(Uuid, String)> = grant::membership(writes.iter()).into_iter().collect();
         let all: Vec<(Uuid, String)> = grant::membership(next.values()).into_iter().collect();
         let granted: Vec<String> = next.keys().filter(|g| *g != UNGROUPED).cloned().collect();
@@ -977,8 +988,8 @@ impl Desk {
         }
         self.0.state.lock().layout = layout.clone();
         self.scopes_follow(&layout);
-        self.boards_ungrouped(&written.ungrouped_boards).await;
-        drop(one);
+        self.orphans_heard(&written.orphaned).await;
+        drop((one, plans));
         self.announce(DeskEvent::Layout {
             layout: layout.clone(),
         });

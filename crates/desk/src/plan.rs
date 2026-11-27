@@ -134,7 +134,8 @@ impl Paused {
 pub struct Plan {
     pub id: Uuid,
     pub board: Uuid,
-    /// The board's group when it was made; none is ungrouped.
+    /// The group its work belongs to: its sessions start there; none is
+    /// Ungrouped.
     pub group: Option<String>,
     /// The boss's agent id.
     pub boss: String,
@@ -778,7 +779,9 @@ pub enum Problem {
     BadModel { ticket: usize, model: String },
     #[error("Ticket {ticket} isn't one this plan has; leave out its id to add it.")]
     UnknownTicket { ticket: usize },
-    #[error("Ticket {ticket} takes on a ticket that isn't on a board of the plan's group.")]
+    #[error(
+        "Ticket {ticket} takes on a ticket that isn't on a board of a group the plan's boss runs."
+    )]
     UnknownAdopt { ticket: usize },
     #[error("Ticket {ticket} is in the list twice.")]
     Twice { ticket: usize },
