@@ -88,7 +88,7 @@ async fn the_homes_boss_takes_on_a_machines_ungrouped_session_only_as_both_ends_
     with_test_pool(workforce_desk::store::build_pool, |pool| async move {
         let dir = tempfile::tempdir().unwrap();
         let (crew, d, [vel9, vel15, vel20, notes]) = devbox(dir.path(), pool).await;
-        let app = super::super::relay::routes(Arc::clone(&crew.state), Arc::clone(&crew));
+        let app = super::relay_app(&crew.state, &crew);
         let token = crew.state.auth_token.clone();
         let from = chrono::Utc::now() - chrono::Duration::hours(1);
 
@@ -169,7 +169,7 @@ async fn a_take_hands_the_home_its_sessions_work_and_their_line_waits_for_it_whi
     with_test_pool(workforce_desk::store::build_pool, |pool| async move {
         let dir = tempfile::tempdir().unwrap();
         let (crew, d, [vel9, vel15, _, _]) = devbox(dir.path(), pool).await;
-        let app = super::super::relay::routes(Arc::clone(&crew.state), Arc::clone(&crew));
+        let app = super::relay_app(&crew.state, &crew);
         let token = crew.state.auth_token.clone();
         let out = post(&app, &token, take_on(vel9.id, true)).await;
         assert_eq!(out["status"], "ok", "{out}");
@@ -292,7 +292,7 @@ async fn an_event_saved_late_is_still_handed_back_and_only_once() {
     with_test_pool(workforce_desk::store::build_pool, |pool| async move {
         let dir = tempfile::tempdir().unwrap();
         let (crew, d, [vel9, _, _, _]) = devbox(dir.path(), pool).await;
-        let app = super::super::relay::routes(Arc::clone(&crew.state), Arc::clone(&crew));
+        let app = super::relay_app(&crew.state, &crew);
         let token = crew.state.auth_token.clone();
         let out = post(&app, &token, take_on(vel9.id, true)).await;
         assert_eq!(out["status"], "ok", "{out}");
@@ -337,7 +337,7 @@ async fn a_question_to_the_homes_boss_is_the_persons_once_desk_lets_the_boss_go(
     with_test_pool(workforce_desk::store::build_pool, |pool| async move {
         let dir = tempfile::tempdir().unwrap();
         let (crew, d, [vel9, _, _, _]) = devbox(dir.path(), pool).await;
-        let app = super::super::relay::routes(Arc::clone(&crew.state), Arc::clone(&crew));
+        let app = super::relay_app(&crew.state, &crew);
         let token = crew.state.auth_token.clone();
         let out = post(&app, &token, take_on(vel9.id, true)).await;
         assert_eq!(out["status"], "ok", "{out}");
@@ -389,7 +389,7 @@ async fn an_event_whose_answer_was_lost_is_handed_again() {
     with_test_pool(workforce_desk::store::build_pool, |pool| async move {
         let dir = tempfile::tempdir().unwrap();
         let (crew, d, [vel9, _, _, _]) = devbox(dir.path(), pool).await;
-        let app = super::super::relay::routes(Arc::clone(&crew.state), Arc::clone(&crew));
+        let app = super::relay_app(&crew.state, &crew);
         let token = crew.state.auth_token.clone();
         let out = post(&app, &token, take_on(vel9.id, true)).await;
         assert_eq!(out["status"], "ok", "{out}");
@@ -425,7 +425,7 @@ async fn a_question_to_the_homes_boss_is_the_persons_once_the_boss_lets_its_sess
     with_test_pool(workforce_desk::store::build_pool, |pool| async move {
         let dir = tempfile::tempdir().unwrap();
         let (crew, d, [vel9, _, _, _]) = devbox(dir.path(), pool).await;
-        let app = super::super::relay::routes(Arc::clone(&crew.state), Arc::clone(&crew));
+        let app = super::relay_app(&crew.state, &crew);
         let token = crew.state.auth_token.clone();
         let out = post(&app, &token, take_on(vel9.id, true)).await;
         assert_eq!(out["status"], "ok", "{out}");
@@ -475,7 +475,7 @@ async fn a_question_is_the_persons_once_its_home_takes_only_under_another_grant(
     with_test_pool(workforce_desk::store::build_pool, |pool| async move {
         let dir = tempfile::tempdir().unwrap();
         let (crew, d, [vel9, _, _, notes]) = devbox(dir.path(), pool).await;
-        let app = super::super::relay::routes(Arc::clone(&crew.state), Arc::clone(&crew));
+        let app = super::relay_app(&crew.state, &crew);
         let token = crew.state.auth_token.clone();
         let mut acme = ungrouped(1, &[notes.id], true);
         acme["name"] = json!("Acme");
@@ -527,7 +527,7 @@ async fn a_question_under_a_grant_just_written_waits_for_its_homes_first_take() 
     with_test_pool(workforce_desk::store::build_pool, |pool| async move {
         let dir = tempfile::tempdir().unwrap();
         let (crew, d, [vel9, vel15, vel20, _]) = devbox(dir.path(), pool).await;
-        let app = super::super::relay::routes(Arc::clone(&crew.state), Arc::clone(&crew));
+        let app = super::relay_app(&crew.state, &crew);
         let token = crew.state.auth_token.clone();
         crew.homes_gone();
         put_ungrouped(&d, 2, &[vel9.id, vel15.id, vel20.id], true).await;
@@ -560,7 +560,7 @@ async fn a_grant_written_again_is_new_whatever_was_taken_under_the_one_gone() {
     with_test_pool(workforce_desk::store::build_pool, |pool| async move {
         let dir = tempfile::tempdir().unwrap();
         let (crew, d, [vel9, vel15, vel20, _]) = devbox(dir.path(), pool).await;
-        let app = super::super::relay::routes(Arc::clone(&crew.state), Arc::clone(&crew));
+        let app = super::relay_app(&crew.state, &crew);
         let token = crew.state.auth_token.clone();
         take(&app, &token, json!({})).await;
         crew.homes_gone();
@@ -594,7 +594,7 @@ async fn a_take_is_refused_to_any_boss_but_the_grants_own_from_its_home() {
     with_test_pool(workforce_desk::store::build_pool, |pool| async move {
         let dir = tempfile::tempdir().unwrap();
         let (crew, _d, _) = devbox(dir.path(), pool).await;
-        let app = super::super::relay::routes(Arc::clone(&crew.state), Arc::clone(&crew));
+        let app = super::relay_app(&crew.state, &crew);
         let token = crew.state.auth_token.clone();
         let mut other = relayed(WORK_TAKE, json!({}), true);
         other["boss"] = json!("local:mia");

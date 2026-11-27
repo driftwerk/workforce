@@ -5,7 +5,7 @@ use axum::body::Body;
 use axum::http::{header, Request, StatusCode};
 use workforce_identity::types::{Identity, IdentityRole};
 
-use workforce_hub::gateway::router;
+use crate::support::router;
 
 use crate::support::{agent_service, send, token_for, Gateway, GATEWAY_TOKEN};
 

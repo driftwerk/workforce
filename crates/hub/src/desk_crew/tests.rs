@@ -30,6 +30,23 @@ pub(super) const FAST: Timing = Timing {
     minute: Duration::from_millis(100),
 };
 
+/// Desk's own session routes for `d`, admitting by `auth`, as a listener
+/// serves them.
+fn desk_app(d: Desk, auth: Arc<dyn Authorize>) -> axum::Router {
+    crate::serve::combined(workforce_desk::sessions_router(crate::surface::Bound::To(
+        (d, auth),
+    )))
+}
+
+/// The relay routes `crew` answers on `state`'s hub, as a listener serves
+/// them.
+fn relay_app(state: &Arc<GatewayState>, crew: &Arc<CrewHub>) -> axum::Router {
+    crate::serve::combined(super::relay::routes(
+        Arc::clone(state),
+        crate::surface::Bound::To(Arc::clone(crew)),
+    ))
+}
+
 pub(super) const PERSON: &str = "person-1";
 
 /// An agent `id` whose model answers everything with `reply`.
@@ -927,7 +944,7 @@ async fn a_blocked_session_wakes_the_overseer_and_its_answer_offers_the_approval
         assert_eq!(brief.by.id, "desk");
 
         // You allow it through Desk's route.
-        let app = workforce_desk::sessions_router(d.clone(), Arc::new(Anyone));
+        let app = desk_app(d.clone(), Arc::new(Anyone));
         let response = app
             .oneshot(
                 Request::post(format!("/api/desk/sessions/{}/approvals/{}", s.id, pending.id))

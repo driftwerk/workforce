@@ -21,7 +21,7 @@ use tower::ServiceExt; // for oneshot
 use workforce_common::postgres::PostgresPool;
 use workforce_common::settings::WorkforceConfig;
 use workforce_core::access::Visibility;
-use workforce_hub::serve::{create_trigger_router, AgentService};
+use workforce_hub::serve::{trigger_state, AgentService};
 use workforce_hub::workflow_runtime::WorkflowRuntime;
 use workforce_orchestrator::workflow_store::{
     mint_trigger_path, EditContext, RunAsWrite, WorkflowStore, KIND_WORKFLOW,
@@ -95,10 +95,12 @@ impl Harness {
             telemetry,
             workflows_dir,
         ));
-        let router = create_trigger_router(
-            Arc::clone(&service),
-            Arc::clone(&runtime) as Arc<dyn workforce_hub::hosts::WorkflowHost>,
-        );
+        let router = workforce_hub::serve::combined(workforce_hub::triggers::router(
+            workforce_hub::surface::Bound::To(trigger_state(
+                Arc::clone(&service),
+                Arc::clone(&runtime) as Arc<dyn workforce_hub::hosts::WorkflowHost>,
+            )),
+        ));
         Self {
             service,
             runtime,

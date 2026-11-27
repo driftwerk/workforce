@@ -108,7 +108,12 @@ async fn start(pool: &PostgresPool, dir: &Path) -> (Desk, CancellationToken, Soc
     )
     .await
     .unwrap();
-    let app = workforce_desk::sessions_router(desk.clone(), Arc::new(Person));
+    let app = workforce_hub::serve::combined(workforce_desk::sessions_router(
+        workforce_hub::surface::Bound::To((
+            desk.clone(),
+            Arc::new(Person) as Arc<dyn workforce_desk::Authorize>,
+        )),
+    ));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });

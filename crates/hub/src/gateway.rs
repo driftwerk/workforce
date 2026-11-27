@@ -3,13 +3,14 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::spoken_text::NextSpeech;
+use crate::surface::routing::{delete, get, post, put};
+use crate::surface::Routes;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path, Query, State};
 use axum::http::header::{AUTHORIZATION, CONTENT_TYPE};
 use axum::http::{HeaderValue, Method, StatusCode};
 use axum::response::IntoResponse;
-use axum::routing::{get, post};
-use axum::{Json, Router};
+use axum::Json;
 use futures::{SinkExt, StreamExt};
 use serde::Deserialize;
 use tokio::sync::broadcast;
@@ -375,48 +376,48 @@ pub fn build_cors_layer(enabled: bool, allowed_origins: &[String]) -> CorsLayer 
 const PICTURE_BODY_LIMIT: usize = crate::pictures::MAX_BYTES + 64 * 1024;
 
 /// Build the gateway router.
-pub fn router(state: Arc<GatewayState>) -> Router {
+pub fn router(state: Arc<GatewayState>) -> Routes {
     // The boss tools of this hub's turns call its uplinks.
     crate::boss_links::tools::serve_for(&state);
     // And what happens in their groups wakes them.
     crate::boss_links::wake::start(&state);
-    let app = Router::new()
-        .route("/", get(static_index))
-        .route("/ws", get(ws_handler))
-        .route("/ws/agent", get(ws_local_agent_handler))
+    let app = Routes::new()
+        .open("/", get(static_index))
+        .member("/ws", get(ws_handler))
+        .member("/ws/agent", get(ws_local_agent_handler))
         // An engine's uplink to this hub as a boss hub: it checks its own
         // link tokens, so nothing before it does.
-        .route("/ws/desk-boss", get(crate::boss_links::uplink::handler))
-        .route("/api/chat", post(chat_handler))
-        .route("/api/evals/grade", post(crate::api_handlers::evals::grade))
-        .route(
+        .machine("/ws/desk-boss", get(crate::boss_links::uplink::handler))
+        .member("/api/chat", post(chat_handler))
+        .member("/api/evals/grade", post(crate::api_handlers::evals::grade))
+        .member(
             "/api/evals/know-how",
             post(crate::api_handlers::evals::know_how),
         )
-        .route("/api/local-agents", get(list_local_agents))
-        .route("/api/sessions", get(list_sessions))
-        .route("/api/sessions/{id}/transcript", get(session_transcript))
-        .route("/api/sessions/{id}/stats", get(session_stats))
-        .route("/api/sessions/{id}/export", get(session_export))
+        .member("/api/local-agents", get(list_local_agents))
+        .member("/api/sessions", get(list_sessions))
+        .member("/api/sessions/{id}/transcript", get(session_transcript))
+        .member("/api/sessions/{id}/stats", get(session_stats))
+        .member("/api/sessions/{id}/export", get(session_export))
         // Session management & chat enhancement endpoints (DW-427)
         // NOTE: static segment /search must be registered before parameterised {id} routes
-        .route("/api/sessions/search", get(crate::session_handlers::search_sessions))
-        .route("/api/sessions/{id}", axum::routing::delete(crate::session_handlers::delete_session))
-        .route("/api/sessions/{id}/reset", post(crate::session_handlers::reset_session))
-        .route("/api/sessions/{id}/stop", post(crate::session_handlers::stop_session_turn))
-        .route("/api/sessions/{id}/model", post(crate::session_handlers::update_session_model))
-        .route("/api/sessions/{id}/label", axum::routing::put(crate::session_handlers::update_session_label))
-        .route("/api/sessions/{id}/context", get(crate::session_handlers::get_session_context))
-        .route("/api/sessions/{id}/tools", get(crate::session_handlers::get_session_tool_calls))
-        .route(
+        .member("/api/sessions/search", get(crate::session_handlers::search_sessions))
+        .member("/api/sessions/{id}", delete(crate::session_handlers::delete_session))
+        .member("/api/sessions/{id}/reset", post(crate::session_handlers::reset_session))
+        .member("/api/sessions/{id}/stop", post(crate::session_handlers::stop_session_turn))
+        .member("/api/sessions/{id}/model", post(crate::session_handlers::update_session_model))
+        .member("/api/sessions/{id}/label", put(crate::session_handlers::update_session_label))
+        .member("/api/sessions/{id}/context", get(crate::session_handlers::get_session_context))
+        .member("/api/sessions/{id}/tools", get(crate::session_handlers::get_session_tool_calls))
+        .member(
             "/api/sessions/{id}/messages/{msg_id}/retry",
             post(crate::session_handlers::retry_session_message),
         )
-        .route(
+        .member(
             "/api/sessions/{id}/messages/{msg_id}",
-            axum::routing::delete(crate::session_handlers::delete_session_message),
+            delete(crate::session_handlers::delete_session_message),
         )
-        .route(
+        .member(
             "/api/sessions/{id}/upload",
             post(crate::session_handlers::upload_session_file)
                 // Per-file cap + multipart framing headroom. The handler
@@ -425,291 +426,283 @@ pub fn router(state: Arc<GatewayState>) -> Router {
                     crate::session_handlers::MAX_FILE_UPLOAD_BYTES as usize + 1024 * 1024,
                 )),
         )
-        .route(
+        .member(
             "/api/sessions/{id}/files/{name}",
             get(crate::session_handlers::session_file_get),
         )
-        .route(
+        .member(
             "/api/agents/{id}/attachments",
             post(crate::desk_attachments::upload)
                 // The handler caps the file as it streams it to disk.
                 .layer(axum::extract::DefaultBodyLimit::disable()),
         )
-        .route(
+        .member(
             "/api/agents/{id}/attachments/{artifact}",
             get(crate::desk_attachments::download),
         )
-        .route("/api/models/health", get(model_health))
-        .route("/api/models/aliases", get(model_aliases))
-        .route("/api/commands", get(list_commands))
-        .route("/api/admin/reset-model", post(admin_reset_model))
-        .route("/api/agents", get(list_agents))
+        .member("/api/models/health", get(model_health))
+        .member("/api/models/aliases", get(model_aliases))
+        .member("/api/commands", get(list_commands))
+        .admin("/api/admin/reset-model", post(admin_reset_model))
+        .member("/api/agents", get(list_agents))
         // Agent CRUD & detail endpoints (DW-421)
-        .route("/api/agents", post(create_agent))
-        .route(
-            "/api/agents/{id}",
-            get(get_agent).put(update_agent).patch(patch_agent).delete(delete_agent),
-        )
-        .route("/api/agents/{id}/tools", get(get_agent_tools))
-        .route("/api/agents/{id}/mentions", get(get_agent_mentions))
-        .route("/api/agents/{id}/identity/{filename}", get(get_agent_identity).put(put_agent_identity))
-        .route(
+        .admin("/api/agents", post(create_agent))
+        .member("/api/agents/{id}", get(get_agent))
+        .admin("/api/agents/{id}", put(update_agent).patch(patch_agent).delete(delete_agent))
+        .member("/api/agents/{id}/tools", get(get_agent_tools))
+        .admin("/api/agents/{id}/mentions", get(get_agent_mentions))
+        .admin("/api/agents/{id}/identity/{filename}", get(get_agent_identity).put(put_agent_identity))
+        .admin(
             "/api/agents/{id}/identity/{filename}/revisions",
             get(agent_identity_revisions_list),
         )
-        .route(
+        .admin(
             "/api/agents/{id}/identity/{filename}/revisions/{rev}",
             get(agent_identity_revision_get),
         )
-        .route(
+        .admin(
             "/api/agents/{id}/identity/{filename}/revisions/{rev}/restore",
             post(agent_identity_revision_restore),
         )
-        .route("/api/agents/{id}/config", get(agent_config_get).put(agent_config_put))
-        .route("/api/agents/{id}/config/check", post(agent_config_check))
-        .route("/api/agents/{id}/logins", get(crate::api_handlers::subscriptions::agent_logins))
-        .route(
+        .member("/api/agents/{id}/config", get(agent_config_get))
+        .admin("/api/agents/{id}/config", put(agent_config_put))
+        .admin("/api/agents/{id}/config/check", post(agent_config_check))
+        .member("/api/agents/{id}/logins", get(crate::api_handlers::subscriptions::agent_logins))
+        .member(
             "/api/agents/{id}/config/revisions",
             get(agent_config_revisions_list),
         )
-        .route(
+        .member(
             "/api/agents/{id}/config/revisions/{rev}",
             get(agent_config_revision_get),
         )
-        .route(
+        .admin(
             "/api/agents/{id}/config/revisions/{rev}/restore",
             post(agent_config_revision_restore),
         )
-        .route("/api/agents/{id}/vault", get(agent_vault_list))
-        .route("/api/agents/{id}/vault/move", post(agent_vault_move))
-        .route("/api/agents/{id}/vault/copy", post(agent_vault_copy))
-        .route("/api/transfer/export", get(export_agents))
-        .route(
+        .admin("/api/agents/{id}/vault", get(agent_vault_list))
+        .admin("/api/agents/{id}/vault/move", post(agent_vault_move))
+        .admin("/api/agents/{id}/vault/copy", post(agent_vault_copy))
+        .admin("/api/transfer/export", get(export_agents))
+        .admin(
             "/api/transfer/import",
             post(agent_import_upload)
                 .layer(axum::extract::DefaultBodyLimit::max(AGENT_IMPORT_BODY_LIMIT)),
         )
-        .route(
+        .admin(
             "/api/transfer/import/{artifact_id}/apply",
             post(agent_import_apply),
         )
-        .route(
+        .admin(
             "/api/agents/{id}/vault/{*path}",
             post(agent_vault_set).delete(agent_vault_delete),
         )
-        .route("/api/agents/{id}/skills", get(agent_skills_list))
-        .route(
-            "/api/agents/{id}/skills/{name}",
-            get(agent_skill_get).put(agent_skill_put).delete(agent_skill_delete),
-        )
-        .route(
-            "/api/agents/{id}/skills/{name}/config",
-            get(agent_skill_config_get).put(agent_skill_config_put),
-        )
-        .route("/api/agents/{id}/stats", get(get_agent_stats))
-        .route(
-            "/api/agents/{id}/slack",
-            get(agent_slack_status).put(agent_slack_connect).delete(agent_slack_disconnect),
-        )
-        .route(
+        .member("/api/agents/{id}/skills", get(agent_skills_list))
+        .member("/api/agents/{id}/skills/{name}", get(agent_skill_get))
+        .admin("/api/agents/{id}/skills/{name}", put(agent_skill_put).delete(agent_skill_delete))
+        .member("/api/agents/{id}/skills/{name}/config", get(agent_skill_config_get))
+        .admin("/api/agents/{id}/skills/{name}/config", put(agent_skill_config_put))
+        .member("/api/agents/{id}/stats", get(get_agent_stats))
+        .member("/api/agents/{id}/slack", get(agent_slack_status))
+        .admin("/api/agents/{id}/slack", put(agent_slack_connect).delete(agent_slack_disconnect))
+        .member(
             "/api/agents/{id}/picture",
-            get(crate::api_handlers::pictures::agent_picture_get)
-                .put(crate::api_handlers::pictures::agent_picture_put)
+            get(crate::api_handlers::pictures::agent_picture_get),
+        )
+        .admin(
+            "/api/agents/{id}/picture",
+            put(crate::api_handlers::pictures::agent_picture_put)
                 .delete(crate::api_handlers::pictures::agent_picture_delete)
                 .layer(axum::extract::DefaultBodyLimit::max(PICTURE_BODY_LIMIT)),
         )
         // Global (non-agent-scoped) skill endpoints
-        .route("/api/skills", get(global_skills_list))
-        .route("/api/skills/catalog", get(skill_catalog_list))
-        .route("/api/skills/catalog/install", post(skill_catalog_install))
-        .route(
-            "/api/skills/{name}",
-            get(global_skill_get).put(global_skill_put).delete(global_skill_delete),
-        )
-        .route(
-            "/api/skills/{name}/config",
-            get(global_skill_config_get).put(global_skill_config_put),
-        )
-        .route(
+        .member("/api/skills", get(global_skills_list))
+        .member("/api/skills/catalog", get(skill_catalog_list))
+        .admin("/api/skills/catalog/install", post(skill_catalog_install))
+        .member("/api/skills/{name}", get(global_skill_get))
+        .admin("/api/skills/{name}", put(global_skill_put).delete(global_skill_delete))
+        .member("/api/skills/{name}/config", get(global_skill_config_get))
+        .admin("/api/skills/{name}/config", put(global_skill_config_put))
+        .member(
             "/api/wasm-skills",
             get(crate::api_handlers::wasm_skills::list_wasm_skills),
         )
-        .route(
+        .member(
             "/api/wasm-skills/{name}",
-            axum::routing::delete(crate::api_handlers::wasm_skills::delete_wasm_skill),
+            delete(crate::api_handlers::wasm_skills::delete_wasm_skill),
         )
-        .route(
+        .member(
             "/api/wasm-skills/{name}/shares",
             get(crate::api_handlers::wasm_skills::get_wasm_skill_shares)
                 .put(crate::api_handlers::wasm_skills::put_wasm_skill_shares),
         )
-        .route(
+        .member(
             "/api/wasm-skills/{name}/visibility",
-            axum::routing::put(crate::api_handlers::wasm_skills::put_wasm_skill_visibility),
+            put(crate::api_handlers::wasm_skills::put_wasm_skill_visibility),
         )
-        .route(
+        .member(
             "/api/wasm-skills/{name}/owner",
-            axum::routing::put(crate::api_handlers::wasm_skills::put_wasm_skill_owner),
+            put(crate::api_handlers::wasm_skills::put_wasm_skill_owner),
         )
-        .route(
+        .member(
             "/api/external-skills",
             get(crate::api_handlers::external_skills::list_external_skills),
         )
-        .route(
+        .member(
             "/api/external-skills/{name}",
-            axum::routing::delete(crate::api_handlers::external_skills::delete_external_skill),
+            delete(crate::api_handlers::external_skills::delete_external_skill),
         )
-        .route(
+        .member(
             "/api/external-skills/{name}/shares",
             get(crate::api_handlers::external_skills::get_external_skill_shares)
                 .put(crate::api_handlers::external_skills::put_external_skill_shares),
         )
-        .route(
+        .member(
             "/api/external-skills/{name}/visibility",
-            axum::routing::put(crate::api_handlers::external_skills::put_external_skill_visibility),
+            put(crate::api_handlers::external_skills::put_external_skill_visibility),
         )
-        .route(
+        .member(
             "/api/external-skills/{name}/owner",
-            axum::routing::put(crate::api_handlers::external_skills::put_external_skill_owner),
+            put(crate::api_handlers::external_skills::put_external_skill_owner),
         )
-        .route("/api/tools", get(list_tools))
-        .route("/api/heartbeat", get(heartbeat_status))
-        .route("/api/heartbeat/wake", post(heartbeat_wake))
-        .route("/api/livez", get(livez))
-        .route("/api/version", get(version_info))
+        .admin("/api/tools", get(list_tools))
+        .admin("/api/heartbeat", get(heartbeat_status))
+        .admin("/api/heartbeat/wake", post(heartbeat_wake))
+        .open("/api/livez", get(livez))
+        .member("/api/version", get(version_info))
         // Heartbeat check CRUD & history endpoints (DW-422)
-        .route("/api/heartbeat/checks", get(list_heartbeat_checks).post(create_heartbeat_check))
-        .route(
+        .admin("/api/heartbeat/checks", get(list_heartbeat_checks).post(create_heartbeat_check))
+        .admin(
             "/api/heartbeat/checks/{id}",
             get(get_heartbeat_check).put(update_heartbeat_check).delete(delete_heartbeat_check),
         )
-        .route("/api/heartbeat/checks/{id}/trigger", post(trigger_heartbeat_check))
-        .route("/api/heartbeat/history", get(get_heartbeat_history))
-        .route("/api/agents/{id}/heartbeat", get(agent_heartbeat_status))
+        .admin("/api/heartbeat/checks/{id}/trigger", post(trigger_heartbeat_check))
+        .admin("/api/heartbeat/history", get(get_heartbeat_history))
+        .member("/api/agents/{id}/heartbeat", get(agent_heartbeat_status))
         // Unauthenticated device pairing endpoints (self-service flow)
-        .route(
+        .open(
             "/api/pair/device/request",
             post(pair_device_request_unauthenticated),
         )
-        .route("/api/pair/device/status/{code}", get(pair_device_status))
+        .open("/api/pair/device/status/{code}", get(pair_device_status))
         // Connecting a device from the browser: the signed-in person approves
         // it into their own account, or an admin assigns it to someone.
-        .route(
+        .member(
             "/api/pair/device/pending/{code}",
             get(crate::api_handlers::device_pairing::pending),
         )
-        .route(
+        .member(
             "/api/pair/device/approve-self",
             post(crate::api_handlers::device_pairing::approve_self),
         )
-        .route(
+        .member(
             "/api/pair/device/reject-self",
             post(crate::api_handlers::device_pairing::reject_self),
         )
-        .route(
+        .admin(
             "/api/pair/device/approve",
             post(crate::api_handlers::device_pairing::assign),
         )
-        .route(
+        .member(
             "/api/pair/device/rotate",
             post(pair_device_rotate_self),
         )
-        .route(
+        .member(
             "/api/pair/device/revoke-self",
             post(pair_device_revoke_self),
         )
-        .route(
+        .member(
             "/api/approvals/{request_id}/decision",
             post(crate::approvals::decide::decision),
         )
         // Pairing endpoints
-        .route("/api/pair/pending", get(pair_list_pending))
-        .route("/api/pair/approve/{code}", post(pair_approve))
-        .route("/api/pair/reject/{code}", post(pair_reject))
-        .route("/api/pair/allowlist", get(pair_list_allowlist))
-        .route("/api/pair/device", post(pair_initiate_device))
-        .route("/api/pair/devices", get(pair_list_devices))
-        .route("/api/pair/devices/{id}/revoke", post(pair_revoke_device))
-        .route("/api/pair/devices/{id}/rotate", post(pair_rotate_device))
+        .admin("/api/pair/pending", get(pair_list_pending))
+        .admin("/api/pair/approve/{code}", post(pair_approve))
+        .admin("/api/pair/reject/{code}", post(pair_reject))
+        .admin("/api/pair/allowlist", get(pair_list_allowlist))
+        .admin("/api/pair/device", post(pair_initiate_device))
+        .admin("/api/pair/devices", get(pair_list_devices))
+        .admin("/api/pair/devices/{id}/revoke", post(pair_revoke_device))
+        .admin("/api/pair/devices/{id}/rotate", post(pair_rotate_device))
         // The document store (see `store_api`). A collection is queried by
         // POSTing to it and a scope is batch-written by POSTing to it; the
         // static tails (`claim`) sit under the document so nothing shadows.
         // Pipelines (see `pipeline_api`): the catalogue, one definition, its
         // items and its events, and one item's costs and timings. Static
         // tails sit under the pipeline id.
-        .route("/api/pipelines", get(crate::pipeline_api::catalogue))
-        .route(
+        .member("/api/pipelines", get(crate::pipeline_api::catalogue))
+        .member(
             "/api/pipelines/{scope}/{id}",
             get(crate::pipeline_api::get_definition),
         )
-        .route(
+        .member(
             "/api/pipelines/{scope}/{id}/items",
             get(crate::pipeline_api::items),
         )
-        .route(
+        .member(
             "/api/pipelines/{scope}/{id}/events",
             get(crate::pipeline_api::events),
         )
-        .route(
+        .member(
             "/api/pipelines/{scope}/{id}/items/{item}/costs",
             get(crate::pipeline_api::item_costs),
         )
-        .route(
+        .member(
             "/api/pipelines/{scope}/{id}/items/{item}/timings",
             get(crate::pipeline_api::item_timings),
         )
-        .route("/api/store/{scope}", post(crate::store_api::batch))
-        .route(
+        .member("/api/store/{scope}", post(crate::store_api::batch))
+        .member(
             "/api/store/{scope}/_collections",
             get(crate::store_api::collections),
         )
-        .route(
+        .member(
             "/api/store/{scope}/{collection}/_describe",
             get(crate::store_api::described).put(crate::store_api::describe),
         )
-        .route(
+        .member(
             "/api/store/{scope}/{collection}/{doc_id}/content",
             get(crate::store_api::content_list),
         )
-        .route(
+        .member(
             "/api/store/{scope}/{collection}/{doc_id}/content/{name}",
             get(crate::store_api::content_get)
                 .put(crate::store_api::content_put)
                 .delete(crate::store_api::content_delete),
         )
-        .route(
+        .member(
             "/api/store/{scope}/{collection}",
             get(crate::store_api::list).post(crate::store_api::query),
         )
-        .route(
+        .member(
             "/api/store/{scope}/{collection}/{doc_id}",
             get(crate::store_api::get_doc)
                 .put(crate::store_api::set_doc)
                 .patch(crate::store_api::update_doc)
                 .delete(crate::store_api::delete_doc),
         )
-        .route(
+        .member(
             "/api/store/{scope}/{collection}/{doc_id}/claim",
             post(crate::store_api::claim).delete(crate::store_api::release),
         )
         // Owner-only vault endpoints
-        .route("/api/vault", get(vault_list))
+        .admin("/api/vault", get(vault_list))
         // Credential catalog for the vault editor (path templates, no secrets).
         // Registered before the `{*path}` wildcard so it isn't shadowed.
-        .route("/api/vault/catalog", get(vault_catalog))
-        .route("/api/vault/rename", post(vault_rename))
-        .route(
+        .member("/api/vault/catalog", get(vault_catalog))
+        .admin("/api/vault/rename", post(vault_rename))
+        .admin(
             "/api/vault/{*path}",
             get(vault_get).post(vault_set).delete(vault_delete),
         )
         // Artifacts v2 knowledge base (DW-553). `search` before the `{id}`
         // route so it isn't captured as an id.
-        .route(
+        .member(
             "/api/artifacts",
             get(artifacts_list).post(artifacts_create),
         )
-        .route("/api/artifacts/search", get(artifacts_search))
-        .route(
+        .member("/api/artifacts/search", get(artifacts_search))
+        .member(
             "/api/artifacts/{id}",
             get(artifacts_get)
                 .put(artifacts_update)
@@ -718,401 +711,402 @@ pub fn router(state: Arc<GatewayState>) -> Router {
         // Cross-instance runtime artifact serving (Inc 2b). A distinct
         // 4-segment path serving the runtime `global_store`, not the
         // orchestrator KnowledgeStore above.
-        .route(
+        .member(
             "/api/artifacts/runtime/{id}",
             get(artifacts_runtime_get),
         )
-        .route(
+        .member(
             "/api/artifacts/runtime/{id}/table",
             get(artifacts_runtime_table),
         )
         // Workflow CRUD endpoints
-        .route("/api/workflows/export", get(workflow_export))
-        .route("/api/workflows", get(workflow_list))
-        .route("/api/workflows/{id}/run", post(workflow_run))
-        .route(
+        .admin("/api/workflows/export", get(workflow_export))
+        .member("/api/workflows", get(workflow_list))
+        .member("/api/workflows/{id}/run", post(workflow_run))
+        .member(
             "/api/workflows/{id}/source",
             get(workflow_get_source),
         )
-        .route(
+        .member(
             "/api/workflows/{id}",
-            axum::routing::put(workflow_put).delete(workflow_delete),
+            put(workflow_put).delete(workflow_delete),
         )
-        .route(
+        .member(
             "/api/workflows/{id}/revisions",
             get(workflow_revisions_list),
         )
-        .route(
+        .member(
             "/api/workflows/{id}/revisions/{rev}",
             get(workflow_revision_get),
         )
-        .route(
+        .member(
             "/api/workflows/{id}/revisions/{rev}/restore",
             post(workflow_revision_restore),
         )
-        .route(
+        .member(
             "/api/workflows/{id}/shares",
             get(workflow_shares_get).put(workflow_shares_put),
         )
-        .route(
+        .member(
             "/api/workflows/{id}/owner",
-            axum::routing::put(workflow_owner_put),
+            put(workflow_owner_put),
         )
         // Playbook CRUD endpoints
-        .route("/api/playbooks/export", get(playbook_export))
-        .route("/api/playbooks", get(playbook_list))
-        .route("/api/playbooks/{id}/source", get(playbook_get_source))
-        .route(
+        .admin("/api/playbooks/export", get(playbook_export))
+        .member("/api/playbooks", get(playbook_list))
+        .member("/api/playbooks/{id}/source", get(playbook_get_source))
+        .member(
             "/api/playbooks/{id}",
-            axum::routing::put(playbook_put).delete(playbook_delete),
+            put(playbook_put).delete(playbook_delete),
         )
-        .route(
+        .member(
             "/api/playbooks/{id}/revisions",
             get(playbook_revisions_list),
         )
-        .route(
+        .member(
             "/api/playbooks/{id}/revisions/{rev}",
             get(playbook_revision_get),
         )
-        .route(
+        .member(
             "/api/playbooks/{id}/revisions/{rev}/restore",
             post(playbook_revision_restore),
         )
-        .route(
+        .member(
             "/api/playbooks/{id}/shares",
             get(playbook_shares_get).put(playbook_shares_put),
         )
-        .route(
+        .member(
             "/api/playbooks/{id}/owner",
-            axum::routing::put(playbook_owner_put),
+            put(playbook_owner_put),
         )
         // Consolidation-template CRUD endpoints (member-owned)
-        .route(
+        .member(
             "/api/consolidation-templates/parse-xlsx",
             post(consolidation_parse_xlsx),
         )
-        .route(
+        .member(
             "/api/consolidation-templates/upload",
             post(consolidation_upload),
         )
-        .route("/api/consolidation-templates", get(consolidation_list))
-        .route(
+        .member("/api/consolidation-templates", get(consolidation_list))
+        .member(
             "/api/consolidation-templates/{id}/source",
             get(consolidation_get_source),
         )
-        .route(
+        .member(
             "/api/consolidation-templates/{id}",
-            axum::routing::put(consolidation_put).delete(consolidation_delete),
+            put(consolidation_put).delete(consolidation_delete),
         )
-        .route(
+        .member(
             "/api/consolidation-templates/{id}/revisions",
             get(consolidation_revisions_list),
         )
-        .route(
+        .member(
             "/api/consolidation-templates/{id}/revisions/{rev}",
             get(consolidation_revision_get),
         )
-        .route(
+        .member(
             "/api/consolidation-templates/{id}/revisions/{rev}/restore",
             post(consolidation_revision_restore),
         )
         // An agent's own environments (admin-only).
-        .route(
+        .admin(
             "/api/agents/{id}/environments",
             get(crate::api_handlers::environments::get_environments)
                 .put(crate::api_handlers::environments::put_environments),
         )
         // Channel monitor CRUD endpoints
-        .route("/api/monitors/export", get(monitor_export))
-        .route("/api/monitors", get(monitor_list))
-        .route("/api/monitors/sort-rules", get(monitor_sort_rules))
-        .route("/api/monitors/{id}/source", get(monitor_get_source))
-        .route(
+        .admin("/api/monitors/export", get(monitor_export))
+        .member("/api/monitors", get(monitor_list))
+        .member("/api/monitors/sort-rules", get(monitor_sort_rules))
+        .member("/api/monitors/{id}/source", get(monitor_get_source))
+        .member(
             "/api/monitors/{id}/enabled",
-            axum::routing::put(monitor_enabled_put),
+            put(monitor_enabled_put),
         )
-        .route(
+        .member(
             "/api/monitors/{id}",
-            axum::routing::put(monitor_put).delete(monitor_delete),
+            put(monitor_put).delete(monitor_delete),
         )
-        .route("/api/monitors/{id}/activity", get(monitor_activity))
-        .route("/api/monitors/{id}/revisions", get(monitor_revisions_list))
-        .route(
+        .member("/api/monitors/{id}/activity", get(monitor_activity))
+        .member("/api/monitors/{id}/revisions", get(monitor_revisions_list))
+        .member(
             "/api/monitors/{id}/revisions/{rev}",
             get(monitor_revision_get),
         )
-        .route(
+        .member(
             "/api/monitors/{id}/revisions/{rev}/restore",
             post(monitor_revision_restore),
         )
-        .route(
+        .member(
             "/api/monitors/{id}/shares",
             get(monitor_shares_get).put(monitor_shares_put),
         )
-        .route(
+        .member(
             "/api/monitors/{id}/owner",
-            axum::routing::put(monitor_owner_put),
+            put(monitor_owner_put),
         )
         // Config, Policy, Engagement & Memory API (DW-425)
-        .route("/api/config", get(crate::api_handlers::config::config_get).put(crate::api_handlers::config::config_put))
-        .route("/api/config/schema", get(crate::api_handlers::config::config_schema))
-        .route("/api/config/raw", get(config_raw_get).put(config_raw_put))
+        .admin("/api/config", get(crate::api_handlers::config::config_get).put(crate::api_handlers::config::config_put))
+        .admin("/api/config/schema", get(crate::api_handlers::config::config_schema))
+        .admin("/api/config/raw", get(config_raw_get).put(config_raw_put))
         // Config overlay (revisions-and-config-overlay design, §12–§13)
-        .route("/api/config/overlay", get(config_overlay_get).put(config_overlay_put))
-        .route("/api/config/effective", get(config_effective_get))
-        .route("/api/config/export", get(config_export_get))
-        .route("/api/config/overlay/revert", post(config_overlay_revert))
-        .route("/api/config/overlay/clear", post(config_overlay_clear))
-        .route(
+        .admin("/api/config/overlay", get(config_overlay_get).put(config_overlay_put))
+        .admin("/api/config/effective", get(config_effective_get))
+        .admin("/api/config/export", get(config_export_get))
+        .admin("/api/config/overlay/revert", post(config_overlay_revert))
+        .admin("/api/config/overlay/clear", post(config_overlay_clear))
+        .admin(
             "/api/policy/rules",
             get(crate::api_handlers::policy::policy_list_rules).post(crate::api_handlers::policy::policy_create_rule),
         )
-        .route(
+        .admin(
             "/api/policy/rules/{name}",
-            axum::routing::put(crate::api_handlers::policy::policy_update_rule).delete(crate::api_handlers::policy::policy_delete_rule),
+            put(crate::api_handlers::policy::policy_update_rule).delete(crate::api_handlers::policy::policy_delete_rule),
         )
-        .route(
+        .admin(
             "/api/policy/proposals",
             get(crate::api_handlers::policy::policy_list_proposals).post(crate::api_handlers::policy::policy_create_proposal),
         )
-        .route(
+        .admin(
             "/api/policy/proposals/{id}/approve",
             post(crate::api_handlers::policy::policy_approve_proposal),
         )
-        .route(
+        .admin(
             "/api/policy/proposals/{id}/reject",
             post(crate::api_handlers::policy::policy_reject_proposal),
         )
         // Permission cascade — read + write API (phases 5 & 6)
-        .route(
+        .admin(
             "/api/permissions/rules",
             get(crate::api_handlers::permissions::list_rules)
                 .post(crate::api_handlers::permissions::create_rule),
         )
-        .route(
+        .admin(
             "/api/permissions/rules/{id}",
-            axum::routing::put(crate::api_handlers::permissions::update_rule)
+            put(crate::api_handlers::permissions::update_rule)
                 .delete(crate::api_handlers::permissions::delete_rule),
         )
-        .route(
+        .admin(
             "/api/permissions/cascade",
             get(crate::api_handlers::permissions::cascade),
         )
-        .route(
+        .admin(
             "/api/permissions/roles",
             get(crate::api_handlers::permissions::list_roles)
                 .post(crate::api_handlers::permissions::create_role),
         )
-        .route(
+        .admin(
             "/api/permissions/roles/{id}",
-            axum::routing::put(crate::api_handlers::permissions::update_role)
+            put(crate::api_handlers::permissions::update_role)
                 .delete(crate::api_handlers::permissions::delete_role),
         )
-        .route(
+        .admin(
             "/api/permissions/roles/{role_id}/rules",
             get(crate::api_handlers::permissions::list_rules_for_role)
                 .post(crate::api_handlers::permissions::grant_rule_to_role),
         )
-        .route(
+        .admin(
             "/api/permissions/roles/{role_id}/rules/{rule_id}",
-            axum::routing::delete(crate::api_handlers::permissions::revoke_rule_from_role),
+            delete(crate::api_handlers::permissions::revoke_rule_from_role),
         )
-        .route(
+        .admin(
             "/api/permissions/identities/{identity_id}/roles",
             get(crate::api_handlers::permissions::list_identity_roles)
                 .post(crate::api_handlers::permissions::assign_role_to_identity),
         )
-        .route(
+        .admin(
             "/api/permissions/identities/{identity_id}/roles/{role_id}",
-            axum::routing::delete(crate::api_handlers::permissions::unassign_role_from_identity),
+            delete(crate::api_handlers::permissions::unassign_role_from_identity),
         )
-        .route(
+        .admin(
             "/api/permissions/audit",
             get(crate::api_handlers::permissions::list_audit),
         )
-        .route(
+        .admin(
             "/api/capabilities/matrix",
             get(crate::api_handlers::permissions::capabilities_matrix)
                 .put(crate::api_handlers::permissions::save_capabilities_matrix),
         )
-        .route(
+        .admin(
             "/api/capabilities/audit",
             get(crate::api_handlers::permissions::capabilities_audit),
         )
-        .route(
+        .member(
             "/api/capabilities/catalog",
             get(crate::api_handlers::permissions::capabilities_catalog),
         )
-        .route(
+        .admin(
             "/api/permissions/effective",
             get(crate::api_handlers::permissions::effective_permission),
         )
-        .route(
+        .admin(
             "/api/roles",
             get(crate::api_handlers::permissions::list_all_roles)
                 .post(crate::api_handlers::permissions::create_custom_role),
         )
-        .route(
+        .admin(
             "/api/roles/{id}",
-            axum::routing::put(crate::api_handlers::permissions::update_custom_role)
+            put(crate::api_handlers::permissions::update_custom_role)
                 .delete(crate::api_handlers::permissions::delete_custom_role),
         )
-        .route(
+        .admin(
             "/api/engagement/modes",
             get(crate::api_handlers::engagement::engagement_list_modes)
                 .put(crate::api_handlers::engagement::engagement_set_mode)
                 .delete(crate::api_handlers::engagement::engagement_delete_mode),
         )
-        .route("/api/agents/{id}/memory/files", get(crate::api_handlers::memory::memory_list_files))
-        .route(
-            "/api/agents/{id}/memory/files/{*path}",
-            get(crate::api_handlers::memory::memory_read_file).put(crate::api_handlers::memory::memory_write_file),
-        )
-        .route("/api/agents/{id}/memory/tasks", get(crate::api_handlers::memory::memory_list_tasks))
-        .route("/api/agents/{id}/memory/stats", get(crate::api_handlers::memory::memory_stats))
-        .route("/api/agents/{id}/memory/summary", get(crate::api_handlers::memory::memory_summary))
+        .member("/api/agents/{id}/memory/files", get(crate::api_handlers::memory::memory_list_files))
+        .member("/api/agents/{id}/memory/files/{*path}", get(crate::api_handlers::memory::memory_read_file))
+        .admin("/api/agents/{id}/memory/files/{*path}", put(crate::api_handlers::memory::memory_write_file))
+        .member("/api/agents/{id}/memory/tasks", get(crate::api_handlers::memory::memory_list_tasks))
+        .member("/api/agents/{id}/memory/stats", get(crate::api_handlers::memory::memory_stats))
+        .member("/api/agents/{id}/memory/summary", get(crate::api_handlers::memory::memory_summary))
         // Auth endpoints (DW-466)
-        .route("/api/auth/login", post(auth_login))
-        .route("/api/auth/refresh", post(auth_refresh))
+        .open("/api/auth/login", post(auth_login))
+        .open("/api/auth/refresh", post(auth_refresh))
         // Public auth config — tells the frontend which login methods are available.
-        .route("/api/auth/config", get(auth_config))
+        .open("/api/auth/config", get(auth_config))
         // OIDC SSO — only functional when an OIDC provider is configured.
-        .route("/api/auth/oidc/login", get(oidc_login))
-        .route("/api/auth/oidc/callback", get(oidc_callback))
+        .open("/api/auth/oidc/login", get(oidc_login))
+        .open("/api/auth/oidc/callback", get(oidc_callback))
         // Google OAuth web-redirect callback — shares a process-wide
         // `OnceLock` store with `GoogleSetupTool` via `google_web_flow_store()`.
         // Only reachable in practice when `skills/google/oauth_client/redirect_uri`
         // is set in the vault; otherwise the agent uses device flow and never
         // creates entries in the store.
-        .route(
+        .machine(
             "/api/auth/google/callback",
             get(crate::google_oauth_callback::google_oauth_callback),
         )
         // FreeAgent OAuth web-redirect callback — shares a process-wide
         // `OnceLock` store with `FreeAgentSetupTool` via `freeagent_state_store()`.
-        .route(
+        .machine(
             "/api/auth/freeagent/callback",
             get(crate::freeagent_oauth_callback::freeagent_oauth_callback),
         )
-        .route(
+        .machine(
             "/api/auth/spotify/callback",
             get(crate::spotify_oauth_callback::spotify_oauth_callback),
         )
         // Identity & Team management (DW-472, DW-473)
-        .route("/api/identities", get(crate::api_handlers::identity::list_identities).post(crate::api_handlers::identity::create_identity))
-        .route("/api/identities/{id}", get(crate::api_handlers::identity::get_identity).put(crate::api_handlers::identity::update_identity).delete(crate::api_handlers::identity_lifecycle::delete_with_defaults))
-        .route("/api/identities/{id}/holdings", get(crate::api_handlers::identity_lifecycle::holdings))
-        .route("/api/identities/{id}/suspend", post(crate::api_handlers::identity_lifecycle::suspend))
-        .route("/api/identities/{id}/resume", post(crate::api_handlers::identity_lifecycle::resume))
-        .route("/api/identities/{id}/merge", post(crate::api_handlers::identity_lifecycle::merge))
-        .route("/api/identities/{id}/transfer", post(crate::api_handlers::identity_lifecycle::transfer))
-        .route("/api/identities/{id}/delete", post(crate::api_handlers::identity_lifecycle::delete))
-        .route("/api/identity-lifecycle/operations", get(crate::api_handlers::identity_lifecycle::operations))
-        .route("/api/identity-lifecycle/operations/{id}", get(crate::api_handlers::identity_lifecycle::operation))
-        .route("/api/identity-lifecycle/orphans", get(crate::api_handlers::identity_lifecycle::orphans))
-        .route("/api/identity-lifecycle/orphans/{id}/transfer", post(crate::api_handlers::identity_lifecycle::transfer_orphan))
-        .route("/api/identity-lifecycle/orphans/{id}/delete", post(crate::api_handlers::identity_lifecycle::delete_orphan))
-        .route("/api/identities/{id}/elevate", post(crate::api_handlers::identity::elevate_identity))
-        .route("/api/identities/{id}/set-password", post(crate::api_handlers::identity::set_password))
-        .route("/api/auth/link-device", post(crate::api_handlers::identity::link_device))
-        .route("/api/identity/teams", get(crate::api_handlers::identity::list_teams).post(crate::api_handlers::identity::create_team))
-        .route("/api/identity/teams/{id}", get(crate::api_handlers::identity::get_team).put(crate::api_handlers::identity::update_team).delete(crate::api_handlers::identity::delete_team))
-        .route("/api/identity/teams/{id}/members", post(crate::api_handlers::identity::add_team_member))
-        .route("/api/identity/teams/{id}/members/{member_id}", axum::routing::delete(crate::api_handlers::identity::remove_team_member))
-        .route("/api/identity/teams/{id}/join-requests", post(crate::api_handlers::identity::request_join_team))
-        .route("/api/identity/teams/{id}/join-requests/{applicant_id}/approve", post(crate::api_handlers::identity::approve_join_request))
-        .route("/api/identity/teams/{id}/join-requests/{applicant_id}/reject", post(crate::api_handlers::identity::reject_join_request))
+        .admin("/api/identities", get(crate::api_handlers::identity::list_identities).post(crate::api_handlers::identity::create_identity))
+        .member("/api/identities/{id}", get(crate::api_handlers::identity::get_identity))
+        .admin("/api/identities/{id}", put(crate::api_handlers::identity::update_identity).delete(crate::api_handlers::identity_lifecycle::delete_with_defaults))
+        .admin("/api/identities/{id}/holdings", get(crate::api_handlers::identity_lifecycle::holdings))
+        .admin("/api/identities/{id}/suspend", post(crate::api_handlers::identity_lifecycle::suspend))
+        .admin("/api/identities/{id}/resume", post(crate::api_handlers::identity_lifecycle::resume))
+        .admin("/api/identities/{id}/merge", post(crate::api_handlers::identity_lifecycle::merge))
+        .admin("/api/identities/{id}/transfer", post(crate::api_handlers::identity_lifecycle::transfer))
+        .admin("/api/identities/{id}/delete", post(crate::api_handlers::identity_lifecycle::delete))
+        .admin("/api/identity-lifecycle/operations", get(crate::api_handlers::identity_lifecycle::operations))
+        .admin("/api/identity-lifecycle/operations/{id}", get(crate::api_handlers::identity_lifecycle::operation))
+        .admin("/api/identity-lifecycle/orphans", get(crate::api_handlers::identity_lifecycle::orphans))
+        .admin("/api/identity-lifecycle/orphans/{id}/transfer", post(crate::api_handlers::identity_lifecycle::transfer_orphan))
+        .admin("/api/identity-lifecycle/orphans/{id}/delete", post(crate::api_handlers::identity_lifecycle::delete_orphan))
+        .admin("/api/identities/{id}/elevate", post(crate::api_handlers::identity::elevate_identity))
+        .admin("/api/identities/{id}/set-password", post(crate::api_handlers::identity::set_password))
+        .member("/api/auth/link-device", post(crate::api_handlers::identity::link_device))
+        .member("/api/identity/teams", get(crate::api_handlers::identity::list_teams))
+        .admin("/api/identity/teams", post(crate::api_handlers::identity::create_team))
+        .member("/api/identity/teams/{id}", get(crate::api_handlers::identity::get_team))
+        .admin("/api/identity/teams/{id}", put(crate::api_handlers::identity::update_team).delete(crate::api_handlers::identity::delete_team))
+        .admin("/api/identity/teams/{id}/members", post(crate::api_handlers::identity::add_team_member))
+        .admin("/api/identity/teams/{id}/members/{member_id}", delete(crate::api_handlers::identity::remove_team_member))
+        .member("/api/identity/teams/{id}/join-requests", post(crate::api_handlers::identity::request_join_team))
+        .admin("/api/identity/teams/{id}/join-requests/{applicant_id}/approve", post(crate::api_handlers::identity::approve_join_request))
+        .admin("/api/identity/teams/{id}/join-requests/{applicant_id}/reject", post(crate::api_handlers::identity::reject_join_request))
         // Owner-scoped scheduler API (members see own + public; admins all)
         // ── Lessons-learned admin API (SCOPE_ADMIN on every route) ──
-        .route("/api/lessons", get(crate::api_handlers::lessons::list_lessons))
-        .route(
+        .admin("/api/lessons", get(crate::api_handlers::lessons::list_lessons))
+        .admin(
             "/api/lessons/metrics",
             get(crate::api_handlers::lessons::lessons_metrics),
         )
-        .route(
+        .admin(
             "/api/lessons/recurrences",
             get(crate::api_handlers::lessons::lessons_recurrences),
         )
-        .route(
+        .admin(
             "/api/lessons/cleanup",
             post(crate::api_handlers::lessons::lessons_cleanup),
         )
-        .route(
+        .admin(
             "/api/lessons/backfill",
             post(crate::api_handlers::lessons::lessons_backfill),
         )
-        .route(
+        .admin(
             "/api/lessons/jobs/{id}",
             get(crate::api_handlers::lessons::lessons_job_status),
         )
-        .route(
+        .admin(
             "/api/lessons/{id}",
-            axum::routing::delete(crate::api_handlers::lessons::delete_lesson),
+            delete(crate::api_handlers::lessons::delete_lesson),
         )
-        .route("/api/schedules", get(schedules_list).post(schedule_create))
-        .route(
+        .member("/api/schedules", get(schedules_list).post(schedule_create))
+        .member(
             "/api/schedules/{id}",
             get(schedule_get).put(schedule_update).delete(schedule_delete),
         )
-        .route("/api/schedules/{id}/run", post(schedule_run))
-        .route("/api/schedules/{id}/history", get(schedule_history))
+        .member("/api/schedules/{id}/run", post(schedule_run))
+        .member("/api/schedules/{id}/history", get(schedule_history))
         // Per-user settings (DW-505)
-        .route("/api/me", get(get_me))
-        .route(
+        .member("/api/me", get(get_me))
+        .member(
             "/api/me/picture",
             get(crate::api_handlers::pictures::my_picture_get)
                 .put(crate::api_handlers::pictures::my_picture_put)
                 .delete(crate::api_handlers::pictures::my_picture_delete)
                 .layer(axum::extract::DefaultBodyLimit::max(PICTURE_BODY_LIMIT)),
         )
-        .route("/api/me/capabilities", get(get_my_capabilities))
-        .route(
+        .member("/api/me/capabilities", get(get_my_capabilities))
+        .member(
             "/api/me/relationship",
             get(crate::api_handlers::relationship::my_relationship),
         )
-        .route("/api/me/integrations", get(crate::api_handlers::my_settings::get_integrations))
-        .route("/api/me/vault", get(crate::api_handlers::my_settings::list_user_vault))
-        .route("/api/me/secret", post(crate::api_handlers::my_settings::set_user_secret).delete(crate::api_handlers::my_settings::delete_user_secret))
-        .route("/api/me/vault/move", post(crate::api_handlers::my_settings::move_user_vault))
-        .route("/api/me/vault/{*path}", post(crate::api_handlers::my_settings::set_user_vault).delete(crate::api_handlers::my_settings::delete_user_vault))
-        .route("/api/me/llm-route", get(crate::api_handlers::llm_route::get_my_route).put(crate::api_handlers::llm_route::put_my_route))
-        .route("/api/me/agents/{id}/llm-route", get(crate::api_handlers::llm_route::get_my_agent_route).put(crate::api_handlers::llm_route::put_my_agent_route))
-        .route("/api/me/subscriptions", get(crate::api_handlers::subscriptions::my_subscriptions))
-        .route("/api/me/subscriptions/{kind}/login", post(crate::api_handlers::subscriptions::save_login).delete(crate::api_handlers::subscriptions::remove_login))
-        .route("/api/me/subscriptions/chatgpt/device", post(crate::api_handlers::subscriptions::start_device_login).get(crate::api_handlers::subscriptions::current_device_login))
-        .route("/api/me/subscriptions/chatgpt/device/{flow_id}", get(crate::api_handlers::subscriptions::get_device_login).delete(crate::api_handlers::subscriptions::cancel_device_login))
-        .route("/api/me/remote-mcp-tokens", get(crate::api_handlers::remote_mcp_tokens::list_my_tokens).post(crate::api_handlers::remote_mcp_tokens::create_my_token))
-        .route("/api/me/remote-mcp-tokens/desk", post(crate::api_handlers::remote_mcp_tokens::create_device_token))
-        .route("/api/me/remote-mcp-tokens/desk/{id}", axum::routing::delete(crate::api_handlers::remote_mcp_tokens::revoke_device_token))
-        .route("/api/me/remote-mcp-tokens/{id}", axum::routing::delete(crate::api_handlers::remote_mcp_tokens::revoke_my_token))
-        .route("/api/me/desk-boss-links", get(crate::api_handlers::desk_boss_links::list).post(crate::api_handlers::desk_boss_links::create))
-        .route("/api/me/desk-boss-links/{id}", axum::routing::delete(crate::api_handlers::desk_boss_links::revoke))
-        .route("/api/me/desk-boss-links/{id}/conversation", post(crate::boss_links::conversation::open))
+        .member("/api/me/integrations", get(crate::api_handlers::my_settings::get_integrations))
+        .member("/api/me/vault", get(crate::api_handlers::my_settings::list_user_vault))
+        .member("/api/me/secret", post(crate::api_handlers::my_settings::set_user_secret).delete(crate::api_handlers::my_settings::delete_user_secret))
+        .member("/api/me/vault/move", post(crate::api_handlers::my_settings::move_user_vault))
+        .member("/api/me/vault/{*path}", post(crate::api_handlers::my_settings::set_user_vault).delete(crate::api_handlers::my_settings::delete_user_vault))
+        .member("/api/me/llm-route", get(crate::api_handlers::llm_route::get_my_route).put(crate::api_handlers::llm_route::put_my_route))
+        .member("/api/me/agents/{id}/llm-route", get(crate::api_handlers::llm_route::get_my_agent_route).put(crate::api_handlers::llm_route::put_my_agent_route))
+        .member("/api/me/subscriptions", get(crate::api_handlers::subscriptions::my_subscriptions))
+        .member("/api/me/subscriptions/{kind}/login", post(crate::api_handlers::subscriptions::save_login).delete(crate::api_handlers::subscriptions::remove_login))
+        .member("/api/me/subscriptions/chatgpt/device", post(crate::api_handlers::subscriptions::start_device_login).get(crate::api_handlers::subscriptions::current_device_login))
+        .member("/api/me/subscriptions/chatgpt/device/{flow_id}", get(crate::api_handlers::subscriptions::get_device_login).delete(crate::api_handlers::subscriptions::cancel_device_login))
+        .member("/api/me/remote-mcp-tokens", get(crate::api_handlers::remote_mcp_tokens::list_my_tokens).post(crate::api_handlers::remote_mcp_tokens::create_my_token))
+        .member("/api/me/remote-mcp-tokens/desk", post(crate::api_handlers::remote_mcp_tokens::create_device_token))
+        .member("/api/me/remote-mcp-tokens/desk/{id}", delete(crate::api_handlers::remote_mcp_tokens::revoke_device_token))
+        .member("/api/me/remote-mcp-tokens/{id}", delete(crate::api_handlers::remote_mcp_tokens::revoke_my_token))
+        .member("/api/me/desk-boss-links", get(crate::api_handlers::desk_boss_links::list).post(crate::api_handlers::desk_boss_links::create))
+        .member("/api/me/desk-boss-links/{id}", delete(crate::api_handlers::desk_boss_links::revoke))
+        .member("/api/me/desk-boss-links/{id}/conversation", post(crate::boss_links::conversation::open))
         // A person's Desk sharing their work with an agent here (Sees): the
         // device mints and revokes; the `wfk_` token pushes, forgets and
         // reads its counts, each checking its own token.
-        .route("/api/me/desk-knows-tokens", post(crate::desk_knows::routes::mint))
-        .route("/api/me/desk-knows-tokens/engines", get(crate::desk_knows::routes::engines))
-        .route("/api/me/desk-knows-tokens/{id}", axum::routing::delete(crate::desk_knows::routes::revoke))
-        .route("/api/me/desk-knows-tokens/engines/{engine}", axum::routing::delete(crate::desk_knows::routes::revoke_engine))
-        .route("/api/desk-knows/revoke", post(crate::desk_knows::routes::revoke_self))
-        .route(
+        .member("/api/me/desk-knows-tokens", post(crate::desk_knows::routes::mint))
+        .open("/api/me/desk-knows-tokens/engines", get(crate::desk_knows::routes::engines))
+        .member("/api/me/desk-knows-tokens/{id}", delete(crate::desk_knows::routes::revoke))
+        .member("/api/me/desk-knows-tokens/engines/{engine}", delete(crate::desk_knows::routes::revoke_engine))
+        .machine("/api/desk-knows/revoke", post(crate::desk_knows::routes::revoke_self))
+        .machine(
             "/api/desk-knows/push",
             post(crate::desk_knows::routes::push).layer(axum::extract::DefaultBodyLimit::max(
                 crate::desk_knows::routes::MAX_BODY + 64 * 1024,
             )),
         )
-        .route(
+        .machine(
             "/api/desk-knows/forget",
             post(crate::desk_knows::routes::forget).layer(axum::extract::DefaultBodyLimit::max(
                 4 * crate::desk_knows::routes::MAX_BODY + 64 * 1024,
             )),
         )
-        .route("/api/desk-knows/status", get(crate::desk_knows::routes::status))
-        .route("/api/remote-mcp-tokens", get(crate::api_handlers::remote_mcp_tokens::list_all_tokens))
-        .route("/api/remote-mcp-tokens/{id}", axum::routing::delete(crate::api_handlers::remote_mcp_tokens::revoke_any_token))
+        .machine("/api/desk-knows/status", get(crate::desk_knows::routes::status))
+        .admin("/api/remote-mcp-tokens", get(crate::api_handlers::remote_mcp_tokens::list_all_tokens))
+        .admin("/api/remote-mcp-tokens/{id}", delete(crate::api_handlers::remote_mcp_tokens::revoke_any_token))
         // ── Agent training corpora (DW-539) ──
-        .route(
+        .admin(
             "/api/agents/{id}/training/corpora",
             post(crate::training_handlers::upload_corpus)
                 .get(crate::training_handlers::list_corpora)
@@ -1120,114 +1114,114 @@ pub fn router(state: Arc<GatewayState>) -> Router {
                     crate::training_handlers::TRAINING_UPLOAD_BODY_LIMIT,
                 )),
         )
-        .route(
+        .admin(
             "/api/agents/{id}/training/corpora/{name}",
             get(crate::training_handlers::get_corpus)
                 .delete(crate::training_handlers::delete_corpus),
         )
-        .route(
+        .admin(
             "/api/agents/{id}/training/documents/{doc_id}",
             get(crate::training_handlers::get_document)
                 .delete(crate::training_handlers::delete_document),
         )
-        .route(
+        .admin(
             "/api/agents/{id}/training/documents/{doc_id}/download",
             get(crate::training_handlers::download_document),
         )
         // ── Agent self-learning (plans + curated items) ──
-        .route(
+        .admin(
             "/api/agents/{id}/self-learning/plans",
             get(crate::self_learning_handlers::list_plans)
                 .post(crate::self_learning_handlers::upsert_plan),
         )
-        .route(
+        .admin(
             "/api/agents/{id}/self-learning/plans/{plan_id}",
             get(crate::self_learning_handlers::get_plan)
                 .delete(crate::self_learning_handlers::delete_plan),
         )
-        .route(
+        .admin(
             "/api/agents/{id}/self-learning/plans/{plan_id}/run",
             post(crate::self_learning_handlers::run_plan),
         )
-        .route(
+        .admin(
             "/api/agents/{id}/self-learning/items",
             get(crate::self_learning_handlers::list_items),
         )
-        .route(
+        .admin(
             "/api/agents/{id}/self-learning/items/{item_id}/approve",
             post(crate::self_learning_handlers::approve_item),
         )
-        .route(
+        .admin(
             "/api/agents/{id}/self-learning/items/{item_id}/reject",
             post(crate::self_learning_handlers::reject_item),
         )
-        .route(
+        .admin(
             "/api/agents/{id}/self-learning/items/{item_id}/reverify",
             post(crate::self_learning_handlers::reverify_item),
         )
-        .route(
+        .admin(
             "/api/agents/{id}/self-learning/items/{item_id}",
-            axum::routing::delete(crate::self_learning_handlers::delete_item),
+            delete(crate::self_learning_handlers::delete_item),
         )
-        .route(
+        .member(
             "/api/agents/{id}/settings",
             get(crate::api_handlers::settings::effective_settings),
         )
         // ── Agent know-how ──
-        .route(
+        .admin(
             "/api/agents/{id}/know-how",
             get(crate::api_handlers::know_how::list_entries),
         )
-        .route(
+        .admin(
             "/api/agents/{id}/know-how/{entry}/pin",
             post(crate::api_handlers::know_how::pin_entry),
         )
-        .route(
+        .admin(
             "/api/agents/{id}/know-how/{entry}/retire",
             post(crate::api_handlers::know_how::retire_entry),
         )
-        .route(
+        .admin(
             "/api/agents/{id}/know-how/{entry}",
-            axum::routing::delete(crate::api_handlers::know_how::delete_entry),
+            delete(crate::api_handlers::know_how::delete_entry),
         )
-        .route(
+        .admin(
             "/api/identities/{id}/know-how",
-            axum::routing::delete(crate::api_handlers::know_how::erase_identity),
+            delete(crate::api_handlers::know_how::erase_identity),
         )
         // ── Deep-expertise knowledge tree ──
-        .route(
+        .admin(
             "/api/agents/{id}/deep-expertise/nodes",
             get(crate::self_learning_handlers::list_nodes),
         )
-        .route(
+        .admin(
             "/api/agents/{id}/deep-expertise/nodes/{node_id}",
             get(crate::self_learning_handlers::get_node)
                 .delete(crate::self_learning_handlers::delete_node),
         )
-        .route(
+        .admin(
             "/api/agents/{id}/deep-expertise/nodes/{node_id}/approve",
             post(crate::self_learning_handlers::approve_node),
         )
-        .route(
+        .admin(
             "/api/agents/{id}/deep-expertise/nodes/{node_id}/reject",
             post(crate::self_learning_handlers::reject_node),
         )
         // ── Stats / analytics ──
-        .route("/api/stats/overview", get(crate::api_handlers::stats::get_overview))
-        .route("/api/stats/cost/breakdown", get(crate::api_handlers::stats::get_cost_breakdown))
-        .route("/api/stats/identities", get(crate::api_handlers::stats::list_identities))
-        .route("/api/stats/identities/{id}", get(crate::api_handlers::stats::get_identity_stats))
-        .route("/api/stats/identities/{id}/tasks", get(crate::api_handlers::stats::get_identity_tasks))
-        .route("/api/stats/agents", get(crate::api_handlers::stats::list_agents))
-        .route("/api/stats/agents/{id}", get(crate::api_handlers::stats::get_agent_stats))
-        .route("/api/stats/agents/{id}/tasks", get(crate::api_handlers::stats::get_agent_tasks))
-        .route("/api/stats/tasks/{task_id}", get(crate::api_handlers::stats::get_task_trace))
-        .route("/api/stats/models", get(crate::api_handlers::stats::get_models))
-        .route("/api/stats/tools", get(crate::api_handlers::stats::get_tools))
-        .route("/api/stats/efficiency", get(crate::api_handlers::stats::get_efficiency))
-        .route("/api/budget/status", get(crate::api_handlers::budget::get_status))
-        .route("/api/budget/overrides", axum::routing::put(crate::api_handlers::budget::put_override))
-        .route("/api/budget/overrides/clear", axum::routing::post(crate::api_handlers::budget::clear_override))
+        .admin("/api/stats/overview", get(crate::api_handlers::stats::get_overview))
+        .admin("/api/stats/cost/breakdown", get(crate::api_handlers::stats::get_cost_breakdown))
+        .admin("/api/stats/identities", get(crate::api_handlers::stats::list_identities))
+        .member("/api/stats/identities/{id}", get(crate::api_handlers::stats::get_identity_stats))
+        .member("/api/stats/identities/{id}/tasks", get(crate::api_handlers::stats::get_identity_tasks))
+        .admin("/api/stats/agents", get(crate::api_handlers::stats::list_agents))
+        .admin("/api/stats/agents/{id}", get(crate::api_handlers::stats::get_agent_stats))
+        .admin("/api/stats/agents/{id}/tasks", get(crate::api_handlers::stats::get_agent_tasks))
+        .member("/api/stats/tasks/{task_id}", get(crate::api_handlers::stats::get_task_trace))
+        .admin("/api/stats/models", get(crate::api_handlers::stats::get_models))
+        .admin("/api/stats/tools", get(crate::api_handlers::stats::get_tools))
+        .admin("/api/stats/efficiency", get(crate::api_handlers::stats::get_efficiency))
+        .admin("/api/budget/status", get(crate::api_handlers::budget::get_status))
+        .admin("/api/budget/overrides", put(crate::api_handlers::budget::put_override))
+        .admin("/api/budget/overrides/clear", post(crate::api_handlers::budget::clear_override))
         .with_state(Arc::clone(&state))
         // The person's Desk takes agents' theme calls: on every hub.
         .merge(crate::desk_themes::router(Arc::clone(&state)))
@@ -1239,7 +1233,7 @@ pub fn router(state: Arc<GatewayState>) -> Router {
 /// `routes` with the security headers every response of the gateway carries
 /// (audit F2, 2026-05-15) and its 1 MiB body limit (audit F3), which a route
 /// raises for itself where it takes more.
-pub(crate) fn hardened(routes: Router) -> Router {
+pub(crate) fn hardened(routes: Routes) -> Routes {
     routes
         .layer(axum::middleware::from_fn(
             crate::security::security_headers_middleware,
@@ -1251,7 +1245,7 @@ pub(crate) fn hardened(routes: Router) -> Router {
 /// a person's own keys copied by their Desk.
 /// They read conversations from the Postgres-backed hub, so a hub without
 /// it serves neither.
-fn desk_routes(state: Arc<GatewayState>) -> Router {
+fn desk_routes(state: Arc<GatewayState>) -> Routes {
     #[cfg(feature = "postgres")]
     {
         crate::desk_conversations::router(Arc::clone(&state))
@@ -1259,15 +1253,15 @@ fn desk_routes(state: Arc<GatewayState>) -> Router {
             // vault (Settings → Connections): the device token alone.
             .merge(crate::desk_key_copies::router(Arc::clone(&state)))
             .merge(
-                Router::new()
-                    .route("/ws/desk", get(crate::desk_surface::link::handler))
+                Routes::new()
+                    .member("/ws/desk", get(crate::desk_surface::link::handler))
                     .with_state(state),
             )
     }
     #[cfg(not(feature = "postgres"))]
     {
         let _ = state;
-        Router::new()
+        Routes::new()
     }
 }
 
@@ -16234,7 +16228,8 @@ mod session_visibility_tests {
         tokio::spawn(async move {
             axum::serve(
                 listener,
-                router(state).into_make_service_with_connect_info::<std::net::SocketAddr>(),
+                crate::serve::combined(router(state))
+                    .into_make_service_with_connect_info::<std::net::SocketAddr>(),
             )
             .await
         });
@@ -16786,21 +16781,23 @@ mod client_ip_tests {
 mod body_limit_tests {
     //! F3 (2026-05-15): router-level body-size cap. A 2 MB POST should be
     //! rejected by the tower layer before it ever reaches a handler.
+    use crate::surface::routing::post;
+    use crate::surface::Routes;
     use axum::body::Body;
     use axum::extract::DefaultBodyLimit;
     use axum::http::{Request, StatusCode};
-    use axum::routing::post;
-    use axum::Router;
     use tower::ServiceExt;
 
     async fn echo(body: axum::body::Bytes) -> String {
         format!("{}", body.len())
     }
 
-    fn router_with_default_limit() -> Router {
-        Router::new()
-            .route("/echo", post(echo))
-            .layer(DefaultBodyLimit::max(1024 * 1024))
+    fn router_with_default_limit() -> axum::Router {
+        crate::serve::combined(
+            Routes::new()
+                .open("/echo", post(echo))
+                .layer(DefaultBodyLimit::max(1024 * 1024)),
+        )
     }
 
     #[tokio::test]
@@ -16833,13 +16830,15 @@ mod body_limit_tests {
     async fn per_route_override_lifts_limit() {
         // Mirrors the upload-route override pattern: 64 MiB on the route,
         // 1 MiB on the rest.
-        let app = Router::new()
-            .route(
-                "/upload",
-                post(echo).layer(DefaultBodyLimit::max(8 * 1024 * 1024)),
-            )
-            .route("/normal", post(echo))
-            .layer(DefaultBodyLimit::max(1024 * 1024));
+        let app = crate::serve::combined(
+            Routes::new()
+                .open(
+                    "/upload",
+                    post(echo).layer(DefaultBodyLimit::max(8 * 1024 * 1024)),
+                )
+                .open("/normal", post(echo))
+                .layer(DefaultBodyLimit::max(1024 * 1024)),
+        );
 
         // 2 MiB to /upload — allowed by the per-route override.
         let payload = vec![b'A'; 2 * 1024 * 1024];
@@ -16867,7 +16866,7 @@ mod body_limit_tests {
 mod cors_layer_tests {
     //! DW-517: replaces `CorsLayer::permissive()` with an explicit allow-list.
     use super::*;
-    use axum::routing::get;
+    use crate::surface::routing::get;
     use tower::ServiceExt;
 
     async fn ping() -> &'static str {
@@ -16884,8 +16883,8 @@ mod cors_layer_tests {
             .unwrap()
     }
 
-    fn router_with(layer: CorsLayer) -> Router {
-        Router::new().route("/p", get(ping)).layer(layer)
+    fn router_with(layer: CorsLayer) -> axum::Router {
+        crate::serve::combined(Routes::new().open("/p", get(ping)).layer(layer))
     }
 
     #[tokio::test]
@@ -18008,9 +18007,11 @@ mod fallback_tests {
     use super::*;
 
     async fn call(method: Method, path: &str) -> (StatusCode, Option<String>, Vec<u8>) {
-        let app: Router = Router::new()
-            .route("/api/known", get(|| async { "known" }))
-            .fallback(static_fallback);
+        let app = crate::serve::combined(
+            Routes::new()
+                .open("/api/known", get(|| async { "known" }))
+                .fallback(static_fallback),
+        );
         let response = app
             .oneshot(
                 Request::builder()

@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use axum::extract::Form;
-use axum::routing::post as post_route;
+use axum::routing::{get as get_route, post as post_route};
 
 use super::*;
 use workforce_skills::adapters::bank::model::CONSENT_DAYS;
@@ -239,11 +239,15 @@ async fn freeagent_company(h: HeaderMap) -> Response {
     }
 }
 
+#[allow(
+    clippy::disallowed_methods,
+    reason = "stand-ins for the services connections reach, not routes the hub serves"
+)]
 async fn services(github: Arc<Github>) -> Services {
-    let app = Router::new()
+    let app = axum::Router::new()
         .route(
             "/banksync/whoami",
-            get(|h: HeaderMap| async move {
+            get_route(|h: HeaderMap| async move {
                 let scopes = match h.get("x-api-key").and_then(|v| v.to_str().ok()) {
                     Some(BS_GOOD) => json!(["banks:read", "institutions:read"]),
                     Some(BS_WRITES) => json!(["banks:read", "banks:write"]),
@@ -254,7 +258,7 @@ async fn services(github: Arc<Github>) -> Services {
         )
         .route(
             "/banksync/banks",
-            get(|| async {
+            get_route(|| async {
                 Json(json!({ "success": true, "data": [
                     { "id": "bnk_nw", "name": "NatWest", "connectionStatus": { "connected": true } },
                     { "id": "bnk_rev", "name": "Revolut", "connectionStatus": { "connected": false } },
@@ -265,7 +269,7 @@ async fn services(github: Arc<Github>) -> Services {
         )
         .route(
             "/banksync/banks/{id}",
-            get(|axum::extract::Path(id): axum::extract::Path<String>| async move {
+            get_route(|axum::extract::Path(id): axum::extract::Path<String>| async move {
                 // BankSync's detail says nothing of Starling's connection.
                 let data = match id.as_str() {
                     "bnk_nw" => json!({ "id": id, "name": "NatWest", "connectionStatus": { "connected": true } }),
@@ -278,7 +282,7 @@ async fn services(github: Arc<Github>) -> Services {
         )
         .route(
             "/banksync/banks/{id}/accounts",
-            get(|axum::extract::Path(id): axum::extract::Path<String>| async move {
+            get_route(|axum::extract::Path(id): axum::extract::Path<String>| async move {
                 match id.as_str() {
                     "bnk_rev" => (
                         StatusCode::CONFLICT,
@@ -291,7 +295,7 @@ async fn services(github: Arc<Github>) -> Services {
         )
         .route(
             "/user",
-            get(|h: HeaderMap| async move {
+            get_route(|h: HeaderMap| async move {
                 match h.get("authorization").and_then(|v| v.to_str().ok()) {
                     Some(a) if a == format!("Bearer {GH_GOOD}") => {
                         Json(json!({ "login": "sarah" })).into_response()
@@ -358,8 +362,8 @@ async fn services(github: Arc<Github>) -> Services {
         )
         .route("/token", post_route(provider_token))
         .route("/token_endpoint", post_route(provider_token))
-        .route("/userinfo", get(google_userinfo))
-        .route("/company", get(freeagent_company))
+        .route("/userinfo", get_route(google_userinfo))
+        .route("/company", get_route(freeagent_company))
         .with_state(github);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base = format!("http://{}", listener.local_addr().unwrap());
@@ -3878,7 +3882,7 @@ async fn a_copied_connection_is_audited_here_with_where_it_came_from() {
             .ok()
             .expect("the fixture's only handle")
     });
-    let app = router(state, Arc::clone(&h.c));
+    let app = crate::serve::combined(router(state, Bound::To(Arc::clone(&h.c))));
     let post = |body: Value| {
         Request::builder()
             .method("POST")
@@ -4879,7 +4883,7 @@ async fn the_documents_folder_is_said_only_to_the_hubs_person_and_never_made() {
         Some(owner.id.to_string()),
     )
     .unwrap();
-    let app = router(state, Arc::clone(&h.c));
+    let app = crate::serve::combined(router(state, Bound::To(Arc::clone(&h.c))));
     let ask = |agent: &str, token: &str| {
         Request::builder()
             .uri(format!("/api/desk/agents/{agent}/documents"))

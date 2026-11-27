@@ -435,7 +435,10 @@ async fn a_person_sees_and_revokes_their_own_always_allows_alone() {
             .unwrap();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let app = workforce_hub::surface_allows::router(Arc::clone(&gateway.state), Some(store));
+        let app = workforce_hub::serve::combined(workforce_hub::surface_allows::router(
+            Arc::clone(&gateway.state),
+            Some(store),
+        ));
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
 
         let (status, mine) = get(addr, "/api/desk/allows", Some(&token_for(&alice))).await;
@@ -487,7 +490,9 @@ async fn serve_floor(
 ) -> std::net::SocketAddr {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    let app = workforce_hub::gateway::router(Arc::clone(&state)).merge(router(state, sources));
+    let app = workforce_hub::serve::combined(
+        workforce_hub::gateway::router(Arc::clone(&state)).merge(router(state, sources)),
+    );
     tokio::spawn(async move {
         axum::serve(
             listener,
@@ -516,14 +521,18 @@ async fn eventually<T>(mut check: impl AsyncFnMut() -> Option<T>) -> T {
 async fn the_desk_routes_mounted_beside_the_gateway_are_hardened_like_it() {
     let dir = tempfile::tempdir().unwrap();
     let gateway = Gateway::new(vec![("scout", agent_service(dir.path()).await)], None);
-    let app = workforce_hub::desk_driver::mount(
-        axum::Router::new(),
+    let desk = workforce_hub::desk_driver::start(
         &gateway.state,
         &workforce_common::settings::WorkforceConfig::default(),
         tokio_util::sync::CancellationToken::new(),
     )
     .await
     .unwrap();
+    let app = workforce_hub::serve::combined(workforce_hub::desk_driver::mount(
+        &gateway.state,
+        workforce_hub::surface::Routes::new(),
+        desk.map(workforce_hub::surface::Bound::To),
+    ));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });

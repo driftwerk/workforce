@@ -1,7 +1,13 @@
-//! Which listener a request arrived on. Each listener runs its requests in an
-//! [`Arrival`] scope; code that reads [`current`] outside one (a spawned task,
-//! a background job) gets the hub's default, which [`set_default`] fixes once
-//! before any listener binds.
+//! Which listener a request arrived on, and what each listener serves. Each
+//! listener runs its requests in an [`Arrival`] scope; code that reads
+//! [`current`] outside one (a spawned task, a background job) gets the hub's
+//! default, which [`set_default`] fixes once before any listener binds. The
+//! routes it serves are the [`Routes`] rendered for its [`Surface`].
+
+mod routes;
+pub mod routing;
+
+pub use routes::{Bound, Declared, RouteClass, Routes};
 
 use std::future::Future;
 use std::net::IpAddr;

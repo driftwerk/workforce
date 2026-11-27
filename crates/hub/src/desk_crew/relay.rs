@@ -29,12 +29,12 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::surface::routing::{get, post};
 use axum::body::Bytes;
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
-use axum::{Json, Router};
+use axum::Json;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use uuid::Uuid;
@@ -188,13 +188,17 @@ impl NativeSeen {
     }
 }
 
-/// `router`, noting in `seen` each `/api/desk/` request made with the hub's
+/// `routes`, noting in `seen` each `/api/desk/` request made with the hub's
 /// own token `token`, as only Desk's native side makes them, whatever its
 /// route. Desk Helper's bootstrap (`/api/identities`, `/api/me`,
 /// `/api/pair/*`) carries the same token and is no sign of Desk's native
 /// side, so it isn't noted.
-pub(crate) fn noting_native(router: Router, token: String, seen: Arc<NativeSeen>) -> Router {
-    router.layer(axum::middleware::from_fn(
+pub(crate) fn noting_native(
+    routes: crate::surface::Routes,
+    token: String,
+    seen: Arc<NativeSeen>,
+) -> crate::surface::Routes {
+    routes.layer(axum::middleware::from_fn(
         move |request: axum::extract::Request, next: axum::middleware::Next| {
             if request.uri().path().starts_with("/api/desk/") && hubs_own(&token, request.headers())
             {
@@ -596,11 +600,14 @@ async fn machine_grants(State(s): S, h: HeaderMap, Query(q): Query<GrantsQuery>)
     }
 }
 
-pub(crate) fn routes(state: Arc<GatewayState>, crew: Arc<CrewHub>) -> Router {
-    Router::new()
-        .route("/api/desk/machine-grants", get(machine_grants))
-        .route("/api/desk/crew/relay", get(take))
-        .route("/api/desk/crew/relay/{id}", post(answer))
-        .route("/api/desk/crew/served", post(served))
-        .with_state(Arc::new(RelayApi { state, crew }))
+pub(crate) fn routes(
+    state: Arc<GatewayState>,
+    crew: crate::surface::Bound<Arc<CrewHub>>,
+) -> crate::surface::Routes {
+    crate::surface::Routes::new()
+        .admin("/api/desk/machine-grants", get(machine_grants))
+        .admin("/api/desk/crew/relay", get(take))
+        .admin("/api/desk/crew/relay/{id}", post(answer))
+        .admin("/api/desk/crew/served", post(served))
+        .bind(crew.map(|crew| Arc::new(RelayApi { state, crew })))
 }

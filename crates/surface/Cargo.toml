@@ -4,7 +4,12 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 publish = false
-description = "Which listener a request arrived on, and the hub's default when none says"
+description = "Which listener a request arrived on, the hub's default when none says, and the routes each listener serves"
 
 [dependencies]
+axum = { workspace = true }
 tokio = { workspace = true }
+tower = "0.5"
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }

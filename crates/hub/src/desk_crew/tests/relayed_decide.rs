@@ -157,7 +157,7 @@ async fn a_machine_unbinds_the_homes_boss_only_while_its_home_holds_it_and_takes
         .await;
         let url = hook_url(dir.path(), started).await;
         let decision = |v: &Value| v["hookSpecificOutput"]["permissionDecision"].clone();
-        let app = super::super::relay::routes(Arc::clone(&crew.state), Arc::clone(&crew));
+        let app = super::relay_app(&crew.state, &crew);
         let token = crew.state.auth_token.clone();
         let take_sent = |in_force: bool, level: &'static str, sent: i64| {
             let (app, token) = (app.clone(), token.clone());
@@ -893,7 +893,7 @@ async fn a_request_beside_a_job_the_home_holds_is_the_persons_on_the_machine() {
         })
         .await;
         let url = hook_url(dir.path(), started).await;
-        let app = super::super::relay::routes(Arc::clone(&crew.state), Arc::clone(&crew));
+        let app = super::relay_app(&crew.state, &crew);
         let token = crew.state.auth_token.clone();
         // Release 4, held by another of Sarah's sessions at home.
         // As her home sends it: as devbox compares a request with it.
@@ -1047,7 +1047,7 @@ async fn a_question_of_a_session_the_homes_boss_runs_on_a_machine_is_answered_by
         })
         .await;
         let url = hook_url(dir.path(), started).await;
-        let app = super::super::relay::routes(Arc::clone(&crew.state), Arc::clone(&crew));
+        let app = super::relay_app(&crew.state, &crew);
         let token = crew.state.auth_token.clone();
         let take = || {
             let (app, token) = (app.clone(), token.clone());

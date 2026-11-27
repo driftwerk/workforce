@@ -212,3 +212,11 @@ impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Captured {
         self.clone()
     }
 }
+
+/// `routes` as a hub with one listener serves them.
+pub(crate) fn app(routes: workforce_surface::Routes) -> axum::Router {
+    routes.render(
+        workforce_surface::Surface::Combined,
+        tower::layer::util::Identity::new(),
+    )
+}

@@ -6,9 +6,10 @@ use workforce_hub::serve::Compose as _;
 use axum::body::Body;
 use axum::http::{header, Request, StatusCode};
 
+use crate::support::router;
 use workforce_common::persistence::CostRecord;
 use workforce_hub::agent_registry::AgentRegistry;
-use workforce_hub::gateway::{require_admin_auth, router, GatewayState};
+use workforce_hub::gateway::{require_admin_auth, GatewayState};
 use workforce_hub::scheduler::{JobPayload, Schedule, ScheduledJob, Scheduler};
 use workforce_hub::serve::AgentService;
 use workforce_identity::sqlite::SqliteIdentityStore;
@@ -102,12 +103,9 @@ impl Fixture {
     fn app(&self) -> axum::Router {
         let mut hub = hub_state(self.data.path());
         hub.scheduler = Some(Arc::clone(&self.scheduler));
-        let admin_api = axum::Router::new()
-            .nest("/api/admin", workforce_hub::api::router(Arc::new(hub)))
-            .layer(axum::middleware::from_fn_with_state(
-                Arc::clone(&self.state),
-                require_admin_auth,
-            ));
+        let admin_api = crate::support::admin_api("/api/admin", Arc::new(hub)).layer(
+            axum::middleware::from_fn_with_state(Arc::clone(&self.state), require_admin_auth),
+        );
         router(Arc::clone(&self.state)).merge(admin_api)
     }
 

@@ -5,10 +5,10 @@
 
 use std::sync::Arc;
 
+use crate::support::router;
 use axum::body::Body;
 use axum::http::{header, Request, StatusCode};
 use workforce_agent::tools::Tool;
-use workforce_hub::gateway::router;
 use workforce_hub::serve::{AgentService, Compose as _};
 use workforce_orchestrator::workflow_store::content_hash;
 

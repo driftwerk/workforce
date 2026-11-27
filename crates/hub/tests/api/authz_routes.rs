@@ -26,9 +26,10 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use tower::ServiceExt; // for oneshot
 
+use crate::support::router;
 use workforce_common::persistence::{SqliteStore, WorkflowInstanceRow};
 use workforce_common::telemetry::TelemetryStore;
-use workforce_hub::gateway::{router, GatewayState};
+use workforce_hub::gateway::GatewayState;
 use workforce_hub::store::Scope;
 use workforce_identity::sqlite::SqliteIdentityStore;
 use workforce_identity::store::IdentityStore;

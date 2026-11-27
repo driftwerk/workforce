@@ -21,12 +21,12 @@
 
 use std::sync::Arc;
 
+use crate::surface::routing::{get, post};
 use axum::body::{Body, Bytes};
 use axum::extract::{DefaultBodyLimit, Path, Query, State};
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
-use axum::{Json, Router};
+use axum::Json;
 use serde::Deserialize;
 use uuid::Uuid;
 use workforce_desk::board::Ticket;
@@ -80,27 +80,27 @@ macro_rules! person {
 }
 
 /// The ticket files' routes.
-pub fn router(sync: Arc<BoardSync>) -> Router {
-    let state = Arc::new(Routes { sync });
-    let uploads = Router::new()
-        .route("/api/desk/tickets/{id}/files", post(upload))
+pub fn router(sync: crate::surface::Bound<Arc<BoardSync>>) -> crate::surface::Routes {
+    let state = sync.map(|sync| Arc::new(Routes { sync }));
+    let uploads = crate::surface::Routes::new()
+        .admin("/api/desk/tickets/{id}/files", post(upload))
+        .bind(state.clone())
         // A file and a little more: the 1 MB every other route keeps to is
         // too little for a screenshot.
-        .layer(DefaultBodyLimit::max(FILE_MAX as usize + 64 * 1024))
-        .with_state(Arc::clone(&state));
-    Router::new()
-        .route(
+        .layer(DefaultBodyLimit::max(FILE_MAX as usize + 64 * 1024));
+    crate::surface::Routes::new()
+        .admin(
             "/api/desk/tickets/{id}/files/{file}",
             get(file_bytes).delete(remove),
         )
-        .route("/api/desk/tickets/{id}/read", post(read_issue))
-        .with_state(state)
+        .admin("/api/desk/tickets/{id}/read", post(read_issue))
+        .bind(state)
         .merge(uploads)
 }
 
 /// The routes, hardened like the board sync's, then sandboxed: the
 /// sandbox goes on last, so the gateway's own policy doesn't replace it.
-pub fn install(sync: Arc<BoardSync>) -> Router {
+pub fn install(sync: crate::surface::Bound<Arc<BoardSync>>) -> crate::surface::Routes {
     crate::gateway::hardened(router(sync)).layer(axum::middleware::from_fn(sandboxed))
 }
 

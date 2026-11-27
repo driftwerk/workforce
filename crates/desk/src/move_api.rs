@@ -7,11 +7,12 @@ use std::sync::Arc;
 use axum::extract::{Path, Query, State};
 use axum::http::HeaderMap;
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
-use axum::{Json, Router};
+use axum::Json;
 use serde::Deserialize;
 use serde_json::json;
 use uuid::Uuid;
+use workforce_surface::routing::{get, post};
+use workforce_surface::Routes;
 
 use crate::api::Authorize;
 use crate::service::{Desk, MoveAsk, MoveCommit};
@@ -57,10 +58,10 @@ async fn handover(State(s): S, h: HeaderMap, Query(q): Q, Path(id): Path<Uuid>) 
     s.desk.handover_view(id).await.map(Json).into_response()
 }
 
-pub fn api_routes(desk: Desk, auth: Arc<dyn Authorize>) -> Router {
-    Router::new()
-        .route("/api/desk/moves/preview", post(preview))
-        .route("/api/desk/moves", post(commit))
-        .route("/api/desk/handovers/{id}", get(handover))
-        .with_state(Arc::new(Api { desk, auth }))
+pub fn api_routes(ground: crate::api::Ground) -> Routes {
+    Routes::new()
+        .member("/api/desk/moves/preview", post(preview))
+        .member("/api/desk/moves", post(commit))
+        .member("/api/desk/handovers/{id}", get(handover))
+        .bind(ground.map(|(desk, auth)| Arc::new(Api { desk, auth })))
 }

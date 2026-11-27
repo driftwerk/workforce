@@ -12,11 +12,12 @@
 
 use std::sync::Arc;
 
+use crate::surface::routing::{delete, get, post};
+use crate::surface::{Bound, Routes};
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
-use axum::routing::{delete, get, post};
-use axum::{Json, Router};
+use axum::Json;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tracing::warn;
@@ -49,16 +50,15 @@ pub struct ApiState {
 /// shape: `GET /api/mcp/servers`, `POST /api/mcp/servers`, etc.
 /// Wrapped in [`require_admin_auth`] so the routes are not exposed
 /// to unauthenticated callers.
-pub fn router(state: ApiState) -> Router {
-    let gateway = Arc::clone(&state.gateway);
-    Router::new()
-        .route("/api/mcp/servers", get(list_servers).post(install_server))
-        .route("/api/mcp/credential-catalog", get(credential_catalog))
-        .route("/api/mcp/presets", get(list_presets))
-        .route("/api/mcp/servers/{id}", delete(uninstall_server))
-        .route("/api/mcp/servers/{id}/refresh", post(refresh_server))
-        .route("/api/mcp/servers/{id}/authorize", post(start_authorize))
-        .with_state(state)
+pub fn router(state: Bound<ApiState>, gateway: Arc<GatewayState>) -> Routes {
+    Routes::new()
+        .admin("/api/mcp/servers", get(list_servers).post(install_server))
+        .admin("/api/mcp/credential-catalog", get(credential_catalog))
+        .admin("/api/mcp/presets", get(list_presets))
+        .admin("/api/mcp/servers/{id}", delete(uninstall_server))
+        .admin("/api/mcp/servers/{id}/refresh", post(refresh_server))
+        .admin("/api/mcp/servers/{id}/authorize", post(start_authorize))
+        .bind(state)
         .layer(axum::middleware::from_fn_with_state(
             gateway,
             require_admin_auth,

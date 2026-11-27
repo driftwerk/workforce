@@ -14,10 +14,11 @@ use axum::extract::rejection::JsonRejection;
 use axum::extract::{Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
-use axum::{Json, Router};
+use axum::Json;
 use serde::Deserialize;
 use serde_json::json;
+use workforce_surface::routing::{get, post};
+use workforce_surface::Routes;
 
 use crate::api::Authorize;
 use crate::repos::{repo_of, Repo};
@@ -125,9 +126,9 @@ async fn checkout(
     }
 }
 
-pub(crate) fn api_routes(desk: Desk, auth: Arc<dyn Authorize>) -> Router {
-    Router::new()
-        .route("/api/desk/repos", get(find))
-        .route("/api/desk/repos/checkout", post(checkout))
-        .with_state(Arc::new(ReposApi { desk, auth }))
+pub(crate) fn api_routes(ground: crate::api::Ground) -> Routes {
+    Routes::new()
+        .admin("/api/desk/repos", get(find))
+        .admin("/api/desk/repos/checkout", post(checkout))
+        .bind(ground.map(|(desk, auth)| Arc::new(ReposApi { desk, auth })))
 }

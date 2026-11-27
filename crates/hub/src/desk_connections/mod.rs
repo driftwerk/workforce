@@ -46,12 +46,13 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
+use crate::surface::routing::{get, post};
+use crate::surface::Bound;
 use async_trait::async_trait;
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
-use axum::{Json, Router};
+use axum::Json;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -2313,12 +2314,12 @@ pub async fn agent_removed(state: &GatewayState) {
 }
 
 /// Connections for this `[desk]` hub, kept for the Google callback, and
-/// its routes.
+/// their setups.
 pub fn install(
     state: &Arc<GatewayState>,
     config: &workforce_common::settings::WorkforceConfig,
     desk: workforce_desk::Desk,
-) -> Router {
+) -> Installed {
     let connections = INSTALLED
         .get_or_init(|| {
             let connections = Connections::new(
@@ -2332,7 +2333,26 @@ pub fn install(
             Arc::new(connections)
         })
         .clone();
-    router(Arc::clone(state), Arc::clone(&connections)).merge(setup::install(state, connections))
+    Installed {
+        setups: setup::install(state, Arc::clone(&connections)),
+        connections,
+    }
+}
+
+/// A `[desk]` hub's connections and their setups.
+#[derive(Clone)]
+pub struct Installed {
+    pub connections: Arc<Connections>,
+    pub setups: Arc<setup::Setups>,
+}
+
+/// The connections' and their setups' routes.
+pub fn routes(state: &Arc<GatewayState>, installed: Bound<Installed>) -> crate::surface::Routes {
+    router(
+        Arc::clone(state),
+        installed.as_ref().map(|i| Arc::clone(&i.connections)),
+    )
+    .merge(setup::routes(state, installed.map(|i| i.setups)))
 }
 
 struct Routes {
@@ -2546,38 +2566,41 @@ pub mod picks;
 pub mod setup;
 
 /// Connections' routes over `connections`.
-pub fn router(state: Arc<GatewayState>, connections: Arc<Connections>) -> Router {
-    Router::new()
-        .route("/api/desk/connections", get(list))
-        .route(
+pub fn router(
+    state: Arc<GatewayState>,
+    connections: Bound<Arc<Connections>>,
+) -> crate::surface::Routes {
+    crate::surface::Routes::new()
+        .admin("/api/desk/connections", get(list))
+        .admin(
             "/api/desk/connections/{connector}",
             post(connect).delete(disconnect_level),
         )
-        .route("/api/desk/connections/{connector}/test", post(test_level))
-        .route("/api/desk/connections/{connector}/app", post(keep_app))
-        .route("/api/desk/connections/{connector}/oauth/start", post(start))
-        .route(
+        .admin("/api/desk/connections/{connector}/test", post(test_level))
+        .admin("/api/desk/connections/{connector}/app", post(keep_app))
+        .admin("/api/desk/connections/{connector}/oauth/start", post(start))
+        .admin(
             "/api/desk/connections/{connector}/{connection}",
             post(reconnect).patch(rename).delete(disconnect),
         )
-        .route(
+        .admin(
             "/api/desk/connections/{connector}/{connection}/test",
             post(test),
         )
-        .route(
+        .admin(
             "/api/desk/connections/{connector}/{connection}/approve",
             post(approve_again),
         )
-        .route(
+        .admin(
             "/api/desk/connection-flows/{flow}",
             get(flow).delete(cancel),
         )
-        .route(
+        .admin(
             "/api/desk/agents/{agent}/connections",
             get(picks::get_picks).put(picks::put_picks),
         )
-        .route("/api/desk/agents/{agent}/documents", get(documents))
-        .with_state(Arc::new(Routes { state, connections }))
+        .admin("/api/desk/agents/{agent}/documents", get(documents))
+        .bind(connections.map(|connections| Arc::new(Routes { state, connections })))
 }
 
 async fn list(State(r): S, h: HeaderMap, Query(q): Query<TokenQuery>) -> Response {

@@ -14,9 +14,9 @@ mod tool_tests;
 pub use crate::workflow_runtime::shared_workflow_store;
 pub use compose::Compose;
 pub use compose::{
-    artifact_index_pace, artifact_search_wait, create_trigger_router, create_webhook_router,
-    load_policy, open_artifact_store, reindex_artifacts, shared_artifact_store,
-    sweep_identity_revisions,
+    all_routes, artifact_index_pace, artifact_search_wait, combined, load_policy,
+    open_artifact_store, reindex_artifacts, shared_artifact_store, sweep_identity_revisions,
+    trigger_state, webhook_state, Mounts,
 };
 pub use compose::{
     artifact_mirror_in_step, artifact_mirror_state, artifact_shadow, mirror_index_pace,

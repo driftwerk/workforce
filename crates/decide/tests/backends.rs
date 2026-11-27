@@ -1,6 +1,11 @@
 //! A fake System One server per backend, so the client, the policy and the
 //! branch helper are exercised over real HTTP.
 
+#![allow(
+    clippy::disallowed_methods,
+    reason = "stand-in decision backends, not routes the hub serves"
+)]
+
 use axum::extract::State;
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::IntoResponse;

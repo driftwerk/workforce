@@ -550,6 +550,10 @@ impl EmbeddingBackend for QueryCached {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "stand-in servers for tests, not routes the hub serves"
+)]
 mod tests {
     /// Every public way to build a memory store refuses a `[memory]
     /// backend` it cannot use, in whichever process calls it (the hub, CLI

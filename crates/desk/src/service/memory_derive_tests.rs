@@ -447,8 +447,13 @@ async fn the_person_confirms_corrects_and_drops_notes_through_the_guarded_route(
         let (decision, todo, fact) = (notes.decisions[0].id, notes.todos[0].id, notes.facts[0].id);
         assert_eq!(notes.counts.open_todos, 1);
 
-        let denied = crate::api::sessions_router(d.clone(), crate::testing::deny_all());
-        let app = crate::api::sessions_router(d.clone(), crate::testing::allow_all());
+        let denied = crate::testing::app(crate::api::sessions_router(
+            workforce_surface::Bound::To((d.clone(), crate::testing::deny_all())),
+        ));
+        let app = crate::testing::app(crate::api::sessions_router(workforce_surface::Bound::To((
+            d.clone(),
+            crate::testing::allow_all(),
+        ))));
         let patch = |app: axum::Router, id: Uuid, body: serde_json::Value| async move {
             use tower::ServiceExt;
             let res = app
@@ -953,8 +958,13 @@ async fn the_person_sets_memorys_switches_through_the_guarded_routes() {
         said(&store, s, "a-1", "Fix the cookie flag.", 10).await;
         let deriver = Arc::new(FakeDeriver::answering(std::iter::empty::<String>()));
         let (d, cancel) = start(&pool, dir.path(), &deriver, |o| o.memory.retain_days = 90).await;
-        let app = crate::api::sessions_router(d.clone(), crate::testing::allow_all());
-        let denied = crate::api::sessions_router(d.clone(), crate::testing::deny_all());
+        let app = crate::testing::app(crate::api::sessions_router(workforce_surface::Bound::To((
+            d.clone(),
+            crate::testing::allow_all(),
+        ))));
+        let denied = crate::testing::app(crate::api::sessions_router(
+            workforce_surface::Bound::To((d.clone(), crate::testing::deny_all())),
+        ));
         let (status, _) = call(
             app.clone(),
             "POST",
@@ -1063,7 +1073,9 @@ async fn the_person_sets_memorys_switches_through_the_guarded_routes() {
 
         // What the install set is the holder's alone to change: another
         // administrator may pause, but not choose.
-        let admin = crate::api::sessions_router(d.clone(), crate::testing::not_holder());
+        let admin = crate::testing::app(crate::api::sessions_router(workforce_surface::Bound::To(
+            (d.clone(), crate::testing::not_holder()),
+        )));
         let (status, body) = call(
             admin.clone(),
             "PATCH",
@@ -1185,7 +1197,10 @@ async fn the_person_sets_memorys_switches_through_the_guarded_routes() {
 
         // Noting off for this Desk: a group can't be let.
         let (d, cancel) = start(&pool, dir.path(), &deriver, |o| o.memory.derive = false).await;
-        let app = crate::api::sessions_router(d.clone(), crate::testing::allow_all());
+        let app = crate::testing::app(crate::api::sessions_router(workforce_surface::Bound::To((
+            d.clone(),
+            crate::testing::allow_all(),
+        ))));
         call(
             app.clone(),
             "POST",

@@ -1305,6 +1305,10 @@ pub fn answer_fields(answer: &Answer, levels: &[String]) -> serde_json::Map<Stri
 
 /// A stand-in System One server and a `[decision]` that points at it.
 #[cfg(test)]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "stand-in servers for tests, not routes the hub serves"
+)]
 pub(crate) mod testing {
     use super::*;
     use axum::{routing::post, Json, Router};
@@ -1449,6 +1453,10 @@ pub async fn evaluate_scope(
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "stand-in servers for tests, not routes the hub serves"
+)]
 mod tests {
     use super::testing::{backend, config_for, recording_backend};
     use super::*;

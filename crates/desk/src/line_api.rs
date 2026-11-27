@@ -12,12 +12,13 @@ use std::time::Duration;
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, patch, post};
-use axum::{Json, Router};
+use axum::Json;
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use uuid::Uuid;
+use workforce_surface::routing::{get, patch, post};
+use workforce_surface::Routes;
 
 use crate::api::Authorize;
 use crate::line::When;
@@ -176,19 +177,24 @@ fn answered(answer: Option<Option<String>>) -> Response {
 }
 
 /// The line's routes on the hook listener.
-pub(crate) fn hook_routes() -> Router<Desk> {
-    let mut r = Router::new();
-    for at in ["/line/{id}/{token}", "/line/terminal/{terminal}/{token}"] {
-        r = r
-            .route(&format!("{at}/tools"), get(tools))
-            .route(&format!("{at}/call"), post(call))
-            .route(&format!("{at}/await/{{ask}}"), get(await_answer))
-            .route(&format!("{at}/next"), get(next))
-            .route(&format!("{at}/ack"), post(ack));
-    }
-    r.route("/mcp/{id}", post(mcp_bearer))
-        .route("/mcp/{id}/{token}", post(mcp))
-        .route("/mcp/terminal/{terminal}/{token}", post(mcp))
+pub(crate) fn hook_routes() -> Routes<Desk> {
+    Routes::new()
+        .machine("/line/{id}/{token}/tools", get(tools))
+        .machine("/line/{id}/{token}/call", post(call))
+        .machine("/line/{id}/{token}/await/{ask}", get(await_answer))
+        .machine("/line/{id}/{token}/next", get(next))
+        .machine("/line/{id}/{token}/ack", post(ack))
+        .machine("/line/terminal/{terminal}/{token}/tools", get(tools))
+        .machine("/line/terminal/{terminal}/{token}/call", post(call))
+        .machine(
+            "/line/terminal/{terminal}/{token}/await/{ask}",
+            get(await_answer),
+        )
+        .machine("/line/terminal/{terminal}/{token}/next", get(next))
+        .machine("/line/terminal/{terminal}/{token}/ack", post(ack))
+        .machine("/mcp/{id}", post(mcp_bearer))
+        .machine("/mcp/{id}/{token}", post(mcp))
+        .machine("/mcp/terminal/{terminal}/{token}", post(mcp))
 }
 
 struct Api {
@@ -352,13 +358,13 @@ async fn draft(
 }
 
 /// The person's line routes.
-pub(crate) fn api_routes(desk: Desk, auth: Arc<dyn Authorize>) -> Router {
-    Router::new()
-        .route("/api/desk/sessions/{id}/line", get(thread).post(post_line))
-        .route("/api/desk/sessions/{id}/draft", post(draft))
-        .route("/api/desk/line/{id}", patch(edit).delete(take_back))
-        .route("/api/desk/line/{id}/answer", post(answer))
-        .route("/api/desk/line/{id}/dismiss", post(dismiss))
-        .route("/api/desk/line/{id}/now", post(send_now))
-        .with_state(Arc::new(Api { desk, auth }))
+pub(crate) fn api_routes(ground: crate::api::Ground) -> Routes {
+    Routes::new()
+        .member("/api/desk/sessions/{id}/line", get(thread).post(post_line))
+        .member("/api/desk/sessions/{id}/draft", post(draft))
+        .member("/api/desk/line/{id}", patch(edit).delete(take_back))
+        .member("/api/desk/line/{id}/answer", post(answer))
+        .member("/api/desk/line/{id}/dismiss", post(dismiss))
+        .member("/api/desk/line/{id}/now", post(send_now))
+        .bind(ground.map(|(desk, auth)| Arc::new(Api { desk, auth })))
 }

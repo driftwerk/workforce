@@ -710,6 +710,10 @@ pub async fn run_http_server(
 }
 
 /// Serve `endpoint` over HTTP on an already-bound listener.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "an MCP endpoint on a listener of its own, not a route of the gateway"
+)]
 pub async fn serve_http(
     endpoint: McpEndpoint,
     listener: tokio::net::TcpListener,
@@ -834,6 +838,10 @@ pub fn matches_any(name: &str, patterns: &[String]) -> bool {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "stand-in servers for tests, not routes the hub serves"
+)]
 mod tests {
     #[tokio::test]
     async fn the_stdio_proxy_posts_each_line_and_writes_back_each_answer() {

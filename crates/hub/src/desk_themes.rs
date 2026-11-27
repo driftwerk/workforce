@@ -39,12 +39,12 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
+use crate::surface::routing::{get, post};
 use async_trait::async_trait;
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
-use axum::{Json, Router};
+use axum::Json;
 use chrono::{DateTime, Utc};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
@@ -487,10 +487,10 @@ impl Tool for ThemeTool {
 }
 
 /// The routes the person's Desk asks for its calls and answers them on.
-pub fn router(state: Arc<GatewayState>) -> Router {
-    Router::new()
-        .route(JOBS_PATH, get(jobs_route))
-        .route(
+pub fn router(state: Arc<GatewayState>) -> crate::surface::Routes {
+    crate::surface::Routes::new()
+        .member(JOBS_PATH, get(jobs_route))
+        .member(
             ANSWER_PATH,
             post(answer_route).layer(axum::extract::DefaultBodyLimit::max(MOST_ANSWER)),
         )
@@ -821,7 +821,7 @@ mod tests {
         use workforce_identity::types::{Identity, IdentityRole, IdentityStatus};
 
         struct Hub {
-            app: Router,
+            app: axum::Router,
             state: Arc<GatewayState>,
             jwt: crate::jwt::JwtConfig,
             ann: Identity,
@@ -851,7 +851,7 @@ mod tests {
                     .expect("the fixture's only handle")
             });
             Hub {
-                app: router(Arc::clone(&state)),
+                app: crate::serve::combined(router(Arc::clone(&state))),
                 state,
                 jwt,
                 ann,

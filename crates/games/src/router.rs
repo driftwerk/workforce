@@ -6,12 +6,14 @@ use axum::extract::{Path, Query, State};
 use axum::http::header::{AUTHORIZATION, CACHE_CONTROL, CONTENT_TYPE};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
-use axum::{Json, Router};
+use axum::Json;
 use futures::{SinkExt, StreamExt};
 use serde::Deserialize;
 
 use crate::driver::{PlayerIdentity, TokenVerifier};
+use workforce_surface::routing::{get, post};
+use workforce_surface::{Bound, Routes};
+
 use crate::manager::{DrawingError, GameManager, JoinError, JoinOutcome};
 use crate::protocol::{
     ClientGameMessage, CreateRoomRequest, CreateRoomResponse, GamesConfigView, RoomSummary,
@@ -23,14 +25,14 @@ pub struct GamesState {
     pub verifier: Arc<dyn TokenVerifier>,
 }
 
-pub fn router(state: Arc<GamesState>) -> Router {
-    Router::new()
-        .route("/api/config", get(games_config))
-        .route("/api/rooms", get(list_rooms).post(create_room))
-        .route("/api/rooms/{id}/art", get(room_art))
-        .route("/api/rooms/{id}/drawing", post(post_drawing))
-        .route("/ws", get(ws_handler))
-        .with_state(state)
+pub fn router(state: Bound<Arc<GamesState>>) -> Routes {
+    Routes::new()
+        .member("/api/config", get(games_config))
+        .member("/api/rooms", get(list_rooms).post(create_room))
+        .member("/api/rooms/{id}/art", get(room_art))
+        .member("/api/rooms/{id}/drawing", post(post_drawing))
+        .member("/ws", get(ws_handler))
+        .bind(state)
 }
 
 fn authenticate(state: &GamesState, headers: &HeaderMap) -> Option<PlayerIdentity> {
@@ -278,9 +280,16 @@ mod tests {
         })
     }
 
+    fn app() -> axum::Router {
+        router(Bound::To(state())).render(
+            workforce_surface::Surface::Combined,
+            tower::layer::util::Identity::new(),
+        )
+    }
+
     #[tokio::test]
     async fn rooms_require_auth() {
-        let app = router(state());
+        let app = app();
         let resp = app
             .oneshot(
                 Request::builder()
@@ -295,7 +304,7 @@ mod tests {
 
     #[tokio::test]
     async fn create_then_list_room() {
-        let app = router(state());
+        let app = app();
         let created = app
             .clone()
             .oneshot(
@@ -329,7 +338,7 @@ mod tests {
 
     #[tokio::test]
     async fn art_requires_auth_and_404s_when_absent() {
-        let app = router(state());
+        let app = app();
         let resp = app
             .oneshot(
                 Request::builder()

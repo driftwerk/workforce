@@ -7,7 +7,6 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use axum::Router;
 use eyre::{eyre, Result};
 use parking_lot::Mutex;
 use tracing::warn;
@@ -316,20 +315,19 @@ fn atomic_write(path: &Path, data: &[u8]) -> Result<()> {
     Ok(())
 }
 
-/// Nest the `/games` router onto `app` when games are enabled and JWT auth is
-/// configured. A no-op otherwise.
-pub fn mount(
-    app: Router,
+/// What the `/games` routes answer with, when games are enabled and JWT auth
+/// is configured; none otherwise.
+pub fn start(
     state: &Arc<GatewayState>,
     games: &GamesConfig,
     data_dir: &Path,
-) -> Router {
+) -> Option<Arc<GamesState>> {
     if !games.enabled {
-        return app;
+        return None;
     }
     if state.jwt_config.is_none() {
         warn!("[games] enabled but JWT auth is not configured; games not mounted");
-        return app;
+        return None;
     }
     let backend = Arc::new(GamesBackend {
         gateway: Arc::clone(state),
@@ -343,11 +341,10 @@ pub fn mount(
         games.agent_players.clone(),
         RoomConfig::default(),
     ));
-    let games_state = Arc::new(GamesState {
+    Some(Arc::new(GamesState {
         manager,
         verifier: Arc::clone(&backend) as Arc<dyn TokenVerifier>,
-    });
-    app.nest("/games", workforce_games::router(games_state))
+    }))
 }
 
 #[cfg(test)]

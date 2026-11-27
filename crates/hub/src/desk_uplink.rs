@@ -43,12 +43,12 @@ use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use crate::surface::routing::{delete, get, put};
 use axum::body::Bytes;
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{delete, get, put};
-use axum::{Json, Router};
+use axum::Json;
 use base64::Engine as _;
 use chrono::{DateTime, Utc};
 use futures::{SinkExt, StreamExt};
@@ -458,12 +458,12 @@ async fn public_key(State(s): S, h: HeaderMap, Query(q): Query<TokenQuery>) -> R
     }
 }
 
-pub(crate) fn routes(state: Arc<GatewayState>) -> Router {
-    Router::new()
-        .route("/api/desk/boss-links", get(list))
-        .route("/api/desk/boss-links/{group}", put(put_link))
-        .route("/api/desk/boss-links/{group}/{link}", delete(forget))
-        .route("/api/desk/engine-key", get(public_key))
+pub(crate) fn routes(state: Arc<GatewayState>) -> crate::surface::Routes {
+    crate::surface::Routes::new()
+        .admin("/api/desk/boss-links", get(list))
+        .admin("/api/desk/boss-links/{group}", put(put_link))
+        .admin("/api/desk/boss-links/{group}/{link}", delete(forget))
+        .admin("/api/desk/engine-key", get(public_key))
         .with_state(Arc::new(Api { state }))
 }
 
@@ -1234,7 +1234,7 @@ mod tests {
     use workforce_identity::store::IdentityStore;
     use workforce_identity::types::{Identity, IdentityRole};
 
-    async fn ask(app: &Router, uri: &str, bearer: Option<&str>) -> (StatusCode, Value) {
+    async fn ask(app: &axum::Router, uri: &str, bearer: Option<&str>) -> (StatusCode, Value) {
         let mut req = Request::builder().method("GET").uri(uri);
         if let Some(b) = bearer {
             req = req.header("authorization", format!("Bearer {b}"));
@@ -1290,7 +1290,7 @@ mod tests {
                 .ok()
                 .expect("the fixture's only handle")
         });
-        let app = routes(Arc::clone(&state));
+        let app = crate::serve::combined(routes(Arc::clone(&state)));
         let path = "/api/desk/engine-key";
 
         let refused = [

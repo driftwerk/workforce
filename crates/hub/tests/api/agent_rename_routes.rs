@@ -3,12 +3,13 @@
 
 use std::sync::Arc;
 
+use crate::support::router;
 use axum::body::Body;
 use axum::http::{header, Request, StatusCode};
 use serde_json::{json, Value};
 use workforce_common::settings::WorkforceConfig;
 use workforce_hub::agent_registry::AgentRegistry;
-use workforce_hub::gateway::{router, GatewayState};
+use workforce_hub::gateway::GatewayState;
 use workforce_identity::sqlite::SqliteIdentityStore;
 
 use crate::support::{send, GatewayParts, GATEWAY_TOKEN};

@@ -5,7 +5,6 @@ use std::sync::Arc;
 use axum::body::Body;
 use axum::http::{header, Request, StatusCode};
 
-use workforce_hub::api::router as api_router;
 use workforce_hub::gateway::require_admin_auth_except_operational;
 use workforce_hub::state::HubState;
 use workforce_hub::workflow_runtime::WorkflowRuntime;
@@ -14,12 +13,10 @@ use crate::support::{agent_service, hub_state, send, Gateway, GATEWAY_TOKEN};
 
 /// The admin API behind the gate, mounted as the standalone admin port is.
 fn admin_api(hub: Arc<HubState>, gateway: &Gateway) -> axum::Router {
-    axum::Router::new()
-        .nest("/api", api_router(hub))
-        .layer(axum::middleware::from_fn_with_state(
-            Arc::clone(&gateway.state),
-            require_admin_auth_except_operational,
-        ))
+    crate::support::admin_api("/api", hub).layer(axum::middleware::from_fn_with_state(
+        Arc::clone(&gateway.state),
+        require_admin_auth_except_operational,
+    ))
 }
 
 fn post(path: &str, bearer: &str, body: serde_json::Value) -> Request<Body> {

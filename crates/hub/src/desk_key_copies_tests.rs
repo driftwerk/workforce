@@ -47,7 +47,7 @@ const SECRETS: &[&str] = &[
 ];
 
 struct Hub {
-    app: Router,
+    app: axum::Router,
     state: Arc<GatewayState>,
     audit: Arc<workforce_common::persistence::SqliteStore>,
     jwt: crate::jwt::JwtConfig,
@@ -119,7 +119,7 @@ async fn hub_on(allow: bool, global: Option<Arc<Vault>>) -> Hub {
     });
     state.desk_key_export.set(allow);
     Hub {
-        app: router(Arc::clone(&state)),
+        app: crate::serve::combined(router(Arc::clone(&state))),
         state,
         audit,
         jwt,
@@ -499,7 +499,7 @@ async fn a_phone_paired_to_ann_is_refused() {
         vault: Some(vault),
         ..Arc::try_unwrap(fx.state).ok().unwrap()
     });
-    let app = router(state);
+    let app = crate::serve::combined(router(state));
     let req = Request::builder()
         .method("GET")
         .uri(LIST_PATH)

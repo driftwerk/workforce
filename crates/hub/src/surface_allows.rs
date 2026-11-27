@@ -7,12 +7,12 @@
 
 use std::sync::{Arc, OnceLock};
 
+use crate::surface::routing::{delete, get};
 use async_trait::async_trait;
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{delete, get};
-use axum::{Json, Router};
+use axum::Json;
 use chrono::{DateTime, Utc};
 use eyre::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -264,15 +264,18 @@ type S = State<Arc<Routes>>;
 
 /// `GET /api/desk/allows` and `DELETE /api/desk/allows/{id}`: the caller's
 /// own allows, answering 404 where the hub keeps none.
-pub fn router(state: Arc<GatewayState>, store: Option<Arc<PgSurfaceAllows>>) -> Router {
-    Router::new()
-        .route("/api/desk/allows", get(list))
-        .route("/api/desk/allows/{id}", delete(revoke))
+pub fn router(
+    state: Arc<GatewayState>,
+    store: Option<Arc<PgSurfaceAllows>>,
+) -> crate::surface::Routes {
+    crate::surface::Routes::new()
+        .member("/api/desk/allows", get(list))
+        .member("/api/desk/allows/{id}", delete(revoke))
         .with_state(Arc::new(Routes { state, store }))
 }
 
 /// The hub's own routes, over its installed list.
-pub fn routes(state: Arc<GatewayState>) -> Router {
+pub fn routes(state: Arc<GatewayState>) -> crate::surface::Routes {
     router(state, store())
 }
 

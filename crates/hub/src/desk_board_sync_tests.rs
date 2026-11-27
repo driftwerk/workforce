@@ -2,6 +2,10 @@
 //! local port, with stand-in `jira.*` tools answering in the adapters' own
 //! shapes (their words wrapped as untrusted content, as the real ones
 //! are). No real Jira, Linear or hub is ever called.
+#![allow(
+    clippy::disallowed_methods,
+    reason = "stand-in servers for tests, not routes the hub serves"
+)]
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
@@ -554,8 +558,8 @@ pub(crate) async fn serve_remote(
         }
         None => String::new(),
     };
-    let app = crate::remote_mcp::server::router(crate::remote_mcp::server::RemoteMcpState::new(
-        Arc::clone(&fx.state),
+    let app = crate::serve::combined(crate::remote_mcp::server::router(
+        crate::remote_mcp::server::RemoteMcpState::new(Arc::clone(&fx.state)),
     ));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
@@ -618,7 +622,8 @@ pub(crate) fn local_hub(desk: Desk, dir: &std::path::Path) -> LocalHub {
         device_pairing: Some(pairing),
         ..state
     });
-    let (sync, app) = install(&state, desk);
+    let sync = install(&state, desk);
+    let app = crate::serve::combined(router(crate::surface::Bound::To(Arc::clone(&sync))));
     LocalHub {
         sync,
         app,

@@ -445,6 +445,10 @@ pub(crate) async fn artifacts_trusted(
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "stand-in servers for tests, not routes the hub serves"
+)]
 mod tests {
     use std::sync::atomic::Ordering;
 

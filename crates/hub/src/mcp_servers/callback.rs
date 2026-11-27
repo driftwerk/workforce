@@ -20,6 +20,8 @@ use serde::Deserialize;
 use tracing::{info, warn};
 
 use super::manager::McpServerManager;
+use crate::surface::routing::get;
+use crate::surface::{Bound, Routes};
 
 /// Application state mounted under `/api/auth`. Holds a closure
 /// that resolves an agent_id back to its [`McpServerManager`] —
@@ -47,8 +49,16 @@ pub struct CallbackQuery {
     pub error_description: Option<String>,
 }
 
-/// Axum handler. Mounted as
-/// `GET /api/auth/{provider}/callback` from `serve.rs`.
+/// The callback's route: on the public gateway, so vendors can redirect
+/// back to the hub after consent. Only the random `state` token, set and
+/// consumed through the shared store, gates it.
+pub fn routes(state: Bound<CallbackState>) -> Routes {
+    Routes::new()
+        .machine(super::manager::DEFAULT_CALLBACK_PATH, get(handle))
+        .bind(state)
+}
+
+/// `GET /api/auth/{provider}/callback`.
 pub async fn handle(
     Path(provider): Path<String>,
     Query(q): Query<CallbackQuery>,

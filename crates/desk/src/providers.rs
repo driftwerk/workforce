@@ -1047,10 +1047,13 @@ mod tests {
             .header("content-type", "application/json")
             .body(body.map_or_else(Body::empty, |b| Body::from(b.to_string())))
             .unwrap();
-        let response = providers_router(Arc::new(Bearer), accounts)
-            .oneshot(request)
-            .await
-            .unwrap();
+        let response = crate::testing::app(providers_router(workforce_surface::Bound::To((
+            Arc::new(Bearer),
+            accounts,
+        ))))
+        .oneshot(request)
+        .await
+        .unwrap();
         let status = response.status();
         let bytes = to_bytes(response.into_body(), 1 << 20).await.unwrap();
         let body = match bytes.is_empty() {
@@ -1734,10 +1737,13 @@ mod tests {
             .header("authorization", "Bearer wrong")
             .body(Body::empty())
             .unwrap();
-        let response = providers_router(Arc::new(Bearer), Arc::new(Held::default()))
-            .oneshot(request)
-            .await
-            .unwrap();
+        let response = crate::testing::app(providers_router(workforce_surface::Bound::To((
+            Arc::new(Bearer),
+            Arc::new(Held::default()),
+        ))))
+        .oneshot(request)
+        .await
+        .unwrap();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 }

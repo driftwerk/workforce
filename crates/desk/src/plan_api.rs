@@ -9,11 +9,12 @@ use std::sync::Arc;
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
-use axum::{Json, Router};
+use axum::Json;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use uuid::Uuid;
+use workforce_surface::routing::{get, post};
+use workforce_surface::Routes;
 
 use crate::api::Authorize;
 use crate::crew::By;
@@ -181,13 +182,13 @@ async fn drop_plan(
 }
 
 /// The person's plan routes.
-pub(crate) fn api_routes(desk: Desk, auth: Arc<dyn Authorize>) -> Router {
-    Router::new()
-        .route("/api/desk/plans", get(list))
-        .route("/api/desk/plans/{id}", get(read).patch(edit))
-        .route("/api/desk/plans/{id}/pause", post(pause))
-        .route("/api/desk/plans/{id}/resume", post(resume))
-        .route("/api/desk/plans/{id}/group", post(regroup))
-        .route("/api/desk/plans/{id}/drop", post(drop_plan))
-        .with_state(Arc::new(Api { desk, auth }))
+pub(crate) fn api_routes(ground: crate::api::Ground) -> Routes {
+    Routes::new()
+        .member("/api/desk/plans", get(list))
+        .member("/api/desk/plans/{id}", get(read).patch(edit))
+        .member("/api/desk/plans/{id}/pause", post(pause))
+        .member("/api/desk/plans/{id}/resume", post(resume))
+        .member("/api/desk/plans/{id}/group", post(regroup))
+        .member("/api/desk/plans/{id}/drop", post(drop_plan))
+        .bind(ground.map(|(desk, auth)| Arc::new(Api { desk, auth })))
 }

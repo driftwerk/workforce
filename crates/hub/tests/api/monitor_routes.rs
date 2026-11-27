@@ -18,10 +18,11 @@ use axum::http::{Request, StatusCode};
 use eyre::Result;
 use tower::ServiceExt; // for oneshot
 
+use crate::support::router;
 use workforce_common::channels::{
     ChannelCapabilities, ChannelMessage, ChannelSurface, Reaction, SurfaceKey, SurfaceRegistry,
 };
-use workforce_hub::gateway::{router, GatewayState};
+use workforce_hub::gateway::GatewayState;
 use workforce_hub::monitor::{
     ActionOutcome, ActionSink, EngineAgent, MonitorEngine, MonitorEngineConfig, MonitorRuntime,
 };

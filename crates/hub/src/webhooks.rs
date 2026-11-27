@@ -1,12 +1,12 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use crate::surface::routing::post;
+use crate::surface::{Bound, Routes};
 use axum::body::Bytes;
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode, Uri};
 use axum::response::IntoResponse;
-use axum::routing::post;
-use axum::Router;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
@@ -46,11 +46,11 @@ struct Delivery {
 }
 
 /// Build the webhook receiver router.
-pub fn router(state: Arc<WebhookState>) -> Router {
-    Router::new()
-        .route("/webhooks/{source}/{event_type}", post(receive_webhook))
-        .route("/webhooks/{source}", post(receive_webhook_generic))
-        .with_state(state)
+pub fn router(state: Bound<Arc<WebhookState>>) -> Routes {
+    Routes::new()
+        .machine("/webhooks/{source}/{event_type}", post(receive_webhook))
+        .machine("/webhooks/{source}", post(receive_webhook_generic))
+        .bind(state)
 }
 
 /// Receive a webhook with explicit source and event type.

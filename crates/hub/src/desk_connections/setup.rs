@@ -53,12 +53,12 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
+use crate::surface::routing::{get, post};
 use async_trait::async_trait;
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
-use axum::{Json, Router};
+use axum::Json;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -3650,27 +3650,40 @@ impl Callers for Hub {
 /// the agent there.
 const TELL_EVERY: Duration = Duration::from_millis(250);
 
-/// Setups over `connections`, and their routes.
-pub fn install(state: &Arc<crate::gateway::GatewayState>, connections: Arc<Connections>) -> Router {
+/// Setups over `connections`.
+pub fn install(
+    state: &Arc<crate::gateway::GatewayState>,
+    connections: Arc<Connections>,
+) -> Arc<Setups> {
     let setups = INSTALLED
         .get_or_init(|| Arc::new(Setups::new(connections, Arc::new(Hub(Arc::clone(state))))))
         .clone();
     register_key_pages();
-    Router::new()
-        .route("/api/desk/connection-setups", get(list_route))
-        .route(
+    setups
+}
+
+/// The setups' routes.
+pub fn routes(
+    state: &Arc<crate::gateway::GatewayState>,
+    setups: crate::surface::Bound<Arc<Setups>>,
+) -> crate::surface::Routes {
+    crate::surface::Routes::new()
+        .admin("/api/desk/connection-setups", get(list_route))
+        .admin(
             "/api/desk/connection-setups/{id}/signed-in",
             post(signed_in_route),
         )
-        .route("/api/desk/connection-setups/{id}/token", post(token_route))
-        .route("/api/desk/connection-setups/{id}/app", post(app_route))
-        .route(
+        .admin("/api/desk/connection-setups/{id}/token", post(token_route))
+        .admin("/api/desk/connection-setups/{id}/app", post(app_route))
+        .admin(
             "/api/desk/connection-setups/{id}/{choice}",
             post(choice_route),
         )
-        .with_state(Arc::new(Routes {
-            state: Arc::clone(state),
-            setups,
+        .bind(setups.map(|setups| {
+            Arc::new(Routes {
+                state: Arc::clone(state),
+                setups,
+            })
         }))
 }
 

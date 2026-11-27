@@ -607,7 +607,7 @@ pub(crate) async fn with_authors(desk: &workforce_desk::Desk, page: &mut Page) {
 }
 
 /// The Desk conversation routes on `state`'s agents.
-pub fn router(state: Arc<GatewayState>) -> axum::Router {
+pub fn router(state: Arc<GatewayState>) -> crate::surface::Routes {
     workforce_desk::conversations::router(Arc::new(HubConversations(state)))
 }
 

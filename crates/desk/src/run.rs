@@ -444,9 +444,10 @@ pub(crate) mod api {
     use axum::extract::{Query, State};
     use axum::http::{HeaderMap, StatusCode};
     use axum::response::{IntoResponse, Response};
-    use axum::routing::post;
-    use axum::{Json, Router};
+    use axum::Json;
     use serde_json::json;
+    use workforce_surface::routing::post;
+    use workforce_surface::Routes;
 
     use super::Check;
     use crate::api::Authorize;
@@ -490,10 +491,10 @@ pub(crate) mod api {
         Json(s.desk.machine_run(check).await).into_response()
     }
 
-    pub(crate) fn api_routes(desk: Desk, auth: Arc<dyn Authorize>) -> Router {
-        Router::new()
-            .route("/api/desk/run", post(run))
-            .with_state(Arc::new(RunApi { desk, auth }))
+    pub(crate) fn api_routes(ground: crate::api::Ground) -> Routes {
+        Routes::new()
+            .admin("/api/desk/run", post(run))
+            .bind(ground.map(|(desk, auth)| Arc::new(RunApi { desk, auth })))
     }
 }
 

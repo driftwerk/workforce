@@ -1,6 +1,10 @@
 //! The hub's end of Desk's extension, against a stand-in extension that
 //! speaks the protocol (`protocol-v1.json`, the same file Desk's extension
 //! tests read) with a real P-256 key.
+#![allow(
+    clippy::disallowed_methods,
+    reason = "stand-in servers for tests, not routes the hub serves"
+)]
 
 use std::sync::Arc;
 use std::time::Duration;

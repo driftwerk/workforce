@@ -3,10 +3,10 @@
 
 use std::sync::Arc;
 
+use crate::support::router;
 use axum::body::Body;
 use axum::http::{header, Request, StatusCode};
 use workforce_hub::agent_registry::AgentRegistry;
-use workforce_hub::gateway::router;
 use workforce_identity::sqlite::SqliteIdentityStore;
 use workforce_identity::store::IdentityStore;
 use workforce_identity::types::{Identity, IdentityRole};

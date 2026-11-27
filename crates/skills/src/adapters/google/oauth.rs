@@ -529,6 +529,10 @@ pub async fn run_login(store: Arc<dyn SecretStore>, opts: LoginOptions) -> Resul
     }
 }
 
+#[allow(
+    clippy::disallowed_methods,
+    reason = "a one-shot loopback listener for the Google sign-in redirect, not a hub route"
+)]
 async fn run_loopback_login(
     store: &Arc<dyn SecretStore>,
     workspace: &str,

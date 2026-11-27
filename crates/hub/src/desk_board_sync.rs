@@ -39,12 +39,12 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::surface::routing::{get, post, put};
 use async_trait::async_trait;
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post, put};
-use axum::{Json, Router};
+use axum::Json;
 use futures::StreamExt;
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -1162,22 +1162,22 @@ macro_rules! person {
 }
 
 /// The board sync's routes.
-pub fn router(sync: Arc<BoardSync>) -> Router {
-    Router::new()
-        .route("/api/desk/sync-hubs", get(list_hubs))
-        .route("/api/desk/sync-hubs/{hub}", put(put_hub).delete(delete_hub))
-        .route("/api/desk/boards/link/check", post(check_link))
-        .route("/api/desk/boards/link/members", post(members_named))
-        .route("/api/desk/boards/link/me", post(choose_me))
-        .route(
+pub fn router(sync: crate::surface::Bound<Arc<BoardSync>>) -> crate::surface::Routes {
+    crate::surface::Routes::new()
+        .admin("/api/desk/sync-hubs", get(list_hubs))
+        .admin("/api/desk/sync-hubs/{hub}", put(put_hub).delete(delete_hub))
+        .admin("/api/desk/boards/link/check", post(check_link))
+        .admin("/api/desk/boards/link/members", post(members_named))
+        .admin("/api/desk/boards/link/me", post(choose_me))
+        .admin(
             "/api/desk/boards/{id}/link",
             put(link_board).delete(unlink_board),
         )
-        .route("/api/desk/boards/{id}/pause", post(pause_board))
-        .route("/api/desk/boards/{id}/sync", post(sync_board))
-        .route("/api/desk/tickets/{id}/take", post(take_ticket))
-        .route("/api/desk/boards/{id}/me", post(recheck_me))
-        .with_state(Arc::new(Routes { sync }))
+        .admin("/api/desk/boards/{id}/pause", post(pause_board))
+        .admin("/api/desk/boards/{id}/sync", post(sync_board))
+        .admin("/api/desk/tickets/{id}/take", post(take_ticket))
+        .admin("/api/desk/boards/{id}/me", post(recheck_me))
+        .bind(sync.map(|sync| Arc::new(Routes { sync })))
 }
 
 async fn list_hubs(State(r): S, h: HeaderMap, Query(q): Query<TokenQuery>) -> Response {
@@ -2361,11 +2361,9 @@ async fn recheck_me(
     }
 }
 
-/// The board sync for this `[desk]` hub, and its routes.
-pub fn install(state: &Arc<GatewayState>, desk: Desk) -> (Arc<BoardSync>, Router) {
-    let sync = Arc::new(BoardSync::new(Arc::clone(state), desk));
-    let routes = router(Arc::clone(&sync));
-    (sync, routes)
+/// The board sync for this `[desk]` hub.
+pub fn install(state: &Arc<GatewayState>, desk: Desk) -> Arc<BoardSync> {
+    Arc::new(BoardSync::new(Arc::clone(state), desk))
 }
 
 #[cfg(test)]

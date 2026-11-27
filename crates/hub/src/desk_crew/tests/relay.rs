@@ -53,7 +53,7 @@ impl Authorize for HubToken {
 }
 
 async fn put_grant(d: &Desk, boss: &str, members: &[uuid::Uuid]) {
-    let app = workforce_desk::sessions_router(d.clone(), Arc::new(HubToken));
+    let app = super::desk_app(d.clone(), Arc::new(HubToken));
     let res = app
         .oneshot(
             Request::builder()
@@ -95,7 +95,7 @@ async fn a_machine_serves_the_homes_boss_its_grant_names_and_nothing_else() {
             .await
             .unwrap();
         put_grant(&d, "local:sarah", &[s.id]).await;
-        let app = super::super::relay::routes(Arc::clone(&crew.state), Arc::clone(&crew));
+        let app = super::relay_app(&crew.state, &crew);
         let token = crew.state.auth_token.clone();
         let call = |boss: &str, id: &str| {
             json!({"group": "acme", "tool": "crew.overview", "input": {}, "boss": boss,
@@ -480,7 +480,7 @@ async fn each_machine_is_to_hold_its_own_sessions_of_the_group_at_the_bosss_own_
         })
         .await;
 
-        let app = super::super::relay::routes(Arc::clone(&crew.state), Arc::clone(&crew));
+        let app = super::relay_app(&crew.state, &crew);
         let token = crew.state.auth_token.clone();
         eventually("the grants", async || {
             crew.machine_grants(true, false).map(drop)
@@ -666,7 +666,7 @@ async fn nothing_is_said_of_machine_grants_before_the_bosses_are_read() {
         let d = desk(pool, dir.path()).await;
         let crew = CrewHub::start(state, d, FAST, CancellationToken::new());
         assert!(crew.machine_grants(true, false).is_none());
-        let app = super::super::relay::routes(Arc::clone(&crew.state), Arc::clone(&crew));
+        let app = super::relay_app(&crew.state, &crew);
         let token = crew.state.auth_token.clone();
         let (code, _) = get(&app, "/api/desk/machine-grants", &token).await;
         assert_eq!(code, StatusCode::SERVICE_UNAVAILABLE);
@@ -1137,7 +1137,7 @@ async fn directs_from_launch(
     let there = machine_desk(devbox_pool, devbox_dir.path()).await;
     let cancel = CancellationToken::new();
     let there_crew = CrewHub::start(Arc::clone(&there_state), there.clone(), FAST, cancel);
-    let served = super::super::relay::routes(Arc::clone(&there_state), Arc::clone(&there_crew));
+    let served = super::relay_app(&there_state, &there_crew);
     let token = there_state.auth_token.clone();
     let carried: Arc<parking_lot::Mutex<Vec<RelayCall>>> = Arc::default();
     let poller = carrying(&crew, &there, &served, &token, &carried, false);
@@ -1473,7 +1473,7 @@ async fn holds_its_own(pool: workforce_postgres::PostgresPool) {
     assert_eq!(workforce_desk::grant::plan_of(&key.to_uppercase()), None);
     // A Desk that doesn't say it carries plans' grants (an older one, which
     // would ask about it as a group's) is told the groups' alone.
-    let app = super::super::relay::routes(Arc::clone(&crew.state), Arc::clone(&crew));
+    let app = super::relay_app(&crew.state, &crew);
     let token = crew.state.auth_token.clone();
     for (uri, plans) in [
         ("/api/desk/machine-grants", false),
@@ -1576,8 +1576,15 @@ async fn a_boss_check_runs_at_the_machines_own_route_and_is_never_a_groups_call(
             ..Default::default()
         });
         // devbox: its own routes, its run route and its served route both.
-        let devbox = workforce_desk::sessions_router(d.clone(), Arc::new(HubToken)).merge(
-            super::super::relay::routes(Arc::clone(&crew.state), Arc::clone(&crew)),
+        let devbox = crate::serve::combined(
+            workforce_desk::sessions_router(crate::surface::Bound::To((
+                d.clone(),
+                Arc::new(HubToken) as Arc<dyn Authorize>,
+            )))
+            .merge(super::super::relay::routes(
+                Arc::clone(&crew.state),
+                crate::surface::Bound::To(Arc::clone(&crew)),
+            )),
         );
         let token = crew.state.auth_token.clone();
         use std::sync::atomic::{AtomicBool, Ordering};
@@ -1655,7 +1662,7 @@ async fn every_machine_call_is_refused_at_the_served_route() {
             &[],
         )
         .await;
-        let app = super::super::relay::routes(Arc::clone(&crew.state), Arc::clone(&crew));
+        let app = super::relay_app(&crew.state, &crew);
         let token = crew.state.auth_token.clone();
         for (i, (tool, group)) in DESK_CALLS
             .iter()
@@ -2043,8 +2050,7 @@ async fn works_a_machine_session(
         crew.overseer_named("desk").map(drop)
     })
     .await;
-    let served =
-        super::super::relay::routes(Arc::clone(&there_crew.state), Arc::clone(&there_crew));
+    let served = super::relay_app(&there_crew.state, &there_crew);
     let carried: Arc<parking_lot::Mutex<Vec<RelayCall>>> = Arc::default();
     let poller = carrying(
         &crew,
@@ -2262,10 +2268,7 @@ async fn a_machine_whose_listing_doesnt_say_its_grants_is_never_written_ungroupe
                     crew.overseer_named("desk").map(drop)
                 })
                 .await;
-                let served = super::super::relay::routes(
-                    Arc::clone(&there_crew.state),
-                    Arc::clone(&there_crew),
-                );
+                let served = super::relay_app(&there_crew.state, &there_crew);
                 let carried: Arc<parking_lot::Mutex<Vec<RelayCall>>> = Arc::default();
                 let poller = carrying(
                     &crew,
@@ -2408,7 +2411,7 @@ async fn started_again_on_devbox(
         FAST,
         CancellationToken::new(),
     );
-    let served = super::super::relay::routes(Arc::clone(&there_state), Arc::clone(&there_crew));
+    let served = super::relay_app(&there_state, &there_crew);
     let token = there_state.auth_token.clone();
     let carried: Arc<parking_lot::Mutex<Vec<RelayCall>>> = Arc::default();
     let poller = carrying(&crew, &there, &served, &token, &carried, older);

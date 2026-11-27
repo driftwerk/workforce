@@ -126,6 +126,12 @@ impl Principal {
             },
         }
     }
+
+    /// Whether this principal stands beyond a member: active, in any role but
+    /// the member one (an administrator, a manager, a custom role).
+    pub fn is_beyond_member(&self) -> bool {
+        self.status == IdentityStatus::Active && self.role_key != IdentityRole::Member.as_str()
+    }
 }
 
 /// The single authorization decision for `(principal, capability)`: the live
@@ -1690,6 +1696,26 @@ mod tests {
 
     fn member() -> Principal {
         principal(IdentityRole::Member, IdentityStatus::Active)
+    }
+
+    #[test]
+    fn beyond_a_member_is_any_active_role_but_the_member_one_under_no_cap() {
+        let custom = Principal {
+            role_key: "reviewer".to_string(),
+            ..member()
+        };
+        let suspended = principal(IdentityRole::SystemAdmin, IdentityStatus::Suspended);
+        let beyond = [
+            principal(IdentityRole::SystemAdmin, IdentityStatus::Active),
+            principal(IdentityRole::Manager, IdentityStatus::Active),
+            custom,
+        ];
+        assert!(beyond.iter().all(Principal::is_beyond_member));
+        assert!(beyond
+            .into_iter()
+            .all(|p| !p.capped(Ceiling::Member).is_beyond_member()));
+        assert!(!member().is_beyond_member());
+        assert!(!suspended.is_beyond_member());
     }
 
     fn admin() -> Principal {

@@ -20,12 +20,13 @@ use async_trait::async_trait;
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
-use axum::{Json, Router};
+use axum::Json;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use workforce_core::desk::{DeskMark, Mark, ReadPoint, DESK_CHANNEL};
+use workforce_surface::routing::{get, post};
+use workforce_surface::Routes;
 
 /// The most messages one page holds, and how many a page holds unasked.
 pub const PAGE_MAX: usize = 200;
@@ -662,26 +663,26 @@ async fn copy_to_chat(
 }
 
 /// The Desk conversation routes on `conversations`.
-pub fn router(conversations: Arc<dyn Conversations>) -> Router {
-    Router::new()
-        .route("/api/desk/conversations", get(active))
-        .route("/api/desk/conversations/{agent}", get(conversation))
-        .route("/api/desk/conversations/{agent}/search", get(search))
-        .route("/api/desk/conversations/{agent}/threads", get(threads))
-        .route(
+pub fn router(conversations: Arc<dyn Conversations>) -> Routes {
+    Routes::new()
+        .member("/api/desk/conversations", get(active))
+        .member("/api/desk/conversations/{agent}", get(conversation))
+        .member("/api/desk/conversations/{agent}/search", get(search))
+        .member("/api/desk/conversations/{agent}/threads", get(threads))
+        .member(
             "/api/desk/conversations/{agent}/messages",
             post(copy_to_chat),
         )
-        .route("/api/desk/conversations/{agent}/close", post(close))
-        .route(
+        .member("/api/desk/conversations/{agent}/close", post(close))
+        .member(
             "/api/desk/conversations/{agent}/read",
-            axum::routing::put(put_read),
+            workforce_surface::routing::put(put_read),
         )
-        .route(
+        .member(
             "/api/desk/conversations/{agent}/messages/{message}",
-            axum::routing::delete(delete_message),
+            workforce_surface::routing::delete(delete_message),
         )
-        .route(
+        .member(
             "/api/desk/conversations/{agent}/messages/{message}/memories",
             get(message_memories),
         )
@@ -910,7 +911,7 @@ mod tests {
         request: axum::http::request::Builder,
         body: Body,
     ) -> (StatusCode, Value) {
-        let response = router(asked)
+        let response = crate::testing::app(router(asked))
             .oneshot(request.body(body).unwrap())
             .await
             .unwrap();

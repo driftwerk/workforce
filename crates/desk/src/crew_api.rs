@@ -16,11 +16,12 @@ use std::sync::Arc;
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, patch, post};
-use axum::{Json, Router};
+use axum::Json;
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
 use serde_json::json;
+use workforce_surface::routing::{get, patch, post};
+use workforce_surface::{Bound, Routes};
 
 use crate::api::Authorize;
 use crate::crew::{
@@ -918,37 +919,37 @@ async fn all_read(
     reads(s.desk.mark_all(&*s.crew, YOU, body.scope).await)
 }
 
-pub(crate) fn crew_router(desk: Desk, auth: Arc<dyn Authorize>, crew: Arc<dyn Crew>) -> Router {
-    Router::new()
-        .route("/api/desk/activity", get(activity))
-        .route("/api/desk/overview", get(overview))
-        .route("/api/desk/manager", get(manager))
-        .route("/api/desk/suggestions", get(suggestions))
-        .route("/api/desk/suggestions/{id}/{answer}", post(answer))
-        .route("/api/desk/decisions/{id}/undo", post(undo))
-        .route("/api/desk/items/{id}/answer", post(item_answer))
-        .route("/api/desk/items/{id}/drop", post(item_drop))
-        .route("/api/desk/items/{id}/done", post(item_done))
-        .route("/api/desk/items/{id}/always", post(item_always))
-        .route("/api/desk/handled", get(handled))
-        .route("/api/desk/dm/{agent}/typing", post(dm_typing))
-        .route("/api/desk/updates/{agent}", get(updates_of))
-        .route("/api/desk/updates/{agent}/roundup", post(roundup_now))
-        .route("/api/desk/presence", post(presence))
-        .route(
+pub(crate) fn crew_router(on: Bound<(Desk, Arc<dyn Authorize>, Arc<dyn Crew>)>) -> Routes {
+    Routes::new()
+        .member("/api/desk/activity", get(activity))
+        .member("/api/desk/overview", get(overview))
+        .member("/api/desk/manager", get(manager))
+        .member("/api/desk/suggestions", get(suggestions))
+        .member("/api/desk/suggestions/{id}/{answer}", post(answer))
+        .member("/api/desk/decisions/{id}/undo", post(undo))
+        .member("/api/desk/items/{id}/answer", post(item_answer))
+        .member("/api/desk/items/{id}/drop", post(item_drop))
+        .member("/api/desk/items/{id}/done", post(item_done))
+        .member("/api/desk/items/{id}/always", post(item_always))
+        .member("/api/desk/handled", get(handled))
+        .member("/api/desk/dm/{agent}/typing", post(dm_typing))
+        .member("/api/desk/updates/{agent}", get(updates_of))
+        .member("/api/desk/updates/{agent}/roundup", post(roundup_now))
+        .member("/api/desk/presence", post(presence))
+        .member(
             "/api/desk/preferences",
             get(preferences).post(preference_new),
         )
-        .route("/api/desk/preferences/{id}", patch(preference_patch))
-        .route("/api/desk/preferences/{id}/{to}", post(preference_state))
-        .route("/api/desk/directives", get(directives))
-        .route("/api/desk/directives/answer", post(directive_answer))
-        .route("/api/desk/directives/own", post(directive_own))
-        .route("/api/desk/directives/asking", post(directive_asking))
-        .route("/api/desk/unread", get(unread))
-        .route("/api/desk/reads", get(read_points).put(put_reads))
-        .route("/api/desk/reads/all", post(all_read))
-        .with_state(Arc::new(CrewApi { desk, auth, crew }))
+        .member("/api/desk/preferences/{id}", patch(preference_patch))
+        .member("/api/desk/preferences/{id}/{to}", post(preference_state))
+        .member("/api/desk/directives", get(directives))
+        .member("/api/desk/directives/answer", post(directive_answer))
+        .member("/api/desk/directives/own", post(directive_own))
+        .member("/api/desk/directives/asking", post(directive_asking))
+        .member("/api/desk/unread", get(unread))
+        .member("/api/desk/reads", get(read_points).put(put_reads))
+        .member("/api/desk/reads/all", post(all_read))
+        .bind(on.map(|(desk, auth, crew)| Arc::new(CrewApi { desk, auth, crew })))
 }
 
 #[cfg(test)]
@@ -967,6 +968,7 @@ mod tests {
     use crate::crew::{CrewAgent, Event, Overseer, Party, Suggestion};
     use crate::store::{build_pool, DeskStore};
     use crate::testing::Bearer;
+    use axum::Router;
 
     /// Oversees as Desk, at `suggest`; accepting remembers what it did.
     #[derive(Default)]
@@ -1060,7 +1062,11 @@ mod tests {
         with_test_pool(build_pool, |pool| async move {
             let dir = tempfile::tempdir().unwrap();
             let d = desk(pool, dir.path()).await;
-            let app = crew_router(d, Arc::new(Bearer), Arc::new(Hub::default()));
+            let app = crate::testing::app(crew_router(workforce_surface::Bound::To((
+                d,
+                Arc::new(Bearer),
+                Arc::new(Hub::default()),
+            ))));
             let uri = |n: u128| format!("/api/desk/decisions/{}/undo", uuid::Uuid::from_u128(n));
             let (status, body) = call(&app, "POST", &uri(1)).await;
             assert_eq!(
@@ -1085,7 +1091,11 @@ mod tests {
         with_test_pool(build_pool, |pool| async move {
             let dir = tempfile::tempdir().unwrap();
             let d = desk(pool, dir.path()).await;
-            let app = crew_router(d, Arc::new(Bearer), Arc::new(Hub::default()));
+            let app = crate::testing::app(crew_router(workforce_surface::Bound::To((
+                d,
+                Arc::new(Bearer),
+                Arc::new(Hub::default()),
+            ))));
             let answer = |n: u128| format!("/api/desk/items/{}/answer", uuid::Uuid::from_u128(n));
             let body = json!({ "answer": " Wait for green " });
             let (status, said) = call_json(&app, &answer(1), &body).await;
@@ -1173,7 +1183,11 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             let d = desk(pool, dir.path()).await;
             let hub = Arc::new(Hub::default());
-            let app = crew_router(d, Arc::new(Bearer), hub.clone());
+            let app = crate::testing::app(crew_router(workforce_surface::Bound::To((
+                d,
+                Arc::new(Bearer),
+                hub.clone(),
+            ))));
             assert_eq!(
                 call(&app, "POST", "/api/desk/dm/desk/typing").await.0,
                 StatusCode::NO_CONTENT
@@ -1237,7 +1251,11 @@ mod tests {
             for p in [&red, &key, &gone] {
                 store.preference_put(p).await.unwrap();
             }
-            let app = crew_router(d.clone(), Arc::new(Bearer), Arc::new(Hub::default()));
+            let app = crate::testing::app(crew_router(workforce_surface::Bound::To((
+                d.clone(),
+                Arc::new(Bearer),
+                Arc::new(Hub::default()),
+            ))));
             // Keeping one goes to the bosses' hub: with none, it says so.
             let (status, said) = send_json(
                 &app,
@@ -1443,7 +1461,11 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             let d = desk(pool, dir.path()).await;
             let hub = Arc::new(Hub::default());
-            let app = crew_router(d.clone(), Arc::new(Bearer), hub.clone());
+            let app = crate::testing::app(crew_router(workforce_surface::Bound::To((
+                d.clone(),
+                Arc::new(Bearer),
+                hub.clone(),
+            ))));
             let scout = Party::agent("scout", "Scout");
             d.note(
                 Event::new(
@@ -1598,7 +1620,7 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             let d = desk(pool, dir.path()).await;
             let hub = Arc::new(Hub::default());
-            let app = crew_router(d.clone(), Arc::new(NotHolder), hub.clone());
+            let app = crate::testing::app(crew_router(workforce_surface::Bound::To((d.clone(), Arc::new(NotHolder), hub.clone()))));
             let card = |tool: &str| Suggestion {
                 id: crate::crew::new_id(),
                 at: crate::crew::now(),
@@ -1634,7 +1656,7 @@ mod tests {
             assert_eq!(status, StatusCode::OK);
 
             // The holder accepts it.
-            let holder = crew_router(d.clone(), Arc::new(Bearer), hub.clone());
+            let holder = crate::testing::app(crew_router(workforce_surface::Bound::To((d.clone(), Arc::new(Bearer), hub.clone()))));
             let (status, done) = call(
                 &holder,
                 "POST",
@@ -1651,7 +1673,11 @@ mod tests {
         with_test_pool(build_pool, |pool| async move {
             let dir = tempfile::tempdir().unwrap();
             let d = desk(pool, dir.path()).await;
-            let app = crew_router(d.clone(), Arc::new(Bearer), Arc::new(Hub::default()));
+            let app = crate::testing::app(crew_router(workforce_surface::Bound::To((
+                d.clone(),
+                Arc::new(Bearer),
+                Arc::new(Hub::default()),
+            ))));
             d.set_bosses(vec![
                 crate::Boss {
                     agent: "desk".into(),
@@ -1735,7 +1761,7 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             let d = desk(pool, dir.path()).await;
             let hub = Arc::new(Hub::default());
-            let app = crew_router(d.clone(), Arc::new(Bearer), hub.clone());
+            let app = crate::testing::app(crew_router(workforce_surface::Bound::To((d.clone(), Arc::new(Bearer), hub.clone()))));
             let room = d
                 .create_room(crate::rooms::NewRoom {
                     name: "Atlas launch".into(),
@@ -1776,7 +1802,11 @@ mod tests {
         with_test_pool(build_pool, |pool| async move {
             let dir = tempfile::tempdir().unwrap();
             let d = desk(pool, dir.path()).await;
-            let app = crew_router(d.clone(), Arc::new(Bearer), Arc::new(Hub::default()));
+            let app = crate::testing::app(crew_router(workforce_surface::Bound::To((
+                d.clone(),
+                Arc::new(Bearer),
+                Arc::new(Hub::default()),
+            ))));
             let (status, v) = call(&app, "GET", "/api/desk/directives").await;
             assert_eq!(status, StatusCode::OK);
             assert_eq!(v["bossScope"], "main");

@@ -14,13 +14,11 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use tower::ServiceExt; // for oneshot
 
-use workforce_hub::api::router as api_router;
-
 /// Build the test app the same way the standalone admin port does in the
 /// CLI: nest the path-relative `api::router` under `/api` so existing test
 /// URIs (`/api/foo`) continue to match.
 fn router(state: Arc<HubState>) -> axum::Router {
-    axum::Router::new().nest("/api", api_router(state))
+    crate::support::admin_api("/api", state)
 }
 
 /// [`router`] as the static admin token reaches it through the admin gate.

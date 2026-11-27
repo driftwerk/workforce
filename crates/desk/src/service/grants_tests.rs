@@ -522,7 +522,9 @@ async fn only_the_hubs_own_token_in_its_header_writes_or_reads_grants() {
             crate::testing::identified("acme-admin"),
             crate::testing::deny_all(),
         ] {
-            let app = crate::api::sessions_router(d.clone(), auth);
+            let app = crate::testing::app(crate::api::sessions_router(
+                workforce_surface::Bound::To((d.clone(), auth)),
+            ));
             for (method, path) in [
                 ("PUT", uri),
                 ("GET", uri),
@@ -536,7 +538,10 @@ async fn only_the_hubs_own_token_in_its_header_writes_or_reads_grants() {
             }
         }
         // The hub's token in the address, which logs keep.
-        let app = crate::api::sessions_router(d.clone(), Arc::new(crate::testing::Bearer));
+        let app = crate::testing::app(crate::api::sessions_router(workforce_surface::Bound::To((
+            d.clone(),
+            Arc::new(crate::testing::Bearer),
+        ))));
         let (code, _) = call(
             &app,
             "PUT",
@@ -910,7 +915,10 @@ async fn a_grant_at_act_fully_says_what_its_sessions_spent_today() {
             )
             .await;
         }
-        let app = crate::api::sessions_router(d.clone(), Arc::new(crate::testing::Bearer));
+        let app = crate::testing::app(crate::api::sessions_router(workforce_surface::Bound::To((
+            d.clone(),
+            Arc::new(crate::testing::Bearer),
+        ))));
         let (code, out) = call(&app, "GET", "/api/desk/grants", Some("hub-token"), None).await;
         assert_eq!(code, 200, "{out}");
         let of = |group: &str| {

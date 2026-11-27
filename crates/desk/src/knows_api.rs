@@ -23,11 +23,12 @@ use std::sync::Arc;
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
-use axum::{Json, Router};
+use axum::Json;
 use chrono::{Duration, Utc};
 use serde::Deserialize;
 use serde_json::{json, Value};
+use workforce_surface::routing::{get, post};
+use workforce_surface::Routes;
 
 use crate::api::Authorize;
 use crate::knows::{agent_key_ok, Digest, Rule};
@@ -254,14 +255,14 @@ async fn machines(
 }
 
 /// The rule routes, every one the hub holder's alone.
-pub fn knows_router(desk: Desk, auth: Arc<dyn Authorize>) -> Router {
-    Router::new()
-        .route("/api/desk/knows", get(rules))
-        .route("/api/desk/knows/{hub}/{agent}", get(rule).put(put_rule))
-        .route("/api/desk/knows/{hub}/{agent}/held", post(held))
-        .route("/api/desk/knows/{hub}/{agent}/log", get(log))
-        .route("/api/desk/knows/{hub}/{agent}/machines", get(machines))
-        .with_state(Arc::new(KnowsApi { desk, auth }))
+pub fn knows_router(ground: crate::api::Ground) -> Routes {
+    Routes::new()
+        .member("/api/desk/knows", get(rules))
+        .member("/api/desk/knows/{hub}/{agent}", get(rule).put(put_rule))
+        .member("/api/desk/knows/{hub}/{agent}/held", post(held))
+        .member("/api/desk/knows/{hub}/{agent}/log", get(log))
+        .member("/api/desk/knows/{hub}/{agent}/machines", get(machines))
+        .bind(ground.map(|(desk, auth)| Arc::new(KnowsApi { desk, auth })))
 }
 
 #[cfg(test)]
@@ -280,6 +281,7 @@ mod tests {
     use crate::knows_store::Sent;
     use crate::store::{build_pool, DeskStore};
     use crate::testing::Bearer;
+    use axum::Router;
 
     async fn desk(pool: workforce_postgres::PostgresPool, dir: &std::path::Path) -> Desk {
         DeskStore::migrate(&pool).await.unwrap();
@@ -339,7 +341,7 @@ mod tests {
         with_test_pool(build_pool, |pool| async move {
             let dir = tempfile::tempdir().unwrap();
             let d = desk(pool, dir.path()).await;
-            let app = knows_router(d.clone(), Arc::new(Bearer));
+            let app = crate::testing::app(knows_router(workforce_surface::Bound::To((d.clone(), Arc::new(Bearer)))));
             let uri = "/api/desk/knows/driftwerk/allan";
             let s = uuid::Uuid::from_u128(9);
             let (status, body) = send(&app, "GET", &format!("{uri}/machines"), None).await;
@@ -370,7 +372,10 @@ mod tests {
         with_test_pool(build_pool, |pool| async move {
             let dir = tempfile::tempdir().unwrap();
             let d = desk(pool, dir.path()).await;
-            let app = knows_router(d.clone(), Arc::new(Bearer));
+            let app = crate::testing::app(knows_router(workforce_surface::Bound::To((
+                d.clone(),
+                Arc::new(Bearer),
+            ))));
             let uri = "/api/desk/knows/driftwerk/allan";
             // Nothing set: its own work alone.
             let (status, body) = send(&app, "GET", uri, None).await;
@@ -543,7 +548,10 @@ mod tests {
     async fn only_the_holder_reads_or_changes_a_rule_or_chooses_what_is_kept() {
         with_test_pool(build_pool, |pool| async move {
             let dir = tempfile::tempdir().unwrap();
-            let app = knows_router(desk(pool, dir.path()).await, Arc::new(NotTheHolder));
+            let app = crate::testing::app(knows_router(workforce_surface::Bound::To((
+                desk(pool, dir.path()).await,
+                Arc::new(NotTheHolder),
+            ))));
             let uri = "/api/desk/knows/driftwerk/allan";
             let (status, _) = send(&app, "PUT", uri, Some(json!({ "places": ["all"] }))).await;
             assert_eq!(status, StatusCode::FORBIDDEN);
@@ -575,7 +583,10 @@ mod tests {
     async fn a_bad_rule_or_agent_is_refused_plainly_and_a_stranger_reaches_nothing() {
         with_test_pool(build_pool, |pool| async move {
             let dir = tempfile::tempdir().unwrap();
-            let app = knows_router(desk(pool, dir.path()).await, Arc::new(Bearer));
+            let app = crate::testing::app(knows_router(workforce_surface::Bound::To((
+                desk(pool, dir.path()).await,
+                Arc::new(Bearer),
+            ))));
             let (status, body) = send(
                 &app,
                 "PUT",

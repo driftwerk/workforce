@@ -146,7 +146,18 @@ async fn mac(desk: &Desk, dir: &std::path::Path) -> (LocalHub, Shared) {
     (local, linear)
 }
 
-async fn send(app: &Router, uri: &str, bearer: &str, body: Option<Value>) -> (StatusCode, Value) {
+/// The issue routes of a computer whose calls go by `carrier`, as a
+/// listener serves them.
+fn issue_app(state: &Arc<GatewayState>, carrier: Carrier) -> axum::Router {
+    crate::serve::combined(routes(Arc::clone(state), Bound::To(carrier)))
+}
+
+async fn send(
+    app: &axum::Router,
+    uri: &str,
+    bearer: &str,
+    body: Option<Value>,
+) -> (StatusCode, Value) {
     let builder = Request::builder()
         .method(if body.is_some() { "POST" } else { "GET" })
         .uri(uri)
@@ -174,8 +185,8 @@ async fn send(app: &Router, uri: &str, bearer: &str, body: Option<Value>) -> (St
 /// Desk's native side: each call the devbox queued, handed to the Mac as
 /// devbox's, and the Mac's answer posted back. What it handed over is kept.
 fn courier(
-    relay: Router,
-    served: Router,
+    relay: axum::Router,
+    served: axum::Router,
     token: String,
     carried: Arc<Mutex<Vec<Value>>>,
 ) -> tokio::task::JoinHandle<()> {
@@ -239,13 +250,13 @@ async fn devbox_works_its_issue(
     let home_desk = desk(mac_pool, mac_dir.path()).await;
     let (local, linear) = mac(&home_desk, mac_dir.path()).await;
     let home = HomeIssues::new(Arc::clone(&local.sync));
-    let served = home_routes(Arc::clone(&local.sync.state), Arc::clone(&home));
+    let served = issue_app(&local.sync.state, Carrier::Home(Arc::clone(&home)));
 
     let there = machine_desk(devbox_pool, devbox_dir.path()).await;
     let machine = MachineIssues::new(Arc::default());
     there.issues_with(Arc::clone(&machine) as _);
     let devbox_state = fixture(false).state;
-    let relay = machine_routes(Arc::clone(&devbox_state), Arc::clone(&machine));
+    let relay = issue_app(&devbox_state, Carrier::Machine(Arc::clone(&machine)));
     let session = new_session(&there, devbox_dir.path(), "vel-15").await;
     let token = devbox_state.auth_token.clone();
     assert_eq!(token, local.sync.state.auth_token);
@@ -411,7 +422,7 @@ async fn only_desk_itself_carries_the_calls() {
     let state = fixture(false).state;
     let token = state.auth_token.clone();
     let machine = MachineIssues::new(Arc::default());
-    let relay = machine_routes(Arc::clone(&state), Arc::clone(&machine));
+    let relay = issue_app(&state, Carrier::Machine(Arc::clone(&machine)));
     for (bearer, uri) in [
         ("someone-else", "/api/desk/issues/relay"),
         (token.as_str(), "/api/desk/issues/relay?token=x"),
@@ -450,13 +461,13 @@ async fn only_desk_itself_carries_the_calls() {
 #[tokio::test]
 async fn desk_reaching_a_machine_by_any_route_is_seen() {
     let seen = Arc::new(crate::desk_crew::relay::NativeSeen::default());
-    let app = crate::desk_crew::relay::noting_native(
-        Router::new()
-            .route("/api/desk/sessions", axum::routing::get(|| async { "[]" }))
-            .route("/api/me", axum::routing::get(|| async { "{}" })),
+    let app = crate::serve::combined(crate::desk_crew::relay::noting_native(
+        Routes::new()
+            .member("/api/desk/sessions", get(|| async { "[]" }))
+            .member("/api/me", get(|| async { "{}" })),
         "the-hubs-token".into(),
         Arc::clone(&seen),
-    );
+    ));
     let (status, _) = send(&app, "/api/desk/sessions", "someone-else", None).await;
     assert_eq!(status, StatusCode::OK);
     assert!(!seen.within(Duration::from_secs(60)));

@@ -7,11 +7,11 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+use crate::surface::routing::{get, post};
 use axum::extract::{Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
-use axum::{Json, Router};
+use axum::Json;
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -610,12 +610,12 @@ struct Routes {
 type S = State<Arc<Routes>>;
 
 /// The floor's routes, answering 404 where the hub keeps no floor.
-pub fn router(state: Arc<GatewayState>, sources: Option<Sources>) -> Router {
-    Router::new()
-        .route("/api/desk/floor", get(floor_view))
-        .route("/api/desk/needs/decide", post(decide))
-        .route("/api/desk/usage", get(usage))
-        .route("/api/desk/usage/work", get(work_usage))
+pub fn router(state: Arc<GatewayState>, sources: Option<Sources>) -> crate::surface::Routes {
+    crate::surface::Routes::new()
+        .member("/api/desk/floor", get(floor_view))
+        .member("/api/desk/needs/decide", post(decide))
+        .member("/api/desk/usage", get(usage))
+        .member("/api/desk/usage/work", get(work_usage))
         .with_state(Arc::new(Routes { state, sources }))
 }
 

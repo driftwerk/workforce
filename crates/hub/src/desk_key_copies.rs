@@ -59,11 +59,11 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
+use crate::surface::routing::{get, post};
 use axum::extract::{Query, State};
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
-use axum::{Json, Router};
+use axum::Json;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -92,10 +92,10 @@ static LISTS: LazyLock<IdentityActionLimiter> =
     LazyLock::new(|| IdentityActionLimiter::new(60, Duration::from_secs(60)));
 
 /// The routes, on `state`.
-pub fn router(state: Arc<GatewayState>) -> Router {
-    Router::new()
-        .route(LIST_PATH, get(list))
-        .route(TAKE_PATH, post(take))
+pub fn router(state: Arc<GatewayState>) -> crate::surface::Routes {
+    crate::surface::Routes::new()
+        .member(LIST_PATH, get(list))
+        .member(TAKE_PATH, post(take))
         .with_state(state)
 }
 

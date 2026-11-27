@@ -1051,7 +1051,9 @@ async fn the_persons_plan_routes_read_edit_approve_and_drop_and_refuse_a_stale_r
             .await
             .unwrap();
         let id = p.summary.plan.id;
-        let closed = crate::plan_api::api_routes(d.clone(), crate::testing::deny_all());
+        let closed = crate::testing::app(crate::plan_api::api_routes(
+            workforce_surface::Bound::To((d.clone(), crate::testing::deny_all())),
+        ));
         for (method, uri) in [
             ("GET", "/api/desk/plans".to_string()),
             ("GET", format!("/api/desk/plans/{id}")),
@@ -1067,7 +1069,10 @@ async fn the_persons_plan_routes_read_edit_approve_and_drop_and_refuse_a_stale_r
         }
         // Approving and turning down are the Floor's decide route's, the
         // hub holder's alone: there are no routes for them here.
-        let hub = crate::plan_api::api_routes(d.clone(), crate::testing::allow_all());
+        let hub = crate::testing::app(crate::plan_api::api_routes(workforce_surface::Bound::To((
+            d.clone(),
+            crate::testing::allow_all(),
+        ))));
         for uri in [
             format!("/api/desk/plans/{id}/approve"),
             format!("/api/desk/plans/{id}/changes/1/reject"),
@@ -1080,7 +1085,10 @@ async fn the_persons_plan_routes_read_edit_approve_and_drop_and_refuse_a_stale_r
                 "{uri}"
             );
         }
-        let app = crate::plan_api::api_routes(d.clone(), crate::testing::identified("sam"));
+        let app = crate::testing::app(crate::plan_api::api_routes(workforce_surface::Bound::To((
+            d.clone(),
+            crate::testing::identified("sam"),
+        ))));
         let (status, list) = call(&app, "GET", "/api/desk/plans?state=proposed", None).await;
         assert_eq!(status, 200);
         assert_eq!(list[0]["id"], id.to_string());

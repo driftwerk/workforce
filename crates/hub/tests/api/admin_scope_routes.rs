@@ -76,15 +76,9 @@ impl Fixture {
 
     /// The admin API behind its gate, as the gateway mounts it.
     fn app(&self) -> axum::Router {
-        axum::Router::new()
-            .nest(
-                "/api/admin",
-                workforce_hub::api::router(Arc::clone(&self.hub)),
-            )
-            .layer(axum::middleware::from_fn_with_state(
-                Arc::clone(&self.gateway),
-                require_admin_auth,
-            ))
+        crate::support::admin_api("/api/admin", Arc::clone(&self.hub)).layer(
+            axum::middleware::from_fn_with_state(Arc::clone(&self.gateway), require_admin_auth),
+        )
     }
 
     async fn call(
@@ -111,11 +105,7 @@ impl Fixture {
         path: &str,
         caller: CallerContext,
     ) -> (StatusCode, serde_json::Value) {
-        let app = axum::Router::new()
-            .nest(
-                "/api/admin",
-                workforce_hub::api::router(Arc::clone(&self.hub)),
-            )
+        let app = crate::support::admin_api("/api/admin", Arc::clone(&self.hub))
             .layer(axum::Extension(caller));
         let request = Request::get(path).body(Body::empty()).unwrap();
         let (status, _, text) = send(app, request).await;

@@ -3,12 +3,13 @@
 
 use std::sync::Arc;
 
+use crate::support::router;
 use axum::body::Body;
 use axum::http::{header, HeaderMap, Request, StatusCode};
 use serde_json::Value;
 use tower::ServiceExt;
 use workforce_hub::agent_registry::AgentRegistry;
-use workforce_hub::gateway::{router, GatewayState};
+use workforce_hub::gateway::GatewayState;
 use workforce_hub::pictures::postgres::PostgresPictures;
 use workforce_hub::pictures::{Image, Owner, PictureStore, SlackPicture};
 use workforce_identity::sqlite::SqliteIdentityStore;

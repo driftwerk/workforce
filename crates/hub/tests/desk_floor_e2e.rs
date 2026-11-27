@@ -255,11 +255,13 @@ async fn run(pg: workforce_postgres::PostgresConfig) {
     let token = token_for(&gateway.admin);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    let app = workforce_hub::gateway::router(Arc::clone(&gateway.state))
-        .merge(router(Arc::clone(&gateway.state), Sources::installed()))
-        .merge(workforce_hub::surface_allows::routes(Arc::clone(
-            &gateway.state,
-        )));
+    let app = workforce_hub::serve::combined(
+        workforce_hub::gateway::router(Arc::clone(&gateway.state))
+            .merge(router(Arc::clone(&gateway.state), Sources::installed()))
+            .merge(workforce_hub::surface_allows::routes(Arc::clone(
+                &gateway.state,
+            ))),
+    );
     tokio::spawn(async move {
         axum::serve(
             listener,

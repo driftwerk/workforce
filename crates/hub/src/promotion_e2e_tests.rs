@@ -7,6 +7,10 @@
 //! `WORKFORCE_TEST_WEAVIATE_URL`, and is skipped without it unless
 //! `WORKFORCE_TEST_WEAVIATE_REQUIRED=1`, as the shadow's own end-to-end
 //! test is.
+#![allow(
+    clippy::disallowed_methods,
+    reason = "stand-in servers for tests, not routes the hub serves"
+)]
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};

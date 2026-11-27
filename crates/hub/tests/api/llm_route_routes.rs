@@ -7,6 +7,7 @@
 use std::sync::Arc;
 use workforce_hub::serve::Compose as _;
 
+use crate::support::router;
 use axum::body::Body;
 use axum::http::{header, Method, Request, StatusCode};
 use serde_json::{json, Value};
@@ -15,7 +16,6 @@ use workforce_common::personal_route::{
     AgentPersonalRoutes, PersonalRouteKind, PersonalRoutesConfig,
 };
 use workforce_hub::agent_registry::AgentRegistry;
-use workforce_hub::gateway::router;
 use workforce_hub::hub_core::personal_routes::{MemoryRouteStore, PersonRouteStore};
 use workforce_hub::serve::AgentService;
 use workforce_hub::subscription::Subscriptions;

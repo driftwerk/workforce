@@ -75,6 +75,10 @@ pub async fn installed(
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "stand-in servers for tests, not routes the hub serves"
+)]
 mod tests {
     use axum::http::HeaderMap;
     use axum::routing::get;

@@ -410,14 +410,19 @@ async fn the_persons_route_regroups_a_plan_and_refuses_what_it_cant() {
             .await
             .unwrap();
         let uri = format!("/api/desk/plans/{}/group", p.summary.plan.id);
-        let closed = crate::plan_api::api_routes(d.clone(), crate::testing::deny_all());
+        let closed = crate::testing::app(crate::plan_api::api_routes(
+            workforce_surface::Bound::To((d.clone(), crate::testing::deny_all())),
+        ));
         assert_eq!(
             call(&closed, "POST", &uri, Some(json!({ "group": "g-atlas" })))
                 .await
                 .0,
             401
         );
-        let hub = crate::plan_api::api_routes(d.clone(), crate::testing::allow_all());
+        let hub = crate::testing::app(crate::plan_api::api_routes(workforce_surface::Bound::To((
+            d.clone(),
+            crate::testing::allow_all(),
+        ))));
         let (status, body) = call(&hub, "POST", &uri, Some(json!({ "group": "g-atlas" }))).await;
         assert_eq!((status, body["group"].as_str()), (200, Some("g-atlas")));
         assert_eq!(body["groupName"].as_str(), Some("Atlas"));

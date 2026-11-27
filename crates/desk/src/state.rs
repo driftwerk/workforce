@@ -6,13 +6,14 @@ use axum::extract::rejection::JsonRejection;
 use axum::extract::{DefaultBodyLimit, Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::routing::get;
-use axum::{Json, Router};
+use axum::Json;
 use chrono::{DateTime, Utc};
 use eyre::{Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::sync::Arc;
+use workforce_surface::routing::get;
+use workforce_surface::Routes;
 
 use crate::api::Authorize;
 use crate::model::DeskEvent;
@@ -268,22 +269,23 @@ async fn list(State(s): S, h: HeaderMap, Query(q): Query<ListQuery>) -> Response
         .into_response()
 }
 
-pub(crate) fn router(desk: Desk, auth: Arc<dyn Authorize>) -> Router {
-    Router::new()
-        .route("/api/desk/state", get(list))
-        .route(
+pub(crate) fn router(ground: crate::api::Ground) -> Routes {
+    Routes::new()
+        .member("/api/desk/state", get(list))
+        .member(
             "/api/desk/state/{*key}",
             get(get_one).put(put_one).delete(delete_one),
         )
+        .bind(ground.map(|(desk, auth)| Arc::new(StateApi { desk, auth })))
         // Room for the envelope and escaping around a value at the limit;
         // the value itself is measured above.
         .layer(DefaultBodyLimit::max(MAX_VALUE_BYTES * 2))
-        .with_state(Arc::new(StateApi { desk, auth }))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::Router;
 
     #[test]
     fn the_groups_boundaries_are_no_routes_to_change() {
@@ -332,7 +334,10 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             let desk = desk_on(pool, dir.path()).await;
             let (_, mut events) = desk.subscribe();
-            let app = router(desk.clone(), allow_all());
+            let app = crate::testing::app(router(workforce_surface::Bound::To((
+                desk.clone(),
+                allow_all(),
+            ))));
 
             let (status, _) = call(&app, "GET", "/api/desk/state/layout/main", None).await;
             assert_eq!(status, StatusCode::NOT_FOUND);
@@ -429,7 +434,10 @@ mod tests {
     async fn oversized_values_and_bad_bodies_are_refused() {
         with_test_pool(build_pool, |pool| async move {
             let dir = tempfile::tempdir().unwrap();
-            let app = router(desk_on(pool, dir.path()).await, allow_all());
+            let app = crate::testing::app(router(workforce_surface::Bound::To((
+                desk_on(pool, dir.path()).await,
+                allow_all(),
+            ))));
             let big = "x".repeat(MAX_VALUE_BYTES);
             let (status, _) = call(
                 &app,
@@ -468,7 +476,10 @@ mod tests {
     async fn state_routes_are_guarded() {
         with_test_pool(build_pool, |pool| async move {
             let dir = tempfile::tempdir().unwrap();
-            let app = router(desk_on(pool, dir.path()).await, crate::testing::deny_all());
+            let app = crate::testing::app(router(workforce_surface::Bound::To((
+                desk_on(pool, dir.path()).await,
+                crate::testing::deny_all(),
+            ))));
             let (status, _) = call(&app, "GET", "/api/desk/state", None).await;
             assert_eq!(status, StatusCode::UNAUTHORIZED);
             let (status, _) = call(

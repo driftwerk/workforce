@@ -493,6 +493,10 @@ impl ArtifactVectors for WeaviateArtifacts {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "stand-in servers for tests, not routes the hub serves"
+)]
 mod tests {
     use std::sync::{Arc, Mutex};
 

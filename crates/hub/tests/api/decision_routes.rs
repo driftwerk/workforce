@@ -11,7 +11,6 @@ use workforce_common::channels::{
     ChannelCapabilities, ChannelSurface, OutboundMessage, Reaction, SentMessage, SurfaceKey,
     SurfaceRegistry,
 };
-use workforce_hub::api::router as api_router;
 use workforce_hub::gateway::require_admin_auth_except_operational;
 use workforce_hub::state::HubState;
 use workforce_hub::workflow_runtime::WorkflowRuntime;
@@ -99,12 +98,12 @@ async fn a_named_decider_presses_over_rest_and_an_admin_who_is_not_named_is_refu
         ..hub_state(data.path())
     });
     let call = |method: &'static str, path: String, bearer: String, body: serde_json::Value| {
-        let app = axum::Router::new()
-            .nest("/api", api_router(Arc::clone(&hub)))
-            .layer(axum::middleware::from_fn_with_state(
+        let app = crate::support::admin_api("/api", Arc::clone(&hub)).layer(
+            axum::middleware::from_fn_with_state(
                 Arc::clone(&gateway.state),
                 require_admin_auth_except_operational,
-            ));
+            ),
+        );
         async move {
             let (status, _, text) = send(app, request(method, &path, &bearer, body)).await;
             (

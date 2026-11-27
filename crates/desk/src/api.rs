@@ -10,8 +10,7 @@ use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path, Query, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, patch, post};
-use axum::{Json, Router};
+use axum::Json;
 use futures::{SinkExt, StreamExt};
 use serde::Deserialize;
 use serde_json::json;
@@ -24,11 +23,13 @@ use crate::model::{Decision, NewSession, SessionPatch};
 use crate::providers::{self, AccountError, Accounts, Catalog, ConnectBody, Entry};
 use crate::pty::Frame;
 use crate::realtime::{Engine, Realtime, RealtimeError};
-use crate::rooms::{Bound, NewMessage, NewRoom, Page, RoomPatch, SearchFilters};
+use crate::rooms::{NewMessage, NewRoom, Page, RoomPatch, SearchFilters};
 use crate::service::{
     Clearing, Desk, DeskError, Import, Layout, NewTerminal, Removal, TerminalPatch,
 };
 use crate::speech::{Speak, SpeakError, Speech};
+use workforce_surface::routing::{get, patch, post};
+use workforce_surface::{Bound, Routes};
 
 /// Decides whether a request may use the desk, and says who it is from: the
 /// person its token names, none for one that names no one. Implemented by
@@ -1592,8 +1593,8 @@ async fn delete_room(State(s): S, h: HeaderMap, Query(q): Q, Path(id): Path<Uuid
 struct TimelineQuery {
     token: Option<String>,
     thread: Option<Uuid>,
-    before: Option<Bound>,
-    after: Option<Bound>,
+    before: Option<crate::rooms::Bound>,
+    after: Option<crate::rooms::Bound>,
     around: Option<Uuid>,
     limit: Option<i64>,
 }
@@ -2022,210 +2023,217 @@ async fn session_lineage(State(s): S, h: HeaderMap, Query(q): Q, Path(id): Path<
     Json(s.desk.session_lineage(id).await).into_response()
 }
 
+/// What most of Desk's routes answer with: its sessions, and who may use
+/// them.
+pub type Ground = Bound<(Desk, Arc<dyn Authorize>)>;
+
 /// The sessions' and rooms' routes and the events socket alone.
-pub fn sessions_router(desk: Desk, auth: Arc<dyn Authorize>) -> Router {
-    Router::new()
-        .route("/api/desk/sessions", get(list).post(create))
-        .route("/api/desk/engines", get(engines))
-        .route("/api/desk/features", get(features))
-        .route("/api/desk/engines/read", post(engines_read))
-        .route("/api/desk/engines/sign-ins", post(start_engine_sign_in))
-        .route(
+pub fn sessions_router(ground: Ground) -> Routes {
+    Routes::new()
+        .member("/api/desk/sessions", get(list).post(create))
+        .member("/api/desk/engines", get(engines))
+        .member("/api/desk/features", get(features))
+        .member("/api/desk/engines/read", post(engines_read))
+        .member("/api/desk/engines/sign-ins", post(start_engine_sign_in))
+        .member(
             "/api/desk/engines/sign-ins/{id}",
             get(engine_sign_in).delete(cancel_engine_sign_in),
         )
-        .route(
+        .member(
             "/api/desk/engines/sign-ins/{id}/token",
             post(engine_sign_in_token),
         )
-        .route("/api/desk/accounts", get(accounts).post(add_account))
-        .route(
+        .member("/api/desk/accounts", get(accounts).post(add_account))
+        .member(
             "/api/desk/accounts/{id}",
             patch(update_account).delete(remove_account),
         )
-        .route("/api/desk/accounts/{id}/hand-over", post(hand_over_account))
-        .route("/api/desk/accounts/{id}/sign-in", post(sign_in_again))
-        .route("/api/desk/accounts/sign-ins/{id}/code", post(sign_in_code))
-        .route(
+        .admin("/api/desk/accounts/{id}/hand-over", post(hand_over_account))
+        .member("/api/desk/accounts/{id}/sign-in", post(sign_in_again))
+        .member("/api/desk/accounts/sign-ins/{id}/code", post(sign_in_code))
+        .member(
             "/api/desk/accounts/sign-ins/{id}/direct",
             get(sign_in_direct),
         )
-        .route("/api/desk/accounts/switch-all", post(switch_all))
-        .route(
+        .member("/api/desk/accounts/switch-all", post(switch_all))
+        .member(
             "/api/desk/accounts/own-sign-in",
-            axum::routing::put(own_sign_in),
+            workforce_surface::routing::put(own_sign_in),
         )
-        .route(
+        .member(
             "/api/desk/accounts/standing",
-            axum::routing::put(learn_standing),
+            workforce_surface::routing::put(learn_standing),
         )
-        .route("/api/desk/accounts/needs/{id}/put-off", post(put_off_need))
-        .route(
+        .member("/api/desk/accounts/needs/{id}/put-off", post(put_off_need))
+        .member(
             "/api/desk/accounts/auto-switch",
-            axum::routing::put(auto_switch),
+            workforce_surface::routing::put(auto_switch),
         )
-        .route(
+        .member(
             "/api/desk/accounts/problems/{id}/dismiss",
             post(dismiss_problem),
         )
-        .route(
+        .member(
             "/api/desk/accounts/sign-ins/{id}",
-            axum::routing::delete(cancel_sign_in),
+            workforce_surface::routing::delete(cancel_sign_in),
         )
-        .route("/api/desk/sessions/{id}/account", post(switch_account))
-        .route("/api/desk/spend", get(spend))
-        .route("/api/desk/ledger", get(ledger))
-        .route("/api/desk/memory/search", get(memory_search))
-        .route("/api/desk/memory/index", get(memory_index_status))
-        .route("/api/desk/memory/index/rebuild", post(rebuild_memory_index))
-        .route(
+        .member("/api/desk/sessions/{id}/account", post(switch_account))
+        .member("/api/desk/spend", get(spend))
+        .member("/api/desk/ledger", get(ledger))
+        .member("/api/desk/memory/search", get(memory_search))
+        .member("/api/desk/memory/index", get(memory_index_status))
+        .member("/api/desk/memory/index/rebuild", post(rebuild_memory_index))
+        .member(
             "/api/desk/sessions/{id}/memory",
             get(session_memory)
                 .delete(forget_memory)
                 .patch(switch_memory),
         )
-        .route("/api/desk/sessions/{id}/memory/derive", post(derive_memory))
-        .route(
+        .member("/api/desk/sessions/{id}/memory/derive", post(derive_memory))
+        .member(
             "/api/desk/sessions/{id}/handoff",
             get(handoff_preview).post(handoff),
         )
-        .route("/api/desk/sessions/{id}/lineage", get(session_lineage))
-        .route("/api/desk/memory/items/{id}", patch(change_memory_item))
-        .route(
+        .member("/api/desk/sessions/{id}/lineage", get(session_lineage))
+        .member("/api/desk/memory/items/{id}", patch(change_memory_item))
+        .member(
             "/api/desk/memory/settings",
             get(memory_settings).patch(change_memory_settings),
         )
-        .route("/api/desk/memory/retain-preview", get(retain_preview))
-        .route("/api/desk/memory/groups/{id}", patch(change_group_memory))
-        .route("/api/desk/budgets", get(budgets).post(put_budget))
-        .route(
+        .member("/api/desk/memory/retain-preview", get(retain_preview))
+        .member("/api/desk/memory/groups/{id}", patch(change_group_memory))
+        .member("/api/desk/budgets", get(budgets).post(put_budget))
+        .member(
             "/api/desk/budgets/{id}",
             patch(patch_budget).delete(delete_budget),
         )
-        .route("/api/desk/breaker/rules", axum::routing::put(breaker_rules))
-        .route("/api/desk/breakers/continue", post(breaker_continue))
-        .route("/api/desk/breakers/keep", post(breaker_keep))
-        .route("/api/desk/sessions/{id}", patch(update).delete(forget))
-        .route("/api/desk/sessions/closed", get(closed))
-        .route("/api/desk/sessions/hidden", get(hidden))
-        .route(
-            "/api/desk/sessions/hidden/{engine}/{cli}",
-            axum::routing::delete(unhide),
+        .member(
+            "/api/desk/breaker/rules",
+            workforce_surface::routing::put(breaker_rules),
         )
-        .route("/api/desk/sessions/clear", post(clear))
-        .route("/api/desk/sessions/{id}/remove", post(remove))
-        .route("/api/desk/sessions/{id}/end", post(end))
-        .route("/api/desk/sessions/{id}/closing", get(closing))
-        .route("/api/desk/sessions/{id}/stop", post(stop))
-        .route("/api/desk/sessions/{id}/interrupt", post(interrupt))
-        .route("/api/desk/sessions/{id}/asked/allow", post(allow_asked))
-        .route("/api/desk/sessions/{id}/asked/dismiss", post(dismiss_asked))
-        .route("/api/desk/sessions/{id}/resume", post(resume))
-        .route("/api/desk/sessions/{id}/restart", post(restart))
-        .route(
+        .member("/api/desk/breakers/continue", post(breaker_continue))
+        .member("/api/desk/breakers/keep", post(breaker_keep))
+        .member("/api/desk/sessions/{id}", patch(update).delete(forget))
+        .member("/api/desk/sessions/closed", get(closed))
+        .member("/api/desk/sessions/hidden", get(hidden))
+        .member(
+            "/api/desk/sessions/hidden/{engine}/{cli}",
+            workforce_surface::routing::delete(unhide),
+        )
+        .member("/api/desk/sessions/clear", post(clear))
+        .member("/api/desk/sessions/{id}/remove", post(remove))
+        .member("/api/desk/sessions/{id}/end", post(end))
+        .member("/api/desk/sessions/{id}/closing", get(closing))
+        .member("/api/desk/sessions/{id}/stop", post(stop))
+        .member("/api/desk/sessions/{id}/interrupt", post(interrupt))
+        .member("/api/desk/sessions/{id}/asked/allow", post(allow_asked))
+        .member("/api/desk/sessions/{id}/asked/dismiss", post(dismiss_asked))
+        .member("/api/desk/sessions/{id}/resume", post(resume))
+        .member("/api/desk/sessions/{id}/restart", post(restart))
+        .member(
             "/api/desk/terminal/colors",
             // 20 colours: a few hundred bytes.
-            axum::routing::put(terminal_colors).layer(axum::extract::DefaultBodyLimit::max(4096)),
+            workforce_surface::routing::put(terminal_colors)
+                .layer(axum::extract::DefaultBodyLimit::max(4096)),
         )
-        .route("/api/desk/sessions/{id}/approvals/{approval}", post(decide))
-        .route("/api/desk/sessions/{id}/pty", get(pty))
-        .route(
+        .member("/api/desk/sessions/{id}/approvals/{approval}", post(decide))
+        .member("/api/desk/sessions/{id}/pty", get(pty))
+        .member(
             "/api/desk/sessions/{id}/name",
-            axum::routing::put(name_session),
+            workforce_surface::routing::put(name_session),
         )
-        .route("/api/desk/folders", get(folders).post(make_folder))
-        .route("/api/desk/layout", get(layout).put(replace_layout))
-        .route("/api/desk/layout/import", post(import_layout))
-        .route("/api/desk/groups", get(layout).post(create_group))
-        .route(
+        .member("/api/desk/folders", get(folders).post(make_folder))
+        .member("/api/desk/layout", get(layout).put(replace_layout))
+        .member("/api/desk/layout/import", post(import_layout))
+        .member("/api/desk/groups", get(layout).post(create_group))
+        .member(
             "/api/desk/groups/{id}",
             patch(update_group).delete(delete_group),
         )
-        .route("/api/desk/groups/{id}/move", post(move_group))
-        .route(
+        .member("/api/desk/groups/{id}/move", post(move_group))
+        .member(
             "/api/desk/groups/ungrouped/order",
-            axum::routing::put(order_ungrouped),
+            workforce_surface::routing::put(order_ungrouped),
         )
-        .route(
+        .member(
             "/api/desk/groups/{id}/items/{*item}",
-            axum::routing::put(put_member).delete(remove_member),
+            workforce_surface::routing::put(put_member).delete(remove_member),
         )
-        .route("/api/desk/terminals", get(terminals).post(create_terminal))
-        .route(
+        .member("/api/desk/terminals", get(terminals).post(create_terminal))
+        .member(
             "/api/desk/terminals/{id}",
             patch(update_terminal).delete(close_terminal),
         )
-        .route("/api/desk/terminals/{id}/reopen", post(reopen_terminal))
-        .route("/api/desk/terminals/{id}/programs", get(terminal_programs))
-        .route("/api/desk/terminals/{id}/pty", get(terminal_pty))
-        .route("/api/desk/restore", post(restore))
-        .route("/api/desk/restore/dismiss", post(dismiss_restore))
-        .route("/api/desk/events", get(events))
-        .route("/api/desk/rooms", get(rooms).post(create_room))
-        .route("/api/desk/rooms/search", get(search))
-        .route(
+        .member("/api/desk/terminals/{id}/reopen", post(reopen_terminal))
+        .member("/api/desk/terminals/{id}/programs", get(terminal_programs))
+        .member("/api/desk/terminals/{id}/pty", get(terminal_pty))
+        .member("/api/desk/restore", post(restore))
+        .member("/api/desk/restore/dismiss", post(dismiss_restore))
+        .member("/api/desk/events", get(events))
+        .member("/api/desk/rooms", get(rooms).post(create_room))
+        .member("/api/desk/rooms/search", get(search))
+        .member(
             "/api/desk/rooms/{id}",
             patch(update_room).delete(delete_room),
         )
-        .route(
+        .member(
             "/api/desk/rooms/{id}/messages",
             get(room_messages).post(post_message),
         )
-        .route("/api/desk/rooms/{id}/messages/{message}", get(room_message))
-        .route(
+        .member("/api/desk/rooms/{id}/messages/{message}", get(room_message))
+        .member(
             "/api/desk/rooms/{id}/messages/{message}/copy",
             post(copy_message),
         )
-        .with_state(Arc::new(ApiState {
-            desk: desk.clone(),
-            auth: Arc::clone(&auth),
-            handed: Default::default(),
+        .bind(ground.clone().map(|(desk, auth)| {
+            Arc::new(ApiState {
+                desk,
+                auth,
+                handed: Default::default(),
+            })
         }))
-        .merge(crate::line_api::api_routes(desk.clone(), Arc::clone(&auth)))
-        .merge(crate::charge_api::api_routes(
-            desk.clone(),
-            Arc::clone(&auth),
-        ))
-        .merge(crate::plan_api::api_routes(desk.clone(), Arc::clone(&auth)))
-        .merge(crate::assignment_api::api_routes(
-            desk.clone(),
-            Arc::clone(&auth),
-        ))
-        .merge(crate::move_api::api_routes(desk.clone(), Arc::clone(&auth)))
-        .merge(crate::board_api::api_routes(
-            desk.clone(),
-            Arc::clone(&auth),
-        ))
-        .merge(crate::repos_api::api_routes(
-            desk.clone(),
-            Arc::clone(&auth),
-        ))
-        .merge(crate::run::api::api_routes(desk.clone(), Arc::clone(&auth)))
-        .merge(crate::grant_api::api_routes(desk, auth))
+        .merge(crate::line_api::api_routes(ground.clone()))
+        .merge(crate::charge_api::api_routes(ground.clone()))
+        .merge(crate::plan_api::api_routes(ground.clone()))
+        .merge(crate::assignment_api::api_routes(ground.clone()))
+        .merge(crate::move_api::api_routes(ground.clone()))
+        .merge(crate::board_api::api_routes(ground.clone()))
+        .merge(crate::repos_api::api_routes(ground.clone()))
+        .merge(crate::run::api::api_routes(ground.clone()))
+        .merge(crate::grant_api::api_routes(ground))
 }
 
-pub fn router(
-    desk: Desk,
-    auth: Arc<dyn Authorize>,
-    realtime: Arc<Realtime>,
-    speech: Arc<dyn Speech>,
-    accounts: Arc<dyn Accounts>,
-    crew: Arc<dyn crate::crew::Crew>,
-) -> Router {
-    desk.read_replies_with(&crew);
-    sessions_router(desk.clone(), Arc::clone(&auth))
-        .merge(crate::state::router(desk.clone(), Arc::clone(&auth)))
-        .merge(crate::computer::api::computer_router(
-            desk.clone(),
-            Arc::clone(&auth),
-        ))
-        .merge(crate::knows_api::knows_router(
-            desk.clone(),
-            Arc::clone(&auth),
-        ))
-        .merge(crate::crew_api::crew_router(desk, Arc::clone(&auth), crew))
-        .merge(voice_router(Arc::clone(&auth), realtime, speech))
-        .merge(providers_router(auth, accounts))
+/// What Desk's routes answer with.
+#[derive(Clone)]
+pub struct Parts {
+    pub desk: Desk,
+    pub auth: Arc<dyn Authorize>,
+    pub realtime: Arc<Realtime>,
+    pub speech: Arc<dyn Speech>,
+    pub accounts: Arc<dyn Accounts>,
+    pub crew: Arc<dyn crate::crew::Crew>,
+}
+
+/// Every route of Desk's served beside the hub's.
+pub fn router(parts: Bound<Parts>) -> Routes {
+    let ground = parts
+        .as_ref()
+        .map(|p| (p.desk.clone(), Arc::clone(&p.auth)));
+    sessions_router(ground.clone())
+        .merge(crate::state::router(ground.clone()))
+        .merge(crate::computer::api::computer_router(ground.clone()))
+        .merge(crate::knows_api::knows_router(ground))
+        .merge(crate::crew_api::crew_router(parts.as_ref().map(|p| {
+            (p.desk.clone(), Arc::clone(&p.auth), Arc::clone(&p.crew))
+        })))
+        .merge(voice_router(parts.as_ref().map(|p| {
+            (
+                Arc::clone(&p.auth),
+                Arc::clone(&p.realtime),
+                Arc::clone(&p.speech),
+            )
+        })))
+        .merge(providers_router(parts.map(|p| (p.auth, p.accounts))))
 }
 
 struct ProvidersApi {
@@ -2315,15 +2323,15 @@ async fn disconnect_provider(
     Json(Entry::of(spec, &*s.accounts).await).into_response()
 }
 
-pub(crate) fn providers_router(auth: Arc<dyn Authorize>, accounts: Arc<dyn Accounts>) -> Router {
-    Router::new()
-        .route("/api/desk/providers", get(list_providers))
-        .route(
+pub(crate) fn providers_router(on: Bound<(Arc<dyn Authorize>, Arc<dyn Accounts>)>) -> Routes {
+    Routes::new()
+        .member("/api/desk/providers", get(list_providers))
+        .member(
             "/api/desk/providers/{id}",
-            axum::routing::delete(disconnect_provider),
+            workforce_surface::routing::delete(disconnect_provider),
         )
-        .route("/api/desk/providers/{id}/connect", post(connect_provider))
-        .with_state(Arc::new(ProvidersApi { auth, accounts }))
+        .member("/api/desk/providers/{id}/connect", post(connect_provider))
+        .bind(on.map(|(auth, accounts)| Arc::new(ProvidersApi { auth, accounts })))
 }
 
 struct VoiceApi {
@@ -2461,20 +2469,21 @@ async fn save_voice_key(
     }
 }
 
-pub(crate) fn voice_router(
-    auth: Arc<dyn Authorize>,
-    realtime: Arc<Realtime>,
-    speech: Arc<dyn Speech>,
-) -> Router {
-    Router::new()
-        .route("/api/desk/voice/session", post(voice_session))
-        .route("/api/desk/voice/relay", get(voice_relay))
-        .route("/api/desk/voice/speak", post(voice_speak))
-        .route("/api/desk/voice/keys/{provider}", post(save_voice_key))
-        .with_state(Arc::new(VoiceApi {
-            auth,
-            realtime,
-            speech,
+/// Who may speak, and the voices they speak with.
+type Voices = (Arc<dyn Authorize>, Arc<Realtime>, Arc<dyn Speech>);
+
+pub(crate) fn voice_router(on: Bound<Voices>) -> Routes {
+    Routes::new()
+        .member("/api/desk/voice/session", post(voice_session))
+        .machine("/api/desk/voice/relay", get(voice_relay))
+        .member("/api/desk/voice/speak", post(voice_speak))
+        .member("/api/desk/voice/keys/{provider}", post(save_voice_key))
+        .bind(on.map(|(auth, realtime, speech)| {
+            Arc::new(VoiceApi {
+                auth,
+                realtime,
+                speech,
+            })
         }))
 }
 
@@ -2524,13 +2533,17 @@ async fn gh_asked(
 
 /// Served on its own loopback listener; the per-session token in the URL is
 /// the credential.
-pub(crate) fn hook_router(desk: Desk) -> Router {
-    Router::new()
-        .route("/hook/{id}/{token}", post(hook))
-        .route("/hook/terminal/{terminal}/{token}", post(terminal_hook))
-        .route("/gh/{id}/{token}", post(gh_asked))
+pub(crate) fn hook_router(desk: Desk) -> axum::Router {
+    Routes::new()
+        .machine("/hook/{id}/{token}", post(hook))
+        .machine("/hook/terminal/{terminal}/{token}", post(terminal_hook))
+        .machine("/gh/{id}/{token}", post(gh_asked))
         .merge(crate::line_api::hook_routes())
         .with_state(desk)
+        .render(
+            workforce_surface::Surface::Combined,
+            tower::layer::util::Identity::new(),
+        )
 }
 
 #[cfg(test)]
@@ -2709,7 +2722,10 @@ mod tests {
                 })
                 .await
                 .unwrap();
-            let app = super::sessions_router(desk.clone(), allow_all());
+            let app = crate::testing::app(super::sessions_router(workforce_surface::Bound::To((
+                desk.clone(),
+                allow_all(),
+            ))));
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let addr = listener.local_addr().unwrap();
             tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
@@ -2847,12 +2863,12 @@ mod tests {
             let path = format!("/api/desk/accounts/{id}/hand-over");
 
             // Not the admin: refused.
-            let denied = super::sessions_router(desk.clone(), crate::testing::deny_all());
+            let denied = crate::testing::app(super::sessions_router(workforce_surface::Bound::To((desk.clone(), crate::testing::deny_all()))));
             let (status, body) = call(&denied, "POST", &path, None).await;
             assert!(status == 401 || status == 403, "{status}");
             assert!(!body.to_string().contains("sk-ant"), "{body}");
 
-            let app = super::sessions_router(desk.clone(), allow_all());
+            let app = crate::testing::app(super::sessions_router(workforce_surface::Bound::To((desk.clone(), allow_all()))));
             // A token in the address (which logs keep) is never answered.
             let (status, body) = call(&app, "POST", &format!("{path}?token=x"), None).await;
             assert_eq!(status, 400, "{body}");
@@ -2912,7 +2928,7 @@ mod tests {
                 withheld: vec![home.join(".ssh")],
             });
             // Not the hub's own token: refused.
-            let page = super::sessions_router(desk.clone(), crate::testing::identified("sarah"));
+            let page = crate::testing::app(super::sessions_router(workforce_surface::Bound::To((desk.clone(), crate::testing::identified("sarah")))));
             let (status, _) = call(
                 &page,
                 "POST",
@@ -2921,7 +2937,7 @@ mod tests {
             )
             .await;
             assert_eq!(status, 403);
-            let app = super::sessions_router(desk, allow_all());
+            let app = crate::testing::app(super::sessions_router(workforce_surface::Bound::To((desk, allow_all()))));
             // A token in the address: refused, even the hub's.
             let (status, _) = call(
                 &app,
@@ -3016,7 +3032,10 @@ mod tests {
             )
             .await
             .unwrap();
-            let app = super::sessions_router(desk, allow_all());
+            let app = crate::testing::app(super::sessions_router(workforce_surface::Bound::To((
+                desk,
+                allow_all(),
+            ))));
             let (status, l) = call(&app, "GET", "/api/desk/folders", None).await;
             assert_eq!(status, 200, "{l}");
             assert_eq!(l["folders"].as_array().unwrap().len(), 1);
@@ -3066,7 +3085,9 @@ mod tests {
         with_test_pool(build_pool, |pool| async move {
             let dir = tempfile::tempdir().unwrap();
             let desk = crate::testing::desk_on(pool, dir.path()).await;
-            let denied = super::sessions_router(desk.clone(), crate::testing::deny_all());
+            let denied = crate::testing::app(super::sessions_router(workforce_surface::Bound::To(
+                (desk.clone(), crate::testing::deny_all()),
+            )));
             let (status, _) = call(&denied, "POST", "/api/desk/engines/read", None).await;
             assert!(status == 401 || status == 403, "{status}");
             let path = format!("/api/desk/accounts/{}/sign-in", uuid::Uuid::new_v4());
@@ -3082,7 +3103,9 @@ mod tests {
             assert!(desk.accounts().is_empty(), "nothing added");
 
             // Signed in, but not an administrator: refused as well.
-            let member = super::sessions_router(desk.clone(), crate::testing::not_an_admin());
+            let member = crate::testing::app(super::sessions_router(workforce_surface::Bound::To(
+                (desk.clone(), crate::testing::not_an_admin()),
+            )));
             let (status, _) = call(&member, "POST", "/api/desk/engines/read", None).await;
             assert_eq!(status, 403);
             let (status, body) = call(
@@ -3098,7 +3121,10 @@ mod tests {
             assert_eq!(desk.engines_reads_this_minute(None), 0, "nothing read");
 
             // An id that isn't one is refused before anything else.
-            let app = super::sessions_router(desk.clone(), allow_all());
+            let app = crate::testing::app(super::sessions_router(workforce_surface::Bound::To((
+                desk.clone(),
+                allow_all(),
+            ))));
             let (status, _) = call(
                 &app,
                 "POST",
@@ -3116,7 +3142,10 @@ mod tests {
         with_test_pool(build_pool, |pool| async move {
             let dir = tempfile::tempdir().unwrap();
             let desk = crate::testing::desk_on(pool, dir.path()).await;
-            let app = super::sessions_router(desk.clone(), allow_all());
+            let app = crate::testing::app(super::sessions_router(workforce_surface::Bound::To((
+                desk.clone(),
+                allow_all(),
+            ))));
             for _ in 0..crate::service::ENGINES_READS_A_MINUTE + 8 {
                 let (status, engines) = call(&app, "POST", "/api/desk/engines/read", None).await;
                 assert_eq!(status, 200, "still answered: {engines}");
@@ -3128,7 +3157,10 @@ mod tests {
                 "only so many read"
             );
             // Counted for each caller: another person asking still reads.
-            let ada = super::sessions_router(desk.clone(), crate::testing::identified("ada"));
+            let ada = crate::testing::app(super::sessions_router(workforce_surface::Bound::To((
+                desk.clone(),
+                crate::testing::identified("ada"),
+            ))));
             let (status, _) = call(&ada, "POST", "/api/desk/engines/read", None).await;
             assert_eq!(status, 200);
             assert_eq!(desk.engines_reads_this_minute(Some("ada")), 1);
@@ -3141,7 +3173,7 @@ mod tests {
         with_test_pool(build_pool, |pool| async move {
             let dir = tempfile::tempdir().unwrap();
             let desk = crate::testing::desk_on(pool, dir.path()).await;
-            let app = super::sessions_router(desk, allow_all());
+            let app = crate::testing::app(super::sessions_router(workforce_surface::Bound::To((desk, allow_all()))));
             let (status, engines) = call(&app, "GET", "/api/desk/engines", None).await;
             assert_eq!(status, 200);
             let names: Vec<&str> = engines
@@ -3230,7 +3262,10 @@ mod tests {
             )
             .await
             .unwrap();
-            let app = super::sessions_router(desk, allow_all());
+            let app = crate::testing::app(super::sessions_router(workforce_surface::Bound::To((
+                desk,
+                allow_all(),
+            ))));
             let uri =
                 "/api/desk/spend?from=2026-10-31T00:00:00Z&to=2026-11-01T00:00:00Z&by=session";
             let mut view = Value::Null;
@@ -3321,7 +3356,10 @@ mod tests {
             });
             let as_crew: std::sync::Arc<dyn crate::crew::Crew> = crew.clone();
             desk.answer_lines_with(&as_crew);
-            let app = super::sessions_router(desk.clone(), allow_all());
+            let app = crate::testing::app(super::sessions_router(workforce_surface::Bound::To((
+                desk.clone(),
+                allow_all(),
+            ))));
             call(
                 &app,
                 "POST",
@@ -3367,7 +3405,7 @@ mod tests {
             let desk = crate::Desk::start(store, options(dir.path()), Default::default(), tokio_util::sync::CancellationToken::new())
                 .await
                 .unwrap();
-            let app = super::sessions_router(desk, allow_all());
+            let app = crate::testing::app(super::sessions_router(workforce_surface::Bound::To((desk, allow_all()))));
             let s = format!("session:{}", r.id);
 
             let (status, v) = call(&app, "PUT", &format!("/api/desk/sessions/{}/name", r.id), Some(json!({ "name": "Ledger migration" }))).await;
@@ -3476,7 +3514,10 @@ mod tests {
             )
             .await
             .unwrap();
-            let app = super::sessions_router(desk, allow_all());
+            let app = crate::testing::app(super::sessions_router(workforce_surface::Bound::To((
+                desk,
+                allow_all(),
+            ))));
 
             let (status, c) = call(&app, "GET", "/api/desk/sessions/closed", None).await;
             assert_eq!(
@@ -3568,7 +3609,10 @@ mod tests {
             )
             .await
             .unwrap();
-            let app = super::sessions_router(desk.clone(), crate::testing::deny_all());
+            let app = crate::testing::app(super::sessions_router(workforce_surface::Bound::To((
+                desk.clone(),
+                crate::testing::deny_all(),
+            ))));
             let id = kept.id;
             for (method, uri, body) in [
                 ("GET", "/api/desk/sessions/closed".to_string(), None),
@@ -3613,7 +3657,7 @@ mod tests {
             let desk = crate::Desk::start(store, options(dir.path()), Default::default(), tokio_util::sync::CancellationToken::new())
                 .await
                 .unwrap();
-            let app = super::sessions_router(desk, allow_all());
+            let app = crate::testing::app(super::sessions_router(workforce_surface::Bound::To((desk, allow_all()))));
             let (status, room) = call(&app, "POST", "/api/desk/rooms", Some(json!({ "name": "Release", "members": [{ "hub": "local", "agent": "scout" }] }))).await;
             assert_eq!(status, 200);
             let channel = format!("desk:{}", room["id"].as_str().unwrap());
@@ -3646,7 +3690,10 @@ mod tests {
             )
             .await
             .unwrap();
-            let app = super::sessions_router(desk, allow_all());
+            let app = crate::testing::app(super::sessions_router(workforce_surface::Bound::To((
+                desk,
+                allow_all(),
+            ))));
             let (_, room) = call(
                 &app,
                 "POST",
@@ -3742,7 +3789,10 @@ mod tests {
             )
             .await
             .unwrap();
-            let app = super::sessions_router(desk, allow_all());
+            let app = crate::testing::app(super::sessions_router(workforce_surface::Bound::To((
+                desk,
+                allow_all(),
+            ))));
             let (_, room) = call(
                 &app,
                 "POST",
@@ -3777,7 +3827,7 @@ mod tests {
             let desk = crate::Desk::start(store, options(dir.path()), Default::default(), tokio_util::sync::CancellationToken::new())
                 .await
                 .unwrap();
-            let app = super::sessions_router(desk, allow_all());
+            let app = crate::testing::app(super::sessions_router(workforce_surface::Bound::To((desk, allow_all()))));
             let (_, room) = call(&app, "POST", "/api/desk/rooms", Some(json!({ "name": "Atlas launch" }))).await;
             let id = room["id"].as_str().unwrap();
             let uri = format!("/api/desk/rooms/{id}/messages");

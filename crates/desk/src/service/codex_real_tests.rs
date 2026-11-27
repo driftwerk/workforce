@@ -2,6 +2,10 @@
 //! pty, with a stand-in Responses API for its model in a scratch
 //! `CODEX_HOME`. Skipped where no CLI is given, unless
 //! `WORKFORCE_CODEX_REQUIRED=1` says it must run (CI).
+#![allow(
+    clippy::disallowed_methods,
+    reason = "stand-in servers for tests, not routes the hub serves"
+)]
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;

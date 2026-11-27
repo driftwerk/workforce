@@ -10,11 +10,12 @@ use std::sync::Arc;
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
-use axum::{Json, Router};
+use axum::Json;
 use serde::Deserialize;
 use serde_json::json;
 use uuid::Uuid;
+use workforce_surface::routing::{get, post};
+use workforce_surface::Routes;
 
 use crate::api::Authorize;
 use crate::assignment::{self, AssignmentState};
@@ -179,10 +180,10 @@ async fn release(
 }
 
 /// The assignments' routes.
-pub(crate) fn api_routes(desk: Desk, auth: Arc<dyn Authorize>) -> Router {
-    Router::new()
-        .route("/api/desk/assignments", get(list))
-        .route("/api/desk/assignments/{id}/close", post(close))
-        .route("/api/desk/assignments/{id}/release", post(release))
-        .with_state(Arc::new(Api { desk, auth }))
+pub(crate) fn api_routes(ground: crate::api::Ground) -> Routes {
+    Routes::new()
+        .member("/api/desk/assignments", get(list))
+        .member("/api/desk/assignments/{id}/close", post(close))
+        .member("/api/desk/assignments/{id}/release", post(release))
+        .bind(ground.map(|(desk, auth)| Arc::new(Api { desk, auth })))
 }

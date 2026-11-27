@@ -1,6 +1,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use workforce_hub::serve::Compose as _;
+use workforce_hub::surface::Bound;
 
 use chrono::{DateTime, Utc};
 use clap::{Parser, Subcommand};
@@ -4253,15 +4254,16 @@ rules:
                 }
             }
 
-            // Clone lock_manager before hub_state is moved into router
             let lock_manager_for_agents = Arc::clone(&hub_state.lock_manager);
-            // Cloned for the gateway nest below — both share the same hub_state.
-            let hub_state_for_gateway = Arc::clone(&hub_state);
 
             // Built bare here; auth + CORS are layered on below, once
             // `gateway_state` exists (the auth middleware needs it as state).
             // audit F3: this admin router must NOT be served auth-free.
-            let admin_app = axum::Router::new().nest("/api", workforce_hub::api::router(hub_state));
+            let admin_app =
+                workforce_hub::serve::combined(workforce_hub::surface::Routes::new().nest(
+                    "/api",
+                    workforce_hub::api::router(Bound::To(Arc::clone(&hub_state))),
+                ));
 
             let admin_addr: std::net::SocketAddr = wf_config
                 .hub
@@ -4901,8 +4903,8 @@ rules:
                     workforce_hub::knowledge::bind_evaluator(&service, evaluator);
                     service.set_permission_gate(Arc::clone(&gate));
                 }
-                hub_state_for_gateway.set_permission_writer(Arc::clone(&writer));
-                hub_state_for_gateway.set_permission_gate(Arc::clone(&gate));
+                hub_state.set_permission_writer(Arc::clone(&writer));
+                hub_state.set_permission_gate(Arc::clone(&gate));
             }
 
             // Capability matrix — admin-editable, hot-reloaded, never gated on
@@ -4969,7 +4971,7 @@ rules:
             for service in registry.all_services() {
                 service.set_capability_gate(Arc::clone(&cap_gate));
             }
-            hub_state_for_gateway.set_capability_gate(Arc::clone(&cap_gate));
+            hub_state.set_capability_gate(Arc::clone(&cap_gate));
             *watcher_capability_gate.write() = Some(Arc::clone(&cap_gate));
 
             if let Some(ref store) = identity_store {
@@ -5074,7 +5076,7 @@ rules:
             workforce_hub::retention::spawn(
                 workforce_hub::retention::prunes(
                     &wf_config,
-                    Arc::clone(&hub_state_for_gateway.telemetry_store),
+                    Arc::clone(&hub_state.telemetry_store),
                     pending_store,
                     shadow_store,
                 ),
@@ -5253,7 +5255,7 @@ rules:
             // Hand the admin router the same registry + identity store
             // the gateway will use, so cost/scheduler-history endpoints
             // can hydrate UUIDs into display names.
-            hub_state_for_gateway.set_agent_registry(Arc::clone(&registry));
+            hub_state.set_agent_registry(Arc::clone(&registry));
             if let Some(s) = identity_store.clone() {
                 let identities = s.as_identity_store();
                 if let Some(warning) = workforce_hub::subscription::unknown_operator(
@@ -5262,7 +5264,7 @@ rules:
                 ) {
                     tracing::warn!("{warning}");
                 }
-                hub_state_for_gateway.set_identity_store(identities);
+                hub_state.set_identity_store(identities);
             }
 
             let skills_dir = wf_config
@@ -5334,7 +5336,7 @@ rules:
                 // exactly the condition that seeds the system rule above.
                 destructive_baseline_active: permission_evaluator.is_some()
                     && wf_config.permissions.destructive_baseline,
-                telemetry_store: Some(Arc::clone(&hub_state_for_gateway.telemetry_store)),
+                telemetry_store: Some(Arc::clone(&hub_state.telemetry_store)),
                 jwt_config,
                 rate_limiter: Some(rate_limiter),
                 pair_rate_limiter: Some(pair_rate_limiter),
@@ -5349,7 +5351,7 @@ rules:
                     ])
                     .expect("static CIDR parses"),
                 ),
-                skills_dir,
+                skills_dir: skills_dir.clone(),
                 slack: Arc::clone(&slack_slot),
                 skill_catalog: Arc::new(workforce_hub::skill_catalog::SkillCatalog::live(
                     &wf_config,
@@ -5396,97 +5398,86 @@ rules:
                     &wf_config.gateway.cors_allowed_origins,
                 ));
 
-            // Merge webhook router into gateway (with workflow trigger support)
-            let webhook_runtime = default_service.workflow_runtime().cloned();
-            let webhook_router = workforce_hub::serve::create_webhook_router(
-                Arc::clone(&default_service),
-                webhook_runtime,
+            // Start the Microsoft Teams skill (Bot Framework), before the
+            // gateway's routes are assembled: Teams is push-based, so its
+            // receiver mounts on the public gateway at `POST /api/messages` —
+            // a server-to-server Bot Connector callback authenticated by its
+            // own JWT (no CORS) — rather than holding a socket. `teams_manager`
+            // owns the dispatch loops for the process lifetime.
+            let mut teams_manager = workforce_hub::teams_manager::TeamsManager::new(
+                registry_for_slack.clone(),
+                skills_dir.clone(),
+                global_vault.clone(),
+                channel_pairing.clone(),
+                drain_token.clone(),
             );
-            // HTTP trigger receiver (`POST /triggers/{path}`); only when a
-            // workflow runtime is present to resolve and start workflows.
-            let trigger_router = match default_service.workflow_runtime().cloned() {
-                Some(rt) => {
-                    workforce_hub::serve::create_trigger_router(Arc::clone(&default_service), rt)
+            let teams = match teams_manager.start().await {
+                Ok(Some(state)) => {
+                    eprintln!("  Teams:     {}", style("connected").cyan());
+                    Some(Bound::To(Arc::new(state)))
                 }
-                None => axum::Router::new(),
+                Ok(None) => {
+                    eprintln!(
+                        "  Teams:     {}",
+                        style("pending (no credentials yet — set teams.<id>.app_id/app_password in the vault)").dim(),
+                    );
+                    None
+                }
+                Err(e) => {
+                    tracing::warn!("Teams startup failed (can reload later): {}", e);
+                    eprintln!("  Teams:     {}", style("not configured").dim());
+                    None
+                }
             };
-            // Mount the admin router inside the gateway at /api/admin so the
-            // dashboard, health, cost, etc. endpoints are reachable from the
-            // same origin as the UI in production deployments where the
-            // standalone admin port is not externally exposed. Auth is
-            // enforced via the same check_auth used by other gateway routes.
-            let admin_nested = axum::Router::new()
-                .nest(
-                    "/api/admin",
-                    workforce_hub::api::router(hub_state_for_gateway),
-                )
-                .layer(axum::middleware::from_fn_with_state(
-                    Arc::clone(&gateway_state),
-                    workforce_hub::gateway::require_admin_auth,
-                ));
 
-            // Public OAuth callback for MCP server installs. Mounted
-            // on the public gateway so vendors (Linear, Atlassian,
-            // GitHub, …) can redirect users back to the hub after
-            // consent. The route itself is unauthenticated — only
-            // the random `state` token (set + consumed via the
-            // shared `OAuthStateStore`) gates access. This mirrors
-            // the public callback pattern Google / Slack OAuth
-            // already use.
+            // The MCP server installs' OAuth callback, and the Settings UI's
+            // MCP Servers tab's API, over the hub's default agent.
             let mcp_managers_lookup: Arc<dyn workforce_hub::mcp_servers::callback::ManagerLookup> =
                 Arc::clone(&mcp_managers) as _;
-            let mcp_callback_state = workforce_hub::mcp_servers::callback::CallbackState {
-                managers: Arc::clone(&mcp_managers_lookup),
-                state_store: Arc::clone(&oauth_state),
-            };
-            let mcp_callback_router = axum::Router::new()
-                .route(
-                    workforce_hub::mcp_servers::DEFAULT_CALLBACK_PATH,
-                    axum::routing::get(workforce_hub::mcp_servers::callback::handle),
-                )
-                .with_state(mcp_callback_state);
-
-            // REST API for the Settings UI's MCP Servers tab.
-            // Operates on the hub's default agent. The router itself
-            // applies `require_admin_auth` so unauthenticated callers
-            // get 401 — these endpoints install/uninstall live tools
-            // and start OAuth flows, never expose them publicly.
-            let mcp_api_state = workforce_hub::mcp_servers::api::ApiState {
-                managers: Arc::clone(&mcp_managers_lookup),
-                default_agent_id: registry.default_id().to_string(),
-                gateway: Arc::clone(&gateway_state),
-                public_url: wf_config.hub.public_url.clone(),
-            };
-            let mcp_api_router = workforce_hub::mcp_servers::api::router(mcp_api_state);
-
-            let remote_mcp_router = workforce_hub::remote_mcp::server::router(
-                workforce_hub::remote_mcp::server::RemoteMcpState::new(Arc::clone(&gateway_state)),
-            );
-
             workforce_hub::desk_attachments::configure(&wf_config.desk);
-            let gateway_app = workforce_hub::gateway::router(gateway_state.clone())
-                .merge(webhook_router)
-                .merge(trigger_router)
-                .merge(admin_nested)
-                .merge(mcp_callback_router)
-                .merge(mcp_api_router)
-                .merge(remote_mcp_router);
-            let gateway_app = workforce_hub::games_driver::mount(
-                gateway_app,
-                &gateway_state,
-                &wf_config.games,
-                std::path::Path::new(&wf_config.hub.data_dir),
-            );
-            let gateway_app = workforce_hub::desk_driver::mount(
-                gateway_app,
-                &gateway_state,
-                &wf_config,
-                background_cancel.clone(),
-            )
-            .await?
-            .layer(workforce_hub::gateway::build_cors_layer(
-                wf_config.gateway.cors,
-                &wf_config.gateway.cors_allowed_origins,
+            let gateway_app = workforce_hub::serve::combined(workforce_hub::serve::all_routes(
+                workforce_hub::serve::Mounts {
+                    gateway: Arc::clone(&gateway_state),
+                    admin: Bound::To(hub_state),
+                    webhooks: Bound::To(workforce_hub::serve::webhook_state(
+                        Arc::clone(&default_service),
+                        default_service.workflow_runtime().cloned(),
+                    )),
+                    triggers: default_service.workflow_runtime().cloned().map(|rt| {
+                        Bound::To(workforce_hub::serve::trigger_state(
+                            Arc::clone(&default_service),
+                            rt,
+                        ))
+                    }),
+                    mcp_callback: Bound::To(workforce_hub::mcp_servers::callback::CallbackState {
+                        managers: Arc::clone(&mcp_managers_lookup),
+                        state_store: Arc::clone(&oauth_state),
+                    }),
+                    mcp_servers: Bound::To(workforce_hub::mcp_servers::api::ApiState {
+                        managers: Arc::clone(&mcp_managers_lookup),
+                        default_agent_id: registry.default_id().to_string(),
+                        gateway: Arc::clone(&gateway_state),
+                        public_url: wf_config.hub.public_url.clone(),
+                    }),
+                    games: workforce_hub::games_driver::start(
+                        &gateway_state,
+                        &wf_config.games,
+                        std::path::Path::new(&wf_config.hub.data_dir),
+                    )
+                    .map(Bound::To),
+                    desk: workforce_hub::desk_driver::start(
+                        &gateway_state,
+                        &wf_config,
+                        background_cancel.clone(),
+                    )
+                    .await?
+                    .map(Bound::To),
+                    teams,
+                    cors: workforce_hub::gateway::build_cors_layer(
+                        wf_config.gateway.cors,
+                        &wf_config.gateway.cors_allowed_origins,
+                    ),
+                },
             ));
 
             let gateway_addr: std::net::SocketAddr = wf_config
@@ -6330,39 +6321,6 @@ rules:
                     style("in process").cyan(),
                 );
             }
-
-            // Start the Microsoft Teams skill (Bot Framework). Mirrors the Slack
-            // block above; Teams is push-based, so its receiver mounts on the
-            // public gateway at `POST /api/messages` — a server-to-server Bot
-            // Connector callback authenticated by its own JWT (no CORS) — rather
-            // than holding a socket. `teams_manager` owns the dispatch loops for
-            // the process lifetime.
-            let mut teams_manager = workforce_hub::teams_manager::TeamsManager::new(
-                registry_for_slack.clone(),
-                skills_dir.clone(),
-                global_vault.clone(),
-                channel_pairing.clone(),
-                drain_token.clone(),
-            );
-            let teams_router = match teams_manager.start().await {
-                Ok(Some(state)) => {
-                    eprintln!("  Teams:     {}", style("connected").cyan());
-                    workforce_hub::teams_messages::router(Arc::new(state))
-                }
-                Ok(None) => {
-                    eprintln!(
-                        "  Teams:     {}",
-                        style("pending (no credentials yet — set teams.<id>.app_id/app_password in the vault)").dim(),
-                    );
-                    axum::Router::new()
-                }
-                Err(e) => {
-                    tracing::warn!("Teams startup failed (can reload later): {}", e);
-                    eprintln!("  Teams:     {}", style("not configured").dim());
-                    axum::Router::new()
-                }
-            };
-            let gateway_app = gateway_app.merge(teams_router);
 
             // Every store is open: say what the Postgres pools may open
             // between them against what the server allows.

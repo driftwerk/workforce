@@ -47,7 +47,9 @@ impl Answer {
 }
 
 async fn send(local: &LocalHub, bearer: &str, method: &str, uri: &str, body: Vec<u8>) -> Answer {
-    let app = super::install(std::sync::Arc::clone(&local.sync));
+    let app = crate::serve::combined(super::install(crate::surface::Bound::To(
+        std::sync::Arc::clone(&local.sync),
+    )));
     let resp = app
         .oneshot(
             Request::builder()

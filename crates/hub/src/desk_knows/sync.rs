@@ -35,11 +35,11 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use crate::surface::routing::put;
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::routing::put;
-use axum::{Json, Router};
+use axum::Json;
 use chrono::Utc;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
@@ -1039,36 +1039,38 @@ async fn delete_all_links(
 }
 
 /// The link routes.
-pub fn router(sync: Arc<KnowsSync>) -> Router {
-    Router::new()
-        .route(
+pub fn router(sync: crate::surface::Bound<Arc<KnowsSync>>) -> crate::surface::Routes {
+    crate::surface::Routes::new()
+        .admin(
             "/api/desk/knows-links",
-            axum::routing::delete(delete_all_links),
+            crate::surface::routing::delete(delete_all_links),
         )
-        .route(
+        .admin(
             "/api/desk/knows-links/{hub}",
-            axum::routing::delete(delete_hub_links),
+            crate::surface::routing::delete(delete_hub_links),
         )
-        .route(
+        .admin(
             "/api/desk/knows-links/{hub}/{agent}",
             put(put_link).delete(delete_link),
         )
-        .with_state(sync)
+        .bind(sync)
 }
 
-/// The sync and its routes, for the desk driver.
+/// The sync, for the desk driver.
 pub fn install(
     state: &Arc<GatewayState>,
     desk: Desk,
     limits: DeskKnowsSyncConfig,
     person: PersonOf,
-) -> (Arc<KnowsSync>, Router) {
-    let sync = Arc::new(KnowsSync::new(Arc::clone(state), desk, limits, person));
-    let routes = router(Arc::clone(&sync));
-    (sync, routes)
+) -> Arc<KnowsSync> {
+    Arc::new(KnowsSync::new(Arc::clone(state), desk, limits, person))
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "stand-in servers for tests, not routes the hub serves"
+)]
 mod tests {
     use super::*;
 

@@ -1314,6 +1314,10 @@ fn check_graphql_response(body: &serde_json::Value) -> Result<()> {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "stand-in servers for tests, not routes the hub serves"
+)]
 mod tests {
     use super::*;
     use crate::graph::entities::{CodeVisibility, EntityId, Language};

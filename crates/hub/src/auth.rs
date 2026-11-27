@@ -8,6 +8,10 @@ pub mod jwt;
 
 use std::sync::Arc;
 
+use axum::extract::{Query, Request, State};
+use axum::middleware::Next;
+use axum::response::{IntoResponse, Response};
+use serde::Deserialize;
 use subtle::ConstantTimeEq;
 use tracing::warn;
 use workforce_identity::store::IdentityStore;
@@ -15,7 +19,7 @@ use workforce_identity::types::IdentityRole;
 use workforce_pairing::{ApprovedDevice, DevicePairingService, TokenMatch};
 
 use crate::authz::Ceiling;
-use crate::gateway::{AuthFailure, GatewayState};
+use crate::gateway::{AuthFailure, CallerContext, GatewayState, ScopeRejection};
 use crate::surface::{Arrival, Surface};
 use jwt::{Claims, JwtConfig};
 
@@ -179,6 +183,43 @@ pub(crate) fn is_hub_token(door: Door<'_>, token: &str) -> bool {
 /// surface that takes it.
 pub(crate) fn bears_hub_token(door: Door<'_>, headers: &axum::http::HeaderMap) -> bool {
     crate::gateway::header_bearer(headers).is_some_and(|token| is_hub_token(door, token))
+}
+
+#[derive(Deserialize)]
+struct TokenQuery {
+    token: Option<String>,
+}
+
+/// What stands before every admin route: a credential, from the `token`
+/// query or the `Authorization` header, admitted as someone beyond a member
+/// (an active administrator, manager or custom role, under no ceiling).
+/// Anything else is refused before the route's extractors run: 401 when no
+/// credential is admitted, 403 when only a member's is.
+pub async fn require_beyond_member(
+    State(state): State<Arc<GatewayState>>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let tokens: Vec<String> = Query::<TokenQuery>::try_from_uri(request.uri())
+        .ok()
+        .and_then(|Query(query)| query.token)
+        .into_iter()
+        .chain(crate::gateway::header_bearer(request.headers()).map(str::to_string))
+        .filter(|token| !token.is_empty())
+        .collect();
+    let mut refusal = ScopeRejection::Unauthenticated;
+    for token in &tokens {
+        if let Ok(admitted) = admit(state.door(), token).await {
+            let caller = CallerContext::from(admitted);
+            if crate::gateway::gateway_principal(&caller, state.identity_store.as_ref())
+                .is_beyond_member()
+            {
+                return next.run(request).await;
+            }
+            refusal = ScopeRejection::MissingScope;
+        }
+    }
+    refusal.into_response()
 }
 
 async fn admit_device(door: Door<'_>, token: &str) -> Result<Admitted, AuthFailure> {

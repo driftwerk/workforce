@@ -2219,6 +2219,10 @@ impl MemoryStore for WeaviateStore {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "stand-in servers for tests, not routes the hub serves"
+)]
 mod tests {
     use super::*;
     use crate::store::dedup_by_memory_id;
@@ -3281,6 +3285,10 @@ mod tests {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "stand-in servers for tests, not routes the hub serves"
+)]
 mod embedded_tests {
     //! The hub-vectored collection against a fake Weaviate that records what
     //! it is sent.

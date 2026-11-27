@@ -2170,7 +2170,9 @@ async fn setting_a_question_aside_over_http_takes_it_off_what_needs_you() {
         idle(&d, s.id).await;
         let ask = waiting_ask(&d, s.id, "Which branch?").await;
         let post = |auth| {
-            let app = crate::api::sessions_router(d.clone(), auth);
+            let app = crate::testing::app(crate::api::sessions_router(
+                workforce_surface::Bound::To((d.clone(), auth)),
+            ));
             async move {
                 let req = axum::http::Request::post(format!("/api/desk/line/{ask}/dismiss"))
                     .body(axum::body::Body::empty())

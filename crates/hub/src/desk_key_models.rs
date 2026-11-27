@@ -190,6 +190,10 @@ pub async fn bedrock_listed(
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "stand-in servers for tests, not routes the hub serves"
+)]
 mod tests {
     use super::*;
     use serde_json::json;

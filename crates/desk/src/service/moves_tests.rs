@@ -1208,7 +1208,10 @@ async fn only_the_person_who_holds_the_hub_previews_or_makes_a_move() {
         let dir = tempfile::tempdir().unwrap();
         let (d, _hub) = desk_with_hub(pool, dir.path()).await;
         let a = acme_session(&d, dir.path()).await;
-        let app = crate::move_api::api_routes(d.clone(), Arc::new(NotTheHolder));
+        let app = crate::testing::app(crate::move_api::api_routes(workforce_surface::Bound::To((
+            d.clone(),
+            Arc::new(NotTheHolder),
+        ))));
         let body =
             serde_json::json!({ "item": { "kind": "session", "id": a.session }, "to": "atlas" });
         let commit = serde_json::json!({ "preview": Uuid::new_v4() });

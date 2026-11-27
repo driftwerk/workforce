@@ -6,11 +6,12 @@ use std::sync::Arc;
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post, put};
-use axum::{Json, Router};
+use axum::Json;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use uuid::Uuid;
+use workforce_surface::routing::{get, post, put};
+use workforce_surface::Routes;
 
 use crate::api::Authorize;
 use crate::crew::By;
@@ -276,29 +277,29 @@ async fn search(State(s): S, h: HeaderMap, Query(q): Q, Query(f): Query<Search>)
 }
 
 /// The person's board routes.
-pub(crate) fn api_routes(desk: Desk, auth: Arc<dyn Authorize>) -> Router {
-    Router::new()
-        .route("/api/desk/boards", get(boards).post(create_board))
-        .route(
+pub(crate) fn api_routes(ground: crate::api::Ground) -> Routes {
+    Routes::new()
+        .member("/api/desk/boards", get(boards).post(create_board))
+        .member(
             "/api/desk/boards/{id}",
-            axum::routing::patch(update_board).delete(delete_board),
+            workforce_surface::routing::patch(update_board).delete(delete_board),
         )
-        .route("/api/desk/boards/{id}/tickets", get(tickets))
-        .route("/api/desk/tickets", post(create_ticket))
-        .route("/api/desk/tickets/search", get(search))
-        .route(
+        .member("/api/desk/boards/{id}/tickets", get(tickets))
+        .member("/api/desk/tickets", post(create_ticket))
+        .member("/api/desk/tickets/search", get(search))
+        .member(
             "/api/desk/tickets/{id}",
             get(ticket).patch(edit_ticket).delete(delete_ticket),
         )
-        .route("/api/desk/tickets/{id}/move", post(move_ticket))
-        .route(
+        .member("/api/desk/tickets/{id}/move", post(move_ticket))
+        .member(
             "/api/desk/tickets/{id}/needs/{other}",
             put(add_need).delete(remove_need),
         )
-        .route("/api/desk/tickets/{id}/assign", post(assign))
-        .route("/api/desk/tickets/{id}/start-text", get(start_text))
-        .route("/api/desk/tickets/{id}/left-filter", post(left_filter))
-        .route("/api/desk/tickets/{id}/history", get(ticket_history))
-        .route("/api/desk/history", get(history))
-        .with_state(Arc::new(Api { desk, auth }))
+        .member("/api/desk/tickets/{id}/assign", post(assign))
+        .member("/api/desk/tickets/{id}/start-text", get(start_text))
+        .member("/api/desk/tickets/{id}/left-filter", post(left_filter))
+        .member("/api/desk/tickets/{id}/history", get(ticket_history))
+        .member("/api/desk/history", get(history))
+        .bind(ground.map(|(desk, auth)| Arc::new(Api { desk, auth })))
 }

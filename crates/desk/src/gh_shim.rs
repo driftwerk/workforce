@@ -96,6 +96,10 @@ pub(crate) fn install(dir: &Path, url: &str, path: &str) -> Result<Option<String
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "stand-in servers for tests, not routes the hub serves"
+)]
 mod tests {
     use std::os::unix::fs::PermissionsExt;
     use std::process::Output;

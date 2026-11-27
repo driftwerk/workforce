@@ -25,14 +25,18 @@ async fn a_hub_without_desk_serves_no_plan_routes() {
     let config = workforce_common::settings::WorkforceConfig::default();
     let dir = tempfile::tempdir().unwrap();
     let gateway = Gateway::new(vec![("scout", agent_service(dir.path()).await)], None);
-    let app = workforce_hub::desk_driver::mount(
-        axum::Router::new(),
+    let desk = workforce_hub::desk_driver::start(
         &gateway.state,
         &config,
         tokio_util::sync::CancellationToken::new(),
     )
     .await
     .expect("a hub without desk");
+    let app = workforce_hub::serve::combined(workforce_hub::desk_driver::mount(
+        &gateway.state,
+        workforce_hub::surface::Routes::new(),
+        desk.map(workforce_hub::surface::Bound::To),
+    ));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
@@ -166,13 +170,15 @@ async fn a_bosss_plan_is_approved_from_the_floor_by_the_person_alone_as_of_the_r
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let addr = listener.local_addr().unwrap();
             let state = Arc::clone(&gateway.state);
-            let app = workforce_hub::gateway::router(Arc::clone(&state)).merge(router(
-                state,
-                Some(Sources::new(
-                    installed,
-                    Arc::new(move || Some(shown.clone())),
+            let app = workforce_hub::serve::combined(
+                workforce_hub::gateway::router(Arc::clone(&state)).merge(router(
+                    state,
+                    Some(Sources::new(
+                        installed,
+                        Arc::new(move || Some(shown.clone())),
+                    )),
                 )),
-            ));
+            );
             tokio::spawn(async move {
                 axum::serve(
                     listener,

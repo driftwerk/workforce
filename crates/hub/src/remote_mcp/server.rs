@@ -10,11 +10,11 @@
 
 use std::sync::Arc;
 
+use crate::surface::routing::post;
+use crate::surface::{Bound, Routes};
 use axum::extract::{DefaultBodyLimit, Path, RawQuery, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::routing::post;
-use axum::Router;
 use tokio::sync::mpsc;
 
 use workforce_agent::tools::registry::ToolRegistry;
@@ -184,23 +184,23 @@ fn load_offered_adapters(service: &AgentService, identity_id: &str, patterns: &[
 /// are.
 pub const DEFAULT_NOT_ADMITTED: &str = "this hub's default agent does not admit you; connect to /mcp/agents/{agent_id} for an agent you can use";
 
-pub fn router(remote: Arc<RemoteMcpState>) -> Router {
-    Router::new()
-        .route(
+pub fn router(remote: Arc<RemoteMcpState>) -> Routes {
+    Routes::new()
+        .machine(
             "/mcp",
             post(serve_default)
                 .get(method_not_allowed)
                 .delete(session_closed),
         )
-        .route("/mcp/agents", axum::routing::get(list_agents))
-        .route(
+        .machine("/mcp/agents", crate::surface::routing::get(list_agents))
+        .machine(
             "/mcp/agents/{agent_id}",
             post(serve_agent)
                 .get(method_not_allowed)
                 .delete(session_closed),
         )
+        .bind(Bound::To(remote))
         .layer(DefaultBodyLimit::max(BODY_LIMIT_BYTES))
-        .with_state(remote)
 }
 
 /// `GET /mcp/agents`: the agents the token's person may reach here, each
@@ -503,6 +503,10 @@ mod tests {
     use workforce_common::sentinel_config::SentinelConfig;
     use workforce_common::settings::RemoteMcpConfig;
 
+    fn served(state: &Arc<GatewayState>) -> axum::Router {
+        crate::serve::combined(router(RemoteMcpState::new(Arc::clone(state))))
+    }
+
     /// The default surface offers every tool Desk's board sync calls, by
     /// exact name, and none of either system's raw, delete or bulk tools.
     #[test]
@@ -738,7 +742,7 @@ mod tests {
     #[tokio::test]
     async fn the_routes_are_absent_until_enabled() {
         let fx = fixture(false);
-        let app = router(RemoteMcpState::new(Arc::clone(&fx.state)));
+        let app = served(&fx.state);
         for uri in ["/mcp", "/mcp/agents/anyone"] {
             let resp = app
                 .clone()
@@ -752,7 +756,7 @@ mod tests {
     #[tokio::test]
     async fn only_post_carries_the_protocol() {
         let fx = fixture(true);
-        let app = router(RemoteMcpState::new(Arc::clone(&fx.state)));
+        let app = served(&fx.state);
         let get = app
             .clone()
             .oneshot(request("GET", "/mcp", None))
@@ -766,7 +770,7 @@ mod tests {
     #[tokio::test]
     async fn an_unauthenticated_post_is_refused_before_anything_else() {
         let fx = fixture(true);
-        let app = router(RemoteMcpState::new(Arc::clone(&fx.state)));
+        let app = served(&fx.state);
         let resp = app.oneshot(request("POST", "/mcp", None)).await.unwrap();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
         assert_eq!(resp.headers().get("www-authenticate").unwrap(), "Bearer");
@@ -778,7 +782,7 @@ mod tests {
         let who = Identity::new("Member", IdentityRole::Member);
         fx.identities.create(&who).unwrap();
         let token = issue(&fx, &who, TokenShape::default());
-        let app = router(RemoteMcpState::new(Arc::clone(&fx.state)));
+        let app = served(&fx.state);
         let resp = app
             .oneshot(request("POST", "/mcp/agents/nobody", Some(&token)))
             .await
@@ -815,7 +819,7 @@ mod tests {
         (fx, member, other)
     }
 
-    async fn status_and_body(app: &Router, uri: &str, token: &str) -> (StatusCode, String) {
+    async fn status_and_body(app: &axum::Router, uri: &str, token: &str) -> (StatusCode, String) {
         let resp = app
             .clone()
             .oneshot(request("POST", uri, Some(token)))
@@ -830,7 +834,7 @@ mod tests {
     async fn an_agent_whose_policy_excludes_the_caller_reads_as_unknown() {
         let tmp = tempfile::tempdir().unwrap();
         let (fx, member, other) = hub_with_a_private_agent(tmp.path(), false).await;
-        let app = router(RemoteMcpState::new(Arc::clone(&fx.state)));
+        let app = served(&fx.state);
         let admitted = issue(&fx, &member, TokenShape::default());
         let excluded = issue(&fx, &other, TokenShape::default());
 
@@ -848,7 +852,7 @@ mod tests {
     async fn a_mistyped_agent_never_reaches_the_default_agent() {
         let tmp = tempfile::tempdir().unwrap();
         let (fx, member, _) = hub_with_a_private_agent(tmp.path(), false).await;
-        let app = router(RemoteMcpState::new(Arc::clone(&fx.state)));
+        let app = served(&fx.state);
         let token = issue(&fx, &member, TokenShape::default());
         assert_eq!(
             status_and_body(&app, "/mcp/agents/defualt", &token).await,
@@ -860,7 +864,7 @@ mod tests {
     async fn the_plain_route_refuses_a_caller_the_default_agent_excludes() {
         let tmp = tempfile::tempdir().unwrap();
         let (fx, member, other) = hub_with_a_private_agent(tmp.path(), true).await;
-        let app = router(RemoteMcpState::new(Arc::clone(&fx.state)));
+        let app = served(&fx.state);
         let (status, _) =
             status_and_body(&app, "/mcp", &issue(&fx, &member, TokenShape::default())).await;
         assert_eq!(status, StatusCode::OK);
@@ -1666,7 +1670,7 @@ mod tests {
         let who = Identity::new("Member", IdentityRole::Member);
         fx.identities.create(&who).unwrap();
         let token = issue(&fx, &who, TokenShape::default());
-        let app = router(RemoteMcpState::new(Arc::clone(&fx.state)));
+        let app = served(&fx.state);
         let post = |uri: String, body: &'static str| {
             let app = app.clone();
             let token = token.clone();
@@ -1779,7 +1783,7 @@ mod tests {
             "nothing loads a person's own key at boot"
         );
         fx.state.registry.insert("default", Arc::clone(&service));
-        let app = router(RemoteMcpState::new(Arc::clone(&fx.state)));
+        let app = served(&fx.state);
         let post = |token: String, body: &'static str| {
             let app = app.clone();
             async move {

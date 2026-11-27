@@ -16,12 +16,13 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use crate::surface::routing::post;
+use crate::surface::{Bound, Routes};
 use axum::body::Bytes;
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::routing::post;
-use axum::{Json, Router};
+use axum::Json;
 use tokio::sync::mpsc;
 use tracing::warn;
 
@@ -49,10 +50,10 @@ pub struct TeamsRouterState {
 }
 
 /// Build the Teams inbound receiver router.
-pub fn router(state: Arc<TeamsRouterState>) -> Router {
-    Router::new()
-        .route("/api/messages", post(receive_messages))
-        .with_state(state)
+pub fn router(state: Bound<Arc<TeamsRouterState>>) -> Routes {
+    Routes::new()
+        .machine("/api/messages", post(receive_messages))
+        .bind(state)
 }
 
 async fn receive_messages(

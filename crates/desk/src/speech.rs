@@ -211,11 +211,11 @@ mod tests {
     }
 
     fn app(speech: Arc<Fake>) -> Router {
-        voice_router(
+        crate::testing::app(voice_router(workforce_surface::Bound::To((
             Arc::new(Bearer),
             Arc::new(Realtime::new(Arc::new(NoKeys))),
             speech,
-        )
+        ))))
     }
 
     async fn speak(app: Router, token: &str, body: Value) -> (StatusCode, String, Vec<u8>) {

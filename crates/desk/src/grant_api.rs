@@ -16,10 +16,11 @@ use axum::extract::rejection::JsonRejection;
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{delete, get, post};
-use axum::{Json, Router};
+use axum::Json;
 use serde::Deserialize;
 use serde_json::json;
+use workforce_surface::routing::{delete, get, post};
+use workforce_surface::Routes;
 
 use crate::api::Authorize;
 use crate::grant::StoppedFrom;
@@ -185,12 +186,12 @@ async fn clear_pause(State(s): S, h: HeaderMap, Query(q): Q) -> Response {
     s.desk.clear_bosses_pause(n).await.map(Json).into_response()
 }
 
-pub(crate) fn api_routes(desk: Desk, auth: Arc<dyn Authorize>) -> Router {
-    Router::new()
-        .route("/api/desk/grants", get(list))
-        .route("/api/desk/grants/{group}", get(one).put(put).delete(remove))
-        .route("/api/desk/bosses", get(status))
-        .route("/api/desk/bosses/stop", post(stop))
-        .route("/api/desk/bosses/paused", delete(clear_pause))
-        .with_state(Arc::new(GrantApi { desk, auth }))
+pub(crate) fn api_routes(ground: crate::api::Ground) -> Routes {
+    Routes::new()
+        .admin("/api/desk/grants", get(list))
+        .admin("/api/desk/grants/{group}", get(one).put(put).delete(remove))
+        .admin("/api/desk/bosses", get(status))
+        .admin("/api/desk/bosses/stop", post(stop))
+        .admin("/api/desk/bosses/paused", delete(clear_pause))
+        .bind(ground.map(|(desk, auth)| Arc::new(GrantApi { desk, auth })))
 }

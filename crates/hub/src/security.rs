@@ -66,6 +66,10 @@ pub async fn security_headers_middleware(request: Request, next: Next) -> Respon
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "stand-in servers for tests, not routes the hub serves"
+)]
 mod tests {
     use super::*;
     use axum::body::Body;

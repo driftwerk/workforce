@@ -293,7 +293,9 @@ async fn a_draft_typed_in_the_composer_keeps_the_session_the_persons() {
         d.0.state.lock().charges.rows.get_mut(&s.id).unwrap().since =
             Utc::now() - chrono::Duration::hours(1);
         assert_eq!(d.wheel_of(s.id), Some(Wheel::Boss));
-        let app = crate::charge_api::api_routes(d.clone(), Arc::new(crate::testing::Bearer));
+        let app = crate::testing::app(crate::charge_api::api_routes(workforce_surface::Bound::To(
+            (d.clone(), Arc::new(crate::testing::Bearer)),
+        )));
         let typing = |id: Uuid| {
             Request::builder()
                 .method("POST")

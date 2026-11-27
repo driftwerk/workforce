@@ -11,7 +11,6 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use axum::http::{HeaderMap, StatusCode};
-use axum::Router;
 use eyre::{Context, Result};
 use tokio_util::sync::CancellationToken;
 use workforce_agent::llm::provider::{AccountExtras, ProviderKind};
@@ -42,6 +41,7 @@ use crate::hub_core::logins::store as login_store;
 use crate::projects::layout::WorkRoots;
 use crate::serve::AgentService;
 use crate::skill_loader::CredScope;
+use crate::surface::{Bound, Routes};
 use crate::vault::Vault;
 
 /// What a voice with `markup` is given of `text`, a sentence Desk has already
@@ -1066,20 +1066,74 @@ fn holder_options(desk: &workforce_common::settings::DeskConfig) -> Option<Holde
     })
 }
 
-/// Merges the desk routes into `app` when `[desk]` is enabled. Fails closed
-/// without Postgres: the registry is what restore reads.
-pub async fn mount(
-    app: Router,
+/// What a `[desk]` hub's own routes answer with, once Desk is started.
+#[derive(Clone)]
+pub struct Started {
+    crew: Arc<crate::desk_crew::CrewHub>,
+    connections: crate::desk_connections::Installed,
+    browser: Arc<crate::desk_browser::Browser>,
+    board_sync: Arc<crate::desk_board_sync::BoardSync>,
+    issues: crate::desk_issues::Carrier,
+    knows: Arc<crate::desk_knows::sync::KnowsSync>,
+    desk: workforce_desk::Parts,
+    /// On a machine, how Desk's native side reaching it is seen.
+    native: Option<Arc<crate::desk_crew::relay::NativeSeen>>,
+}
+
+/// `app` with the desk routes merged in: the allows and the floor on every
+/// hub, and, with Desk started (or only declared), the rest of a `[desk]`
+/// hub's. On a machine, all of it notes Desk's native side reaching it by
+/// any route, so a Desk that never asks for its sessions' issue calls is
+/// known to be older.
+pub fn mount(state: &Arc<GatewayState>, app: Routes, desk: Option<Bound<Started>>) -> Routes {
+    let native = match &desk {
+        Some(Bound::To(started)) => started.native.clone(),
+        _ => None,
+    };
+    let app = app.merge(routes(state, desk));
+    match native {
+        Some(native) => {
+            crate::desk_crew::relay::noting_native(app, state.auth_token.clone(), native)
+        }
+        None => app,
+    }
+}
+
+fn routes(state: &Arc<GatewayState>, desk: Option<Bound<Started>>) -> Routes {
+    let always = crate::gateway::hardened(crate::surface_allows::routes(Arc::clone(state)).merge(
+        crate::desk_floor::router(Arc::clone(state), crate::desk_floor::Sources::installed()),
+    ));
+    let Some(desk) = desk else {
+        return always;
+    };
+    let board_sync = desk.as_ref().map(|d| Arc::clone(&d.board_sync));
+    [
+        crate::desk_uplink::routes(Arc::clone(state)),
+        crate::desk_crew::relay::routes(
+            Arc::clone(state),
+            desk.as_ref().map(|d| Arc::clone(&d.crew)),
+        ),
+        crate::desk_connections::routes(state, desk.as_ref().map(|d| d.connections.clone())),
+        crate::desk_browser::routes(desk.as_ref().map(|d| Arc::clone(&d.browser))),
+        crate::desk_board_sync::router(board_sync.clone()),
+        crate::desk_issues::routes(Arc::clone(state), desk.as_ref().map(|d| d.issues.clone())),
+        crate::desk_knows::sync::router(desk.as_ref().map(|d| Arc::clone(&d.knows))),
+    ]
+    .into_iter()
+    .map(crate::gateway::hardened)
+    .fold(always, Routes::merge)
+    .merge(crate::desk_ticket_files::install(board_sync.clone()))
+    .merge(crate::desk_ticket_comments::install(board_sync))
+    .merge(workforce_desk::router(desk.map(|d| d.desk)))
+}
+
+/// Starts Desk when `[desk]` is enabled: what its routes answer with, or
+/// none. Fails closed without Postgres: the registry is what restore reads.
+pub async fn start(
     state: &Arc<GatewayState>,
     config: &WorkforceConfig,
     cancel: CancellationToken,
-) -> Result<Router> {
-    let app = app.merge(crate::gateway::hardened(
-        crate::surface_allows::routes(Arc::clone(state)).merge(crate::desk_floor::router(
-            Arc::clone(state),
-            crate::desk_floor::Sources::installed(),
-        )),
-    ));
+) -> Result<Option<Started>> {
     if let Some(floor) = crate::floor::installed() {
         floor.gists.serve(Arc::new(crate::floor::gists::HubModel {
             state: Arc::clone(state),
@@ -1087,7 +1141,7 @@ pub async fn mount(
         }));
     }
     if !config.desk.enabled {
-        return Ok(app);
+        return Ok(None);
     }
     let pg = config
         .postgres
@@ -1159,7 +1213,7 @@ pub async fn mount(
     desk.serve_lines(crate::desk_line_mcp::LineMcp::new(desk.clone()));
     let computer = desk.computer();
     crate::desk_computer::prune_daily(computer.clone(), cancel_crew.clone());
-    let browser_routes =
+    let browser =
         crate::desk_browser::install(state, config, computer.clone(), cancel_crew.clone());
     crate::desk_computer::install(computer, Arc::new(config.clone()));
     desk.boss_bounds_with(crate::desk_computer::boss_bounds(config));
@@ -1188,11 +1242,7 @@ pub async fn mount(
             fallback: config.floor.fallback_providers,
         },
     }));
-    // The boss links this engine holds, its key, and its uplinks to their
-    // boss hubs.
-    let app = app.merge(crate::gateway::hardened(crate::desk_uplink::routes(
-        Arc::clone(state),
-    )));
+    // This engine's uplinks to the boss hubs of the links it holds.
     crate::desk_uplink::start(
         crate::desk_uplink::Uplink {
             state: Arc::clone(state),
@@ -1204,55 +1254,38 @@ pub async fn mount(
         },
         cancel_uplink,
     );
-    // The relay to the person's machines, Desk's native side's alone.
-    let app = app.merge(crate::gateway::hardened(crate::desk_crew::relay::routes(
-        Arc::clone(state),
-        Arc::clone(&crew),
-    )));
     let voice = Realtime::new(Arc::new(VaultKeys::new(state.vault.clone())));
-    let app = app.merge(crate::gateway::hardened(crate::desk_connections::install(
-        state,
-        config,
-        desk.clone(),
-    )));
-    let app = app.merge(crate::gateway::hardened(browser_routes));
-    let (board_sync, board_sync_routes) = crate::desk_board_sync::install(state, desk.clone());
+    let connections = crate::desk_connections::install(state, config, desk.clone());
+    let board_sync = crate::desk_board_sync::install(state, desk.clone());
     board_sync.start(cancel_sync.clone());
-    let app = app.merge(crate::gateway::hardened(board_sync_routes));
     // Sessions' Linear and Jira: through this computer's board links, or,
     // on a machine, through Desk on the person's Mac.
-    let issues_routes = match is_machine(&config.desk) {
+    let issues = match is_machine(&config.desk) {
         true => {
             let issues = crate::desk_issues::MachineIssues::new(Arc::clone(&crew.native));
             desk.issues_with(Arc::clone(&issues) as _);
-            crate::desk_issues::machine_routes(Arc::clone(state), issues)
+            crate::desk_issues::Carrier::Machine(issues)
         }
         false => {
             let issues = crate::desk_issues::HomeIssues::new(Arc::clone(&board_sync));
             desk.issues_with(Arc::clone(&issues) as _);
-            crate::desk_issues::home_routes(Arc::clone(state), issues)
+            crate::desk_issues::Carrier::Home(issues)
         }
     };
-    let app = app.merge(crate::gateway::hardened(issues_routes));
-    let app = app.merge(crate::desk_ticket_files::install(Arc::clone(&board_sync)));
-    let app = app.merge(crate::desk_ticket_comments::install(Arc::clone(
-        &board_sync,
-    )));
     // What the person's work agents are sent, by each one's rule (Sees).
-    let (knows_sync, knows_routes) =
-        crate::desk_knows::sync::install(state, desk.clone(), config.desk.knows.clone(), {
-            let crew = Arc::clone(&crew);
-            Arc::new(move || crew.person(None))
-        });
-    knows_sync.start(cancel_sync);
-    let app = app.merge(crate::gateway::hardened(knows_routes));
-    let native = Arc::clone(&crew.native);
-    let app = app.merge(workforce_desk::router(
+    let knows = crate::desk_knows::sync::install(state, desk.clone(), config.desk.knows.clone(), {
+        let crew = Arc::clone(&crew);
+        Arc::new(move || crew.person(None))
+    });
+    knows.start(cancel_sync);
+    let crew_of: Arc<dyn workforce_desk::crew::Crew> = crew.clone();
+    desk.read_replies_with(&crew_of);
+    let parts = workforce_desk::Parts {
         desk,
-        Arc::new(SystemAdmins(Arc::clone(state))),
-        Arc::new(voice),
-        Arc::new(VaultKeys::new(state.vault.clone())),
-        Arc::new(HubAccounts {
+        auth: Arc::new(SystemAdmins(Arc::clone(state))),
+        realtime: Arc::new(voice),
+        speech: Arc::new(VaultKeys::new(state.vault.clone())),
+        accounts: Arc::new(HubAccounts {
             vault: state.vault.clone(),
             known: {
                 let state = Arc::clone(state);
@@ -1273,15 +1306,18 @@ pub async fn mount(
                     ),
                 }),
         }),
+        crew: crew_of,
+    };
+    Ok(Some(Started {
+        native: is_machine(&config.desk).then(|| Arc::clone(&crew.native)),
         crew,
-    ));
-    // On a machine, Desk's native side reaching it by any route is seen,
-    // so a Desk that never asks for its sessions' issue calls is known to
-    // be older.
-    Ok(match is_machine(&config.desk) {
-        true => crate::desk_crew::relay::noting_native(app, state.auth_token.clone(), native),
-        false => app,
-    })
+        connections,
+        browser,
+        board_sync,
+        issues,
+        knows,
+        desk: parts,
+    }))
 }
 
 #[cfg(test)]
@@ -1422,7 +1458,10 @@ mod tests {
                     "Desk",
                 );
                 let state = Arc::clone(&local.fx.state);
-                let app = workforce_desk::knows_router(desk, Arc::new(SystemAdmins(state.clone())));
+                let app = crate::serve::combined(workforce_desk::knows_router(Bound::To((
+                    desk,
+                    Arc::new(SystemAdmins(state.clone())) as Arc<dyn workforce_desk::Authorize>,
+                ))));
                 let send = |token: Option<String>,
                             method: &str,
                             uri: &str,

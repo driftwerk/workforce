@@ -12,6 +12,10 @@
 //!
 //! CI's `vellev-node` job runs it against Weaviate's own binary, at a
 //! pinned version, with `WORKFORCE_TEST_WEAVIATE_REQUIRED=1`.
+#![allow(
+    clippy::disallowed_methods,
+    reason = "stand-in servers for tests, not routes the hub serves"
+)]
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};

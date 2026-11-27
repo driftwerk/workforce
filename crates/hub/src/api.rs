@@ -2,8 +2,7 @@ use std::sync::Arc;
 
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
-use axum::routing::{get, post, put};
-use axum::{Extension, Json, Router};
+use axum::{Extension, Json};
 use chrono::Datelike;
 use serde::{Deserialize, Serialize};
 use workforce_common::persistence::WorkflowInstanceRow;
@@ -14,6 +13,8 @@ use crate::hub_core::jobs::JobReader;
 use crate::hub_core::workflows::{DecisionRefused, ResumeAsk, ResumeRefused, Resumed};
 use crate::run_steering::{Steer, SteerAction, SteerRefused, Steerer};
 use crate::state::HubState;
+use crate::surface::routing::{get, post, put};
+use crate::surface::{Bound, Routes};
 use workforce_common::admin::{
     AgentsSummary, AuditEntry, CostSnapshot, DashboardView, NodesSummary, TasksSummary,
     TeamsSummary,
@@ -25,59 +26,59 @@ use workforce_orchestrator::workflow::instance::StepRecord;
 /// Build the admin API router. Routes are path-relative so callers can
 /// `nest` this router under whatever prefix they need (e.g. `/api` for the
 /// standalone admin port, `/api/admin` for the gateway-mounted version).
-pub fn router(state: Arc<HubState>) -> Router {
-    Router::new()
-        .route("/health", get(health))
-        .route("/ready", get(ready))
-        .route("/metrics", get(metrics))
-        .route("/dashboard", get(dashboard))
-        .route("/cost", get(cost_summary))
-        .route("/cost/history", get(cost_history))
-        .route("/cost/monthly", get(cost_monthly))
-        .route("/cost/detail", get(cost_detail))
-        .route("/scheduler/jobs/history", get(scheduled_jobs_history))
-        .route("/tasks", post(submit_task))
-        .route("/workflows", get(list_workflows))
-        .route("/workflows/{id}", get(get_workflow_definition))
-        .route("/workflows/{id}/run", post(run_workflow))
-        .route("/playbooks", get(list_playbooks))
-        .route("/workflow-instances", get(list_workflow_instances))
-        .route("/workflow-instances/{id}", get(get_workflow_instance))
-        .route(
+pub fn router(state: Bound<Arc<HubState>>) -> Routes {
+    Routes::new()
+        .admin("/health", get(health))
+        .admin("/ready", get(ready))
+        .admin("/metrics", get(metrics))
+        .admin("/dashboard", get(dashboard))
+        .admin("/cost", get(cost_summary))
+        .admin("/cost/history", get(cost_history))
+        .admin("/cost/monthly", get(cost_monthly))
+        .admin("/cost/detail", get(cost_detail))
+        .admin("/scheduler/jobs/history", get(scheduled_jobs_history))
+        .admin("/tasks", post(submit_task))
+        .admin("/workflows", get(list_workflows))
+        .admin("/workflows/{id}", get(get_workflow_definition))
+        .admin("/workflows/{id}/run", post(run_workflow))
+        .admin("/playbooks", get(list_playbooks))
+        .admin("/workflow-instances", get(list_workflow_instances))
+        .admin("/workflow-instances/{id}", get(get_workflow_instance))
+        .admin(
             "/workflow-instances/{id}/resume",
             post(resume_workflow_instance),
         )
-        .route(
+        .admin(
             "/workflow-instances/{id}/abort",
             post(abort_workflow_instance),
         )
-        .route(
+        .admin(
             "/workflow-instances/{id}/reject",
             post(reject_workflow_instance),
         )
-        .route("/workflow-instances/{id}/steps", get(get_instance_steps))
-        .route("/workflow-instances/{id}/cost", get(get_instance_cost))
-        .route(
+        .admin("/workflow-instances/{id}/steps", get(get_instance_steps))
+        .admin("/workflow-instances/{id}/cost", get(get_instance_cost))
+        .admin(
             "/workflow-instances/{id}/retry",
             post(retry_instance_step),
         )
-        .route("/workflow-instances/{id}/skip", post(skip_instance_step))
-        .route("/workflow-instances/{id}/goto", post(goto_instance_step))
-        .route("/workflow-instances/{id}/pause", post(pause_instance))
-        .route(
+        .admin("/workflow-instances/{id}/skip", post(skip_instance_step))
+        .admin("/workflow-instances/{id}/goto", post(goto_instance_step))
+        .admin("/workflow-instances/{id}/pause", post(pause_instance))
+        .admin(
             "/workflow-instances/{id}/variables",
             get(get_instance_variables),
         )
-        .route(
+        .admin(
             "/workflow-instances/{id}/variables/{key}",
             put(set_instance_variable_handler),
         )
         // ─── Sub-agent management (DW-428) ───
-        .route("/subagents", get(list_subagents))
-        .route("/subagents/{id}", get(get_subagent))
-        .route("/subagents/{id}/cancel", post(cancel_subagent))
+        .admin("/subagents", get(list_subagents))
+        .admin("/subagents/{id}", get(get_subagent))
+        .admin("/subagents/{id}/cancel", post(cancel_subagent))
         .merge(administrators_only())
-        .with_state(state)
+        .bind(state)
 }
 
 /// Routes over everyone's tasks, audit trail, scheduled jobs, sessions and
@@ -85,39 +86,39 @@ pub fn router(state: Arc<HubState>) -> Router {
 /// event sources and knowledge index, which are the operator's to run. The
 /// router admits the `admin` scope, which a caller who is no administrator may
 /// hold; only an administrator is let through these.
-fn administrators_only() -> Router<Arc<HubState>> {
-    Router::new()
-        .route("/events/sources", get(list_event_sources))
-        .route("/events/sources/{id}/start", post(start_event_source))
-        .route("/events/sources/{id}/stop", post(stop_event_source))
-        .route("/events/sources/{id}/restart", post(restart_event_source))
-        .route("/artifacts/index", get(artifact_index))
-        .route("/artifacts/index/retry", post(retry_artifact_index))
-        .route("/knowledge/vectors", get(code_vectors))
-        .route("/knowledge/status", get(knowledge_status))
-        .route("/knowledge/index", post(trigger_knowledge_index))
-        .route("/knowledge/index/cancel", post(cancel_knowledge_index))
-        .route("/logs", get(system_logs))
-        .route("/tasks", get(list_tasks))
-        .route("/audit", get(audit_log))
-        .route(
+fn administrators_only() -> Routes<Arc<HubState>> {
+    Routes::new()
+        .admin("/events/sources", get(list_event_sources))
+        .admin("/events/sources/{id}/start", post(start_event_source))
+        .admin("/events/sources/{id}/stop", post(stop_event_source))
+        .admin("/events/sources/{id}/restart", post(restart_event_source))
+        .admin("/artifacts/index", get(artifact_index))
+        .admin("/artifacts/index/retry", post(retry_artifact_index))
+        .admin("/knowledge/vectors", get(code_vectors))
+        .admin("/knowledge/status", get(knowledge_status))
+        .admin("/knowledge/index", post(trigger_knowledge_index))
+        .admin("/knowledge/index/cancel", post(cancel_knowledge_index))
+        .admin("/logs", get(system_logs))
+        .admin("/tasks", get(list_tasks))
+        .admin("/audit", get(audit_log))
+        .admin(
             "/scheduler",
             get(list_scheduled_jobs).post(create_scheduled_job),
         )
-        .route("/scheduler/history", get(get_global_history))
-        .route(
+        .admin("/scheduler/history", get(get_global_history))
+        .admin(
             "/scheduler/{id}",
             get(get_scheduled_job)
                 .put(update_scheduled_job)
                 .delete(delete_scheduled_job),
         )
-        .route("/scheduler/{id}/run", post(trigger_scheduled_job))
-        .route("/scheduler/{id}/history", get(get_job_history))
-        .route("/sessions/history", get(session_history))
-        .route("/sessions/redact", post(redact_sessions))
+        .admin("/scheduler/{id}/run", post(trigger_scheduled_job))
+        .admin("/scheduler/{id}/history", get(get_job_history))
+        .admin("/sessions/history", get(session_history))
+        .admin("/sessions/redact", post(redact_sessions))
         // Shadow mode's operator surface (DW-676).
-        .route("/shadow/status", get(crate::shadow_admin::status))
-        .route("/shadow/report", get(crate::shadow_admin::report))
+        .admin("/shadow/status", get(crate::shadow_admin::status))
+        .admin("/shadow/report", get(crate::shadow_admin::report))
         .route_layer(axum::middleware::from_fn(admit_administrator))
 }
 

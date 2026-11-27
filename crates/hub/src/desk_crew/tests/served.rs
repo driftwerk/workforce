@@ -27,7 +27,7 @@ impl Authorize for HubToken {
 }
 
 pub(super) async fn native(d: &Desk, method: &str, uri: &str, body: Value) -> (StatusCode, Value) {
-    let app = workforce_desk::sessions_router(d.clone(), Arc::new(HubToken));
+    let app = super::desk_app(d.clone(), Arc::new(HubToken));
     let res = app
         .oneshot(
             Request::builder()

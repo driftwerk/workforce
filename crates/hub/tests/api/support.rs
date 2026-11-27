@@ -129,6 +129,19 @@ impl GatewayParts {
     }
 }
 
+/// `state`'s gateway routes, served as one listener serves them.
+pub fn router(state: Arc<GatewayState>) -> axum::Router {
+    workforce_hub::serve::combined(workforce_hub::gateway::router(state))
+}
+
+/// The admin API nested under `prefix`, served as one listener serves it.
+pub fn admin_api(prefix: &'static str, hub: Arc<workforce_hub::state::HubState>) -> axum::Router {
+    workforce_hub::serve::combined(workforce_hub::surface::Routes::new().nest(
+        prefix,
+        workforce_hub::api::router(workforce_hub::surface::Bound::To(hub)),
+    ))
+}
+
 /// `state`'s gateway on a loopback port, as `workforce serve` runs it.
 pub async fn serve(state: Arc<GatewayState>) -> std::net::SocketAddr {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -136,8 +149,7 @@ pub async fn serve(state: Arc<GatewayState>) -> std::net::SocketAddr {
     tokio::spawn(async move {
         axum::serve(
             listener,
-            workforce_hub::gateway::router(state)
-                .into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            router(state).into_make_service_with_connect_info::<std::net::SocketAddr>(),
         )
         .await
         .unwrap();

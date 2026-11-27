@@ -6,7 +6,7 @@ use std::sync::Arc;
 use axum::body::Body;
 use axum::http::{header, Request, StatusCode};
 
-use workforce_hub::gateway::router;
+use crate::support::router;
 use workforce_hub::serve::AgentService;
 use workforce_orchestrator::workflow_store::{EditContext, WorkflowStore, KIND_AGENT_CONFIG};
 

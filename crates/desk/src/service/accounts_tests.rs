@@ -735,8 +735,12 @@ async fn only_the_hub_holder_signs_an_engine_in() {
         let mut o = account_options(dir.path(), Arc::new(MemoryKeys::default()));
         o.programs.insert(Engine::Devin, devin(dir.path()));
         let d = desk(pool, o).await;
-        let holder = crate::api::sessions_router(d.clone(), crate::testing::allow_all());
-        let other = crate::api::sessions_router(d.clone(), crate::testing::not_holder());
+        let holder = crate::testing::app(crate::api::sessions_router(
+            workforce_surface::Bound::To((d.clone(), crate::testing::allow_all())),
+        ));
+        let other = crate::testing::app(crate::api::sessions_router(workforce_surface::Bound::To(
+            (d.clone(), crate::testing::not_holder()),
+        )));
         let start = serde_json::json!({"engine": "devin", "manual": true});
         let at = format!("/api/desk/engines/sign-ins/{}", Uuid::new_v4());
         // Refused before anything is looked up or started.
@@ -797,7 +801,10 @@ async fn devin_signs_in_by_a_pasted_code_kept_and_said_nowhere() {
             .insert("WINDSURF_API_KEY".into(), "wsk-not-a-sign-in".into());
         let d = desk(pool, o).await;
         let (_, mut events) = d.subscribe();
-        let app = crate::api::sessions_router(d.clone(), crate::testing::allow_all());
+        let app = crate::testing::app(crate::api::sessions_router(workforce_surface::Bound::To((
+            d.clone(),
+            crate::testing::allow_all(),
+        ))));
         until(|| (devin_signed_in(&d) == crate::engine::SignIn::Out).then_some(())).await;
 
         let (code, started) = api(
@@ -1005,7 +1012,10 @@ async fn devin_signs_in_in_the_browser_it_opens_from_its_own_picker() {
         let mut o = account_options(dir.path(), Arc::new(MemoryKeys::default()));
         o.programs.insert(Engine::Devin, devin(dir.path()));
         let d = desk(pool, o).await;
-        let app = crate::api::sessions_router(d.clone(), crate::testing::allow_all());
+        let app = crate::testing::app(crate::api::sessions_router(workforce_surface::Bound::To((
+            d.clone(),
+            crate::testing::allow_all(),
+        ))));
         let state = |id| d.engine_sign_in(id).unwrap().state;
         until(|| (devin_signed_in(&d) == crate::engine::SignIn::Out).then_some(())).await;
 
@@ -2164,7 +2174,10 @@ async fn removing_an_account_says_so_when_its_sign_in_could_not_be_deleted() {
             "{said}"
         );
         // Not a 2xx over the API, and the account itself is gone.
-        let app = crate::api::sessions_router(d.clone(), crate::testing::allow_all());
+        let app = crate::testing::app(crate::api::sessions_router(workforce_surface::Bound::To((
+            d.clone(),
+            crate::testing::allow_all(),
+        ))));
         assert!(d.accounts().iter().all(|a| a.id != work));
         let again = paste(&d, "Again", OTHER, false).await;
         let (code, body) = api(&app, "DELETE", &format!("/api/desk/accounts/{again}"), None).await;
@@ -2220,14 +2233,17 @@ async fn only_the_hubs_own_token_is_handed_a_sign_in_and_only_once_a_minute() {
 
         // A signed-in administrator (a system-admin JWT) is refused, and
         // being refused uses up nothing.
-        let admin =
-            crate::api::sessions_router(d.clone(), crate::testing::identified("acme-admin"));
+        let admin = crate::testing::app(crate::api::sessions_router(workforce_surface::Bound::To(
+            (d.clone(), crate::testing::identified("acme-admin")),
+        )));
         let (code, body) = api(&admin, "POST", &uri, None).await;
         assert_eq!(code, 403, "{body}");
         assert!(body.get("token").is_none(), "{body}");
 
         // The hub's own token is handed it, once.
-        let gateway = crate::api::sessions_router(d.clone(), crate::testing::allow_all());
+        let gateway = crate::testing::app(crate::api::sessions_router(
+            workforce_surface::Bound::To((d.clone(), crate::testing::allow_all())),
+        ));
         let (code, body) = api(&gateway, "POST", &uri, None).await;
         assert_eq!(code, 200, "{body}");
         assert_eq!(body["token"], GOOD);
@@ -2406,7 +2422,10 @@ async fn after_copying_accounts_to_a_computer_never_logged_in_a_session_started_
             signed_out_options(dir.path(), Arc::new(MemoryKeys::default())),
         )
         .await;
-        let hub = crate::api::sessions_router(d.clone(), crate::testing::allow_all());
+        let hub = crate::testing::app(crate::api::sessions_router(workforce_surface::Bound::To((
+            d.clone(),
+            crate::testing::allow_all(),
+        ))));
         // Read as the hub reads its engines (every engine's at start; just
         // Claude Code's here).
         d.read_engine_now(Engine::Claude).await;

@@ -34,6 +34,7 @@ use crate::reaction_tool::{ReactionRemoveTool, ReactionTool};
 use crate::reminder_tool::ReminderTool;
 use crate::scheduler::Scheduler;
 use crate::scheduler_tool::SchedulerTool;
+use crate::surface::{Bound, Routes};
 use crate::vault::Vault;
 use crate::vault_tool::{
     VaultDeleteTool, VaultGetTool, VaultInspectTool, VaultListTool, VaultSetTool,
@@ -5423,40 +5424,103 @@ pub async fn sweep_identity_revisions(
     }
 }
 
-/// Create a webhook [`Router`](axum::Router) backed by the given agent service.
-///
-/// Returns the router ready to be `.merge()`-ed into the main application.
-///
-/// ```rust,ignore
-/// let webhook_router = create_webhook_router(Arc::clone(&service), runtime);
-/// let app = app.merge(webhook_router);
-/// ```
-pub fn create_webhook_router(
+/// What the webhook receiver answers with: the given agent service.
+pub fn webhook_state(
     service: Arc<AgentService>,
     workflow_runtime: Option<Arc<dyn crate::hosts::WorkflowHost>>,
-) -> axum::Router {
-    let state = std::sync::Arc::new(crate::webhooks::WebhookState {
+) -> Arc<crate::webhooks::WebhookState> {
+    Arc::new(crate::webhooks::WebhookState {
         service,
         workflow_runtime,
-    });
-    crate::webhooks::router(state)
+    })
 }
 
-/// Create the HTTP trigger [`Router`](axum::Router) serving `POST /triggers/{path}`.
-///
-/// One wildcard route answers every addressing form: the minted
-/// `t.{hex}` path and the owner-derived `{id}` / `{owner}/{id}` ones.
-/// Returns the router ready to be `.merge()`-ed into the main application.
-pub fn create_trigger_router(
+/// What the HTTP trigger receiver (`POST /triggers/{path}`) answers with.
+pub fn trigger_state(
     service: Arc<AgentService>,
     workflow_runtime: Arc<dyn crate::hosts::WorkflowHost>,
-) -> axum::Router {
-    let state = std::sync::Arc::new(crate::triggers::TriggerHttpState {
+) -> Arc<crate::triggers::TriggerHttpState> {
+    Arc::new(crate::triggers::TriggerHttpState {
         service,
         runtime: workflow_runtime,
-        oidc: std::sync::Arc::new(crate::trigger_oidc::OidcVerifier::new()),
-    });
-    crate::triggers::router(state)
+        oidc: Arc::new(crate::trigger_oidc::OidcVerifier::new()),
+    })
+}
+
+/// What each part of the hub's routes answers with. A part that is `None`
+/// is not served; one [`Bound::Declared`] is only declared, as the route
+/// manifest reads it.
+pub struct Mounts {
+    pub gateway: Arc<crate::gateway::GatewayState>,
+    pub admin: Bound<Arc<crate::state::HubState>>,
+    pub webhooks: Bound<Arc<crate::webhooks::WebhookState>>,
+    pub triggers: Option<Bound<Arc<crate::triggers::TriggerHttpState>>>,
+    pub mcp_callback: Bound<crate::mcp_servers::callback::CallbackState>,
+    pub mcp_servers: Bound<crate::mcp_servers::api::ApiState>,
+    pub games: Option<Bound<Arc<workforce_games::GamesState>>>,
+    #[cfg(feature = "postgres")]
+    pub desk: Option<Bound<crate::desk_driver::Started>>,
+    pub teams: Option<Bound<Arc<crate::teams_messages::TeamsRouterState>>>,
+    pub cors: tower_http::cors::CorsLayer,
+}
+
+/// Every route the hub's gateway serves, each with its class: what `serve`
+/// renders for its listener, and what the route manifest is read from.
+/// Each part keeps the layers it has always had: the gateway's and Desk's
+/// own are hardened, `/api/admin` is behind the admin check, a machine
+/// notes Desk's native side reaching it, and every route but Teams' (a
+/// server-to-server callback) answers CORS.
+pub fn all_routes(mounts: Mounts) -> Routes {
+    let Mounts {
+        gateway,
+        admin,
+        webhooks,
+        triggers,
+        mcp_callback,
+        mcp_servers,
+        games,
+        #[cfg(feature = "postgres")]
+        desk,
+        teams,
+        cors,
+    } = mounts;
+    let routes = crate::gateway::router(Arc::clone(&gateway))
+        .merge(crate::webhooks::router(webhooks))
+        .merge(triggers.map(crate::triggers::router).unwrap_or_default())
+        .merge(
+            Routes::new()
+                .nest("/api/admin", crate::api::router(admin))
+                .layer(axum::middleware::from_fn_with_state(
+                    Arc::clone(&gateway),
+                    crate::gateway::require_admin_auth,
+                )),
+        )
+        .merge(crate::mcp_servers::callback::routes(mcp_callback))
+        .merge(crate::mcp_servers::api::router(
+            mcp_servers,
+            Arc::clone(&gateway),
+        ))
+        .merge(crate::remote_mcp::server::router(
+            crate::remote_mcp::server::RemoteMcpState::new(Arc::clone(&gateway)),
+        ))
+        .nest(
+            "/games",
+            games.map(workforce_games::router).unwrap_or_default(),
+        );
+    #[cfg(feature = "postgres")]
+    let routes = crate::desk_driver::mount(&gateway, routes, desk);
+    routes
+        .layer(cors)
+        .merge(teams.map(crate::teams_messages::router).unwrap_or_default())
+}
+
+/// A hub with one listener: every route, each answering as its own
+/// handler decides, as the hub always has.
+pub fn combined(routes: Routes) -> axum::Router {
+    routes.render(
+        crate::surface::Surface::Combined,
+        tower::layer::util::Identity::new(),
+    )
 }
 
 /// Whether this agent offers what runs on a `kind` login: its

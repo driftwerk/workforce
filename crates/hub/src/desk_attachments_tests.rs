@@ -276,7 +276,7 @@ async fn until(
 async fn serve_on_a_port(state: &Arc<GatewayState>) -> std::net::SocketAddr {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    let app = crate::gateway::router(Arc::clone(state));
+    let app = crate::serve::combined(crate::gateway::router(Arc::clone(state)));
     tokio::spawn(async move {
         axum::serve(
             listener,
@@ -300,7 +300,7 @@ pub(crate) async fn call(
     request: axum::http::Request<axum::body::Body>,
 ) -> (StatusCode, HeaderMap, Vec<u8>) {
     use tower::ServiceExt;
-    let response = crate::gateway::router(Arc::clone(state))
+    let response = crate::serve::combined(crate::gateway::router(Arc::clone(state)))
         .oneshot(request)
         .await
         .unwrap();

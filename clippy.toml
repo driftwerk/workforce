@@ -1,2 +1,7 @@
 too-many-arguments-threshold = 10
 type-complexity-threshold = 300
+disallowed-methods = [
+    { path = "axum::Router::route", reason = "declare routes through workforce_surface::Routes" },
+    { path = "axum::Router::route_service", reason = "declare routes through workforce_surface::Routes" },
+    { path = "axum::Router::nest_service", reason = "declare routes through workforce_surface::Routes" },
+]

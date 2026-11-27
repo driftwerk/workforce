@@ -36,14 +36,18 @@ async fn run(pg: workforce_postgres::PostgresConfig) {
         .unwrap()
         .create(&member)
         .unwrap();
-    let app = workforce_hub::desk_driver::mount(
-        axum::Router::new(),
+    let desk = workforce_hub::desk_driver::start(
         &gateway.state,
         &config,
         tokio_util::sync::CancellationToken::new(),
     )
     .await
     .expect("the hub's desk");
+    let app = workforce_hub::serve::combined(workforce_hub::desk_driver::mount(
+        &gateway.state,
+        workforce_hub::surface::Routes::new(),
+        desk.map(workforce_hub::surface::Bound::To),
+    ));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {

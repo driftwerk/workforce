@@ -21,13 +21,14 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use crate::surface::routing::{get, post};
+use crate::surface::{Bound, Routes};
 use async_trait::async_trait;
 use axum::body::Bytes;
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
-use axum::{Json, Router};
+use axum::Json;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -411,19 +412,39 @@ async fn served(
     Json(Answer::from(out)).into_response()
 }
 
-/// A machine's routes: its sessions' calls, for Desk on the Mac to carry.
-pub(crate) fn machine_routes(state: Arc<GatewayState>, issues: Arc<MachineIssues>) -> Router {
-    Router::new()
-        .route("/api/desk/issues/relay", get(take))
-        .route("/api/desk/issues/relay/{id}", post(answer))
-        .with_state(Arc::new(Api { state, issues }))
+/// Where a computer's sessions' Linear and Jira calls go.
+#[derive(Clone)]
+pub(crate) enum Carrier {
+    /// A machine's: through Desk on the person's Mac.
+    Machine(Arc<MachineIssues>),
+    /// The person's own computer's: through its board links.
+    Home(Arc<HomeIssues>),
 }
 
-/// The person's own computer's route: its machines' sessions' calls.
-pub(crate) fn home_routes(state: Arc<GatewayState>, issues: Arc<HomeIssues>) -> Router {
-    Router::new()
-        .route("/api/desk/issues/served", post(served))
-        .with_state(Arc::new(Api { state, issues }))
+/// The issue routes of a computer whose calls go by `issues`: a machine's
+/// for Desk on the Mac to carry, or the person's own computer's for its
+/// machines' sessions' calls. Declared alone, both.
+pub(crate) fn routes(state: Arc<GatewayState>, issues: Bound<Carrier>) -> Routes {
+    match issues {
+        Bound::To(Carrier::Machine(issues)) => {
+            machine_routes(Bound::To(Arc::new(Api { state, issues })))
+        }
+        Bound::To(Carrier::Home(issues)) => home_routes(Bound::To(Arc::new(Api { state, issues }))),
+        Bound::Declared => machine_routes(Bound::Declared).merge(home_routes(Bound::Declared)),
+    }
+}
+
+fn machine_routes(api: Bound<Arc<Api<MachineIssues>>>) -> Routes {
+    Routes::new()
+        .admin("/api/desk/issues/relay", get(take))
+        .admin("/api/desk/issues/relay/{id}", post(answer))
+        .bind(api)
+}
+
+fn home_routes(api: Bound<Arc<Api<HomeIssues>>>) -> Routes {
+    Routes::new()
+        .admin("/api/desk/issues/served", post(served))
+        .bind(api)
 }
 
 #[cfg(test)]

@@ -300,6 +300,10 @@ fn to_app(m: WsMessage) -> Step<AxumMessage> {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "stand-in servers for tests, not routes the hub serves"
+)]
 mod tests {
     use super::*;
     use crate::api::voice_router;
@@ -343,13 +347,21 @@ mod tests {
     }
 
     fn router(realtime: Realtime) -> Router {
-        voice_router(Arc::new(Bearer), Arc::new(realtime), Arc::new(Mute))
+        crate::testing::app(voice_router(workforce_surface::Bound::To((
+            Arc::new(Bearer),
+            Arc::new(realtime),
+            Arc::new(Mute),
+        ))))
     }
 
     #[tokio::test]
     async fn gpt_live_gets_a_relay_ticket_not_the_key() {
         let realtime = Arc::new(Realtime::new(Arc::new(Keys(Some("sk-vault")))));
-        let app = voice_router(Arc::new(Bearer), Arc::clone(&realtime), Arc::new(Mute));
+        let app = crate::testing::app(voice_router(workforce_surface::Bound::To((
+            Arc::new(Bearer),
+            Arc::clone(&realtime),
+            Arc::new(Mute),
+        ))));
         let (status, grant) = ask(app, "gpt-live", "hub-token").await;
         assert_eq!(status, StatusCode::OK);
         let token = grant["token"].as_str().unwrap();
@@ -491,11 +503,9 @@ mod tests {
             Arc::new(Keys(Some("sk-vault"))),
             endpoints,
         ));
-        let hub = serve(voice_router(
-            Arc::new(Bearer),
-            Arc::clone(&realtime),
-            Arc::new(Mute),
-        ))
+        let hub = serve(crate::testing::app(voice_router(
+            workforce_surface::Bound::To((Arc::new(Bearer), Arc::clone(&realtime), Arc::new(Mute))),
+        )))
         .await;
         let grant = realtime.grant(Engine::GptLive, &hub).await.unwrap();
 

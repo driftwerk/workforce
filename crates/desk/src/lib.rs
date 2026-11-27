@@ -141,7 +141,7 @@ mod vt;
 pub mod worktree;
 
 pub use adopt::HubInternal;
-pub use api::{router, sessions_router, Authorize};
+pub use api::{router, sessions_router, Authorize, Ground, Parts};
 pub use claude::DIALOG_HOLD;
 pub use conversations::{
     Active, Author, Close, Closed, ConversationError, ConversationRead, ConversationUnread,

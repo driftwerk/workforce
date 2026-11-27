@@ -12127,6 +12127,7 @@ dependencies = [
  "workforce-common",
  "workforce-core",
  "workforce-postgres",
+ "workforce-surface",
 ]
 
 [[package]]
@@ -12162,6 +12163,7 @@ dependencies = [
  "tower",
  "tracing",
  "uuid",
+ "workforce-surface",
 ]
 
 [[package]]
@@ -12835,7 +12837,9 @@ dependencies = [
 name = "workforce-surface"
 version = "0.1.7"
 dependencies = [
+ "axum",
  "tokio",
+ "tower",
 ]
 
 [[package]]

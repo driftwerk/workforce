@@ -105,3 +105,7 @@ mod desk_floor_routes;
 #[cfg(feature = "postgres")]
 #[path = "api/desk_memory_routes.rs"]
 mod desk_memory_routes;
+
+#[cfg(all(feature = "oidc", feature = "postgres"))]
+#[path = "api/route_manifest.rs"]
+mod route_manifest;

@@ -120,6 +120,10 @@ impl Bridge {
         bail!("every port of the durable MCP bridge range is in use")
     }
 
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "the worker's own loopback MCP bridge, not a hub route"
+    )]
     fn serve(
         route: Arc<dyn McpRoute>,
         listener: TcpListener,

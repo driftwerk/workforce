@@ -33,11 +33,11 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use crate::surface::routing::{get, post};
 use axum::extract::{Path as UrlPath, Query, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
-use axum::{Json, Router};
+use axum::Json;
 use serde::Deserialize;
 use serde_json::json;
 use tracing::warn;
@@ -586,7 +586,8 @@ fn activity_of(done: &Done, shot: Option<&str>) -> Activity {
     }
 }
 
-struct Routes {
+/// What Desk's browser routes answer with.
+pub(crate) struct Browser {
     state: Arc<GatewayState>,
     computer: Computer,
     shots: PathBuf,
@@ -594,7 +595,7 @@ struct Routes {
     chrome: Arc<Chrome>,
 }
 
-type S = State<Arc<Routes>>;
+type S = State<Arc<Browser>>;
 
 #[derive(Deserialize)]
 struct TokenQuery {
@@ -612,7 +613,11 @@ fn refusal(status: StatusCode, error: &str) -> Response {
 }
 
 /// Only the person whose Desk this is.
-async fn holder(routes: &Routes, headers: &HeaderMap, token: Option<&str>) -> Result<(), Response> {
+async fn holder(
+    routes: &Browser,
+    headers: &HeaderMap,
+    token: Option<&str>,
+) -> Result<(), Response> {
     let caller = resolve_caller_context(&routes.state, headers, token).await;
     match caller.auth_failure {
         Some(AuthFailure::InvalidCredentials | AuthFailure::SurfaceRefused) => {
@@ -744,7 +749,7 @@ pub async fn stop_everything() {
 /// The settings, and how Desk's extension stands: whether the Chrome Desk
 /// uses is connected now, every profile it connects from, and where to get
 /// the extension.
-async fn settings_view(r: &Routes) -> serde_json::Value {
+async fn settings_view(r: &Browser) -> serde_json::Value {
     let store_url = format!(
         "https://chromewebstore.google.com/detail/{}",
         crate::desk_chrome::STORE_ID
@@ -899,14 +904,14 @@ pub fn equip(service: &crate::serve::AgentService) {
     }
 }
 
-/// Installs Desk's browser hooks and returns its routes. Where the hub's
-/// data isn't Desk's, screenshots go beside the hub's data.
-pub fn install(
+/// Installs Desk's browser hooks, and returns what its routes answer with.
+/// Where the hub's data isn't Desk's, screenshots go beside the hub's data.
+pub(crate) fn install(
     state: &Arc<GatewayState>,
     config: &WorkforceConfig,
     computer: Computer,
     cancel: tokio_util::sync::CancellationToken,
-) -> Router {
+) -> Arc<Browser> {
     let root = browser_root(config);
     let shots = shots_dir(config);
     let settings = Arc::new(SettingsFile::new(root.join("settings.json")));
@@ -977,28 +982,33 @@ pub fn install(
             }
         });
     }
-    Router::new()
-        .route("/api/desk/browser", get(list))
-        .route("/api/desk/browser/stop", post(stop))
-        .route("/api/desk/browser/show", post(show))
-        .route("/api/desk/browser/shots/{file}", get(shot))
-        .route(
+    Arc::new(Browser {
+        state: Arc::clone(state),
+        computer,
+        shots,
+        settings,
+        chrome,
+    })
+}
+
+/// Desk's browser routes.
+pub(crate) fn routes(browser: crate::surface::Bound<Arc<Browser>>) -> crate::surface::Routes {
+    crate::surface::Routes::new()
+        .admin("/api/desk/browser", get(list))
+        .admin("/api/desk/browser/stop", post(stop))
+        .admin("/api/desk/browser/show", post(show))
+        .admin("/api/desk/browser/shots/{file}", get(shot))
+        .admin(
             "/api/desk/browser/settings",
             get(get_settings).put(put_settings),
         )
-        .route("/api/desk/browser/chrome/{id}/{what}", post(profile))
-        .route(
+        .admin("/api/desk/browser/chrome/{id}/{what}", post(profile))
+        .admin(
             "/api/desk/browser/chrome/{id}",
-            axum::routing::delete(forget_profile),
+            crate::surface::routing::delete(forget_profile),
         )
-        .route("/ws/desk/chrome", get(chrome_socket))
-        .with_state(Arc::new(Routes {
-            state: Arc::clone(state),
-            computer,
-            shots,
-            settings,
-            chrome,
-        }))
+        .admin("/ws/desk/chrome", get(chrome_socket))
+        .bind(browser)
 }
 
 #[cfg(test)]

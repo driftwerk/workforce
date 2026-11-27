@@ -8,8 +8,8 @@ use axum::body::Body;
 use axum::http::{header, Request, StatusCode};
 use serde_json::Value;
 
+use crate::support::router;
 use workforce_common::settings::{AgentConfig, WorkforceConfig};
-use workforce_hub::gateway::router;
 use workforce_hub::serve::AgentService;
 use workforce_identity::types::{Identity, IdentityRole};
 

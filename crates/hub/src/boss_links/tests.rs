@@ -1163,6 +1163,10 @@ fn only_a_person_changes_an_agents_desk_boss() {
 
 // ── The uplink (RB5a) ───────────────────────────────────────────────────
 
+#[allow(
+    clippy::disallowed_methods,
+    reason = "stand-in servers for tests, not routes the hub serves"
+)]
 mod uplink_tests {
     use super::*;
     use crate::boss_links::uplink::{Timing, MAX_FRAME, PROTOCOL_HEADER};

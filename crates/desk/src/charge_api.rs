@@ -6,11 +6,12 @@ use std::sync::Arc;
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
-use axum::{Json, Router};
+use axum::Json;
 use serde::Deserialize;
 use serde_json::json;
 use uuid::Uuid;
+use workforce_surface::routing::{get, post};
+use workforce_surface::Routes;
 
 use crate::api::Authorize;
 use crate::charge::How;
@@ -192,13 +193,13 @@ async fn typing(State(s): S, h: HeaderMap, Query(q): Q, Path(id): Path<Uuid>) ->
 }
 
 /// The person's charge routes.
-pub(crate) fn api_routes(desk: Desk, auth: Arc<dyn Authorize>) -> Router {
-    Router::new()
-        .route("/api/desk/charges", get(list))
-        .route(
+pub(crate) fn api_routes(ground: crate::api::Ground) -> Routes {
+    Routes::new()
+        .member("/api/desk/charges", get(list))
+        .member(
             "/api/desk/sessions/{id}/charge",
             post(hand).delete(release).patch(wheel),
         )
-        .route("/api/desk/sessions/{id}/typing", post(typing))
-        .with_state(Arc::new(Api { desk, auth }))
+        .member("/api/desk/sessions/{id}/typing", post(typing))
+        .bind(ground.map(|(desk, auth)| Arc::new(Api { desk, auth })))
 }

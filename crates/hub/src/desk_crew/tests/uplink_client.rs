@@ -1,6 +1,10 @@
 //! The engine's uplink (remote bosses, RB5b): devbox holds Allan's link
 //! for Acme, proves it to the boss hub it dials, and serves Allan's calls
 //! under Acme's grant, each in order, on time and within its limits.
+#![allow(
+    clippy::disallowed_methods,
+    reason = "stand-in servers for tests, not routes the hub serves"
+)]
 
 use super::*;
 use crate::boss_links::engine_key::{verify_challenge, Challenge};
@@ -105,7 +109,7 @@ async fn an_engine_proves_its_link_and_serves_its_bosss_calls_in_order() {
         d.change_layout(|l| l.create("acme", "Acme", std::slice::from_ref(&item), None))
             .await
             .unwrap();
-        let desk_app = workforce_desk::sessions_router(d.clone(), Arc::new(HubToken));
+        let desk_app = super::desk_app(d.clone(), Arc::new(HubToken));
         let (code, out) = send(
             &desk_app,
             "PUT",
@@ -120,7 +124,7 @@ async fn an_engine_proves_its_link_and_serves_its_bosss_calls_in_order() {
 
         // Desk hands devbox the link: kept, never answered back.
         let state = with_vault(dir.path());
-        let app = desk_uplink::routes(Arc::clone(&state));
+        let app = crate::serve::combined(desk_uplink::routes(Arc::clone(&state)));
         let token = state.auth_token.clone();
         let link_id = uuid::Uuid::new_v4();
         let token_id = uuid::Uuid::new_v4();

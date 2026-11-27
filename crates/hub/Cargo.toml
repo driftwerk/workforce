@@ -58,6 +58,7 @@ unicode-normalization = { workspace = true }
 # The overseer reads what it says past look-alike and hidden letters.
 tokio = { version = "1", features = ["full"] }
 tokio-util = { version = "0.7", features = ["rt", "io"] }
+tower = "0.5"
 tower-http = { version = "0.6", features = ["cors"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
@@ -205,7 +206,6 @@ workforce-hub-core = { path = "../hub-core", features = ["test-support"] }
 workforce-hub = { path = ".", features = ["test-support"] }
 workforce-agent = { path = "../agent-runtime", features = ["s3", "test-support"] }
 tempfile = "3"
-tower = "0.5"
 wiremock = "0.6"
 serde_yaml = { workspace = true }
 rust_xlsxwriter = { workspace = true }

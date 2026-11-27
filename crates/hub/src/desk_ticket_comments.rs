@@ -25,11 +25,11 @@
 
 use std::sync::Arc;
 
+use crate::surface::routing::get;
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::routing::get;
-use axum::{Json, Router};
+use axum::Json;
 use serde::Deserialize;
 use serde_json::json;
 use uuid::Uuid;
@@ -66,11 +66,11 @@ macro_rules! person {
 }
 
 /// The ticket comments' routes, hardened like the board sync's.
-pub fn install(sync: Arc<BoardSync>) -> Router {
+pub fn install(sync: crate::surface::Bound<Arc<BoardSync>>) -> crate::surface::Routes {
     crate::gateway::hardened(
-        Router::new()
-            .route("/api/desk/tickets/{id}/comments", get(list).post(post))
-            .with_state(Arc::new(Routes { sync })),
+        crate::surface::Routes::new()
+            .admin("/api/desk/tickets/{id}/comments", get(list).post(post))
+            .bind(sync.map(|sync| Arc::new(Routes { sync }))),
     )
 }
 

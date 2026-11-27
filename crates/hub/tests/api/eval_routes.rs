@@ -2,10 +2,10 @@
 //! of `POST /api/chat`: who may call them and what they refuse, on the paths
 //! that need no model.
 
+use crate::support::router;
 use axum::body::Body;
 use axum::http::{header, Request, StatusCode};
 use serde_json::{json, Value};
-use workforce_hub::gateway::router;
 use workforce_identity::types::{Identity, IdentityRole};
 
 use crate::support::{agent_service, send, token_for, Gateway, GATEWAY_TOKEN};

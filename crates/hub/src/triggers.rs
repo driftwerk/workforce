@@ -14,13 +14,14 @@
 
 use std::sync::Arc;
 
+use crate::surface::routing::post;
+use crate::surface::{Bound, Routes};
 use axum::body::Bytes;
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
-use axum::routing::post;
-use axum::{Json, Router};
+use axum::Json;
 use tokio::sync::broadcast;
 use tracing::{info, warn};
 
@@ -46,14 +47,14 @@ pub struct TriggerHttpState {
 }
 
 /// Build the HTTP trigger receiver router.
-pub fn router(state: Arc<TriggerHttpState>) -> Router {
-    Router::new()
+pub fn router(state: Bound<Arc<TriggerHttpState>>) -> Routes {
+    Routes::new()
         // One wildcard resolves all three forms — minted `/triggers/t.{hex}`,
         // bare `/triggers/{id}` and owner-namespaced `/triggers/{owner}/{id}`.
         // A second, more specific route would put the compatibility guarantee
         // at the mercy of routing precedence.
-        .route("/triggers/{*id}", post(receive_trigger))
-        .with_state(state)
+        .machine("/triggers/{*id}", post(receive_trigger))
+        .bind(state)
 }
 
 async fn receive_trigger(

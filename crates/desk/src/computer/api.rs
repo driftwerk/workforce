@@ -26,11 +26,12 @@ use std::sync::Arc;
 use axum::extract::{Path as UrlPath, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{delete, get, post};
-use axum::{Json, Router};
+use axum::Json;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use uuid::Uuid;
+use workforce_surface::routing::{delete, get, post};
+use workforce_surface::Routes;
 
 use super::store::{level_refusal, ActivityFilter, KeptGrant, OnItsOwnRow};
 use workforce_core::computer::{ActionKind, Level, Scope};
@@ -538,23 +539,23 @@ async fn ask_again(
     }
 }
 
-pub(crate) fn computer_router(desk: Desk, auth: Arc<dyn Authorize>) -> Router {
-    Router::new()
-        .route("/api/desk/computer/disk-access", get(get_disk_access))
-        .route("/api/desk/computer/access", get(get_access).put(put_access))
-        .route("/api/desk/computer/grants", get(list_grants))
-        .route("/api/desk/computer/grants/{id}", delete(revoke_grant))
-        .route(
+pub(crate) fn computer_router(ground: crate::api::Ground) -> Routes {
+    Routes::new()
+        .member("/api/desk/computer/disk-access", get(get_disk_access))
+        .member("/api/desk/computer/access", get(get_access).put(put_access))
+        .member("/api/desk/computer/grants", get(list_grants))
+        .member("/api/desk/computer/grants/{id}", delete(revoke_grant))
+        .member(
             "/api/desk/computer/sessions/{session_id}/forget",
             post(forget_session),
         )
-        .route("/api/desk/computer/activity", get(list_activity))
-        .route(
+        .member("/api/desk/computer/activity", get(list_activity))
+        .member(
             "/api/desk/computer/on-its-own",
             get(get_on_its_own).put(put_on_its_own),
         )
-        .route("/api/desk/computer/on-its-own/ask-again", post(ask_again))
-        .with_state(Arc::new(ComputerApi { desk, auth }))
+        .member("/api/desk/computer/on-its-own/ask-again", post(ask_again))
+        .bind(ground.map(|(desk, auth)| Arc::new(ComputerApi { desk, auth })))
 }
 
 #[cfg(test)]
@@ -563,6 +564,7 @@ mod tests {
     use crate::computer::store::{Activity, NewGrant};
     use crate::store::build_pool;
     use crate::testing::{allow_all, deny_all};
+    use axum::Router;
     use serde_json::Value;
     use workforce_postgres::test_support::with_test_pool;
 
@@ -592,7 +594,10 @@ mod tests {
         with_test_pool(build_pool, |pool| async move {
             let dir = tempfile::tempdir().unwrap();
             let desk = crate::testing::desk_on(pool, dir.path()).await;
-            let closed = computer_router(desk.clone(), deny_all());
+            let closed = crate::testing::app(computer_router(workforce_surface::Bound::To((
+                desk.clone(),
+                deny_all(),
+            ))));
             for (method, uri) in [
                 ("GET", "/api/desk/computer/access"),
                 ("GET", "/api/desk/computer/grants"),
@@ -601,7 +606,10 @@ mod tests {
             ] {
                 assert_eq!(call(&closed, method, uri, None).await.0, 401, "{uri}");
             }
-            let app = computer_router(desk.clone(), allow_all());
+            let app = crate::testing::app(computer_router(workforce_surface::Bound::To((
+                desk.clone(),
+                allow_all(),
+            ))));
             assert_eq!(
                 call(&app, "GET", "/api/desk/computer/access", None).await,
                 (200, json!({"stopped": false}))
@@ -713,7 +721,7 @@ mod tests {
         with_test_pool(build_pool, |pool| async move {
             let dir = tempfile::tempdir().unwrap();
             let desk = crate::testing::desk_on(pool, dir.path()).await;
-            let closed = computer_router(desk.clone(), deny_all());
+            let closed = crate::testing::app(computer_router(workforce_surface::Bound::To((desk.clone(), deny_all()))));
             let devbox = json!({"agent": "kat", "kind": "network", "scope": {"kind": "host", "value": "dev@DevBox"}, "level": "anywhere"});
             for (method, uri, body) in [
                 ("GET", "/api/desk/computer/on-its-own?agent=kat", None),
@@ -734,7 +742,7 @@ mod tests {
                 .unwrap()
                 .is_empty());
 
-            let app = computer_router(desk.clone(), allow_all());
+            let app = crate::testing::app(computer_router(workforce_surface::Bound::To((desk.clone(), allow_all()))));
             let put = |body: Value| {
                 let app = app.clone();
                 async move { call(&app, "PUT", "/api/desk/computer/on-its-own", Some(body)).await }

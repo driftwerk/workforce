@@ -3,13 +3,13 @@
 
 use std::sync::Arc;
 
+use crate::support::router;
 use axum::body::Body;
 use axum::http::{header, Request, StatusCode};
 use workforce_common::persistence::{BillingSplit, CostRecord, CostScope, SqliteStore};
 use workforce_common::subscription::{Billing, CredentialTier};
 use workforce_common::telemetry::TelemetryStore;
 use workforce_hub::agent_registry::AgentRegistry;
-use workforce_hub::gateway::router;
 use workforce_identity::sqlite::SqliteIdentityStore;
 use workforce_identity::store::IdentityStore;
 use workforce_identity::types::{Identity, IdentityRole};
@@ -131,12 +131,12 @@ async fn cost_detail_names_the_plan_of_subscription_rows_only() {
     ] {
         state.telemetry_store.record_cost(&record).unwrap();
     }
-    let app = axum::Router::new()
-        .nest("/api", workforce_hub::api::router(Arc::new(state)))
-        .layer(axum::Extension(workforce_hub::gateway::CallerContext {
+    let app = crate::support::admin_api("/api", Arc::new(state)).layer(axum::Extension(
+        workforce_hub::gateway::CallerContext {
             is_admin: true,
             ..Default::default()
-        }));
+        },
+    ));
 
     let request = Request::get("/api/cost/detail")
         .body(Body::empty())
