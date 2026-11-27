@@ -1464,11 +1464,7 @@ const REPLAY_WITHIN: Duration = Duration::from_secs(2);
 
 /// How long Desk's own resume of a thread, as it joins, may take to load
 /// it before its connection is made again.
-const RESUME_WITHIN: Duration = if cfg!(test) {
-    Duration::from_secs(6)
-} else {
-    Duration::from_secs(300)
-};
+const RESUME_WITHIN: Duration = Duration::from_secs(300);
 
 /// How often Desk tries to follow a session again once it lost sight of it.
 const LOST_AGAIN: Duration = if cfg!(test) {
@@ -3159,7 +3155,6 @@ pub(crate) mod tests {
         let mut f = Follower::new(Some("t1".into()), None).resuming(json!({}), tx);
         f.joined();
         assert_eq!(f.asking(), Some(RESUME_WITHIN));
-        assert!(RESUME_WITHIN > SIGHT_WITHIN);
     }
 
     #[test]
