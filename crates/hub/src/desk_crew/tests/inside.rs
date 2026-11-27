@@ -185,8 +185,9 @@ async fn every_facet_is_fenced_and_names_no_secret() {
 }
 
 /// crew.history and crew.inside read a session's own transcript: its
-/// prompt, the call it made and its reply, fenced. Where Desk can't read
-/// one, crew.history gives its screen instead, saying why.
+/// prompt, the call it made and its reply, fenced, newest first. Where
+/// Desk can't read one, or it has nothing in it yet, crew.history gives
+/// its screen instead, saying why.
 #[tokio::test(flavor = "multi_thread")]
 async fn crew_history_and_inside_read_its_transcript_and_its_screen_only_without_one() {
     with_test_pool(workforce_desk::store::build_pool, |pool| async move {
@@ -235,11 +236,7 @@ async fn crew_history_and_inside_read_its_transcript_and_its_screen_only_without
         let project = home.join(".claude/projects/-acme-web");
         std::fs::create_dir_all(&project).unwrap();
         let transcript = project.join("cc-acme-web.jsonl");
-        std::fs::write(
-            &transcript,
-            include_str!("../../../../desk/fixtures/ledger/claude.jsonl"),
-        )
-        .unwrap();
+        std::fs::write(&transcript, "").unwrap();
         hook(
             &hook_url(home, s.id).await,
             json!({"hook_event_name": "SessionStart", "session_id": "cc-acme-web",
@@ -252,7 +249,17 @@ async fn crew_history_and_inside_read_its_transcript_and_its_screen_only_without
                 .filter(|v| v.cli_session_id.as_deref() == Some("cc-acme-web"))
         })
         .await;
+        // Nothing in it yet: its screen, and why.
         let said = history(s.id).await;
+        assert!(said.contains("\"transcript_unread\""), "{said}");
+        assert!(said.contains("\"terminal\""), "{said}");
+        std::fs::write(
+            &transcript,
+            include_str!("../../../../desk/fixtures/ledger/claude.jsonl"),
+        )
+        .unwrap();
+        let said = history(s.id).await;
+        assert!(said.contains("\"transcript_newest_first\""), "{said}");
         for seen in [
             "Fix the login race in acme-web",
             "cargo test",

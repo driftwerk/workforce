@@ -510,22 +510,21 @@ async fn a_resumed_codex_session_is_up_only_once_its_tui_is_on_its_screen() {
         let last = tui_starts(&dir).pop().unwrap();
         assert!(last.contains("tui.alternate_screen=\"always\""), "{last}");
 
-        // Its thread loaded, but its TUI never takes its screen: still starting, and
-        // said so once its start's watch is over.
+        // Its thread loaded, but its TUI never takes its screen: starting
+        // until its start's watch is over, then done, said not to have
+        // come up (its screen left out: this Desk has no redactor).
         stopped(&d, s.id).await;
         std::fs::write(dir.join("hang"), "").unwrap();
-        started_again(&d, &dir, std::slice::from_ref(&ok), resume).await;
+        // Its app-server kept: Desk sees it all along.
+        let (_, _ws) = started_again(&d, &dir, std::slice::from_ref(&ok), resume).await;
         tokio::time::sleep(Duration::from_secs(1)).await;
         assert_eq!(state(), SessionState::Starting);
         assert!(d.view(s.id).unwrap().live);
         until(|| said.has("a Codex session is still starting")).await;
-        assert_eq!(state(), SessionState::Starting);
-        assert!(
-            matches!(&d.view(s.id).unwrap().failure,
-                Some(crate::limit::TurnFailure::Failed(why)) if why.starts_with("Codex didn't come up")),
-            "{:?}",
-            d.view(s.id).unwrap().failure
-        );
+        until(|| state() == SessionState::Done).await;
+        let v = d.view(s.id).unwrap();
+        assert!(v.live);
+        assert_eq!(v.failed.as_deref(), Some("Codex didn't come up"));
         stopped(&d, s.id).await;
         std::fs::remove_file(dir.join("hang")).unwrap();
         // Started again: that failure is behind it.

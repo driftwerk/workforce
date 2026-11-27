@@ -674,12 +674,15 @@ pub enum CodexEvent {
     /// call).
     ToolFailed(String),
     /// Its turn failed (`turn/completed` with an error, or its thread's
-    /// `systemError`): Codex's words, or [`TURN_FAILED`] until it says.
-    /// Said before the turn's [`CodexEvent::Idle`].
-    TurnFailed(String),
+    /// `systemError`): on its plan's usage limit, or in Codex's words, or
+    /// [`TURN_FAILED`] until it says. Said before the turn's
+    /// [`CodexEvent::Idle`].
+    TurnFailed(crate::limit::TurnFailure),
     /// Desk couldn't follow it again within [`SIGHT_WITHIN`] of losing its
-    /// app-server's connection: nothing more is heard of it.
+    /// app-server's connection: it keeps trying, every [`LOST_AGAIN`].
     Lost,
+    /// Followed again after it was [`CodexEvent::Lost`].
+    Found,
     Reply(String),
     /// A sub-agent thread it started.
     Child(String),
@@ -1391,10 +1394,24 @@ pub struct Follower {
     /// Codex refused to follow its thread: its connection ends, to be made
     /// again.
     refused: bool,
-    /// Desk's answers Codex hasn't said resolved, by request, each with the
-    /// request it answers: one Codex sends again as it is followed again
-    /// never had its answer, which goes again.
-    sent: HashMap<String, (Value, Value)>,
+    /// Desk's answers Codex hasn't said resolved, by request: one Codex
+    /// sends again as it is followed again never had its answer, which goes
+    /// again; one it doesn't was answered.
+    sent: HashMap<String, Sent>,
+    /// Its turn running now ran into its plan's usage limit, as Codex said.
+    limited: bool,
+    /// Desk lost sight of it ([`CodexEvent::Lost`]) and hasn't followed it
+    /// since.
+    lost: bool,
+}
+
+/// An answer Desk sent: the request it answers, its thread, the request
+/// as Codex sent it, and the answer.
+struct Sent {
+    request: Value,
+    thread: String,
+    asked: Value,
+    answer: Value,
 }
 
 /// A request it forwarded: its thread, and for a permissions request, what
@@ -1439,9 +1456,21 @@ pub const SIGHT_WITHIN: Duration = if cfg!(test) {
 };
 
 /// How long Codex has, once it follows a thread again, to send again what
-/// it still asks (it sends each straight after its answer: CLI 0.166's
+/// it still asks. It sends each straight after its answer, the same
+/// request with the same id (CLI 0.166: `thread/resume` replays
+/// `pending_requests_for_thread`, app-server/src/outgoing_message.rs,
 /// `replay_requests_to_connection_for_thread`).
-const REPLAY_WITHIN: Duration = Duration::from_secs(1);
+const REPLAY_WITHIN: Duration = Duration::from_secs(2);
+
+/// How often Desk tries to follow a session again once it lost sight of it.
+const LOST_AGAIN: Duration = if cfg!(test) {
+    Duration::from_millis(500)
+} else {
+    Duration::from_secs(30)
+};
+
+/// What Codex calls the error of a turn its plan's usage limit stopped.
+const USAGE_LIMIT: &str = "usageLimitExceeded";
 
 /// The waits between tries to follow a session again, the last repeated.
 const AGAIN_AFTER: [Duration; 5] = [
@@ -1489,6 +1518,8 @@ impl Follower {
             unread: HashSet::new(),
             refused: false,
             sent: HashMap::new(),
+            limited: false,
+            lost: false,
         }
     }
 
@@ -1551,7 +1582,8 @@ impl Follower {
         self.rejoined = true;
         self.refused = false;
         self.at_once = true;
-        self.unconfirmed = (!self.open.is_empty()).then(|| self.open.keys().cloned().collect());
+        let held: HashSet<String> = self.open.keys().chain(self.sent.keys()).cloned().collect();
+        self.unconfirmed = (!held.is_empty()).then_some(held);
         let refused = self
             .steering
             .drain(..)
@@ -1572,18 +1604,46 @@ impl Follower {
         self.unconfirmed.is_some()
     }
 
-    /// What it had open that Codex didn't send again once it followed the
-    /// thread again: answered while Desk couldn't see, so gone.
+    /// What it had open, or answered without hearing it resolved, that
+    /// Codex didn't send again once it followed the thread again: answered
+    /// while Desk couldn't see, so gone.
     pub fn confirmed(&mut self) -> Vec<Seen> {
         let unconfirmed = self.unconfirmed.take().unwrap_or_default();
         unconfirmed
             .iter()
-            .filter_map(|k| self.open.remove(k))
-            .map(|o| Seen {
-                thread: o.thread,
-                event: CodexEvent::Resolved(o.request),
+            .filter_map(|k| {
+                let open = self.open.remove(k).map(|o| (o.thread, o.request));
+                open.or_else(|| self.sent.remove(k).map(|s| (s.thread, s.request)))
+            })
+            .map(|(thread, request)| Seen {
+                thread,
+                event: CodexEvent::Resolved(request),
             })
             .collect()
+    }
+
+    /// Whether its subscription is asked and not yet answered.
+    fn asking(&self) -> bool {
+        self.subscribed && !self.followed
+    }
+
+    /// Desk lost sight of it: once followed again, it says so
+    /// ([`CodexEvent::Found`]).
+    pub fn lose(&mut self) {
+        self.lost = true;
+    }
+
+    /// How its turn failed, said in `words`: on its plan's usage limit
+    /// when Codex said so.
+    fn failure_of(&self, words: String) -> crate::limit::TurnFailure {
+        match self.limited {
+            true => crate::limit::TurnFailure::Limit(crate::limit::LimitHit {
+                window: None,
+                resets_at: None,
+                at: None,
+            }),
+            false => crate::limit::TurnFailure::Failed(words),
+        }
     }
 
     /// Whether Codex refused to follow its thread since last asked.
@@ -1659,6 +1719,10 @@ impl Follower {
                 };
                 tracing::info!(target: crate::STARTS, %thread, "codex: following its thread");
                 self.followed = true;
+                let found = std::mem::take(&mut self.lost).then(|| Seen {
+                    thread: thread.clone(),
+                    event: CodexEvent::Found,
+                });
                 // Joined again: where its thread got to meanwhile, as its
                 // status would have said it.
                 let moved = std::mem::take(&mut self.rejoined)
@@ -1689,7 +1753,15 @@ impl Follower {
                     thread,
                     event: CodexEvent::Runs(runs),
                 });
-                (loaded.into_iter().chain(runs).chain(moved).collect(), None)
+                (
+                    found
+                        .into_iter()
+                        .chain(loaded)
+                        .chain(runs)
+                        .chain(moved)
+                        .collect(),
+                    None,
+                )
             }
             (Some(id), Some(method)) => {
                 let params = v.get("params").cloned().unwrap_or(Value::Null);
@@ -1717,9 +1789,12 @@ impl Follower {
                 }
                 let key = id.to_string();
                 let asked_now = json!({ "method": method, "params": params });
-                if let Some((_, answer)) = self.sent.get(&key).filter(|(a, _)| *a == asked_now) {
+                if let Some(sent) = self.sent.get(&key).filter(|s| s.asked == asked_now) {
                     tracing::info!(%method, "codex asked again what Desk answered: its answer goes again");
-                    return (Vec::new(), Some(answer.clone()));
+                    if let Some(unconfirmed) = &mut self.unconfirmed {
+                        unconfirmed.remove(&key);
+                    }
+                    return (Vec::new(), Some(sent.answer.clone()));
                 }
                 let asks = ask_of(method, id, &params, &self.files, self.home.as_deref());
                 // A question is the terminal's to answer: only shown.
@@ -1813,18 +1888,26 @@ impl Follower {
                         self.turn = turn;
                         self.settled = false;
                         self.failed = None;
+                        self.limited = false;
                         self.sent.clear();
+                    }
+                    "error" if ours => {
+                        self.limited |= params.pointer("/error/codexErrorInfo")
+                            == Some(&json!(USAGE_LIMIT))
+                            && params.get("willRetry") != Some(&json!(true));
                     }
                     "turn/completed" if ours => {
                         self.turn = None;
+                        self.limited |= params.pointer("/turn/error/codexErrorInfo")
+                            == Some(&json!(USAGE_LIMIT));
                         let first = !std::mem::replace(&mut self.settled, true);
                         // Its status said it failed first: these are its words.
                         let fills = self
                             .failed
                             .as_ref()
                             .is_some_and(|f| f.is_none() || *f == turn);
-                        failure =
-                            turn_error(&params).filter(|e| first || (fills && e != TURN_FAILED));
+                        failure = turn_error(&params)
+                            .filter(|e| first || (fills && (e != TURN_FAILED || self.limited)));
                         if failure.is_some() {
                             self.failed = Some(turn);
                         }
@@ -1844,7 +1927,7 @@ impl Follower {
                     }
                     _ => {}
                 }
-                let failure = failure.map(CodexEvent::TurnFailed);
+                let failure = failure.map(|words| CodexEvent::TurnFailed(self.failure_of(words)));
                 if method == "serverRequest/resolved" {
                     if let Some(request) = params.get("requestId") {
                         self.open.remove(&request.to_string());
@@ -1920,7 +2003,13 @@ impl Follower {
             None => CodexEvent::Late(reply.request.clone()),
         };
         if let Some((o, answer)) = opened.as_ref().zip(answer.as_ref()) {
-            self.sent.insert(key, (o.asked.clone(), answer.clone()));
+            let sent = Sent {
+                request: o.request.clone(),
+                thread: o.thread.clone(),
+                asked: o.asked.clone(),
+                answer: answer.clone(),
+            };
+            self.sent.insert(key, sent);
         }
         let thread = opened.map(|o| o.thread).or_else(|| self.thread.clone());
         (thread.map(|thread| Seen { thread, event }), answer)
@@ -1965,7 +2054,8 @@ struct Inbox {
 /// closed it, or refused to follow the thread) is made again, the
 /// follower's open requests kept; when none follows the thread again
 /// within [`SIGHT_WITHIN`], it says it lost sight of it
-/// ([`CodexEvent::Lost`]) and stops.
+/// ([`CodexEvent::Lost`]), and keeps trying every [`LOST_AGAIN`] until
+/// one does ([`CodexEvent::Found`]) or `cancel` fires.
 pub async fn observe(
     socket: PathBuf,
     mut follower: Follower,
@@ -2011,10 +2101,10 @@ pub async fn observe(
         if let Err(e) = &ended {
             tracing::debug!(error = %e, "codex: couldn't follow the session");
         }
-        if since.elapsed() >= SIGHT_WITHIN {
+        if since.elapsed() >= SIGHT_WITHIN && !follower.lost {
             tracing::warn!(
                 secs = SIGHT_WITHIN.as_secs(),
-                "codex observer couldn't follow the session again; Desk lost sight of it"
+                "codex observer couldn't follow the session again; Desk lost sight of it, and keeps trying"
             );
             let thread = follower.thread.clone().unwrap_or_default();
             events
@@ -2023,12 +2113,15 @@ pub async fn observe(
                     event: CodexEvent::Lost,
                 })
                 .await?;
-            return Ok(());
+            follower.lose();
         }
         if tries == 0 {
             tracing::warn!("codex observer lost the session's app-server; following it again");
         }
-        let wait = AGAIN_AFTER[tries.min(AGAIN_AFTER.len() - 1)];
+        let wait = match follower.lost {
+            true => LOST_AGAIN,
+            false => AGAIN_AFTER[tries.min(AGAIN_AFTER.len() - 1)],
+        };
         tries += 1;
         tokio::select! {
             () = cancel.cancelled() => return Ok(()),
@@ -2073,11 +2166,17 @@ async fn follow(
     if let Some(subscribe) = follower.joined() {
         tx.send(Message::text(subscribe.to_string())).await?;
     }
+    // When a subscription Codex hasn't answered is given up on, and the
+    // connection with it.
+    let mut unanswered = follower
+        .asking()
+        .then(|| tokio::time::Instant::now() + SIGHT_WITHIN);
     // When its resume, refused while the thread was held elsewhere, is
     // asked again.
     let mut again: Option<tokio::time::Instant> = None;
     // When what it had open and Codex didn't send again is taken as gone.
     let mut confirm: Option<tokio::time::Instant> = None;
+
     let at = |when: Option<tokio::time::Instant>| when.unwrap_or_else(tokio::time::Instant::now);
     loop {
         tokio::select! {
@@ -2093,6 +2192,13 @@ async fn follow(
                 for seen in follower.confirmed() {
                     events.send(seen).await?;
                 }
+            }
+            () = tokio::time::sleep_until(at(unanswered)), if unanswered.is_some() => {
+                tracing::warn!(
+                    secs = SIGHT_WITHIN.as_secs(),
+                    "codex never answered the subscription to the session's thread; connecting again"
+                );
+                return Ok(());
             }
             steer = inbox.steers.recv(), if inbox.steering => match steer {
                 Some(text) => {
@@ -2156,6 +2262,9 @@ async fn follow(
                 if confirm.is_none() && follower.confirming() && follower.followed {
                     confirm = Some(tokio::time::Instant::now() + REPLAY_WITHIN);
                 }
+                unanswered = follower
+                    .asking()
+                    .then(|| unanswered.unwrap_or_else(|| tokio::time::Instant::now() + SIGHT_WITHIN));
                 for seen in seen {
                     events.send(seen).await?;
                 }
@@ -2819,7 +2928,7 @@ pub(crate) mod tests {
         let started =
             json!({"method": "turn/started", "params": {"threadId": "t1", "turn": {"id": "u1"}}});
         let completed = json!({"method": "turn/completed", "params": {"threadId": "t1", "turn": {"id": "u1", "status": "failed"}}});
-        let failed = CodexEvent::TurnFailed(TURN_FAILED.into());
+        let failed = CodexEvent::TurnFailed(crate::limit::TurnFailure::Failed(TURN_FAILED.into()));
         heard(&mut f, status("active"));
         heard(&mut f, started.clone());
         // No status at all: the completion is its end, and it failed.
@@ -2860,24 +2969,33 @@ pub(crate) mod tests {
     /// turn that didn't fail, or that was interrupted, isn't.
     #[test]
     fn a_failed_turn_is_said_with_its_words_in_either_order() {
+        use crate::limit::{LimitHit, TurnFailure};
+        let limit = || {
+            CodexEvent::TurnFailed(TurnFailure::Limit(LimitHit {
+                window: None,
+                resets_at: None,
+                at: None,
+            }))
+        };
         let heard = |f: &mut Follower, v: Value| -> Vec<CodexEvent> {
             f.heard(&v).0.into_iter().map(|s| s.event).collect()
         };
         let started = |turn: &str| json!({"method": "turn/started", "params": {"threadId": "t1", "turn": {"id": turn}}});
         let system_error = json!({"method": "thread/status/changed", "params": {"threadId": "t1", "status": {"type": "systemError"}}});
-        let words = "You’ve hit your usage limit. Try again later.";
+        let words = "stream disconnected before completion";
         let completed = |turn: &str| {
             json!({"method": "turn/completed", "params": {"threadId": "t1",
             "turn": {"id": turn, "status": "failed", "error": {"message": words}}}})
         };
-        let said = CodexEvent::TurnFailed(words.into());
+        let said = CodexEvent::TurnFailed(TurnFailure::Failed(words.into()));
+        let unsaid = CodexEvent::TurnFailed(TurnFailure::Failed(TURN_FAILED.into()));
 
         // Its status first: said failed at once, its words once they come.
         let mut f = Follower::new(Some("t1".into()), None);
         heard(&mut f, started("u1"));
         assert_eq!(
             heard(&mut f, system_error.clone()),
-            [CodexEvent::TurnFailed(TURN_FAILED.into()), CodexEvent::Idle]
+            [unsaid.clone(), CodexEvent::Idle]
         );
         assert_eq!(heard(&mut f, completed("u1")), std::slice::from_ref(&said));
         // Another turn's completion doesn't speak for it.
@@ -2894,12 +3012,26 @@ pub(crate) mod tests {
         );
         assert_eq!(heard(&mut f, system_error), []);
 
+        // Its usage limit, as Codex says it on the turn's completion.
+        let mut f = Follower::new(Some("t1".into()), None);
+        heard(&mut f, started("u1"));
+        let limited = json!({"method": "turn/completed", "params": {"threadId": "t1",
+            "turn": {"id": "u1", "status": "failed",
+            "error": {"message": "You’ve hit your usage limit.", "codexErrorInfo": "usageLimitExceeded"}}}});
+        assert_eq!(heard(&mut f, limited), [limit(), CodexEvent::Idle]);
+        // The next turn's start leaves it behind.
+        heard(&mut f, started("u2"));
+        assert_eq!(
+            heard(&mut f, completed("u2")),
+            [said.clone(), CodexEvent::Idle]
+        );
+
         // As Codex 0.166 recorded a usage limit: its status first, then its
-        // words; a finished or interrupted turn, never.
+        // error and words, the limit; a finished or interrupted turn, never.
         for (recording, failures) in [
             (
                 include_str!("../fixtures/codex/app-server-0.166-failed.jsonl"),
-                vec![CodexEvent::TurnFailed(TURN_FAILED.into()), said],
+                vec![unsaid, limit()],
             ),
             (
                 include_str!("../fixtures/codex/app-server-0.166-ok.jsonl"),
@@ -2924,8 +3056,9 @@ pub(crate) mod tests {
 
     /// Joined again on a new connection, it subscribes to its thread at
     /// once, takes the thread's status from the answer, keeps what Codex
-    /// sends again of its open requests and lets go of the rest, and says
-    /// refused what the line said into the turn Codex can no longer answer.
+    /// sends again of its open requests and lets go of the rest (and of
+    /// what it answered that Codex never said resolved), and says refused
+    /// what the line said into the turn Codex can no longer answer.
     #[test]
     fn joined_again_it_keeps_what_codex_still_asks_and_lets_go_of_the_rest() {
         let mut f = Follower::new(Some("t1".into()), None).at_once();
@@ -2939,8 +3072,15 @@ pub(crate) mod tests {
             "params": {"threadId": "t1", "turnId": "u1", "itemId": format!("exec-{id}"),
                 "command": "rm a.txt", "cwd": "/repo"}})
         };
+        let reply = |request: i64| Reply {
+            request: json!(request),
+            decision: Decision::Allow,
+            answers: None,
+        };
         f.heard(&ask(7));
         f.heard(&ask(8));
+        f.heard(&ask(9));
+        assert!(f.reply(&reply(9)).1.is_some());
         let row = Uuid::new_v4();
         f.line_steer(row, "and the docs").unwrap();
         assert!(!f.confirming());
@@ -2958,15 +3098,16 @@ pub(crate) mod tests {
         assert!(
             matches!(seen.as_slice(), [Seen { event: CodexEvent::Asks(a), .. }] if a.request == json!(7))
         );
-        let gone: Vec<CodexEvent> = f.confirmed().into_iter().map(|s| s.event).collect();
-        assert_eq!(gone, [CodexEvent::Resolved(json!(8))]);
+        let mut gone: Vec<String> = f
+            .confirmed()
+            .into_iter()
+            .map(|s| format!("{:?}", s.event))
+            .collect();
+        gone.sort();
+        let resolved = |id: i64| format!("{:?}", CodexEvent::Resolved(json!(id)));
+        assert_eq!(gone, [resolved(8), resolved(9)]);
         assert!(!f.confirming());
         // What it still asks is answered here; what went, isn't.
-        let reply = |request: i64| Reply {
-            request: json!(request),
-            decision: Decision::Allow,
-            answers: None,
-        };
         assert!(f.reply(&reply(7)).1.is_some());
         assert!(f.reply(&reply(8)).1.is_none());
     }
@@ -3844,6 +3985,73 @@ pub(crate) mod tests {
         cancel.cancel();
     }
 
+    /// A Codex session Desk lost sight of is followed again once its
+    /// app-server answers: said found, its thread's status as it is now.
+    /// A subscription Codex never answers ends its connection, to be made
+    /// again.
+    #[tokio::test]
+    async fn a_session_desk_lost_sight_of_is_found_again_and_an_unanswered_subscription_asked_again(
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("s.sock");
+        let mut servers = fake_servers(&socket);
+        let (events, mut seen) = mpsc::channel(16);
+        let cancel = CancellationToken::new();
+        tokio::spawn(observe(
+            socket,
+            Follower::new(Some("t1".into()), None).at_once(),
+            events,
+            mpsc::unbounded_channel().1,
+            mpsc::unbounded_channel().1,
+            mpsc::unbounded_channel().1,
+            None,
+            cancel.clone(),
+        ));
+        // Asked, never answered: given up on, and asked again on a new
+        // connection.
+        let mut ws = servers.recv().await.unwrap();
+        next_sent(&mut ws, |v| v["method"] == "thread/resume").await;
+        let again = tokio::time::timeout(SIGHT_WITHIN * 2, servers.recv())
+            .await
+            .expect("connected again")
+            .unwrap();
+        drop((ws, again));
+        // Every connection lost at once: lost sight of, said once.
+        let lost = tokio::time::timeout(SIGHT_WITHIN * 3, async {
+            loop {
+                tokio::select! {
+                    ws = servers.recv() => drop(ws),
+                    lost = seen.recv() => return lost.unwrap().event,
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(lost, CodexEvent::Lost);
+        let mut ws = tokio::time::timeout(LOST_AGAIN * 4, servers.recv())
+            .await
+            .expect("tried again")
+            .unwrap();
+        // Its app-server back: followed, found, and where its thread is.
+        let resume = next_sent(&mut ws, |v| v["method"] == "thread/resume").await;
+        say(
+            &mut ws,
+            json!({"id": resume["id"], "result": {"thread": {"id": "t1",
+                "status": {"type": "active", "activeFlags": []}}}}),
+        )
+        .await;
+        let mut next = async || {
+            tokio::time::timeout(Duration::from_secs(5), seen.recv())
+                .await
+                .unwrap()
+                .unwrap()
+                .event
+        };
+        assert_eq!(next().await, CodexEvent::Found);
+        assert_eq!(next().await, CodexEvent::Working { waiting: false });
+        cancel.cancel();
+    }
+
     #[tokio::test]
     async fn the_observer_hears_what_codex_asks_and_answers_it() {
         let dir = tempfile::tempdir().unwrap();
@@ -3917,13 +4125,21 @@ pub(crate) mod tests {
         assert_eq!(next!().event, CodexEvent::Late(json!(0)));
         // The server goes (without a goodbye) for good: the observer tries
         // to follow it again, says it lost sight of it once none follows
-        // within its time, and ends with what it forwards.
+        // within its time, once, and keeps trying until it is stopped.
         drop(ws);
         let lost = tokio::time::timeout(SIGHT_WITHIN * 3, seen.recv())
             .await
             .unwrap()
             .unwrap();
         assert_eq!(lost.event, CodexEvent::Lost);
+        assert!(
+            tokio::time::timeout(LOST_AGAIN * 4, seen.recv())
+                .await
+                .is_err(),
+            "said once"
+        );
+        assert!(!observer.is_finished());
+        cancel.cancel();
         let _ = tokio::time::timeout(Duration::from_secs(5), observer)
             .await
             .unwrap()

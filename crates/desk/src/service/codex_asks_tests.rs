@@ -614,13 +614,22 @@ async fn a_codex_turn_that_failed_leaves_its_session_done() {
             say(&mut ws, v.clone()).await;
         }
         until(|| d.view(s.id).unwrap().state == SessionState::Done).await;
-        // How it failed, in Codex's words once they come.
-        let words = "You\u{2019}ve hit your usage limit. Try again later.";
-        until(|| d.view(s.id).unwrap().failure == Some(TurnFailure::Failed(words.into()))).await;
+        // How it failed, once Codex says: on its plan's usage limit.
+        until(|| {
+            d.view(s.id)
+                .unwrap()
+                .failure
+                .as_ref()
+                .is_some_and(|f| f.limit().is_some())
+        })
+        .await;
         tokio::time::sleep(Duration::from_millis(100)).await;
         let v = d.view(s.id).unwrap();
         assert_eq!(v.state, SessionState::Done, "and stays so");
-        assert_eq!(serde_json::to_value(&v).unwrap()["failed"], words);
+        assert_eq!(
+            serde_json::to_value(&v).unwrap()["failed"],
+            "It stopped on its plan's usage limit"
+        );
         // Asked again: its failure is behind it.
         say(
             &mut ws,
@@ -680,8 +689,8 @@ async fn a_codex_turn_completed_failed_first_is_done_with_its_words() {
 
 /// The observer's connection to the app-server lost while its TUI runs:
 /// followed again, what Codex still asks stays the same request, answered
-/// from Desk there; never followed again, the session says Desk lost
-/// sight of it, said in Activity too.
+/// from Desk there; not followed again in time, the session says Desk
+/// lost sight of it, said in Activity too, until it is followed again.
 #[tokio::test]
 async fn a_codex_session_followed_again_keeps_its_request_and_one_lost_says_so() {
     with_test_pool(build_pool, |pool| async move {
@@ -745,7 +754,6 @@ async fn a_codex_session_followed_again_keeps_its_request_and_one_lost_says_so()
         until(|| d.view(s.id).unwrap().pending.is_some_and(|q| q.id != p.id)).await;
 
         // The app-server takes no more connections that last.
-        drop(servers);
         drop(ws);
         let lost = Some(TurnFailure::Failed(
             "Desk lost sight of this Codex session".into(),
@@ -753,6 +761,9 @@ async fn a_codex_session_followed_again_keeps_its_request_and_one_lost_says_so()
         for _ in 0..100 {
             if d.view(s.id).unwrap().failure == lost {
                 break;
+            }
+            if let Ok(ws) = servers.try_recv() {
+                drop(ws);
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
@@ -767,6 +778,64 @@ async fn a_codex_session_followed_again_keeps_its_request_and_one_lost_says_so()
             .iter()
             .any(|e| e.text.contains("Desk lost sight"));
         assert!(said, "said in Activity");
+
+        // Its app-server back: followed again, what it says is so again.
+        let mut ws = servers.recv().await.unwrap();
+        let resume = next_sent(&mut ws, |v| v["method"] == "thread/resume").await;
+        say(
+            &mut ws,
+            json!({"id": resume["id"], "result": {"thread": {"id": "t1",
+            "status": {"type": "active", "activeFlags": ["waitingOnApproval"]}}}}),
+        )
+        .await;
+        say(&mut ws, ask(1, None)).await;
+        until(|| d.view(s.id).unwrap().failure.is_none()).await;
+        until(|| d.view(s.id).unwrap().pending.is_some_and(|p| p.answerable)).await;
+        assert_eq!(d.view(s.id).unwrap().state, SessionState::Blocked);
+    })
+    .await;
+}
+
+/// A Codex session whose thread doesn't start within its start's watch
+/// is done, said not to have come up; its thread starting late brings it
+/// up after all, that behind it.
+#[tokio::test]
+async fn a_codex_session_that_comes_up_late_is_up_and_its_failure_behind_it() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        DeskStore::migrate(&pool).await.unwrap();
+        let d = Desk::start(
+            DeskStore::from_pool(pool),
+            options(dir.path()).with_program(Engine::Codex, fake_codex(dir.path())),
+            Default::default(),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        let server = serve(dir.path());
+        let s = d
+            .create(codex_session(dir.path(), false), None)
+            .await
+            .unwrap();
+        let mut ws = server.await.unwrap();
+        next_sent(&mut ws, |v| v["method"] == "initialized").await;
+        for _ in 0..100 {
+            if d.view(s.id).unwrap().state != SessionState::Starting {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        let v = d.view(s.id).unwrap();
+        assert_eq!(v.state, SessionState::Done);
+        assert_eq!(v.failed.as_deref(), Some("Codex didn't come up"));
+        say(
+            &mut ws,
+            json!({"method": "thread/started", "params": {"thread": {"id": "t1",
+            "environments": [{"cwd": "/repo"}], "path": null}}}),
+        )
+        .await;
+        until(|| d.view(s.id).unwrap().state == SessionState::Idle).await;
+        assert_eq!(d.view(s.id).unwrap().failure, None);
     })
     .await;
 }

@@ -614,8 +614,8 @@ async fn the_real_codex_a_boss_starts_runs_desks_gh_whatever_the_profile_puts_fi
 
 /// What the real Codex did is read from its rollout, as the boss reads it
 /// (crew.history, crew.inside): the prompt, the command it ran and its
-/// reply. A turn its model refuses on a usage limit ends done, with how it
-/// failed in Codex's words, and the next turn's start leaves that behind.
+/// reply. A turn its model refuses on a usage limit ends done, stopped on
+/// its plan's usage limit, and the next turn's start leaves that behind.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_real_codex_is_seen_inside_and_its_failed_turn_says_how() {
     let Some(bin) = codex_bin() else {
@@ -650,8 +650,11 @@ async fn the_real_codex_is_seen_inside_and_its_failed_turn_says_how() {
         .await;
         let v = d.view(s.id).unwrap();
         assert_eq!(v.state, SessionState::Done);
-        let failed = v.failure.unwrap().said();
-        assert!(failed.to_lowercase().contains("usage limit"), "{failed}");
+        assert!(v.failure.unwrap().limit().is_some());
+        assert_eq!(
+            v.failed.as_deref(),
+            Some("It stopped on its plan's usage limit")
+        );
 
         typed(&d, s.id, &heard, "say ok").await;
         assert_eq!(d.view(s.id).unwrap().failure, None);
