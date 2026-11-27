@@ -2178,9 +2178,7 @@ async fn follow(
     }
     // When a subscription Codex hasn't answered is given up on, and the
     // connection with it.
-    let mut unanswered = follower
-        .asking()
-        .map(|within| tokio::time::Instant::now() + within);
+    let mut unanswered = give_up_at(follower.asking(), None, tokio::time::Instant::now());
     // When its resume, refused while the thread was held elsewhere, is
     // asked again.
     let mut again: Option<tokio::time::Instant> = None;
@@ -2203,7 +2201,7 @@ async fn follow(
                     events.send(seen).await?;
                 }
             }
-            () = tokio::time::sleep_until(at(unanswered)), if unanswered.is_some() => {
+            () = tokio::time::sleep_until(at(unanswered.map(|(_, at)| at))), if unanswered.is_some() => {
                 tracing::warn!(
                     "codex never answered the subscription to the session's thread in time; connecting again"
                 );
@@ -2271,9 +2269,7 @@ async fn follow(
                 if confirm.is_none() && follower.confirming() && follower.followed {
                     confirm = Some(tokio::time::Instant::now() + REPLAY_WITHIN);
                 }
-                unanswered = follower
-                    .asking()
-                    .map(|within| unanswered.unwrap_or_else(|| tokio::time::Instant::now() + within));
+                unanswered = give_up_at(follower.asking(), unanswered, tokio::time::Instant::now());
                 for seen in seen {
                     events.send(seen).await?;
                 }
@@ -2283,6 +2279,21 @@ async fn follow(
             }
         }
     }
+}
+
+/// When a subscription Codex hasn't answered is given up on, as `asking`
+/// says how long it has ([`Follower::asking`]): when it `had` while it is
+/// the same ask, and from `now` once it is another, as when Desk's own
+/// resume is refused and its subscription is left to answer.
+fn give_up_at(
+    asking: Option<Duration>,
+    had: Option<(Duration, tokio::time::Instant)>,
+    now: tokio::time::Instant,
+) -> Option<(Duration, tokio::time::Instant)> {
+    asking.map(|within| match had {
+        Some((was, at)) if was == within => (was, at),
+        _ => (within, now + within),
+    })
 }
 
 /// The method a message names, read from its text where it isn't JSON.
@@ -3155,6 +3166,23 @@ pub(crate) mod tests {
         let mut f = Follower::new(Some("t1".into()), None).resuming(json!({}), tx);
         f.joined();
         assert_eq!(f.asking(), Some(RESUME_WITHIN));
+    }
+
+    /// The same ask keeps its time; another, as when Desk's own resume is
+    /// refused and its subscription is left unanswered, has its own from
+    /// then.
+    #[test]
+    fn an_unanswered_subscription_left_after_a_refused_resume_has_its_own_time() {
+        let start = tokio::time::Instant::now();
+        let resume = give_up_at(Some(RESUME_WITHIN), None, start);
+        assert_eq!(resume, Some((RESUME_WITHIN, start + RESUME_WITHIN)));
+        let later = start + Duration::from_secs(10);
+        assert_eq!(give_up_at(Some(RESUME_WITHIN), resume, later), resume);
+        assert_eq!(
+            give_up_at(Some(SIGHT_WITHIN), resume, later),
+            Some((SIGHT_WITHIN, later + SIGHT_WITHIN))
+        );
+        assert_eq!(give_up_at(None, resume, later), None);
     }
 
     #[test]
