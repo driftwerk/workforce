@@ -440,6 +440,25 @@ impl DeskStore {
         rows.iter().map(item).collect()
     }
 
+    /// Every boss's items not closed whose key starts with `prefix`, newest
+    /// first.
+    pub async fn items_keyed_from(&self, prefix: &str) -> Result<Vec<OpenItem>> {
+        let client = self.pool().get().await?;
+        client
+            .query(
+                &format!(
+                    "SELECT {COLUMNS} FROM boss_open_items \
+                     WHERE left(dedupe_key, length($1)) = $1 AND state <> 'closed' \
+                     ORDER BY opened_at DESC, id"
+                ),
+                &[&prefix],
+            )
+            .await?
+            .iter()
+            .map(item)
+            .collect()
+    }
+
     /// `boss`'s items closed since `since`, newest first, at most `limit`.
     pub async fn items_closed_since(
         &self,

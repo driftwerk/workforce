@@ -2052,3 +2052,131 @@ async fn a_plan_whose_group_gets_a_boss_passes_to_that_boss() {
     })
     .await;
 }
+
+/// A plan of the main boss's the plan limit pauses stays the main boss's
+/// while its group gets a boss of its own, its ask still on its card; once
+/// the limit lets it go, it passes to that boss as any running plan does.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_plan_the_plan_limit_pauses_stays_its_bosss_until_the_limit_lifts() {
+    use workforce_desk::plan::{self, Paused};
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let c = clients(dir.path(), pool).await;
+        let p =
+            c.d.propose_plan(
+                workforce_desk::NewPlan {
+                    draft: plan::Draft {
+                        goal: "Keep Infra green".into(),
+                        tickets: vec![plan::DraftTicket {
+                            title: "Fix the flaky deploy".into(),
+                            folder: dir.path().to_string_lossy().into_owned(),
+                            ..Default::default()
+                        }],
+                    },
+                    board: None,
+                    parallel: None,
+                    engine: Engine::Claude,
+                    group: Some("infra".into()),
+                    budget: None,
+                    result: None,
+                    goal_ticket: None,
+                },
+                &Party::manager("desk", "Desk"),
+                &By::manager("desk", "Desk", "For the test."),
+            )
+            .await
+            .unwrap();
+        let id = p.summary.plan.id;
+        c.d.approve_plan(id, 1, &By::you()).await.unwrap();
+        let words =
+            "by plan limit until 09:00: your weekly Claude plan is at 88%, over your 80% limit";
+        let paused_until = async |until: chrono::DateTime<chrono::Utc>| {
+            let (paused, _) = c.d.pause_plan_limit(id, words, until).await.unwrap();
+            let mut ask = workforce_desk::open_item::NewItem::ask(
+                "desk",
+                workforce_desk::open_item::OpenKind::Ask,
+                None,
+                "“Keep Infra green” is paused.",
+            );
+            ask.dedupe_key = paused.summary.plan.limit_key().unwrap();
+            ask.options = vec!["Raise to 95%".into(), "Keep".into()];
+            ask.cant_decide = Some("Only you can change your plan limit.".into());
+            c.d.store().item_open(&ask).await.unwrap();
+        };
+        let login = crate::subscription::test_support::claude_login(&format!(
+            "token-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let read = |used: f64| {
+            let week = workforce_common::usage::Window {
+                used_percent: used,
+                resets_at: Some(chrono::Utc::now() + chrono::Duration::hours(2)),
+                minutes: workforce_common::usage::SEVEN_DAY,
+            };
+            c.desk
+                .cost_governor
+                .plan_guard()
+                .observe(&login, &[week], chrono::Utc::now());
+        };
+        read(88.0);
+        c.crew.note_wake(
+            &c.desk,
+            Some(login.clone()),
+            &crate::cost_governor::Admission::Waits(format!(
+                "{} your weekly Claude plan is at 88%",
+                crate::hub_core::plan_guard::WAITS_PREFIX
+            )),
+            chrono::Utc::now(),
+        );
+        paused_until(chrono::Utc::now() + chrono::Duration::hours(2)).await;
+        crate::agent_config_write::save(
+            &c.mia,
+            "mia",
+            None,
+            &format!("[oversight]\nenabled = true\ngroup = \"infra\"\n{ACTS}"),
+            workforce_orchestrator::workflow_store::EditContext::new("web", None),
+            |_| true,
+        )
+        .await
+        .unwrap();
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        let s = c.d.plan(id).await.unwrap().summary;
+        assert_eq!(
+            (s.plan.boss.as_str(), s.plan.paused),
+            ("desk", Some(Paused::PlanLimit)),
+            "its boss's limit holds it, so it stays theirs"
+        );
+        assert_eq!(
+            s.ask.expect("its card's ask").options,
+            ["Raise to 95%", "Keep"]
+        );
+
+        read(40.0);
+        eventually(
+            "the plan to pass to Mia once the limit lets it go",
+            async || {
+                let p = c.d.plan(id).await.ok()?.summary.plan;
+                (p.boss == "mia").then_some(p)
+            },
+        )
+        .await;
+        let s = c.d.plan(id).await.unwrap().summary;
+        assert_eq!(s.plan.paused, Some(Paused::NoBoss), "it waits for Continue");
+        assert!(s.ask.is_none(), "its limit ask closed");
+        let told = |boss: &AgentService, said: &str| {
+            boss.sessions
+                .find(DESK_CHANNEL, PERSON)
+                .unwrap()
+                .is_some_and(|dm| dm.messages.iter().any(|m| m.content.contains(said)))
+        };
+        eventually("Mia told the plan is hers", async || {
+            told(&c.mia, "This plan is yours now: Mia runs Infra.").then_some(())
+        })
+        .await;
+        assert!(
+            !told(&c.desk, "“Keep Infra green” goes on"),
+            "the boss it passed from isn't told it goes on"
+        );
+    })
+    .await;
+}

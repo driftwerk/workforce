@@ -2853,3 +2853,126 @@ async fn a_plans_ticket_starts_in_its_own_worktree_from_before() {
     })
     .await;
 }
+
+#[tokio::test]
+async fn a_plan_the_plan_limit_pauses_says_until_when_and_carries_only_its_own_ask() {
+    use crate::open_item::{NewItem, OpenKind};
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(pool, dir.path()).await;
+        let p = d
+            .propose_plan(new_plan(dir.path(), &[("a", &[])]), &sarah(), &by_sarah())
+            .await
+            .unwrap();
+        let (id, boss) = (p.summary.plan.id, p.summary.plan.boss.clone());
+        d.approve_plan(id, 1, &By::you()).await.unwrap();
+        let until =
+            chrono::DateTime::from_timestamp(crate::crew::now().timestamp() + 86_400, 0).unwrap();
+        let at_88 = "by plan limit until Fri 09:00: your weekly ChatGPT plan is at 88%";
+        let (paused, new) = d.pause_plan_limit(id, at_88, until).await.unwrap();
+        assert!(new, "a new pause");
+        assert_eq!(paused.summary.plan.paused, Some(Paused::PlanLimit));
+        assert_eq!(paused.summary.paused_why.as_deref(), Some(at_88));
+        let pause = paused.summary.plan.limit_key().expect("its pause's key");
+        assert_eq!(
+            paused.summary.plan.paused_for.as_deref(),
+            Some(boss.as_str())
+        );
+        let at_91 = "by plan limit until Fri 09:00: your weekly ChatGPT plan is at 91%";
+        let (_, new) = d.pause_plan_limit(id, at_91, until).await.unwrap();
+        assert!(!new, "paused so already");
+        let read = d.plan(id).await.unwrap().summary;
+        assert_eq!(
+            read.paused_why.as_deref(),
+            Some(at_91),
+            "its words kept current"
+        );
+        assert_eq!(read.plan.paused_until, Some(until));
+        assert_eq!(read.plan.limit_key(), Some(pause.clone()), "the same pause");
+        assert!(read.ask.is_none(), "nothing asked yet");
+        d.pass_plan(id, &crate::crew::Party::manager("ada", "Ada"), &By::you())
+            .await
+            .unwrap();
+        let read = d.plan(id).await.unwrap().summary;
+        assert_eq!(
+            (
+                read.plan.boss.as_str(),
+                read.plan.paused,
+                read.plan.paused_until
+            ),
+            ("ada", Some(Paused::PlanLimit), Some(until)),
+            "a plan passed on keeps its limit pause"
+        );
+        assert!(
+            read.plan.paused_for_another(),
+            "paused under its former boss"
+        );
+        assert_eq!(read.plan.limit_key(), Some(pause.clone()));
+        assert_eq!(read.paused_why.as_deref(), Some(at_91));
+
+        let ask = |key: String| {
+            let mut new = NewItem::ask(&boss, OpenKind::Ask, None, "Raise?");
+            new.dedupe_key = key;
+            new.options = vec!["Raise to 95%".into(), "Keep".into()];
+            new.cant_decide = Some("Only you can change your plan limit.".into());
+            new
+        };
+        d.store()
+            .item_open(&ask(format!("plan-stopped:{id}")))
+            .await
+            .unwrap();
+        assert!(
+            d.plan(id).await.unwrap().summary.ask.is_none(),
+            "another ask of the plan's isn't its"
+        );
+        let crate::open_item_store::Opened::New(limit) =
+            d.store().item_open(&ask(pause.clone())).await.unwrap()
+        else {
+            panic!("a new ask");
+        };
+        let carried = d.plan(id).await.unwrap().summary.ask.expect("its ask");
+        assert_eq!(
+            carried.item_id,
+            limit.id.to_string(),
+            "its ask, whoever's boss it is"
+        );
+        assert_eq!(carried.options, ["Raise to 95%", "Keep"]);
+
+        assert!(d.resume_plan_limit(id).await.unwrap());
+        let read = d.plan(id).await.unwrap().summary;
+        assert_eq!(
+            (
+                read.plan.paused,
+                read.plan.paused_why.clone(),
+                read.plan.paused_until
+            ),
+            (None, None, None),
+            "resumed, nothing of the pause is left"
+        );
+        assert_eq!((read.plan.paused_at, read.plan.paused_for), (None, None));
+        assert!(
+            read.ask.is_none(),
+            "only a plan the limit pauses carries it"
+        );
+        assert!(!d.resume_plan_limit(id).await.unwrap(), "not paused so");
+        let (again, new) = d.pause_plan_limit(id, at_88, until).await.unwrap();
+        assert!(new);
+        assert!(
+            again.summary.plan.limit_key().is_some_and(|k| k != pause),
+            "a pause of its own, in the same window"
+        );
+        assert!(d.resume_plan_limit(id).await.unwrap());
+
+        d.pause_plan(id, Paused::Person, &By::you()).await.unwrap();
+        let (_, new) = d.pause_plan_limit(id, at_88, until).await.unwrap();
+        assert!(!new);
+        let read = d.plan(id).await.unwrap().summary;
+        assert_eq!(
+            read.plan.paused,
+            Some(Paused::Person),
+            "the person's pause stays theirs"
+        );
+        assert_eq!(read.plan.paused_until, None);
+    })
+    .await;
+}
