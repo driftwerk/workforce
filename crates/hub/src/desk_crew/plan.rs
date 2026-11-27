@@ -1500,10 +1500,9 @@ impl CrewHub {
         let id = p.summary.plan.id;
         self.keep_readings(id, &result, &readings).await;
         let text = format!(
-            "{} drafted a plan for you to review: {}\nIts sessions start in {}.\n\n{}",
+            "{} drafted a plan for you to review: {}\n\n{}",
             boss.name,
             p.summary.plan.goal,
-            group_said(&p),
             self.plan_lines(&p)
         );
         let placed = placed.said(group_said(&p));
