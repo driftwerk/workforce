@@ -33,6 +33,8 @@ pub mod sync;
 pub mod tools;
 
 #[cfg(test)]
+mod handed_routes_tests;
+#[cfg(test)]
 mod revoke_tests;
 
 use std::sync::Arc;

@@ -491,8 +491,6 @@ const CLAIMS: &[(&str, &str, &str, Claim)] = &[
     ("hub", "items", "person", By(C::DecisionRecords)),
     ("hub", "owners", "person", By(C::DecisionRecords)),
     ("hub", "daily", "person", By(C::DecisionRecords)),
-    // The requests an agent here handed to their Desk boss (DW-770), and
-    // when their Desk last took them: erased with what it shared.
     ("hub", "handed", "person", By(C::DecisionRecords)),
     ("hub", "checked_in", "person", By(C::DecisionRecords)),
     (

@@ -47,6 +47,10 @@ pub(super) fn stopped(e: &eyre::Report) -> bool {
     e.chain().any(|c| c.is::<TurnStopped>())
 }
 
+/// What a message of the DM that someone other than the person sent on is
+/// marked with, before its own id: never read as the person's words.
+pub(super) const RELAY_MARK: &str = "desk-relay:";
+
 tokio::task_local! {
     /// Set around a crew turn whose caller is told once its prompt is kept
     /// in the session, before it runs ([`told_when_asked`]).
@@ -199,7 +203,7 @@ impl CrewHub {
         // A message of the DM is found again by a mark of its own.
         let relay = author
             .is_some()
-            .then(|| format!("desk-relay:{}", workforce_desk::crew::new_id()));
+            .then(|| format!("{RELAY_MARK}{}", workforce_desk::crew::new_id()));
         let tx = self.state.broadcast_tx.clone();
         // Theirs, relayed: in this boss's picture as their word, before
         // its turn on it begins.

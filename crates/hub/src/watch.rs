@@ -110,8 +110,8 @@ pub(crate) const CREW_WATCH: &str = "No extra watch is needed for Desk's session
      minutes. Just say what you'll do when it next wakes you; \
      `watch` only polls read-only status tools.";
 
-/// Why `watch` doesn't poll the person's Desk work, nor the crew where this
-/// hub runs no Desk: their Desk boss keeps it on track, handed it by
+/// Why `watch` doesn't poll the person's Desk work, nor the crew for an
+/// agent that isn't a boss: their Desk boss keeps it on track, handed it by
 /// [`crate::desk_knows::handed`] (DW-770).
 pub(crate) const DESK_WORK_WATCH: &str = "Desk's work isn't polled: to have Desk keep it on \
      track and tell the person of each stall, hand it to their Desk boss with \
@@ -200,9 +200,12 @@ impl Tool for WatchTool {
         // in `scheduler`, which runs as a real owner through the gate.
         let watch_params = input.params.clone().unwrap_or_else(|| json!({}));
         if input.tool.starts_with("crew.") {
-            let why = match crate::desk_crew::for_agent(&self.service) {
-                Some(_) => CREW_WATCH,
-                None => DESK_WORK_WATCH,
+            let boss = crate::desk_crew::for_agent(&self.service)
+                .and_then(|(crew, now)| crew.overseer_named(now.agent_id.as_str()))
+                .is_some();
+            let why = match boss {
+                true => CREW_WATCH,
+                false => DESK_WORK_WATCH,
             };
             return Ok(ToolResult::failure(why, elapsed()));
         }

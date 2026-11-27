@@ -689,7 +689,8 @@ enum Ran {
 /// of its own, each with when.
 #[derive(Default)]
 pub(super) struct Talk {
-    /// The person's own messages: Desk's notes in it are not theirs.
+    /// The person's own messages: Desk's notes in it, and what another
+    /// sent on ([`super::deliver::RELAY_MARK`]), are not theirs.
     pub theirs: Vec<(DateTime<Utc>, String)>,
     /// The boss's replies: Desk's posts by it (plan cards, updates,
     /// notices, a turn's failure) aren't its words to answer.
@@ -728,7 +729,12 @@ fn talk_on(
         .filter(|m| m.at > since && !m.text.trim().is_empty())
         .filter(|m| match m.from {
             Author::User => {
-                m.author.kind == SpeakerKind::You && !crate::desk_surface::hub_note(m.text.trim())
+                m.author.kind == SpeakerKind::You
+                    && !crate::desk_surface::hub_note(m.text.trim())
+                    && !m
+                        .client_id
+                        .as_deref()
+                        .is_some_and(|c| c.starts_with(super::deliver::RELAY_MARK))
             }
             Author::Agent => m
                 .mark

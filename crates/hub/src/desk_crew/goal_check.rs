@@ -286,14 +286,14 @@ fn one_turn(looked: Vec<Looked>) -> Option<(Uuid, Vec<String>)> {
     Some((first.plan, lines))
 }
 
-/// The ids of `p`'s tickets' sessions ([`plan_sessions`]).
-pub(super) fn session_ids(p: &PlanDetail) -> Vec<String> {
-    plan_sessions(p).into_iter().map(|(id, _)| id).collect()
+/// The ids of `sessions`, as [`plan_sessions`] names them.
+pub(super) fn session_ids(sessions: &[(String, String)]) -> Vec<String> {
+    sessions.iter().map(|(id, _)| id.clone()).collect()
 }
 
 /// The sessions of `p`'s tickets, by id (`machine/id` on a machine), with
 /// what each is called: its ticket's key.
-fn plan_sessions(p: &PlanDetail) -> Vec<(String, String)> {
+pub(super) fn plan_sessions(p: &PlanDetail) -> Vec<(String, String)> {
     p.tickets
         .iter()
         .filter_map(|t| {
@@ -503,13 +503,11 @@ impl CrewHub {
                 return Vec::new();
             }
         }
-        // Each spell the boss is woken for, said back where a request it
-        // carries was asked (DW-770), as the person's roundup says it.
         if let Some(s) = goal::leading(&stalls).filter(|_| woke) {
             let sent = self.last_sent(service, sessions, s.since).await;
             let line = note_line(&plan.goal, now - s.since, sent, self.desk.timezone());
-            let ids: Vec<String> = sessions.iter().map(|(id, _)| id.clone()).collect();
-            self.flag_handed(service, plan, &ids, &line).await;
+            self.flag_handed(service, plan, &session_ids(sessions), &line)
+                .await;
         }
         if let Some(note) = note {
             let mut c = self.goal_checks.lock();
@@ -812,7 +810,7 @@ impl CrewHub {
         let mut sessions = HashSet::new();
         for (p, ..) in self.goals_checked().await.unwrap_or_default() {
             if let Ok(detail) = self.desk.plan(p.id).await {
-                sessions.extend(plan_sessions(&detail).into_iter().map(|(id, _)| id));
+                sessions.extend(session_ids(&plan_sessions(&detail)));
             }
         }
         self.goal_checks

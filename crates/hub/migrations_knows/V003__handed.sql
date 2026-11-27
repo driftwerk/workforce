@@ -1,6 +1,5 @@
--- A person's request an agent here handed to their Desk boss (DW-770):
--- their words, the session it is about and where they asked, taken by the
--- Desk on their own computer, and Desk's words on it told back there.
+-- Requests an agent here handed to the person's Desk boss (DW-770), and
+-- when each of their Desks last checked in for them.
 CREATE TABLE handed (
     id           UUID        PRIMARY KEY,
     person       UUID        NOT NULL,
@@ -13,6 +12,7 @@ CREATE TABLE handed (
     workspace    TEXT,
     channel      TEXT        NOT NULL,
     thread       TEXT,
+    conversation TEXT,
     asked_at     TIMESTAMPTZ NOT NULL,
     taken_at     TIMESTAMPTZ,
     taken_by     TEXT,
@@ -22,7 +22,8 @@ CREATE TABLE handed (
     ended        TEXT
 );
 CREATE INDEX handed_waiting ON handed (person, agent) WHERE ended_at IS NULL AND heard_at IS NULL;
--- When each of a person's Desks last checked in for requests.
+CREATE UNIQUE INDEX handed_open ON handed (person, agent, md5(words), coalesce(session, ''))
+    WHERE ended_at IS NULL AND heard_at IS NULL;
 CREATE TABLE checked_in (
     person UUID        NOT NULL,
     source TEXT        NOT NULL,

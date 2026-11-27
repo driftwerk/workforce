@@ -840,31 +840,59 @@ pub async fn status(State(state): State<Arc<GatewayState>>, headers: HeaderMap) 
     }
 }
 
-/// `POST /api/desk-knows/handed`.
-pub async fn take_handed(State(state): State<Arc<GatewayState>>, headers: HeaderMap) -> Response {
-    let live = match authenticate(&state, &headers, true) {
+/// What a Desk taking requests says of those it is delivering still.
+#[derive(Deserialize, Default)]
+struct TakeBody {
+    #[serde(default)]
+    delivering: Vec<Uuid>,
+}
+
+/// `POST /api/desk-knows/handed` `{delivering}`.
+pub async fn take_handed(
+    State(state): State<Arc<GatewayState>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    taking(&state, &headers, &body, store).await
+}
+
+/// [`take_handed`], over the store `store` gives.
+pub(super) async fn taking(
+    state: &GatewayState,
+    headers: &HeaderMap,
+    body: &[u8],
+    store: impl FnOnce() -> Result<Arc<dyn KnowsStore>, Response>,
+) -> Response {
+    let live = match authenticate(state, headers, true) {
         Ok(l) => l,
         Err(r) => return r,
     };
     if !own_computer(live.token.desk_link.as_ref().map(|l| l.engine_id.as_str())) {
-        return err(
-            StatusCode::FORBIDDEN,
-            "Only the Desk on your own computer takes requests.",
-        );
+        return not_own_computer();
     }
+    let Ok(body) = (match body.is_empty() {
+        true => Ok(TakeBody::default()),
+        false => serde_json::from_slice::<TakeBody>(body),
+    }) else {
+        return err(
+            StatusCode::BAD_REQUEST,
+            "Say which requests you are delivering still, by id.",
+        );
+    };
     let store = match store() {
         Ok(s) => s,
         Err(r) => return r,
     };
-    match store.take_handed(&live.owner, Utc::now()).await {
+    match store
+        .take_handed(&live.owner, Utc::now(), &body.delivering)
+        .await
+    {
         Ok(taken) => Json(json!({
             "handed": taken.iter().map(|h| json!({
                 "id": h.id,
                 "words": h.words,
                 "session": h.session,
-                "sessionName": h.session_name,
-                "agentName": h.agent_name,
-                "place": super::handed::place_of(&h.platform),
+                "platform": h.platform,
                 "askedAt": h.asked_at,
             })).collect::<Vec<_>>(),
         }))
@@ -879,6 +907,13 @@ pub async fn take_handed(State(state): State<Arc<GatewayState>>, headers: Header
     }
 }
 
+fn not_own_computer() -> Response {
+    err(
+        StatusCode::FORBIDDEN,
+        "Only the Desk on your own computer takes requests and answers them.",
+    )
+}
+
 #[derive(Deserialize)]
 struct SayBody {
     text: String,
@@ -891,11 +926,25 @@ pub async fn say_handed(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    let live = match authenticate(&state, &headers, true) {
+    saying(&state, id, &headers, &body, store).await
+}
+
+/// [`say_handed`], over the store `store` gives.
+pub(super) async fn saying(
+    state: &GatewayState,
+    id: Uuid,
+    headers: &HeaderMap,
+    body: &[u8],
+    store: impl FnOnce() -> Result<Arc<dyn KnowsStore>, Response>,
+) -> Response {
+    let live = match authenticate(state, headers, true) {
         Ok(l) => l,
         Err(r) => return r,
     };
-    let Some(text) = serde_json::from_slice::<SayBody>(&body)
+    if !own_computer(live.token.desk_link.as_ref().map(|l| l.engine_id.as_str())) {
+        return not_own_computer();
+    }
+    let Some(text) = serde_json::from_slice::<SayBody>(body)
         .ok()
         .and_then(|b| plain(&b.text, super::handed::SAY_CHARS).map(str::to_string))
     else {
@@ -912,7 +961,7 @@ pub async fn say_handed(
         person: live.owner.person,
         agent: live.owner.agent.clone(),
     };
-    match super::handed::say(&state, store.as_ref(), &reader, id, &text).await {
+    match super::handed::say(state, store.as_ref(), &reader, id, &text).await {
         Ok(Said::Told) => {
             tracing::info!(target: "sentinel.audit", agent = %reader.agent, handed = %id, "Desk's word on a request was told where it was asked");
             Json(json!({ "said": true })).into_response()

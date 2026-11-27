@@ -1,13 +1,11 @@
 //! A person asks their agent in Slack to keep work on track in Desk
-//! (DW-770, 25 Nov): the request waits on the agent's hub, their Desk takes
-//! it, its boss holds it as their own words relayed by the agent, and the
-//! goal's stall is told back in the Slack thread it was asked in.
+//! (DW-770, 25 Nov): the request waits on the agent's hub, their Desk's
+//! sync takes it, its boss holds it as their own words relayed by the agent,
+//! and the goal's stall is told back in the Slack thread it was asked in.
 
-use parking_lot::Mutex;
 use uuid::Uuid;
-use workforce_common::channels::{
-    ChannelCapabilities, ChannelSurface, OutboundMessage, Reaction, SentMessage, SurfaceKey,
-};
+use workforce_common::channels::SurfaceKey;
+use workforce_common::settings::DeskKnowsSyncConfig;
 use workforce_desk::conversations::SpeakerKind;
 
 use super::goal_checks::{checking, mantis};
@@ -15,52 +13,15 @@ use super::goals::boss_on;
 use super::plan_watch::asked_with;
 use super::*;
 use crate::desk_knows::store::{Handed as Asked, KnowsStore, MemoryKnows, Owner, Reader};
+use crate::desk_knows::sync::KnowsSync;
+use crate::serve::testing::SentToSlack;
 
 const WORDS: &str = "ok keep Mantis CI fast on track in desk please";
 const GOAL: &str = "keep Mantis CI fast";
 
-/// What was posted on Slack: channel, thread and text.
-#[derive(Default)]
-struct Posted(Mutex<Vec<(String, Option<String>, String)>>);
-
-impl Posted {
-    fn saying(&self, words: &str) -> Vec<(String, Option<String>, String)> {
-        self.0
-            .lock()
-            .iter()
-            .filter(|(_, _, text)| text.contains(words))
-            .cloned()
-            .collect()
-    }
-}
-
-#[async_trait::async_trait]
-impl ChannelSurface for Posted {
-    fn platform(&self) -> &str {
-        "slack"
-    }
-    fn capabilities(&self) -> ChannelCapabilities {
-        ChannelCapabilities::default()
-    }
-    async fn add_reaction(&self, _: &Reaction) -> eyre::Result<()> {
-        Ok(())
-    }
-    async fn remove_reaction(&self, _: &Reaction) -> eyre::Result<()> {
-        Ok(())
-    }
-    async fn send_message(&self, message: &OutboundMessage) -> eyre::Result<SentMessage> {
-        self.0.lock().push((
-            message.channel.clone(),
-            message.thread_id.clone(),
-            message.text.clone(),
-        ));
-        Ok(SentMessage {
-            channel: message.channel.clone(),
-            message_id: "1".to_string(),
-            thread_id: message.thread_id.clone(),
-            platform: "slack".to_string(),
-        })
-    }
+/// The person, as their own computer's Desk and its links name them.
+fn owner() -> String {
+    Uuid::from_u128(7).to_string()
 }
 
 /// The person's Desk on their own computer, linked to agent `agent` here.
@@ -86,45 +47,51 @@ fn asked(agent: &str, words: &str, session: Option<String>) -> Asked {
         workspace: Some("T1".into()),
         channel: "D1".into(),
         thread: Some("1700.1".into()),
+        conversation: None,
         asked_at: chrono::Utc::now(),
     }
 }
 
-/// Takes what waits for the person's Desk in `knows` and hands it to
-/// `crew` from `person`'s link, as their Desk's sync does: twice, as a
-/// Desk that died mid-delivery would.
-async fn taken(crew: &Arc<CrewHub>, knows: &MemoryKnows, agent: &str, person: &str) {
-    let desk = their_desk(agent);
-    for h in knows.take_handed(&desk, chrono::Utc::now()).await.unwrap() {
-        let h = crate::desk_knows::sync::local_handed(&format!("local/{agent}"), &h);
-        crew.take_handed(person, h.clone()).await.unwrap();
-        crew.take_handed(person, h).await.unwrap();
-    }
+/// The crew's Desk sync, its person `person`, over `knows` for this hub's
+/// own agents.
+fn sync_of(crew: &CrewHub, d: &Desk, knows: &Arc<MemoryKnows>, person: &str) -> KnowsSync {
+    let person = person.to_string();
+    KnowsSync::new(
+        Arc::clone(&crew.state),
+        d.clone(),
+        DeskKnowsSyncConfig::default(),
+        Arc::new(move || Some(person.clone())),
+    )
+    .over(Arc::clone(knows) as Arc<dyn KnowsStore>)
 }
 
-/// Sends what Desk owes back, as its sync does for an agent of this hub.
-async fn says(crew: &CrewHub, knows: &MemoryKnows, agent: &str) {
-    let reader = Reader {
-        person: their_desk(agent).person,
-        agent: agent.into(),
-    };
-    let store = crew.desk.store();
-    for o in store.handed_owed(50).await.unwrap() {
-        crate::desk_knows::handed::say(&crew.state, knows, &reader, o.handed, &o.text)
-            .await
-            .unwrap();
-        store.handed_sent(o.id).await.unwrap();
-    }
+/// `boss`'s Desk DM with the person, theirs, the newest: the crew reads
+/// them as the person whose Desk this is, with GitHub as their key reads it.
+fn their_dm(boss: &AgentService, person: &str) {
+    boss.vault
+        .as_ref()
+        .expect("the agent's vault")
+        .set(
+            &format!("users/{person}/skills/github/token"),
+            "their-token",
+        )
+        .unwrap();
+    let dm = boss
+        .sessions
+        .get_or_create(DESK_CHANNEL, person, boss.agent_id.as_str())
+        .unwrap();
+    boss.sessions.save(&dm).unwrap();
 }
 
 /// The person's `words` in their Slack DM thread with `agent`, handed by
-/// its tool from that turn to `knows`: what the tool answered.
+/// its tool from that turn to `knows`: what the tool answered, and the
+/// agent's session there.
 async fn handed_in_slack(
     agent: &Arc<AgentService>,
     knows: &Arc<MemoryKnows>,
     words: &str,
     session: &str,
-) -> Value {
+) -> (Value, String) {
     use workforce_agent::tools::Tool as _;
     let scheduler = Arc::new(crate::scheduler::Scheduler::new(Arc::clone(agent)));
     let key = "slack:T1:D1:1700.1";
@@ -134,6 +101,7 @@ async fn handed_in_slack(
     let desk = their_desk(agent.agent_id.as_str());
     let mut dm = workforce_common::session::Session::new(key, &desk.person.to_string(), "desk");
     dm.context_type = Some(workforce_common::session::SessionContextType::Dm);
+    agent.sessions.save(&dm).unwrap();
     // The turn's own message: not yet in the session store.
     dm.messages
         .push(workforce_common::session::SessionMessage::user(
@@ -150,12 +118,24 @@ async fn handed_in_slack(
     let r = workforce_agent::runner::CURRENT_SESSION_KEY
         .scope(
             key.into(),
-            tool.execute(json!({ "person_said": words, "session": session })),
+            workforce_agent::runner::CURRENT_SESSION_ID.scope(
+                dm.id.clone(),
+                tool.execute(json!({ "person_said": words, "session": session })),
+            ),
         )
         .await
         .unwrap();
     assert!(r.success, "{r:?}");
-    r.output
+    (r.output, dm.id)
+}
+
+/// What `sent` holds that says `words`.
+fn saying(slack: &SentToSlack, words: &str) -> Vec<(String, Option<String>, String)> {
+    slack
+        .sent()
+        .into_iter()
+        .filter(|(_, _, text)| text.contains(words))
+        .collect()
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -166,11 +146,7 @@ async fn a_request_handed_from_slack_is_kept_as_a_goal_on_the_persons_words_and_
         let base = std::fs::canonicalize(dir.path()).unwrap();
         let gh = mantis(chrono::Utc::now(), 22, "diverged").await;
         let (boss, crew, d, llm) = boss_on(&base, pool, &checking(5), &gh).await;
-        let slack = Arc::new(Posted::default());
-        boss.surface_registry
-            .write()
-            .await
-            .register(SurfaceKey::workspace("slack", "T1"), slack.clone());
+        let slack = SentToSlack::on(&boss).await;
         let r = super::goals::run(
             &boss,
             "crew.start_session",
@@ -182,6 +158,7 @@ async fn a_request_handed_from_slack_is_kept_as_a_goal_on_the_persons_words_and_
             d.list().into_iter().find(|v| v.goal == "Make Mantis CI fast")
         })
         .await;
+        their_dm(&boss, &owner());
         // What the person's Desk shares with the agent: the session's account.
         let knows = MemoryKnows::new();
         knows
@@ -200,18 +177,19 @@ async fn a_request_handed_from_slack_is_kept_as_a_goal_on_the_persons_words_and_
             .await
             .unwrap();
         knows
-            .take_handed(&their_desk("desk"), chrono::Utc::now())
+            .take_handed(&their_desk("desk"), chrono::Utc::now(), &[])
             .await
             .unwrap();
-        let queued = handed_in_slack(&boss, &knows, WORDS, &s.id.to_string()).await;
+        let (queued, conversation) = handed_in_slack(&boss, &knows, WORDS, &s.id.to_string()).await;
         assert!(
             queued["message"].as_str().unwrap().starts_with("Handed to your Desk."),
             "{queued}"
         );
-        taken(&crew, &knows, "desk", PERSON).await;
+        let sync = sync_of(&crew, &d, &knows, &owner());
+        sync.take("local/desk").await.unwrap();
 
         let theirs = eventually("their words, exactly, in the boss's DM", async || {
-            let dm = boss.sessions.find(DESK_CHANNEL, PERSON).ok()??;
+            let dm = boss.sessions.find(DESK_CHANNEL, &owner()).ok()??;
             dm.messages.into_iter().find(|m| m.content == WORDS)
         })
         .await;
@@ -225,45 +203,67 @@ async fn a_request_handed_from_slack_is_kept_as_a_goal_on_the_persons_words_and_
         .await;
         assert_eq!(author.kind, SpeakerKind::Overseer);
         assert_eq!(author.id, "local/desk");
-        // The fixture's person has no name in the identity store.
         assert_eq!(author.name, "Desk, in Slack");
 
         let answered = eventually("its word back", async || {
-            says(&crew, &knows, "desk").await;
-            let told = slack.saying("has your request and answered");
+            sync.says().await;
+            let told = saying(&slack, "isn't kept as a goal yet");
             (!told.is_empty()).then_some(told)
         })
         .await;
-        assert_eq!(answered.len(), 1, "delivered once, though taken twice");
+        assert_eq!(answered.len(), 1);
         assert_eq!(answered[0].0, "D1");
         assert_eq!(answered[0].1.as_deref(), Some("1700.1"));
         assert_eq!(asked_with(&llm, &[WORDS, "passed on by Desk"]).await, 1);
+        let told_agent = boss.sessions.get(&conversation).unwrap().unwrap();
+        assert!(
+            told_agent
+                .messages
+                .iter()
+                .any(|m| m.content == answered[0].2),
+            "the agent knows what its person was told"
+        );
 
-        // The boss keeps it as a goal on the person's words, relayed: they
-        // read as theirs.
-        let r = super::goals::run(
+        // Relayed, their words are never read as typed in the DM.
+        assert!(crew.agreed_at(&boss, GOAL, GOAL).is_err());
+        let other = super::goals::run(
             &boss,
             "crew.plan",
             json!({
-                "goal": GOAL,
-                "agreed": { "person_said": "keep Mantis CI fast" },
+                "goal": "Ship the docs site",
+                "agreed": { "person_said": GOAL },
+                "result": { "words": "Done when CI on main is green", "parts": [{
+                    "kind": "ci", "repo": "acme/mantis", "branch": "main",
+                    "want": { "kind": "green", "runs": 1 } }] },
+            }),
+        )
+        .await;
+        assert!(!other.success, "they agree their own goal alone: {other:?}");
+
+        // They agree the goal they say, once.
+        let plan = |goal: &str| {
+            json!({
+                "goal": goal,
+                "agreed": { "person_said": GOAL },
                 "result": { "words": "Done when CI on main is green", "parts": [{
                     "kind": "ci", "repo": "acme/mantis", "branch": "main",
                     "want": { "kind": "green", "runs": 1 } }] },
                 "tickets": [{ "session": s.id.to_string() }],
-            }),
-        )
-        .await;
+            })
+        };
+        let r = super::goals::run(&boss, "crew.plan", plan(GOAL)).await;
         assert!(r.success, "{r:?}");
         let id: uuid::Uuid = r.output["proposed"]["plan_id"].as_str().unwrap().parse().unwrap();
         let p = d.plan(id).await.unwrap().summary.plan;
-        assert_eq!(p.agreed.as_deref(), Some("keep Mantis CI fast"));
+        assert_eq!(p.agreed.as_deref(), Some(GOAL));
         assert_eq!(p.state, workforce_desk::plan::PlanState::Running);
+        let again = super::goals::run(&boss, "crew.plan", plan(GOAL)).await;
+        assert!(!again.success, "a plan carries it already: {again:?}");
 
         // CI stays slow.
         let stalled = eventually("its stall told back in Slack", async || {
-            says(&crew, &knows, "desk").await;
-            let told = slack.saying("Desk (your Desk boss): No progress on");
+            sync.says().await;
+            let told = saying(&slack, "Desk (your Desk boss): No progress on");
             (!told.is_empty()).then_some(told)
         })
         .await;
@@ -274,103 +274,365 @@ async fn a_request_handed_from_slack_is_kept_as_a_goal_on_the_persons_words_and_
     .await;
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn a_request_with_no_boss_for_it_or_from_another_persons_link_is_said_back_and_never_delivered(
+/// Hands `h` to `crew` from `person`'s link, through the sync over `knows`,
+/// and sends what it owes back.
+async fn handed_through(
+    crew: &Arc<CrewHub>,
+    d: &Desk,
+    knows: &Arc<MemoryKnows>,
+    person: &str,
+    h: &Asked,
 ) {
+    knows.hand(h).await.unwrap();
+    let sync = sync_of(crew, d, knows, person);
+    sync.take("local/desk").await.unwrap();
+    sync.says().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_request_desk_cannot_deliver_is_said_back_saying_why_and_never_delivered() {
     with_test_pool(workforce_desk::store::build_pool, |pool| async move {
         let dir = tempfile::tempdir().unwrap();
         let base = std::fs::canonicalize(dir.path()).unwrap();
         let gh = mantis(chrono::Utc::now(), 22, "diverged").await;
-        let (boss, crew, _, llm) = boss_on(&base, pool, &checking(5), &gh).await;
-        let slack = Arc::new(Posted::default());
-        boss.surface_registry
-            .write()
-            .await
-            .register(SurfaceKey::platform("slack"), slack.clone());
+        let (boss, crew, d, llm) = boss_on(&base, pool, &checking(5), &gh).await;
+        let slack = SentToSlack::on(&boss).await;
+        boss.surface_registry.write().await.register(
+            SurfaceKey::workspace("slack", "T1"),
+            Arc::clone(&slack) as _,
+        );
+        their_dm(&boss, &owner());
         let knows = MemoryKnows::new();
-        knows
-            .hand(&asked("desk", WORDS, Some(Uuid::new_v4().to_string())))
-            .await
-            .unwrap();
-        taken(&crew, &knows, "desk", PERSON).await;
-        knows
-            .hand(&asked("desk", "keep the docs green", None))
-            .await
-            .unwrap();
-        taken(&crew, &knows, "desk", "someone-else").await;
+        let asking = |words: &str, session: Option<String>| asked("desk", words, session);
 
-        says(&crew, &knows, "desk").await;
-        assert_eq!(slack.saying("doesn't have the session").len(), 1);
-        assert_eq!(slack.saying("This Desk isn't yours").len(), 1);
+        let gone = asking(
+            "keep the old work on track please",
+            Some(Uuid::new_v4().to_string()),
+        );
+        handed_through(&crew, &d, &knows, &owner(), &gone).await;
+        assert_eq!(
+            saying(&slack, "doesn't have the session you named").len(),
+            1
+        );
+
+        let unreadable = asking(
+            "keep that thing on track please",
+            Some("not a session".into()),
+        );
+        handed_through(&crew, &d, &knows, &owner(), &unreadable).await;
+        assert_eq!(saying(&slack, "couldn't tell which session").len(), 1);
+
+        let long = asking(
+            &format!("keep this on track {}", "please ".repeat(200)),
+            None,
+        );
+        handed_through(&crew, &d, &knows, &owner(), &long).await;
+        assert_eq!(saying(&slack, "too long for your Desk").len(), 1);
+
+        let theirs = asking("keep the docs green on track please", None);
+        knows.hand(&theirs).await.unwrap();
+        crew.take_handed(
+            &Uuid::from_u128(8).to_string(),
+            crate::desk_knows::sync::local_handed("local/desk", "Desk", &theirs),
+        )
+        .await
+        .unwrap();
+        sync_of(&crew, &d, &knows, &owner()).says().await;
+        assert_eq!(saying(&slack, "This Desk isn't yours").len(), 1);
+
+        assert_eq!(
+            asked_with(&llm, &["keep the old work on track", "passed on by Desk"]).await
+                + asked_with(&llm, &["keep that thing on track", "passed on by Desk"]).await
+                + asked_with(&llm, &["keep the docs green", "passed on by Desk"]).await,
+            0
+        );
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_request_with_no_boss_over_it_is_told_what_turns_one_on() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(dir.path()).unwrap();
+        let gh = mantis(chrono::Utc::now(), 22, "diverged").await;
+        let (boss, crew, d, llm) = boss_on(&base, pool, &checking(5), &gh).await;
+        let slack = SentToSlack::on(&boss).await;
+        boss.surface_registry.write().await.register(
+            SurfaceKey::workspace("slack", "T1"),
+            Arc::clone(&slack) as _,
+        );
+        write_config(
+            &boss,
+            "[oversight]\nenabled = true\ngroup = \"acme\"\nlevel = \"act\"\n",
+        );
+        eventually("the boss over acme alone", async || {
+            crew.overseer_for(&workforce_common::oversight::Scope::Ungrouped)
+                .is_none()
+                .then_some(())
+        })
+        .await;
+        their_dm(&boss, &owner());
+        let knows = MemoryKnows::new();
+        let loose = asked("desk", "keep the docs green on track please", None);
+        handed_through(&crew, &d, &knows, &owner(), &loose).await;
+        assert_eq!(saying(&slack, "You have no boss in Desk yet").len(), 1);
+
+        let session = new_session(&d, &base, "atlas-web").await;
+        d.change_layout(|l| {
+            l.create(
+                "atlas",
+                "Atlas",
+                &[workforce_desk::session_item(session.id)],
+                None,
+            )
+        })
+        .await
+        .unwrap();
+        let grouped = asked(
+            "desk",
+            "keep atlas on track please",
+            Some(session.id.to_string()),
+        );
+        handed_through(&crew, &d, &knows, &owner(), &grouped).await;
+        assert_eq!(saying(&slack, "No boss oversees").len(), 1);
         assert_eq!(asked_with(&llm, &["passed on by Desk"]).await, 0);
     })
     .await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_request_taken_again_after_desk_stopped_is_delivered_or_said_to_wait_in_the_dm() {
+async fn a_request_taken_again_after_desk_stopped_is_delivered_once_or_said_to_wait_in_the_dm() {
     with_test_pool(workforce_desk::store::build_pool, |pool| async move {
         let dir = tempfile::tempdir().unwrap();
         let base = std::fs::canonicalize(dir.path()).unwrap();
         let gh = mantis(chrono::Utc::now(), 22, "diverged").await;
         let (boss, crew, d, llm) = boss_on(&base, pool, &checking(5), &gh).await;
-        let slack = Arc::new(Posted::default());
-        boss.surface_registry
-            .write()
-            .await
-            .register(SurfaceKey::platform("slack"), slack.clone());
+        let slack = SentToSlack::on(&boss).await;
+        their_dm(&boss, &owner());
         let knows = MemoryKnows::new();
         let store = d.store();
+        let kept = |h: &Asked| crate::desk_knows::sync::local_handed("local/desk", "Desk", h);
 
         // Kept, then Desk stopped before delivering it.
         let never = asked("desk", WORDS, None);
         knows.hand(&never).await.unwrap();
-        let taken_first = knows
-            .take_handed(&their_desk("desk"), chrono::Utc::now())
-            .await
-            .unwrap();
-        store
-            .handed_keep(&crate::desk_knows::sync::local_handed(
-                "local/desk",
-                &taken_first[0],
-            ))
-            .await
-            .unwrap();
+        store.handed_keep(&kept(&never)).await.unwrap();
         // Delivered, then Desk stopped before its boss answered.
-        let lost = asked("desk", "keep the docs green", None);
-        let lost_kept = crate::desk_knows::sync::local_handed("local/desk", &lost);
-        store.handed_keep(&lost_kept).await.unwrap();
-        store.handed_delivered(lost.id, "desk").await.unwrap();
-
-        // The hub offers both again after a while.
-        for h in [&taken_first[0], &lost] {
-            crew.take_handed(
-                PERSON,
-                crate::desk_knows::sync::local_handed("local/desk", h),
-            )
+        let lost = asked("desk", "keep the docs green on track please", None);
+        knows.hand(&lost).await.unwrap();
+        store.handed_keep(&kept(&lost)).await.unwrap();
+        store
+            .handed_delivered(&kept(&lost), "desk", chrono::Utc::now())
             .await
             .unwrap();
+
+        // The hub offers both again; the first is taken twice at once.
+        for h in [&never, &never, &lost] {
+            crew.take_handed(&owner(), kept(h)).await.unwrap();
         }
         eventually("the undelivered one delivered", async || {
             (asked_with(&llm, &[WORDS, "passed on by Desk"]).await > 0).then_some(())
         })
         .await;
-        knows.hand(&lost).await.unwrap();
+        let sync = sync_of(&crew, &d, &knows, &owner());
         eventually("both said back", async || {
-            says(&crew, &knows, "desk").await;
-            (!slack.saying("has your request and answered").is_empty()).then_some(())
+            sync.says().await;
+            (!saying(&slack, "isn't kept as a goal yet").is_empty()).then_some(())
         })
         .await;
         assert_eq!(
-            slack
-                .saying("has your request in your Desk DM, but Desk stopped before it answered")
-                .len(),
+            asked_with(&llm, &[WORDS, "passed on by Desk"]).await,
+            1,
+            "delivered once"
+        );
+        assert_eq!(
+            saying(
+                &slack,
+                "has your request in your Desk DM, but Desk stopped before it answered"
+            )
+            .len(),
             1
         );
         assert_eq!(
             asked_with(&llm, &["keep the docs green", "passed on by Desk"]).await,
             0
         );
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_word_the_hub_cannot_post_is_kept_to_try_again_and_one_it_never_knew_is_done() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(dir.path()).unwrap();
+        let gh = mantis(chrono::Utc::now(), 22, "diverged").await;
+        let (boss, crew, d, _llm) = boss_on(&base, pool, &checking(5), &gh).await;
+        their_dm(&boss, &owner());
+        let knows = MemoryKnows::new();
+        let store = d.store();
+        // No surface for Slack: the hub can't post Desk's word.
+        let unknown = crate::desk_knows::sync::local_handed(
+            "local/desk",
+            "Desk",
+            &asked("desk", "keep the docs green on track please", None),
+        );
+        store.handed_keep(&unknown).await.unwrap();
+        store
+            .handed_say(&unknown, "Your Desk boss has it.")
+            .await
+            .unwrap();
+        let h = asked("desk", WORDS, None);
+        knows.hand(&h).await.unwrap();
+        let kept = crate::desk_knows::sync::local_handed("local/desk", "Desk", &h);
+        store.handed_keep(&kept).await.unwrap();
+        store
+            .handed_say(&kept, "Your Desk boss has it.")
+            .await
+            .unwrap();
+
+        let sync = sync_of(&crew, &d, &knows, &owner());
+        sync.says().await;
+        let owed = store.handed_owed(10).await.unwrap();
+        assert_eq!(owed.len(), 1, "the one never known is done with");
+        assert_eq!(owed[0].handed, h.id);
+        sync.says().await;
+        assert_eq!(
+            store.handed_owed(10).await.unwrap().len(),
+            1,
+            "waiting out its back-off, untried"
+        );
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_machines_desk_takes_no_request() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(dir.path()).unwrap();
+        let gh = mantis(chrono::Utc::now(), 22, "diverged").await;
+        let machine_dir = tempfile::tempdir().unwrap();
+        let machine = super::machine_desk(pool.clone(), machine_dir.path()).await;
+        let (boss, crew, _d, llm) = boss_on(&base, pool, &checking(5), &gh).await;
+        their_dm(&boss, &owner());
+        let rule = workforce_desk::knows::Rule::new(&[], false, Default::default()).unwrap();
+        machine
+            .store()
+            .knows_rule_put("local/desk", &rule, chrono::Utc::now())
+            .await
+            .unwrap();
+        let knows = MemoryKnows::new();
+        knows.hand(&asked("desk", WORDS, None)).await.unwrap();
+        sync_of(&crew, &machine, &knows, &owner()).pass().await;
+        assert_eq!(
+            knows
+                .checked_in(&Reader {
+                    person: their_desk("desk").person,
+                    agent: "desk".into(),
+                })
+                .await
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            knows
+                .take_handed(&their_desk("desk"), chrono::Utc::now(), &[])
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "still waiting for the person's own computer's Desk"
+        );
+        assert_eq!(asked_with(&llm, &["passed on by Desk"]).await, 0);
+    })
+    .await;
+}
+
+/// A hub answering Desk's word on each request with the status `statuses`
+/// gives its id, counting what it is sent.
+async fn hub_answering(statuses: Vec<(Uuid, u16)>) -> (String, Arc<parking_lot::Mutex<Vec<Uuid>>>) {
+    let seen = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let log = Arc::clone(&seen);
+    let app = axum::Router::new().route(
+        "/api/desk-knows/handed/{id}/say",
+        axum::routing::post(move |axum::extract::Path(id): axum::extract::Path<Uuid>| {
+            let (log, statuses) = (Arc::clone(&log), statuses.clone());
+            async move {
+                log.lock().push(id);
+                let status = statuses
+                    .iter()
+                    .find(|(h, _)| *h == id)
+                    .map_or(500, |(_, s)| *s);
+                StatusCode::from_u16(status).unwrap()
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    (url, seen)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_word_another_hub_can_never_take_is_done_and_one_it_refuses_now_is_kept() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(dir.path()).unwrap();
+        let gh = mantis(chrono::Utc::now(), 22, "diverged").await;
+        let (_boss, _crew, d, _llm) = boss_on(&base, pool, &checking(5), &gh).await;
+        let gone = Uuid::new_v4();
+        let refused = Uuid::new_v4();
+        let (url, seen) = hub_answering(vec![(gone, 404), (refused, 401)]).await;
+        let hub = workforce_desk::hub_id_for_url(&url).unwrap();
+        let agent = format!("{hub}/allan");
+        let vault = crate::vault::Vault::open(
+            &dir.path().join("links.json"),
+            &crate::vault::Vault::generate_master_key(),
+        )
+        .unwrap();
+        vault
+            .set(
+                &crate::desk_knows::sync::link_key(&hub, "allan"),
+                &json!({ "url": url, "token": format!("wfk_{}", "a".repeat(40)), "person": owner() })
+                    .to_string(),
+            )
+            .unwrap();
+        let state = Arc::new(crate::gateway::GatewayState {
+            vault: Some(Arc::new(vault)),
+            ..Arc::try_unwrap(crate::remote_mcp::testing::fixture(false).state)
+                .ok()
+                .expect("the fixture's only handle")
+        });
+        let store = d.store();
+        for id in [gone, refused] {
+            let h = workforce_desk::handed::Handed {
+                id,
+                agent: agent.clone(),
+                agent_name: "allan".into(),
+                place: "Slack".into(),
+                words: WORDS.into(),
+                session: None,
+                asked_at: chrono::Utc::now(),
+                boss: None,
+                delivered_at: None,
+            };
+            store.handed_keep(&h).await.unwrap();
+            store.handed_say(&h, "Your Desk boss has it.").await.unwrap();
+        }
+        let person = owner();
+        let sync = KnowsSync::new(
+            state,
+            d.clone(),
+            DeskKnowsSyncConfig::default(),
+            Arc::new(move || Some(person.clone())),
+        );
+        sync.says().await;
+        assert_eq!(seen.lock().as_slice(), [gone, refused]);
+        let owed = store.handed_owed(10).await.unwrap();
+        assert_eq!(owed.len(), 1, "404 is done with; 401 is kept");
+        assert_eq!(owed[0].handed, refused);
     })
     .await;
 }

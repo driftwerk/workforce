@@ -1426,10 +1426,15 @@ impl CrewHub {
         if agreed.is_some() && o.level == Level::Suggest {
             return Err(AT_SUGGEST.into());
         }
-        // The person's words are checked before anything is saved.
-        let said = match agreed.as_deref().or(start_now.as_deref()) {
-            Some(w) => Some((w.to_string(), self.agreed_at(&b.service, w, goal)?)),
-            None => None,
+        // The person's words are checked before anything is saved: typed in
+        // the DM, or the request of theirs Desk delivered for this goal.
+        let said = match (agreed.as_deref(), start_now.as_deref()) {
+            (Some(w), _) => Some((
+                w.to_string(),
+                self.agreed_or_handed(&b.service, w, goal).await?,
+            )),
+            (None, Some(w)) => Some((w.to_string(), self.agreed_at(&b.service, w, goal)?)),
+            (None, None) => None,
         };
         let input = &self.sessions_named(b, input, None).await?;
         let adopted = self.adopted_of(b, input).await?;
