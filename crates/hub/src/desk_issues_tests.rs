@@ -349,7 +349,7 @@ async fn devbox_works_its_issue(
     // boards, as the ticket tool does: Vellev's link isn't its.
     let item = format!("session:devbox/{}", session.id);
     home_desk
-        .change_layout(|l| l.create("g-acme", "Acme", &[item], None))
+        .change_layout(|l| l.create("g-acme", "Acme", std::slice::from_ref(&item), None))
         .await
         .unwrap();
     let e = call(json!({ "action": "list" })).await.unwrap_err();

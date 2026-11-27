@@ -798,7 +798,12 @@ impl CrewHub {
             for (m, members) in machines {
                 add(
                     &m,
-                    granted.wanted(UNGROUPED.to_string(), "Ungrouped".into(), members, None),
+                    granted.wanted(
+                        UNGROUPED.to_string(),
+                        workforce_desk::UNGROUPED_NAME.into(),
+                        members,
+                        None,
+                    ),
                 );
             }
         }

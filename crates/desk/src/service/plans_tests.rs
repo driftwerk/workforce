@@ -11,11 +11,11 @@ use super::*;
 use crate::floor::{Answer, DecideRef};
 use crate::store::build_pool;
 
-fn sarah() -> Party {
+pub(super) fn sarah() -> Party {
     Party::manager("sarah", "Sarah")
 }
 
-fn by_sarah() -> By {
+pub(super) fn by_sarah() -> By {
     By::manager("sarah", "Sarah", "The person asked for the checkout.")
 }
 
@@ -42,7 +42,7 @@ fn draft(dir: &Path, titles: &[(&str, &[usize])]) -> Draft {
     }
 }
 
-fn new_plan(dir: &Path, titles: &[(&str, &[usize])]) -> NewPlan {
+pub(super) fn new_plan(dir: &Path, titles: &[(&str, &[usize])]) -> NewPlan {
     NewPlan {
         draft: draft(dir, titles),
         board: None,
@@ -1010,7 +1010,7 @@ async fn a_paused_plan_starts_nothing_until_the_person_resumes_it() {
     .await;
 }
 
-async fn call(
+pub(super) async fn call(
     app: &axum::Router,
     method: &str,
     uri: &str,

@@ -1986,7 +1986,8 @@ async fn a_boss_makes_its_own_board_for_a_plan_and_moves_a_plan_onto_another() {
         let ste = d.store().board_by_prefix("STE").await.unwrap().unwrap();
         assert_eq!(d.plan(id).await.unwrap().summary.plan.board, ste.id);
 
-        // A board of another group: said, with the way to one of its own.
+        // A board of a group with no boss of its own is the main boss's too:
+        // the plan moves onto it, and stays in its own group.
         d.change_layout(|l| l.create("other", "Other", &[], None)).await.unwrap();
         d.create_board(workforce_desk::NewBoard {
             name: "Other work".into(),
@@ -1999,9 +2000,11 @@ async fn a_boss_makes_its_own_board_for_a_plan_and_moves_a_plan_onto_another() {
             .execute(json!({ "plan_id": id.to_string(), "board": "OTH", "why": "Elsewhere." }))
             .await
             .unwrap();
-        assert!(!r.success, "{r:?}");
-        assert!(r.error.unwrap().contains("new_board"));
-        assert_eq!(d.plan(id).await.unwrap().summary.plan.board, ste.id);
+        assert!(r.success, "{r:?}");
+        let oth = d.store().board_by_prefix("OTH").await.unwrap().unwrap();
+        let moved = d.plan(id).await.unwrap().summary.plan;
+        assert_eq!((moved.board, moved.group), (oth.id, None));
+        assert_ne!(oth.id, ste.id);
 
         // Without a prefix, made once and then the same board.
         let r = create
@@ -2141,6 +2144,105 @@ async fn a_plans_ticket_on_a_machine_starts_there_once_and_its_turns_wake_the_bo
         })
         .await;
         assert!(said(&llm, "Recall is 3x faster now.").await > 0);
+        poller.abort();
+    })
+    .await;
+}
+
+/// A plan of the main boss's in a group with no boss of its own starts on
+/// a machine in its own grant there, as one in Ungrouped does, and its
+/// session shows in its group.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_main_boss_plan_in_an_open_group_starts_on_a_machine_in_its_own_grant() {
+    use super::super::relay::RelayAnswer;
+    use super::super::served::ServedStatus;
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (overseer, state, d, _llm) = hub_with(dir.path(), pool, ACTS).await;
+        d.change_layout(|l| l.create("g-infra", "Infra", &[], None))
+            .await
+            .unwrap();
+        let crew = CrewHub::start(state, d.clone(), FAST, CancellationToken::new());
+        eventually("the plan tools", async || {
+            overseer.tools.has("crew.plan").then_some(())
+        })
+        .await;
+        let calls: Arc<parking_lot::Mutex<Vec<(String, String)>>> = Arc::default();
+        let poller = {
+            let (crew, calls) = (Arc::clone(&crew), Arc::clone(&calls));
+            tokio::spawn(async move {
+                let there: parking_lot::Mutex<Vec<Value>> = Default::default();
+                loop {
+                    for c in crew.relay_take(Duration::from_millis(200)).await {
+                        let body = match c.tool.as_str() {
+                            "desk.sessions" => Value::Array(there.lock().clone()),
+                            "desk.session_start" => {
+                                let s = json!({
+                                    "id": c.input["id"], "name": c.input["name"],
+                                    "cwd": c.input["cwd"], "state": "working", "lastReply": null,
+                                });
+                                there.lock().push(s.clone());
+                                s
+                            }
+                            _ => Value::Null,
+                        };
+                        if c.tool.starts_with("desk.") {
+                            calls.lock().push((c.tool.clone(), c.group.clone()));
+                        }
+                        crew.relay_answer(
+                            c.id,
+                            RelayAnswer {
+                                status: ServedStatus::Ok,
+                                body,
+                            },
+                        );
+                    }
+                }
+            })
+        };
+        let r = overseer
+            .tools
+            .get("crew.plan")
+            .unwrap()
+            .execute(json!({
+                "result": judged(),
+                "goal": "Speed up the Infra build",
+                "group": "Infra",
+                "machine": "devbox",
+                "tickets": [{"title": "Cache the build", "folder": "/home/dev/infra"}],
+            }))
+            .await
+            .unwrap();
+        assert!(r.success, "{r:?}");
+        let id: uuid::Uuid = r.output["proposed"]["plan_id"]
+            .as_str()
+            .unwrap()
+            .parse()
+            .unwrap();
+        d.approve_plan(id, 1, &By::you()).await.unwrap();
+        let item = eventually("its session on devbox", async || {
+            let p = d.plan(id).await.ok()?;
+            let a = p.tickets[0].ticket.ticket.assignee.clone()?;
+            Some(format!("session:{}", a.id))
+        })
+        .await;
+        let grant = workforce_desk::grant::plan_key(id);
+        let said = calls.lock().clone();
+        assert!(
+            said.iter()
+                .any(|(tool, group)| tool == "desk.session_start" && *group == grant),
+            "{said:?}"
+        );
+        assert!(
+            said.iter()
+                .filter(|(tool, _)| tool == "desk.sessions")
+                .all(|(_, group)| group.is_empty()),
+            "{said:?}"
+        );
+        eventually("its session in Infra", async || {
+            (workforce_desk::scope::group_of(&item, &d.layout()) == Some("g-infra")).then_some(())
+        })
+        .await;
         poller.abort();
     })
     .await;
