@@ -195,11 +195,11 @@ async fn typing(State(s): S, h: HeaderMap, Query(q): Q, Path(id): Path<Uuid>) ->
 /// The person's charge routes.
 pub(crate) fn api_routes(ground: crate::api::Ground) -> Routes {
     Routes::new()
-        .member("/api/desk/charges", get(list))
-        .member(
+        .admin("/api/desk/charges", get(list))
+        .admin(
             "/api/desk/sessions/{id}/charge",
             post(hand).delete(release).patch(wheel),
         )
-        .member("/api/desk/sessions/{id}/typing", post(typing))
+        .admin("/api/desk/sessions/{id}/typing", post(typing))
         .bind(ground.map(|(desk, auth)| Arc::new(Api { desk, auth })))
 }

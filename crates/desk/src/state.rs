@@ -271,8 +271,8 @@ async fn list(State(s): S, h: HeaderMap, Query(q): Query<ListQuery>) -> Response
 
 pub(crate) fn router(ground: crate::api::Ground) -> Routes {
     Routes::new()
-        .member("/api/desk/state", get(list))
-        .member(
+        .admin("/api/desk/state", get(list))
+        .admin(
             "/api/desk/state/{*key}",
             get(get_one).put(put_one).delete(delete_one),
         )

@@ -182,8 +182,8 @@ async fn release(
 /// The assignments' routes.
 pub(crate) fn api_routes(ground: crate::api::Ground) -> Routes {
     Routes::new()
-        .member("/api/desk/assignments", get(list))
-        .member("/api/desk/assignments/{id}/close", post(close))
-        .member("/api/desk/assignments/{id}/release", post(release))
+        .admin("/api/desk/assignments", get(list))
+        .admin("/api/desk/assignments/{id}/close", post(close))
+        .admin("/api/desk/assignments/{id}/release", post(release))
         .bind(ground.map(|(desk, auth)| Arc::new(Api { desk, auth })))
 }

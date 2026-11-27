@@ -360,11 +360,11 @@ async fn draft(
 /// The person's line routes.
 pub(crate) fn api_routes(ground: crate::api::Ground) -> Routes {
     Routes::new()
-        .member("/api/desk/sessions/{id}/line", get(thread).post(post_line))
-        .member("/api/desk/sessions/{id}/draft", post(draft))
-        .member("/api/desk/line/{id}", patch(edit).delete(take_back))
-        .member("/api/desk/line/{id}/answer", post(answer))
-        .member("/api/desk/line/{id}/dismiss", post(dismiss))
-        .member("/api/desk/line/{id}/now", post(send_now))
+        .admin("/api/desk/sessions/{id}/line", get(thread).post(post_line))
+        .admin("/api/desk/sessions/{id}/draft", post(draft))
+        .admin("/api/desk/line/{id}", patch(edit).delete(take_back))
+        .admin("/api/desk/line/{id}/answer", post(answer))
+        .admin("/api/desk/line/{id}/dismiss", post(dismiss))
+        .admin("/api/desk/line/{id}/now", post(send_now))
         .bind(ground.map(|(desk, auth)| Arc::new(Api { desk, auth })))
 }

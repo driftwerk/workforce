@@ -184,11 +184,11 @@ async fn drop_plan(
 /// The person's plan routes.
 pub(crate) fn api_routes(ground: crate::api::Ground) -> Routes {
     Routes::new()
-        .member("/api/desk/plans", get(list))
-        .member("/api/desk/plans/{id}", get(read).patch(edit))
-        .member("/api/desk/plans/{id}/pause", post(pause))
-        .member("/api/desk/plans/{id}/resume", post(resume))
-        .member("/api/desk/plans/{id}/group", post(regroup))
-        .member("/api/desk/plans/{id}/drop", post(drop_plan))
+        .admin("/api/desk/plans", get(list))
+        .admin("/api/desk/plans/{id}", get(read).patch(edit))
+        .admin("/api/desk/plans/{id}/pause", post(pause))
+        .admin("/api/desk/plans/{id}/resume", post(resume))
+        .admin("/api/desk/plans/{id}/group", post(regroup))
+        .admin("/api/desk/plans/{id}/drop", post(drop_plan))
         .bind(ground.map(|(desk, auth)| Arc::new(Api { desk, auth })))
 }

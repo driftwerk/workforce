@@ -60,8 +60,8 @@ async fn handover(State(s): S, h: HeaderMap, Query(q): Q, Path(id): Path<Uuid>) 
 
 pub fn api_routes(ground: crate::api::Ground) -> Routes {
     Routes::new()
-        .member("/api/desk/moves/preview", post(preview))
-        .member("/api/desk/moves", post(commit))
-        .member("/api/desk/handovers/{id}", get(handover))
+        .admin("/api/desk/moves/preview", post(preview))
+        .admin("/api/desk/moves", post(commit))
+        .admin("/api/desk/handovers/{id}", get(handover))
         .bind(ground.map(|(desk, auth)| Arc::new(Api { desk, auth })))
 }

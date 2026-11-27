@@ -2030,158 +2030,158 @@ pub type Ground = Bound<(Desk, Arc<dyn Authorize>)>;
 /// The sessions' and rooms' routes and the events socket alone.
 pub fn sessions_router(ground: Ground) -> Routes {
     Routes::new()
-        .member("/api/desk/sessions", get(list).post(create))
-        .member("/api/desk/engines", get(engines))
-        .member("/api/desk/features", get(features))
-        .member("/api/desk/engines/read", post(engines_read))
-        .member("/api/desk/engines/sign-ins", post(start_engine_sign_in))
-        .member(
+        .admin("/api/desk/sessions", get(list).post(create))
+        .admin("/api/desk/engines", get(engines))
+        .admin("/api/desk/features", get(features))
+        .admin("/api/desk/engines/read", post(engines_read))
+        .admin("/api/desk/engines/sign-ins", post(start_engine_sign_in))
+        .admin(
             "/api/desk/engines/sign-ins/{id}",
             get(engine_sign_in).delete(cancel_engine_sign_in),
         )
-        .member(
+        .admin(
             "/api/desk/engines/sign-ins/{id}/token",
             post(engine_sign_in_token),
         )
-        .member("/api/desk/accounts", get(accounts).post(add_account))
-        .member(
+        .admin("/api/desk/accounts", get(accounts).post(add_account))
+        .admin(
             "/api/desk/accounts/{id}",
             patch(update_account).delete(remove_account),
         )
         .admin("/api/desk/accounts/{id}/hand-over", post(hand_over_account))
-        .member("/api/desk/accounts/{id}/sign-in", post(sign_in_again))
-        .member("/api/desk/accounts/sign-ins/{id}/code", post(sign_in_code))
-        .member(
+        .admin("/api/desk/accounts/{id}/sign-in", post(sign_in_again))
+        .admin("/api/desk/accounts/sign-ins/{id}/code", post(sign_in_code))
+        .admin(
             "/api/desk/accounts/sign-ins/{id}/direct",
             get(sign_in_direct),
         )
-        .member("/api/desk/accounts/switch-all", post(switch_all))
-        .member(
+        .admin("/api/desk/accounts/switch-all", post(switch_all))
+        .admin(
             "/api/desk/accounts/own-sign-in",
             workforce_surface::routing::put(own_sign_in),
         )
-        .member(
+        .admin(
             "/api/desk/accounts/standing",
             workforce_surface::routing::put(learn_standing),
         )
-        .member("/api/desk/accounts/needs/{id}/put-off", post(put_off_need))
-        .member(
+        .admin("/api/desk/accounts/needs/{id}/put-off", post(put_off_need))
+        .admin(
             "/api/desk/accounts/auto-switch",
             workforce_surface::routing::put(auto_switch),
         )
-        .member(
+        .admin(
             "/api/desk/accounts/problems/{id}/dismiss",
             post(dismiss_problem),
         )
-        .member(
+        .admin(
             "/api/desk/accounts/sign-ins/{id}",
             workforce_surface::routing::delete(cancel_sign_in),
         )
-        .member("/api/desk/sessions/{id}/account", post(switch_account))
-        .member("/api/desk/spend", get(spend))
-        .member("/api/desk/ledger", get(ledger))
-        .member("/api/desk/memory/search", get(memory_search))
-        .member("/api/desk/memory/index", get(memory_index_status))
-        .member("/api/desk/memory/index/rebuild", post(rebuild_memory_index))
-        .member(
+        .admin("/api/desk/sessions/{id}/account", post(switch_account))
+        .admin("/api/desk/spend", get(spend))
+        .admin("/api/desk/ledger", get(ledger))
+        .admin("/api/desk/memory/search", get(memory_search))
+        .admin("/api/desk/memory/index", get(memory_index_status))
+        .admin("/api/desk/memory/index/rebuild", post(rebuild_memory_index))
+        .admin(
             "/api/desk/sessions/{id}/memory",
             get(session_memory)
                 .delete(forget_memory)
                 .patch(switch_memory),
         )
-        .member("/api/desk/sessions/{id}/memory/derive", post(derive_memory))
-        .member(
+        .admin("/api/desk/sessions/{id}/memory/derive", post(derive_memory))
+        .admin(
             "/api/desk/sessions/{id}/handoff",
             get(handoff_preview).post(handoff),
         )
-        .member("/api/desk/sessions/{id}/lineage", get(session_lineage))
-        .member("/api/desk/memory/items/{id}", patch(change_memory_item))
-        .member(
+        .admin("/api/desk/sessions/{id}/lineage", get(session_lineage))
+        .admin("/api/desk/memory/items/{id}", patch(change_memory_item))
+        .admin(
             "/api/desk/memory/settings",
             get(memory_settings).patch(change_memory_settings),
         )
-        .member("/api/desk/memory/retain-preview", get(retain_preview))
-        .member("/api/desk/memory/groups/{id}", patch(change_group_memory))
-        .member("/api/desk/budgets", get(budgets).post(put_budget))
-        .member(
+        .admin("/api/desk/memory/retain-preview", get(retain_preview))
+        .admin("/api/desk/memory/groups/{id}", patch(change_group_memory))
+        .admin("/api/desk/budgets", get(budgets).post(put_budget))
+        .admin(
             "/api/desk/budgets/{id}",
             patch(patch_budget).delete(delete_budget),
         )
-        .member(
+        .admin(
             "/api/desk/breaker/rules",
             workforce_surface::routing::put(breaker_rules),
         )
-        .member("/api/desk/breakers/continue", post(breaker_continue))
-        .member("/api/desk/breakers/keep", post(breaker_keep))
-        .member("/api/desk/sessions/{id}", patch(update).delete(forget))
-        .member("/api/desk/sessions/closed", get(closed))
-        .member("/api/desk/sessions/hidden", get(hidden))
-        .member(
+        .admin("/api/desk/breakers/continue", post(breaker_continue))
+        .admin("/api/desk/breakers/keep", post(breaker_keep))
+        .admin("/api/desk/sessions/{id}", patch(update).delete(forget))
+        .admin("/api/desk/sessions/closed", get(closed))
+        .admin("/api/desk/sessions/hidden", get(hidden))
+        .admin(
             "/api/desk/sessions/hidden/{engine}/{cli}",
             workforce_surface::routing::delete(unhide),
         )
-        .member("/api/desk/sessions/clear", post(clear))
-        .member("/api/desk/sessions/{id}/remove", post(remove))
-        .member("/api/desk/sessions/{id}/end", post(end))
-        .member("/api/desk/sessions/{id}/closing", get(closing))
-        .member("/api/desk/sessions/{id}/stop", post(stop))
-        .member("/api/desk/sessions/{id}/interrupt", post(interrupt))
-        .member("/api/desk/sessions/{id}/asked/allow", post(allow_asked))
-        .member("/api/desk/sessions/{id}/asked/dismiss", post(dismiss_asked))
-        .member("/api/desk/sessions/{id}/resume", post(resume))
-        .member("/api/desk/sessions/{id}/restart", post(restart))
-        .member(
+        .admin("/api/desk/sessions/clear", post(clear))
+        .admin("/api/desk/sessions/{id}/remove", post(remove))
+        .admin("/api/desk/sessions/{id}/end", post(end))
+        .admin("/api/desk/sessions/{id}/closing", get(closing))
+        .admin("/api/desk/sessions/{id}/stop", post(stop))
+        .admin("/api/desk/sessions/{id}/interrupt", post(interrupt))
+        .admin("/api/desk/sessions/{id}/asked/allow", post(allow_asked))
+        .admin("/api/desk/sessions/{id}/asked/dismiss", post(dismiss_asked))
+        .admin("/api/desk/sessions/{id}/resume", post(resume))
+        .admin("/api/desk/sessions/{id}/restart", post(restart))
+        .admin(
             "/api/desk/terminal/colors",
             // 20 colours: a few hundred bytes.
             workforce_surface::routing::put(terminal_colors)
                 .layer(axum::extract::DefaultBodyLimit::max(4096)),
         )
-        .member("/api/desk/sessions/{id}/approvals/{approval}", post(decide))
-        .member("/api/desk/sessions/{id}/pty", get(pty))
-        .member(
+        .admin("/api/desk/sessions/{id}/approvals/{approval}", post(decide))
+        .admin("/api/desk/sessions/{id}/pty", get(pty))
+        .admin(
             "/api/desk/sessions/{id}/name",
             workforce_surface::routing::put(name_session),
         )
-        .member("/api/desk/folders", get(folders).post(make_folder))
-        .member("/api/desk/layout", get(layout).put(replace_layout))
-        .member("/api/desk/layout/import", post(import_layout))
-        .member("/api/desk/groups", get(layout).post(create_group))
-        .member(
+        .admin("/api/desk/folders", get(folders).post(make_folder))
+        .admin("/api/desk/layout", get(layout).put(replace_layout))
+        .admin("/api/desk/layout/import", post(import_layout))
+        .admin("/api/desk/groups", get(layout).post(create_group))
+        .admin(
             "/api/desk/groups/{id}",
             patch(update_group).delete(delete_group),
         )
-        .member("/api/desk/groups/{id}/move", post(move_group))
-        .member(
+        .admin("/api/desk/groups/{id}/move", post(move_group))
+        .admin(
             "/api/desk/groups/ungrouped/order",
             workforce_surface::routing::put(order_ungrouped),
         )
-        .member(
+        .admin(
             "/api/desk/groups/{id}/items/{*item}",
             workforce_surface::routing::put(put_member).delete(remove_member),
         )
-        .member("/api/desk/terminals", get(terminals).post(create_terminal))
-        .member(
+        .admin("/api/desk/terminals", get(terminals).post(create_terminal))
+        .admin(
             "/api/desk/terminals/{id}",
             patch(update_terminal).delete(close_terminal),
         )
-        .member("/api/desk/terminals/{id}/reopen", post(reopen_terminal))
-        .member("/api/desk/terminals/{id}/programs", get(terminal_programs))
-        .member("/api/desk/terminals/{id}/pty", get(terminal_pty))
-        .member("/api/desk/restore", post(restore))
-        .member("/api/desk/restore/dismiss", post(dismiss_restore))
-        .member("/api/desk/events", get(events))
-        .member("/api/desk/rooms", get(rooms).post(create_room))
-        .member("/api/desk/rooms/search", get(search))
-        .member(
+        .admin("/api/desk/terminals/{id}/reopen", post(reopen_terminal))
+        .admin("/api/desk/terminals/{id}/programs", get(terminal_programs))
+        .admin("/api/desk/terminals/{id}/pty", get(terminal_pty))
+        .admin("/api/desk/restore", post(restore))
+        .admin("/api/desk/restore/dismiss", post(dismiss_restore))
+        .admin("/api/desk/events", get(events))
+        .admin("/api/desk/rooms", get(rooms).post(create_room))
+        .admin("/api/desk/rooms/search", get(search))
+        .admin(
             "/api/desk/rooms/{id}",
             patch(update_room).delete(delete_room),
         )
-        .member(
+        .admin(
             "/api/desk/rooms/{id}/messages",
             get(room_messages).post(post_message),
         )
-        .member("/api/desk/rooms/{id}/messages/{message}", get(room_message))
-        .member(
+        .admin("/api/desk/rooms/{id}/messages/{message}", get(room_message))
+        .admin(
             "/api/desk/rooms/{id}/messages/{message}/copy",
             post(copy_message),
         )
@@ -2325,12 +2325,12 @@ async fn disconnect_provider(
 
 pub(crate) fn providers_router(on: Bound<(Arc<dyn Authorize>, Arc<dyn Accounts>)>) -> Routes {
     Routes::new()
-        .member("/api/desk/providers", get(list_providers))
-        .member(
+        .admin("/api/desk/providers", get(list_providers))
+        .admin(
             "/api/desk/providers/{id}",
             workforce_surface::routing::delete(disconnect_provider),
         )
-        .member("/api/desk/providers/{id}/connect", post(connect_provider))
+        .admin("/api/desk/providers/{id}/connect", post(connect_provider))
         .bind(on.map(|(auth, accounts)| Arc::new(ProvidersApi { auth, accounts })))
 }
 
@@ -2474,10 +2474,10 @@ type Voices = (Arc<dyn Authorize>, Arc<Realtime>, Arc<dyn Speech>);
 
 pub(crate) fn voice_router(on: Bound<Voices>) -> Routes {
     Routes::new()
-        .member("/api/desk/voice/session", post(voice_session))
+        .admin("/api/desk/voice/session", post(voice_session))
         .machine("/api/desk/voice/relay", get(voice_relay))
-        .member("/api/desk/voice/speak", post(voice_speak))
-        .member("/api/desk/voice/keys/{provider}", post(save_voice_key))
+        .admin("/api/desk/voice/speak", post(voice_speak))
+        .admin("/api/desk/voice/keys/{provider}", post(save_voice_key))
         .bind(on.map(|(auth, realtime, speech)| {
             Arc::new(VoiceApi {
                 auth,

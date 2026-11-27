@@ -279,27 +279,27 @@ async fn search(State(s): S, h: HeaderMap, Query(q): Q, Query(f): Query<Search>)
 /// The person's board routes.
 pub(crate) fn api_routes(ground: crate::api::Ground) -> Routes {
     Routes::new()
-        .member("/api/desk/boards", get(boards).post(create_board))
-        .member(
+        .admin("/api/desk/boards", get(boards).post(create_board))
+        .admin(
             "/api/desk/boards/{id}",
             workforce_surface::routing::patch(update_board).delete(delete_board),
         )
-        .member("/api/desk/boards/{id}/tickets", get(tickets))
-        .member("/api/desk/tickets", post(create_ticket))
-        .member("/api/desk/tickets/search", get(search))
-        .member(
+        .admin("/api/desk/boards/{id}/tickets", get(tickets))
+        .admin("/api/desk/tickets", post(create_ticket))
+        .admin("/api/desk/tickets/search", get(search))
+        .admin(
             "/api/desk/tickets/{id}",
             get(ticket).patch(edit_ticket).delete(delete_ticket),
         )
-        .member("/api/desk/tickets/{id}/move", post(move_ticket))
-        .member(
+        .admin("/api/desk/tickets/{id}/move", post(move_ticket))
+        .admin(
             "/api/desk/tickets/{id}/needs/{other}",
             put(add_need).delete(remove_need),
         )
-        .member("/api/desk/tickets/{id}/assign", post(assign))
-        .member("/api/desk/tickets/{id}/start-text", get(start_text))
-        .member("/api/desk/tickets/{id}/left-filter", post(left_filter))
-        .member("/api/desk/tickets/{id}/history", get(ticket_history))
-        .member("/api/desk/history", get(history))
+        .admin("/api/desk/tickets/{id}/assign", post(assign))
+        .admin("/api/desk/tickets/{id}/start-text", get(start_text))
+        .admin("/api/desk/tickets/{id}/left-filter", post(left_filter))
+        .admin("/api/desk/tickets/{id}/history", get(ticket_history))
+        .admin("/api/desk/history", get(history))
         .bind(ground.map(|(desk, auth)| Arc::new(Api { desk, auth })))
 }

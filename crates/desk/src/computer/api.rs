@@ -541,20 +541,20 @@ async fn ask_again(
 
 pub(crate) fn computer_router(ground: crate::api::Ground) -> Routes {
     Routes::new()
-        .member("/api/desk/computer/disk-access", get(get_disk_access))
-        .member("/api/desk/computer/access", get(get_access).put(put_access))
-        .member("/api/desk/computer/grants", get(list_grants))
-        .member("/api/desk/computer/grants/{id}", delete(revoke_grant))
-        .member(
+        .admin("/api/desk/computer/disk-access", get(get_disk_access))
+        .admin("/api/desk/computer/access", get(get_access).put(put_access))
+        .admin("/api/desk/computer/grants", get(list_grants))
+        .admin("/api/desk/computer/grants/{id}", delete(revoke_grant))
+        .admin(
             "/api/desk/computer/sessions/{session_id}/forget",
             post(forget_session),
         )
-        .member("/api/desk/computer/activity", get(list_activity))
-        .member(
+        .admin("/api/desk/computer/activity", get(list_activity))
+        .admin(
             "/api/desk/computer/on-its-own",
             get(get_on_its_own).put(put_on_its_own),
         )
-        .member("/api/desk/computer/on-its-own/ask-again", post(ask_again))
+        .admin("/api/desk/computer/on-its-own/ask-again", post(ask_again))
         .bind(ground.map(|(desk, auth)| Arc::new(ComputerApi { desk, auth })))
 }
 

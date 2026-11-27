@@ -257,11 +257,11 @@ async fn machines(
 /// The rule routes, every one the hub holder's alone.
 pub fn knows_router(ground: crate::api::Ground) -> Routes {
     Routes::new()
-        .member("/api/desk/knows", get(rules))
-        .member("/api/desk/knows/{hub}/{agent}", get(rule).put(put_rule))
-        .member("/api/desk/knows/{hub}/{agent}/held", post(held))
-        .member("/api/desk/knows/{hub}/{agent}/log", get(log))
-        .member("/api/desk/knows/{hub}/{agent}/machines", get(machines))
+        .admin("/api/desk/knows", get(rules))
+        .admin("/api/desk/knows/{hub}/{agent}", get(rule).put(put_rule))
+        .admin("/api/desk/knows/{hub}/{agent}/held", post(held))
+        .admin("/api/desk/knows/{hub}/{agent}/log", get(log))
+        .admin("/api/desk/knows/{hub}/{agent}/machines", get(machines))
         .bind(ground.map(|(desk, auth)| Arc::new(KnowsApi { desk, auth })))
 }
 
