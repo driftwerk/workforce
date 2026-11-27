@@ -841,9 +841,10 @@ impl CrewHub {
         // A request that only reads is allowed with no call, whatever
         // holds the session: a hold stops new work, never reading.
         let reads = read_only_in(&view.cwd, p);
-        // What kind of step it is, and whether a push to the default
-        // branch goes past the pull requests that merge into it: git is
-        // asked off the async workers.
+        // What kind of step it is, and whether it pushes straight to a
+        // default branch GitHub requires pull requests for, however it is
+        // run (`git -C`, a shell): git and GitHub are asked off the async
+        // workers.
         let (class, past) = match reads {
             true => (Class::Other, false),
             false => {
@@ -851,7 +852,7 @@ impl CrewHub {
                     (self.desk.clone(), view.id, p.id, boss.to_string());
                 tokio::task::spawn_blocking(move || {
                     let class = desk.request_class(id, approval, &boss);
-                    let past = class == Class::DefaultBranchPush
+                    let past = class != Class::GhPrMerge
                         && desk.request_pushes_past_review(id, approval, &boss);
                     (class, past)
                 })
@@ -862,8 +863,8 @@ impl CrewHub {
         let mut decided = match (reads, class) {
             (true, _) => Some(Verdict::Allow(ONLY_READS.into())),
             (false, Class::GhPrMerge) => Some(self.past_review(view, &decider.oversight, class)),
-            (false, Class::DefaultBranchPush) if past => {
-                Some(self.past_review(view, &decider.oversight, class))
+            (false, _) if past => {
+                Some(self.past_review(view, &decider.oversight, Class::DefaultBranchPush))
             }
             (false, _) => self
                 .standing_allow(&decider, view, class, boss, slot, cancel)

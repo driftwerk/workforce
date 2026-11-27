@@ -3016,12 +3016,11 @@ pub fn push_kind(command: &str, here: &Here<'_>) -> Option<PushKind> {
         .max()
 }
 
-/// The operands of `git push`'s `args`: its remote and refspecs, its
-/// flags (and the values of those that take one) left out.
-fn push_operands(args: &[Word]) -> Vec<&str> {
+/// What `git push` given `args` pushes: its remote, then its refspecs.
+fn push_operands<'a>(args: &[&'a str]) -> Vec<&'a str> {
     const VALUED: &[&str] = &["-o", "--push-option", "--repo", "--receive-pack", "--exec"];
     let mut operands = Vec::new();
-    let mut it = args.iter().map(|w| w.text.as_str());
+    let mut it = args.iter().copied();
     while let Some(a) = it.next() {
         match a {
             "--" => operands.extend(it.by_ref()),
@@ -3035,16 +3034,31 @@ fn push_operands(args: &[Word]) -> Vec<&str> {
     operands
 }
 
+/// The subcommand and its arguments of `git` given `args`, past git's own
+/// options (`-C <dir>`, `-c <key=value>`, `--git-dir=<dir>`, `--no-pager`).
+fn git_subcommand<'a, 'b>(args: &'b [&'a str]) -> Option<(&'a str, &'b [&'a str])> {
+    const VALUED: &[&str] = &[
+        "-C",
+        "-c",
+        "--git-dir",
+        "--work-tree",
+        "--namespace",
+        "--config-env",
+    ];
+    match args {
+        [flag, _, rest @ ..] if VALUED.contains(flag) => git_subcommand(rest),
+        [flag, rest @ ..] if flag.starts_with('-') => git_subcommand(rest),
+        [sub, rest @ ..] => Some((sub, rest)),
+        [] => None,
+    }
+}
+
 /// Whether `command` pushes straight to `origin`'s own default branch, as
 /// `origin/HEAD` names it ([`Here::default_branch`]), from the branch the
-/// folder is on: a branch that only reads as one (`release-…`) isn't it.
-/// Only a push read straight counts; one through a shell, a wrapper or
-/// git's own options is the boss's to judge.
+/// folder is on, wherever it runs it ([`class::runs`]): a branch that only
+/// reads as one (`release-…`) isn't it.
 pub fn pushes_the_default(command: &str, here: &Here<'_>) -> bool {
     let (Some(default), Some(branch)) = (here.default_branch, here.branch) else {
-        return false;
-    };
-    let Ok(cmds) = split(command) else {
         return false;
     };
     let is_default = |to: &str| to.strip_prefix("refs/heads/").unwrap_or(to) == default;
@@ -3055,21 +3069,19 @@ pub fn pushes_the_default(command: &str, here: &Here<'_>) -> bool {
                 .and_then(|to| to.split_once('/'))
                 .is_some_and(|(r, b)| r == "origin" && is_default(b))
     };
-    cmds.iter().any(|cmd| match cmd.words.as_slice() {
-        [g, sub, rest @ ..] if g.text.rsplit('/').next() == Some("git") && sub.text == "push" => {
-            match push_operands(rest).as_slice() {
-                [] => bare(None),
-                [remote] => bare(Some(remote)),
-                [remote, specs @ ..] => {
-                    *remote == "origin"
-                        && specs.iter().any(|spec| {
-                            let spec = spec.trim_start_matches('+');
-                            let (src, to) = spec.split_once(':').unwrap_or((spec, spec));
-                            !src.is_empty() && is_default(if to == "HEAD" { branch } else { to })
-                        })
-                }
+    class::runs(command, &|program, args| match git_subcommand(args) {
+        Some(("push", rest)) if program == "git" => match push_operands(rest).as_slice() {
+            [] => bare(None),
+            [remote] => bare(Some(remote)),
+            [remote, specs @ ..] => {
+                *remote == "origin"
+                    && specs.iter().any(|spec| {
+                        let spec = spec.trim_start_matches('+');
+                        let (src, to) = spec.split_once(':').unwrap_or((spec, spec));
+                        !src.is_empty() && is_default(if to == "HEAD" { branch } else { to })
+                    })
             }
-        }
+        },
         _ => false,
     })
 }
@@ -5105,6 +5117,13 @@ pub(crate) mod tests {
             "git push -u origin main",
             "git push --push-option ci.skip origin +HEAD:main",
             "npm test && git push origin main",
+            "sh -c 'git push origin main'",
+            "bash -lc 'cd . && git push origin HEAD:main'",
+            "git -C . push origin main",
+            "git -c core.hooksPath=/dev/null --no-pager push origin main",
+            "timeout 60 git push origin main",
+            "env GIT_TRACE=1 git push origin main",
+            "/usr/bin/git push origin main",
         ] {
             assert!(past(command), "{command}");
         }
@@ -5115,8 +5134,9 @@ pub(crate) mod tests {
             "git push origin release-2026",
             "git push upstream main",
             "git push origin :main",
-            "sh -c 'git push origin main'",
-            "git -C . push origin main",
+            "git -C main push origin feat/x",
+            "echo git push origin main",
+            "sh 'git push origin main'",
             "git push",
         ] {
             assert!(!past(command), "{command}");

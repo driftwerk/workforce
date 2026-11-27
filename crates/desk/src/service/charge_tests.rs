@@ -8,7 +8,7 @@ use serde_json::{json, Value};
 use uuid::Uuid;
 use workforce_postgres::test_support::with_test_pool;
 
-use super::super::tests::{desk, new_session, went_in};
+use super::super::tests::{desk, desk_on, new_session, options, went_in};
 use super::*;
 use crate::computer::boss::PushKind;
 use crate::line::{Delivery, Send, Target, Wait, When};
@@ -2091,17 +2091,64 @@ fn pushing_repo(
     repo
 }
 
-/// Under a boss acting fully, a push straight to a default branch pull
-/// requests merge into (a GitHub `origin` that has it) is refused before
-/// it runs, in a mode that asks nothing; a release branch, a repository
-/// that isn't on GitHub, or its first push isn't, nor anything while the
-/// person is in the session.
+/// A `gh` under `base` whose `gh api <endpoint>` prints what `answers`
+/// gives that endpoint and fails for any other, each endpoint it is asked
+/// written to `base`'s `asked`; the folder it is in.
+fn gh_answering(base: &std::path::Path, answers: &[(&str, &str)]) -> std::path::PathBuf {
+    let tools = base.join("tools");
+    let said = base.join("github");
+    std::fs::create_dir_all(&said).unwrap();
+    std::fs::create_dir_all(&tools).unwrap();
+    for (endpoint, answer) in answers {
+        std::fs::write(said.join(endpoint.replace('/', "_")), answer).unwrap();
+    }
+    workforce_common::executable::write(
+        &tools.join("gh"),
+        format!(
+            "#!/bin/sh\necho \"$2\" >> '{}'\nf='{}'/$(printf %s \"$2\" | tr / _)\n[ \"$1\" = api ] && [ -f \"$f\" ] && exec cat \"$f\"\nexit 1\n",
+            base.join("asked").display(),
+            said.display()
+        ),
+    )
+    .unwrap();
+    tools
+}
+
+/// Under a boss acting fully, a push straight to a default branch GitHub
+/// requires a pull request for (by a ruleset or its classic protection)
+/// is refused before it runs, in a mode that asks nothing, GitHub asked
+/// once for a while; one GitHub doesn't protect so, or can't say about, a
+/// release branch, a repository that isn't on GitHub, or its first push
+/// isn't, nor anything while the person is in the session.
 #[tokio::test]
-async fn a_push_straight_to_a_default_branch_pull_requests_merge_into_is_refused_before_it_runs() {
+async fn a_push_straight_to_a_default_branch_github_protects_is_refused_before_it_runs() {
     with_test_pool(build_pool, |pool| async move {
         let dir = tempfile::tempdir().unwrap();
         let base = std::fs::canonicalize(dir.path()).unwrap();
-        let d = desk(pool, &base).await;
+        let tools = gh_answering(
+            &base,
+            &[
+                (
+                    "repos/acme/web/rules/branches/main",
+                    r#"[{"type":"deletion"},{"type":"pull_request","parameters":{}}]"#,
+                ),
+                ("repos/acme/classic/rules/branches/main", "[]"),
+                (
+                    "repos/acme/classic/branches/main/protection",
+                    r#"{"required_pull_request_reviews":{"required_approving_review_count":1}}"#,
+                ),
+                ("repos/acme/checked/rules/branches/main", "[]"),
+                (
+                    "repos/acme/checked/branches/main/protection",
+                    r#"{"required_status_checks":{"strict":true,"contexts":["ci"]}}"#,
+                ),
+                ("repos/acme/open/rules/branches/main", "[]"),
+            ],
+        );
+        let mut o = options(&base);
+        o.env
+            .insert("PATH".into(), format!("{}:/usr/bin:/bin", tools.display()));
+        let d = desk_on(pool, o).await;
         d.boss_bounds_with(crate::charge::Bounds {
             home: base.clone(),
             ..Default::default()
@@ -2133,11 +2180,24 @@ async fn a_push_straight_to_a_default_branch_pull_requests_merge_into_is_refused
                     .to_string()
             })
         };
-        let github = "https://github.com/acme/web.git";
-        let web = session(&pushing_repo(&base, "web", github, true)).await;
+        let github = |name: &str| format!("https://github.com/acme/{name}.git");
+        let web = session(&pushing_repo(&base, "web", &github("web"), true)).await;
+        for _ in 0..2 {
+            assert_eq!(
+                refused(web, "git push origin HEAD:main").await,
+                Some(crate::plan::default_push_refused())
+            );
+        }
+        let asked = std::fs::read_to_string(base.join("asked")).unwrap();
         assert_eq!(
-            refused(web, "git push origin HEAD:main").await,
-            Some(crate::plan::default_push_refused())
+            asked.lines().collect::<Vec<_>>(),
+            ["repos/acme/web/rules/branches/main"],
+            "GitHub asked once"
+        );
+        assert_eq!(
+            refused(web, "timeout 60 sh -c 'git -C . push origin main'").await,
+            Some(crate::plan::default_push_refused()),
+            "however it is run"
         );
         assert_eq!(refused(web, "git push origin feat/x").await, None);
         assert_eq!(
@@ -2152,7 +2212,16 @@ async fn a_push_straight_to_a_default_branch_pull_requests_merge_into_is_refused
             None,
             "no pull requests where it isn't on GitHub"
         );
-        let fresh = session(&pushing_repo(&base, "new", github, false)).await;
+        for (name, refusal, what) in [
+            ("classic", Some(crate::plan::default_push_refused()), "classic protection"),
+            ("checked", None, "protected without pull requests"),
+            ("open", None, "unprotected"),
+            ("down", None, "GitHub can't say"),
+        ] {
+            let id = session(&pushing_repo(&base, name, &github(name), true)).await;
+            assert_eq!(refused(id, "git push origin HEAD:main").await, refusal, "{what}");
+        }
+        let fresh = session(&pushing_repo(&base, "new", &github("new"), false)).await;
         assert_eq!(
             refused(fresh, "git push origin HEAD:main").await,
             None,
@@ -2222,4 +2291,52 @@ fn git_says_its_own_commands_and_those_the_sessions_shell_finds() {
         super::git_commands("/nonexistent/sh", work.path(), &env),
         None
     );
+}
+
+/// A Codex session a boss starts runs its commands in a plain shell, its
+/// `gh` Desk's whatever the profiles say; the person's own in their login
+/// shell.
+#[tokio::test]
+async fn only_a_session_a_boss_starts_runs_its_commands_in_a_plain_shell() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(pool, dir.path()).await;
+        let by = By::manager("sarah", "Sarah", "Acme's web upgrade");
+        let started = d
+            .create_for(start_in(dir.path(), None), &sarah(), by)
+            .await
+            .unwrap();
+        assert_eq!(
+            d.command_shell(started.id),
+            crate::codex::CommandShell::Plain
+        );
+        let own = d.create(start_in(dir.path(), None), None).await.unwrap();
+        assert_eq!(d.command_shell(own.id), crate::codex::CommandShell::Login);
+    })
+    .await;
+}
+
+/// Where Desk's environment isn't the login shell's, a session a boss
+/// starts keeps the login shell, its commands finding the person's tools;
+/// what said so is never passed on.
+#[tokio::test]
+async fn a_login_environment_desk_couldnt_read_keeps_the_login_shell() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let mut o = options(dir.path());
+        o.env
+            .insert(super::super::LOGIN_ENV_UNREAD.into(), "1".into());
+        let d = desk_on(pool, o).await;
+        assert!(!d.login_env().contains_key(super::super::LOGIN_ENV_UNREAD));
+        let by = By::manager("sarah", "Sarah", "Acme's web upgrade");
+        let started = d
+            .create_for(start_in(dir.path(), None), &sarah(), by)
+            .await
+            .unwrap();
+        assert_eq!(
+            d.command_shell(started.id),
+            crate::codex::CommandShell::Login
+        );
+    })
+    .await;
 }

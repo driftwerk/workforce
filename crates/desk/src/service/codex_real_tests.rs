@@ -493,12 +493,13 @@ async fn the_real_codex_runs_each_typed_turn_in_what_desk_set() {
     .await;
 }
 
-/// A command a real Codex session runs finds Desk's `gh` first, whatever
-/// the person's profiles put ahead of it on `PATH` and however Codex is
-/// set to snapshot its shell.
+/// A command a real Codex session a boss starts runs finds Desk's `gh`
+/// first, whatever the person's profiles put ahead of it on `PATH` and
+/// however Codex is set to snapshot its shell; the person's own session
+/// runs its commands in their login shell, their profiles' `gh` first.
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
-async fn the_real_codex_runs_desks_gh_whatever_the_profile_puts_first() {
+async fn the_real_codex_a_boss_starts_runs_desks_gh_whatever_the_profile_puts_first() {
     use std::os::unix::fs::PermissionsExt;
     let Some(bin) = codex_bin() else {
         return;
@@ -538,34 +539,44 @@ async fn the_real_codex_runs_desks_gh_whatever_the_profile_puts_first() {
             .replace("shell_snapshot = false", "shell_snapshot = true");
         std::fs::write(&config, snapshots).unwrap();
 
-        let mut new = codex_session(&work, false);
-        new.prompt = Some("say which gh".into());
-        let s = d.create(new, None).await.unwrap();
-        until("its command asked", Duration::from_secs(60), || {
-            d.view(s.id).unwrap().pending.is_some_and(|p| p.answerable)
-        })
-        .await;
-        let p = d.view(s.id).unwrap().pending.unwrap();
-        d.decide(s.id, p.id, Decision::Allow, Some(By::you()))
+        let new = || {
+            let mut new = codex_session(&work, false);
+            new.prompt = Some("say which gh".into());
+            new
+        };
+        let which_gh = async |id: uuid::Uuid| {
+            until("its command asked", Duration::from_secs(60), || {
+                d.view(id).unwrap().pending.is_some_and(|p| p.answerable)
+            })
+            .await;
+            let p = d.view(id).unwrap().pending.unwrap();
+            d.decide(id, p.id, Decision::Allow, Some(By::you()))
+                .unwrap();
+            until("its turn's end", Duration::from_secs(30), || ended(&d, id)).await;
+            let gh = std::fs::read_to_string(work.join("gh.txt")).unwrap_or_else(|e| {
+                let said: Vec<String> = heard
+                    .lock()
+                    .iter()
+                    .flat_map(|b| b["input"].as_array().cloned().unwrap_or_default())
+                    .filter(|i| i["type"] == "function_call_output")
+                    .map(|i| i["output"].to_string())
+                    .collect();
+                panic!("{e}: {said:?}")
+            });
+            std::fs::remove_file(work.join("gh.txt")).unwrap();
+            gh.trim().to_string()
+        };
+        let crew = crate::crew::Party::manager("crew", "Crew");
+        let s = d
+            .create_for(new(), &crew, By::manager("crew", "Crew", "it should say"))
+            .await
             .unwrap();
-        until("its turn's end", Duration::from_secs(30), || {
-            ended(&d, s.id)
-        })
-        .await;
-        let gh = std::fs::read_to_string(work.join("gh.txt")).unwrap_or_else(|e| {
-            let said: Vec<String> = heard
-                .lock()
-                .iter()
-                .flat_map(|b| b["input"].as_array().cloned().unwrap_or_default())
-                .filter(|i| i["type"] == "function_call_output")
-                .map(|i| i["output"].to_string())
-                .collect();
-            panic!("{e}: {said:?}")
-        });
-        assert!(
-            gh.trim().ends_with(&format!("{}-bin/gh", s.id.simple())),
-            "{gh}"
-        );
+        let gh = which_gh(s.id).await;
+        assert!(gh.ends_with(&format!("{}-bin/gh", s.id.simple())), "{gh}");
+
+        let own = d.create(new(), None).await.unwrap();
+        let gh = which_gh(own.id).await;
+        assert!(gh.ends_with("profiled/gh"), "the person's own: {gh}");
     })
     .await;
 }

@@ -500,9 +500,9 @@ pub struct Facts {
     pub branches: Vec<String>,
     /// The tags at `origin`'s default branch's commit.
     pub tip_tags: Vec<String>,
-    /// Work reaches the default branch by pull request: `origin` is a
-    /// GitHub repository, and its default branch is there already.
-    pub pr_flow: bool,
+    /// The GitHub repository `origin` is, when its default branch is there
+    /// already: where pull requests may be what reaches it.
+    pub pulls_into: Option<crate::repos::Repo>,
     pub what: What,
 }
 
@@ -617,7 +617,7 @@ pub fn facts_of(
         unpushed: true,
         branches: Vec::new(),
         tip_tags: Vec::new(),
-        pr_flow: false,
+        pulls_into: None,
         what,
     }
 }
@@ -758,7 +758,7 @@ pub fn push_kind(
 }
 
 /// Whether the command of `facts` pushes straight to its default branch
-/// where work reaches it by pull request ([`Facts::pr_flow`],
+/// on a GitHub `origin` that has it ([`Facts::pulls_into`],
 /// [`boss::pushes_the_default`]).
 pub fn pushes_past_review(
     facts: &Facts,
@@ -769,7 +769,7 @@ pub fn pushes_past_review(
         return false;
     };
     let own = real(&facts.own);
-    facts.pr_flow
+    facts.pulls_into.is_some()
         && boss::pushes_the_default(
             command,
             &here_of(facts, bounds, own.as_deref(), real, &|_| false),
