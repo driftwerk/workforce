@@ -491,7 +491,7 @@ pub const FORGOTTEN: &str = "A session since forgotten";
 /// What Desk calls the calls it can't say the account of.
 pub const UNKNOWN_ACCOUNT: &str = "Account not known";
 /// What Desk calls the spend of what is in no group.
-pub const UNGROUPED_SPEND: &str = "Ungrouped";
+pub const UNGROUPED_SPEND: &str = crate::UNGROUPED_NAME;
 
 /// `cells` with each session's calls counted as its work's: what
 /// [`SpendBy::Work`] folds.

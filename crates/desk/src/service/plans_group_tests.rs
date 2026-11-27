@@ -101,7 +101,8 @@ async fn a_plans_group_lifecycle_propose_regroup_start_and_a_deleted_group() {
         let moved = d
             .regroup_plan(id, Some("g-atlas".into()), &By::you())
             .await
-            .unwrap();
+            .unwrap()
+            .plan;
         assert_eq!(moved.summary.plan.group.as_deref(), Some("g-atlas"));
         assert_eq!(moved.summary.plan.board, board.id);
         assert_eq!(keys(&moved), was);
@@ -123,7 +124,8 @@ async fn a_plans_group_lifecycle_propose_regroup_start_and_a_deleted_group() {
         let again = d
             .regroup_plan(id, Some("g-atlas".into()), &By::you())
             .await
-            .unwrap();
+            .unwrap()
+            .plan;
         assert_eq!(again.summary.plan.updated_at, moved.summary.plan.updated_at);
 
         // Started, its sessions are in Atlas.
@@ -150,14 +152,6 @@ async fn a_plans_group_lifecycle_propose_regroup_start_and_a_deleted_group() {
             .unwrap();
         assert_eq!(group_of(&d, a.id).as_deref(), Some("g-mantis"));
         assert_eq!(group_of(&d, b.id), None);
-
-        // A start the runner read while the plan was in Atlas starts in
-        // Mantis, where the plan is now.
-        let c = d
-            .plan_start(&read, &start_of(&p, 2), &sarah(), &by_sarah())
-            .await
-            .unwrap();
-        assert_eq!(group_of(&d, c.id).as_deref(), Some("g-mantis"));
 
         // Mantis deleted: the plan is ungrouped with its board, heard so,
         // and on the Floor in Ungrouped.
@@ -206,7 +200,7 @@ async fn a_plan_doesnt_move_across_a_boss_boundary_nor_to_a_group_there_isnt_nor
             .await
             .unwrap();
         let id = p.summary.plan.id;
-        let refused = |r: Result<PlanDetail, DeskError>| r.unwrap_err();
+        let refused = |r: Result<Regrouped, DeskError>| r.unwrap_err();
 
         let e = refused(d.regroup_plan(id, Some("g-acme".into()), &By::you()).await);
         assert!(
@@ -398,6 +392,235 @@ async fn a_plans_machine_calls_carry_its_group_only_when_that_is_a_boundary() {
         assert_eq!(d.relay_group(&plan_in(None)), None);
         assert_eq!(d.relay_group(&plan_in(Some("g-mantis"))), None);
         assert_eq!(d.relay_group(&plan_in(Some("g-acme"))), Some("g-acme"));
+    })
+    .await;
+}
+
+/// A start the runner read before the plan moved starts where the plan is
+/// as it starts.
+#[tokio::test]
+async fn a_start_reads_its_plans_group_as_it_starts() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(pool, dir.path()).await;
+        with_groups(&d).await;
+        let mut new = new_plan(dir.path(), &[("a", &[])]);
+        new.group = Some("g-atlas".into());
+        let id = d
+            .propose_plan(new, &sarah(), &by_sarah())
+            .await
+            .unwrap()
+            .summary
+            .plan
+            .id;
+        let p = d.approve_plan(id, 1, &By::you()).await.unwrap();
+        let read = p.summary.plan.clone();
+        d.regroup_plan(id, Some("g-mantis".into()), &By::you())
+            .await
+            .unwrap();
+        let a = d
+            .plan_start(&read, &start_of(&p, 0), &sarah(), &by_sarah())
+            .await
+            .unwrap();
+        assert_eq!(group_of(&d, a.id).as_deref(), Some("g-mantis"));
+    })
+    .await;
+}
+
+/// Back to Ungrouped, its running session goes with it.
+#[tokio::test]
+async fn a_regroup_to_ungrouped_takes_its_running_session_there() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(pool, dir.path()).await;
+        with_groups(&d).await;
+        let mut new = new_plan(dir.path(), &[("a", &[])]);
+        new.group = Some("g-mantis".into());
+        let id = d
+            .propose_plan(new, &sarah(), &by_sarah())
+            .await
+            .unwrap()
+            .summary
+            .plan
+            .id;
+        let p = d.approve_plan(id, 1, &By::you()).await.unwrap();
+        let a = d
+            .plan_start(&p.summary.plan, &start_of(&p, 0), &sarah(), &by_sarah())
+            .await
+            .unwrap();
+        assert_eq!(group_of(&d, a.id).as_deref(), Some("g-mantis"));
+        let moved = d.regroup_plan(id, None, &By::you()).await.unwrap();
+        assert_eq!((moved.plan.summary.plan.group, moved.unmoved), (None, None));
+        assert_eq!(group_of(&d, a.id), None);
+    })
+    .await;
+}
+
+/// Sessions it couldn't move are said, and the plan is in its new group
+/// still.
+#[tokio::test]
+async fn a_regroup_whose_sessions_cant_move_says_so() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(pool, dir.path()).await;
+        with_groups(&d).await;
+        let p = d
+            .propose_plan(new_plan(dir.path(), &[("a", &[])]), &sarah(), &by_sarah())
+            .await
+            .unwrap();
+        let id = p.summary.plan.id;
+        let broken = serde_json::to_value(Party {
+            kind: PartyKind::Session,
+            id: "not-a-session".into(),
+            name: "Broken".into(),
+            engine: None,
+            origin: None,
+        })
+        .unwrap();
+        d.0.store
+            .pool()
+            .get()
+            .await
+            .unwrap()
+            .execute(
+                "UPDATE tickets SET state = 'doing', assignee = $2 WHERE id = $1",
+                &[&p.tickets[0].ticket.ticket.id, &broken],
+            )
+            .await
+            .unwrap();
+        let (_, mut events) = d.subscribe();
+        let moved = d
+            .regroup_plan(id, Some("g-mantis".into()), &By::you())
+            .await
+            .unwrap();
+        assert_eq!(moved.plan.summary.plan.group.as_deref(), Some("g-mantis"));
+        let said = moved.unmoved.unwrap();
+        assert!(
+            said.starts_with("Its running sessions stayed where they were"),
+            "{said}"
+        );
+        let (_, noted) = heard(&mut events);
+        assert!(noted.iter().any(|e| e.text.contains(&said)), "{noted:?}");
+    })
+    .await;
+}
+
+/// A group deleted waits for a plan being written, so no write puts the
+/// group back; a plan read with a group the sidebar no longer has runs as
+/// Ungrouped.
+#[tokio::test]
+async fn a_deleted_group_is_never_written_back_and_reads_as_ungrouped() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(pool, dir.path()).await;
+        with_groups(&d).await;
+        let mut new = new_plan(dir.path(), &[("a", &[])]);
+        new.group = Some("g-mantis".into());
+        let id = d
+            .propose_plan(new, &sarah(), &by_sarah())
+            .await
+            .unwrap()
+            .summary
+            .plan
+            .id;
+        let writing = d.0.plan_write.lock().await;
+        let deleting = tokio::spawn({
+            let d = d.clone();
+            async move { d.change_layout(|l| l.delete("g-mantis")).await }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert!(
+            !deleting.is_finished(),
+            "the delete waits for the plan write"
+        );
+        assert!(d.layout().groups.iter().any(|g| g.id == "g-mantis"));
+        drop(writing);
+        deleting.await.unwrap().unwrap();
+        assert_eq!(d.plan(id).await.unwrap().summary.plan.group, None);
+
+        // A row that still names it (as one written before this hub did):
+        // its sessions start in Ungrouped.
+        let p = d.approve_plan(id, 1, &By::you()).await.unwrap();
+        let stale = Plan {
+            group: Some("g-mantis".into()),
+            ..p.summary.plan.clone()
+        };
+        d.0.store.put_plan(&stale).await.unwrap();
+        assert_eq!((d.live_group(&stale), d.relay_group(&stale)), (None, None));
+        let a = d
+            .plan_start(&stale, &start_of(&p, 0), &sarah(), &by_sarah())
+            .await
+            .unwrap();
+        assert_eq!(group_of(&d, a.id), None);
+    })
+    .await;
+}
+
+/// A finished plan keeps the group it ran in when that is deleted, and
+/// isn't announced again.
+#[tokio::test]
+async fn a_finished_plan_keeps_its_deleted_group_unannounced() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(pool, dir.path()).await;
+        with_groups(&d).await;
+        let mut new = new_plan(dir.path(), &[("a", &[])]);
+        new.group = Some("g-mantis".into());
+        let id = d
+            .propose_plan(new, &sarah(), &by_sarah())
+            .await
+            .unwrap()
+            .summary
+            .plan
+            .id;
+        d.drop_plan(id, OnDrop::Leave, &By::you()).await.unwrap();
+        let (_, mut events) = d.subscribe();
+        d.change_layout(|l| l.delete("g-mantis")).await.unwrap();
+        assert_eq!(
+            d.plan(id).await.unwrap().summary.plan.group.as_deref(),
+            Some("g-mantis")
+        );
+        let (plans, _) = heard(&mut events);
+        assert!(plans.iter().all(|s| s.plan.id != id), "{plans:?}");
+    })
+    .await;
+}
+
+/// What a plan may move to is its boss's part of Desk, not the part its
+/// group is in now.
+#[tokio::test]
+async fn a_plan_moves_within_its_bosss_part_wherever_its_group_is_now() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(pool, dir.path()).await;
+        with_groups(&d).await;
+        let mut new = new_plan(dir.path(), &[("a", &[])]);
+        new.group = Some("g-atlas".into());
+        let id = d
+            .propose_plan(new, &sarah(), &by_sarah())
+            .await
+            .unwrap()
+            .summary
+            .plan
+            .id;
+        // Atlas gets a boss of its own before the plan follows it there.
+        d.set_bosses(vec![
+            boss("sarah", "Sarah", None),
+            boss("ada", "Ada", Some("g-atlas")),
+        ]);
+        let moved = d
+            .regroup_plan(id, Some("g-mantis".into()), &By::you())
+            .await
+            .unwrap();
+        assert_eq!(moved.plan.summary.plan.group.as_deref(), Some("g-mantis"));
+        let e = d
+            .regroup_plan(id, Some("g-atlas".into()), &By::you())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&e, DeskError::Conflict(w) if w.starts_with("Atlas is Ada's to run")),
+            "{e}"
+        );
     })
     .await;
 }

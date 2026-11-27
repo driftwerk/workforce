@@ -1961,39 +1961,49 @@ async fn the_main_boss_puts_a_plan_in_its_works_group_and_moves_it_only_among_it
     .await;
 }
 
-/// A running plan of the main boss's in a group that gets a boss of its
-/// own passes to that boss, paused until the person says Continue.
+/// The main boss's plans in a group that gets a boss of its own pass to
+/// that boss: a running one paused until the person says Continue, one the
+/// person paused as it was, so one Continue goes on. Both bosses' DMs say
+/// so.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_running_plan_whose_group_gets_a_boss_passes_to_that_boss() {
+async fn a_plan_whose_group_gets_a_boss_passes_to_that_boss() {
     with_test_pool(workforce_desk::store::build_pool, |pool| async move {
         let dir = tempfile::tempdir().unwrap();
         let c = clients(dir.path(), pool).await;
-        let p =
-            c.d.propose_plan(
-                workforce_desk::NewPlan {
-                    draft: workforce_desk::plan::Draft {
-                        goal: "Keep Infra green".into(),
-                        tickets: vec![workforce_desk::plan::DraftTicket {
-                            title: "Fix the flaky deploy".into(),
-                            folder: dir.path().to_string_lossy().into_owned(),
-                            ..Default::default()
-                        }],
+        let in_infra = async |goal: &str| {
+            let p =
+                c.d.propose_plan(
+                    workforce_desk::NewPlan {
+                        draft: workforce_desk::plan::Draft {
+                            goal: goal.into(),
+                            tickets: vec![workforce_desk::plan::DraftTicket {
+                                title: "Fix the flaky deploy".into(),
+                                folder: dir.path().to_string_lossy().into_owned(),
+                                ..Default::default()
+                            }],
+                        },
+                        board: None,
+                        parallel: None,
+                        engine: Engine::Claude,
+                        group: Some("infra".into()),
+                        budget: None,
+                        result: None,
+                        goal_ticket: None,
                     },
-                    board: None,
-                    parallel: None,
-                    engine: Engine::Claude,
-                    group: Some("infra".into()),
-                    budget: None,
-                    result: None,
-                    goal_ticket: None,
-                },
-                &Party::manager("desk", "Desk"),
-                &By::manager("desk", "Desk", "For the test."),
-            )
+                    &Party::manager("desk", "Desk"),
+                    &By::manager("desk", "Desk", "For the test."),
+                )
+                .await
+                .unwrap();
+            let id = p.summary.plan.id;
+            c.d.approve_plan(id, 1, &By::you()).await.unwrap();
+            id
+        };
+        let running = in_infra("Keep Infra green").await;
+        let held = in_infra("Tidy the Infra runbooks").await;
+        c.d.pause_plan(held, workforce_desk::plan::Paused::Person, &By::you())
             .await
             .unwrap();
-        let id = p.summary.plan.id;
-        c.d.approve_plan(id, 1, &By::you()).await.unwrap();
         crate::agent_config_write::save(
             &c.mia,
             "mia",
@@ -2004,19 +2014,39 @@ async fn a_running_plan_whose_group_gets_a_boss_passes_to_that_boss() {
         )
         .await
         .unwrap();
-        let now = eventually("the plan to pass to Mia", async || {
-            let p = c.d.plan(id).await.ok()?.summary.plan;
-            (p.boss == "mia").then_some(p)
-        })
-        .await;
+        let mias = async |id: uuid::Uuid| {
+            eventually("the plan to pass to Mia", async || {
+                let p = c.d.plan(id).await.ok()?.summary.plan;
+                (p.boss == "mia").then_some(p)
+            })
+            .await
+        };
+        use workforce_desk::plan::{Paused, PlanState};
+        let now = mias(running).await;
         assert_eq!(
             (now.state, now.paused, now.group.as_deref()),
-            (
-                workforce_desk::plan::PlanState::Paused,
-                Some(workforce_desk::plan::Paused::NoBoss),
-                Some("infra")
-            )
+            (PlanState::Paused, Some(Paused::NoBoss), Some("infra"))
         );
+        let now = mias(held).await;
+        assert_eq!(
+            (now.state, now.paused),
+            (PlanState::Paused, Some(Paused::Person))
+        );
+        let told = |boss: &AgentService, said: &str| {
+            boss.sessions
+                .find(DESK_CHANNEL, PERSON)
+                .unwrap()
+                .is_some_and(|dm| dm.messages.iter().any(|m| m.content.contains(said)))
+        };
+        eventually("both bosses' DMs told", async || {
+            (told(&c.mia, "This plan is yours now: Mia runs Infra.")
+                && told(
+                    &c.desk,
+                    "Mia runs Infra now, so this plan is theirs: Tidy the Infra runbooks",
+                ))
+            .then_some(())
+        })
+        .await;
     })
     .await;
 }

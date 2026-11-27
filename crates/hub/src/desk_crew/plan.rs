@@ -33,7 +33,7 @@ use workforce_desk::crew::{
 };
 use workforce_desk::model::{DeskEvent, Engine, Exited, SessionState};
 use workforce_desk::plan::{self, Draft, DraftTicket, Plan, PlanState, PlanTicket};
-use workforce_desk::{plan_group, Changed, NewPlan, PlanDetail, PlanEdit};
+use workforce_desk::{plan_group, Changed, NewPlan, PlanDetail, PlanEdit, UNGROUPED_NAME};
 
 use super::actions::{Action, Handout};
 use super::goal;
@@ -892,7 +892,6 @@ pub(crate) fn machine_of_items<'a>(items: impl IntoIterator<Item = &'a String>) 
     on
 }
 
-/// A plan as the boss reads it back: its tickets by key, id and place.
 /// Why a new plan is in its group.
 enum Placed {
     Said,
@@ -930,8 +929,7 @@ fn group_said(p: &PlanDetail) -> &str {
     p.summary.group_name.as_deref().unwrap_or(UNGROUPED_NAME)
 }
 
-const UNGROUPED_NAME: &str = "Ungrouped";
-
+/// A plan as the boss reads it back: its tickets by key, id and place.
 fn plan_out(p: &PlanDetail) -> Value {
     plan_out_with(p, &Briefs::None)
 }
@@ -1175,7 +1173,7 @@ impl CrewHub {
             return Ok(Some(id.clone()));
         }
         let names: Vec<String> = ungrouped
-            .then(|| "Ungrouped".to_string())
+            .then(|| UNGROUPED_NAME.to_string())
             .into_iter()
             .chain(groups.into_iter().map(|(_, name)| name))
             .collect();
@@ -1777,8 +1775,9 @@ impl CrewHub {
                     .regroup_plan(id, group, &by)
                     .await
                     .map_err(unmoved)?;
-                let text = format!("{name} moved the plan to {}.", group_said(&now));
-                self.post_plan(&b.service, &now.summary.plan, &text).await;
+                let text = format!("{name} moved the plan to {}.", group_said(&now.plan));
+                self.post_plan(&b.service, &now.plan.summary.plan, &text)
+                    .await;
                 Some(now)
             }
         };
@@ -1825,13 +1824,17 @@ impl CrewHub {
                 m
             }
             (None, Some(g), _) => {
+                let sessions = match &g.unmoved {
+                    None => "its running sessions moved there".to_string(),
+                    Some(why) => format!("{why}; tell the person"),
+                };
                 note = format!(
-                    "{note} It is in {} now: its running sessions moved there, and the ones it starts from now on start there.",
-                    group_said(&g)
+                    "{note} It is in {} now: {sessions}, and the ones it starts from now on start there.",
+                    group_said(&g.plan)
                 )
                 .trim()
                 .to_string();
-                g
+                g.plan
             }
             (None, None, Some(c)) => c.plan,
             (None, None, None) => {
@@ -1992,7 +1995,9 @@ impl CrewHub {
         match self.desk.plans(Some(PlanState::Paused), None).await {
             Ok(paused) => {
                 for s in paused {
-                    self.lift_hold(&s.plan).await;
+                    if self.boss_of_plan(&s.plan).is_some() || !self.follow_group(&s.plan).await {
+                        self.lift_hold(&s.plan).await;
+                    }
                 }
             }
             Err(e) => tracing::warn!(error = %e, "couldn't read the paused plans"),
@@ -2313,19 +2318,34 @@ impl CrewHub {
     /// plan is in.
     pub(super) fn boss_of_plan(&self, p: &Plan) -> Option<(Arc<AgentService>, Oversight)> {
         self.overseer_named(&p.boss)
-            .filter(|(_, o)| self.desk.seen_by(&o.scope).sees(p.group.as_deref()))
+            .filter(|(_, o)| self.desk.seen_by(&o.scope).sees(self.desk.live_group(p)))
+    }
+
+    /// `p`, whose boss no longer runs its group, passes to the boss that
+    /// does now, when there is one: whether it passed.
+    async fn follow_group(&self, p: &Plan) -> bool {
+        let lead = self
+            .desk
+            .boss_of(&self.desk.scope_of_group(self.desk.live_group(p)))
+            .filter(|l| l.agent != p.boss);
+        match lead {
+            Some(lead) => self.plan_follows(p, &lead).await,
+            None => false,
+        }
     }
 
     /// `p` passes to `lead`, who runs its group's part of Desk now that its
-    /// own boss doesn't: paused until the person says Continue.
-    async fn plan_follows(&self, p: &Plan, lead: &workforce_desk::Boss) {
+    /// own boss doesn't: paused until the person says Continue (a plan
+    /// paused already keeps its pause, so one Continue goes on). Both
+    /// bosses' DMs say so, the person reading each.
+    async fn plan_follows(&self, p: &Plan, lead: &workforce_desk::Boss) -> bool {
         let to = Party::manager(&lead.agent, &lead.name);
         let by = By::desk("Its group has a boss of its own now.");
         let now = match self.desk.pass_plan(p.id, &to, &by).await {
             Ok(now) => now,
             Err(e) => {
                 tracing::info!(plan = %p.id, error = %e, "a plan wasn't passed to its group's boss");
-                return;
+                return false;
             }
         };
         if let Some((service, _)) = self.overseer_named(&lead.agent) {
@@ -2337,6 +2357,16 @@ impl CrewHub {
             );
             self.post_plan(&service, &now.summary.plan, &text).await;
         }
+        if let Some((service, _)) = self.overseer_named(&p.boss) {
+            let text = format!(
+                "{} runs {} now, so this plan is theirs: {}",
+                lead.name,
+                group_said(&now),
+                crew::one_line(&p.goal, 120)
+            );
+            self.post_plan(&service, &now.summary.plan, &text).await;
+        }
+        true
     }
 
     async fn run_plan(&self, p: Plan) {
@@ -2347,12 +2377,8 @@ impl CrewHub {
                 if let Err(e) = self.desk.pause_plan(p.id, plan::Paused::NoBoss, &by).await {
                     tracing::info!(plan = %p.id, error = %e, "a plan with no boss wasn't paused");
                 }
-            } else if let Some(lead) = self
-                .desk
-                .boss_of(&self.desk.scope_of_group(p.group.as_deref()))
-                .filter(|l| l.agent != p.boss)
-            {
-                self.plan_follows(&p, &lead).await;
+            } else {
+                self.follow_group(&p).await;
             }
             return;
         };
@@ -2375,7 +2401,7 @@ impl CrewHub {
         // Its own budget, its group's or Desk's at its warning or over, and
         // the breaker holding new starts for it: the person has the need,
         // with Continue; the plan pauses until they say, and nothing starts.
-        let held = self.desk.plan_starts_held(p.group.as_deref(), p.id);
+        let held = self.desk.plan_starts_held(self.desk.live_group(&p), p.id);
         if held.is_some() {
             let by = By::desk("Desk's breaker holds its new starts.");
             if let Err(e) = self.desk.pause_plan(p.id, plan::Paused::Budget, &by).await {

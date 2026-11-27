@@ -99,8 +99,8 @@ mod codex_resume_tests;
 mod ledger;
 mod plans;
 pub use plans::{
-    Changed, NewPlan, OnDrop, PlanDetail, PlanEdit, PlanSummary, PlanTicketView, StartRefused,
-    Started,
+    Changed, NewPlan, OnDrop, PlanDetail, PlanEdit, PlanSummary, PlanTicketView, Regrouped,
+    StartRefused, Started,
 };
 #[cfg(test)]
 mod lifecycle_tests;
@@ -149,6 +149,7 @@ use transition::Transition;
 pub use grants::{GrantView, GrantWritten, GrantsView, Native, Paused};
 pub use groups::{
     local_agent_item, session_item, Group, Import, Imported, Layout, Ungrouped, UNGROUPED,
+    UNGROUPED_NAME,
 };
 pub(crate) use groups::{put_layout_in, Orphaned};
 pub use sight::{

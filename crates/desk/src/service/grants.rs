@@ -946,6 +946,9 @@ impl Desk {
             self.0.scopes.lock().granted = granted;
             return Ok(0);
         }
+        // A grant taken away deletes its group, which ungroups its plans:
+        // no plan is written meanwhile (plans before the layout).
+        let plans = self.0.plan_write.lock().await;
         let one = self.0.layout_write.lock().await;
         let before = self.layout();
         let layout = grant::layout_of(next.values(), &before).checked_except(&Default::default())?;
@@ -978,7 +981,7 @@ impl Desk {
         self.0.state.lock().layout = layout.clone();
         self.scopes_follow(&layout);
         self.orphans_heard(&written.orphaned).await;
-        drop(one);
+        drop((one, plans));
         self.announce(DeskEvent::Layout {
             layout: layout.clone(),
         });

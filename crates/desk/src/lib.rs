@@ -168,7 +168,7 @@ pub use service::{
     HolderOptions, Import, Imported, KeptSession, Layout, LedgerPage, LineError, MemoryHitView,
     MemorySearch, NewTerminal, Options, Removal, Removed, RestorePolicy, Sender as LineSender,
     SessionMcp, SessionMemory, SpendQuery, TerminalPatch, TerminalState, TerminalView, Ungrouped,
-    UNGROUPED,
+    UNGROUPED, UNGROUPED_NAME,
 };
 pub use service::{AccountAnswer, AccountMoment, AccountRead};
 pub use service::{
@@ -176,8 +176,8 @@ pub use service::{
     NewTicket, StartText, TicketPatch, TicketQuery, TicketView,
 };
 pub use service::{
-    Changed, NewPlan, OnDrop, PlanDetail, PlanEdit, PlanSummary, PlanTicketView, StartRefused,
-    Started,
+    Changed, NewPlan, OnDrop, PlanDetail, PlanEdit, PlanSummary, PlanTicketView, Regrouped,
+    StartRefused, Started,
 };
 pub use service::{CommentPost, FileBytes, PostVia, READ_FRESH};
 pub use service::{EffectView, HandoverView, MoveAsk, MoveCommit, MoveDone, MovePreview, SentNote};

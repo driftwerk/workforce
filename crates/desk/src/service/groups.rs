@@ -19,6 +19,8 @@ use crate::store::DeskStore;
 
 /// The fixed group of whatever is in no other; always last.
 pub const UNGROUPED: &str = "ungrouped";
+/// What the person calls it.
+pub const UNGROUPED_NAME: &str = "Ungrouped";
 const MAX_GROUPS: usize = 200;
 const MAX_ITEMS: usize = 5000;
 const MAX_NAME: usize = 200;
@@ -471,8 +473,8 @@ pub struct Orphaned {
     pub plans: Vec<Uuid>,
 }
 
-/// [`DeskStore::put_layout_with`] within `tx`: the boards and plans in a
-/// group it no longer has, which become ungrouped.
+/// [`DeskStore::put_layout_with`] within `tx`: the boards and unfinished
+/// plans in a group it no longer has, which become ungrouped.
 pub(crate) async fn put_layout_in(
     tx: &tokio_postgres::Transaction<'_>,
     layout: &Layout,
@@ -493,7 +495,7 @@ pub(crate) async fn put_layout_in(
     let now = Utc::now();
     let ungrouped = Group {
         id: UNGROUPED.into(),
-        name: "Ungrouped".into(),
+        name: UNGROUPED_NAME.into(),
         collapsed: layout.ungrouped.collapsed,
         items: layout.ungrouped.items.clone(),
     };
@@ -536,12 +538,12 @@ pub(crate) async fn put_layout_in(
         .await?;
     }
     let kept: Vec<&str> = layout.groups.iter().map(|g| g.id.as_str()).collect();
-    let ungroup = async |table: &str| -> Result<Vec<Uuid>> {
+    let ungroup = async |table: &str, and: &str| -> Result<Vec<Uuid>> {
         Ok(tx
             .query(
                 format!(
                     "UPDATE {table} SET group_id = NULL, updated_at = now() \
-                     WHERE group_id IS NOT NULL AND NOT group_id = ANY($1) RETURNING id"
+                     WHERE group_id IS NOT NULL AND NOT group_id = ANY($1){and} RETURNING id"
                 )
                 .as_str(),
                 &[&kept],
@@ -552,9 +554,18 @@ pub(crate) async fn put_layout_in(
             .collect::<Result<Vec<Uuid>, _>>()?)
     };
     Ok(Orphaned {
-        boards: ungroup("boards").await?,
-        plans: ungroup("plans").await?,
+        boards: ungroup("boards", "").await?,
+        // A finished plan keeps the group it ran in.
+        plans: ungroup("plans", " AND state NOT IN ('done', 'dropped')").await?,
     })
+}
+
+/// Whether `after` has lost a group `before` has.
+pub(super) fn drops_groups(before: &Layout, after: &Layout) -> bool {
+    before
+        .groups
+        .iter()
+        .any(|b| !after.groups.iter().any(|g| g.id == b.id))
 }
 
 /// The sessions whose group `after` changes from `before` (each item and
@@ -634,7 +645,7 @@ impl Desk {
     /// sessions whose group it changed). One change at a time.
     pub async fn change_layout(
         &self,
-        f: impl FnOnce(&Layout) -> Result<Layout, DeskError>,
+        f: impl Fn(&Layout) -> Result<Layout, DeskError>,
     ) -> Result<Layout, DeskError> {
         self.change_layout_as(f, true).await
     }
@@ -648,7 +659,7 @@ impl Desk {
     /// the move routes crosses, with its preview and its handover note.
     pub async fn change_layout_by_person(
         &self,
-        f: impl FnOnce(&Layout) -> Result<Layout, DeskError>,
+        f: impl Fn(&Layout) -> Result<Layout, DeskError>,
     ) -> Result<Layout, DeskError> {
         let _one = self.0.move_write.lock().await;
         self.change_layout(|before| {
@@ -680,13 +691,23 @@ impl Desk {
     /// push of its layout may bring back ids it already had.
     async fn change_layout_as(
         &self,
-        f: impl FnOnce(&Layout) -> Result<Layout, DeskError>,
+        f: impl Fn(&Layout) -> Result<Layout, DeskError>,
         fresh_ids: bool,
     ) -> Result<Layout, DeskError> {
-        let _one = self.0.layout_write.lock().await;
-        let before = self.layout();
-        let closed = self.closed_items().await?;
-        let after = f(&before)?.checked_except(&closed)?;
+        // A deleted group ungroups its plans: no plan is written meanwhile,
+        // so none writes the group back. Plans are locked before the layout.
+        let mut plans = None;
+        let (_one, before, after) = loop {
+            let one = self.0.layout_write.lock().await;
+            let before = self.layout();
+            let closed = self.closed_items().await?;
+            let after = f(&before)?.checked_except(&closed)?;
+            if plans.is_some() || !drops_groups(&before, &after) {
+                break (one, before, after);
+            }
+            drop(one);
+            plans = Some(self.0.plan_write.lock().await);
+        };
         if after == before {
             return Ok(after);
         }
@@ -737,7 +758,7 @@ impl Desk {
                 crossed.push((id, group(&before), group(&after)));
             }
         }
-        drop(_one);
+        drop((_one, plans));
         // Boxed: what a move undoes (a ticket's hand-out) can itself start
         // a session, which goes into the sidebar.
         for (id, from, to) in crossed {
@@ -814,7 +835,7 @@ impl Desk {
                     if !fresh {
                         self.stays_in_scope(before, &layout)?;
                     }
-                    Ok(layout)
+                    Ok(layout.clone())
                 },
                 false,
             )

@@ -633,7 +633,7 @@ async fn on_a_granted_machine_only_a_grant_moves_a_session_between_groups() {
         let item = session_item(s);
         for change in [
             Box::new(|l: &Layout| l.put(&item, "g-globex", None))
-                as Box<dyn FnOnce(&Layout) -> Result<Layout, DeskError> + Send>,
+                as Box<dyn Fn(&Layout) -> Result<Layout, DeskError> + Send>,
             Box::new(|l: &Layout| l.remove(&item)),
         ] {
             let e = d.change_layout(change).await.unwrap_err();
