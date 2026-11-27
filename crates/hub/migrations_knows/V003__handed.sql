@@ -10,6 +10,7 @@ CREATE TABLE handed (
     session      TEXT,
     session_name TEXT,
     platform     TEXT        NOT NULL,
+    workspace    TEXT,
     channel      TEXT        NOT NULL,
     thread       TEXT,
     asked_at     TIMESTAMPTZ NOT NULL,

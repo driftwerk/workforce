@@ -491,6 +491,16 @@ const CLAIMS: &[(&str, &str, &str, Claim)] = &[
     ("hub", "items", "person", By(C::DecisionRecords)),
     ("hub", "owners", "person", By(C::DecisionRecords)),
     ("hub", "daily", "person", By(C::DecisionRecords)),
+    // The requests an agent here handed to their Desk boss (DW-770), and
+    // when their Desk last took them: erased with what it shared.
+    ("hub", "handed", "person", By(C::DecisionRecords)),
+    ("hub", "checked_in", "person", By(C::DecisionRecords)),
+    (
+        "hub",
+        "handed",
+        "taken_by",
+        NotPersonal("the Desk (its engine) that took the request"),
+    ),
     ("hub", "identity_pictures", "identity_id", By(C::Pictures)),
     ("hub", "bulk_jobs", "owner", By(C::MailJobs)),
     ("hub", "intents", "person", By(C::KnowHow)),

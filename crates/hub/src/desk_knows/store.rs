@@ -153,6 +153,8 @@ pub struct Handed {
     pub session: Option<String>,
     pub session_name: Option<String>,
     pub platform: String,
+    /// The platform's workspace it was asked in, when it has one.
+    pub workspace: Option<String>,
     pub channel: String,
     pub thread: Option<String>,
     pub asked_at: DateTime<Utc>,
@@ -910,8 +912,8 @@ pub mod postgres {
             client
                 .execute(
                     "INSERT INTO handed (id, person, agent, agent_name, words, session, session_name, \
-                       platform, channel, thread, asked_at) \
-                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
+                       platform, channel, thread, asked_at, workspace) \
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
                     &[
                         &h.id,
                         &h.person,
@@ -924,6 +926,7 @@ pub mod postgres {
                         &h.channel,
                         &h.thread,
                         &h.asked_at,
+                        &h.workspace,
                     ],
                 )
                 .await?;
@@ -1044,7 +1047,7 @@ pub mod postgres {
     }
 
     const HANDED: &str = "id, person, agent, agent_name, words, session, session_name, platform, \
-                          channel, thread, asked_at";
+                          channel, thread, asked_at, workspace";
 
     fn handed_of(r: &tokio_postgres::Row) -> Result<Handed> {
         Ok(Handed {
@@ -1059,6 +1062,7 @@ pub mod postgres {
             channel: r.try_get(8)?,
             thread: r.try_get(9)?,
             asked_at: r.try_get(10)?,
+            workspace: r.try_get(11)?,
         })
     }
 
@@ -1391,6 +1395,7 @@ pub(crate) mod tests {
             session: Some("s1".into()),
             session_name: Some("video".into()),
             platform: "slack".into(),
+            workspace: Some("T1".into()),
             channel: "D1".into(),
             thread: Some("1700.1".into()),
             asked_at,

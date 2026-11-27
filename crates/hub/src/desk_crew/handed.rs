@@ -11,15 +11,21 @@
 //!   their words, exactly, relayed by the agent that took them: every check
 //!   of the person's words reads it as if they typed it there.
 //! - **Said back.** Whether the boss keeps it as a goal, and each stall of
-//!   that goal after ([`CrewHub::flag_handed`]).
+//!   that goal after (`CrewHub::flag_handed`).
+//! - **Taken again** when the Desk that took it stopped first: delivered
+//!   if it never was, and said to be in the boss's DM if its turn's answer
+//!   was lost.
 
-use std::sync::Arc;
+use std::collections::HashSet;
+use std::sync::{Arc, LazyLock};
+
+use parking_lot::Mutex;
 
 use eyre::Result;
 use workforce_common::channels::DESK_CHANNEL;
 use workforce_common::oversight::Scope;
 use workforce_desk::crew::one_line;
-use workforce_desk::handed::{covers, Handed};
+use workforce_desk::handed::{covers, Handed, Kept};
 use workforce_desk::plan::PlanState;
 use workforce_desk::Speaker;
 
@@ -27,6 +33,31 @@ use super::{name_of, AgentService, CrewHub};
 
 const NOT_YOURS: &str = "This Desk isn't yours: the person whose Desk it is linked me, so it took nothing. Ask me from your own Desk's link.";
 const NO_BOSS: &str = "You have no boss in Desk yet: open an agent's settings in Desk and turn on Oversees the crew. Then ask me again.";
+
+/// The requests whose boss's turn runs in this process now.
+static DELIVERING: LazyLock<Mutex<HashSet<uuid::Uuid>>> = LazyLock::new(Default::default);
+
+/// One request's boss's turn under way, for as long as it is held.
+struct Delivering(uuid::Uuid);
+
+impl Delivering {
+    fn begin(id: uuid::Uuid) -> Self {
+        DELIVERING.lock().insert(id);
+        Self(id)
+    }
+}
+
+impl Drop for Delivering {
+    fn drop(&mut self) {
+        DELIVERING.lock().remove(&self.0);
+    }
+}
+
+/// What the person is told of a request boss `boss` holds whose answer
+/// was lost: Desk stopped while its turn ran.
+fn unanswered(boss: &str) -> String {
+    format!("Your Desk boss {boss} has your request in your Desk DM, but Desk stopped before it answered: answer there, or ask me again.")
+}
 
 /// What the person is told when no boss oversees session `name`'s group.
 fn no_group_boss(name: &str) -> String {
@@ -43,7 +74,7 @@ fn session_gone(name: &str) -> String {
 fn told(h: &Handed, person: &str, session: Option<&str>) -> String {
     let on = session.map_or_else(String::new, |s| format!(", on the session “{s}”"));
     format!(
-        "This is {person}'s own request, in their words, passed on by {agent}, their agent elsewhere, from their {place} conversation with it. They want this kept on track and any stall flagged: keep it as a goal with crew.plan (agreed: their words, exactly as here){on}. Desk tells {agent} of each stall, and {agent} tells them in {place}.",
+        "This is {person}'s own request, in their words, passed on by {agent}, their agent elsewhere, from their {place} conversation with it. They want this kept on track and any stall flagged: keep it as a goal with crew.plan, its goal in their own words and agreed: their words, exactly as here{on}. Desk tells {agent} of each stall, and {agent} tells them in {place}.",
         agent = h.agent_name,
         place = h.place,
     )
@@ -54,8 +85,15 @@ impl CrewHub {
     /// delivered on its own task, so a long turn never holds up the share.
     pub(crate) async fn take_handed(self: &Arc<Self>, person: &str, h: Handed) -> Result<()> {
         let store = self.desk.store();
-        if !store.handed_keep(&h).await? {
-            return Ok(());
+        match store.handed_keep(&h).await? {
+            Kept::New | Kept::Undelivered => {}
+            Kept::Done => return Ok(()),
+            Kept::Unanswered { .. } if DELIVERING.lock().contains(&h.id) => return Ok(()),
+            Kept::Unanswered { boss } => {
+                return store
+                    .handed_say(h.id, &unanswered(&self.boss_name_of(&boss)))
+                    .await
+            }
         }
         if self.person(None).is_some_and(|p| p != person) {
             return store.handed_say(h.id, NOT_YOURS).await;
@@ -86,8 +124,10 @@ impl CrewHub {
         let owner = person.to_string();
         let name = session.map(|(_, name)| name);
         let settling = crate::shutdown::Settling::begin();
+        let delivering = Delivering::begin(h.id);
         tokio::spawn(async move {
             let _settling = settling;
+            let _delivering = delivering;
             crew.deliver_handed(&service, &owner, &h, name.as_deref())
                 .await;
         });
@@ -139,7 +179,7 @@ impl CrewHub {
                     one_line(&goal, 200)
                 ),
                 None => format!(
-                    "Your Desk boss {name} has your request and answered: “{}”. It isn't kept as a goal yet, so Desk can't flag stalls on it until it is.",
+                    "Your Desk boss {name} has your request and answered: “{}”. It isn't kept as a goal yet, so Desk can't flag stalls on it until it is: if it waits on your OK, give it in your Desk DM with {name}.",
                     one_line(&ran.answer, 600)
                 ),
             },

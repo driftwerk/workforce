@@ -74,6 +74,7 @@ An agent hands the person's own request to their Desk boss: "keep this on track 
   - older: "Your Desk last checked in at 17:02 UTC, so it's closed or your computer is asleep. It picks this up once Desk is open on your computer. If that isn't within a day, I'll tell you here and drop it."
   - never, though it shares work: "Your Desk shares your work with me but hasn't checked in for requests yet: update Desk on your computer and open it. If that isn't within a day, I'll tell you here and drop it."
 - **The guard (DW-714 / DW-767).** It declares no read or stay (`Tool::reach` in #537), so a turn armed by outside content holds it for the person, as any send. It never arms anything itself. It builds on nothing #537 adds, and #537's per-item fencing of `desk_work.*` reads leaves the person's own work unarmed, so it runs unheld after reading it.
+- **The person's words are read from the turn's own session**, as the turn holds it when its tools are built: the message the turn answers is in it before the session store has it (it is saved when the turn ends).
 - **The origin** is what `watch` and `scheduler` use: the turn's messaging context (`SchedulerHost::get_messaging_context` under `CURRENT_SESSION_KEY`), plus the session's platform (`slack`, `teams`, …) for posting back on that platform's surfaces alone. Nothing Desk sends ever names a place.
 
 ### 2. Held on the agent's hub: `desk_knows.handed` (K/migrations_knows/V003)
@@ -123,7 +124,7 @@ Both use the `wfk_` token alone, through `authenticate(.., serving = true)`. The
   - `429` once `MAX_SAID` is spent.
   - `502` when no surface took it. The count is kept, so a broken channel can't loop forever.
 
-`tell` is one function, used by the route, the expiry sweep and the Mac's own local agents. It sends one `OutboundMessage` through the platform's surfaces in the agent's `surface_registry`.
+`tell` is one function, used by the route, the expiry sweep and the Mac's own local agents. It sends one `OutboundMessage` through the one surface the agent's `surface_registry` resolves for the place it was asked (its platform, channel and workspace, kept from the session's channel `platform:workspace:channel…`), so a hub with several workspaces posts once, in the right one.
 
 **The expiry sweep** (`desk_knows::handed::start(&state)`, beside `boss_links::wake::start` in `gateway::router`, once per process): every minute, `handed_expired(now − HANDED_LIFE)`. It tells each one where it was asked: "Your Desk didn't pick up your request “…” within a day, so I've dropped it. Open Desk on your computer and ask me again."
 
@@ -153,7 +154,10 @@ CREATE TABLE IF NOT EXISTS handed_says (
 
 `CrewHub::take_handed`:
 
-1. **Once.** `handed_keep` inserts it unless its id is kept. One already kept is done.
+1. **Once.** `handed_keep` inserts it unless its id is kept, and says what became of one kept before (`Kept`):
+   - never delivered nor answered (Desk stopped after keeping it): delivered now;
+   - delivered with nothing said back, and no turn on it running in this process (Desk stopped mid-turn): "Your Desk boss X has your request in your Desk DM, but Desk stopped before it answered: answer there, or ask me again.";
+   - otherwise done.
 2. **Only the person's.** `from.person` must be `crew.person(..)`. A link made by someone else is answered "This Desk isn't yours…" and nothing is delivered.
 3. **The boss.**
    - When a session is named, it goes to that session's boss (`overseer_of_session`). A session Desk doesn't have any more, or one in a group no boss oversees, says so and names the fix: "No boss oversees “X”'s group in Desk: open a group's boss settings and turn on Oversees the crew."
@@ -162,11 +166,12 @@ CREATE TABLE IF NOT EXISTS handed_says (
    - Its prompt and its kept message are the person's words, exactly. Every check of the person's words (a goal agreed in `crew.plan`, an order kept from the turn, `consent`/`agreement`) reads them as if typed in the DM.
    - Its author is `Speaker::overseer("<hub>/<agent>", "Allan, for Kingsley in Slack")`. Desk shows the message as relayed by that name.
    - The turn's `theirs` is the words, so the turn is the person's, as `run_dm_turn_for_them`'s is.
-   - The turn is told, outside the message (`channel_system_prompt`, never kept): "This is Kingsley's own request, in their words, passed on by Allan, their agent elsewhere, from their Slack conversation with it. They want this kept on track and any stall flagged: keep it as a goal with crew.plan (agreed: their words, exactly as here)[, on the session “X”]. Desk tells Allan of each stall, and Allan tells them in Slack."
+   - The turn is told, outside the message (`channel_system_prompt`, never kept): "This is Kingsley's own request, in their words, passed on by Allan, their agent elsewhere, from their Slack conversation with it. They want this kept on track and any stall flagged: keep it as a goal with crew.plan, its goal in their own words and agreed: their words, exactly as here[, on the session “X”]. Desk tells Allan of each stall, and Allan tells them in Slack." The goal is in their words because `goal::agreement` reads a "keep …" as unclear unless it says the goal.
+   - Below Act fully, `crew.plan` in this turn is held for the person's OK: Desk's own notes on the crew are fenced into every boss turn and arm the outside-content guard, and no one is on a relayed turn to answer. That is the guard's (DW-767, #537), not changed here; the word back says so ("if it waits on your OK, give it in your Desk DM with X").
    - `run_turn_with` gains `told: Option<&str>` for this. Every other caller passes `None`.
 5. **Said back.** After the turn, one word back is kept (`handed_say`):
    - when a running plan of that boss covers it (`handed::covers`): "Your Desk boss Desk has it: it keeps “goal” as a goal, and Desk tells you here when it stalls.";
-   - else: "Your Desk boss Desk has your request and answered: “…”. It isn't kept as a goal yet, so Desk can't flag stalls on it until it is.";
+   - else: "Your Desk boss Desk has your request and answered: “…”. It isn't kept as a goal yet, so Desk can't flag stalls on it until it is: if it waits on your OK, give it in your Desk DM with Desk.";
    - a turn that failed: "Your Desk boss Desk couldn't take your request just now (…). It is in your Desk DM with Desk: answer there, or ask me again."
 
    A refusal in steps 2–3 is kept the same way. The request is held with no boss, so it is never delivered again.

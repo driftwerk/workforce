@@ -21,7 +21,7 @@ use serde_json::{json, Value};
 use uuid::Uuid;
 use workforce_agent::tools::{Tool, ToolResult};
 use workforce_common::channels::OutboundMessage;
-use workforce_common::session::{MessageRole, Session, SessionStore};
+use workforce_common::session::{MessageRole, Session};
 
 use super::store::{Handed, Heard, KnowsStore, Reader, HANDED_LIFE};
 use super::tools::{Work, NOT_SHARED};
@@ -93,18 +93,31 @@ fn own_part(content: &str) -> &str {
         .trim()
 }
 
-/// The person's message of `messages` since `since` that is `said`, word
-/// for word and whole.
-fn their_message(
+/// The person's own words in `messages`, by when they said each: their
+/// message this turn answers among them, as the turn holds it.
+fn theirs_in(
     messages: &[workforce_common::session::SessionMessage],
+) -> Vec<(DateTime<Utc>, String)> {
+    messages
+        .iter()
+        .filter(|m| m.role == MessageRole::User && m.tool_data.is_none())
+        .map(|m| (m.timestamp, own_part(&m.content)))
+        .filter(|(_, text)| !text.is_empty() && !crate::desk_surface::hub_note(text))
+        .map(|(at, text)| (at, text.to_string()))
+        .collect()
+}
+
+/// The person's message of `theirs` since `since` that is `said`, word for
+/// word and whole.
+fn their_message(
+    theirs: &[(DateTime<Utc>, String)],
     said: &str,
     since: DateTime<Utc>,
 ) -> Result<String, String> {
-    let theirs: Vec<&str> = messages
+    let theirs: Vec<&str> = theirs
         .iter()
-        .filter(|m| m.role == MessageRole::User && m.timestamp > since && m.tool_data.is_none())
-        .map(|m| own_part(&m.content))
-        .filter(|text| !text.is_empty() && !crate::desk_surface::hub_note(text))
+        .filter(|(at, _)| *at > since)
+        .map(|(_, text)| text.as_str())
         .collect();
     let same = |text: &str| {
         workforce_desk::goal::says_goal(text, said) && workforce_desk::goal::says_goal(said, text)
@@ -127,22 +140,44 @@ pub struct KeepOnTrack {
     agent_name: String,
     platform: String,
     own: bool,
-    sessions: Arc<dyn SessionStore>,
+    /// The person's own words in the conversation, as the turn began.
+    theirs: Vec<(DateTime<Utc>, String)>,
+    workspace: Option<String>,
     scheduler: Option<Arc<dyn SchedulerHost>>,
 }
 
 /// The tool for `service`'s turn in `session`, over what `work` reads.
 pub fn tool(work: Work, service: &AgentService, session: &Session) -> Arc<dyn Tool> {
-    Arc::new(KeepOnTrack {
+    Arc::new(tool_for(
         work,
-        agent_name: crate::desk_crew::name_of(service),
-        platform: workforce_common::channels::parse_channel(&session.channel)
-            .0
-            .to_string(),
+        crate::desk_crew::name_of(service),
+        session,
+        service.scheduler.clone(),
+    ))
+}
+
+/// The tool for agent `agent_name`'s turn in `session`, where `scheduler`
+/// knows the conversation's place: `session` as the turn holds it, with
+/// the message it answers.
+pub(crate) fn tool_for(
+    work: Work,
+    agent_name: String,
+    session: &Session,
+    scheduler: Option<Arc<dyn SchedulerHost>>,
+) -> KeepOnTrack {
+    let mut parts = session.channel.split(':');
+    let platform = parts.next().unwrap_or_default().to_string();
+    let rest: Vec<&str> = parts.collect();
+    KeepOnTrack {
+        work,
+        agent_name,
+        platform,
         own: crate::turn_loop::tools::is_own_conversation(session),
-        sessions: Arc::clone(&service.sessions),
-        scheduler: service.scheduler.clone(),
-    })
+        theirs: theirs_in(&session.messages),
+        // `<platform>:<workspace>:<channel>…`: the workspace it was asked in.
+        workspace: (rest.len() >= 2).then(|| rest[0].to_string()),
+        scheduler,
+    }
 }
 
 impl KeepOnTrack {
@@ -156,16 +191,7 @@ impl KeepOnTrack {
 
     /// The person's whole message `said` is, in this conversation.
     fn words(&self, said: &str) -> Result<String, String> {
-        let sid = workforce_agent::runner::CURRENT_SESSION_ID
-            .try_with(Clone::clone)
-            .map_err(|_| NO_PLACE.to_string())?;
-        let session = self
-            .sessions
-            .get(&sid)
-            .ok()
-            .flatten()
-            .ok_or_else(|| NO_PLACE.to_string())?;
-        their_message(&session.messages, said, Utc::now() - SAID_WITHIN)
+        their_message(&self.theirs, said, Utc::now() - SAID_WITHIN)
     }
 
     async fn hand(&self, input: &Value) -> Result<Result<Value, String>> {
@@ -219,6 +245,7 @@ impl KeepOnTrack {
             session: id,
             session_name: session.and_then(|(_, name)| name),
             platform: self.platform.clone(),
+            workspace: self.workspace.clone(),
             channel,
             thread,
             asked_at: now,
@@ -278,17 +305,20 @@ pub async fn tell(service: &AgentService, h: &Handed, text: &str) -> bool {
         blocks: None,
         outside: false,
     };
-    let surfaces = service.surface_registry.read().await.all_for(&h.platform);
-    let mut told = false;
-    for surface in surfaces {
-        match surface.send_message(&message).await {
-            Ok(_) => told = true,
-            Err(e) => {
-                tracing::warn!(handed = %h.id, platform = %h.platform, error = %e, "Desk's word on a request wasn't posted")
-            }
-        }
+    let hint = workforce_common::channels::ChannelHint::from_parts(
+        None,
+        h.workspace.clone(),
+        Some(h.channel.clone()),
+    );
+    let registry = service.surface_registry.read().await;
+    let sent = match registry.resolve(&h.platform, &h.channel, hint).await {
+        Ok(surface) => surface.send_message(&message).await.map(drop),
+        Err(e) => Err(e),
+    };
+    if let Err(e) = &sent {
+        tracing::warn!(handed = %h.id, platform = %h.platform, error = %format!("{e:#}"), "Desk's word on a request wasn't posted");
     }
-    told
+    sent.is_ok()
 }
 
 /// What became of a word back from the person's Desk on a request.
@@ -403,6 +433,7 @@ mod tests {
             ),
             said("keep it going but not tonight", now),
         ];
+        let messages = theirs_in(&messages);
         assert_eq!(
             their_message(
                 &messages,
@@ -424,7 +455,7 @@ mod tests {
     }
 
     use crate::desk_knows::store::{Item, MemoryKnows, Owner};
-    use workforce_agent::runner::{CURRENT_SESSION_ID, CURRENT_SESSION_KEY};
+    use workforce_agent::runner::CURRENT_SESSION_KEY;
 
     const SAID: &str = "ok keep that video creation on Track in desk please";
 
@@ -436,8 +467,9 @@ mod tests {
         }
     }
 
-    /// The tool in the person's Slack DM with Allan (`own`), where they
-    /// said [`SAID`], over `store`, run on `input`.
+    /// The tool in the turn answering the person's [`SAID`] in their Slack
+    /// DM with Allan (`own`), over `store`, run on `input`. The turn's
+    /// message is its own, not yet in the session store.
     async fn handing(store: Arc<MemoryKnows>, own: bool, input: Value) -> Result<Value, String> {
         let dir = tempfile::tempdir().unwrap();
         let service = crate::serve::testing::plain_service(dir.path()).await;
@@ -449,26 +481,20 @@ mod tests {
         session
             .messages
             .push(SessionMessage::user(SAID, None, None, None));
-        service.sessions.save(&session).unwrap();
-        let tool = KeepOnTrack {
-            work: Work {
-                store,
-                reader: Reader {
-                    person: desk().person,
-                    agent: "allan".into(),
-                },
+        let work = Work {
+            store,
+            reader: Reader {
+                person: desk().person,
+                agent: "allan".into(),
             },
-            agent_name: "Allan".into(),
-            platform: "slack".into(),
-            own,
-            sessions: Arc::clone(&service.sessions),
-            scheduler: Some(scheduler),
         };
+        let tool = KeepOnTrack {
+            own,
+            ..tool_for(work, "Allan".into(), &session, Some(scheduler))
+        };
+        assert_eq!(tool.workspace.as_deref(), Some("T1"));
         CURRENT_SESSION_KEY
-            .scope(
-                "slack:T1:D1".into(),
-                CURRENT_SESSION_ID.scope(session.id.clone(), tool.hand(&input)),
-            )
+            .scope("slack:T1:D1".into(), tool.hand(&input))
             .await
             .unwrap()
     }

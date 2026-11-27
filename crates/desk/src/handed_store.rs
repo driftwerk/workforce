@@ -6,7 +6,7 @@ use eyre::{Context, Result};
 use tokio_postgres::Row;
 use uuid::Uuid;
 
-use crate::handed::{Handed, Owed};
+use crate::handed::{Handed, Kept, Owed};
 use crate::store::DeskStore;
 
 /// How long a delivered request is looked at for its plan's stalls.
@@ -29,8 +29,9 @@ fn handed_of(r: &Row) -> Result<Handed> {
 }
 
 impl DeskStore {
-    /// Keeps `h` as taken, unless its id is kept already: whether it is new.
-    pub async fn handed_keep(&self, h: &Handed) -> Result<bool> {
+    /// Keeps `h` as taken, unless its id is kept already, and what became of
+    /// it then.
+    pub async fn handed_keep(&self, h: &Handed) -> Result<Kept> {
         let client = self.pool().get().await?;
         let made = client
             .execute(
@@ -40,7 +41,25 @@ impl DeskStore {
             )
             .await
             .context("keeping a handed request")?;
-        Ok(made == 1)
+        if made == 1 {
+            return Ok(Kept::New);
+        }
+        let row = client
+            .query_one(
+                "SELECT boss, delivered_at IS NOT NULL, EXISTS (SELECT 1 FROM handed_says s WHERE s.handed = h.id) \
+                 FROM handed h WHERE id = $1",
+                &[&h.id],
+            )
+            .await
+            .context("reading a handed request kept")?;
+        let boss: Option<String> = row.try_get(0)?;
+        Ok(
+            match (boss, row.try_get::<_, bool>(1)?, row.try_get::<_, bool>(2)?) {
+                (_, _, true) => Kept::Done,
+                (Some(boss), true, false) => Kept::Unanswered { boss },
+                _ => Kept::Undelivered,
+            },
+        )
     }
 
     /// `id` delivered to `boss` now: when, as kept.
@@ -144,8 +163,12 @@ mod tests {
                 boss: None,
                 delivered_at: None,
             };
-            assert!(store.handed_keep(&h).await.unwrap());
-            assert!(!store.handed_keep(&h).await.unwrap(), "once");
+            assert_eq!(store.handed_keep(&h).await.unwrap(), Kept::New);
+            assert_eq!(
+                store.handed_keep(&h).await.unwrap(),
+                Kept::Undelivered,
+                "a Desk that stopped before delivering it"
+            );
             assert!(store.handed_of_boss("desk").await.unwrap().is_empty());
 
             let at = store.handed_delivered(h.id, "desk").await.unwrap();
@@ -154,9 +177,16 @@ mod tests {
             assert_eq!(kept[0].boss.as_deref(), Some("desk"));
             assert_eq!(kept[0].delivered_at, Some(at));
             assert_eq!(kept[0].words, h.words);
+            assert_eq!(
+                store.handed_keep(&h).await.unwrap(),
+                Kept::Unanswered {
+                    boss: "desk".into()
+                }
+            );
 
             store.handed_say(h.id, "has it").await.unwrap();
             store.handed_say(h.id, "stalled").await.unwrap();
+            assert_eq!(store.handed_keep(&h).await.unwrap(), Kept::Done);
             let owed = store.handed_owed(10).await.unwrap();
             assert_eq!(
                 owed.iter().map(|o| o.text.as_str()).collect::<Vec<_>>(),

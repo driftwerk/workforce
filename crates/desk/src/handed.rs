@@ -28,6 +28,20 @@ pub struct Handed {
     pub delivered_at: Option<DateTime<Utc>>,
 }
 
+/// What keeping a request taken found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Kept {
+    /// Kept now, for the first time.
+    New,
+    /// Kept before, but never delivered nor answered: a Desk that stopped
+    /// before it did.
+    Undelivered,
+    /// Delivered to `boss` before, with nothing said back on it yet.
+    Unanswered { boss: String },
+    /// Delivered or refused, and said back on.
+    Done,
+}
+
 /// A word owed back to where a request was asked.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Owed {
