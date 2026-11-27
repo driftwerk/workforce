@@ -2499,7 +2499,9 @@ impl CrewHub {
         let now = chrono::Utc::now();
         let mut still = HashMap::new();
         for (ticket, mut f) in kept {
-            if self.desk.plan(f.plan).await.is_err() {
+            // Dropped only with its plan; a plan that can't be read now
+            // keeps what it counted.
+            if let Err(workforce_desk::DeskError::NotFound) = self.desk.plan(f.plan).await {
                 continue;
             }
             f.next = f.next.min(now + self.wait_after(f.count));

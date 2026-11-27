@@ -84,47 +84,49 @@ pub const GRANT_TOO_LONG: &str = "grant_too_long";
 
 impl IntoResponse for DeskError {
     fn into_response(self) -> Response {
-        let status =
-            match &self {
-                DeskError::NotFound => StatusCode::NOT_FOUND,
-                DeskError::Conflict(_) => StatusCode::CONFLICT,
-                DeskError::CrossesBoss => {
-                    return (
-                        StatusCode::CONFLICT,
-                        Json(json!({ "error": self.to_string(), "code": CROSSES_BOSS })),
-                    )
-                        .into_response()
-                }
-                DeskError::NotHeld(_) => {
-                    return (
-                        StatusCode::CONFLICT,
-                        Json(json!({ "error": self.to_string(), "code": crate::grant::NOT_HELD })),
-                    )
-                        .into_response()
-                }
-                DeskError::WorktreeTaken { why, holder } => return (
+        let status = match &self {
+            DeskError::NotFound => StatusCode::NOT_FOUND,
+            DeskError::Conflict(_) => StatusCode::CONFLICT,
+            DeskError::CrossesBoss => {
+                return (
                     StatusCode::CONFLICT,
-                    Json(json!({ "error": why, "code": crate::worktree::TAKEN, "holder": holder })),
+                    Json(json!({ "error": self.to_string(), "code": CROSSES_BOSS })),
                 )
-                    .into_response(),
-                DeskError::Invalid(_) => StatusCode::BAD_REQUEST,
-                DeskError::TooLong { most, .. } => {
-                    let most = *most;
-                    return (
-                        StatusCode::BAD_REQUEST,
-                        Json(json!({
-                            "error": self.to_string(),
-                            "code": GRANT_TOO_LONG,
-                            "mostHours": most,
-                        })),
-                    )
-                        .into_response();
-                }
-                DeskError::Internal(e) => {
-                    tracing::error!(error = format!("{e:#}"), "desk request failed");
-                    StatusCode::INTERNAL_SERVER_ERROR
-                }
-            };
+                    .into_response()
+            }
+            DeskError::NotHeld(_) => {
+                return (
+                    StatusCode::CONFLICT,
+                    Json(json!({ "error": self.to_string(), "code": crate::grant::NOT_HELD })),
+                )
+                    .into_response()
+            }
+            DeskError::WorktreeTaken { why, holder } => {
+                let body = json!({
+                    "error": why,
+                    "code": crate::worktree::TAKEN,
+                    "holder": holder,
+                });
+                return (StatusCode::CONFLICT, Json(body)).into_response();
+            }
+            DeskError::Invalid(_) => StatusCode::BAD_REQUEST,
+            DeskError::TooLong { most, .. } => {
+                let most = *most;
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({
+                        "error": self.to_string(),
+                        "code": GRANT_TOO_LONG,
+                        "mostHours": most,
+                    })),
+                )
+                    .into_response();
+            }
+            DeskError::Internal(e) => {
+                tracing::error!(error = format!("{e:#}"), "desk request failed");
+                StatusCode::INTERNAL_SERVER_ERROR
+            }
+        };
         (status, Json(json!({ "error": self.to_string() }))).into_response()
     }
 }
@@ -791,6 +793,10 @@ struct Start {
     /// gives way ([`crate::Desk::create_held`]).
     #[serde(default)]
     free_resting: bool,
+    /// With `free_resting`, the session its ticket names now, which never
+    /// gives way.
+    #[serde(default)]
+    assigned: Option<Uuid>,
 }
 
 async fn create(State(s): S, h: HeaderMap, Query(q): Q, Json(start): Json<Start>) -> Response {
@@ -798,7 +804,13 @@ async fn create(State(s): S, h: HeaderMap, Query(q): Q, Json(start): Json<Start>
     match (start.boss, start.id) {
         (Some(boss), id) => {
             s.desk
-                .create_held(start.new, &boss, id, start.deps, start.free_resting)
+                .create_held(
+                    start.new,
+                    &boss,
+                    id,
+                    start.deps,
+                    start.free_resting.then_some(start.assigned),
+                )
                 .await
         }
         (None, None) => s.desk.create_chosen(start.new, start.deps).await,

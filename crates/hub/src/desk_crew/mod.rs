@@ -1480,6 +1480,28 @@ impl CrewHub {
     }
 }
 
+/// What `machine`'s refusal `body` of a call says: that it doesn't hold
+/// the plan's grant yet, that the worktree there is taken (by the session
+/// it names by its id, if any), or why else.
+pub(crate) fn machine_refusal(
+    machine: &str,
+    body: &serde_json::Value,
+) -> workforce_desk::crew::MachineRefused {
+    use workforce_desk::crew::MachineRefused;
+    let why = body
+        .get("error")
+        .and_then(serde_json::Value::as_str)
+        .map_or_else(|| format!("{machine} refused it."), str::to_string);
+    match &body["code"] {
+        c if c == workforce_desk::grant::NOT_HELD => MachineRefused::NotHeld(why),
+        c if c == workforce_desk::worktree::TAKEN => {
+            let holder = body["holder"].as_str().and_then(|h| h.parse().ok());
+            MachineRefused::WorktreeTaken(why, holder)
+        }
+        _ => MachineRefused::Refused(why),
+    }
+}
+
 #[async_trait]
 impl Crew for CrewHub {
     /// Through the relay Desk's native side takes, as a boss's relayed
@@ -1509,21 +1531,9 @@ impl Crew for CrewHub {
         let a = self
             .relay_as(machine, group.unwrap_or(""), call, input, boss, &ceiling)
             .await?;
-        let why = || {
-            a.body
-                .get("error")
-                .and_then(serde_json::Value::as_str)
-                .map_or_else(|| format!("{machine} refused it."), str::to_string)
-        };
         match a.status {
             served::ServedStatus::Ok => Ok(a.body),
-            _ if a.body["code"] == workforce_desk::grant::NOT_HELD => {
-                Err(MachineRefused::NotHeld(why()))
-            }
-            _ if a.body["code"] == workforce_desk::worktree::TAKEN => {
-                Err(MachineRefused::WorktreeTaken(why()))
-            }
-            _ => Err(MachineRefused::Refused(why())),
+            _ => Err(machine_refusal(machine, &a.body)),
         }
     }
 

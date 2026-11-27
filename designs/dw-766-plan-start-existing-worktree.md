@@ -207,3 +207,23 @@ A plan's ticket on a machine is freed the same way.
 
 A relayed test runs this through the Mac hub, the native-side stand-in
 and devbox's own Desk, both with the flag carried and without it.
+
+## Final check
+
+- Every resume is checked against the worktree's hold except Desk's own
+  restore (no one, no prompt). That includes a restart and a start again
+  for a change of mode.
+- A machine's held start sends `assigned` with `free_resting`. That is the
+  session id its ticket names on that machine (`<machine>/<id>`), and that
+  session never gives way, as here.
+- A machine's `worktree_taken` refusal carries `holder` through Desk's
+  native side, through `MachineRefused::WorktreeTaken`, and into the plan's
+  error.
+- A review session (one linked to a pull request) holds no worktree. It
+  reads beside the work, until DW-765 gives reviews their own worktrees.
+- A kept failure is dropped on load only when its plan is not found. A
+  plan that can't be read for any other reason keeps its count.
+- A held start finds its own session on the machine by the id it sent,
+  whatever that machine's clock says. The `earlier` exclusion applies only
+  to the by-name fallback, and it stays at `since`: compared against the
+  slack (`since - 10 min`), it would never leave anything out.

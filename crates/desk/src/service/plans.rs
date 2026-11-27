@@ -3246,8 +3246,8 @@ impl Desk {
             crew::MachineRefused::Refused(why) => sure(DeskError::Invalid(format!(
                 "{machine} didn't start {key}: {why}"
             ))),
-            crew::MachineRefused::WorktreeTaken(why) => {
-                sure(DeskError::WorktreeTaken { why, holder: None })
+            crew::MachineRefused::WorktreeTaken(why, holder) => {
+                sure(DeskError::WorktreeTaken { why, holder })
             }
             e @ crew::MachineRefused::Unknown(_) => failed(DeskError::Invalid(e.to_string()), true),
             e => sure(DeskError::Invalid(e.to_string())),
@@ -3285,10 +3285,11 @@ impl Desk {
         // (a start not held, or a machine that doesn't take its id), one of
         // its key made since: an older session of the same key (the ticket
         // was sent back and started again) is never taken up. Wide enough
-        // for the two computers' clocks to differ, so one resting there made
-        // before this start began is an earlier start's, never this one's. A
-        // held start takes up only one its boss has there: never the
-        // person's own of that name.
+        // for the two computers' clocks to differ. A held start takes up its
+        // own session there by its id, whatever that machine's clock says;
+        // by its name, only one its boss has there, never the person's own,
+        // and never one resting there made before this start began: that is
+        // an earlier start's, which `free_resting` replaces.
         let after = since - chrono::Duration::minutes(10);
         let earlier = |s: &crew::MachineSession, made: chrono::DateTime<chrono::Utc>| {
             made < since && matches!(s.state.as_str(), "idle" | "done")
@@ -3354,6 +3355,16 @@ impl Desk {
         // than that ignores it, and the start is refused as taken.
         if worktree && held.is_some() {
             body["free_resting"] = true.into();
+            // The session its ticket names there now (`<machine>/<id>`, as
+            // [`Self::assign_machine_session`] names it), which never gives way.
+            let assigned = t
+                .assignee
+                .as_ref()
+                .and_then(|a| a.id.strip_prefix(machine)?.strip_prefix('/'))
+                .and_then(|id| id.parse::<Uuid>().ok());
+            if let Some(a) = assigned {
+                body["assigned"] = a.to_string().into();
+            }
         }
         body["deps"] = true.into();
         if let Some(model) = &runs.model {
@@ -3374,12 +3385,12 @@ impl Desk {
         {
             // A retry's worktree may be held by the session its first try
             // made there: taken up when it is.
-            Err(crew::MachineRefused::WorktreeTaken(why)) if retry => {
+            Err(crew::MachineRefused::WorktreeTaken(why, holder)) if retry => {
                 return read()
                     .await
                     .ok()
                     .and_then(|listed| there(&listed))
-                    .ok_or_else(|| sure(DeskError::WorktreeTaken { why, holder: None }));
+                    .ok_or_else(|| sure(DeskError::WorktreeTaken { why, holder }));
             }
             made => made.map_err(refused)?,
         };

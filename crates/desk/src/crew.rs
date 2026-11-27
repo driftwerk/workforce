@@ -741,8 +741,9 @@ pub enum MachineRefused {
     /// ([`crate::grant::NOT_HELD`]): nothing was done, and the start waits.
     NotHeld(String),
     /// It refused a start whose worktree there is held by something else
-    /// ([`crate::worktree::TAKEN`]): nothing was done, and no retry changes it.
-    WorktreeTaken(String),
+    /// ([`crate::worktree::TAKEN`]), by the session there it names, if any:
+    /// nothing was done, and no retry changes it.
+    WorktreeTaken(String, Option<uuid::Uuid>),
     /// It may have had it, but no answer came: what it did isn't known.
     Unknown(String),
 }
@@ -753,7 +754,7 @@ impl std::fmt::Display for MachineRefused {
             Self::Unreached(w)
             | Self::Refused(w)
             | Self::NotHeld(w)
-            | Self::WorktreeTaken(w)
+            | Self::WorktreeTaken(w, _)
             | Self::Unknown(w) => f.write_str(w),
         }
     }

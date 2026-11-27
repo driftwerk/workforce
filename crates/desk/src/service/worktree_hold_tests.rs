@@ -292,6 +292,80 @@ async fn desks_own_restore_brings_back_sessions_sharing_a_worktree() {
         );
         d.resume(first.id, None, None).await.unwrap();
         assert!(d.record(second.id).unwrap().state.is_running());
+        // Back together, neither is started again over the other: not by a
+        // restart, nor by a change of its mode.
+        taken_by(
+            d.restart(first.id, None, By::you()).await.unwrap_err(),
+            "second",
+        );
+        assert!(!d.record(first.id).unwrap().state.is_running());
+        d.resume(first.id, None, None).await.unwrap();
+        d.set_mode(first.id, crate::mode::Mode::Plan, By::you())
+            .await
+            .unwrap();
+        assert!(
+            !d.record(first.id).unwrap().state.is_running(),
+            "not started again"
+        );
+        assert!(d.record(second.id).unwrap().state.is_running());
+    })
+    .await;
+}
+
+/// A stopped session restarted into its worktree, which a later start has
+/// taken since, is refused; alone there, it restarts.
+#[tokio::test]
+async fn a_restart_into_a_worktree_another_session_took_is_refused() {
+    with_test_pool(build_pool, |pool| async move {
+        let (home, repo) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        crate::worktree::test_repo(repo.path()).await;
+        let d = desk(pool, home.path()).await;
+        let first = d
+            .create(on(repo.path(), "first", Some("man-21")), None)
+            .await
+            .unwrap();
+        stopped(&d, first.id).await;
+        let second = d
+            .create(on(repo.path(), "second", Some("man-21")), None)
+            .await
+            .unwrap();
+        taken_by(
+            d.restart(first.id, None, By::you()).await.unwrap_err(),
+            "second",
+        );
+        stopped(&d, second.id).await;
+        d.restart(first.id, None, By::you()).await.unwrap();
+    })
+    .await;
+}
+
+/// A review reads beside the session working in the worktree: it holds
+/// nothing, so the work's start there goes on while it runs.
+#[tokio::test]
+async fn a_review_in_a_worktree_holds_nothing() {
+    with_test_pool(build_pool, |pool| async move {
+        let (home, repo) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        crate::worktree::test_repo(repo.path()).await;
+        let d = desk(pool, home.path()).await;
+        let review = d
+            .create(on(repo.path(), "review", Some("man-22")), None)
+            .await
+            .unwrap();
+        let pr = crate::plan::PrRef {
+            owner: "acme".into(),
+            repo: "atlas".into(),
+            number: 22,
+        };
+        d.0.store
+            .pr_review_link(review.id, "sarah", &pr)
+            .await
+            .unwrap();
+        let work = d
+            .create(on(repo.path(), "work", Some("man-22")), None)
+            .await
+            .unwrap();
+        assert_eq!(work.cwd, review.cwd);
+        assert!(d.record(review.id).unwrap().state.is_running());
     })
     .await;
 }

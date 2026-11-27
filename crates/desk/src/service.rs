@@ -4243,16 +4243,21 @@ impl Desk {
             self.breaker_refuses_prompt(id, by.as_ref())?;
         }
         let carrier = by.clone();
-        self.resume_checked(id, prompt, by, carrier.as_ref()).await
+        // A restore (no one, no prompt) brings back what ran before.
+        let restoring = by.is_none() && prompt.is_none();
+        self.resume_checked(id, prompt, by, carrier.as_ref(), restoring)
+            .await
     }
 
-    /// [`Self::resume`], the breaker already asked.
+    /// [`Self::resume`], the breaker already asked; `restoring` when it is
+    /// Desk's restore, which brings back what ran together before.
     async fn resume_checked(
         &self,
         id: Uuid,
         prompt: Option<String>,
         by: Option<By>,
         carrier: Option<&By>,
+        restoring: bool,
     ) -> Result<SessionView, DeskError> {
         // A Devin session's run before ends whole first ([`Self::on_exit`]),
         // and it is read after: what that end said is never saved over.
@@ -4309,11 +4314,11 @@ impl Desk {
             }
             self.end_held(id).await?;
         }
-        // Desk's own restore at its start (no one) brings back what ran
-        // together before; anyone's resume is checked.
-        let held = by
-            .as_ref()
-            .and_then(|_| worktree_hold::held_folder(Path::new(&r.cwd), r.branch.is_some()));
+        // Desk's own restore brings back what ran together before; any
+        // other resume (anyone's, a restart, a start again) is checked.
+        let held = (!restoring)
+            .then(|| worktree_hold::held_folder(Path::new(&r.cwd), r.branch.is_some()))
+            .flatten();
         let hold = match held {
             Some(folder) => Some(self.worktree_hold(folder).await),
             None => None,
@@ -4601,7 +4606,7 @@ impl Desk {
         }
         self.0.state.lock().acted.insert(id);
         let view = self
-            .resume_checked(id, prompt.clone(), None, Some(&by))
+            .resume_checked(id, prompt.clone(), None, Some(&by), false)
             .await?;
         let text = match &prompt {
             Some(p) => format!(

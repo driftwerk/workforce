@@ -40,11 +40,13 @@ pub(super) fn held_folder(cwd: &Path, branch: bool) -> Option<PathBuf> {
 }
 
 /// What a start or resume in a worktree is checked against, under the lock
-/// that records it: the worktree's folder (canonical), and the sessions
-/// whose process the terminal keeper still runs there.
+/// that records it: the worktree's folder (canonical), the sessions whose
+/// process the terminal keeper still runs there, and the reviews there,
+/// which read beside the session that works in it and hold nothing.
 pub(super) struct Hold {
     folder: PathBuf,
     kept: HashSet<Uuid>,
+    reviews: HashSet<Uuid>,
 }
 
 impl Hold {
@@ -55,6 +57,7 @@ impl Hold {
             .values()
             .find(|r| {
                 r.id != except
+                    && !self.reviews.contains(&r.id)
                     && (r.state.is_running()
                         || st.starting.contains(&r.id)
                         || self.kept.contains(&r.id))
@@ -75,7 +78,33 @@ impl Desk {
     /// The hold on `folder`, a worktree ([`held_folder`]).
     pub(super) async fn worktree_hold(&self, folder: PathBuf) -> Hold {
         let kept = self.kept_in(&folder).await;
-        Hold { folder, kept }
+        let reviews = self.reviews_in(&folder).await;
+        Hold {
+            folder,
+            kept,
+            reviews,
+        }
+    }
+
+    /// The review sessions in `folder` (canonical): one whose link can't
+    /// be read counts as no review.
+    async fn reviews_in(&self, folder: &Path) -> HashSet<Uuid> {
+        let there: Vec<Uuid> = self
+            .0
+            .state
+            .lock()
+            .records
+            .values()
+            .filter(|r| within(r, folder))
+            .map(|r| r.id)
+            .collect();
+        let linked =
+            futures::future::join_all(there.iter().map(|id| self.0.store.pr_review_of(*id))).await;
+        there
+            .into_iter()
+            .zip(linked)
+            .filter_map(|(id, l)| matches!(l, Ok(Some(_))).then_some(id))
+            .collect()
     }
 
     /// The interrupted sessions in `folder` (canonical) whose process the
