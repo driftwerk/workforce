@@ -1489,6 +1489,9 @@ impl CrewHub {
             .await
             .map_err(|e| ItemRefused::Cant(Self::item_err(e)))?
             .ok_or(ItemRefused::Closed)?;
+        if let Some(said) = self.plan_limit_answer(&closed, answer).await {
+            return said.map_err(ItemRefused::Cant);
+        }
         // "You undid … Should I change that preference?": keeping or
         // forgetting it is done here; changing it goes to the boss.
         if let Some(done) = self.overrule_answered(&closed, answer).await {
@@ -1935,6 +1938,9 @@ impl CrewHub {
         if i.state == OpenState::Parked {
             return None;
         }
+        if let Some(past) = self.limit_ask_past(i).await {
+            return past;
+        }
         // A promise or order ends when it is kept, or lapses.
         if matches!(i.kind, OpenKind::Promise | OpenKind::Order) {
             if let Some(what) = self.kept(i).await {
@@ -2286,6 +2292,7 @@ fn goes_to_boss(item: &OpenItem, answer: &str) -> bool {
     !waiting::is_waiting(&item.dedupe_key)
         && item.line_message.is_none()
         && super::preferences::overrule_of(item, answer).is_none()
+        && !super::plan_limit::answers(item, answer)
 }
 
 /// The id the person's answer to `item` is said to its boss under: the

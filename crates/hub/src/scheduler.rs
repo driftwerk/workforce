@@ -4106,6 +4106,7 @@ mod tests {
         assert!(resumed.plan_resumed_at.is_some());
         let verdict = crate::plan_guard::PlanGuard::global().check(
             &service.config.budget.plan,
+            service.config.budget.plan.pause_at(),
             &resumed.work(service.agent_id.as_str()),
             None,
             Utc::now(),

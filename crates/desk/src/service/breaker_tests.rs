@@ -618,3 +618,24 @@ async fn an_agents_hold_lapses_when_its_period_ends() {
     })
     .await;
 }
+
+#[tokio::test]
+async fn the_persons_plan_limit_is_a_share_of_a_window_kept_across_a_restart() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(pool.clone(), dir.path()).await;
+        assert_eq!(d.plan_pause_at(), None);
+        for wrong in [0.0, 100.5, f64::NAN] {
+            assert!(
+                matches!(d.set_plan_pause_at(wrong).await, Err(DeskError::Invalid(_))),
+                "{wrong}"
+            );
+        }
+        assert_eq!(d.plan_pause_at(), None);
+        assert_eq!(d.set_plan_pause_at(95.0).await.unwrap(), 95.0);
+        assert_eq!(d.plan_pause_at(), Some(95.0));
+        let again = desk(pool, dir.path()).await;
+        assert_eq!(again.plan_pause_at(), Some(95.0), "read again as kept");
+    })
+    .await;
+}

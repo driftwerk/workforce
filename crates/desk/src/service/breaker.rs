@@ -28,6 +28,9 @@ use crate::model::DeskEvent;
 
 /// Where the breaker's own settings are kept.
 const RULES_KEY: &str = "hub.breaker.rules";
+/// Where the person's own threshold for background work on their plans is
+/// kept.
+const PLAN_PAUSE_KEY: &str = "hub.plan.pause_at";
 /// How often held breakers are looked at again, so a hold whose period
 /// ended lifts without new spend.
 const LOOK_EVERY: Duration = Duration::from_secs(60);
@@ -51,6 +54,8 @@ pub(super) struct BreakerRun {
     names: HashMap<String, String>,
     /// The plans with a budget, as last read, for their breakers' words.
     plans: HashMap<Uuid, PlanFacts>,
+    /// The person's own threshold for background work on their plans.
+    plan_pause_at: Option<f64>,
 }
 
 /// What a plan's breaker says of it.
@@ -303,6 +308,11 @@ fn warn_agents_spend(error: &str) {
     }
 }
 
+/// Whether `percent` is a plan limit: a share of a window, 1-100.
+fn plan_pause_fits(percent: f64) -> bool {
+    (1.0..=100.0).contains(&percent)
+}
+
 /// A tool call's key: the same call hashes the same.
 fn key_of(label: &str) -> u64 {
     let mut h = std::collections::hash_map::DefaultHasher::new();
@@ -335,6 +345,15 @@ impl Desk {
             Ok(Some(e)) => serde_json::from_value(e.value).unwrap_or_default(),
             _ => Rules::default(),
         };
+        let plan_pause_at = match store.state(PLAN_PAUSE_KEY).await {
+            Ok(e) => e
+                .and_then(|e| e.value.as_f64())
+                .filter(|p| plan_pause_fits(*p)),
+            Err(e) => {
+                tracing::warn!(error = format!("{e:#}"), "couldn't read the plan limit");
+                None
+            }
+        };
         let plans: Vec<Uuid> = states
             .keys()
             .filter_map(|k| match BreakerOf::parse(k) {
@@ -347,6 +366,7 @@ impl Desk {
             run.budgets = budgets;
             run.states = states;
             run.rules = rules;
+            run.plan_pause_at = plan_pause_at;
         }
         // What a plan's hold says of it, from the start.
         self.read_plan_facts(&plans).await;
@@ -1557,6 +1577,28 @@ impl Desk {
             }
         }
         Ok(rules)
+    }
+
+    /// The person's own threshold for background work on their plans, when
+    /// they set one.
+    pub fn plan_pause_at(&self) -> Option<f64> {
+        self.0.breakers.lock().plan_pause_at
+    }
+
+    /// Background work on the person's plans pauses from `percent` of a
+    /// window, 1-100, from now on.
+    pub async fn set_plan_pause_at(&self, percent: f64) -> Result<f64, DeskError> {
+        if !plan_pause_fits(percent) {
+            return Err(DeskError::Invalid(
+                "the plan limit is a share of a window from 1 to 100".into(),
+            ));
+        }
+        self.0
+            .store
+            .put_state(PLAN_PAUSE_KEY, &serde_json::json!(percent))
+            .await?;
+        self.0.breakers.lock().plan_pause_at = Some(percent);
+        Ok(percent)
     }
 
     // ── Budgets ─────────────────────────────────────────────────────────
