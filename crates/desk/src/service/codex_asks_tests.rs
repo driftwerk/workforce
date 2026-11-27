@@ -16,6 +16,7 @@ use super::{Desk, DeskError, Floor};
 use crate::codex::tests::{next_sent, say};
 use crate::crew::By;
 use crate::floor::{Answer, DecideRef, TurnOp};
+use crate::limit::TurnFailure;
 use crate::model::{Decision, Engine, NewSession, SessionState};
 use crate::store::{build_pool, DeskStore};
 
@@ -36,23 +37,44 @@ fn fake_codex(dir: &Path) -> PathBuf {
     path
 }
 
+/// Where the stand-in in `dir` was told to listen, once it was.
+async fn listened(dir: &Path) -> PathBuf {
+    let told = dir.join("listen");
+    loop {
+        if let Ok(s) = std::fs::read_to_string(&told) {
+            if !s.trim().is_empty() {
+                return PathBuf::from(s.trim());
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
 /// Listens where the stand-in was told to, and takes the observer's
 /// connection.
 fn serve(dir: &Path) -> tokio::task::JoinHandle<WebSocketStream<UnixStream>> {
-    let told = dir.join("listen");
+    let dir = dir.to_path_buf();
     tokio::spawn(async move {
-        let socket = loop {
-            if let Ok(s) = std::fs::read_to_string(&told) {
-                if !s.trim().is_empty() {
-                    break PathBuf::from(s.trim());
-                }
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        };
-        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let listener = tokio::net::UnixListener::bind(listened(&dir).await).unwrap();
         let (stream, _) = listener.accept().await.unwrap();
         tokio_tungstenite::accept_async(stream).await.unwrap()
     })
+}
+
+/// Listens where the stand-in was told to, and takes each connection the
+/// observer makes; once the receiver is dropped, each is closed at once.
+fn serving(dir: &Path) -> tokio::sync::mpsc::UnboundedReceiver<WebSocketStream<UnixStream>> {
+    let dir = dir.to_path_buf();
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        let mut each = crate::codex::tests::fake_servers(&listened(&dir).await);
+        while let Some(ws) = each.recv().await {
+            if tx.send(ws).is_err() {
+                return;
+            }
+        }
+    });
+    rx
 }
 
 pub(super) async fn until(mut ok: impl FnMut() -> bool) {
@@ -592,12 +614,228 @@ async fn a_codex_turn_that_failed_leaves_its_session_done() {
             say(&mut ws, v.clone()).await;
         }
         until(|| d.view(s.id).unwrap().state == SessionState::Done).await;
+        // How it failed, once Codex says: on its plan's usage limit.
+        until(|| {
+            d.view(s.id)
+                .unwrap()
+                .failure
+                .as_ref()
+                .is_some_and(|f| f.limit().is_some())
+        })
+        .await;
         tokio::time::sleep(Duration::from_millis(100)).await;
+        let v = d.view(s.id).unwrap();
+        assert_eq!(v.state, SessionState::Done, "and stays so");
         assert_eq!(
-            d.view(s.id).unwrap().state,
-            SessionState::Done,
-            "and stays so"
+            serde_json::to_value(&v).unwrap()["failed"],
+            "It stopped on its plan's usage limit"
         );
+        // Asked again: its failure is behind it.
+        say(
+            &mut ws,
+            json!({"method": "turn/started", "params": {"threadId": "t1", "turn": {"id": "u2"}}}),
+        )
+        .await;
+        until(|| d.view(s.id).unwrap().failure.is_none()).await;
+    })
+    .await;
+}
+
+/// A turn whose completion says it failed before its status does is done,
+/// with Codex's words, and asks nothing.
+#[tokio::test]
+async fn a_codex_turn_completed_failed_first_is_done_with_its_words() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (d, s, mut ws) = following(pool, dir.path()).await;
+        say(
+            &mut ws,
+            json!({"method": "turn/started", "params": {"threadId": "t1", "turn": {"id": "u1"}}}),
+        )
+        .await;
+        say(
+            &mut ws,
+            json!({"method": "thread/status/changed", "params": {"threadId": "t1",
+            "status": {"type": "active", "activeFlags": []}}}),
+        )
+        .await;
+        until(|| d.view(s.id).unwrap().state == SessionState::Working).await;
+        say(
+            &mut ws,
+            json!({"method": "turn/completed", "params": {"threadId": "t1", "turn": {"id": "u1",
+            "status": "failed", "error": {"message": "stream disconnected before completion"}}}}),
+        )
+        .await;
+        until(|| d.view(s.id).unwrap().state == SessionState::Done).await;
+        let v = d.view(s.id).unwrap();
+        assert_eq!(
+            v.failure,
+            Some(TurnFailure::Failed(
+                "stream disconnected before completion".into()
+            ))
+        );
+        assert_eq!(v.asked, None);
+        say(
+            &mut ws,
+            json!({"method": "thread/status/changed", "params": {"threadId": "t1",
+            "status": {"type": "systemError"}}}),
+        )
+        .await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(d.view(s.id).unwrap().failure, v.failure, "its words kept");
+    })
+    .await;
+}
+
+/// The observer's connection to the app-server lost while its TUI runs:
+/// followed again, what Codex still asks stays the same request, answered
+/// from Desk there; not followed again in time, the session says Desk
+/// lost sight of it, said in Activity too, until it is followed again.
+#[tokio::test]
+async fn a_codex_session_followed_again_keeps_its_request_and_one_lost_says_so() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        DeskStore::migrate(&pool).await.unwrap();
+        let d = Desk::start(
+            DeskStore::from_pool(pool),
+            options(dir.path()).with_program(Engine::Codex, fake_codex(dir.path())),
+            Default::default(),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        let mut servers = serving(dir.path());
+        let s = d
+            .create(codex_session(dir.path(), false), None)
+            .await
+            .unwrap();
+        let mut ws = servers.recv().await.unwrap();
+        next_sent(&mut ws, |v| v["method"] == "initialized").await;
+        say(
+            &mut ws,
+            json!({"method": "thread/started", "params": {"thread": {"id": "t1",
+            "environments": [{"cwd": "/repo"}], "path": null}}}),
+        )
+        .await;
+        say(&mut ws, status(&[])).await;
+        let resume = next_sent(&mut ws, |v| v["method"] == "thread/resume").await;
+        say(&mut ws, json!({"id": resume["id"], "result": {"thread": {"id": "t1"}}})).await;
+        say(&mut ws, status(&["waitingOnApproval"])).await;
+        say(&mut ws, ask(0, None)).await;
+        until(|| d.view(s.id).unwrap().pending.is_some_and(|p| p.answerable)).await;
+        let p = d.view(s.id).unwrap().pending.unwrap();
+
+        drop(ws);
+        let mut ws = servers.recv().await.unwrap();
+        let resume = next_sent(&mut ws, |v| v["method"] == "thread/resume").await;
+        assert_eq!(resume["params"]["threadId"], "t1");
+        say(
+            &mut ws,
+            json!({"id": resume["id"], "result": {"thread": {"id": "t1",
+            "status": {"type": "active", "activeFlags": ["waitingOnApproval"]}}}}),
+        )
+        .await;
+        say(&mut ws, ask(0, None)).await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let v = d.view(s.id).unwrap();
+        assert_eq!(v.state, SessionState::Blocked);
+        assert_eq!(v.pending.as_ref().map(|q| q.id), Some(p.id), "the same request");
+        assert_eq!(v.failure, None);
+        d.decide(s.id, p.id, Decision::Allow, Some(By::you()))
+            .unwrap();
+        let answer = next_sent(&mut ws, |v| v.get("result").is_some()).await;
+        assert_eq!(answer, json!({"id": 0, "result": {"decision": "accept"}}));
+        say(
+            &mut ws,
+            json!({"method": "serverRequest/resolved", "params": {"threadId": "t1", "requestId": 0}}),
+        )
+        .await;
+        say(&mut ws, ask(1, None)).await;
+        until(|| d.view(s.id).unwrap().pending.is_some_and(|q| q.id != p.id)).await;
+
+        // The app-server takes no more connections that last.
+        drop(ws);
+        let lost = Some(TurnFailure::Failed(
+            "Desk lost sight of this Codex session".into(),
+        ));
+        for _ in 0..100 {
+            if d.view(s.id).unwrap().failure == lost {
+                break;
+            }
+            if let Ok(ws) = servers.try_recv() {
+                drop(ws);
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        let v = d.view(s.id).unwrap();
+        assert_eq!(v.failure, lost);
+        assert_eq!((v.state, v.pending), (SessionState::Done, None));
+        let said = d
+            .activity(crate::crew::Filter::All, None, 50)
+            .await
+            .unwrap()
+            .events
+            .iter()
+            .any(|e| e.text.contains("Desk lost sight"));
+        assert!(said, "said in Activity");
+
+        // Its app-server back: followed again, what it says is so again.
+        let mut ws = servers.recv().await.unwrap();
+        let resume = next_sent(&mut ws, |v| v["method"] == "thread/resume").await;
+        say(
+            &mut ws,
+            json!({"id": resume["id"], "result": {"thread": {"id": "t1",
+            "status": {"type": "active", "activeFlags": ["waitingOnApproval"]}}}}),
+        )
+        .await;
+        say(&mut ws, ask(1, None)).await;
+        until(|| d.view(s.id).unwrap().failure.is_none()).await;
+        until(|| d.view(s.id).unwrap().pending.is_some_and(|p| p.answerable)).await;
+        assert_eq!(d.view(s.id).unwrap().state, SessionState::Blocked);
+    })
+    .await;
+}
+
+/// A Codex session whose thread doesn't start within its start's watch
+/// is done, said not to have come up; its thread starting late brings it
+/// up after all, that behind it.
+#[tokio::test]
+async fn a_codex_session_that_comes_up_late_is_up_and_its_failure_behind_it() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        DeskStore::migrate(&pool).await.unwrap();
+        let d = Desk::start(
+            DeskStore::from_pool(pool),
+            options(dir.path()).with_program(Engine::Codex, fake_codex(dir.path())),
+            Default::default(),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        let server = serve(dir.path());
+        let s = d
+            .create(codex_session(dir.path(), false), None)
+            .await
+            .unwrap();
+        let mut ws = server.await.unwrap();
+        next_sent(&mut ws, |v| v["method"] == "initialized").await;
+        for _ in 0..100 {
+            if d.view(s.id).unwrap().state != SessionState::Starting {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        let v = d.view(s.id).unwrap();
+        assert_eq!(v.state, SessionState::Done);
+        assert_eq!(v.failed.as_deref(), Some("Codex didn't come up"));
+        say(
+            &mut ws,
+            json!({"method": "thread/started", "params": {"thread": {"id": "t1",
+            "environments": [{"cwd": "/repo"}], "path": null}}}),
+        )
+        .await;
+        until(|| d.view(s.id).unwrap().state == SessionState::Idle).await;
+        assert_eq!(d.view(s.id).unwrap().failure, None);
     })
     .await;
 }

@@ -267,10 +267,16 @@ pub struct SessionView {
     #[serde(skip)]
     pub reading: bool,
     /// How its last turn ended when an API error ended it: the plan's
-    /// limit, or another failure ([`crate::limit`]). Cleared once it is
-    /// asked again.
+    /// limit, or another failure ([`crate::limit`]); or how its run failed
+    /// apart from its turns (a Codex session that never came up, or that
+    /// Desk lost sight of). Cleared once it is asked again.
     #[serde(skip)]
     pub failure: Option<crate::limit::TurnFailure>,
+    /// Its [`Self::failure`] in plain words, as its card, its ticket and its
+    /// boss say it: none while Desk still reads what a rate limit was, nor
+    /// once it is closed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failed: Option<String>,
     /// The mode that doesn't ask (auto, bypass) an unbound boss started it
     /// in, while it runs in it: shown on its card.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -512,6 +518,7 @@ impl SessionView {
             waits_on_you: None,
             boss_has: None,
             failure: None,
+            failed: None,
             exited: None,
             deps: None,
             waits: None,
