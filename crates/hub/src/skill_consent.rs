@@ -351,7 +351,11 @@ impl Consent {
         // system administrator's standing over external skills cannot be an
         // edit of it: they hold the bypass either way.
         let manages_skills = is_admin
-            || crate::authz::holds_capability(identities.as_ref(), uid, Capability::SkillsManage);
+            || crate::authz::holds_capability(
+                identities.as_ref(),
+                crate::authz::Holder::full(uid),
+                Capability::SkillsManage,
+            );
         Self::from_parts(
             crate::wasm_skill_tools::global_skill_store(),
             crate::wasm_skill_tools::SkillLockerVault::compose(

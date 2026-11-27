@@ -1331,6 +1331,63 @@ pub(crate) struct WsCaller {
     /// Which slot of a device's token chain matched, for `connected`.
     pub(crate) token_match: Option<String>,
     pub(crate) identity_role: String,
+    pub(crate) ceiling: crate::authz::Ceiling,
+}
+
+impl WsCaller {
+    /// The person connecting, held to the credential's ceiling.
+    pub(crate) fn holder(&self) -> Option<crate::authz::Holder<'_>> {
+        self.identity_id
+            .as_deref()
+            .map(|identity_id| crate::authz::Holder {
+                identity_id,
+                ceiling: self.ceiling,
+            })
+    }
+}
+
+impl From<crate::auth::Admitted> for WsCaller {
+    fn from(admitted: crate::auth::Admitted) -> Self {
+        let crate::auth::Admitted {
+            claims,
+            ceiling,
+            kind,
+        } = admitted;
+        match kind {
+            // Paired devices are the primary user → Owner trust, no wrap.
+            crate::auth::CredentialKind::Device(token_match) => Self {
+                device_id: claims.device_id,
+                scopes: Some(claims.scopes),
+                identity_id: claims.identity_id,
+                token_match: Some(
+                    match token_match {
+                        workforce_pairing::TokenMatch::Current => "current",
+                        workforce_pairing::TokenMatch::Previous => "previous",
+                    }
+                    .to_string(),
+                ),
+                identity_role: "manager".to_string(),
+                ceiling,
+            },
+            crate::auth::CredentialKind::Jwt { unscoped: true }
+            | crate::auth::CredentialKind::StaticToken => Self {
+                device_id: claims.device_id,
+                scopes: None,
+                identity_id: claims.identity_id,
+                token_match: None,
+                identity_role: claims.role.as_str().to_string(),
+                ceiling,
+            },
+            crate::auth::CredentialKind::Jwt { unscoped: false } => Self {
+                device_id: claims.device_id,
+                scopes: Some(claims.scopes),
+                identity_id: claims.identity_id,
+                token_match: None,
+                identity_role: claims.role.as_str().to_string(),
+                ceiling,
+            },
+        }
+    }
 }
 
 /// The credential a WebSocket handshake presents: its `?token=`, which a
@@ -1395,107 +1452,48 @@ mod ws_token_tests {
     }
 }
 
-/// Authenticate a WebSocket handshake's `token`: a device pairing token, then
-/// a JWT. The refusal is the response the upgrade is answered with: 403 for a
+/// Authenticate a WebSocket handshake's `token`: a device pairing token or a
+/// JWT. The refusal is the response the upgrade is answered with: 403 for a
 /// suspended person, 503 when the pairing store could not be read, else 401.
 pub(crate) async fn authenticate_ws(
     state: &GatewayState,
     token: &str,
 ) -> Result<WsCaller, axum::response::Response> {
-    // The admin token names nobody, so it never opens a WebSocket; it stays
-    // valid for REST APIs, MCP and admin endpoints.
-    let mut pairing_store_error = false;
-
-    if let Some(ref pairing) = state.device_pairing {
-        match pairing
-            .validate_token_with_match_async(token.to_string())
-            .await
-        {
-            Ok(Some((device, kind))) => {
-                let identity_id = state
-                    .identity_store
-                    .as_ref()
-                    .and_then(|store| identity_for_device(store.as_ref(), &device.id));
-                if let Some(refused) = suspended_refusal(state, identity_id.as_deref()) {
-                    return Err(refused);
-                }
-                return Ok(WsCaller {
-                    device_id: Some(device.id),
-                    scopes: Some(device.scopes),
-                    identity_id,
-                    token_match: Some(
-                        match kind {
-                            workforce_pairing::TokenMatch::Current => "current",
-                            workforce_pairing::TokenMatch::Previous => "previous",
-                        }
-                        .to_string(),
-                    ),
-                    // Paired devices are the primary user → Owner trust, no wrap.
-                    identity_role: "manager".to_string(),
-                });
-            }
-            Ok(None) => {}
-            Err(e) => {
-                // Store failure ≠ bad token, and the JWT strategy below has
-                // no dependency on the pairing store — a valid JWT must still
-                // connect. Record the failure and only surface it after JWT
-                // has had its chance.
-                warn!(
-                    token = %crate::token_hint::hint(token),
-                    error = %e,
-                    "Pairing store error during WebSocket auth — failing closed"
-                );
-                pairing_store_error = true;
+    match crate::auth::admit(state.door(), token).await {
+        // The admin token names nobody, so it never opens a WebSocket; it
+        // stays valid for REST APIs, MCP and admin endpoints.
+        Ok(admitted) if admitted.kind != crate::auth::CredentialKind::StaticToken => {
+            match suspended_refusal(state, admitted.claims.identity_id.as_deref()) {
+                Some(refused) => Err(refused),
+                None => Ok(admitted.into()),
             }
         }
-    }
-
-    if let Some(ref jwt_config) = state.jwt_config {
-        if let Ok(claims) = crate::jwt::validate_token(jwt_config, token) {
-            if let Some(refused) = suspended_refusal(state, claims.identity_id.as_deref()) {
-                return Err(refused);
-            }
-            let identity_id = claims.identity_id.clone();
-            let legacy_unscoped = claims.scopes.is_empty();
-            let claims = crate::jwt::current_claims(state.identity_store.as_ref(), claims);
-            return Ok(WsCaller {
-                device_id: claims.device_id,
-                scopes: (!legacy_unscoped).then_some(claims.scopes),
-                identity_id,
-                token_match: None,
-                identity_role: claims.role.as_str().to_string(),
-            });
-        }
-    }
-
-    if pairing_store_error {
-        // The token wasn't a valid JWT and the pairing store couldn't be
-        // consulted, so its validity is unknown. A 401 here would make the
-        // iOS client count an auth strike (three disable reconnection);
-        // 503 keeps it on the plain retry-with-backoff path.
-        return Err((
+        // The token's validity is unknown. A 401 here would make the iOS
+        // client count an auth strike (three disable reconnection); 503 keeps
+        // it on the plain retry-with-backoff path.
+        Err(AuthFailure::StoreError) => Err((
             StatusCode::SERVICE_UNAVAILABLE,
             axum::Json(serde_json::json!({
                 "error": "service_unavailable",
                 "message": "Authentication backend unavailable — retry shortly."
             })),
         )
-            .into_response());
+            .into_response()),
+        Ok(_) | Err(AuthFailure::InvalidCredentials | AuthFailure::SurfaceRefused) => {
+            warn!(
+                token = %crate::token_hint::hint(token),
+                "WebSocket auth failed — invalid or expired token"
+            );
+            Err((
+                StatusCode::UNAUTHORIZED,
+                axum::Json(serde_json::json!({
+                    "error": "unauthorized",
+                    "message": "Authentication required. Provide a valid token (Authorization: Bearer, or ?token=...) or pair your device via /api/pair/device/request."
+                })),
+            )
+                .into_response())
+        }
     }
-
-    warn!(
-        token = %crate::token_hint::hint(token),
-        "WebSocket auth failed — invalid or expired token"
-    );
-
-    Err((
-        StatusCode::UNAUTHORIZED,
-        axum::Json(serde_json::json!({
-            "error": "unauthorized",
-            "message": "Authentication required. Provide a valid token (Authorization: Bearer, or ?token=...) or pair your device via /api/pair/device/request."
-        })),
-    )
-        .into_response())
 }
 
 /// WebSocket upgrade handler.
@@ -2291,6 +2289,7 @@ async fn handle_ws(
         identity_id,
         token_match,
         identity_role,
+        ceiling: _,
     } = caller;
     let (mut sender, mut receiver) = socket.split();
     let mut broadcast_rx = state.broadcast_tx.subscribe();
@@ -5049,7 +5048,9 @@ async fn list_agents(
     // stranded device stayed invisible for weeks. Only credential-less
     // callers proceed as anonymous (and see nothing — F1).
     match caller.auth_failure {
-        Some(AuthFailure::InvalidCredentials) => return Err(StatusCode::UNAUTHORIZED),
+        Some(AuthFailure::InvalidCredentials | AuthFailure::SurfaceRefused) => {
+            return Err(StatusCode::UNAUTHORIZED)
+        }
         Some(AuthFailure::StoreError) => return Err(StatusCode::SERVICE_UNAVAILABLE),
         None => {}
     }
@@ -5170,6 +5171,10 @@ pub enum AuthFailure {
     /// The pairing store errored while validating, so the credential's
     /// validity is unknown — fail with 503, never fail-open to anonymous.
     StoreError,
+    /// A valid credential of a kind the surface it arrived on does not take:
+    /// the static token off the admin listener's host, a device token or a
+    /// member-surface JWT on the admin surface. Rejected with 401.
+    SurfaceRefused,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -5192,25 +5197,39 @@ pub struct CallerContext {
     /// Set when a credential was presented but did not authenticate. `None`
     /// for both successful auth and credential-less anonymous callers.
     pub auth_failure: Option<AuthFailure>,
+    /// The most the credential may exercise on the surface it arrived on.
+    pub ceiling: crate::authz::Ceiling,
 }
 
-/// A JWT carries identity_id and (optionally) device_id directly. Only
-/// SystemAdmin inherits `is_admin` for cross-user session visibility —
-/// Managers see only their own sessions, matching the user-facing
-/// requirement.
-impl From<crate::jwt::Claims> for CallerContext {
-    fn from(claims: crate::jwt::Claims) -> Self {
+/// An admitted credential's claims already carry the live role under the
+/// ceiling. Only SystemAdmin inherits `is_admin` for cross-user session
+/// visibility — Managers see only their own sessions, matching the
+/// user-facing requirement — and a paired device never does.
+impl From<crate::auth::Admitted> for CallerContext {
+    fn from(admitted: crate::auth::Admitted) -> Self {
+        let claims = admitted.claims;
         Self {
             identity_id: claims.identity_id,
             device_id: claims.device_id,
             is_admin: claims.role.can_manage_system(),
             scopes: claims.scopes,
             auth_failure: None,
+            ceiling: admitted.ceiling,
         }
     }
 }
 
 impl CallerContext {
+    /// The person the credential presents, held to its ceiling.
+    pub(crate) fn holder(&self) -> Option<crate::authz::Holder<'_>> {
+        self.identity_id
+            .as_deref()
+            .map(|identity_id| crate::authz::Holder {
+                identity_id,
+                ceiling: self.ceiling,
+            })
+    }
+
     /// True if `owner` matches this caller's identity_id or device_id.
     /// Admin tokens are NOT auto-owners — they may view but cannot act-as.
     pub(crate) fn owns(&self, owner: &str) -> bool {
@@ -5674,76 +5693,44 @@ pub async fn resolve_caller_context(
     headers: &axum::http::HeaderMap,
     query_token: Option<&str>,
 ) -> CallerContext {
-    let token = match query_token.map(str::to_owned).or_else(|| {
-        headers
-            .get("authorization")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|h| h.strip_prefix("Bearer "))
-            .map(str::to_owned)
-    }) {
+    let token = match query_token.or_else(|| header_bearer(headers)) {
         Some(t) if !t.is_empty() => t,
         _ => return CallerContext::default(),
     };
-
-    // Admin token grants cross-user visibility but no specific identity.
-    if crate::auth::constant_time_token_eq(&token, &state.auth_token) {
-        return CallerContext {
-            is_admin: true,
-            scopes: vec![crate::jwt::SCOPE_WILDCARD.to_string()],
-            ..Default::default()
-        };
-    }
-
-    if let Some(ref jwt_config) = state.jwt_config {
-        if let Ok(claims) = crate::jwt::validate_token(jwt_config, &token) {
-            return crate::jwt::current_claims(state.identity_store.as_ref(), claims).into();
-        }
-    }
-
-    // Paired-device token (wfp_*): validate and resolve the linked identity.
-    let token_hint = crate::token_hint::hint(&token);
-    if let Some(ref pairing) = state.device_pairing {
-        match pairing.validate_token_async(token).await {
-            Ok(Some(device)) => {
-                let identity_id = state
-                    .identity_store
-                    .as_ref()
-                    .and_then(|store| identity_for_device(store.as_ref(), &device.id));
-                return CallerContext {
-                    identity_id,
-                    device_id: Some(device.id),
-                    is_admin: false,
-                    scopes: device.scopes,
-                    auth_failure: None,
-                };
+    crate::auth::admit(state.door(), token)
+        .await
+        .map(CallerContext::from)
+        .unwrap_or_else(|failure| {
+            // info, not warn: routine token expiry (web JWTs especially) lands
+            // here on every request until the client refreshes, across every
+            // handler that resolves a caller — warn would flood prod logs with
+            // non-actionable noise while staying visible enough to diagnose a
+            // stranded client.
+            match failure {
+                AuthFailure::InvalidCredentials => info!(
+                    token = %crate::token_hint::hint(token),
+                    "Presented credential failed authentication (invalid or expired token)"
+                ),
+                AuthFailure::SurfaceRefused => info!(
+                    token = %crate::token_hint::hint(token),
+                    surface = ?crate::surface::current().surface,
+                    "Presented credential is not taken on this surface"
+                ),
+                AuthFailure::StoreError => {}
             }
-            Ok(None) => {}
-            Err(e) => {
-                warn!(
-                    token = %token_hint,
-                    error = %e,
-                    "Pairing store error while validating device token — failing closed"
-                );
-                return CallerContext {
-                    auth_failure: Some(AuthFailure::StoreError),
-                    ..Default::default()
-                };
+            CallerContext {
+                auth_failure: Some(failure),
+                ..Default::default()
             }
-        }
-    }
+        })
+}
 
-    // info, not warn: routine token expiry (web JWTs especially) lands here
-    // on every request until the client refreshes, across every handler that
-    // resolves a caller — warn would flood prod logs with non-actionable
-    // noise while staying visible enough to diagnose a stranded client.
-    info!(
-        token = %token_hint,
-        "Presented credential failed authentication (invalid or expired token)"
-    );
-    CallerContext {
-        auth_failure: Some(AuthFailure::InvalidCredentials),
-        ..Default::default()
-    }
+/// The `Authorization: Bearer` token, if the request carries one.
+pub(crate) fn header_bearer(headers: &axum::http::HeaderMap) -> Option<&str> {
+    headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|h| h.strip_prefix("Bearer "))
 }
 
 /// Canonical channel name for iOS / paired-device chat conversations, and the
@@ -8404,7 +8391,17 @@ pub(crate) async fn require_scope(
 ///   `role.can_manage_system()` with no status check, so honouring it would
 ///   reopen exactly that hole.
 /// * No store, an unresolvable id, or no principal at all → non-admin Member.
+///
+/// Whichever it is, the caller's ceiling holds it: on the member surface the
+/// matrix scores the member row.
 pub(crate) fn gateway_principal(
+    caller: &CallerContext,
+    identity_store: Option<&Arc<dyn workforce_identity::store::IdentityStore>>,
+) -> crate::authz::Principal {
+    uncapped_principal(caller, identity_store).capped(caller.ceiling)
+}
+
+fn uncapped_principal(
     caller: &CallerContext,
     identity_store: Option<&Arc<dyn workforce_identity::store::IdentityStore>>,
 ) -> crate::authz::Principal {
@@ -9268,29 +9265,21 @@ async fn pair_device_rotate_self(
 
 /// Strict owner-only auth check.
 /// Accepts the static admin token or a valid JWT with SystemAdmin role.
+/// The `?token=` query parameter only ever carries the static token here.
+/// The role read is the person's live one, so a token minted before a
+/// demotion or suspension no longer passes.
 pub(crate) fn check_owner_auth(
     state: &GatewayState,
     headers: &axum::http::HeaderMap,
     query_token: Option<&str>,
 ) -> bool {
-    if let Some(t) = query_token {
-        if crate::auth::constant_time_token_eq(t, &state.auth_token) {
-            return true;
-        }
-    }
-    if let Some(auth) = headers.get("authorization").and_then(|v| v.to_str().ok()) {
-        if let Some(token) = auth.strip_prefix("Bearer ") {
-            if crate::auth::constant_time_token_eq(token, &state.auth_token) {
-                return true;
-            }
-            if let Some(ref cfg) = state.jwt_config {
-                if let Ok(claims) = crate::jwt::validate_token(cfg, token) {
-                    return claims.role.can_manage_system();
-                }
-            }
-        }
-    }
-    false
+    let admitted = |token| crate::auth::admit_signed(state.door(), token).and_then(Result::ok);
+    query_token
+        .and_then(admitted)
+        .is_some_and(|a| a.kind == crate::auth::CredentialKind::StaticToken)
+        || header_bearer(headers)
+            .and_then(admitted)
+            .is_some_and(|a| a.claims.role.can_manage_system())
 }
 
 /// Choose the audit actor for an admin-surface vault write.
@@ -15706,6 +15695,7 @@ mod session_visibility_tests {
             is_admin: false,
             scopes: vec![crate::jwt::SCOPE_WILDCARD.to_string()],
             auth_failure: None,
+            ceiling: crate::authz::Ceiling::Full,
         }
     }
 
@@ -16334,6 +16324,7 @@ mod session_visibility_tests {
         let role = |state: &GatewayState| {
             crate::api_handlers::identity::require_auth(state, &headers)
                 .unwrap()
+                .claims
                 .role
         };
         assert_eq!(role(&state), IdentityRole::Member);
@@ -16674,6 +16665,7 @@ mod caller_scope_tests {
             is_admin: false,
             scopes: scopes.iter().map(|s| s.to_string()).collect(),
             auth_failure: None,
+            ceiling: crate::authz::Ceiling::Full,
         }
     }
 

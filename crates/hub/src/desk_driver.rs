@@ -157,11 +157,7 @@ impl Authorize for SystemAdmins {
         query_token: Option<&str>,
     ) -> Result<Option<String>, StatusCode> {
         let caller = resolve_caller_context(&self.0, headers, query_token).await;
-        if crate::desk_floor::holds_the_hub(
-            self.0.identity_store.as_ref(),
-            true,
-            caller.identity_id.as_deref(),
-        ) {
+        if crate::desk_floor::holds_the_hub(self.0.identity_store.as_ref(), true, caller.holder()) {
             return Ok(caller.identity_id);
         }
         match caller {

@@ -12298,6 +12298,7 @@ dependencies = [
  "workforce-projects",
  "workforce-self-learning",
  "workforce-skills",
+ "workforce-surface",
  "workforce-training",
  "workforce-vellev",
  "workforce-wasm-runtime",
@@ -12828,6 +12829,13 @@ dependencies = [
  "workforce-common",
  "workforce-core",
  "workforce-oauth-client",
+]
+
+[[package]]
+name = "workforce-surface"
+version = "0.1.7"
+dependencies = [
+ "tokio",
 ]
 
 [[package]]

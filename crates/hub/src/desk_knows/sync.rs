@@ -830,7 +830,7 @@ async fn holder(
 ) -> Result<String, Response> {
     let caller = resolve_caller_context(state, headers, token).await;
     match caller.auth_failure {
-        Some(AuthFailure::InvalidCredentials) => {
+        Some(AuthFailure::InvalidCredentials | AuthFailure::SurfaceRefused) => {
             return Err(refusal(StatusCode::UNAUTHORIZED, "not allowed"))
         }
         Some(AuthFailure::StoreError) => {
@@ -841,13 +841,15 @@ async fn holder(
         }
         None => {}
     }
+    let holds =
+        crate::desk_floor::holds_the_hub(state.identity_store.as_ref(), true, caller.holder());
     let Some(person) = caller.identity_id else {
         return Err(refusal(
             StatusCode::FORBIDDEN,
             "What Desk shares is a person's: ask as yourself, not as the hub",
         ));
     };
-    if !crate::desk_floor::holds_the_hub(state.identity_store.as_ref(), true, Some(&person)) {
+    if !holds {
         return Err(refusal(
             StatusCode::FORBIDDEN,
             "Only the person whose Desk this is links its agents",

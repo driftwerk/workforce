@@ -8,6 +8,7 @@ use workforce_identity::store::IdentityFilter;
 use workforce_identity::team::TeamStore;
 use workforce_identity::types::{Identity, IdentityRole, IdentityStatus, ProvisioningSource};
 
+use crate::auth::Admitted;
 use crate::gateway::GatewayState;
 
 type ApiResult<T> = Result<Json<T>, (StatusCode, Json<serde_json::Value>)>;
@@ -36,48 +37,16 @@ fn require_known_role_key(role: &str) -> Result<(), (StatusCode, Json<serde_json
     }
 }
 
-fn extract_claims(
-    state: &GatewayState,
-    headers: &axum::http::HeaderMap,
-) -> Result<crate::jwt::Claims, (StatusCode, Json<serde_json::Value>)> {
-    // Try JWT first — preserves identity_id from the token.
-    let token = headers
-        .get("authorization")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|h| h.strip_prefix("Bearer "));
-
-    if let Some(token) = token {
-        if let Some(ref jwt_config) = state.jwt_config {
-            if let Ok(claims) = crate::jwt::validate_token(jwt_config, token) {
-                return Ok(crate::jwt::current_claims(
-                    state.identity_store.as_ref(),
-                    claims,
-                ));
-            }
-        }
-    }
-
-    // Fall back to static gateway token → SystemAdmin with no identity
-    if super::check_owner_auth(state, headers, None) {
-        return Ok(crate::jwt::Claims {
-            sub: "admin".to_string(),
-            role: IdentityRole::SystemAdmin,
-            identity_id: None,
-            iat: 0,
-            exp: u64::MAX,
-            scopes: Vec::new(),
-            device_id: None,
-        });
-    }
-
-    Err(err(StatusCode::UNAUTHORIZED, "Unauthorized"))
-}
-
+/// The caller, by the static gateway token or a JWT in the
+/// `Authorization` header; a paired device's token is not taken here.
 pub(crate) fn require_auth(
     state: &GatewayState,
     headers: &axum::http::HeaderMap,
-) -> Result<crate::jwt::Claims, (StatusCode, Json<serde_json::Value>)> {
-    extract_claims(state, headers)
+) -> Result<Admitted, (StatusCode, Json<serde_json::Value>)> {
+    crate::gateway::header_bearer(headers)
+        .and_then(|token| crate::auth::admit_signed(state.door(), token))
+        .and_then(Result::ok)
+        .ok_or_else(|| err(StatusCode::UNAUTHORIZED, "Unauthorized"))
 }
 
 /// Extract the caller's `identity_id` from the JWT, rejecting static admin
@@ -90,13 +59,14 @@ pub(crate) fn require_identity(
     require_person(state, headers).map(|(person, _)| person.to_string())
 }
 
-/// [`require_identity`], keeping the claims it was read from.
+/// [`require_identity`], keeping the credential it was read from.
 pub(crate) fn require_person(
     state: &GatewayState,
     headers: &axum::http::HeaderMap,
-) -> Result<(uuid::Uuid, crate::jwt::Claims), (StatusCode, Json<serde_json::Value>)> {
-    let claims = require_auth(state, headers)?;
-    let person = claims
+) -> Result<(uuid::Uuid, Admitted), (StatusCode, Json<serde_json::Value>)> {
+    let admitted = require_auth(state, headers)?;
+    let person = admitted
+        .claims
         .identity_id
         .as_deref()
         .filter(|id| !id.is_empty())
@@ -110,18 +80,18 @@ pub(crate) fn require_person(
             uuid::Uuid::parse_str(id)
                 .map_err(|_| err(StatusCode::FORBIDDEN, "Invalid identity format"))
         })?;
-    Ok((person, claims))
+    Ok((person, admitted))
 }
 
 fn require_admin(
     state: &GatewayState,
     headers: &axum::http::HeaderMap,
-) -> Result<crate::jwt::Claims, (StatusCode, Json<serde_json::Value>)> {
-    let claims = extract_claims(state, headers)?;
-    if !claims.role.can_manage_system() {
+) -> Result<Admitted, (StatusCode, Json<serde_json::Value>)> {
+    let admitted = require_auth(state, headers)?;
+    if !admitted.claims.role.can_manage_system() {
         return Err(err(StatusCode::FORBIDDEN, "Requires SystemAdmin role"));
     }
-    Ok(claims)
+    Ok(admitted)
 }
 
 /// Enforce [`crate::authz::Capability::RolesAssign`] for the user-management
@@ -169,15 +139,15 @@ fn guard_system_admin_grant(
 pub(crate) fn require_admin_or_manager(
     state: &GatewayState,
     headers: &axum::http::HeaderMap,
-) -> Result<crate::jwt::Claims, (StatusCode, Json<serde_json::Value>)> {
-    let claims = extract_claims(state, headers)?;
-    if !claims.role.can_manage_teams() {
+) -> Result<Admitted, (StatusCode, Json<serde_json::Value>)> {
+    let admitted = require_auth(state, headers)?;
+    if !admitted.claims.role.can_manage_teams() {
         return Err(err(
             StatusCode::FORBIDDEN,
             "Requires SystemAdmin or Manager role",
         ));
     }
-    Ok(claims)
+    Ok(admitted)
 }
 
 /// Allow the request when the caller is SystemAdmin / Manager OR is the
@@ -188,13 +158,12 @@ pub(crate) fn require_self_or_admin(
     state: &GatewayState,
     headers: &axum::http::HeaderMap,
     target_identity_id: &str,
-) -> Result<crate::jwt::Claims, (StatusCode, Json<serde_json::Value>)> {
-    let claims = extract_claims(state, headers)?;
-    if claims.role.can_manage_teams() {
-        return Ok(claims);
-    }
-    if claims.identity_id.as_deref() == Some(target_identity_id) {
-        return Ok(claims);
+) -> Result<Admitted, (StatusCode, Json<serde_json::Value>)> {
+    let admitted = require_auth(state, headers)?;
+    if admitted.claims.role.can_manage_teams()
+        || admitted.claims.identity_id.as_deref() == Some(target_identity_id)
+    {
+        return Ok(admitted);
     }
     Err(err(
         StatusCode::FORBIDDEN,
@@ -532,6 +501,7 @@ pub async fn elevate_identity(
         .update(&identity)
         .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?;
     let actor = admin
+        .claims
         .identity_id
         .as_deref()
         .and_then(|id| uuid::Uuid::parse_str(id).ok());
@@ -542,7 +512,7 @@ pub async fn elevate_identity(
     workforce_memory::access_audit::emit(workforce_memory::access_audit::AccessAuditEvent::new(
         workforce_memory::access_audit::AuditOperation::IdentityElevate,
         workforce_memory::access_audit::AuditDecision::Allow,
-        admin.identity_id.as_deref(),
+        admin.claims.identity_id.as_deref(),
         Some(&id),
         Some(&id),
     ));
@@ -554,7 +524,7 @@ pub async fn elevate_identity(
         from_status = ?prior_status,
         to_status = ?identity.status,
         password_changed,
-        caller_identity = ?admin.identity_id,
+        caller_identity = ?admin.claims.identity_id,
         "Identity elevated"
     );
 

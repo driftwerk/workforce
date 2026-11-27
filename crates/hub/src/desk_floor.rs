@@ -33,6 +33,7 @@ use workforce_identity::store::IdentityStore;
 
 use crate::approvals::resume::APPROVAL_DIRECTIVE;
 use crate::approvals::PendingApproval;
+use crate::authz::Holder;
 use crate::desk_crew::CHECK_IN;
 use crate::floor::Installed;
 use crate::gateway::{
@@ -111,20 +112,24 @@ pub(crate) fn by_person_of(o: &Origin<'_>) -> bool {
         && !o.message.starts_with(CHECK_IN)
 }
 
-/// Whether `identity` holds this hub: on a hub running Desk, its sessions
+/// Whether `holder` holds this hub: on a hub running Desk, its sessions
 /// are the person's who administers it, however they connect (the Desk app
-/// reads its own hub with its device).
+/// reads its own hub with its device), as far as their credential's ceiling
+/// lets them be its administrator.
 pub(crate) fn holds_the_hub(
     identities: Option<&Arc<dyn IdentityStore>>,
     has_desk: bool,
-    identity: Option<&str>,
+    holder: Option<Holder<'_>>,
 ) -> bool {
     has_desk
-        && identity
-            .and_then(|id| Uuid::parse_str(id).ok())
-            .zip(identities)
-            .and_then(|(id, store)| store.get_by_id(id).ok().flatten())
-            .is_some_and(|i| crate::authz::is_effective_admin(i.role, i.status))
+        && holder
+            .and_then(|holder| {
+                crate::cap_gate::resolve_principal(identities, holder.identity_id)
+                    .map(|principal| principal.capped(holder.ceiling))
+            })
+            .is_some_and(|principal| {
+                crate::authz::is_effective_admin(principal.role, principal.status)
+            })
 }
 
 /// Who the floor is read for: a person (their identity, else their paired
@@ -147,7 +152,9 @@ impl FloorCaller {
     /// ([`holds_the_hub`]).
     fn of(caller: &CallerContext, holds: bool) -> Result<Self, Refused> {
         match caller.auth_failure {
-            Some(AuthFailure::InvalidCredentials) => return Err(Refused::Unauthorized),
+            Some(AuthFailure::InvalidCredentials | AuthFailure::SurfaceRefused) => {
+                return Err(Refused::Unauthorized)
+            }
             Some(AuthFailure::StoreError) => return Err(Refused::Unavailable),
             None => {}
         }
@@ -633,7 +640,7 @@ async fn reader(
     let holds = holds_the_hub(
         routes.state.identity_store.as_ref(),
         has_desk,
-        caller.identity_id.as_deref(),
+        caller.holder(),
     );
     let caller = FloorCaller::of(&caller, holds).map_err(|refused| match refused {
         Refused::Unauthorized => refusal(StatusCode::UNAUTHORIZED, "unauthorized"),
@@ -1640,6 +1647,7 @@ mod tests {
             is_admin: admin,
             scopes: vec![],
             auth_failure: None,
+            ceiling: crate::authz::Ceiling::Full,
         };
         assert_eq!(
             FloorCaller::of(&caller(Some("u1"), Some("d1"), false), true),
@@ -1682,7 +1690,8 @@ mod tests {
         }
         let store: Arc<dyn IdentityStore> = Arc::new(store);
         let holds = |desk, who: Option<&Identity>| {
-            holds_the_hub(Some(&store), desk, who.map(|i| i.id.to_string()).as_deref())
+            let id = who.map(|i| i.id.to_string());
+            holds_the_hub(Some(&store), desk, id.as_deref().map(Holder::full))
         };
         assert!(holds(true, Some(&admin)));
         assert!(
@@ -1692,7 +1701,23 @@ mod tests {
         assert!(!holds(true, Some(&member)));
         assert!(!holds(true, Some(&suspended)));
         assert!(!holds(true, None), "a device paired to nobody");
-        assert!(!holds_the_hub(None, true, Some(&admin.id.to_string())));
+        assert!(!holds_the_hub(
+            None,
+            true,
+            Some(Holder::full(&admin.id.to_string()))
+        ));
+        let admin_id = admin.id.to_string();
+        assert!(
+            !holds_the_hub(
+                Some(&store),
+                true,
+                Some(Holder {
+                    identity_id: &admin_id,
+                    ceiling: crate::authz::Ceiling::Member,
+                })
+            ),
+            "on the member surface an administrator is a member"
+        );
     }
 
     #[test]

@@ -18,19 +18,17 @@ use workforce_games::{
     PlayRecord, PlayerIdentity, Rivalry, RivalryStore, RoomConfig, TokenVerifier, VisionGuesser,
 };
 
-use crate::agent_registry::AgentRegistry;
 use crate::gateway::GatewayState;
-use crate::jwt::JwtConfig;
 
 struct GamesBackend {
-    registry: Arc<AgentRegistry>,
-    jwt_config: JwtConfig,
+    gateway: Arc<GatewayState>,
 }
 
 #[async_trait]
 impl AgentDriver for GamesBackend {
     async fn respond(&self, request: AgentTurnRequest) -> Result<String> {
         let service = self
+            .gateway
             .registry
             .get(&request.agent_id)
             .ok_or_else(|| eyre!("game agent '{}' is not configured", request.agent_id))?;
@@ -78,6 +76,7 @@ impl VisionGuesser for GamesBackend {
         prompt: &str,
     ) -> Result<String> {
         let service = self
+            .gateway
             .registry
             .get(agent_id)
             .ok_or_else(|| eyre!("game agent '{agent_id}' is not configured"))?;
@@ -120,6 +119,7 @@ impl VisionGuesser for GamesBackend {
 impl ImageGenerator for GamesBackend {
     async fn draw(&self, agent_id: &str, prompt: &str) -> Result<GeneratedArt> {
         let service = self
+            .gateway
             .registry
             .get(agent_id)
             .ok_or_else(|| eyre!("game agent '{agent_id}' is not configured"))?;
@@ -155,7 +155,10 @@ impl ImageGenerator for GamesBackend {
 
 impl TokenVerifier for GamesBackend {
     fn verify(&self, token: &str) -> Option<PlayerIdentity> {
-        let claims = crate::jwt::validate_token(&self.jwt_config, token).ok()?;
+        let claims = crate::auth::admit_signed(self.gateway.door(), token)?
+            .ok()
+            .filter(|admitted| matches!(admitted.kind, crate::auth::CredentialKind::Jwt { .. }))?
+            .claims;
         Some(PlayerIdentity {
             id: claims.identity_id.unwrap_or_else(|| claims.sub.clone()),
             display_name: claims.sub,
@@ -324,13 +327,12 @@ pub fn mount(
     if !games.enabled {
         return app;
     }
-    let Some(jwt_config) = state.jwt_config.clone() else {
+    if state.jwt_config.is_none() {
         warn!("[games] enabled but JWT auth is not configured; games not mounted");
         return app;
-    };
+    }
     let backend = Arc::new(GamesBackend {
-        registry: Arc::clone(&state.registry),
-        jwt_config,
+        gateway: Arc::clone(state),
     });
     let rivalry = rivalry_store(data_dir);
     let manager = Arc::new(GameManager::new(

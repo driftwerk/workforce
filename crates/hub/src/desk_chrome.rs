@@ -712,11 +712,7 @@ pub(crate) async fn handler(
         Ok(c) => c,
         Err(refused) => return refused,
     };
-    if !crate::desk_floor::holds_the_hub(
-        state.identity_store.as_ref(),
-        true,
-        caller.identity_id.as_deref(),
-    ) {
+    if !crate::desk_floor::holds_the_hub(state.identity_store.as_ref(), true, caller.holder()) {
         return (
             axum::http::StatusCode::FORBIDDEN,
             axum::Json(

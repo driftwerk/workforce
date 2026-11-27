@@ -1265,8 +1265,8 @@ const UNKNOWN: &str = "unknown";
 
 /// The hub's facts about callers.
 pub trait Callers: Send + Sync {
-    /// Whether `person` is the one whose Desk this is.
-    fn holds_the_hub(&self, person: &str) -> bool;
+    /// Whether `holder` is the one whose Desk this is.
+    fn holds_the_hub(&self, holder: crate::authz::Holder<'_>) -> bool;
     /// Whether `agent` is the person's overseer.
     fn oversees(&self, agent: &str) -> bool;
     /// The agent `name` (its name or id) names, if there is one.
@@ -1330,7 +1330,10 @@ impl Setups {
         if caller.session.is_none() {
             return Err("Connections are set up in a conversation with the person.".into());
         }
-        match self.callers.holds_the_hub(&caller.person) {
+        match self
+            .callers
+            .holds_the_hub(crate::authz::Holder::full(&caller.person))
+        {
             true => Ok(()),
             false => Err(
                 "Only the person whose Desk this is sets up its connections, in their own conversation.".into(),
@@ -3576,8 +3579,8 @@ pub(crate) mod testing {
 struct Hub(Arc<crate::gateway::GatewayState>);
 
 impl Callers for Hub {
-    fn holds_the_hub(&self, person: &str) -> bool {
-        crate::desk_floor::holds_the_hub(self.0.identity_store.as_ref(), true, Some(person))
+    fn holds_the_hub(&self, holder: crate::authz::Holder<'_>) -> bool {
+        crate::desk_floor::holds_the_hub(self.0.identity_store.as_ref(), true, Some(holder))
     }
 
     fn oversees(&self, agent: &str) -> bool {
@@ -3693,8 +3696,10 @@ async fn holder(
     if caller.auth_failure.is_some() {
         return Err(refuse(StatusCode::UNAUTHORIZED, "not allowed"));
     }
-    match caller.identity_id {
-        Some(person) if routes.setups.callers.holds_the_hub(&person) => Ok(person),
+    match caller.holder() {
+        Some(holder) if routes.setups.callers.holds_the_hub(holder) => {
+            Ok(holder.identity_id.to_string())
+        }
         _ => Err(refuse(
             StatusCode::FORBIDDEN,
             "Only the person whose Desk this is sees its setups",

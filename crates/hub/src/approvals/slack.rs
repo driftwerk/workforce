@@ -62,7 +62,7 @@ impl Clicker<'_> {
             .is_some_and(|identity| {
                 crate::authz::holds_capability(
                     store,
-                    &identity.id.to_string(),
+                    crate::authz::Holder::full(&identity.id.to_string()),
                     crate::authz::Capability::PermissionsManage,
                 )
             })

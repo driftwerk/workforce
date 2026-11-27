@@ -869,7 +869,9 @@ impl HubConversations {
         let state = &self.0;
         let caller = resolve_caller_context(state, headers, token).await;
         match caller.auth_failure {
-            Some(AuthFailure::InvalidCredentials) => return Err(ConversationError::Unauthorized),
+            Some(AuthFailure::InvalidCredentials | AuthFailure::SurfaceRefused) => {
+                return Err(ConversationError::Unauthorized)
+            }
             Some(AuthFailure::StoreError) => {
                 return Err(ConversationError::Unavailable(
                     "the hub could not check that token".into(),

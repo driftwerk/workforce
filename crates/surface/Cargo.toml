@@ -1,0 +1,10 @@
+[package]
+name = "workforce-surface"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+description = "Which listener a request arrived on, and the hub's default when none says"
+
+[dependencies]
+tokio = { workspace = true }

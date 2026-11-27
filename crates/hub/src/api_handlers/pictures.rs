@@ -59,7 +59,7 @@ async fn caller(state: &GatewayState, headers: &HeaderMap) -> Result<CallerConte
             StatusCode::SERVICE_UNAVAILABLE,
             "The hub couldn't check who you are.",
         )),
-        Some(AuthFailure::InvalidCredentials) => {
+        Some(AuthFailure::InvalidCredentials | AuthFailure::SurfaceRefused) => {
             Err(refused(StatusCode::UNAUTHORIZED, "unauthorized"))
         }
         None if !caller.is_authenticated() => {

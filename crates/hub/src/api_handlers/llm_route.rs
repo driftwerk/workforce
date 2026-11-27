@@ -211,13 +211,13 @@ fn store_failed(e: eyre::Report) -> ApiError {
 
 fn agent_for(
     state: &GatewayState,
-    claims: crate::jwt::Claims,
+    caller: crate::auth::Admitted,
     agent_id: &str,
 ) -> Result<Arc<AgentService>, ApiError> {
     state
         .registry
         .get(agent_id)
-        .filter(|_| AgentViewer::new(state, claims.into()).can_see(agent_id))
+        .filter(|_| AgentViewer::new(state, caller.into()).can_see(agent_id))
         .ok_or_else(|| crate::gateway::not_found_agent(agent_id))
 }
 
@@ -918,8 +918,8 @@ pub async fn get_my_agent_route(
     headers: HeaderMap,
     Path(agent_id): Path<String>,
 ) -> ApiResult<MyAgentRouteView> {
-    let (person, claims) = super::identity::require_person(&state, &headers)?;
-    let service = agent_for(&state, claims, &agent_id)?;
+    let (person, caller) = super::identity::require_person(&state, &headers)?;
+    let service = agent_for(&state, caller, &agent_id)?;
     let routes = routes(&state)?;
     let switch = switch_for(&routes, &service);
     let options = agent_options(&routes, &service, &switch, person).await;
@@ -935,8 +935,8 @@ pub async fn put_my_agent_route(
     Path(agent_id): Path<String>,
     Json(write): Json<RouteWrite<AgentRoute>>,
 ) -> ApiResult<MyAgentRouteView> {
-    let (person, claims) = super::identity::require_person(&state, &headers)?;
-    let service = agent_for(&state, claims, &agent_id)?;
+    let (person, caller) = super::identity::require_person(&state, &headers)?;
+    let service = agent_for(&state, caller, &agent_id)?;
     let routes = routes(&state)?;
     let store = store(&routes)?;
     let switch = switch_for(&routes, &service);

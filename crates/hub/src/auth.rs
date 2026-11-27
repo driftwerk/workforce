@@ -1,15 +1,23 @@
+//! The one door every bearer credential comes through. [`admit`] recognises
+//! the credential (the static gateway token, a JWT, a paired device's token),
+//! decides what the surface it arrived on lets it be ([`ceiling`]), and reads
+//! the person's live role under that ceiling. Nothing outside this module
+//! validates a JWT.
+
+pub mod jwt;
+
 use std::sync::Arc;
 
-use axum::extract::{Request, State};
-use axum::http::StatusCode;
-use axum::middleware::Next;
-use axum::response::Response;
 use subtle::ConstantTimeEq;
+use tracing::warn;
+use workforce_identity::store::IdentityStore;
+use workforce_identity::types::IdentityRole;
+use workforce_pairing::{DevicePairingService, TokenMatch};
 
-/// Auth token to validate against.
-pub struct AuthState {
-    pub token: String,
-}
+use crate::authz::Ceiling;
+use crate::gateway::{AuthFailure, GatewayState};
+use crate::surface::{Arrival, Surface};
+use jwt::{Claims, JwtConfig};
 
 /// Constant-time token comparison to prevent timing side-channel attacks.
 /// Hashes both tokens with blake3 first to ensure fixed-length comparison.
@@ -29,61 +37,146 @@ pub fn constant_time_token_eq(a: &str, b: &str) -> bool {
     hash_a.as_bytes().ct_eq(hash_b.as_bytes()).into()
 }
 
-/// Bearer token auth middleware.
-pub async fn auth_middleware(
-    State(state): State<Arc<AuthState>>,
-    request: Request,
-    next: Next,
-) -> Result<Response, StatusCode> {
-    let auth_header = request
-        .headers()
-        .get("authorization")
-        .and_then(|v| v.to_str().ok());
+/// What a hub admits bearer credentials against.
+#[derive(Clone, Copy)]
+pub(crate) struct Door<'a> {
+    pub jwt: Option<&'a JwtConfig>,
+    pub static_token: Option<&'a str>,
+    pub pairing: Option<&'a DevicePairingService>,
+    pub identities: Option<&'a Arc<dyn IdentityStore>>,
+}
 
-    match auth_header {
-        Some(header) if header.starts_with("Bearer ") => {
-            let token = &header[7..];
-            if constant_time_token_eq(token, &state.token) {
-                Ok(next.run(request).await)
-            } else {
-                Err(StatusCode::UNAUTHORIZED)
-            }
+impl GatewayState {
+    pub(crate) fn door(&self) -> Door<'_> {
+        Door {
+            jwt: self.jwt_config.as_ref(),
+            static_token: Some(&self.auth_token),
+            pairing: self.device_pairing.as_deref(),
+            identities: self.identity_store.as_ref(),
         }
-        _ => Err(StatusCode::UNAUTHORIZED),
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CredentialKind {
+    StaticToken,
+    /// `unscoped`: the token carried no scopes, as tokens minted before
+    /// scopes existed do.
+    Jwt {
+        unscoped: bool,
+    },
+    Device(TokenMatch),
+}
+
+/// An admitted credential: its claims, already carrying the person's live
+/// role held to `ceiling`.
+#[derive(Debug, Clone)]
+pub(crate) struct Admitted {
+    pub claims: Claims,
+    pub ceiling: Ceiling,
+    pub kind: CredentialKind,
+}
+
+/// What a credential of `kind` may be on the surface it arrived by. The
+/// combined surface caps nothing, as a hub with one listener always has; the
+/// public surface holds everyone to a member and refuses the static token;
+/// the admin surface takes only its own JWTs, and the static token from the
+/// host itself.
+pub(crate) fn ceiling(arrival: Arrival, kind: CredentialKind) -> Result<Ceiling, AuthFailure> {
+    match (arrival.surface, kind) {
+        (Surface::Combined, _) => Ok(Ceiling::Full),
+        (Surface::Public, CredentialKind::StaticToken) => Err(AuthFailure::SurfaceRefused),
+        (Surface::Public, _) => Ok(Ceiling::Member),
+        (Surface::Admin, CredentialKind::Jwt { .. }) => Ok(Ceiling::Full),
+        (Surface::Admin, CredentialKind::StaticToken)
+            if arrival
+                .peer
+                .is_some_and(|peer| peer.to_canonical().is_loopback()) =>
+        {
+            Ok(Ceiling::Full)
+        }
+        (Surface::Admin, _) => Err(AuthFailure::SurfaceRefused),
+    }
+}
+
+/// Admits `token` as whichever credential it is, on the surface in scope.
+pub(crate) async fn admit(door: Door<'_>, token: &str) -> Result<Admitted, AuthFailure> {
+    match admit_signed(door, token) {
+        Some(admitted) => admitted,
+        None => admit_device(door, token).await,
+    }
+}
+
+/// [`admit`] for the credentials the hub checks without a store: the static
+/// token and JWTs. `None` when `token` is neither.
+pub(crate) fn admit_signed(door: Door<'_>, token: &str) -> Option<Result<Admitted, AuthFailure>> {
+    let arrival = crate::surface::current();
+    let (kind, claims) = match door
+        .static_token
+        .is_some_and(|ours| constant_time_token_eq(token, ours))
+    {
+        true => (CredentialKind::StaticToken, hub_owner()),
+        false => {
+            let claims =
+                jwt::validate_token(&door.jwt?.surface_key(arrival.surface), token).ok()?;
+            let unscoped = claims.scopes.is_empty();
+            (CredentialKind::Jwt { unscoped }, claims)
+        }
+    };
+    Some(ceiling(arrival, kind).map(|ceiling| Admitted {
+        claims: jwt::current_claims(door.identities, claims, ceiling),
+        ceiling,
+        kind,
+    }))
+}
+
+async fn admit_device(door: Door<'_>, token: &str) -> Result<Admitted, AuthFailure> {
+    let pairing = door.pairing.ok_or(AuthFailure::InvalidCredentials)?;
+    let (device, token_match) = pairing
+        .validate_token_with_match_async(token.to_string())
+        .await
+        .map_err(|e| {
+            warn!(
+                token = %crate::token_hint::hint(token),
+                error = %e,
+                "Pairing store error while validating a device token — failing closed"
+            );
+            AuthFailure::StoreError
+        })?
+        .ok_or(AuthFailure::InvalidCredentials)?;
+    let kind = CredentialKind::Device(token_match);
+    let ceiling = ceiling(crate::surface::current(), kind)?;
+    let identity_id = door
+        .identities
+        .and_then(|store| crate::device_link::identity_for_device(store.as_ref(), &device.id));
+    let claims = Claims {
+        sub: device.device_name,
+        role: IdentityRole::Member,
+        identity_id,
+        iat: 0,
+        exp: u64::MAX,
+        scopes: device.scopes,
+        device_id: Some(device.id),
+    };
+    Ok(Admitted {
+        claims: jwt::capped(claims, ceiling),
+        ceiling,
+        kind,
+    })
+}
+
+/// The static gateway token's claims: the hub's owner, who is no one.
+fn hub_owner() -> Claims {
+    Claims {
+        sub: "admin".to_string(),
+        role: IdentityRole::SystemAdmin,
+        identity_id: None,
+        iat: 0,
+        exp: u64::MAX,
+        scopes: vec![jwt::SCOPE_WILDCARD.to_string()],
+        device_id: None,
     }
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn constant_time_eq_matching_tokens() {
-        assert!(constant_time_token_eq(
-            "secret-token-123",
-            "secret-token-123"
-        ));
-    }
-
-    #[test]
-    fn constant_time_eq_different_tokens() {
-        assert!(!constant_time_token_eq(
-            "secret-token-123",
-            "secret-token-456"
-        ));
-    }
-
-    #[test]
-    fn constant_time_eq_different_lengths() {
-        assert!(!constant_time_token_eq("short", "a-much-longer-token"));
-    }
-
-    #[test]
-    fn constant_time_eq_empty_strings_never_match() {
-        // audit F2: an empty/unset token must never authenticate — otherwise a
-        // tokenless caller matches an unset `auth_token`.
-        assert!(!constant_time_token_eq("", ""));
-        assert!(!constant_time_token_eq("", "real-token"));
-        assert!(!constant_time_token_eq("real-token", ""));
-    }
-}
+mod tests;

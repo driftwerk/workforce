@@ -1160,8 +1160,11 @@ impl CrewHub {
         let store = Arc::clone(&service.telemetry_store);
         let from = since.max(now - Duration::hours(24));
         let seen = self.desk.seen_by(&o.scope);
-        let holds =
-            crate::desk_floor::holds_the_hub(self.state.identity_store.as_ref(), true, Some(owner));
+        let holds = crate::desk_floor::holds_the_hub(
+            self.state.identity_store.as_ref(),
+            true,
+            Some(crate::authz::Holder::full(owner)),
+        );
         let mut crew: Vec<String> = Vec::new();
         if holds {
             crew.push(boss.to_string());

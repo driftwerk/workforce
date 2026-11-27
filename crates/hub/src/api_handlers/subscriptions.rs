@@ -291,10 +291,10 @@ impl Caller {
 }
 
 fn caller(state: &GatewayState, headers: &HeaderMap) -> Result<Caller, ApiError> {
-    let (person, claims) = super::identity::require_person(state, headers)?;
+    let (person, admitted) = super::identity::require_person(state, headers)?;
     Ok(Caller {
         person,
-        context: claims.into(),
+        context: admitted.into(),
     })
 }
 

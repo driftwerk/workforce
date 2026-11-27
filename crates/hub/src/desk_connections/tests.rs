@@ -1981,8 +1981,8 @@ mod setups {
         fn tell(&self, caller: &Caller, note: String) {
             self.told.lock().unwrap().push((caller.agent.clone(), note));
         }
-        fn holds_the_hub(&self, person: &str) -> bool {
-            person == SARAH
+        fn holds_the_hub(&self, holder: crate::authz::Holder<'_>) -> bool {
+            holder == crate::authz::Holder::full(SARAH)
         }
         fn oversees(&self, agent: &str) -> bool {
             agent == "ben"

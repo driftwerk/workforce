@@ -11,6 +11,7 @@ path = "src/lib.rs"
 
 [dependencies]
 workforce-hub-core = { path = "../hub-core" }
+workforce-surface = { path = "../surface" }
 workforce-core = { path = "../core" }
 workforce-common = { path = "../common", features = ["otel", "prometheus", "sentry"] }
 workforce-crypto = { workspace = true }

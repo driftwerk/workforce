@@ -174,7 +174,7 @@ pub(crate) async fn decision(
 ) -> Response {
     let caller = resolve_caller_context(&state, &headers, query.token.as_deref()).await;
     match caller.auth_failure {
-        Some(AuthFailure::InvalidCredentials) => {
+        Some(AuthFailure::InvalidCredentials | AuthFailure::SurfaceRefused) => {
             return refused(StatusCode::UNAUTHORIZED, "not signed in")
         }
         Some(AuthFailure::StoreError) => {

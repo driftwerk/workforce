@@ -1048,6 +1048,7 @@ mod tests {
             is_admin,
             scopes: vec![crate::jwt::SCOPE_WILDCARD.to_string()],
             auth_failure: None,
+            ceiling: crate::authz::Ceiling::Full,
         }
     }
 

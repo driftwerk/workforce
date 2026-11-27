@@ -640,6 +640,7 @@ mod tests {
             is_admin: true,
             scopes: vec![],
             auth_failure: None,
+            ceiling: crate::authz::Ceiling::Full,
         };
         let c = caller_from_request(&ctx);
         assert_eq!(c.identity.as_deref(), Some("alice"));

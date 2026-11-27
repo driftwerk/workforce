@@ -514,7 +514,7 @@ async fn person(state: &GatewayState, headers: &HeaderMap) -> Result<String, Res
     // The header only: a token in the address would be in access logs.
     let caller = resolve_caller_context(state, headers, None).await;
     match caller.auth_failure {
-        Some(AuthFailure::InvalidCredentials) => {
+        Some(AuthFailure::InvalidCredentials | AuthFailure::SurfaceRefused) => {
             return Err(refused(StatusCode::UNAUTHORIZED, "not allowed"))
         }
         Some(AuthFailure::StoreError) => {

@@ -100,7 +100,7 @@ pub(crate) async fn handler(
         Ok(caller) => caller,
         Err(refused) => return refused,
     };
-    let Some(identity) = caller.identity_id else {
+    let Some(holder) = caller.holder() else {
         return (
             StatusCode::FORBIDDEN,
             axum::Json(serde_json::json!({ "error": "link_requires_identity" })),
@@ -119,19 +119,20 @@ pub(crate) async fn handler(
             .into_response();
     }
     let listener = Listener {
-        holds: holds(&state, &identity),
-        identity,
+        holds: holds(&state, holder),
+        identity: holder.identity_id.to_string(),
     };
-    ws.on_upgrade(move |socket| run(socket, state, listener, token))
+    let arrival = crate::surface::current();
+    ws.on_upgrade(move |socket| arrival.scope(run(socket, state, listener, token)))
         .into_response()
 }
 
-/// Whether `identity` holds this hub now.
-fn holds(state: &GatewayState, identity: &str) -> bool {
+/// Whether `holder` holds this hub now.
+fn holds(state: &GatewayState, holder: crate::authz::Holder<'_>) -> bool {
     crate::desk_floor::holds_the_hub(
         state.identity_store.as_ref(),
         crate::desk_driver::desk().is_some(),
-        Some(identity),
+        Some(holder),
     )
 }
 
@@ -140,8 +141,10 @@ fn holds(state: &GatewayState, identity: &str) -> bool {
 /// and, when it does, whether they hold the hub now.
 async fn still_theirs(state: &GatewayState, token: &str, listener: &Listener) -> Option<bool> {
     let caller = authenticate_ws(state, token).await.ok()?;
-    (caller.identity_id.as_deref() == Some(listener.identity.as_str()))
-        .then(|| holds(state, &listener.identity))
+    caller
+        .holder()
+        .filter(|holder| holder.identity_id == listener.identity)
+        .map(|holder| holds(state, holder))
 }
 
 async fn send(
@@ -296,7 +299,11 @@ mod tests {
         let link = |who: &Identity| {
             let identity = who.id.to_string();
             Listener {
-                holds: crate::desk_floor::holds_the_hub(Some(&store), true, Some(&identity)),
+                holds: crate::desk_floor::holds_the_hub(
+                    Some(&store),
+                    true,
+                    Some(crate::authz::Holder::full(&identity)),
+                ),
                 identity,
             }
         };

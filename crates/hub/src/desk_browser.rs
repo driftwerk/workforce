@@ -193,8 +193,11 @@ fn attended_by_holder(state: &Arc<GatewayState>) -> bool {
         .try_with(|u| u.clone())
         .ok()
         .filter(|u| !u.is_empty());
-    let holder =
-        crate::desk_floor::holds_the_hub(state.identity_store.as_ref(), true, user.as_deref());
+    let holder = crate::desk_floor::holds_the_hub(
+        state.identity_store.as_ref(),
+        true,
+        user.as_deref().map(crate::authz::Holder::full),
+    );
     attended(
         crate::hub_core::origins::automated_origin().as_deref(),
         crew_wake_now(),
@@ -612,7 +615,7 @@ fn refusal(status: StatusCode, error: &str) -> Response {
 async fn holder(routes: &Routes, headers: &HeaderMap, token: Option<&str>) -> Result<(), Response> {
     let caller = resolve_caller_context(&routes.state, headers, token).await;
     match caller.auth_failure {
-        Some(AuthFailure::InvalidCredentials) => {
+        Some(AuthFailure::InvalidCredentials | AuthFailure::SurfaceRefused) => {
             return Err(refusal(StatusCode::UNAUTHORIZED, "not allowed"))
         }
         Some(AuthFailure::StoreError) => {
@@ -626,7 +629,7 @@ async fn holder(routes: &Routes, headers: &HeaderMap, token: Option<&str>) -> Re
     if !crate::desk_floor::holds_the_hub(
         routes.state.identity_store.as_ref(),
         true,
-        caller.identity_id.as_deref(),
+        caller.holder(),
     ) {
         return Err(refusal(
             StatusCode::FORBIDDEN,
@@ -950,7 +953,11 @@ pub fn install(
         workforce_core::computer::browser_is_the_persons_chrome();
         let state = Arc::clone(state);
         crate::desk_computer::judge_holder_with(Box::new(move |user| {
-            crate::desk_floor::holds_the_hub(state.identity_store.as_ref(), true, user)
+            crate::desk_floor::holds_the_hub(
+                state.identity_store.as_ref(),
+                true,
+                user.map(crate::authz::Holder::full),
+            )
         }));
     }
     let _ = STOPPING.set(computer.clone());

@@ -294,7 +294,7 @@ async fn reader(
 ) -> Result<(String, Arc<PgSurfaceAllows>), Response> {
     let caller = resolve_caller_context(&routes.state, headers, token).await;
     let person = match caller.auth_failure {
-        Some(AuthFailure::InvalidCredentials) => None,
+        Some(AuthFailure::InvalidCredentials | AuthFailure::SurfaceRefused) => None,
         Some(AuthFailure::StoreError) => {
             return Err(refusal(StatusCode::SERVICE_UNAVAILABLE, "unavailable"))
         }

@@ -60,7 +60,7 @@ fn human_identity(claims: &crate::jwt::Claims) -> Result<Uuid, Rejection> {
 }
 
 fn require_identity(state: &GatewayState, headers: &HeaderMap) -> Result<Uuid, Rejection> {
-    human_identity(&require_auth(state, headers)?)
+    human_identity(&require_auth(state, headers)?.claims)
 }
 
 fn service(state: &GatewayState) -> Result<RemoteMcpTokenService, Rejection> {

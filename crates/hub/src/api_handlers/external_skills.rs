@@ -34,16 +34,17 @@ use super::owned_skills::{
 
 /// The caller's standing over external skills: an active system administrator
 /// and holders of `skills_manage` in the live capability matrix manage every
-/// one. `skills_manage` is delegable through the matrix, so an administrator
-/// holds the bypass by office as well, and cannot be edited out of it.
+/// one, as far as the credential's ceiling lets them. `skills_manage` is
+/// delegable through the matrix, so an administrator holds the bypass by
+/// office as well, and cannot be edited out of it.
 pub(crate) fn external_caller(state: &GatewayState, context: &CallerContext) -> SkillCaller {
     SkillCaller::new(
         context.identity_id.clone(),
         crate::gateway::caller_is_admin(state.identity_store.as_ref(), context)
-            || context.identity_id.as_deref().is_some_and(|uid| {
+            || context.holder().is_some_and(|holder| {
                 crate::authz::holds_capability(
                     state.identity_store.as_ref(),
-                    uid,
+                    holder,
                     Capability::SkillsManage,
                 )
             }),

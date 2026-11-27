@@ -1126,7 +1126,7 @@ pub(crate) async fn person_at_desk(
 fn holder_of(sync: &BoardSync, caller: &CallerContext) -> Result<String, Response> {
     let state = &sync.state;
     match caller.auth_failure {
-        Some(AuthFailure::InvalidCredentials) => {
+        Some(AuthFailure::InvalidCredentials | AuthFailure::SurfaceRefused) => {
             return Err(refusal(StatusCode::UNAUTHORIZED, "not allowed"))
         }
         Some(AuthFailure::StoreError) => {
@@ -1143,7 +1143,7 @@ fn holder_of(sync: &BoardSync, caller: &CallerContext) -> Result<String, Respons
             "A board's sync is a person's: ask as yourself, not as the hub",
         ));
     };
-    if !crate::desk_floor::holds_the_hub(state.identity_store.as_ref(), true, Some(&person)) {
+    if !crate::desk_floor::holds_the_hub(state.identity_store.as_ref(), true, caller.holder()) {
         return Err(refusal(
             StatusCode::FORBIDDEN,
             "Only the person whose Desk this is links its boards",

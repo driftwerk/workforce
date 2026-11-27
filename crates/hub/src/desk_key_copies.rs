@@ -300,6 +300,7 @@ fn sources_of(
             is_admin: false,
             scopes: device.scopes.clone(),
             auth_failure: None,
+            ceiling: crate::authz::Ceiling::Full,
         },
     );
     let mut ids: Vec<String> = state

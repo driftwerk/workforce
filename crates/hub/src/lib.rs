@@ -175,7 +175,7 @@ pub mod image_view_sink;
 pub mod investigate;
 pub mod job_runner;
 pub mod jobs_tool;
-pub mod jwt;
+pub use auth::jwt;
 pub mod keyed_provider;
 pub mod know_how;
 pub mod knowledge;
@@ -277,6 +277,7 @@ pub mod store;
 pub mod store_api;
 pub mod store_bridge;
 pub mod store_tool;
+pub use workforce_surface as surface;
 #[cfg(feature = "postgres")]
 pub mod surface_allows;
 

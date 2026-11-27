@@ -1,10 +1,9 @@
+use std::borrow::Cow;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::extract::{Request, State};
 use axum::http::StatusCode;
-use axum::middleware::Next;
-use axum::response::Response;
 use eyre::Result;
 use serde::{Deserialize, Serialize};
 use subtle::ConstantTimeEq;
@@ -12,7 +11,8 @@ use workforce_identity::store::IdentityStore;
 use workforce_identity::types::IdentityRole;
 use workforce_pairing::DevicePairingService;
 
-use crate::auth::constant_time_token_eq;
+use crate::authz::Ceiling;
+use crate::surface::Surface;
 
 // ── Scope constants ──────────────────────────────────────────────────
 
@@ -121,7 +121,21 @@ impl JwtConfig {
             expiry_secs,
         })
     }
+
+    /// The key tokens are signed with on `surface`: the configured secret,
+    /// as ever, except on the admin surface, whose key is derived from it so
+    /// that neither surface's tokens validate on the other.
+    pub fn surface_key(&self, surface: Surface) -> Cow<'_, [u8]> {
+        match surface {
+            Surface::Combined | Surface::Public => Cow::Borrowed(self.secret.as_bytes()),
+            Surface::Admin => {
+                Cow::Owned(hmac_sha256(self.secret.as_bytes(), ADMIN_SURFACE_KEY_LABEL).to_vec())
+            }
+        }
+    }
 }
+
+const ADMIN_SURFACE_KEY_LABEL: &[u8] = b"workforce/admin-surface/v1";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Claims {
@@ -164,26 +178,35 @@ pub fn generate_token_with_identity(
         scopes: token_scopes(role),
         device_id: None,
     };
-    encode_claims(config, &claims)
+    sign_here(config, &claims)
 }
 
-fn encode_claims(config: &JwtConfig, claims: &Claims) -> Result<String> {
+/// `claims` signed with the key of the surface in scope, where the token
+/// will be presented.
+fn sign_here(config: &JwtConfig, claims: &Claims) -> Result<String> {
+    encode_claims(
+        &config.surface_key(crate::surface::current().surface),
+        claims,
+    )
+}
+
+fn encode_claims(key: &[u8], claims: &Claims) -> Result<String> {
     let header = base64_url_encode(r#"{"alg":"HS256","typ":"JWT"}"#.as_bytes());
     let payload = base64_url_encode(&serde_json::to_vec(claims)?);
     let signing_input = format!("{}.{}", header, payload);
-    let signature = hmac_sha256(config.secret.as_bytes(), signing_input.as_bytes());
+    let signature = hmac_sha256(key, signing_input.as_bytes());
     let sig_b64 = base64_url_encode(&signature);
     Ok(format!("{}.{}", signing_input, sig_b64))
 }
 
-pub fn validate_token(config: &JwtConfig, token: &str) -> Result<Claims> {
+pub(super) fn validate_token(key: &[u8], token: &str) -> Result<Claims> {
     let parts: Vec<&str> = token.split('.').collect();
     if parts.len() != 3 {
         return Err(eyre::eyre!("Invalid JWT format"));
     }
 
     let signing_input = format!("{}.{}", parts[0], parts[1]);
-    let expected_sig = hmac_sha256(config.secret.as_bytes(), signing_input.as_bytes());
+    let expected_sig = hmac_sha256(key, signing_input.as_bytes());
 
     let provided_sig = base64_url_decode(parts[2])?;
     let sig_match: bool = expected_sig.ct_eq(&provided_sig).into();
@@ -209,7 +232,7 @@ pub fn refresh_token(config: &JwtConfig, claims: &Claims) -> Result<String> {
         exp: now + config.expiry_secs,
         ..claims.clone()
     };
-    encode_claims(config, &refreshed)
+    sign_here(config, &refreshed)
 }
 
 /// `claims` carrying `role`, the person's role now: a token never keeps a
@@ -236,22 +259,43 @@ fn with_current_role(claims: Claims, role: IdentityRole) -> Claims {
     }
 }
 
-/// `claims` carrying the role their person holds now, so a token minted
-/// before a demotion grants nothing the person has lost; a suspended person
-/// is the member they have become, as the capability matrix scores them. A
-/// token naming no identity the store knows is left as it is, and so is
-/// every token while the store cannot be read: a lookup outage must not
-/// strip every administrator of the means to fix it.
-pub(crate) fn current_claims(store: Option<&Arc<dyn IdentityStore>>, claims: Claims) -> Claims {
+/// `claims` held to `ceiling`: under [`Ceiling::Member`], the member role
+/// and no scope the member role lacks.
+pub(super) fn capped(claims: Claims, ceiling: Ceiling) -> Claims {
+    match ceiling {
+        Ceiling::Full => claims,
+        Ceiling::Member => Claims {
+            role: IdentityRole::Member,
+            scopes: scopes_for_role(IdentityRole::Member)
+                .into_iter()
+                .filter(|scope| has_scope(&claims.scopes, scope))
+                .collect(),
+            ..claims
+        },
+    }
+}
+
+/// `claims` carrying the role their person holds now, held to `ceiling`, so
+/// a token minted before a demotion grants nothing the person has lost; a
+/// suspended person is the member they have become, as the capability
+/// matrix scores them. A token naming no identity the store knows keeps its
+/// role, and so does every token while the store cannot be read: a lookup
+/// outage must not strip every administrator of the means to fix it. The
+/// ceiling holds either way.
+pub(super) fn current_claims(
+    store: Option<&Arc<dyn IdentityStore>>,
+    claims: Claims,
+    ceiling: Ceiling,
+) -> Claims {
     let Some((id, store)) = claims
         .identity_id
         .as_deref()
         .and_then(|id| uuid::Uuid::parse_str(id).ok())
         .zip(store)
     else {
-        return claims;
+        return capped(claims, ceiling);
     };
-    match store.get_by_id(id) {
+    let current = match store.get_by_id(id) {
         Ok(Some(identity)) => {
             let role = match identity.status {
                 workforce_identity::types::IdentityStatus::Suspended => IdentityRole::Member,
@@ -264,7 +308,8 @@ pub(crate) fn current_claims(store: Option<&Arc<dyn IdentityStore>>, claims: Cla
             tracing::warn!(%id, error = %e, "Failed to read a token holder's current role; using the token's");
             claims
         }
-    }
+    };
+    capped(current, ceiling)
 }
 
 pub struct JwtAuthState {
@@ -274,74 +319,15 @@ pub struct JwtAuthState {
     pub identity_store: Option<Arc<dyn IdentityStore>>,
 }
 
-pub async fn jwt_auth_middleware(
-    State(state): State<Arc<JwtAuthState>>,
-    mut request: Request,
-    next: Next,
-) -> Result<Response, StatusCode> {
-    let auth_header = request
-        .headers()
-        .get("authorization")
-        .and_then(|v| v.to_str().ok());
-
-    let token = match auth_header {
-        Some(header) if header.starts_with("Bearer ") => &header[7..],
-        _ => return Err(StatusCode::UNAUTHORIZED),
-    };
-
-    if let Some(ref static_tok) = state.static_token {
-        if constant_time_token_eq(token, static_tok) {
-            let claims = Claims {
-                sub: "admin".to_string(),
-                role: IdentityRole::SystemAdmin,
-                identity_id: None,
-                iat: 0,
-                exp: u64::MAX,
-                scopes: token_scopes(IdentityRole::SystemAdmin),
-                device_id: None,
-            };
-            request.extensions_mut().insert(claims);
-            return Ok(next.run(request).await);
+impl JwtAuthState {
+    pub(crate) fn door(&self) -> super::Door<'_> {
+        super::Door {
+            jwt: Some(&self.config),
+            static_token: self.static_token.as_deref(),
+            pairing: self.device_pairing.as_deref(),
+            identities: self.identity_store.as_ref(),
         }
     }
-
-    if let Ok(claims) = validate_token(&state.config, token) {
-        request
-            .extensions_mut()
-            .insert(current_claims(state.identity_store.as_ref(), claims));
-        return Ok(next.run(request).await);
-    }
-
-    if let Some(ref pairing) = state.device_pairing {
-        match pairing.validate_token_async(token.to_string()).await {
-            Ok(Some(device)) => {
-                let now = now_secs().unwrap_or(0);
-                let claims = Claims {
-                    sub: device.device_name,
-                    role: IdentityRole::Member,
-                    identity_id: None,
-                    iat: now,
-                    exp: now + 3600,
-                    scopes: device.scopes,
-                    device_id: Some(device.id),
-                };
-                request.extensions_mut().insert(claims);
-                return Ok(next.run(request).await);
-            }
-            Ok(None) => {}
-            Err(e) => {
-                // Store failure ≠ bad token: 503 tells the client to retry,
-                // where a 401 would send it down token-recovery paths.
-                tracing::warn!(
-                    error = %e,
-                    "Pairing store error during bearer auth — failing closed"
-                );
-                return Err(StatusCode::SERVICE_UNAVAILABLE);
-            }
-        }
-    }
-
-    Err(StatusCode::UNAUTHORIZED)
 }
 
 // ── Auth endpoints ──────────────────────────────────────────────────
@@ -448,33 +434,33 @@ pub async fn refresh_handler(
         .and_then(|s| s.strip_prefix("Bearer "))
         .ok_or_else(|| json_error(StatusCode::UNAUTHORIZED, "Missing bearer token"))?;
 
+    let admitted = super::admit_signed(state.door(), token)
+        .and_then(Result::ok)
+        .ok_or_else(|| json_error(StatusCode::UNAUTHORIZED, "Invalid or expired token"))?;
+
     // The static admin token has no expiry and cannot be "refreshed" — echo
     // it back so the frontend's on-mount refresh does not get 401'd into a
     // logout when the user is authenticated via the bootstrap token.
-    if let Some(ref static_tok) = state.static_token {
-        if constant_time_token_eq(token, static_tok) {
-            return Ok(axum::Json(RefreshResponse {
-                token: token.to_string(),
-            }));
-        }
+    if admitted.kind == super::CredentialKind::StaticToken {
+        return Ok(axum::Json(RefreshResponse {
+            token: token.to_string(),
+        }));
     }
 
-    let mut claims = validate_token(&state.config, token)
-        .map_err(|_| json_error(StatusCode::UNAUTHORIZED, "Invalid or expired token"))?;
-
-    if let (Some(ref store), Some(ref identity_id)) = (&state.identity_store, &claims.identity_id) {
+    if let (Some(ref store), Some(ref identity_id)) =
+        (&state.identity_store, &admitted.claims.identity_id)
+    {
         if let Ok(id) = uuid::Uuid::parse_str(identity_id) {
-            let identity = store
+            store
                 .get_by_id(id)
                 .ok()
                 .flatten()
                 .filter(|i| i.status != workforce_identity::types::IdentityStatus::Suspended)
                 .ok_or_else(|| json_error(StatusCode::UNAUTHORIZED, "Session invalidated"))?;
-            claims = with_current_role(claims, identity.role);
         }
     }
 
-    let token = refresh_token(&state.config, &claims)
+    let token = refresh_token(&state.config, &admitted.claims)
         .map_err(|_| json_error(StatusCode::INTERNAL_SERVER_ERROR, "Token refresh failed"))?;
 
     Ok(axum::Json(RefreshResponse { token }))
@@ -555,6 +541,10 @@ mod tests {
     use workforce_identity::sqlite::SqliteIdentityStore;
     use workforce_identity::types::Identity;
 
+    fn validate(config: &JwtConfig, token: &str) -> Result<Claims> {
+        validate_token(&config.surface_key(Surface::Combined), token)
+    }
+
     fn test_config() -> JwtConfig {
         JwtConfig {
             secret: "test-secret-key-at-least-32-chars".to_string(),
@@ -566,7 +556,7 @@ mod tests {
     fn generate_and_validate() {
         let config = test_config();
         let token = generate_token(&config, "kings", IdentityRole::SystemAdmin).unwrap();
-        let claims = validate_token(&config, &token).unwrap();
+        let claims = validate(&config, &token).unwrap();
         assert_eq!(claims.sub, "kings");
         assert_eq!(claims.role, IdentityRole::SystemAdmin);
     }
@@ -603,7 +593,7 @@ mod tests {
             Some(id.to_string()),
         )
         .unwrap();
-        let claims = validate_token(&config, &token).unwrap();
+        let claims = validate(&config, &token).unwrap();
         assert_eq!(claims.identity_id.as_deref(), Some(id));
     }
 
@@ -615,7 +605,7 @@ mod tests {
             secret: "different-secret-key-at-least-32c".to_string(),
             expiry_secs: 3600,
         };
-        assert!(validate_token(&bad, &token).is_err());
+        assert!(validate(&bad, &token).is_err());
     }
 
     #[test]
@@ -626,16 +616,16 @@ mod tests {
         };
         let token = generate_token(&config, "kings", IdentityRole::Member).unwrap();
         std::thread::sleep(std::time::Duration::from_secs(1));
-        assert!(validate_token(&config, &token).is_err());
+        assert!(validate(&config, &token).is_err());
     }
 
     #[test]
     fn reject_malformed_token() {
         let config = test_config();
-        assert!(validate_token(&config, "not.a.valid.token").is_err());
-        assert!(validate_token(&config, "only-one-part").is_err());
-        assert!(validate_token(&config, "two.parts").is_err());
-        assert!(validate_token(&config, "a.b.tampered").is_err());
+        assert!(validate(&config, "not.a.valid.token").is_err());
+        assert!(validate(&config, "only-one-part").is_err());
+        assert!(validate(&config, "two.parts").is_err());
+        assert!(validate(&config, "a.b.tampered").is_err());
     }
 
     #[test]
@@ -719,7 +709,7 @@ mod tests {
             Some("id-member".to_string()),
         )
         .unwrap();
-        let claims = validate_token(&config, &token).unwrap();
+        let claims = validate(&config, &token).unwrap();
 
         // Member happy-path: not locked out of any member-facing surface.
         assert!(has_scope(&claims.scopes, SCOPE_CHAT));
@@ -737,7 +727,7 @@ mod tests {
     fn system_admin_token_grants_admin_scope() {
         let config = test_config();
         let token = generate_token(&config, "admin", IdentityRole::SystemAdmin).unwrap();
-        let claims = validate_token(&config, &token).unwrap();
+        let claims = validate(&config, &token).unwrap();
         assert!(has_scope(&claims.scopes, SCOPE_ADMIN));
     }
 
@@ -766,11 +756,11 @@ mod tests {
             Some("id-123".to_string()),
         )
         .unwrap();
-        let claims = validate_token(&config, &token).unwrap();
+        let claims = validate(&config, &token).unwrap();
         assert_eq!(claims.scopes, scopes_for_role(IdentityRole::Manager));
 
         let refreshed_token = refresh_token(&config, &claims).unwrap();
-        let refreshed = validate_token(&config, &refreshed_token).unwrap();
+        let refreshed = validate(&config, &refreshed_token).unwrap();
 
         assert_eq!(refreshed.sub, "kings");
         assert_eq!(refreshed.role, IdentityRole::Manager);
@@ -920,7 +910,7 @@ mod tests {
 
         let new_token = &resp.0.token;
         assert!(!new_token.is_empty());
-        let claims = validate_token(&state.config, new_token).unwrap();
+        let claims = validate(&state.config, new_token).unwrap();
         assert_eq!(claims.sub, "kings");
         assert_eq!(claims.role, IdentityRole::Manager);
         assert_eq!(claims.identity_id.as_deref(), Some("id-abc"));
@@ -960,7 +950,7 @@ mod tests {
         .await
         .ok()
         .unwrap_or_else(|| panic!("an active person's token refreshes"));
-        let claims = validate_token(&state.config, &resp.0.token).unwrap();
+        let claims = validate(&state.config, &resp.0.token).unwrap();
         assert_eq!(claims.role, IdentityRole::Member);
         assert_eq!(claims.scopes, token_scopes(IdentityRole::Member));
     }

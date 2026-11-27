@@ -86,6 +86,48 @@ pub struct Principal {
     pub status: IdentityStatus,
 }
 
+/// The most a credential may exercise where it was presented: all the
+/// person's live role grants, or only what the member role grants.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Ceiling {
+    #[default]
+    Full,
+    Member,
+}
+
+/// A person as a credential presents them: who, held to which [`Ceiling`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Holder<'a> {
+    pub identity_id: &'a str,
+    pub ceiling: Ceiling,
+}
+
+impl<'a> Holder<'a> {
+    /// `identity_id` as their role stands, on a path no credential caps: an
+    /// agent's turn, a Slack click, a background job.
+    pub fn full(identity_id: &'a str) -> Self {
+        Self {
+            identity_id,
+            ceiling: Ceiling::Full,
+        }
+    }
+}
+
+impl Principal {
+    /// This principal held to `ceiling`: under [`Ceiling::Member`] the matrix
+    /// scores the member row, whatever the person's own role.
+    pub fn capped(self, ceiling: Ceiling) -> Self {
+        match ceiling {
+            Ceiling::Full => self,
+            Ceiling::Member => Self {
+                role: IdentityRole::Member,
+                role_key: IdentityRole::Member.as_str().to_string(),
+                ..self
+            },
+        }
+    }
+}
+
 /// The single authorization decision for `(principal, capability)`: the live
 /// matrix cell. `matrix` layers admin overrides over the built-in defaults; an
 /// empty matrix ([`CapabilityMatrix::default`]) reproduces [`decision_for`].
@@ -258,25 +300,29 @@ pub fn make_admin_policy(identity_store: IdentityStoreHandle) -> IsAdminFn {
     })
 }
 
-/// Whether `uid` resolves to an identity the live capability matrix outright
-/// allows `capability` — the standing a surface without the pre-dispatch gate
-/// reads. `Ask` is not holding it: a confirmation cannot be asked for there.
+/// Whether `holder` resolves to an identity the live capability matrix, read
+/// under the holder's ceiling, outright allows `capability` — the standing a
+/// surface without the pre-dispatch gate reads. `Ask` is not holding it: a
+/// confirmation cannot be asked for there.
 pub fn holds_capability(
     identity_store: Option<&Arc<dyn IdentityStore>>,
-    uid: &str,
+    holder: Holder<'_>,
     capability: Capability,
 ) -> bool {
-    holds_capability_in(identity_store, uid, capability, &capability_matrix())
+    holds_capability_in(identity_store, holder, capability, &capability_matrix())
 }
 
 fn holds_capability_in(
     identity_store: Option<&Arc<dyn IdentityStore>>,
-    uid: &str,
+    holder: Holder<'_>,
     capability: Capability,
     matrix: &CapabilityMatrix,
 ) -> bool {
-    crate::cap_gate::resolve_principal(identity_store, uid)
-        .is_some_and(|principal| authorize(&principal, capability, matrix) == Decision::Allow)
+    crate::cap_gate::resolve_principal(identity_store, holder.identity_id).is_some_and(
+        |principal| {
+            authorize(&principal.capped(holder.ceiling), capability, matrix) == Decision::Allow
+        },
+    )
 }
 
 /// The [`IsAdminFn`] shape of [`holds_capability`] for the turn's identity, so
@@ -286,8 +332,13 @@ pub fn make_capability_policy(
     capability: Capability,
 ) -> IsAdminFn {
     Arc::new(move || {
-        crate::user_config::current_identity_id()
-            .is_some_and(|uid| holds_capability(identity_store.read().as_ref(), &uid, capability))
+        crate::user_config::current_identity_id().is_some_and(|uid| {
+            holds_capability(
+                identity_store.read().as_ref(),
+                Holder::full(&uid),
+                capability,
+            )
+        })
     })
 }
 
@@ -2000,7 +2051,12 @@ mod tests {
         }
         let store: Arc<dyn IdentityStore> = Arc::new(store);
         let holds = |identity: &str, matrix: &CapabilityMatrix| {
-            holds_capability_in(Some(&store), identity, Capability::SkillsManage, matrix)
+            holds_capability_in(
+                Some(&store),
+                Holder::full(identity),
+                Capability::SkillsManage,
+                matrix,
+            )
         };
         let defaults = CapabilityMatrix::default();
         let member_allowed = CapabilityMatrix::from_overrides(&[CapabilityOverride {
@@ -2019,9 +2075,79 @@ mod tests {
         assert!(!holds("not-a-uuid", &defaults));
         assert!(!holds_capability(
             None,
-            &admin.id.to_string(),
+            Holder::full(&admin.id.to_string()),
             Capability::SkillsManage
         ));
+    }
+
+    #[test]
+    fn under_the_member_ceiling_every_holder_holds_what_the_member_role_holds() {
+        use workforce_identity::sqlite::SqliteIdentityStore;
+        use workforce_identity::types::Identity;
+
+        let store = SqliteIdentityStore::in_memory().unwrap();
+        let mut custom = Identity::new("Custom", IdentityRole::Member);
+        custom.set_role_key("auditor");
+        let people = [
+            Identity::new("Admin", IdentityRole::SystemAdmin),
+            Identity::new("Manager", IdentityRole::Manager),
+            custom,
+            Identity::new("Member", IdentityRole::Member),
+            Identity::new("Suspended", IdentityRole::SystemAdmin)
+                .with_status(IdentityStatus::Suspended),
+        ];
+        for person in &people {
+            store.create(person).unwrap();
+        }
+        let store: Arc<dyn IdentityStore> = Arc::new(store);
+        let grant = |role: &str, capability: Capability| CapabilityOverride {
+            role: role.into(),
+            capability: capability.key().into(),
+            decision: StoredDecision::Allow,
+            updated_at: chrono::Utc::now(),
+            updated_by: None,
+        };
+        let matrices = [
+            CapabilityMatrix::default(),
+            CapabilityMatrix::from_overrides(&[
+                grant("member", Capability::SkillsManage),
+                grant("auditor", Capability::OpsRead),
+            ]),
+        ];
+        let member_row = |matrix: &CapabilityMatrix, capability| {
+            matrix.decision("member", IdentityStatus::Active, capability) == Decision::Allow
+        };
+        for matrix in &matrices {
+            for capability in Capability::ALL {
+                for person in &people {
+                    let id = person.id.to_string();
+                    let capped = Holder {
+                        identity_id: &id,
+                        ceiling: Ceiling::Member,
+                    };
+                    assert_eq!(
+                        holds_capability_in(Some(&store), capped, capability, matrix),
+                        member_row(matrix, capability),
+                        "{} under the member ceiling, {capability:?}",
+                        person.display_name
+                    );
+                }
+            }
+        }
+        let admin = people[0].id.to_string();
+        let manages = |ceiling| {
+            holds_capability_in(
+                Some(&store),
+                Holder {
+                    identity_id: &admin,
+                    ceiling,
+                },
+                Capability::SkillsManage,
+                &matrices[0],
+            )
+        };
+        assert!(manages(Ceiling::Full));
+        assert!(!manages(Ceiling::Member));
     }
 
     /// `system.enable_skill` maps to the member-allowed `SkillsEnable`

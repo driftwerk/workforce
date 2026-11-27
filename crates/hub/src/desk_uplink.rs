@@ -413,9 +413,10 @@ async fn not_the_holders(s: &Api, h: &HeaderMap, q: &TokenQuery) -> Option<Respo
     };
     let caller = crate::gateway::resolve_caller_context(&s.state, h, None).await;
     match caller.auth_failure {
-        Some(crate::gateway::AuthFailure::InvalidCredentials) => {
-            return refused(StatusCode::UNAUTHORIZED, "not allowed")
-        }
+        Some(
+            crate::gateway::AuthFailure::InvalidCredentials
+            | crate::gateway::AuthFailure::SurfaceRefused,
+        ) => return refused(StatusCode::UNAUTHORIZED, "not allowed"),
         Some(crate::gateway::AuthFailure::StoreError) => {
             return refused(
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -424,11 +425,7 @@ async fn not_the_holders(s: &Api, h: &HeaderMap, q: &TokenQuery) -> Option<Respo
         }
         None => {}
     }
-    if crate::desk_floor::holds_the_hub(
-        s.state.identity_store.as_ref(),
-        true,
-        caller.identity_id.as_deref(),
-    ) {
+    if crate::desk_floor::holds_the_hub(s.state.identity_store.as_ref(), true, caller.holder()) {
         return None;
     }
     if caller.identity_id.is_some() || caller.device_id.is_some() {
