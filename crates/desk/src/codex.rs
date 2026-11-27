@@ -1462,6 +1462,14 @@ pub const SIGHT_WITHIN: Duration = if cfg!(test) {
 /// `replay_requests_to_connection_for_thread`).
 const REPLAY_WITHIN: Duration = Duration::from_secs(2);
 
+/// How long Desk's own resume of a thread, as it joins, may take to load
+/// it before its connection is made again.
+const RESUME_WITHIN: Duration = if cfg!(test) {
+    Duration::from_secs(6)
+} else {
+    Duration::from_secs(300)
+};
+
 /// How often Desk tries to follow a session again once it lost sight of it.
 const LOST_AGAIN: Duration = if cfg!(test) {
     Duration::from_millis(500)
@@ -1622,11 +1630,15 @@ impl Follower {
             .collect()
     }
 
-    /// Whether its subscription is asked and not yet answered: never its
-    /// own resume of the thread as it joins, which takes as long as the
-    /// thread takes to load, and whose starter hears how it went.
-    fn asking(&self) -> bool {
-        self.subscribed && !self.followed && self.priming.is_none()
+    /// How long Codex has to answer its subscription, while it is asked
+    /// and not yet answered: its own resume of the thread as it joins
+    /// takes as long as the thread takes to load.
+    fn asking(&self) -> Option<Duration> {
+        let within = match self.priming {
+            Some(_) => RESUME_WITHIN,
+            None => SIGHT_WITHIN,
+        };
+        (self.subscribed && !self.followed).then_some(within)
     }
 
     /// Desk lost sight of it: once followed again, it says so
@@ -2172,7 +2184,7 @@ async fn follow(
     // connection with it.
     let mut unanswered = follower
         .asking()
-        .then(|| tokio::time::Instant::now() + SIGHT_WITHIN);
+        .map(|within| tokio::time::Instant::now() + within);
     // When its resume, refused while the thread was held elsewhere, is
     // asked again.
     let mut again: Option<tokio::time::Instant> = None;
@@ -2197,8 +2209,7 @@ async fn follow(
             }
             () = tokio::time::sleep_until(at(unanswered)), if unanswered.is_some() => {
                 tracing::warn!(
-                    secs = SIGHT_WITHIN.as_secs(),
-                    "codex never answered the subscription to the session's thread; connecting again"
+                    "codex never answered the subscription to the session's thread in time; connecting again"
                 );
                 return Ok(());
             }
@@ -2266,7 +2277,7 @@ async fn follow(
                 }
                 unanswered = follower
                     .asking()
-                    .then(|| unanswered.unwrap_or_else(|| tokio::time::Instant::now() + SIGHT_WITHIN));
+                    .map(|within| unanswered.unwrap_or_else(|| tokio::time::Instant::now() + within));
                 for seen in seen {
                     events.send(seen).await?;
                 }
@@ -3130,6 +3141,25 @@ pub(crate) mod tests {
         f.heard(&json!({"id": SUBSCRIBE, "error": {"code": -32603, "message": "internal error"}}));
         assert!(f.refused());
         assert!(!f.refused(), "said once");
+    }
+
+    /// A subscription Codex doesn't answer is given up on within
+    /// [`SIGHT_WITHIN`]; Desk's own resume as it joins, which loads the
+    /// thread, within [`RESUME_WITHIN`]; neither once answered.
+    #[test]
+    fn an_unanswered_subscription_has_its_time_and_a_resume_more() {
+        let mut f = Follower::new(Some("t1".into()), None).at_once();
+        assert_eq!(f.asking(), None);
+        f.joined();
+        assert_eq!(f.asking(), Some(SIGHT_WITHIN));
+        f.heard(&json!({"id": SUBSCRIBE, "result": {"thread": {"id": "t1"}}}));
+        assert_eq!(f.asking(), None);
+
+        let (tx, _rx) = oneshot::channel();
+        let mut f = Follower::new(Some("t1".into()), None).resuming(json!({}), tx);
+        f.joined();
+        assert_eq!(f.asking(), Some(RESUME_WITHIN));
+        assert!(RESUME_WITHIN > SIGHT_WITHIN);
     }
 
     #[test]

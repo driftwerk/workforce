@@ -6525,23 +6525,31 @@ impl Desk {
     /// 0.166): its session is up once it is on its screen (the alternate
     /// one, which it leaves to refuse), not once it is ready for input. One
     /// still starting at the watch's end is said, with what its terminal
-    /// shows, as its failure ([`NOT_UP`]); one that joins is up once it
-    /// takes its screen after all ([`Self::watch_codex_late`]).
+    /// shows, as its failure ([`NOT_UP`]); one that joins is looked at on
+    /// while it runs, and is up once it takes its screen after all.
     /// It holds Desk weakly, so Desk ends (and its sessions with it) as it
     /// would without it.
     async fn watch_codex_start(desk: Weak<Inner>, id: Uuid, tui: Weak<Pty>, joins: bool) {
         let until = tokio::time::Instant::now() + CODEX_START_WATCH;
         let mut watch = codex::StartWatch::default();
         let mut on_screen = false;
-        while tokio::time::Instant::now() < until {
-            tokio::time::sleep(CODEX_START_LOOK).await;
+        // Said not to have come up, it is looked at on, less often, until
+        // it takes its screen.
+        let mut late = false;
+        loop {
+            tokio::time::sleep(if late {
+                CODEX_LATE_LOOK
+            } else {
+                CODEX_START_LOOK
+            })
+            .await;
             let Some(pty) = tui.upgrade() else { return };
             let shown = pty
                 .primary_text()
                 .map(|t| crate::pty::shown_end(&t, EXITED_LINES));
             if joins && !on_screen && shown.is_none() {
                 on_screen = true;
-                tracing::info!(target: crate::STARTS, %id, "a resumed Codex session's TUI is on its screen, not refusing: it's up");
+                tracing::info!(target: crate::STARTS, %id, late, "a resumed Codex session's TUI is on its screen, not refusing: it's up");
                 let Some(desk) = desk.upgrade().map(Desk) else {
                     return;
                 };
@@ -6552,36 +6560,26 @@ impl Desk {
                 pty.kill();
                 return;
             }
-        }
-        let Some(pty) = tui.upgrade() else { return };
-        let Some(d) = desk.upgrade().map(Desk) else {
-            return;
-        };
-        if d.record(id)
-            .is_ok_and(|r| r.state == SessionState::Starting)
-        {
-            let shown = crate::pty::shown_end(&crate::pty::plain_text(pty.text().as_bytes()), 4);
-            tracing::warn!(%id, secs = CODEX_START_WATCH.as_secs(), shown = %shown, "a Codex session is still starting");
-            d.codex_not_up(id, &shown);
-            if joins && !on_screen {
-                drop((pty, d));
-                Self::watch_codex_late(desk, id, tui).await;
-            }
-        }
-    }
-
-    /// Looks on, while its TUI runs, for session `id`'s Codex that didn't
-    /// come up in its start's watch to take its screen after all: it is up
-    /// then, that failure behind it.
-    async fn watch_codex_late(desk: Weak<Inner>, id: Uuid, tui: Weak<Pty>) {
-        loop {
-            tokio::time::sleep(CODEX_LATE_LOOK).await;
-            let Some(pty) = tui.upgrade() else { return };
-            if pty.primary_text().is_none() {
-                tracing::info!(target: crate::STARTS, %id, "a resumed Codex session's TUI took its screen late: it's up");
-                if let Some(d) = desk.upgrade().map(Desk) {
-                    d.codex_up(id);
+            if late || tokio::time::Instant::now() < until {
+                if late && on_screen {
+                    return;
                 }
+                continue;
+            }
+            let Some(desk) = desk.upgrade().map(Desk) else {
+                return;
+            };
+            if desk
+                .record(id)
+                .is_ok_and(|r| r.state == SessionState::Starting)
+            {
+                let shown =
+                    crate::pty::shown_end(&crate::pty::plain_text(pty.text().as_bytes()), 4);
+                tracing::warn!(%id, secs = CODEX_START_WATCH.as_secs(), shown = %shown, "a Codex session is still starting");
+                desk.codex_not_up(id, &shown);
+                late = joins && !on_screen;
+            }
+            if !late {
                 return;
             }
         }
