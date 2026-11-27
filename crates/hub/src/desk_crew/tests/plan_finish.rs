@@ -6,7 +6,8 @@
 //! boss ends or removes one only on the person's own words asking for it,
 //! or their plain reply to its question, a finished one listed on its board
 //! as finished; and one whose finish was refused (a ticket reopened during
-//! its closing turn) is finished on a later pass once settled again.
+//! its closing turn) is finished on a later pass once settled again; and
+//! no boss turn is spent on a plan paused at a budget.
 
 use super::*;
 use workforce_desk::board::TicketState;
@@ -14,7 +15,7 @@ use workforce_desk::plan::{Paused, PlanState};
 
 use super::decides_at_once::said;
 use super::goals::{boss_says, run};
-use super::plans::{hub_with, person_says, proposed, ACTS};
+use super::plans::{hub_with, judged, person_says, proposal, proposed, ACTS};
 
 const WATCHES: &str = "[oversight]\nenabled = true\nlevel = \"watch\"\n";
 
@@ -354,6 +355,73 @@ async fn a_plan_whose_ticket_reopened_during_its_closing_turn_finishes_once_sett
         set(TicketState::Done).await;
         crew.run_plans().await;
         done(&d, id).await;
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_plan_paused_at_a_budget_gets_no_bosss_turn_desk_finishes_it_or_it_waits_for_the_lift() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (overseer, state, d, llm) = hub_with(dir.path(), pool, ACTS).await;
+        let no_goal = settled(&d, dir.path(), 2).await;
+        let mut new = proposal(dir.path(), 2);
+        new.result = Some(serde_json::from_value(judged()).unwrap());
+        let party = workforce_desk::crew::Party::manager("desk", "Desk");
+        let unmet = d
+            .propose_plan(new, &party, &By::you())
+            .await
+            .unwrap()
+            .summary
+            .plan
+            .id;
+        let p = d.approve_plan(unmet, 1, &By::you()).await.unwrap();
+        for t in &p.tickets {
+            let mv = workforce_desk::Move {
+                state: TicketState::Done,
+                before: None,
+                after: None,
+            };
+            d.move_ticket(t.ticket.ticket.id, mv, &By::you())
+                .await
+                .unwrap();
+        }
+        for id in [no_goal, unmet] {
+            d.pause_plan(id, Paused::Budget, &By::desk("Its budget is spent."))
+                .await
+                .unwrap();
+        }
+        // No runner: nothing lifts the pauses under the test.
+        let stopped = CancellationToken::new();
+        stopped.cancel();
+        let crew = CrewHub::start(state, d.clone(), FAST, stopped);
+
+        crew.plan_turn_now(no_goal, vec!["Every ticket is done or dropped.".into()])
+            .await;
+        assert_eq!(
+            d.plan(no_goal).await.unwrap().summary.plan.state,
+            PlanState::Done
+        );
+        let words = "“Make the suite green” is done: 1 of 1 tickets done.";
+        assert_eq!(said(&overseer, &[words]), 1, "in Desk's words");
+
+        crew.plan_turn_now(unmet, vec!["Every ticket is done or dropped.".into()])
+            .await;
+        let p = d.plan(unmet).await.unwrap().summary.plan;
+        assert_eq!(p.state, PlanState::Paused, "waits for its pause to lift");
+        assert!(!crew.goal_checks.lock().closing.contains(&unmet));
+        let unmet_turns = llm
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|r| String::from_utf8_lossy(&r.body).contains("Not read met:"))
+            .count();
+        assert_eq!(
+            (closings(&llm).await, unmet_turns),
+            (0, 0),
+            "no boss turn past a budget"
+        );
     })
     .await;
 }

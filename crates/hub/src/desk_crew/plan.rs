@@ -3518,13 +3518,13 @@ impl CrewHub {
     }
 }
 
-/// Whether plan `p` is paused for a budget (its own, its group's or its
-/// boss's): no boss turn closes it past one, so its goal not read met
-/// waits for the pause to lift.
+/// Whether plan `p` is paused for a budget (its own, its group's, its
+/// boss's, or the plan limit's): no boss turn closes it past one, so its
+/// goal not read met waits for the pause to lift.
 fn waits_for_lift(p: &Plan) -> bool {
     matches!(
         p.paused,
-        Some(plan::Paused::Budget | plan::Paused::BossHeld)
+        Some(plan::Paused::Budget | plan::Paused::BossHeld | plan::Paused::PlanLimit)
     )
 }
 
