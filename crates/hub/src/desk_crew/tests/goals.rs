@@ -327,9 +327,13 @@ async fn a_goal_the_person_agreed_is_kept_by_desk_until_it_is_met() {
         .await
         .unwrap();
         let unmet = "Every ticket is settled but the goal isn't met";
+        // This turn, or the runner pass's closing turn that saw it first.
         crew.plan_turn_now(id, vec!["MAN-1 is done.".into()]).await;
+        eventually("the plan finished", async || {
+            (d.plan(id).await.ok()?.summary.plan.state == PlanState::Done).then_some(())
+        })
+        .await;
         let p = d.plan(id).await.unwrap().summary.plan;
-        assert_eq!(p.state, PlanState::Done);
         assert!(p.met.is_none(), "never read met");
         let bodies: Vec<String> = llm
             .received_requests()
@@ -338,8 +342,11 @@ async fn a_goal_the_person_agreed_is_kept_by_desk_until_it_is_met() {
             .iter()
             .map(|r| String::from_utf8_lossy(&r.body).to_string())
             .collect();
-        let turn: Vec<&String> = bodies.iter().filter(|b| b.contains("MAN-1 is done.")).collect();
-        assert!(turn.iter().any(|b| b.contains(unmet) && b.contains("“Not read met:”")));
+        let turns = bodies
+            .iter()
+            .filter(|b| b.contains(unmet) && b.contains("“Not read met:”"))
+            .count();
+        assert!(turns >= 1, "its one closing turn was told so");
         crew.plan_turn_now(id, vec!["Still done.".into()]).await;
         let again = llm.received_requests().await.unwrap();
         assert!(
