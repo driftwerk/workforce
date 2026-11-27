@@ -1165,27 +1165,39 @@ fn a_plan_is_ended_on_the_persons_words_asking_for_it_or_their_reply_to_the_boss
     let said = |texts: &[(i64, &str)]| -> Vec<(DateTime<Utc>, String)> {
         texts.iter().map(|(m, t)| (at(*m), t.to_string())).collect()
     };
+    let goal = "Fix the Mantis bugs";
     let theirs = said(&[
         (1, "ok"),
-        (2, "the tests are green"),
+        (2, "don't stop the plan yet"),
         (3, "Please end the Mantis bugs plan now"),
     ]);
     let asking = |quote: &str| said_by(&theirs, quote, at(-60), Said::Asking);
-    assert!(asks_to_end("end the Mantis bugs plan"));
-    assert!(!asks_to_end("ok") && !asks_to_end("the tests"));
+    assert!(asks_to_end("end the Mantis bugs plan", goal));
+    assert!(
+        asks_to_end("stop fix the Mantis bugs", goal),
+        "named by its goal"
+    );
+    for quote in [
+        "ok",
+        "the tests",
+        "close the PR when CI is green",
+        "finish the tests first",
+    ] {
+        assert!(!asks_to_end(quote, goal), "{quote}");
+    }
     assert_eq!(asking("end the Mantis bugs plan"), Ok(at(3)));
-    assert_eq!(asking("Please end the Mantis bugs plan now"), Ok(at(3)));
+    assert_eq!(asking("don't stop the plan yet"), Err(NotSaid::Refuses));
     assert!(asking("ok").is_err(), "a short whole message isn't asking");
     assert!(matches!(asking("end the"), Err(NotSaid::TooShort { .. })));
 
-    let boss = said(&[(4, "Every ticket is done. Shall I end the plan?")]);
     let yes = said(&[(5, "yes")]);
-    assert_eq!(replied_to_end(&yes, &boss, "yes", at(-60)), Ok(at(5)));
-    let other = said(&[(4, "The tests are green. Shall I open the PR?")]);
+    let reply = |boss: &str| replied_to_end(&yes, &said(&[(4, boss)]), "yes", goal, at(-60));
+    assert_eq!(reply("Shall I end the Mantis bugs plan?"), Ok(at(5)));
     assert_eq!(
-        replied_to_end(&yes, &other, "yes", at(-60)),
+        reply("Shall I close the old PR?"),
         Err(NotReplied::NothingProposed),
         "a yes to something else"
     );
-    assert!(replied_to_end(&said(&[(5, "no")]), &boss, "no", at(-60)).is_err());
+    let boss = said(&[(4, "Shall I end the Mantis bugs plan?")]);
+    assert!(replied_to_end(&said(&[(5, "no")]), &boss, "no", goal, at(-60)).is_err());
 }

@@ -695,18 +695,19 @@ impl CrewHub {
         })
     }
 
-    /// When the person asked, in `quote`, for the boss `service`'s plan to
-    /// be ended or removed, within a day: their own words saying so
+    /// When the person asked, in `quote`, for the boss `service`'s plan of
+    /// `goal_of` to be ended or removed, within a day: their own words saying so
     /// ([`Said::Asking`]), or their plain reply to its own question about
     /// it ([`goal::replied_to_end`]).
     pub(super) fn asked_at(
         &self,
         service: &AgentService,
+        goal_of: &str,
         quote: &str,
     ) -> Result<DateTime<Utc>, String> {
         let now = crew::now();
         let since = now - AGREED_WITHIN;
-        if goal::asks_to_end(quote) {
+        if goal::asks_to_end(quote, goal_of) {
             return goal::said_by(
                 &self.person_words(service, now - WORDS_LOOKED),
                 quote,
@@ -720,7 +721,7 @@ impl CrewHub {
             .map(|person| super::orchestrator::dm_talks(service, &person, since, MESSAGES_READ))
             .unwrap_or_default()
             .iter()
-            .map(|talk| goal::replied_to_end(&talk.theirs, &talk.boss, quote, since))
+            .map(|talk| goal::replied_to_end(&talk.theirs, &talk.boss, quote, goal_of, since))
             .collect();
         let q = crew::one_line(quote, 120);
         match replies.iter().filter_map(|r| r.ok()).max() {
@@ -731,7 +732,7 @@ impl CrewHub {
             }) {
                 Some(says) => not_yes(&q, says),
                 None => format!(
-                    "“{q}” doesn't ask for the plan to end or go: quote the person's own words that do, naming it (end, stop, drop, remove, finish, close), at least 4 words and 15 characters of one message; or ask them in your DM whether to end it and pass their plain reply."
+                    "“{q}” doesn't ask for this plan to end or go: quote the person's own words that name the plan (the word plan, or its goal) and its ending (end, stop, drop, remove, finish, close), at least 4 words and 15 characters of one message; or ask them in your DM whether to end the plan, naming it, and pass their plain reply."
                 ),
             }),
         }

@@ -258,11 +258,13 @@ them in your DM in the words you pass (or crew.ask_person with plan_id and propo
 their reply (person_said), a plain “yes” counting; record what \
 you report as done as facts, a judged part's progress as a checkpoint, and fix where a part is \
 read from with repair once its reads keep failing. When the person asks you to end a plan, \
-give end with their words asking for it (person_said: at least 4 words naming end, stop, drop, \
-remove, finish or close; or, to your own question whether to end it, their plain reply): it \
-stops, its tickets stay as they are and its sessions working now carry on as theirs. When they ask to remove one, give remove the same way: a running \
-one is ended first, and its tickets stay on the board as no plan's; crew.board lists finished \
-ones as finished_plans. Either goes in a call of its own. Say why.";
+give end with their words asking for it (person_said: at least 4 words naming the plan, by the \
+word plan or its goal, and its end: end, stop, drop, remove, finish or close; or their plain \
+reply to your own question whether to end the plan, naming it): it stops, its tickets stay as \
+they are and its sessions working now carry on as theirs. When they ask to remove one, give \
+remove the same way: a running one is ended first, and its tickets stay on the board as no \
+plan's; crew.board lists finished ones as finished_plans. Either goes in a call of its own. \
+Say why.";
 
 /// What `crew.plan_update` with `end` or `remove` may say besides.
 const ENDING_ALONE: [&str; 5] = ["plan_id", "revision", "why", "end", "remove"];
@@ -3429,7 +3431,7 @@ impl CrewHub {
         let agent = b.service.agent_id.as_str();
         match asked.get("person_said").and_then(Value::as_str).map(str::trim) {
             Some(words) if !words.is_empty() => {
-                self.asked_at(&b.service, words)?;
+                self.asked_at(&b.service, &p.goal, words)?;
             }
             _ if self.unbound_given(agent, &b.oversight) => {}
             _ => {

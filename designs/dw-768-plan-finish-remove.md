@@ -73,6 +73,7 @@ There is also no way to end or remove a plan from its row:
    - its budget ends (`plan_budget_ends`, as today);
    - its open watches end (`watches_end_plan`, "its plan ended"), so the boss stops watching at once instead of at the watch's next poll;
    - its open asks (`boss_open_items.plan = id`, not closed) close as the boss's, "its plan ended".
+   - its plan-limit asks, keyed by `limit_prefix` and carrying no plan, close as lapsed, parked ones too.
    The hub forgets what it keeps per plan when it hears the plan closed or removed (`forget_plan`): the goal checks' `closing`, `pulled`, `pulls`, `heads` and notes for it, and `plan_failed`'s entries of its tickets (kept again). `unmet_said` goes: the settled-unmet line is said in the one turn before the plan finishes, so it needs no memory of having been said.
 5. **End plan reuses the `dropped` state; it is not a new state.** `dropped` already means "stopped before it was done" everywhere: watches, adoption (`ADOPTABLE`), the boss's context, Floor, budgets. What becomes of the tickets is the action's, not the state's. A new state would need every `Done | Dropped` site, both SQL `IN ('done','dropped')` clauses and the app's unions to learn it, which is exactly the class of miss this ticket is about.
 
@@ -96,13 +97,13 @@ There is also no way to end or remove a plan from its row:
 8. **The boss's way: `crew.plan_update` with `end` or `remove`**, each `said_schema` (the person's words asking). That extends the existing grammar rather than adding a tool.
    - `remove` on an open plan ends it first.
    - Each takes only `plan_id`, `why` and itself.
-   - The quote must ask for this, within 24 hours, checked in the person's DM. Either it names an ending (end, stop, drop, remove, finish, close, cancel, delete, scrap, wrap: `goal::asks_to_end`) and is at least 4 words and 15 characters of one of their messages (`Said::Asking`, the Changing floor; "end the Mantis bugs plan"), or it is their plain reply ("yes") to the boss's own last DM message before it, which asked about ending or removing the plan (`goal::replied_to_end`, read as `replied_to` reads a reply for `item_set_goal`). "ok" or "the tests" end nothing.
+   - The quote must ask for this, within 24 hours, checked in the person's DM. Either it names the plan (the word plan, or its goal) and an ending (end, stop, drop, remove, finish, close, cancel, delete, scrap, wrap: `goal::asks_to_end`), is at least 4 words and 15 characters of one of their messages (`Said::Asking`, the Changing floor; "end the Mantis bugs plan"), and its message doesn't say no ("don't stop the plan yet" is refused); or it is their plain reply ("yes") to the boss's own last DM message before it, which asked about ending or removing the plan, naming it (`goal::replied_to_end`, read as `replied_to` reads a reply for `item_set_goal`). "ok", "the tests", "close the PR when CI is green" and "finish the tests first" end nothing, nor a "yes" to "Shall I close the old PR?".
    - An unbound boss at Act fully may end or remove its own plan without a quote. This follows "Act fully = no restraints", and the note says it did.
    - `crew.board` lists finished plans under `finished_plans` (id, goal, state), from the same read of the plans as the open ones, so "remove the Mantis bugs plan" finds the id.
 9. **The board (A):**
    - `BoardPlans` shows the open plans by default (proposed, running, paused), plus the one opened.
    - A `chip-btn` "Finished · n" with `aria-pressed` (the `search-filters` pattern) shows the done and ended ones instead.
-   - `plansOn` keeps dropped plans now. The board's plan select and its tickets' plan chips leave out ended plans, but the one shown. Every plan the board knows is read in full, ended ones too, so one whose tickets moved to another board still shows there until removed.
+   - `plansOn` keeps dropped plans now. The board's plan select and its tickets' plan chips leave out ended plans, but the one shown. Every plan going is read in full, so one whose tickets moved to another board shows there; a finished or ended one is read in full only while Finished is pressed or it is shown, so a board with many old plans doesn't read them all.
    - The Finished toggle turns off again once no finished plan is left to show.
    - The row's actions live in a new `PlanRowMenu` (so DW-760's `PlanRow`/`PlanCard` edits merge cleanly): a ⋯ `icon-btn-sm` (`MoreIcon`, `Menu`).
      - Running or paused: "End plan…", which opens `Confirm` (tone danger), titled "End this plan?": "“goal” stops: its boss starts no more of its tickets and stops watching it. Its tickets stay where they are on the board, and any session on one is left to you. You can remove it from the board once it has ended." Action "End plan".

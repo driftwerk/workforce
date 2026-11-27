@@ -255,7 +255,8 @@ async fn then(boss: &AgentService, says: fn(&AgentService, &str), text: &str) {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_short_quote_ends_a_plan_only_as_the_persons_reply_to_the_bosss_question_about_it() {
+async fn a_plan_is_ended_only_on_words_naming_it_and_its_end_or_a_yes_to_the_bosss_question_about_it(
+) {
     with_test_pool(workforce_desk::store::build_pool, |pool| async move {
         let dir = tempfile::tempdir().unwrap();
         let (overseer, state, d, _llm) = hub_with(dir.path(), pool, ACTS).await;
@@ -270,24 +271,37 @@ async fn a_short_quote_ends_a_plan_only_as_the_persons_reply_to_the_bosss_questi
         .await;
         let running = async |id| d.plan(id).await.unwrap().summary.plan.state == PlanState::Running;
 
-        then(&overseer, person_says, "ok").await;
-        let r = run(&overseer, "crew.plan_update", ending(first, "end", "ok")).await;
-        assert!(!r.success, "a bare ok asks for nothing");
-        assert!(r.error.unwrap().contains("doesn't ask for the plan to end"));
-        then(&overseer, person_says, "the tests are green on main").await;
-        let r = run(
-            &overseer,
-            "crew.plan_update",
-            ending(first, "end", "the tests"),
-        )
-        .await;
-        assert!(!r.success, "words that don't ask for it");
+        for words in [
+            "ok",
+            "the tests are green on main",
+            "don't stop the plan yet",
+            "close the PR when CI is green",
+            "finish the tests first",
+        ] {
+            then(&overseer, person_says, words).await;
+        }
+        for quote in [
+            "ok",
+            "the tests",
+            "don't stop the plan yet",
+            "close the PR when CI is green",
+            "finish the tests first",
+        ] {
+            let r = run(&overseer, "crew.plan_update", ending(first, "end", quote)).await;
+            assert!(!r.success, "{quote} asks for no end of the plan");
+        }
+        assert!(running(first).await);
+
+        then(&overseer, boss_says, "Shall I close the old PR?").await;
+        then(&overseer, person_says, "yes").await;
+        let r = run(&overseer, "crew.plan_update", ending(first, "end", "yes")).await;
+        assert!(!r.success, "a yes to something else");
         assert!(running(first).await);
 
         then(
             &overseer,
             boss_says,
-            "Every ticket is done. Shall I end the suite plan?",
+            "Every ticket is done. Shall I end the Mantis bugs plan?",
         )
         .await;
         then(&overseer, person_says, "yes").await;
@@ -347,10 +361,7 @@ async fn a_plan_whose_ticket_reopened_during_its_closing_turn_finishes_once_sett
             d.plan(id).await.unwrap().summary.plan.state,
             "refused"
         );
-        assert!(
-            !crew.goal_checks.lock().closing.contains(&id),
-            "its closing is over"
-        );
+        assert!(!crew.closing_started_for(id), "its closing is over");
 
         set(TicketState::Done).await;
         crew.run_plans().await;
@@ -409,7 +420,7 @@ async fn a_plan_paused_at_a_budget_gets_no_bosss_turn_desk_finishes_it_or_it_wai
             .await;
         let p = d.plan(unmet).await.unwrap().summary.plan;
         assert_eq!(p.state, PlanState::Paused, "waits for its pause to lift");
-        assert!(!crew.goal_checks.lock().closing.contains(&unmet));
+        assert!(!crew.closing_started_for(unmet));
         let unmet_turns = llm
             .received_requests()
             .await

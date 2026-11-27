@@ -3029,6 +3029,20 @@ impl Desk {
         {
             tracing::warn!(plan = %p.id, error = %e, "an ended plan's asks weren't closed");
         }
+        // Its plan-limit asks carry no plan, only their key: closed by it,
+        // parked ones too.
+        if let Err(e) = self
+            .0
+            .store
+            .item_close_of_key_prefix(
+                &crate::plan::limit_prefix(p.id),
+                crate::open_item::ClosedBy::Lapsed,
+                "Its plan ended.",
+            )
+            .await
+        {
+            tracing::warn!(plan = %p.id, error = %e, "an ended plan's limit asks weren't closed");
+        }
         self.plan_note(p, by, kind, text);
     }
 

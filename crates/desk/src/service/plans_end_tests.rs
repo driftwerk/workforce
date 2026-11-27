@@ -505,3 +505,33 @@ async fn the_persons_routes_end_and_remove_a_plan() {
     })
     .await;
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_plan_ending_closes_its_plan_limit_asks_parked_ones_too() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(pool, dir.path()).await;
+        let p = running(&d, dir.path(), &[("a", &[])]).await;
+        let id = p.summary.plan.id;
+        let limit_ask = async |key: String| {
+            let mut new = NewItem::ask("sarah", OpenKind::Ask, None, "Raise the limit?");
+            new.dedupe_key = key;
+            match d.store().item_open(&new).await.unwrap() {
+                Opened::New(i) | Opened::Again(i) => i.id,
+            }
+        };
+        let open = limit_ask(format!("{}open", crate::plan::limit_prefix(id))).await;
+        let parked = limit_ask(format!("{}parked", crate::plan::limit_prefix(id))).await;
+        d.store()
+            .item_said(parked, crew::now(), true)
+            .await
+            .unwrap();
+        let state = async |item| d.store().open_item(item).await.unwrap().unwrap().state;
+        assert_eq!(state(parked).await, OpenState::Parked);
+
+        d.end_plan(id, &By::you()).await.unwrap();
+        assert_eq!(state(open).await, OpenState::Closed);
+        assert_eq!(state(parked).await, OpenState::Closed);
+    })
+    .await;
+}

@@ -976,9 +976,10 @@ pub enum Said {
     /// a longer one.
     Answering,
     /// Asking, unprompted, for a plan to be ended or removed: at least 4
-    /// words and 15 characters of one message that say so ([`asks_to_end`]).
-    /// A shorter reply ("yes") counts only as the answer to the boss's own
-    /// question about it ([`replied_to_end`]).
+    /// words and 15 characters of one message that name the plan and its
+    /// ending ([`asks_to_end`]), in a message that doesn't say no ("don't
+    /// stop the plan yet"). A shorter reply ("yes") counts only as the
+    /// answer to the boss's own question about it ([`replied_to_end`]).
     Asking,
 }
 
@@ -1059,7 +1060,11 @@ pub fn said_by(
     said: Said,
 ) -> Result<DateTime<Utc>, NotSaid> {
     found(messages, quote, since, said, &|text| match said {
-        Said::Changing | Said::Asking => Consent::Yes,
+        Said::Changing => Consent::Yes,
+        Said::Asking => match consent(text) {
+            Consent::No => Consent::No,
+            _ => Consent::Yes,
+        },
         _ => consent(text),
     })
 }
@@ -1146,28 +1151,33 @@ const ENDING: [&str; 13] = [
     "delete", "scrap", "wrap",
 ];
 
-/// Whether `text` asks for a plan to be ended or removed: it names it so
-/// (end, stop, drop, remove, finish, close, cancel, delete, scrap, wrap).
-pub fn asks_to_end(text: &str) -> bool {
-    compared_words(text)
-        .iter()
-        .any(|w| ENDING.contains(&w.as_str()))
+/// Whether `text` asks for the plan of `goal` to be ended or removed: it
+/// names the plan (the word plan, or its goal) and its ending (end, stop,
+/// drop, remove, finish, close, cancel, delete, scrap, wrap). "Close the
+/// PR" or "finish the tests first" name no plan.
+pub fn asks_to_end(text: &str, goal: &str) -> bool {
+    let words = compared_words(text);
+    let ends = words.iter().any(|w| ENDING.contains(&w.as_str()));
+    let names = words.iter().any(|w| w == "plan" || w == "plans") || says_goal(text, goal);
+    ends && names
 }
 
 /// When the person's `quote` is their plain reply ("yes") to the boss's
 /// last message before it in `boss`, which asked them about ending or
-/// removing the plan ([`asks_to_end`]): as [`replied_to`] reads a reply.
+/// removing the plan of `goal` ([`asks_to_end`]): as [`replied_to`] reads
+/// a reply.
 pub fn replied_to_end(
     theirs: &[(DateTime<Utc>, String)],
     boss: &[(DateTime<Utc>, String)],
     quote: &str,
+    goal: &str,
     since: DateTime<Utc>,
 ) -> Result<DateTime<Utc>, NotReplied> {
     let at = replied_to(theirs, boss, quote, &[], since)?;
     boss.iter()
         .filter(|(when, _)| *when < at)
         .max_by_key(|(when, _)| *when)
-        .filter(|(_, asked)| asks_to_end(asked))
+        .filter(|(_, asked)| asks_to_end(asked, goal))
         .map(|_| at)
         .ok_or(NotReplied::NothingProposed)
 }
