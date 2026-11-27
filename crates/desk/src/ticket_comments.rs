@@ -320,8 +320,9 @@ pub fn linear_comments(answer: &Value) -> Result<RemoteRead, String> {
         let (body, flagged) = unfence(c["body"].as_str().unwrap_or_default());
         let body = held(&body);
         let bot = c.get("botActor").filter(|b| b.is_object());
+        // An app writing, even for a person (an integration's), is an app's.
         let (name, app) = match (c["user"]["name"].as_str(), bot) {
-            (Some(_), _) => (name_of(&c["user"]["name"]), false),
+            (Some(_), b) => (name_of(&c["user"]["name"]), b.is_some()),
             (None, Some(b)) => (name_of(&b["name"]), true),
             (None, None) => (None, false),
         };

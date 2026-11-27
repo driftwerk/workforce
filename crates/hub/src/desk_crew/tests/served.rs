@@ -368,6 +368,12 @@ async fn a_served_boss_is_decided_by_its_grant_on_the_engine_that_holds_the_sess
                 .as_deref(),
             Some("acme")
         );
+        // What it was started on is taken as carrying outside content: the
+        // boss's turn is on another hub.
+        assert_eq!(
+            d.store().session_start(started).await.unwrap(),
+            Some(Some(crate::desk_crew::served::SERVED_UNSAID.to_string()))
+        );
         // The local overseer doesn't run it, nor Allan the local's.
         assert!(!crew.runs(started, "desk"));
         // Its CLI was started with a pre-tool hook that fails closed.

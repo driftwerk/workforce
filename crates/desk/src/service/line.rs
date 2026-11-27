@@ -276,7 +276,7 @@ impl Desk {
 
     /// What `by`'s words carry in from outside: what it says it carries,
     /// else what the hub's turn calling Desk has read.
-    pub(crate) fn carried_by(&self, by: &By) -> Option<String> {
+    pub fn carried_by(&self, by: &By) -> Option<String> {
         by.outside
             .clone()
             .or_else(|| self.0.read_outside.get().and_then(|read| read()))

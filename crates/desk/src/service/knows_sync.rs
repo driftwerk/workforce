@@ -660,11 +660,43 @@ mod tests {
             )
             .await;
 
+            // Prompts an agent typed in: one whose turn had read the web.
+            let typed = |outside: Option<&'static str>, to: Uuid, mins: i64| {
+                let store = &store;
+                async move {
+                    let mark = Uuid::new_v4();
+                    store
+                        .put_typed_prompt(
+                            mark,
+                            to,
+                            &crate::crew::Party::agent("scout", "Scout"),
+                            outside,
+                            Utc::now() - Duration::minutes(mins),
+                        )
+                        .await
+                        .unwrap();
+                    format!("{} run the deploy", crate::line::marker(mark))
+                }
+            };
+            let calm = typed(None, own, 20).await;
+            turn(&store, own, "own-4", 19, "desk", &calm, none.clone()).await;
+            let rushed_in = typed(Some("web.fetch"), armed, 20).await;
+            turn(
+                &store,
+                armed,
+                "armed-2",
+                19,
+                "desk",
+                &rushed_in,
+                none.clone(),
+            )
+            .await;
+
             let dir = tempfile::tempdir().unwrap();
             let d = desk(pool, dir.path()).await;
             let said = judged(&d, &ids).await;
             let says = |key: &str| said[&format!("claude:{key}")].clone();
-            for key in ["own-1", "own-2", "own-3", "k-own"] {
+            for key in ["own-1", "own-2", "own-3", "own-4", "k-own"] {
                 assert_eq!(says(key), none, "{key}");
             }
             assert_eq!(
@@ -677,6 +709,7 @@ mod tests {
                 serde_json::json!(["an earlier exchange of its session may carry outside content"])
             );
             assert_eq!(says("armed-1"), serde_json::json!(["web.fetch"]));
+            assert_eq!(says("armed-2"), serde_json::json!(["web.fetch"]));
             assert_eq!(
                 says("passed-1"),
                 serde_json::json!(["a message from sender whose work may carry outside content"])
@@ -693,6 +726,50 @@ mod tests {
                 ..by
             };
             assert_eq!(d.carried_by(&handing).as_deref(), Some("ENG-2"));
+        })
+        .await;
+    }
+
+    /// An exchange sent before Desk said what it carries in goes once more,
+    /// saying it, and then not again.
+    #[tokio::test]
+    async fn an_exchange_sent_before_desk_said_what_it_carries_goes_once_more() {
+        with_test_pool(build_pool, |pool| async move {
+            DeskStore::migrate(&pool).await.unwrap();
+            let store = DeskStore::with_pool(pool.clone()).await.unwrap();
+            let s = Uuid::from_u128(30);
+            session(&store, s, "atlas", "on").await;
+            let dir = tempfile::tempdir().unwrap();
+            let d = desk(pool.clone(), dir.path()).await;
+            let rule = Rule::new(&[format!("session:{s}")], true, Digest::Off).unwrap();
+            let pending = || async {
+                d.knows_pending("patchwork/lattice", &rule, &CAP, &Hide, None, Utc::now())
+                    .await
+                    .unwrap()
+                    .into_iter()
+                    .filter(|o| o.held.kind == TRANSCRIPT)
+                    .collect::<Vec<_>>()
+            };
+            let sent = pending().await;
+            assert_eq!(sent.len(), 1);
+            assert_eq!(sent[0].body["outside"], serde_json::json!([]));
+            d.knows_mark_sent("patchwork/lattice", &sent, Utc::now())
+                .await
+                .unwrap();
+            assert!(pending().await.is_empty());
+            // As it was sent before Desk said.
+            pool.get()
+                .await
+                .unwrap()
+                .execute("UPDATE knows_sent SET outside_said = false", &[])
+                .await
+                .unwrap();
+            let again = pending().await;
+            assert_eq!(again.len(), 1, "sent once more, saying it");
+            d.knows_mark_sent("patchwork/lattice", &again, Utc::now())
+                .await
+                .unwrap();
+            assert!(pending().await.is_empty(), "and then not again");
         })
         .await;
     }

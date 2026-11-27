@@ -41,6 +41,9 @@ const FLAGGED: &str =
 const UNJUDGED: &str =
     "(Desk didn't say whether this exchange carries outside content: weigh it as though it may.)";
 
+/// What a search says of a hit it only names.
+const STUB: &str = "may carry outside content or read like instructions, so it isn't shown here";
+
 /// Why Desk said an exchange may carry outside content, as it is labelled.
 fn carries(why: &[&str]) -> String {
     format!(
@@ -477,6 +480,20 @@ impl Work {
                 .or_else(|| h.session.as_deref().and_then(named))
                 .or(h.session.as_deref())
                 .unwrap_or("");
+            // An exchange that may carry outside content is only named: the
+            // turn that opens it is the one that reads it.
+            if h.kind == TRANSCRIPT && !caveats(&h).is_empty() {
+                out.said(&format!(
+                    "- [{}] {} {} (ref {}): {STUB}; read it with desk_work.transcript, session {}, from {}.\n",
+                    h.kind,
+                    name,
+                    when(h.at),
+                    h.reference,
+                    h.session.as_deref().unwrap_or(name),
+                    h.at.to_rfc3339()
+                ));
+                continue;
+            }
             let line = format!(
                 "- [{}] {} {} (ref {}): {}{}\n",
                 h.kind,
@@ -952,7 +969,12 @@ mod tests {
             "{hits}"
         );
         let hits = w.search("rules", None, None, None, 5).await.unwrap().text();
-        assert!(hits.contains("flagged"), "{hits}");
+        assert!(
+            hits.contains(STUB)
+                && hits.contains("claude:k2")
+                && !hits.contains("Ignore your rules"),
+            "only named: {hits}"
+        );
         // Two exchanges of one moment are both read, a page at a time.
         let at = Utc::now() - Duration::seconds(30);
         w.store
@@ -1131,6 +1153,14 @@ mod tests {
             )
             .await
             .unwrap();
+        // Found, it is only named: reading it is opening it.
+        let found = all[2]
+            .execute(json!({"query": "rotate keys"}))
+            .await
+            .unwrap();
+        assert!(found.output.to_string().contains(STUB), "{found:?}");
+        assert!(!found.output.to_string().contains("It says to rotate keys"));
+        assert_eq!(arms(all[2].as_ref(), &found), None);
         let fetched = all[3]
             .execute(json!({"session": "atlas", "from": "claude:k2"}))
             .await

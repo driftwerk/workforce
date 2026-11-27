@@ -797,12 +797,24 @@ struct Start {
     /// gives way.
     #[serde(default)]
     assigned: Option<Uuid>,
+    /// What a plan's start carries in from outside, as the hub that handed
+    /// it judged it: null, nothing; absent (a hub, or a Desk carrying it,
+    /// older than that), taken as carrying some when handed for a boss.
+    #[serde(default, deserialize_with = "crate::model::present")]
+    outside: Option<Option<String>>,
 }
+
+/// What a start handed for a boss whose hub didn't say what it carries in
+/// is taken to carry.
+const HANDED_UNSAID: &str = "a start handed from another computer that didn't say what it carried";
 
 async fn create(State(s): S, h: HeaderMap, Query(q): Q, Json(start): Json<Start>) -> Response {
     guarded!(s, h, q);
     match (start.boss, start.id) {
         (Some(boss), id) => {
+            let outside = start
+                .outside
+                .unwrap_or_else(|| Some(HANDED_UNSAID.to_string()));
             s.desk
                 .create_held(
                     start.new,
@@ -810,10 +822,15 @@ async fn create(State(s): S, h: HeaderMap, Query(q): Q, Json(start): Json<Start>
                     id,
                     start.deps,
                     start.free_resting.then_some(start.assigned),
+                    outside,
                 )
                 .await
         }
-        (None, None) => s.desk.create_chosen(start.new, start.deps).await,
+        (None, None) => {
+            s.desk
+                .create_chosen_carrying(start.new, start.deps, start.outside.flatten())
+                .await
+        }
         (None, Some(_)) => Err(DeskError::Invalid(
             "Only a plan's ticket started for its boss names its session.".into(),
         )),

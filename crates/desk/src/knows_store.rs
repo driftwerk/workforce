@@ -202,7 +202,7 @@ impl DeskStore {
                  ON CONFLICT (agent, kind, ref) DO UPDATE SET session = EXCLUDED.session, \
                    group_id = EXCLUDED.group_id, board = EXCLUDED.board, boss = EXCLUDED.boss, \
                    bytes = EXCLUDED.bytes, sent_at = EXCLUDED.sent_at, hash = EXCLUDED.hash, \
-                   deleted_at = NULL, kept_at = NULL",
+                   deleted_at = NULL, kept_at = NULL, outside_said = EXCLUDED.outside_said",
             )
             .await?;
         for s in sent {

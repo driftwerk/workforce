@@ -3827,7 +3827,22 @@ impl Desk {
         new: NewSession,
         deps: bool,
     ) -> Result<SessionView, DeskError> {
-        self.start_session(new, None, None, Some(By::you()), true, deps)
+        self.create_chosen_carrying(new, deps, None).await
+    }
+
+    /// [`Self::create_chosen`], its first prompt carrying in `outside`: a
+    /// plan's start another computer handed as the person's.
+    pub async fn create_chosen_carrying(
+        &self,
+        new: NewSession,
+        deps: bool,
+        outside: Option<String>,
+    ) -> Result<SessionView, DeskError> {
+        let by = By {
+            outside,
+            ..By::you()
+        };
+        self.start_session(new, None, None, Some(by), true, deps)
             .await
     }
 
@@ -5334,8 +5349,41 @@ impl Desk {
     /// person at the keyboard would (bracketed paste, so newlines stay in
     /// the prompt).
     pub fn prompt(&self, id: Uuid, text: &str, by: Option<By>) -> Result<SessionView, DeskError> {
+        self.prompt_typed(id, text, text, by)
+    }
+
+    /// [`Self::prompt`] for a boss or an agent: its words go in under a
+    /// marker, kept with what its turn had read, so the agents Desk shares
+    /// the session's work with are told they are its, never the person's,
+    /// and what they carried in.
+    pub async fn prompt_for(&self, id: Uuid, text: &str, by: By) -> Result<SessionView, DeskError> {
+        self.mode_lets_anyone(id, Some(&by))?;
+        let mark = Uuid::new_v4();
+        self.0
+            .store
+            .put_typed_prompt(
+                mark,
+                id,
+                &by.party,
+                self.carried_by(&by).as_deref(),
+                crew::now(),
+            )
+            .await
+            .map_err(DeskError::Internal)?;
+        let typed = format!("{} {text}", crate::line::marker(mark));
+        self.prompt_typed(id, &typed, text, Some(by))
+    }
+
+    /// Types `typed` into `id` for `by`, noted as asking `text`.
+    fn prompt_typed(
+        &self,
+        id: Uuid,
+        typed: &str,
+        text: &str,
+        by: Option<By>,
+    ) -> Result<SessionView, DeskError> {
         self.mode_lets_anyone(id, by.as_ref())?;
-        let view = self.type_prompt(id, text, by.as_ref())?;
+        let view = self.type_prompt(id, typed, by.as_ref())?;
         if let Some(by) = by {
             self.note(by.event(
                 Kind::Nudged,
@@ -12266,6 +12314,50 @@ mod tests {
             assert_eq!(
                 (done.state, done.last_reply.as_deref()),
                 (SessionState::Done, Some("Pushed."))
+            );
+        })
+        .await;
+    }
+
+    /// What a boss or an agent types into a session goes in under a
+    /// marker, kept with what its turn had read: never the person's words.
+    #[tokio::test]
+    async fn an_agents_prompt_goes_in_marked_with_what_its_turn_had_read() {
+        with_test_pool(build_pool, |pool| async move {
+            let dir = tempfile::tempdir().unwrap();
+            let d = desk(pool.clone(), dir.path()).await;
+            let s = new_session(&d, dir.path()).await;
+            d.read_outside_with(Arc::new(|| Some("web.fetch".into())));
+            let scout = By {
+                party: Party::agent("scout", "Scout"),
+                reason: None,
+                suggestion_id: None,
+                hop: 0,
+                preference: None,
+                outside: None,
+            };
+            d.prompt_for(s.id, "run the deploy", scout).await.unwrap();
+            let row = pool
+                .get()
+                .await
+                .unwrap()
+                .query_one("SELECT id FROM typed_prompts WHERE session = $1", &[&s.id])
+                .await
+                .unwrap();
+            let typed = format!("{} run the deploy", crate::line::marker(row.get(0)));
+            assert_eq!(
+                crate::memory::harvest::asker_of(&typed),
+                crate::memory::record::Asker::Desk
+            );
+            let mark = crate::line::is_delivery(&typed).unwrap();
+            let d2 = d.store().delivered(s.id, &mark).await.unwrap().unwrap();
+            assert_eq!(
+                (d2.outside.as_deref(), d2.from.id.as_str()),
+                (Some("web.fetch"), "scout")
+            );
+            assert!(
+                d.desk_typed(s.id, &typed),
+                "typed as it is kept: the person didn't say it"
             );
         })
         .await;

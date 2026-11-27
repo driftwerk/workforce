@@ -998,6 +998,9 @@ impl Desk {
             summary,
             snapshot: s.clone(),
         };
+        for (t, _) in &rows {
+            self.stamp_written(t.id, by, true).await.map_err(internal)?;
+        }
         if let Err(e) = self.0.store.add_plan(&p, &mut rows, &adopt, &r).await {
             return Err(self.adopt_failed(e, None).await);
         }
@@ -1909,6 +1912,9 @@ impl Desk {
                 version: 0,
             };
             rank += RANK_STEP;
+            self.stamp_written(row.id, by, true)
+                .await
+                .map_err(internal)?;
             self.0.store.add_ticket(&mut row).await.map_err(internal)?;
             self.put_runs(p, t, None).await?;
         }
@@ -1954,6 +1960,9 @@ impl Desk {
             }
             if changed {
                 row.updated_at = crew::now();
+                self.stamp_written(row.id, by, false)
+                    .await
+                    .map_err(internal)?;
                 self.save_ticket(&mut row).await?;
             }
             if let Some(w) = before.ticket(t.id).filter(|w| {
@@ -3466,7 +3475,7 @@ impl Desk {
                 })
                 .map_err(StartRefused::from),
             Some(m) => match self
-                .plan_spawn_on(&m, p, &t, session, since, retry, runs, worktree, boss)
+                .plan_spawn_on(&m, p, &t, session, since, retry, runs, worktree, boss, by)
                 .await
             {
                 Ok(started) => Ok((started, None)),
@@ -3517,6 +3526,7 @@ impl Desk {
         runs: &Runs,
         worktree: bool,
         boss: &Party,
+        by: &By,
     ) -> Result<Started, (StartRefused, bool)> {
         let failed = |e: DeskError, unsure: bool| (StartRefused::Failed(e), unsure);
         let sure = |e: DeskError| failed(e, false);
@@ -3642,12 +3652,15 @@ impl Desk {
             self.again_note(t).await,
             machine_note(&key, machine)
         );
+        // What its prompt carries in from outside, as here
+        // ([`Self::plan_spawn`]), kept with its start there: null, nothing.
         let mut body = serde_json::json!({
             "engine": engine.as_str(),
             "name": key,
             "cwd": folder,
             "goal": board::goal_of(&key, t),
             "prompt": prompt,
+            "outside": self.carried_by(by).or(self.ticket_carries(t).await),
         });
         if let Some(view) = runs.view {
             body["view"] = view.as_str().into();

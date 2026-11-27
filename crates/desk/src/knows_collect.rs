@@ -13,6 +13,8 @@
 //! A session whose memory is off is never read, nor what of a group whose
 //! harvest is off.
 
+use std::collections::HashMap;
+
 use chrono::{DateTime, Utc};
 use eyre::Result;
 use serde_json::Value;
@@ -167,9 +169,14 @@ pub fn exchange_ref(engine: &str, key: &str) -> String {
 /// Not yet sent to `$1` as `kind` by `ref_sql`, or sent and deleted: the
 /// append kinds' anti-join. Being deleted counts as sent.
 fn unsent(kind: &str, ref_sql: &str) -> String {
+    // An exchange sent before Desk said what it carries in goes again.
+    let said = match kind {
+        TRANSCRIPT => " AND k.outside_said",
+        _ => "",
+    };
     format!(
         "NOT EXISTS (SELECT 1 FROM knows_sent k WHERE k.agent = $1 AND k.kind = '{kind}' \
-         AND k.ref = {ref_sql} AND (k.deleted_at IS NULL OR k.deleting IS NOT NULL))"
+         AND k.ref = {ref_sql} AND (k.deleted_at IS NULL OR k.deleting IS NOT NULL){said})"
     )
 }
 
@@ -447,14 +454,18 @@ impl DeskStore {
             .collect()
     }
 
-    /// The line message to `session` its `mark` ([`crate::line::marker`])
+    /// The line message to `session`, or the prompt typed into it
+    /// ([`Self::put_typed_prompt`]), its `mark` ([`crate::line::marker`])
     /// names, newest if more than one does.
     pub async fn delivered(&self, session: Uuid, mark: &str) -> Result<Option<Delivered>> {
         let client = self.pool().get().await?;
         client
             .query_opt(
                 "SELECT outside, sender, at FROM line_messages \
-                 WHERE recipient ->> 'id' = $1 AND replace(id::text, '-', '') LIKE $2 || '%' \
+                   WHERE recipient ->> 'id' = $1 AND replace(id::text, '-', '') LIKE $2 || '%' \
+                 UNION ALL \
+                 SELECT outside, sender, at FROM typed_prompts \
+                   WHERE session::text = $1 AND replace(id::text, '-', '') LIKE $2 || '%' \
                  ORDER BY at DESC LIMIT 1",
                 &[&session.to_string(), &mark],
             )
@@ -467,6 +478,58 @@ impl DeskStore {
                 })
             })
             .transpose()
+    }
+
+    /// A prompt `sender` typed into `session` at `at` under the marker of
+    /// `id`, carrying in `outside` (none: nothing).
+    pub async fn put_typed_prompt(
+        &self,
+        id: Uuid,
+        session: Uuid,
+        sender: &crate::crew::Party,
+        outside: Option<&str>,
+        at: DateTime<Utc>,
+    ) -> Result<()> {
+        let client = self.pool().get().await?;
+        client
+            .execute(
+                "INSERT INTO typed_prompts (id, session, sender, outside, at) \
+                 VALUES ($1, $2, $3, $4, $5)",
+                &[&id, &session, &serde_json::to_value(sender)?, &outside, &at],
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// What the boss's turn that wrote ticket or comment `id` had read
+    /// (none: nothing). A reason once said stays, whatever is said after.
+    pub async fn put_written_outside(&self, id: Uuid, outside: Option<&str>) -> Result<()> {
+        let client = self.pool().get().await?;
+        client
+            .execute(
+                "INSERT INTO written_outside (id, outside) VALUES ($1, $2) \
+                 ON CONFLICT (id) DO UPDATE \
+                 SET outside = COALESCE(written_outside.outside, EXCLUDED.outside)",
+                &[&id, &outside],
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// Of `ids` (tickets and comments), what each written by a boss's turn
+    /// said it had read ([`Self::put_written_outside`]): absent, one Desk
+    /// was never told of.
+    pub async fn written_outside(&self, ids: &[Uuid]) -> Result<HashMap<Uuid, Option<String>>> {
+        let client = self.pool().get().await?;
+        client
+            .query(
+                "SELECT id, outside FROM written_outside WHERE id = ANY($1)",
+                &[&ids],
+            )
+            .await?
+            .iter()
+            .map(|r| Ok((r.try_get(0)?, r.try_get(1)?)))
+            .collect()
     }
 
     /// `session` started on a prompt carrying in `outside` (none: nothing).

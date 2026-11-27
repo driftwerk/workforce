@@ -2,6 +2,7 @@ use super::*;
 use crate::board::{External, Seen, Sync, System, TicketState};
 use crate::crew::Party;
 use crate::ticket_comments::{Author, AuthorKind};
+use crate::ticket_history::{HistoryBy, HistoryEvent};
 use chrono::Utc;
 use serde_json::json;
 use uuid::Uuid;
@@ -42,6 +43,17 @@ fn gh_reads_outside_content_only_for_others_words() {
         "gh release view v1.2",
         "gh gist view abc",
         "git push && gh pr view --json body",
+        "gh -R acme/web pr view 648",
+        "gh --repo acme/web issue list",
+        "gh --hostname ghe.acme.dev --repo=acme/web pr diff 9",
+        "gh search issues 'login timeout'",
+        "gh repo view acme/web",
+        "gh pr list --state open",
+        "gh pr checkout 648",
+        "gh run view 991 --log-failed",
+        "gh run view --log",
+        "bash -c \"curl -s https://api.example/v1\"",
+        "sh -c 'wget https://example.com/x'",
     ] {
         assert!(reads(others), "{others}");
     }
@@ -51,7 +63,10 @@ fn gh_reads_outside_content_only_for_others_words() {
         "gh pr merge 648 --squash",
         "gh run watch",
         "gh auth status",
+        "gh -R acme/issue pr create --fill",
+        "gh --repo acme/api pr checks 648",
         "git log --oneline",
+        "echo \"done\"",
     ] {
         assert!(!reads(own), "{own}");
     }
@@ -159,18 +174,43 @@ fn comment(by: &str) -> Comment {
     }
 }
 
-/// A ticket made here is the person's words when they, a boss or Desk
-/// made it; a session's or another agent's is not.
-#[test]
-fn a_ticket_made_here_is_the_persons_unless_a_session_wrote_it() {
-    let b = board(None);
-    for own in [
-        Party::you(),
-        Party::manager("sarah", "Sarah"),
-        Party::desk(),
-    ] {
-        assert_eq!(ticket_outside(&ticket(own), &b, &[]), None);
+fn none() -> HashMap<Uuid, Option<String>> {
+    HashMap::new()
+}
+
+fn by<'a>(comments: &'a [Comment], stamps: &'a HashMap<Uuid, Option<String>>) -> Writers<'a> {
+    Writers {
+        comments,
+        history: None,
+        stamps,
     }
+}
+
+fn posted(by: Party) -> Comment {
+    Comment {
+        remote_id: None,
+        posted_by: Some(by),
+        only_here: true,
+        ..comment("here")
+    }
+}
+
+/// A ticket made here is the person's words when they, a boss whose turn
+/// had read nothing, or Desk made it; a session's or another agent's is
+/// not, nor a boss's that had read outside content or never said.
+#[test]
+fn a_ticket_made_here_is_the_persons_unless_a_session_or_an_armed_boss_wrote_it() {
+    let b = board(None);
+    let boss = Party::manager("sarah", "Sarah");
+    for own in [Party::you(), boss.clone(), Party::desk()] {
+        let t = ticket(own);
+        let stamps = HashMap::from([(t.id, None)]);
+        assert_eq!(ticket_outside(&t, &b, by(&[], &stamps)), None);
+    }
+    assert_eq!(
+        ticket_outside(&ticket(Party::you()), &b, by(&[], &none())),
+        None
+    );
     let by_session = Party {
         kind: PartyKind::Session,
         id: Uuid::new_v4().to_string(),
@@ -178,33 +218,101 @@ fn a_ticket_made_here_is_the_persons_unless_a_session_wrote_it() {
         engine: None,
         origin: None,
     };
-    assert!(ticket_outside(&ticket(by_session), &b, &[]).is_some());
+    assert!(ticket_outside(&ticket(by_session.clone()), &b, by(&[], &none())).is_some());
+
+    let armed = ticket(boss.clone());
+    let stamps = HashMap::from([(armed.id, Some("web.fetch".to_string()))]);
+    assert_eq!(
+        ticket_outside(&armed, &b, by(&[], &stamps)).as_deref(),
+        Some("ENG-1, written by a boss's turn that had read web.fetch")
+    );
+    assert!(
+        ticket_outside(&ticket(boss.clone()), &b, by(&[], &none())).is_some(),
+        "a boss's from before Desk said"
+    );
+    // A person's ticket an armed boss edited.
+    let edited = ticket(Party::you());
+    let stamps = HashMap::from([(edited.id, Some("web.fetch".to_string()))]);
+    assert!(ticket_outside(&edited, &b, by(&[], &stamps)).is_some());
+
+    // Its bosses' comments count; a session's note on it is its own work.
+    let t = ticket(Party::you());
+    let note = posted(by_session);
+    assert_eq!(ticket_outside(&t, &b, by(&[note], &none())), None);
+    let said = posted(boss.clone());
+    let stamps = HashMap::from([(said.id, None)]);
+    assert_eq!(
+        ticket_outside(&t, &b, by(std::slice::from_ref(&said), &stamps)),
+        None
+    );
+    let stamps = HashMap::from([(said.id, Some("web.fetch".to_string()))]);
+    assert!(ticket_outside(&t, &b, by(std::slice::from_ref(&said), &stamps)).is_some());
+    assert!(
+        ticket_outside(&t, &b, by(&[said], &none())).is_some(),
+        "a boss's comment from before Desk said"
+    );
 }
 
 /// A synced issue is the person's words only when Desk knows who they
-/// are there, they wrote it, and every comment on it is theirs and read.
+/// are there, they wrote it, every comment on it is theirs, a person's,
+/// and read, and no one else edited its description.
 #[test]
 fn a_synced_issue_is_the_persons_only_when_they_wrote_it_and_all_its_comments() {
     let mine = board(Some("u-me"));
-    assert_eq!(ticket_outside(&issue("u-me", 0), &mine, &[]), None);
-    assert_eq!(
-        ticket_outside(&issue("u-me", 1), &mine, &[comment("u-me")]),
-        None
-    );
+    let alone = |t: &Ticket, comments: &[Comment]| ticket_outside(t, &mine, by(comments, &none()));
+    assert_eq!(alone(&issue("u-me", 0), &[]), None);
+    assert_eq!(alone(&issue("u-me", 1), &[comment("u-me")]), None);
     assert!(
-        ticket_outside(&issue("u-me", 2), &mine, &[comment("u-me")]).is_some(),
+        alone(&issue("u-me", 2), &[comment("u-me")]).is_some(),
         "a comment not read"
     );
     assert!(
-        ticket_outside(&issue("u-me", 1), &mine, &[comment("u-teammate")]).is_some(),
+        alone(&issue("u-me", 1), &[comment("u-teammate")]).is_some(),
         "a teammate's comment"
     );
+    let app = Comment {
+        author: Author {
+            kind: AuthorKind::Agent,
+            ..comment("u-me").author
+        },
+        ..comment("u-me")
+    };
     assert!(
-        ticket_outside(&issue("u-customer", 0), &mine, &[]).is_some(),
+        alone(&issue("u-me", 1), &[app]).is_some(),
+        "an app writing as the person"
+    );
+    assert!(
+        alone(&issue("u-customer", 0), &[]).is_some(),
         "someone else's issue"
     );
     assert!(
-        ticket_outside(&issue("u-me", 0), &board(None), &[]).is_some(),
+        ticket_outside(&issue("u-me", 0), &board(None), by(&[], &none())).is_some(),
         "the person not known there"
+    );
+
+    // Its history, as last read: a description another edited.
+    let edit = |who: HistoryBy| {
+        serde_json::from_value::<HistoryEvent>(json!({
+            "at": Utc::now(), "by": who, "kind": "field", "field": "description"
+        }))
+        .unwrap()
+    };
+    let t = issue("u-me", 0);
+    let read = |events: Vec<HistoryEvent>| {
+        let stamps = none();
+        ticket_outside(
+            &t,
+            &mine,
+            Writers {
+                comments: &[],
+                history: Some(&events),
+                stamps: &stamps,
+            },
+        )
+    };
+    assert_eq!(read(vec![edit(HistoryBy::Desk)]), None);
+    assert!(
+        read(vec![edit(HistoryBy::Remote)]).is_some(),
+        "a teammate's edit"
     );
 }

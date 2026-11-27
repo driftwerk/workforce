@@ -94,6 +94,10 @@ pub struct ServedCall {
     pub ceiling: Option<Ceiling>,
 }
 
+/// What a served boss's word is taken to carry in: its turn is on another
+/// hub, which doesn't say what it had read.
+pub const SERVED_UNSAID: &str = "a boss on another hub, whose turn Desk can't see";
+
 /// Whether switch `k` of `act` is on: off unless said so.
 fn switch_on(act: &Value, k: &str) -> bool {
     act.get(k).and_then(Value::as_bool).unwrap_or(false)
@@ -1205,7 +1209,12 @@ impl CrewHub {
                 ));
             }
         }
-        let by = By::manager(boss, &boss_name(g), reason);
+        // Its turn is on another hub, which doesn't say what it had read:
+        // what it says to a session is taken as carrying outside content.
+        let by = By {
+            outside: Some(SERVED_UNSAID.into()),
+            ..By::manager(boss, &boss_name(g), reason)
+        };
         match self.gate_as(&action, o, Some(boss), true) {
             Gate::No(why) => Err(why.into_owned()),
             Gate::Refuse => {

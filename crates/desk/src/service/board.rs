@@ -782,6 +782,7 @@ impl Desk {
             updated_at: at,
             version: 0,
         };
+        self.stamp_written(t.id, by, true).await.map_err(internal)?;
         self.0.store.add_ticket(&mut t).await.map_err(internal)?;
         let key = t.key(&b).unwrap_or_default();
         let text = format!("created {key} “{}”", crew::one_line(&t.title, 120));
@@ -847,6 +848,9 @@ impl Desk {
         }
         if !said.is_empty() {
             t.updated_at = at;
+            self.stamp_written(t.id, by, false)
+                .await
+                .map_err(internal)?;
         }
         let quiet = said.is_empty();
         if let Some(pinned) = patch.pinned {
@@ -2105,6 +2109,21 @@ impl Desk {
 }
 
 impl Desk {
+    /// What the boss's turn writing `id` (a ticket or a comment) for `by`
+    /// had read, kept for those its words are given to: every boss's
+    /// `made` one (one with none kept is taken as from before Desk said),
+    /// and any edit that carried some, which stays.
+    pub(super) async fn stamp_written(&self, id: Uuid, by: &By, made: bool) -> eyre::Result<()> {
+        let outside = self.carried_by(by);
+        if outside.is_some() || (made && by.party.kind == PartyKind::Manager) {
+            self.0
+                .store
+                .put_written_outside(id, outside.as_deref())
+                .await?;
+        }
+        Ok(())
+    }
+
     /// Why ticket `t`'s words, as a session is given them, may carry
     /// outside content ([`crate::knows_outside::ticket_outside`]); taken
     /// as carrying some when they can't be read.
@@ -2112,7 +2131,20 @@ impl Desk {
         let read = async {
             let b = self.board_of(t.board).await?;
             let comments = self.ticket_comments(t.id).await?;
-            Ok::<_, DeskError>(crate::knows_outside::ticket_outside(t, &b, &comments))
+            let history = match t.external.as_ref().is_some_and(|e| e.synced) {
+                true => self.0.store.history_of(t.id).await.map_err(internal)?,
+                false => None,
+            };
+            let ids: Vec<Uuid> = std::iter::once(t.id)
+                .chain(comments.iter().map(|c| c.id))
+                .collect();
+            let stamps = self.0.store.written_outside(&ids).await.map_err(internal)?;
+            let writers = crate::knows_outside::Writers {
+                comments: &comments,
+                history: history.as_ref().map(|(events, _)| events.as_slice()),
+                stamps: &stamps,
+            };
+            Ok::<_, DeskError>(crate::knows_outside::ticket_outside(t, &b, writers))
         };
         read.await
             .unwrap_or_else(|_| Some("a ticket whose writers couldn't be read".into()))
