@@ -194,7 +194,8 @@ struct TokenQuery {
 /// query or the `Authorization` header, admitted as someone beyond a member
 /// (an active administrator, manager or custom role, under no ceiling).
 /// Anything else is refused before the route's extractors run: 401 when no
-/// credential is admitted, 403 when only a member's is.
+/// credential is admitted, 403 when only a member's is, and 503 when a
+/// store a credential is read from could not be.
 pub async fn require_beyond_member(
     State(state): State<Arc<GatewayState>>,
     request: Request,
@@ -207,19 +208,40 @@ pub async fn require_beyond_member(
         .chain(crate::gateway::header_bearer(request.headers()).map(str::to_string))
         .filter(|token| !token.is_empty())
         .collect();
-    let mut refusal = ScopeRejection::Unauthenticated;
-    for token in &tokens {
-        if let Ok(admitted) = admit(state.door(), token).await {
-            let caller = CallerContext::from(admitted);
-            if crate::gateway::gateway_principal(&caller, state.identity_store.as_ref())
-                .is_beyond_member()
+    let standing = futures::future::join_all(tokens.iter().map(|token| admit(state.door(), token)))
+        .await
+        .into_iter()
+        .map(|admitted| match admitted {
+            Ok(admitted) => match crate::gateway::gateway_principal(
+                &CallerContext::from(admitted),
+                state.identity_store.as_ref(),
+            )
+            .is_beyond_member()
             {
-                return next.run(request).await;
-            }
-            refusal = ScopeRejection::MissingScope;
-        }
+                true => Standing::Beyond,
+                false => Standing::Member,
+            },
+            Err(AuthFailure::StoreError) => Standing::Unknown,
+            Err(AuthFailure::InvalidCredentials | AuthFailure::SurfaceRefused) => Standing::Nobody,
+        })
+        .max()
+        .unwrap_or(Standing::Nobody);
+    match standing {
+        Standing::Beyond => next.run(request).await,
+        Standing::Unknown => axum::http::StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        Standing::Member => ScopeRejection::MissingScope.into_response(),
+        Standing::Nobody => ScopeRejection::Unauthenticated.into_response(),
     }
-    refusal.into_response()
+}
+
+/// What the best credential a request carries makes its caller, weakest
+/// first.
+#[derive(PartialEq, Eq, PartialOrd, Ord)]
+enum Standing {
+    Nobody,
+    Member,
+    Unknown,
+    Beyond,
 }
 
 async fn admit_device(door: Door<'_>, token: &str) -> Result<Admitted, AuthFailure> {

@@ -341,7 +341,10 @@ impl Routes<()> {
     /// is answered by the fallback, as an unknown one is, and never by a
     /// sibling route that would otherwise match it. Elsewhere each admin
     /// route has `admin_guard` in front of its handler.
-    #[allow(clippy::disallowed_methods)]
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "the one place a declared route becomes an axum route"
+    )]
     pub fn render<L>(self, surface: Surface, admin_guard: L) -> Router
     where
         L: Layer<Route> + Clone + Send + Sync + 'static,
