@@ -2060,10 +2060,27 @@ impl CrewHub {
             return;
         };
         let id = p.id;
-        tokio::spawn(async move {
-            crew.plan_turn(id, vec!["Every ticket is done or dropped.".into()])
-                .await
-        });
+        tokio::spawn(async move { crew.closing_turn(id).await });
+    }
+
+    /// Plan `id`'s closing turn, started by a runner pass: run only if it
+    /// is still closing once its boss's turn comes (the person may have
+    /// paused it meanwhile, or its boss added work).
+    async fn closing_turn(&self, id: Uuid) {
+        self.plan_turn_as(id, async {
+            let closing = match self.desk.plan(id).await {
+                Ok(d) => self.desk.plan_closing(&d.summary.plan).await.ok().flatten(),
+                Err(_) => None,
+            };
+            match closing {
+                Some(_) => {
+                    let line = "Every ticket is done or dropped.".to_string();
+                    self.plan_turn_now(id, vec![line]).await
+                }
+                None => self.closing_over(id),
+            }
+        })
+        .await;
     }
 
     /// Forgets what the hub keeps of plan `id`, ended or removed.
@@ -3158,15 +3175,18 @@ impl CrewHub {
 
     /// One `[Desk plan]` turn of plan `id`'s boss, for `lines`.
     pub(super) async fn plan_turn(&self, id: Uuid, lines: Vec<String>) {
-        // Its boss decides it with nothing else of its own deciding at
-        // once ([`super::mind`]).
+        self.plan_turn_as(id, self.plan_turn_now(id, lines)).await;
+    }
+
+    /// `turn`, about plan `id`, run as its boss's: with nothing else of its
+    /// own deciding at once ([`super::mind`]).
+    async fn plan_turn_as(&self, id: Uuid, turn: impl std::future::Future<Output = ()>) {
         let boss = match self.desk.plan(id).await {
             Ok(detail) => detail.summary.plan.boss,
             Err(_) => return,
         };
         self.yield_to_person(&boss).await;
-        self.with_mind(&boss, "a plan's turn", self.plan_turn_now(id, lines))
-            .await;
+        self.with_mind(&boss, "a plan's turn", turn).await;
     }
 
     pub(super) async fn plan_turn_now(&self, id: Uuid, lines: Vec<String>) {
