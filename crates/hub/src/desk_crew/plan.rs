@@ -2329,8 +2329,12 @@ impl CrewHub {
     }
 
     /// `p`, whose boss no longer runs its group, passes to the boss that
-    /// does now, when there is one: whether it passed.
+    /// does now, when there is one: whether it passed. One the plan limit
+    /// pauses stays its boss's, whose limit holds it, until that lifts.
     async fn follow_group(&self, p: &Plan) -> bool {
+        if p.paused == Some(plan::Paused::PlanLimit) {
+            return false;
+        }
         let lead = self
             .desk
             .boss_of(&self.desk.scope_of_group(self.desk.live_group(p)))
