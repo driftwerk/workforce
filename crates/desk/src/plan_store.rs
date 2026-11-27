@@ -23,7 +23,7 @@ use crate::store::DeskStore;
 pub(crate) const PLAN: &str =
     "id, board, group_id, boss, goal, state, paused, parallel, revision, \
                     approved_revision, created_at, updated_at, paused_why, result, agreed, \
-                    agreed_at, goal_ticket, read_back_at, met_at, met_by, met_why";
+                    agreed_at, goal_ticket, read_back_at, met_at, met_by, met_why, paused_until";
 const REVISION: &str = "plan, revision, at, made_by, change, summary, snapshot";
 
 /// The `ticket_links` kind of a session about to start for a ticket.
@@ -53,6 +53,7 @@ pub(crate) fn plan(row: &Row) -> Result<Plan> {
         state: PlanState::parse(row.try_get("state")?)?,
         paused: paused.as_deref().map(Paused::parse).transpose()?,
         paused_why: row.try_get("paused_why")?,
+        paused_until: row.try_get("paused_until")?,
         parallel: row.try_get("parallel")?,
         revision: row.try_get("revision")?,
         approved_revision: row.try_get("approved_revision")?,
@@ -118,11 +119,12 @@ async fn put_plan_in<C: tokio_postgres::GenericClient>(client: &C, p: &Plan) -> 
         .execute(
             "INSERT INTO plans (id, board, group_id, boss, goal, state, paused, parallel, \
              revision, approved_revision, created_at, updated_at, paused_why, result, agreed, \
-             agreed_at, goal_ticket) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17) \
+             agreed_at, goal_ticket, paused_until) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18) \
              ON CONFLICT (id) DO UPDATE SET board = EXCLUDED.board, group_id = EXCLUDED.group_id, \
              boss = EXCLUDED.boss, goal = EXCLUDED.goal, state = EXCLUDED.state, \
              paused = EXCLUDED.paused, paused_why = EXCLUDED.paused_why, \
+             paused_until = EXCLUDED.paused_until, \
              parallel = EXCLUDED.parallel, \
              revision = EXCLUDED.revision, approved_revision = EXCLUDED.approved_revision, \
              updated_at = EXCLUDED.updated_at, result = EXCLUDED.result, \
@@ -146,6 +148,7 @@ async fn put_plan_in<C: tokio_postgres::GenericClient>(client: &C, p: &Plan) -> 
                 &p.agreed,
                 &p.agreed_at,
                 &p.goal_ticket,
+                &p.paused_until,
             ],
         )
         .await?;
@@ -853,6 +856,7 @@ pub(crate) mod tests {
             state: PlanState::Proposed,
             paused: None,
             paused_why: None,
+            paused_until: None,
             parallel: Some(2),
             revision: 1,
             approved_revision: None,
@@ -876,7 +880,9 @@ pub(crate) mod tests {
             s.put_plan(&p).await.unwrap();
             assert_eq!(s.plan(p.id).await.unwrap().as_ref(), Some(&p));
             p.state = PlanState::Paused;
-            p.paused = Some(Paused::BossHeld);
+            p.paused = Some(Paused::PlanLimit);
+            p.paused_why = Some("by plan limit until Fri 09:00".into());
+            p.paused_until = Some(crate::crew::now() + chrono::Duration::days(1));
             p.approved_revision = Some(1);
             s.put_plan(&p).await.unwrap();
             assert_eq!(s.plan(p.id).await.unwrap().as_ref(), Some(&p));

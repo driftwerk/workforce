@@ -30,6 +30,26 @@ pub const GOAL_MAX: usize = 1_000;
 /// What a ticket names to run as a sub-agent job rather than a session.
 pub const SUBAGENT: &str = "subagent";
 
+/// What every item asking the person about a plan-limit pause is keyed by.
+pub const LIMIT_KEY: &str = "plan-limit:";
+
+/// What the items asking the person about plan `plan`'s plan-limit pauses
+/// are keyed by.
+pub fn limit_prefix(plan: Uuid) -> String {
+    format!("{LIMIT_KEY}{plan}:")
+}
+
+/// The plan an item keyed `key` asks about the plan-limit pause of.
+pub fn limit_plan(key: &str) -> Option<Uuid> {
+    key.strip_prefix(LIMIT_KEY)?.split(':').next()?.parse().ok()
+}
+
+/// The item asking the person about plan `plan`'s plan-limit pause until
+/// `until`: one each time the limit holds it, per window.
+pub fn limit_key(plan: Uuid, until: DateTime<Utc>) -> String {
+    format!("{}{}", limit_prefix(plan), until.timestamp())
+}
+
 text_enum!(PlanState {
     Proposed => "proposed",
     Running => "running",
@@ -64,6 +84,8 @@ pub enum Paused {
     /// One of its tickets failed to start again and again: the person
     /// looks at why before it is tried again.
     StartFailing,
+    /// Its boss's own turns are held by the person's plan limit.
+    PlanLimit,
 }
 
 impl Paused {
@@ -75,6 +97,7 @@ impl Paused {
             Self::Restoring => "restoring",
             Self::NoBoss => "no_boss",
             Self::StartFailing => "start_failing",
+            Self::PlanLimit => "plan_limit",
         }
     }
 
@@ -86,6 +109,7 @@ impl Paused {
             "restoring" => Ok(Self::Restoring),
             "no_boss" => Ok(Self::NoBoss),
             "start_failing" => Ok(Self::StartFailing),
+            "plan_limit" => Ok(Self::PlanLimit),
             other => Err(eyre::eyre!("unknown Paused {other:?}")),
         }
     }
@@ -99,6 +123,7 @@ impl Paused {
             Self::Restoring => "Desk is resuming its sessions",
             Self::NoBoss => "its group has no boss",
             Self::StartFailing => "a ticket of it keeps failing to start",
+            Self::PlanLimit => "the plan limit holds its boss",
         }
     }
 }
@@ -120,6 +145,9 @@ pub struct Plan {
     /// to start. Sent only as its summary's `pausedWhy`.
     #[serde(skip_serializing)]
     pub paused_why: Option<String>,
+    /// Until when it is paused, when that is known: the plan limit's window.
+    #[serde(skip_serializing)]
+    pub paused_until: Option<DateTime<Utc>>,
     /// This plan's limit of sessions at once, when lower than its boss's.
     pub parallel: Option<i16>,
     /// Its newest revision.
@@ -169,6 +197,21 @@ impl Plan {
                 self.approved_revision != Some(self.revision)
             }
         }
+    }
+
+    /// Paused for `why`, said as `said`, until `until` when that is known.
+    pub fn pause(&mut self, why: Paused, said: Option<String>, until: Option<DateTime<Utc>>) {
+        self.state = PlanState::Paused;
+        self.paused = Some(why);
+        self.paused_why = said;
+        self.paused_until = until;
+    }
+
+    /// No longer paused, for any reason.
+    pub fn unpause(&mut self) {
+        self.paused = None;
+        self.paused_why = None;
+        self.paused_until = None;
     }
 
     /// Whether it may start sessions now, as far as the plan itself says.

@@ -2185,6 +2185,10 @@ impl CrewHub {
     /// Continue, or the hold's period ended. Its boss can't: no crew tool
     /// lets a hold go.
     async fn lift_hold(&self, p: &Plan) {
+        if p.paused == Some(plan::Paused::PlanLimit) {
+            self.lift_limit(p).await;
+            return;
+        }
         if !matches!(
             p.paused,
             Some(plan::Paused::BossHeld | plan::Paused::Budget)
@@ -2229,6 +2233,9 @@ impl CrewHub {
             {
                 tracing::info!(plan = %p.id, error = %e, "a plan whose boss is held wasn't paused");
             }
+            return;
+        }
+        if self.held_by_limit(&p).await {
             return;
         }
         // Its own budget, its group's or Desk's at its warning or over, and

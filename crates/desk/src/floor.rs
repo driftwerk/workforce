@@ -753,6 +753,9 @@ pub struct PlanProgress {
     pub boss: String,
     pub boss_name: String,
     pub state: crate::plan::PlanState,
+    /// Why it starts nothing, while it is paused.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub paused: Option<crate::plan::Paused>,
     /// Why it is paused, in the person's words, while it is.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub paused_why: Option<String>,

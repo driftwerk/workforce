@@ -121,13 +121,20 @@ pub fn plan_of(kind: SubscriptionKind) -> PlanKind {
     }
 }
 
-/// Whether `w` still counts at `now`: its reset is ahead, or (with no
-/// reset said) its length since it was read is.
-fn live(w: &Window, read_at: DateTime<Utc>, now: DateTime<Utc>) -> bool {
-    match w.resets_at {
-        Some(reset) => reset > now,
-        None => read_at + chrono::Duration::minutes(i64::from(w.minutes)) > now,
-    }
+/// When `w`, read at `read_at`, stops counting: its reset, or (with no reset
+/// said) its length after it was read.
+fn lapses(w: &Window, read_at: DateTime<Utc>) -> DateTime<Utc> {
+    w.resets_at
+        .unwrap_or_else(|| read_at + chrono::Duration::minutes(i64::from(w.minutes)))
+}
+
+/// Background work on a plan held by the threshold: where the plan stands,
+/// the threshold, and when the window holding it lapses.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Held {
+    pub standing: PlanStanding,
+    pub at: f64,
+    pub until: DateTime<Utc>,
 }
 
 /// What background work did, and why the guard says what it does.
@@ -328,19 +335,45 @@ impl PlanGuard {
         }
     }
 
-    /// Where `login`'s plan stands at `now`: its fullest live window, if it
-    /// has been read.
-    pub fn standing(&self, login: &Login, now: DateTime<Utc>) -> Option<PlanStanding> {
+    /// `login`'s plan's fullest live window at `now`, if it has been read,
+    /// and when that window lapses.
+    fn fullest(&self, login: &Login, now: DateTime<Utc>) -> Option<(PlanStanding, DateTime<Utc>)> {
         let book = self.freshest(&Self::keys_of(login))?;
         book.windows
             .iter()
-            .filter(|w| live(w, book.at, now))
-            .max_by(|a, b| a.used_percent.total_cmp(&b.used_percent))
-            .map(|w| PlanStanding {
-                plan: book.plan,
-                used_percent: w.used_percent,
-                window_minutes: w.minutes,
-                resets_at: w.resets_at,
+            .map(|w| (w, lapses(w, book.at)))
+            .filter(|(_, until)| *until > now)
+            .max_by(|(a, _), (b, _)| a.used_percent.total_cmp(&b.used_percent))
+            .map(|(w, until)| {
+                (
+                    PlanStanding {
+                        plan: book.plan,
+                        used_percent: w.used_percent,
+                        window_minutes: w.minutes,
+                        resets_at: w.resets_at,
+                    },
+                    until,
+                )
+            })
+    }
+
+    /// Where `login`'s plan stands at `now`: its fullest live window, if it
+    /// has been read.
+    pub fn standing(&self, login: &Login, now: DateTime<Utc>) -> Option<PlanStanding> {
+        self.fullest(login, now).map(|(standing, _)| standing)
+    }
+
+    /// Whether the threshold holds background work on `login` at `now`.
+    pub fn holds(&self, cfg: &PlanGuardConfig, login: &Login, now: DateTime<Utc>) -> Option<Held> {
+        let at = cfg.pause_at();
+        cfg.enabled
+            .then(|| self.fullest(login, now))
+            .flatten()
+            .filter(|(standing, _)| standing.used_percent >= at)
+            .map(|(standing, until)| Held {
+                standing,
+                at,
+                until,
             })
     }
 
@@ -361,10 +394,8 @@ impl PlanGuard {
         if let Some(why) = self.stopped(&work.key, allowed.resumed_at, now) {
             return Verdict::Stopped { why, first: false };
         }
-        if let Some(standing) = login.and_then(|l| self.standing(l, now)) {
-            if standing.used_percent >= cfg.pause_at() {
-                return Verdict::Waits(waits_why(&standing, cfg.pause_at()));
-            }
+        if let Some(held) = login.and_then(|l| self.holds(cfg, l, now)) {
+            return Verdict::Waits(waits_why(&held));
         }
         let since = [
             allowed.resumed_at,
@@ -502,14 +533,14 @@ fn moved(before: &Book, windows: &[Window]) -> Vec<(u32, f64)> {
         .collect()
 }
 
-fn waits_why(standing: &PlanStanding, at: f64) -> String {
-    let until = standing.resets_at.map_or_else(String::new, |r| {
+fn waits_why(held: &Held) -> String {
+    let until = held.standing.resets_at.map_or_else(String::new, |r| {
         format!(", or until it resets at {}", r.format("%a %H:%M UTC"))
     });
     format!(
         "{WAITS_PREFIX} {}, and background work pauses from {}% so the plan is left for you. It goes on by itself once usage is under that{until}.",
-        standing.says(),
-        at.floor() as i64
+        held.standing.says(),
+        held.at.floor() as i64
     )
 }
 
@@ -905,6 +936,70 @@ mod tests {
         );
         assert_eq!(
             guard.check(&off, &job, Some(&l), at("2026-11-23T11:00:00Z")),
+            Verdict::Proceed
+        );
+    }
+
+    #[test]
+    fn the_threshold_holds_from_its_share_until_the_window_lapses_and_waits_with_it() {
+        let guard = PlanGuard::new();
+        let l = login("ab");
+        let job = Work::job("atlas", "j1", "email check");
+        let now = at("2026-11-19T10:00:00Z");
+        assert_eq!(guard.holds(&cfg(), &l, now), None, "nothing read");
+        guard.observe(&l, &[week(79.9, "2026-11-23T09:00:00Z")], now);
+        assert_eq!(guard.holds(&cfg(), &l, now), None, "under");
+        guard.observe(
+            &l,
+            &[
+                week(80.0, "2026-11-23T09:00:00Z"),
+                Window {
+                    used_percent: 30.0,
+                    resets_at: None,
+                    minutes: 300,
+                },
+            ],
+            now,
+        );
+        let held = guard.holds(&cfg(), &l, now).unwrap();
+        assert_eq!(
+            (held.standing.used_percent, held.at, held.until),
+            (80.0, 80.0, at("2026-11-23T09:00:00Z"))
+        );
+        assert!(matches!(
+            guard.check(&cfg(), &job, Some(&l), now),
+            Verdict::Waits(_)
+        ));
+        let mut off = cfg();
+        off.enabled = false;
+        assert_eq!(guard.holds(&off, &l, now), None, "turned off");
+        assert_eq!(
+            guard.holds(&cfg(), &l, at("2026-11-23T09:00:00Z")),
+            None,
+            "its window reset"
+        );
+        let unsaid = login("ac");
+        guard.observe(
+            &unsaid,
+            &[Window {
+                used_percent: 90.0,
+                resets_at: None,
+                minutes: 300,
+            }],
+            now,
+        );
+        assert_eq!(
+            guard.holds(&cfg(), &unsaid, now).unwrap().until,
+            now + chrono::Duration::hours(5),
+            "a window with no reset said lapses its length after it was read"
+        );
+        assert_eq!(
+            guard.check(
+                &cfg(),
+                &job,
+                Some(&unsaid),
+                now + chrono::Duration::hours(5)
+            ),
             Verdict::Proceed
         );
     }

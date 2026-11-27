@@ -66,6 +66,10 @@ pub struct PlanSummary {
     /// How many sessions it runs at once: its own limit within its boss's,
     /// as its runner counts them; none while no boss of it oversees.
     pub limit: Option<usize>,
+    /// What its pause asks the person, as the chat carries it, while the
+    /// plan limit pauses it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ask: Option<crate::open_item::MentionedItem>,
 }
 
 /// A plan's ticket as its card shows it.
@@ -343,7 +347,7 @@ impl Desk {
     fn paused_why(&self, p: &Plan) -> Option<String> {
         let why = p.paused?;
         let said = match why {
-            Paused::StartFailing => p.paused_why.clone(),
+            Paused::StartFailing | Paused::PlanLimit => p.paused_why.clone(),
             Paused::Budget => self
                 .plan_starts_held(p.group.as_deref(), p.id)
                 .map(|(_, ask)| ask)
@@ -428,8 +432,29 @@ impl Desk {
             budget,
             held: self.plan_held(&p),
             limit: self.plan_limit(&p),
+            ask: self.plan_ask(&p).await?,
             plan: p,
         })
+    }
+
+    /// What `p`'s plan-limit pause asks the person, while it is paused so.
+    async fn plan_ask(
+        &self,
+        p: &Plan,
+    ) -> Result<Option<crate::open_item::MentionedItem>, DeskError> {
+        if p.paused != Some(Paused::PlanLimit) {
+            return Ok(None);
+        }
+        let prefix = plan::limit_prefix(p.id);
+        Ok(self
+            .0
+            .store
+            .items_not_closed(Some(p.boss.as_str()))
+            .await
+            .map_err(internal)?
+            .into_iter()
+            .find(|i| i.dedupe_key.starts_with(&prefix))
+            .map(|i| i.mention_at(true)))
     }
 
     /// How many sessions `p` runs at once ([`PlanSummary::limit`]).
@@ -546,6 +571,7 @@ impl Desk {
                 budget: applied.budget.clone(),
                 held: self.plan_held(&p),
                 limit: self.plan_limit(&p),
+                ask: self.plan_ask(&p).await?,
                 plan: p,
             },
             tickets: shown,
@@ -611,6 +637,7 @@ impl Desk {
                 boss: s.plan.boss,
                 boss_name: s.boss_name,
                 state: s.plan.state,
+                paused: s.plan.paused,
                 paused_why: s.paused_why,
                 progress: s.progress,
             })
@@ -851,6 +878,7 @@ impl Desk {
             state: PlanState::Proposed,
             paused: None,
             paused_why: None,
+            paused_until: None,
             parallel: new.parallel,
             revision: 1,
             approved_revision: None,
@@ -2294,18 +2322,43 @@ impl Desk {
         why: Paused,
         by: &By,
     ) -> Result<PlanDetail, DeskError> {
-        self.pause_plan_saying(id, why, None, by).await
+        self.pause_plan_saying(id, why, None, None, by)
+            .await
+            .map(|(detail, _)| detail)
     }
 
-    /// [`Self::pause_plan`], `said` saying why in the person's words: a
-    /// pause for the same reason saying something new keeps the newer.
+    /// Pauses plan `id` because the person's plan limit holds its boss
+    /// until `until`, `said` saying so in their words, as Desk. Whether it
+    /// was not paused for that before.
+    pub async fn pause_plan_limit(
+        &self,
+        id: Uuid,
+        said: &str,
+        until: DateTime<Utc>,
+    ) -> Result<(PlanDetail, bool), DeskError> {
+        let by = By::desk("The person's plan limit holds its boss.");
+        self.pause_plan_saying(
+            id,
+            Paused::PlanLimit,
+            Some(said.to_string()),
+            Some(until),
+            &by,
+        )
+        .await
+    }
+
+    /// [`Self::pause_plan`], `said` saying why in the person's words, until
+    /// `until` when that is known: a pause for the same reason saying
+    /// something new keeps the newer. Whether it was not paused for `why`
+    /// before.
     async fn pause_plan_saying(
         &self,
         id: Uuid,
         why: Paused,
         said: Option<String>,
+        until: Option<DateTime<Utc>>,
         by: &By,
-    ) -> Result<PlanDetail, DeskError> {
+    ) -> Result<(PlanDetail, bool), DeskError> {
         let _write = self.0.plan_write.lock().await;
         let mut p = self.plan_of(id).await?;
         if !matches!(p.state, PlanState::Running | PlanState::Paused) {
@@ -2316,22 +2369,21 @@ impl Desk {
         // A pause of the person's stays theirs: Desk's own reasons never
         // replace it.
         if p.paused == Some(Paused::Person) && why != Paused::Person {
-            return self.plan_detail(p).await;
+            return Ok((self.plan_detail(p).await?, false));
         }
         // Paused so already: only a newer reason is kept, said once.
         if p.paused == Some(why) {
-            return match p.paused_why == said {
-                true => self.plan_detail(p).await,
+            return match (&p.paused_why, p.paused_until) == (&said, until) {
+                true => Ok((self.plan_detail(p).await?, false)),
                 false => {
                     p.paused_why = said;
+                    p.paused_until = until;
                     p.updated_at = crew::now();
-                    self.plan_saved(&p).await
+                    Ok((self.plan_saved(&p).await?, false))
                 }
             };
         }
-        p.state = PlanState::Paused;
-        p.paused = Some(why);
-        p.paused_why = said;
+        p.pause(why, said, until);
         p.updated_at = crew::now();
         self.plan_note_why(
             &p,
@@ -2340,7 +2392,7 @@ impl Desk {
             format!("paused the plan: {}", why.why()),
             Some(why),
         );
-        self.plan_saved(&p).await
+        Ok((self.plan_saved(&p).await?, true))
     }
 
     /// Plan `id` passes to the boss `to`: its boss moved to another scope.
@@ -2351,9 +2403,7 @@ impl Desk {
         let mut p = self.plan_of(id).await?;
         p.boss = to.id.clone();
         if p.state == PlanState::Running {
-            p.state = PlanState::Paused;
-            p.paused = Some(Paused::NoBoss);
-            p.paused_why = None;
+            p.pause(Paused::NoBoss, None, None);
         }
         p.updated_at = crew::now();
         self.plan_note(
@@ -2376,6 +2426,20 @@ impl Desk {
         let _write = self.0.plan_write.lock().await;
         let p = self.plan_of(id).await?;
         self.resume_read(p, why, by).await
+    }
+
+    /// Resumes plan `id` while the person's plan limit pauses it, as Desk:
+    /// whether it did.
+    pub async fn resume_plan_limit(&self, id: Uuid) -> Result<bool, DeskError> {
+        let _write = self.0.plan_write.lock().await;
+        let p = self.plan_of(id).await?;
+        if p.paused != Some(Paused::PlanLimit) {
+            return Ok(false);
+        }
+        let by = By::desk("The person's plan limit no longer holds its boss.");
+        self.resume_read(p, &[Paused::PlanLimit], &by)
+            .await
+            .map(|_| true)
     }
 
     /// Resumes plan `id` if Desk paused it because its boss was held or the
@@ -2418,8 +2482,7 @@ impl Desk {
             };
         };
         p.state = PlanState::Running;
-        p.paused = None;
-        p.paused_why = None;
+        p.unpause();
         p.updated_at = crew::now();
         self.plan_note_why(
             &p,
@@ -2437,8 +2500,9 @@ impl Desk {
     pub async fn pause_plan_failing(&self, id: Uuid, why: &str) -> Result<PlanDetail, DeskError> {
         let why = crew::one_line(why, 300);
         let by = By::desk(&why);
-        self.pause_plan_saying(id, Paused::StartFailing, Some(why), &by)
+        self.pause_plan_saying(id, Paused::StartFailing, Some(why), None, &by)
             .await
+            .map(|(detail, _)| detail)
     }
 
     /// The person keeps plan `id` as approved and turns down the boss's
@@ -2616,8 +2680,7 @@ impl Desk {
             }
         }
         p.state = PlanState::Dropped;
-        p.paused = None;
-        p.paused_why = None;
+        p.unpause();
         p.updated_at = crew::now();
         self.plan_budget_ends(&p, by).await;
         self.plan_note(
@@ -2649,8 +2712,7 @@ impl Desk {
             ));
         }
         p.state = PlanState::Done;
-        p.paused = None;
-        p.paused_why = None;
+        p.unpause();
         p.updated_at = crew::now();
         self.plan_budget_ends(&p, by).await;
         self.plan_note(

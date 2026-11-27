@@ -1494,6 +1494,9 @@ impl CrewHub {
         if let Some(done) = self.overrule_answered(&closed, answer).await {
             return Ok(done);
         }
+        if let Some(done) = self.plan_limit_answered(&closed, answer).await {
+            return Ok(done);
+        }
         let Some((service, _)) = self.overseer_named(&closed.boss) else {
             return Ok("Answered.".into());
         };
@@ -1935,6 +1938,9 @@ impl CrewHub {
         if i.state == OpenState::Parked {
             return None;
         }
+        if let Some(past) = self.limit_ask_past(i).await {
+            return past;
+        }
         // A promise or order ends when it is kept, or lapses.
         if matches!(i.kind, OpenKind::Promise | OpenKind::Order) {
             if let Some(what) = self.kept(i).await {
@@ -2286,6 +2292,7 @@ fn goes_to_boss(item: &OpenItem, answer: &str) -> bool {
     !waiting::is_waiting(&item.dedupe_key)
         && item.line_message.is_none()
         && super::preferences::overrule_of(item, answer).is_none()
+        && !super::plan_limit::answers(item, answer)
 }
 
 /// The id the person's answer to `item` is said to its boss under: the

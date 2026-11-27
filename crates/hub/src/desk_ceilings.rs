@@ -40,6 +40,10 @@ impl Ceilings for DeskCeilings {
             AgentVerdict::Held(why) => Verdict::Held(why),
         }
     }
+
+    fn plan_pause_at(&self) -> Option<f64> {
+        self.desk.plan_pause_at()
+    }
 }
 
 /// The hub's agents' use for the desk's totals: the money they spent (a

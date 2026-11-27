@@ -21,7 +21,7 @@ async fn call(crew: &Arc<CrewHub>, name: &str, input: Value) -> workforce_agent:
         .unwrap()
 }
 
-fn dm_posts(
+pub(super) fn dm_posts(
     overseer: &AgentService,
     starts: &str,
 ) -> Vec<workforce_common::session::SessionMessage> {

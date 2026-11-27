@@ -1747,6 +1747,171 @@ async fn a_held_bosss_plans_pause_until_the_person_lets_it_go_on() {
     .await;
 }
 
+/// A boss on a plan at `used`% of its week, its own wake held there, with
+/// one plan approved.
+async fn limit_held(
+    dir: &Path,
+    pool: workforce_postgres::PostgresPool,
+    used: f64,
+) -> (
+    Arc<AgentService>,
+    Arc<CrewHub>,
+    Desk,
+    crate::hub_core::logins::resolve::Login,
+    uuid::Uuid,
+) {
+    let (overseer, state, d, _llm) = hub_with(dir, pool, ACTS).await;
+    let crew = CrewHub::start(state, d.clone(), FAST, CancellationToken::new());
+    eventually("the plan tools", async || {
+        overseer.tools.has("crew.plan").then_some(())
+    })
+    .await;
+    let login =
+        crate::subscription::test_support::claude_login(&format!("token-{}", uuid::Uuid::new_v4()));
+    read_at(&overseer, &crew, &login, used);
+    let id = proposed(&d, dir, 2).await.summary.plan.id;
+    d.approve_plan(id, 1, &By::you()).await.unwrap();
+    eventually("the plan paused by the plan limit", async || {
+        let p = d.plan(id).await.unwrap().summary;
+        (p.plan.paused == Some(workforce_desk::plan::Paused::PlanLimit)).then_some(())
+    })
+    .await;
+    (overseer, crew, d, login, id)
+}
+
+/// `login`'s week read at `used`%, and the boss's own wake on it noted.
+fn read_at(
+    overseer: &AgentService,
+    crew: &CrewHub,
+    login: &crate::hub_core::logins::resolve::Login,
+    used: f64,
+) {
+    let week = workforce_common::usage::Window {
+        used_percent: used,
+        resets_at: Some(chrono::Utc::now() + chrono::Duration::days(2)),
+        minutes: workforce_common::usage::SEVEN_DAY,
+    };
+    let now = chrono::Utc::now();
+    overseer
+        .cost_governor
+        .plan_guard()
+        .observe(login, &[week], now);
+    crew.note_wake(overseer, Some(login.clone()), now);
+}
+
+/// A boss the person's plan limit holds pauses its plans: the person is
+/// told once, on the card and in the chat, with a raise to offer, and
+/// told again when the plan goes on, once the plan is under the limit.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_plan_the_plan_limit_holds_is_said_paused_once_and_said_going_on() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (overseer, crew, d, login, id) = limit_held(dir.path(), pool, 88.0).await;
+        assert!(started(&d).is_empty());
+        let told = "**Needs you.** “Make the suite green” is paused: your weekly Claude plan is at 88%";
+        eventually("the person told", async || {
+            super::items::dm_posts(&overseer, told).into_iter().next()
+        })
+        .await;
+        let s = d.plan(id).await.unwrap().summary;
+        assert!(
+            s.plan
+                .paused_why
+                .as_deref()
+                .is_some_and(|w| w.starts_with("by plan limit until ")
+                    && w.ends_with(": your weekly Claude plan is at 88%, over your 80% limit")),
+            "{:?}",
+            s.plan.paused_why
+        );
+        let ask = s.ask.expect("the card's ask");
+        assert_eq!(ask.options, ["Raise to 95%", "Keep"]);
+        let item = d
+            .store()
+            .open_item(ask.item_id.parse().unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            item.text.starts_with("“Make the suite green” is paused: your weekly Claude plan is at 88%, over your 80% limit. Nothing will move until ")
+                && item.text.ends_with(" unless you raise the limit."),
+            "{}",
+            item.text
+        );
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert_eq!(super::items::dm_posts(&overseer, told).len(), 1, "told once");
+
+        read_at(&overseer, &crew, &login, 40.0);
+        eventually("its sessions", async || {
+            (started(&d).len() == 2).then_some(())
+        })
+        .await;
+        let s = d.plan(id).await.unwrap().summary;
+        assert_eq!(s.plan.paused, None);
+        assert!(s.ask.is_none(), "its ask closed");
+        eventually("the person told it goes on", async || {
+            super::items::dm_posts(
+                &overseer,
+                "“Make the suite green” goes on: your weekly Claude plan is at 40%, under your 80% limit.",
+            )
+            .into_iter()
+            .next()
+        })
+        .await;
+    })
+    .await;
+}
+
+/// The person's answer to a plan-limit ask is Desk's to act on: Keep
+/// leaves the limit and says when the plan goes on by itself, a raise is
+/// kept as their limit.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_plan_limit_ask_is_answered_by_desk_keep_or_raise() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (_overseer, crew, d, _login, id) = limit_held(dir.path(), pool, 88.0).await;
+        let ask = || async {
+            d.plan(id)
+                .await
+                .unwrap()
+                .summary
+                .ask
+                .map(|a| a.item_id.parse::<uuid::Uuid>().unwrap())
+        };
+        let item = eventually("the card's ask", async || ask().await).await;
+        let kept = crew.answer_item(item, "Keep").await.unwrap();
+        assert!(
+            kept.starts_with("Kept at 80%. “Make the suite green” goes on by itself after "),
+            "{kept}"
+        );
+        assert_eq!(d.plan_pause_at(), None);
+        assert_eq!(
+            d.plan(id).await.unwrap().summary.plan.paused,
+            Some(workforce_desk::plan::Paused::PlanLimit),
+            "kept, it stays paused"
+        );
+        assert!(ask().await.is_none(), "answered");
+
+        let mut again = workforce_desk::open_item::NewItem::ask(
+            "desk",
+            workforce_desk::open_item::OpenKind::Ask,
+            None,
+            "Raise?",
+        );
+        again.dedupe_key = format!("{}raised", workforce_desk::plan::limit_prefix(id));
+        let workforce_desk::open_item_store::Opened::New(raise) =
+            d.store().item_open(&again).await.unwrap()
+        else {
+            panic!("a new ask");
+        };
+        assert_eq!(
+            crew.answer_item(raise.id, "Raise to 95%").await.unwrap(),
+            "Raised: background work on your plans now pauses from 95%."
+        );
+        assert_eq!(d.plan_pause_at(), Some(95.0));
+    })
+    .await;
+}
+
 /// Bound at Act, start_now is the person's agreement, as `agreed` is: a
 /// draft starts on their checked words. One that doesn't read changes
 /// nothing else of the call either.
