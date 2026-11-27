@@ -147,7 +147,7 @@ Styles: no new class. The note, chip and buttons use the card's existing `pc-not
 
 - **A new window holds the plan** (the week reset into a five-hour window over the limit): its ask of the older window is closed as lapsed before the new one is asked.
 - **A boss whose wakes run on two plans:** held while either login it was held on in the last hour still is, so its plans don't flip between paused and going on.
-- **A plan passed to another boss while the limit pauses it:** a paused plan keeps its reason through `pass_plan`; its ask is found by key whatever its boss.
+- **A plan passed to another boss while the limit pauses it:** a paused plan keeps its reason through `pass_plan`; its ask is found by key whatever its boss. While the new boss's own wakes say nothing (`Unknown`), it never goes on by the old boss's window: once that lapses, a pause whose ask was never the plan's boss's (`item_ever_keyed(boss, limit_key)`) becomes `NoBoss`, waiting for the person's Continue as a plan passed on does, and nothing is said of it going on.
 - **Two plans of one boss:** each is paused and told, by its own key. One Raise lifts both: the threshold is the person's.
 - **The plan is at 100%:** no raise is offered; the ask has only Keep. It resumes once the window resets.
 - **The threshold is raised while another window of the plan is also over it:** `holds` reads the fullest live window, so it stays paused, with new words, and a raise to 100 is offered next time (a new key, since `until` differs) only if the window changes. The Raise answer says the new threshold; the plan is lifted only if nothing holds it.

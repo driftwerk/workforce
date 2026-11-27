@@ -2000,23 +2000,36 @@ async fn a_plan_limit_ask_is_answered_by_desk_keep_or_raise() {
 }
 
 /// After a restart nothing is noted of the boss's wakes: a plan the limit
-/// paused stays paused until its window lapses, then goes on, said.
+/// paused stays paused until its window lapses, then goes on, said; one the
+/// limit paused for a boss before its own waits for the person's Continue.
 #[tokio::test(flavor = "multi_thread")]
 async fn after_a_restart_a_plan_the_limit_paused_waits_for_its_window() {
     with_test_pool(workforce_desk::store::build_pool, |pool| async move {
         let dir = tempfile::tempdir().unwrap();
         let (overseer, state, d, _llm) = hub_with(dir.path(), pool, ACTS).await;
-        let p = proposed(&d, dir.path(), 2).await;
-        let id = p.summary.plan.id;
-        d.approve_plan(id, 1, &By::you()).await.unwrap();
-        let until = chrono::Utc::now() + chrono::Duration::hours(2);
-        d.pause_plan_limit(
-            id,
-            "by plan limit until 11:00: your weekly Claude plan is at 88%, over your 80% limit",
-            until,
-        )
-        .await
-        .unwrap();
+        let words =
+            "by plan limit until 09:00: your weekly Claude plan is at 88%, over your 80% limit";
+        let paused = |boss: &'static str, until: chrono::DateTime<chrono::Utc>| {
+            let (d, dir) = (d.clone(), dir.path().to_path_buf());
+            async move {
+                let id = proposed(&d, &dir, 1).await.summary.plan.id;
+                d.approve_plan(id, 1, &By::you()).await.unwrap();
+                d.pause_plan_limit(id, words, until).await.unwrap();
+                let mut ask = workforce_desk::open_item::NewItem::ask(
+                    boss,
+                    workforce_desk::open_item::OpenKind::Ask,
+                    None,
+                    "Raise?",
+                );
+                ask.dedupe_key = workforce_desk::plan::limit_key(id, until);
+                ask.options = vec!["Keep".into()];
+                d.store().item_open(&ask).await.unwrap();
+                id
+            }
+        };
+        let held = paused("desk", chrono::Utc::now() + chrono::Duration::hours(2)).await;
+        let lapsed = chrono::Utc::now() - chrono::Duration::minutes(1);
+        let passed = paused("ada", lapsed).await;
         plan_login(&overseer, &state, &d).await;
         let _crew = CrewHub::start(
             Arc::clone(&state),
@@ -2024,23 +2037,32 @@ async fn after_a_restart_a_plan_the_limit_paused_waits_for_its_window() {
             FAST,
             CancellationToken::new(),
         );
-        tokio::time::sleep(Duration::from_secs(2)).await;
+        eventually(
+            "the plan paused for another boss waits for Continue",
+            async || {
+                let p = d.plan(passed).await.unwrap().summary;
+                (p.plan.paused == Some(workforce_desk::plan::Paused::NoBoss)).then_some(())
+            },
+        )
+        .await;
         assert_eq!(
-            d.plan(id).await.unwrap().summary.plan.paused,
+            d.plan(held).await.unwrap().summary.plan.paused,
             Some(workforce_desk::plan::Paused::PlanLimit),
             "kept paused while its window holds"
         );
         assert!(started(&d).is_empty());
-        let lapsed = chrono::Utc::now() - chrono::Duration::minutes(1);
-        d.pause_plan_limit(
-            id,
-            "by plan limit until 09:00: your weekly Claude plan is at 88%, over your 80% limit",
-            lapsed,
-        )
-        .await
-        .unwrap();
-        eventually("its sessions", async || {
-            (started(&d).len() == 2).then_some(())
+        let mut own = workforce_desk::open_item::NewItem::ask(
+            "desk",
+            workforce_desk::open_item::OpenKind::Ask,
+            None,
+            "Raise?",
+        );
+        own.dedupe_key = workforce_desk::plan::limit_key(held, lapsed);
+        own.options = vec!["Keep".into()];
+        d.store().item_open(&own).await.unwrap();
+        d.pause_plan_limit(held, words, lapsed).await.unwrap();
+        eventually("its session", async || {
+            (started(&d).len() == 1).then_some(())
         })
         .await;
         eventually("the person told it goes on", async || {
@@ -2052,6 +2074,16 @@ async fn after_a_restart_a_plan_the_limit_paused_waits_for_its_window() {
             .next()
         })
         .await;
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert_eq!(
+            super::items::dm_posts(&overseer, GOES_ON).len(),
+            1,
+            "the plan passed on isn't said to go on"
+        );
+        assert_eq!(
+            d.plan(passed).await.unwrap().summary.plan.paused,
+            Some(workforce_desk::plan::Paused::NoBoss)
+        );
     })
     .await;
 }

@@ -11,7 +11,7 @@
 use std::collections::{HashMap, HashSet};
 
 use chrono::{DateTime, Duration, Utc};
-use workforce_desk::crew;
+use workforce_desk::crew::{self, By};
 use workforce_desk::open_item::{ClosedBy, NewItem, OpenItem, OpenKind};
 use workforce_desk::open_item_store::Opened;
 use workforce_desk::plan::{self, Paused, Plan, PlanState};
@@ -389,7 +389,14 @@ impl CrewHub {
                 return;
             }
             Limit::Unknown if p.paused_until.is_some_and(|u| u > now) => return,
-            Limit::Unknown => None,
+            Limit::Unknown => match self.paused_for_another(p).await {
+                Some(false) => None,
+                Some(true) => {
+                    self.limit_handed_over(p).await;
+                    return;
+                }
+                None => return,
+            },
             Limit::Lifted(standing) => standing,
         };
         match self.desk.resume_plan_limit(p.id).await {
@@ -428,6 +435,50 @@ impl CrewHub {
             tz,
         );
         self.tell_dm(&p.boss, &text).await;
+    }
+
+    /// Whether the limit paused `p` for a boss before its own (it was
+    /// passed on since): its ask of that pause was never this boss's. None
+    /// when that can't be read.
+    async fn paused_for_another(&self, p: &Plan) -> Option<bool> {
+        let Some(until) = p.paused_until else {
+            return Some(false);
+        };
+        match self
+            .desk
+            .store()
+            .item_ever_keyed(&p.boss, &plan::limit_key(p.id, until))
+            .await
+        {
+            Ok(own) => Some(!own),
+            Err(e) => {
+                tracing::info!(plan = %p.id, error = %e, "whose limit pause a plan's was couldn't be read");
+                None
+            }
+        }
+    }
+
+    /// `p`, paused by its former boss's plan limit, once that window lapsed:
+    /// it waits for the person to say Continue, as a plan passed on does,
+    /// its limit asks closed.
+    async fn limit_handed_over(&self, p: &Plan) {
+        let by = By::desk("The plan limit that paused it held its former boss.");
+        if let Err(e) = self.desk.pause_plan(p.id, Paused::NoBoss, &by).await {
+            tracing::info!(plan = %p.id, error = %e, "a plan passed on under the plan limit wasn't handed over");
+            return;
+        }
+        if let Err(e) = self
+            .desk
+            .store()
+            .item_close_of_key_prefix(
+                &plan::limit_prefix(p.id),
+                ClosedBy::Lapsed,
+                "Its plan passed to another boss.",
+            )
+            .await
+        {
+            tracing::info!(plan = %p.id, error = %e, "a plan's limit asks weren't closed");
+        }
     }
 
     /// Every plan the plan limit pauses, lifted where it no longer holds.

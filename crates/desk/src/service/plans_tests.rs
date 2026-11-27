@@ -2880,6 +2880,20 @@ async fn a_plan_the_plan_limit_pauses_says_until_when_and_carries_only_its_own_a
         );
         assert_eq!(read.plan.paused_until, Some(until));
         assert!(read.ask.is_none(), "nothing asked yet");
+        d.pass_plan(id, &crate::crew::Party::manager("ada", "Ada"), &By::you())
+            .await
+            .unwrap();
+        let read = d.plan(id).await.unwrap().summary;
+        assert_eq!(
+            (
+                read.plan.boss.as_str(),
+                read.plan.paused,
+                read.plan.paused_until
+            ),
+            ("ada", Some(Paused::PlanLimit), Some(until)),
+            "a plan passed on keeps its limit pause"
+        );
+        assert_eq!(read.paused_why.as_deref(), Some(at_91));
 
         let ask = |key: String| {
             let mut new = NewItem::ask(&boss, OpenKind::Ask, None, "Raise?");
@@ -2905,7 +2919,11 @@ async fn a_plan_the_plan_limit_pauses_says_until_when_and_carries_only_its_own_a
             panic!("a new ask");
         };
         let carried = d.plan(id).await.unwrap().summary.ask.expect("its ask");
-        assert_eq!(carried.item_id, limit.id.to_string());
+        assert_eq!(
+            carried.item_id,
+            limit.id.to_string(),
+            "its ask, whoever's boss it is"
+        );
         assert_eq!(carried.options, ["Raise to 95%", "Keep"]);
 
         assert!(d.resume_plan_limit(id).await.unwrap());
