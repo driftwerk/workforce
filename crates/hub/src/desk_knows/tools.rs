@@ -991,16 +991,30 @@ mod tests {
             ("steps", json!([{"tool": "Task"}])),
             ("steps", json!([{"tool": "mcp__linear__get_issue"}])),
             ("steps", json!([{"tool": "github__get_pull_request"}])),
-            ("commands", json!(["curl -s https://docs.example/page | jq ."])),
-            ("commands", json!(["/usr/bin/wget https://docs.example/page"])),
+            (
+                "commands",
+                json!(["curl -s https://docs.example/page | jq ."]),
+            ),
+            (
+                "commands",
+                json!(["/usr/bin/wget https://docs.example/page"]),
+            ),
             ("commands", json!(["gh issue view 12"])),
             ("steps_total", json!(41)),
             ("commands_total", json!(41)),
         ] {
-            assert_eq!(with(field, value.clone()), vec![READ_OUTSIDE], "{field}: {value}");
+            assert_eq!(
+                with(field, value.clone()),
+                vec![READ_OUTSIDE],
+                "{field}: {value}"
+            );
         }
         for asker in ["desk", "session", "unknown"] {
-            assert_eq!(with("asker", json!(asker)), vec![ASKED_ELSEWHERE], "{asker}");
+            assert_eq!(
+                with("asker", json!(asker)),
+                vec![ASKED_ELSEWHERE],
+                "{asker}"
+            );
         }
         let account = item("account", "s1", "s1", Utc::now(), json!({"name": "atlas"}));
         assert!(caveats(&account).is_empty());

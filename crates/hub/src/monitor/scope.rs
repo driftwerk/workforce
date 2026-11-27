@@ -642,7 +642,11 @@ mod tests {
         ] {
             let fresh = ContentGuard::new(ContentScope::default());
             fresh.returned(tool, false, true, "the object");
-            assert_eq!(fresh.armed().is_some(), arms, "{tool}: an object's body is others' words");
+            assert_eq!(
+                fresh.armed().is_some(),
+                arms,
+                "{tool}: an object's body is others' words"
+            );
         }
     }
 

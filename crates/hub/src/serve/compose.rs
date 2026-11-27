@@ -1559,7 +1559,9 @@ impl crate::job_runner::AgentExecutor for ServiceAgentExecutor {
                 Some(keeper),
                 workforce_agent::runner::with_content_guard(
                     config.guarded_as.clone().map(|scope| {
-                        Arc::new(workforce_agent::security::monitor::ContentGuard::new(*scope))
+                        Arc::new(workforce_agent::security::monitor::ContentGuard::new(
+                            *scope,
+                        ))
                     }),
                     self.run_as_submitted(config, channel),
                 ),

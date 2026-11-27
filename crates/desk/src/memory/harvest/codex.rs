@@ -141,7 +141,10 @@ fn item(
         "web_search_call" => vec![Part::Call {
             id: p["id"].as_str().unwrap_or_default().to_string(),
             tool: "web_search".into(),
-            input: p["action"]["query"].as_str().unwrap_or_default().to_string(),
+            input: p["action"]["query"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string(),
             files: Vec::new(),
             command: None,
         }],

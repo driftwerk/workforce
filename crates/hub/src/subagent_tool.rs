@@ -654,9 +654,7 @@ mod tests {
     async fn a_spawn_naming_a_channel_writes_there_on_the_turns_platform() {
         let dir = tempfile::tempdir().unwrap();
         let tool = SubAgentTool::new(crate::serve::testing::plain_service(dir.path()).await);
-        let spawn = |channel: &str| {
-            serde_json::json!({ "action": "spawn", "task": "t", "channel_id": channel, "thread_id": "" })
-        };
+        let spawn = |channel: &str| serde_json::json!({ "action": "spawn", "task": "t", "channel_id": channel, "thread_id": "" });
         assert_eq!(tool.surface_effect(&spawn(" ")), None);
         assert_eq!(
             tool.surface_effect(&serde_json::json!({ "action": "spawn", "task": "t" })),

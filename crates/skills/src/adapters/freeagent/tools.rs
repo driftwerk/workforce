@@ -193,7 +193,9 @@ impl Tool for FreeAgentTool {
     }
 
     fn reach(&self, _input: &serde_json::Value) -> Option<workforce_agent::tools::Reach> {
-        self.spec.reads.then_some(workforce_agent::tools::Reach::Reads)
+        self.spec
+            .reads
+            .then_some(workforce_agent::tools::Reach::Reads)
     }
 
     async fn execute(&self, input: Value) -> Result<ToolResult> {

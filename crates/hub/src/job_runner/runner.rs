@@ -2493,10 +2493,17 @@ mod agent_job_tests {
         let handed_back = |read| async move {
             let executor: Arc<dyn AgentExecutor> = Arc::new(Read(read));
             let (_tx, rx) = tokio::sync::watch::channel(false);
-            execute_agent_job(Some(&executor), &agent_config("x"), "agent-job:t", None, rx, 600)
-                .await
-                .unwrap()
-                .0
+            execute_agent_job(
+                Some(&executor),
+                &agent_config("x"),
+                "agent-job:t",
+                None,
+                rx,
+                600,
+            )
+            .await
+            .unwrap()
+            .0
         };
         let fenced = handed_back(Some("web.fetch")).await;
         let guard = workforce_agent::security::monitor::ContentGuard::default();
