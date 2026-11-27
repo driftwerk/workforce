@@ -27,7 +27,8 @@ const DESK_STARTING: &str = "Desk hasn't started on this hub yet";
 
 /// Why a Desk delivery can't be made on this hub.
 pub(crate) const NOT_ON_DESK: &str = "this monitor tells you in Desk (`surface = \"desk\"`), and \
-     this hub doesn't run Desk: deliver on slack or teams here, or save it on the hub your Desk runs";
+     this hub doesn't run Desk: deliver on slack or teams here, or save it on the hub your Desk runs; \
+     to have Desk keep work on track, desk_work.keep_on_track hands it to their Desk boss";
 
 /// How an `agent_task` told to Desk ends its prompt.
 pub(crate) const TELLS_DESK: &str = "Your answer is what the person reads: it is told to them in \

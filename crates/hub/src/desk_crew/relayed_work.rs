@@ -1254,7 +1254,9 @@ impl CrewHub {
         let prompt = self.machine_work_prompt(k, run, work, o);
         let channel = super::line::machine_line_channel(&k.0, run.id);
         let ran = self
-            .run_turn_with(service, &owner, &channel, &prompt, hop, None, None, None)
+            .run_turn_with(
+                service, &owner, &channel, &prompt, hop, None, None, None, None,
+            )
             .await;
         if let Err(e) = &ran {
             tracing::warn!(machine = %k.0, session = %run.id, error = %format!("{e:#}"), "the overseer's turn on a machine session failed");

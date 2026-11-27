@@ -286,6 +286,11 @@ fn one_turn(looked: Vec<Looked>) -> Option<(Uuid, Vec<String>)> {
     Some((first.plan, lines))
 }
 
+/// The ids of `p`'s tickets' sessions ([`plan_sessions`]).
+pub(super) fn session_ids(p: &PlanDetail) -> Vec<String> {
+    plan_sessions(p).into_iter().map(|(id, _)| id).collect()
+}
+
 /// The sessions of `p`'s tickets, by id (`machine/id` on a machine), with
 /// what each is called: its ticket's key.
 fn plan_sessions(p: &PlanDetail) -> Vec<(String, String)> {
@@ -485,6 +490,7 @@ impl CrewHub {
             now,
             window,
         );
+        let woke = goal::wakes(&stalls, &said);
         let mut told = said.clone();
         let mut lines = self.stall_lines(o, &detail, &stalls, sessions, now, &mut told);
         lines.extend(self.undelivered_lines(plan, sessions, waiting, window, now, &mut told));
@@ -496,6 +502,14 @@ impl CrewHub {
                 tracing::warn!(plan = %id, error = %e, "what a goal's boss is told wasn't kept; it is said once it can be");
                 return Vec::new();
             }
+        }
+        // Each spell the boss is woken for, said back where a request it
+        // carries was asked (DW-770), as the person's roundup says it.
+        if let Some(s) = goal::leading(&stalls).filter(|_| woke) {
+            let sent = self.last_sent(service, sessions, s.since).await;
+            let line = note_line(&plan.goal, now - s.since, sent, self.desk.timezone());
+            let ids: Vec<String> = sessions.iter().map(|(id, _)| id.clone()).collect();
+            self.flag_handed(service, plan, &ids, &line).await;
         }
         if let Some(note) = note {
             let mut c = self.goal_checks.lock();
@@ -712,24 +726,33 @@ impl CrewHub {
             return None;
         }
         told.noted = Some((s.since, s.spell));
-        let ids: Vec<Uuid> = sessions
-            .iter()
-            .filter_map(|(id, _)| id.parse().ok())
-            .collect();
-        let sent = self
-            .desk
-            .store()
-            .line_sent_by(service.agent_id.as_str(), &ids, s.since)
-            .await
-            .unwrap_or_default()
-            .into_iter()
-            .map(|(_, at)| at)
-            .max();
+        let sent = self.last_sent(service, sessions, s.since).await;
         Some(GoalNote {
             plan: plan.id,
             at: now,
             text: note_line(&plan.goal, now - s.since, sent, self.desk.timezone()),
         })
+    }
+
+    /// When `service` last sent any of `sessions` work since `since`.
+    async fn last_sent(
+        &self,
+        service: &AgentService,
+        sessions: &[(String, String)],
+        since: DateTime<Utc>,
+    ) -> Option<DateTime<Utc>> {
+        let ids: Vec<Uuid> = sessions
+            .iter()
+            .filter_map(|(id, _)| id.parse().ok())
+            .collect();
+        self.desk
+            .store()
+            .line_sent_by(service.agent_id.as_str(), &ids, since)
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(_, at)| at)
+            .max()
     }
 
     /// Plan `id`, its goal met for `why`, closed by its boss's closing

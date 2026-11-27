@@ -134,6 +134,46 @@ pub struct Daily {
 /// The digest modes Desk may set.
 pub const DIGESTS: [&str; 3] = ["off", "live", "daily"];
 
+/// How long a handed request waits for the person's Desk.
+pub const HANDED_LIFE: chrono::Duration = chrono::Duration::hours(24);
+/// How long a request taken but never heard of waits to be taken again.
+pub const RETAKE: chrono::Duration = chrono::Duration::minutes(10);
+/// The most words Desk may say back on one request.
+pub const MAX_SAID: i32 = 48;
+
+/// A person's request an agent here handed to their Desk boss (DW-770):
+/// their words, the session it is about, and where they asked.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Handed {
+    pub id: Uuid,
+    pub person: Uuid,
+    pub agent: String,
+    pub agent_name: String,
+    pub words: String,
+    pub session: Option<String>,
+    pub session_name: Option<String>,
+    pub platform: String,
+    pub channel: String,
+    pub thread: Option<String>,
+    pub asked_at: DateTime<Utc>,
+}
+
+impl Handed {
+    fn of(&self, reader: &Reader) -> bool {
+        self.person == reader.person && self.agent == reader.agent
+    }
+}
+
+/// What a word back on a request finds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Heard {
+    /// No request of the reader's by that id.
+    Unknown,
+    /// Its words back are spent.
+    Spent,
+    Say(Box<Handed>),
+}
+
 #[async_trait]
 pub trait KnowsStore: Send + Sync {
     /// Keeps `items` for `owner`, each replacing what it had under its kind
@@ -165,6 +205,24 @@ pub trait KnowsStore: Send + Sync {
     /// The daily digest last built for `reader`.
     async fn daily(&self, reader: &Reader) -> Result<Option<Daily>>;
     async fn set_daily(&self, reader: &Reader, daily: &Daily) -> Result<()>;
+    async fn hand(&self, handed: &Handed) -> Result<()>;
+    /// `reader`'s requests still waiting for their Desk.
+    async fn handed_waiting(&self, reader: &Reader) -> Result<Vec<Handed>>;
+    /// `owner`'s Desk checks in at `now` and takes what waits for it:
+    /// asked within [`HANDED_LIFE`], never heard of, and not taken within
+    /// [`RETAKE`].
+    async fn take_handed(&self, owner: &Owner, now: DateTime<Utc>) -> Result<Vec<Handed>>;
+    /// One word back from `reader`'s Desk on request `id`, counted.
+    async fn handed_heard(&self, reader: &Reader, id: Uuid, now: DateTime<Utc>) -> Result<Heard>;
+    /// When `reader`'s Desk last checked in for requests.
+    async fn checked_in(&self, reader: &Reader) -> Result<Option<DateTime<Utc>>>;
+    /// The requests asked before `before` that no Desk ever answered,
+    /// ended at `now`.
+    async fn handed_expired(
+        &self,
+        before: DateTime<Utc>,
+        now: DateTime<Utc>,
+    ) -> Result<Vec<Handed>>;
 }
 
 /// The kind a session's conversation is shared as.
@@ -180,7 +238,25 @@ pub struct MemoryKnows(
     Mutex<Kept>,
     Mutex<BTreeMap<Owner, (String, DateTime<Utc>)>>,
     Mutex<BTreeMap<(Uuid, String), Daily>>,
+    Mutex<Vec<HandedRow>>,
+    Mutex<BTreeMap<Owner, DateTime<Utc>>>,
 );
+
+/// A request kept in memory, with what became of it.
+#[derive(Clone)]
+struct HandedRow {
+    handed: Handed,
+    taken_at: Option<DateTime<Utc>>,
+    heard: bool,
+    said: i32,
+    ended: bool,
+}
+
+impl HandedRow {
+    fn waiting(&self) -> bool {
+        !self.ended && !self.heard
+    }
+}
 
 impl MemoryKnows {
     pub fn new() -> Arc<Self> {
@@ -275,12 +351,15 @@ impl KnowsStore for MemoryKnows {
                 }
             }
         }
+        self.3.lock().retain(|r| r.handed.asked_at >= before);
         Ok((start - kept.len()) as u64)
     }
 
     async fn forget_person(&self, person: Uuid) -> Result<u64> {
         self.1.lock().retain(|o, _| o.person != person);
         self.2.lock().retain(|(p, _), _| *p != person);
+        self.3.lock().retain(|r| r.handed.person != person);
+        self.4.lock().retain(|o, _| o.person != person);
         let mut kept = self.0.lock();
         let before = kept.len();
         kept.retain(|(o, _, _), _| o.person != person);
@@ -379,6 +458,95 @@ impl KnowsStore for MemoryKnows {
             .lock()
             .insert((reader.person, reader.agent.clone()), daily.clone());
         Ok(())
+    }
+
+    async fn hand(&self, handed: &Handed) -> Result<()> {
+        self.3.lock().push(HandedRow {
+            handed: handed.clone(),
+            taken_at: None,
+            heard: false,
+            said: 0,
+            ended: false,
+        });
+        Ok(())
+    }
+
+    async fn handed_waiting(&self, reader: &Reader) -> Result<Vec<Handed>> {
+        Ok(self
+            .3
+            .lock()
+            .iter()
+            .filter(|r| r.waiting() && r.handed.of(reader))
+            .map(|r| r.handed.clone())
+            .collect())
+    }
+
+    async fn take_handed(&self, owner: &Owner, now: DateTime<Utc>) -> Result<Vec<Handed>> {
+        self.4.lock().insert(owner.clone(), now);
+        let reader = Reader {
+            person: owner.person,
+            agent: owner.agent.clone(),
+        };
+        Ok(self
+            .3
+            .lock()
+            .iter_mut()
+            .filter(|r| {
+                r.waiting()
+                    && r.handed.of(&reader)
+                    && r.handed.asked_at > now - HANDED_LIFE
+                    && r.taken_at.is_none_or(|t| t < now - RETAKE)
+            })
+            .map(|r| {
+                r.taken_at = Some(now);
+                r.handed.clone()
+            })
+            .collect())
+    }
+
+    async fn handed_heard(&self, reader: &Reader, id: Uuid, _now: DateTime<Utc>) -> Result<Heard> {
+        let mut rows = self.3.lock();
+        Ok(
+            match rows
+                .iter_mut()
+                .find(|r| r.handed.id == id && r.handed.of(reader))
+            {
+                None => Heard::Unknown,
+                Some(r) if r.said >= MAX_SAID => Heard::Spent,
+                Some(r) => {
+                    r.said += 1;
+                    r.heard = true;
+                    Heard::Say(Box::new(r.handed.clone()))
+                }
+            },
+        )
+    }
+
+    async fn checked_in(&self, reader: &Reader) -> Result<Option<DateTime<Utc>>> {
+        Ok(self
+            .4
+            .lock()
+            .iter()
+            .filter(|(o, _)| reader.reads(o))
+            .map(|(_, at)| *at)
+            .max())
+    }
+
+    async fn handed_expired(
+        &self,
+        before: DateTime<Utc>,
+        _now: DateTime<Utc>,
+    ) -> Result<Vec<Handed>> {
+        Ok(self
+            .3
+            .lock()
+            .iter_mut()
+            .filter(|r| r.waiting() && r.handed.asked_at < before)
+            .map(|r| {
+                r.ended = true;
+                r.handed.clone()
+            })
+            .collect())
     }
 }
 
@@ -567,6 +735,9 @@ pub mod postgres {
                     &[&TRANSCRIPT, &max_bytes],
                 )
                 .await?;
+            client
+                .execute("DELETE FROM handed WHERE asked_at < $1", &[&before])
+                .await?;
             Ok(old + over)
         }
 
@@ -577,6 +748,12 @@ pub mod postgres {
                 .await?;
             client
                 .execute("DELETE FROM daily WHERE person = $1", &[&person])
+                .await?;
+            client
+                .execute("DELETE FROM handed WHERE person = $1", &[&person])
+                .await?;
+            client
+                .execute("DELETE FROM checked_in WHERE person = $1", &[&person])
                 .await?;
             Ok(client
                 .execute("DELETE FROM items WHERE person = $1", &[&person])
@@ -727,6 +904,162 @@ pub mod postgres {
                 .await?;
             Ok(())
         }
+
+        async fn hand(&self, h: &Handed) -> Result<()> {
+            let client = self.pool.get().await?;
+            client
+                .execute(
+                    "INSERT INTO handed (id, person, agent, agent_name, words, session, session_name, \
+                       platform, channel, thread, asked_at) \
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
+                    &[
+                        &h.id,
+                        &h.person,
+                        &h.agent,
+                        &h.agent_name,
+                        &h.words,
+                        &h.session,
+                        &h.session_name,
+                        &h.platform,
+                        &h.channel,
+                        &h.thread,
+                        &h.asked_at,
+                    ],
+                )
+                .await?;
+            Ok(())
+        }
+
+        async fn handed_waiting(&self, reader: &Reader) -> Result<Vec<Handed>> {
+            let client = self.pool.get().await?;
+            client
+                .query(
+                    &format!(
+                        "SELECT {HANDED} FROM handed WHERE person = $1 AND agent = $2 \
+                         AND ended_at IS NULL AND heard_at IS NULL ORDER BY asked_at"
+                    ),
+                    &[&reader.person, &reader.agent],
+                )
+                .await?
+                .iter()
+                .map(handed_of)
+                .collect()
+        }
+
+        async fn take_handed(&self, owner: &Owner, now: DateTime<Utc>) -> Result<Vec<Handed>> {
+            let client = self.pool.get().await?;
+            client
+                .execute(
+                    "INSERT INTO checked_in (person, source, agent, at) VALUES ($1, $2, $3, $4) \
+                     ON CONFLICT (person, source, agent) DO UPDATE SET at = EXCLUDED.at",
+                    &[&owner.person, &owner.source, &owner.agent, &now],
+                )
+                .await?;
+            client
+                .query(
+                    &format!(
+                        "UPDATE handed SET taken_at = $4, taken_by = $2 \
+                         WHERE person = $1 AND agent = $3 AND ended_at IS NULL AND heard_at IS NULL \
+                           AND asked_at > $5 AND (taken_at IS NULL OR taken_at < $6) \
+                         RETURNING {HANDED}"
+                    ),
+                    &[
+                        &owner.person,
+                        &owner.source,
+                        &owner.agent,
+                        &now,
+                        &(now - HANDED_LIFE),
+                        &(now - RETAKE),
+                    ],
+                )
+                .await?
+                .iter()
+                .map(handed_of)
+                .collect()
+        }
+
+        async fn handed_heard(
+            &self,
+            reader: &Reader,
+            id: Uuid,
+            now: DateTime<Utc>,
+        ) -> Result<Heard> {
+            let client = self.pool.get().await?;
+            let said = client
+                .query_opt(
+                    &format!(
+                        "UPDATE handed SET said = said + 1, heard_at = coalesce(heard_at, $4) \
+                         WHERE id = $1 AND person = $2 AND agent = $3 AND said < $5 \
+                         RETURNING {HANDED}"
+                    ),
+                    &[&id, &reader.person, &reader.agent, &now, &MAX_SAID],
+                )
+                .await?;
+            if let Some(row) = said {
+                return Ok(Heard::Say(Box::new(handed_of(&row)?)));
+            }
+            let known = client
+                .query_opt(
+                    "SELECT 1 FROM handed WHERE id = $1 AND person = $2 AND agent = $3",
+                    &[&id, &reader.person, &reader.agent],
+                )
+                .await?;
+            Ok(match known {
+                Some(_) => Heard::Spent,
+                None => Heard::Unknown,
+            })
+        }
+
+        async fn checked_in(&self, reader: &Reader) -> Result<Option<DateTime<Utc>>> {
+            let client = self.pool.get().await?;
+            Ok(client
+                .query_one(
+                    "SELECT max(at) FROM checked_in WHERE person = $1 AND agent = $2",
+                    &[&reader.person, &reader.agent],
+                )
+                .await?
+                .try_get(0)?)
+        }
+
+        async fn handed_expired(
+            &self,
+            before: DateTime<Utc>,
+            now: DateTime<Utc>,
+        ) -> Result<Vec<Handed>> {
+            let client = self.pool.get().await?;
+            client
+                .query(
+                    &format!(
+                        "UPDATE handed SET ended_at = $2, ended = 'expired' \
+                         WHERE ended_at IS NULL AND heard_at IS NULL AND asked_at < $1 \
+                         RETURNING {HANDED}"
+                    ),
+                    &[&before, &now],
+                )
+                .await?
+                .iter()
+                .map(handed_of)
+                .collect()
+        }
+    }
+
+    const HANDED: &str = "id, person, agent, agent_name, words, session, session_name, platform, \
+                          channel, thread, asked_at";
+
+    fn handed_of(r: &tokio_postgres::Row) -> Result<Handed> {
+        Ok(Handed {
+            id: r.try_get(0)?,
+            person: r.try_get(1)?,
+            agent: r.try_get(2)?,
+            agent_name: r.try_get(3)?,
+            words: r.try_get(4)?,
+            session: r.try_get(5)?,
+            session_name: r.try_get(6)?,
+            platform: r.try_get(7)?,
+            channel: r.try_get(8)?,
+            thread: r.try_get(9)?,
+            asked_at: r.try_get(10)?,
+        })
     }
 
     fn item_of(r: &tokio_postgres::Row) -> Result<Item> {
@@ -751,6 +1084,7 @@ pub mod postgres {
                 let store = PostgresKnows::with_pool(pool).await.unwrap();
                 super::super::tests::exercise(&store).await;
                 super::super::tests::exercise_reads(&store).await;
+                super::super::tests::exercise_handed(&store).await;
             })
             .await;
         }
@@ -1047,9 +1381,129 @@ pub(crate) mod tests {
         assert_eq!(store.status(&other).await.unwrap(), Status::default());
     }
 
+    pub(crate) fn handed(person: Uuid, words: &str, asked_at: DateTime<Utc>) -> Handed {
+        Handed {
+            id: Uuid::new_v4(),
+            person,
+            agent: "allan".into(),
+            agent_name: "Allan".into(),
+            words: words.into(),
+            session: Some("s1".into()),
+            session_name: Some("video".into()),
+            platform: "slack".into(),
+            channel: "D1".into(),
+            thread: Some("1700.1".into()),
+            asked_at,
+        }
+    }
+
+    /// A request handed is taken by its person's Desk once, again only
+    /// after a while, never past its life; heard to its cap; ended unheard.
+    pub(crate) async fn exercise_handed(store: &dyn KnowsStore) {
+        use chrono::SubsecRound;
+        let now = Utc::now().trunc_subsecs(6);
+        let mac = Owner {
+            person: Uuid::from_u128(7),
+            source: "mac".into(),
+            agent: "allan".into(),
+        };
+        let me = Reader {
+            person: mac.person,
+            agent: "allan".into(),
+        };
+        let stranger = Reader {
+            person: Uuid::from_u128(8),
+            agent: "allan".into(),
+        };
+        let fresh = handed(mac.person, "keep the video on track", now);
+        let old = handed(
+            mac.person,
+            "keep the docs on track",
+            now - HANDED_LIFE - chrono::Duration::minutes(1),
+        );
+        store.hand(&fresh).await.unwrap();
+        store.hand(&old).await.unwrap();
+        assert_eq!(store.checked_in(&me).await.unwrap(), None);
+        assert_eq!(store.handed_waiting(&me).await.unwrap().len(), 2);
+        assert!(store.handed_waiting(&stranger).await.unwrap().is_empty());
+
+        let taken = store.take_handed(&mac, now).await.unwrap();
+        assert_eq!(
+            taken,
+            std::slice::from_ref(&fresh),
+            "never one past its life"
+        );
+        let checked = store.checked_in(&me).await.unwrap().unwrap();
+        assert!((checked - now).num_milliseconds().abs() < 1);
+        assert!(
+            store.take_handed(&mac, now).await.unwrap().is_empty(),
+            "once"
+        );
+        let later = now + RETAKE + chrono::Duration::seconds(1);
+        assert_eq!(
+            store.take_handed(&mac, later).await.unwrap().len(),
+            1,
+            "again, unheard"
+        );
+
+        assert_eq!(
+            store.handed_heard(&stranger, fresh.id, now).await.unwrap(),
+            Heard::Unknown
+        );
+        assert_eq!(
+            store.handed_heard(&me, fresh.id, now).await.unwrap(),
+            Heard::Say(Box::new(fresh.clone()))
+        );
+        assert!(store
+            .handed_waiting(&me)
+            .await
+            .unwrap()
+            .iter()
+            .all(|h| h.id != fresh.id));
+        let much_later = later + RETAKE + chrono::Duration::seconds(1);
+        assert!(
+            store
+                .take_handed(&mac, much_later)
+                .await
+                .unwrap()
+                .is_empty(),
+            "heard"
+        );
+        for _ in 1..MAX_SAID {
+            assert!(matches!(
+                store.handed_heard(&me, fresh.id, now).await.unwrap(),
+                Heard::Say(_)
+            ));
+        }
+        assert_eq!(
+            store.handed_heard(&me, fresh.id, now).await.unwrap(),
+            Heard::Spent
+        );
+
+        let expired = store.handed_expired(now - HANDED_LIFE, now).await.unwrap();
+        assert_eq!(expired, std::slice::from_ref(&old));
+        assert!(
+            store
+                .handed_expired(now - HANDED_LIFE, now)
+                .await
+                .unwrap()
+                .is_empty(),
+            "once"
+        );
+        assert!(store.handed_waiting(&me).await.unwrap().is_empty());
+
+        store.forget_person(mac.person).await.unwrap();
+        assert_eq!(store.checked_in(&me).await.unwrap(), None);
+        assert_eq!(
+            store.handed_heard(&me, fresh.id, now).await.unwrap(),
+            Heard::Unknown
+        );
+    }
+
     #[tokio::test]
     async fn kept_upserted_forgotten_counted_and_pruned_in_memory() {
         exercise(MemoryKnows::new().as_ref()).await;
         exercise_reads(MemoryKnows::new().as_ref()).await;
+        exercise_handed(MemoryKnows::new().as_ref()).await;
     }
 }

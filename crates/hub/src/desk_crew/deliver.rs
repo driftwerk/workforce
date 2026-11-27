@@ -134,6 +134,7 @@ impl CrewHub {
             None,
             Some(author),
             Some(theirs),
+            None,
         )
         .await
         .map(Ran::said)
@@ -154,15 +155,18 @@ impl CrewHub {
         listed: Option<Vec<MentionedApproval>>,
         author: Option<Speaker>,
     ) -> Result<(String, String)> {
-        self.run_turn_with(service, owner, channel, prompt, hop, listed, author, None)
-            .await
-            .map(Ran::said)
+        self.run_turn_with(
+            service, owner, channel, prompt, hop, listed, author, None, None,
+        )
+        .await
+        .map(Ran::said)
     }
 
     /// [`Self::run_turn`], answering `theirs` (the person's words a boss
     /// sent on) when it is an overseer's message in the DM, and saying too
     /// whether the turn did something: a call of a tool not known only to
-    /// look ([`super::tools::only_looks`]).
+    /// look ([`super::tools::only_looks`]). `told` is what the turn is told
+    /// beside the message, never kept with it.
     #[allow(clippy::too_many_arguments)]
     pub(super) async fn run_turn_with(
         &self,
@@ -174,6 +178,7 @@ impl CrewHub {
         listed: Option<Vec<MentionedApproval>>,
         author: Option<Speaker>,
         theirs: Option<String>,
+        told: Option<&str>,
     ) -> Result<Ran> {
         let agent_id = service.agent_id.as_str();
         let in_dm = channel == DESK_CHANNEL;
@@ -287,7 +292,7 @@ impl CrewHub {
                     relay.as_deref(),
                     Some(&sid),
                     None,
-                    None,
+                    told,
                     None,
                     None,
                     Some(inbox),

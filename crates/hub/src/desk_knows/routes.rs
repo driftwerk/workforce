@@ -21,6 +21,11 @@
 //!   `[desk_knows]` is off or the agent no longer accepts, so what was
 //!   shared can always be taken back.
 //! - `GET /api/desk-knows/status` (the token): what is kept, by kind.
+//! - `POST /api/desk-knows/handed` (the token, of the person's own
+//!   computer's Desk alone): the requests the person handed its boss
+//!   through this agent, for it to take ([`super::handed`]).
+//! - `POST /api/desk-knows/handed/{id}/say` `{text}` (the token): Desk's
+//!   word on one of them, told where the person asked it.
 //!
 //! Each push and forget is one `sentinel.audit` line and audit row, with
 //! counts and never content.
@@ -47,7 +52,8 @@ use workforce_identity::remote_mcp_token::{
 };
 use workforce_identity::types::IdentityStatus;
 
-use super::store::{Forget, Item, KnowsStore, Owner};
+use super::handed::Said;
+use super::store::{Forget, Item, KnowsStore, Owner, Reader};
 use crate::api_handlers::my_settings::enforce_action_rate_limit;
 use crate::api_handlers::remote_mcp_tokens::paired_device;
 use crate::boss_links::engine_key::EnginePublicKey;
@@ -188,9 +194,10 @@ fn engine_id_ok(id: &str) -> bool {
         && !id.chars().all(|c| c == '.')
 }
 
-/// Whether a push from engine `engine` says how the agent hears of the
-/// person's work: from their own computer's alone.
-fn sets_digest(engine: Option<&str>) -> bool {
+/// Whether a token of engine `engine` is the Desk on the person's own
+/// computer: the one that says how the agent hears of their work, and
+/// takes the requests they hand its boss.
+fn own_computer(engine: Option<&str>) -> bool {
     engine == Some(HOME_ENGINE)
 }
 
@@ -713,7 +720,7 @@ pub async fn push(
     let digest = parsed
         .digest
         .as_ref()
-        .filter(|_| sets_digest(live.token.desk_link.as_ref().map(|l| l.engine_id.as_str())));
+        .filter(|_| own_computer(live.token.desk_link.as_ref().map(|l| l.engine_id.as_str())));
     let store = match store() {
         Ok(s) => s,
         Err(r) => return r,
@@ -833,6 +840,109 @@ pub async fn status(State(state): State<Arc<GatewayState>>, headers: HeaderMap) 
     }
 }
 
+/// `POST /api/desk-knows/handed`.
+pub async fn take_handed(State(state): State<Arc<GatewayState>>, headers: HeaderMap) -> Response {
+    let live = match authenticate(&state, &headers, true) {
+        Ok(l) => l,
+        Err(r) => return r,
+    };
+    if !own_computer(live.token.desk_link.as_ref().map(|l| l.engine_id.as_str())) {
+        return err(
+            StatusCode::FORBIDDEN,
+            "Only the Desk on your own computer takes requests.",
+        );
+    }
+    let store = match store() {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    match store.take_handed(&live.owner, Utc::now()).await {
+        Ok(taken) => Json(json!({
+            "handed": taken.iter().map(|h| json!({
+                "id": h.id,
+                "words": h.words,
+                "session": h.session,
+                "sessionName": h.session_name,
+                "agentName": h.agent_name,
+                "place": super::handed::place_of(&h.platform),
+                "askedAt": h.asked_at,
+            })).collect::<Vec<_>>(),
+        }))
+        .into_response(),
+        Err(e) => {
+            warn!(error = %format!("{e:#}"), "handing requests to Desk failed");
+            err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "This hub couldn't read them; Desk will try again.",
+            )
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct SayBody {
+    text: String,
+}
+
+/// `POST /api/desk-knows/handed/{id}/say`.
+pub async fn say_handed(
+    State(state): State<Arc<GatewayState>>,
+    Path(id): Path<Uuid>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let live = match authenticate(&state, &headers, true) {
+        Ok(l) => l,
+        Err(r) => return r,
+    };
+    let Some(text) = serde_json::from_slice::<SayBody>(&body)
+        .ok()
+        .and_then(|b| plain(&b.text, super::handed::SAY_CHARS).map(str::to_string))
+    else {
+        return err(
+            StatusCode::BAD_REQUEST,
+            "Say it in plain text, at most 1 500 characters.",
+        );
+    };
+    let store = match store() {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    let reader = Reader {
+        person: live.owner.person,
+        agent: live.owner.agent.clone(),
+    };
+    match super::handed::say(&state, store.as_ref(), &reader, id, &text).await {
+        Ok(Said::Told) => {
+            tracing::info!(target: "sentinel.audit", agent = %reader.agent, handed = %id, "Desk's word on a request was told where it was asked");
+            Json(json!({ "said": true })).into_response()
+        }
+        Ok(Said::Unknown) => err(
+            StatusCode::NOT_FOUND,
+            "This hub has no such request of yours.",
+        ),
+        Ok(Said::Gone) => err(
+            StatusCode::NOT_FOUND,
+            "The agent this request went through is gone.",
+        ),
+        Ok(Said::Spent) => err(
+            StatusCode::TOO_MANY_REQUESTS,
+            "Desk has said all it may on this request.",
+        ),
+        Ok(Said::NotPosted) => err(
+            StatusCode::BAD_GATEWAY,
+            "This hub couldn't post it where the request was asked.",
+        ),
+        Err(e) => {
+            warn!(error = %format!("{e:#}"), "taking Desk's word on a request failed");
+            err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "This hub couldn't take that; Desk will try again.",
+            )
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -896,9 +1006,9 @@ mod tests {
 
     #[test]
     fn only_the_persons_own_computer_sets_the_digest_and_an_engine_is_named_plainly() {
-        assert!(sets_digest(Some(HOME_ENGINE)));
-        assert!(!sets_digest(Some("devbox")));
-        assert!(!sets_digest(None));
+        assert!(own_computer(Some(HOME_ENGINE)));
+        assert!(!own_computer(Some("devbox")));
+        assert!(!own_computer(None));
         assert!(engine_id_ok("local"));
         assert!(engine_id_ok("devbox-2"));
         for bad in ["", ".", "..", "a/b", "a b", &"x".repeat(65)] {

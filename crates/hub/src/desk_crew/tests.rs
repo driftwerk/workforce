@@ -2178,6 +2178,7 @@ mod holds;
 
 mod goal_checks;
 mod goals;
+mod handed;
 mod plan_watch;
 mod plans;
 

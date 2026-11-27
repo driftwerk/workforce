@@ -380,6 +380,8 @@ pub fn router(state: Arc<GatewayState>) -> Router {
     crate::boss_links::tools::serve_for(&state);
     // And what happens in their groups wakes them.
     crate::boss_links::wake::start(&state);
+    // Requests handed to a person's Desk that it never took are told.
+    crate::desk_knows::handed::start(&state);
     let app = Router::new()
         .route("/", get(static_index))
         .route("/ws", get(ws_handler))
@@ -1109,6 +1111,8 @@ pub fn router(state: Arc<GatewayState>) -> Router {
             )),
         )
         .route("/api/desk-knows/status", get(crate::desk_knows::routes::status))
+        .route("/api/desk-knows/handed", post(crate::desk_knows::routes::take_handed))
+        .route("/api/desk-knows/handed/{id}/say", post(crate::desk_knows::routes::say_handed))
         .route("/api/remote-mcp-tokens", get(crate::api_handlers::remote_mcp_tokens::list_all_tokens))
         .route("/api/remote-mcp-tokens/{id}", axum::routing::delete(crate::api_handlers::remote_mcp_tokens::revoke_any_token))
         // ── Agent training corpora (DW-539) ──

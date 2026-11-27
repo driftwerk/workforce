@@ -1927,4 +1927,4 @@ pub fn is_sha(s: &str) -> bool {
 
 #[cfg(test)]
 #[path = "plan_tests.rs"]
-mod tests;
+pub(crate) mod tests;
