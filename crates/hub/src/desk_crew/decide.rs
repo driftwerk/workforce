@@ -604,13 +604,9 @@ impl CrewHub {
             }
             return self.clear_terminal(&view, &p, &boss, cleared, waits);
         }
-        // Codex's request Desk didn't see whole (no command, its changes
-        // unseen or cut) is the person's: the boss can't judge what runs.
-        let unseen = p.request.as_ref().is_none_or(|r| {
-            r.input.get("clipped").and_then(serde_json::Value::as_bool) == Some(true)
-                || r.input.get("grantRoot").is_some_and(|g| !g.is_null())
-        });
-        if !p.choices.is_empty() && unseen {
+        // Codex's request Desk didn't see whole is the person's: the boss
+        // can't judge what runs.
+        if !p.choices.is_empty() && !seen_whole(&p) {
             return waits(
                 "Desk didn't see all of what it runs, so I can't judge it; it's yours to answer"
                     .into(),
@@ -1289,6 +1285,17 @@ pub(crate) async fn decision_call(
         .collect())
 }
 
+/// Whether Desk saw all of what Codex's request `p` runs: its command, or
+/// every change it makes, none cut, and no folder it grants beyond them.
+fn seen_whole(p: &PendingApproval) -> bool {
+    p.request.as_ref().is_some_and(|r| {
+        r.input.get("clipped").and_then(serde_json::Value::as_bool) != Some(true)
+            && r.input
+                .get("grantRoot")
+                .is_none_or(serde_json::Value::is_null)
+    })
+}
+
 /// Why a request of `engine`'s, in a session a boss runs, is the person's
 /// when that boss is on another hub (`served`): an engine such a boss
 /// can't be trusted with ([`workforce_desk::engine::boss_safe`]).
@@ -1316,7 +1323,9 @@ fn asking(engine: workforce_desk::engine::Engine) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::{asking, judged, judging_effort, kept_from, verdict, Verdict, DECISION_TOKENS};
+    use super::{
+        asking, judged, judging_effort, kept_from, seen_whole, verdict, Verdict, DECISION_TOKENS,
+    };
     use workforce_agent::llm::anthropic::Effort;
     use workforce_agent::llm::provider::{effective_effort, LlmProvider};
     use workforce_agent::llm::types::{
@@ -1468,5 +1477,47 @@ mod tests {
         // Nothing Desk didn't see whole is made up.
         let bare = super::pending_for_boss(&PendingApproval { request: None, ..p });
         assert!(bare.get("asks_whole").is_none());
+    }
+
+    /// Codex's request Desk saw whole is the boss's to judge; one with no
+    /// command or changes, one cut, or one granting a folder beyond them
+    /// isn't.
+    #[test]
+    fn only_a_codex_request_seen_whole_is_the_bosss_to_judge() {
+        use workforce_desk::model::{Decision, PendingApproval, Request};
+        let asked = |input: Option<serde_json::Value>| PendingApproval {
+            id: uuid::Uuid::new_v4(),
+            tool: "Bash".into(),
+            detail: "rm a.txt".into(),
+            since: chrono::Utc::now(),
+            answerable: true,
+            choices: vec![Decision::Allow, Decision::Deny],
+            why: None,
+            options: None,
+            request: input.map(|input| Request {
+                tool: "Bash".into(),
+                input,
+                cwd: Some("/repo".into()),
+                read_only: false,
+            }),
+            call: None,
+            agent: None,
+            cli_session: None,
+        };
+        let whole = serde_json::json!({"command": "rm a.txt", "grantRoot": null});
+        assert!(seen_whole(&asked(Some(whole))));
+        assert!(!seen_whole(&asked(None)), "nothing of it seen");
+        assert!(
+            !seen_whole(&asked(Some(
+                serde_json::json!({"changes": [], "clipped": true})
+            ))),
+            "its changes cut"
+        );
+        assert!(
+            !seen_whole(&asked(Some(
+                serde_json::json!({"changes": [], "grantRoot": "/"})
+            ))),
+            "a folder granted beyond them"
+        );
     }
 }

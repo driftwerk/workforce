@@ -120,6 +120,29 @@ impl TurnFailure {
     pub fn refused(&self) -> bool {
         matches!(self, TurnFailure::Failed(e) if e == ACCOUNT_REFUSED)
     }
+
+    /// How it failed, in plain words, as its card and its boss read it.
+    pub fn said(&self) -> String {
+        match self {
+            TurnFailure::Limit(_) => "It stopped on its plan's usage limit".into(),
+            TurnFailure::Failed(_) if self.refused() => {
+                "The provider turned its account away".into()
+            }
+            // Claude Code's own code for it (`server_error`), or Codex's words.
+            TurnFailure::Failed(e) if !e.contains(char::is_whitespace) => {
+                format!("Its turn failed ({e})")
+            }
+            TurnFailure::Failed(e) => e.clone(),
+        }
+    }
+}
+
+/// `failure` as its plain words ([`TurnFailure::said`]), for the wire.
+pub fn serialize_said<S: serde::Serializer>(
+    failure: &Option<TurnFailure>,
+    to: S,
+) -> Result<S::Ok, S::Error> {
+    serde::Serialize::serialize(&failure.as_ref().map(TurnFailure::said), to)
 }
 
 /// Why the provider refused a login, in plain words, from what the turn

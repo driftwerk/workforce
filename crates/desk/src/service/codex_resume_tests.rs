@@ -520,8 +520,19 @@ async fn a_resumed_codex_session_is_up_only_once_its_tui_is_on_its_screen() {
         assert!(d.view(s.id).unwrap().live);
         until(|| said.has("a Codex session is still starting")).await;
         assert_eq!(state(), SessionState::Starting);
+        assert!(
+            matches!(&d.view(s.id).unwrap().failure,
+                Some(crate::limit::TurnFailure::Failed(why)) if why.starts_with("Codex didn't come up")),
+            "{:?}",
+            d.view(s.id).unwrap().failure
+        );
         stopped(&d, s.id).await;
         std::fs::remove_file(dir.join("hang")).unwrap();
+        // Started again: that failure is behind it.
+        started_again(&d, &dir, std::slice::from_ref(&ok), resume).await;
+        until(|| state() == SessionState::Idle).await;
+        assert_eq!(d.view(s.id).unwrap().failure, None);
+        stopped(&d, s.id).await;
 
         // Its thread loaded, and then its TUI can't start: never up.
         let program = dir.join("fake-codex");

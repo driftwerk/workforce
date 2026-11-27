@@ -469,14 +469,16 @@ impl CrewTool {
                 Ok(json!({ "events": reported(&lines.join("\n"), "the crew's activity") }))
             }
             "crew.history" => {
-                let limit = input["limit"].as_u64().unwrap_or(20).clamp(1, 100) as usize;
+                let limit = input["limit"]
+                    .as_u64()
+                    .map_or(HISTORY_LIMIT, |l| l.clamp(1, 100) as usize);
                 if let Some(message) = input["message_id"].as_str() {
                     return line_message_read(crew, message, |s| crew.session_seen(s, seen)).await;
                 }
                 if let Some(session) = input["session_id"].as_str() {
                     let id = session_id(session)?;
                     crew.session_seen(id, seen)?;
-                    return self.session_said(crew, id, input);
+                    return self.session_said(crew, id, input, limit).await;
                 }
                 let agent = input["agent_id"]
                     .as_str()
@@ -570,23 +572,40 @@ impl CrewTool {
         }
     }
 
-    /// Session `id`'s last prompt, reply, pending request and screen: what
-    /// crew.history gives of it, and crew.account when it keeps no account.
-    fn session_said(
+    /// Session `id`'s last prompt and reply, its pending request, how its
+    /// last turn failed, and its transcript's newest exchanges, at most
+    /// `limit`; its screen only where Desk can't read its transcript, with
+    /// why: what crew.history gives of it, and crew.account when it keeps
+    /// no account.
+    async fn session_said(
         &self,
         crew: &Arc<CrewHub>,
         id: uuid::Uuid,
         input: &Value,
+        limit: usize,
     ) -> Result<Value, String> {
         let v = crew.desk.view(id).map_err(|_| crew.not_ours(&self.scope))?;
-        let terminal = crew.desk.terminal_text(id, 3000).ok();
         let (from, turn) = reply_asked(input);
-        let said = json!({
+        let mut said = json!({
             "name": v.label(), "hub_name": v.name, "group": v.group.as_ref().map(|g| g.name.clone()),
             "goal": v.goal, "cwd": v.cwd,
             "last_prompt": v.last_prompt, "last_reply": crew.desk.reply_read(&v, from, turn.as_deref()),
-            "pending": v.pending.as_ref().map(super::decide::pending_for_boss), "terminal": terminal,
+            "pending": v.pending.as_ref().map(super::decide::pending_for_boss),
+            "failed": v.failure.as_ref().map(workforce_desk::limit::TurnFailure::said),
         });
+        match crew
+            .desk
+            .transcript_page(id, workforce_desk::TranscriptAsk::default())
+            .await
+        {
+            Ok(t) => {
+                said["transcript"] = json!(t.exchanges.into_iter().take(limit).collect::<Vec<_>>());
+            }
+            Err(why) => {
+                said["transcript_unread"] = json!(why);
+                said["terminal"] = json!(crew.desk.terminal_text(id, 3000).ok());
+            }
+        }
         Ok(json!({
             "state": v.state,
             "session": reported(&said.to_string(), "the session"),
@@ -634,9 +653,11 @@ impl CrewTool {
                 out
             }
             None => {
-                let mut out = self.session_said(crew, id, &Value::Null)?;
+                let mut out = self
+                    .session_said(crew, id, &Value::Null, HISTORY_LIMIT)
+                    .await?;
                 out["note"] = json!(
-                    "Desk keeps no account of it yet: this is its last prompt, reply and screen."
+                    "Desk keeps no account of it yet: this is its last prompt and reply, and the newest of its transcript."
                 );
                 out
             }
@@ -1184,6 +1205,10 @@ impl CrewTool {
 /// `crew.ask_session`: the last resort, after the boss looked itself.
 pub(super) const ASK_SESSION_DESCRIPTION: &str = "Last resort: ask a session (session_id) about its work, as Desk's status question on its line, without derailing it. Look first: crew.inside (its processes, transcript and workspace) and crew.account answer most questions now. One that is working gets the question only once its turn ends, so a session stuck in a long tool call (a build queue, a hung command) won't answer: look inside it instead. It asks for words only and never changes what the session does; to have it wait, hold or change course, tell it so with crew.nudge.";
 
+/// How many messages, or a session's transcript exchanges, crew.history
+/// gives unless asked for another number.
+const HISTORY_LIMIT: usize = 20;
+
 /// How much of each message of an agent's Desk DM crew.history shows.
 const DM_CHARS: usize = 1500;
 /// How far back crew.history looks for the DM message `dm_id` names.
@@ -1267,7 +1292,7 @@ pub(crate) fn describe(name: &str) -> &'static str {
             "crew.activity" => "What happened on the crew, newest first: turns started and finished, questions, requests, failures, and what you and the person did. Filter to one agent or session with subject_id.",
             "crew.account" => "What one session (session_id) is for, who asked, its plan, what it has done (with its PRs, tickets, commits and deploys), what it is doing now, what it waits on, what comes next and the choices it made: its running account, brought up to date first when it is stale, with the time it is as of. Read it before you say anything of a session. With question, also the answer its own recent conversation gives to something the account doesn't say (which key, which file, what error).",
             "crew.ask_session" => ASK_SESSION_DESCRIPTION,
-            "crew.history" => "The recent messages of one agent's Desk DM with the person (agent_id; one too long says so and is read whole with dm_id), one session's last prompt, reply, pending request and terminal (session_id; a reply too long for one read says so and is read on with reply_from and turn), or one message on a session's Desk line, whole (message_id: when what you were shown of it says it was cut short).",
+            "crew.history" => "The recent messages of one agent's Desk DM with the person (agent_id; one too long says so and is read whole with dm_id), one session's last prompt, reply, pending request, how its last turn failed and its transcript's newest exchanges, its terminal only where Desk can't read its transcript (session_id; a reply too long for one read says so and is read on with reply_from and turn; older exchanges are crew.inside's transcript), or one message on a session's Desk line, whole (message_id: when what you were shown of it says it was cut short).",
             "crew.nudge" => "Send a short message to an agent's DM (agent_id) or to a session on its Desk line (session_id): a check-in, a hint, a correction. A session gets it once its turn ends, or, with urgent, with its next tool call's result (crew.interrupt stops a turn now). With reply_to (a question's message id), it is your answer to what that session asked you. To hold a session, name the directive that needs the hold (directive_id, from crew.directives) and what ends it (until: person_answers, directive_withdrawn, or a condition in words, like \"CI green at the head\"), and ask the person its question first (crew.ask_person with its session_id); a hold with no directive is refused. End a condition's hold with crew.nudge (session_id, hold_met: the condition, message: what to do now) once it is met. A hold stops new work, never reading: leave its CI, checks and logs to it.",
             "crew.escalate" => concat!("Give a question a session asked you on its Desk line to the person (message_id): say why in reason, offer answers in options, and draft one in draft if you can. Use it for anything that pushes, deletes, deploys, spends, sends to people or changes scope, and whenever you are unsure; at Act fully, only as this says: ", super::watcher::act_fully!()),
             "crew.approve" => "Allow a session's pending request (session_id, approval_id from crew.overview).",

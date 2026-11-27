@@ -267,9 +267,15 @@ pub struct SessionView {
     #[serde(skip)]
     pub reading: bool,
     /// How its last turn ended when an API error ended it: the plan's
-    /// limit, or another failure ([`crate::limit`]). Cleared once it is
-    /// asked again.
-    #[serde(skip)]
+    /// limit, or another failure ([`crate::limit`]); or how its run failed
+    /// apart from its turns (a Codex session that never came up, or that
+    /// Desk lost sight of). Cleared once it is asked again. Sent as its
+    /// plain words (`failed`).
+    #[serde(
+        rename = "failed",
+        serialize_with = "crate::limit::serialize_said",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub failure: Option<crate::limit::TurnFailure>,
     /// The mode that doesn't ask (auto, bypass) an unbound boss started it
     /// in, while it runs in it: shown on its card.

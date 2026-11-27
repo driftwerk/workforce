@@ -12,6 +12,7 @@ use parking_lot::Mutex;
 use serde_json::Value;
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
+use tracing::Instrument;
 use uuid::Uuid;
 
 use crate::adopt::{self, External, HubInternal};
@@ -1081,6 +1082,28 @@ const CODEX_START_WATCH: Duration = if cfg!(test) {
 };
 const CODEX_START_LOOK: Duration = Duration::from_millis(250);
 
+/// How a Codex session that never came up says so, before the end of its
+/// screen (at most [`NOT_UP_SHOWN`] characters of it).
+const NOT_UP: &str = "Codex didn't come up";
+const NOT_UP_SHOWN: usize = 300;
+
+/// What a Codex session's card says once Desk can no longer follow it.
+const LOST_SIGHT: &str = "Desk lost sight of this Codex session";
+
+/// Whether `f` is a Codex session's failure to come up.
+fn never_up(f: &crate::limit::TurnFailure) -> bool {
+    matches!(f, crate::limit::TurnFailure::Failed(why) if why.starts_with(NOT_UP))
+}
+
+/// Whether `f` is how a Codex session's run failed apart from its turns:
+/// it never came up, Desk lost sight of it, or it couldn't start again in
+/// its new permissions. Each is over once it runs again.
+fn codex_run_failure(f: &crate::limit::TurnFailure) -> bool {
+    never_up(f)
+        || modes::unapplied(f)
+        || matches!(f, crate::limit::TurnFailure::Failed(why) if why == LOST_SIGHT)
+}
+
 /// How often, within a [`STOP_GRACE`], an ending process is looked for.
 const STOP_LOOKS: u32 = 10;
 
@@ -1549,13 +1572,20 @@ fn codex_question(
     q: claude::Question,
     asks: Option<Value>,
 ) {
-    // The generic wait its status said becomes this question.
-    let was = l
-        .pending
-        .clone()
-        .filter(|p| !p.answerable && l.codex_asks.is_empty());
+    // The generic wait its status said becomes this question; the same
+    // question asked again (sent again as Desk follows it again) stays it.
+    let again = l
+        .codex_question
+        .as_ref()
+        .filter(|(asked, _)| *asked == request)
+        .map(|(_, p)| p.clone());
+    let was = again.clone().or_else(|| {
+        l.pending
+            .clone()
+            .filter(|p| !p.answerable && l.codex_asks.is_empty())
+    });
     let pending = PendingApproval {
-        id: Uuid::new_v4(),
+        id: again.map_or_else(Uuid::new_v4, |p| p.id),
         since: was.as_ref().map_or_else(Utc::now, |p| p.since),
         tool: q.tool,
         detail: q.detail,
@@ -6087,13 +6117,9 @@ impl Desk {
                 let mut link =
                     self.observe_codex(r.id, server, socket.clone(), follower, permissions);
                 link.mode = mode;
-                // Started in what it now runs in: a start that couldn't
-                // apply them before is over.
-                self.change_unseen(r.id, |st| {
-                    if st.turn_failures.get(&r.id).is_some_and(modes::unapplied) {
-                        st.turn_failures.remove(&r.id);
-                    }
-                });
+                // Started in what it now runs in, and followed afresh: how
+                // its last run failed apart from its turns is over.
+                self.codex_failure_over(r.id, codex_run_failure);
                 if let Some(primed) = primed {
                     if let Err(why) = codex_primed(primed).await {
                         link.stop();
@@ -6396,8 +6422,9 @@ impl Desk {
     /// is then said as it started, with what it printed. A TUI that `joins`
     /// a thread Desk's resume loaded says nothing to Desk as it does (CLI
     /// 0.166): its session is up once it is on its screen (the alternate
-    /// one, which it leaves to refuse), not once it is ready for input. One still starting at the watch's end is said, with
-    /// what its terminal shows.
+    /// one, which it leaves to refuse), not once it is ready for input. One
+    /// still starting at the watch's end is said, with what its terminal
+    /// shows, as its failure ([`NOT_UP`]).
     /// It holds Desk weakly, so Desk ends (and its sessions with it) as it
     /// would without it.
     async fn watch_codex_start(desk: Weak<Inner>, id: Uuid, tui: Weak<Pty>, joins: bool) {
@@ -6436,9 +6463,57 @@ impl Desk {
             .record(id)
             .is_ok_and(|r| r.state == SessionState::Starting)
         {
-            let shown = crate::pty::shown_end(&pty.text(), 4);
+            let shown = crate::pty::shown_end(&crate::pty::plain_text(pty.text().as_bytes()), 4);
             tracing::warn!(%id, secs = CODEX_START_WATCH.as_secs(), shown = %shown, "a Codex session is still starting");
+            desk.codex_not_up(id, &shown);
         }
+    }
+
+    /// Says `id`'s Codex didn't come up, as its screen ends (`shown`): its
+    /// failure, and in Activity.
+    fn codex_not_up(&self, id: Uuid, shown: &str) {
+        let words = shown.split_whitespace().collect::<Vec<_>>().join(" ");
+        let why = match words.as_str() {
+            "" => NOT_UP.to_string(),
+            words => format!("{NOT_UP}: {}", crew::clip(words, NOT_UP_SHOWN)),
+        };
+        self.codex_failed(id, why);
+    }
+
+    /// Desk couldn't follow `id`'s Codex again once it lost its app-server's
+    /// connection: said as its failure, and its turn, which Desk can no
+    /// longer see the end of, is taken as over.
+    fn codex_lost(&self, id: Uuid) {
+        self.codex_failed(id, LOST_SIGHT.into());
+        self.change(id, |r, _| {
+            if matches!(r.state, SessionState::Working | SessionState::Blocked) {
+                r.state = SessionState::Done;
+            }
+        });
+    }
+
+    /// `id`'s Codex run failed apart from its turns (`why`): its failure,
+    /// said in Activity.
+    fn codex_failed(&self, id: Uuid, why: String) {
+        tracing::warn!(%id, why, "a Codex session failed");
+        self.change_unseen(id, |st| {
+            st.turn_failures
+                .insert(id, crate::limit::TurnFailure::Failed(why.clone()));
+        });
+        if let Ok(view) = self.view(id) {
+            let me = Party::session(&view);
+            self.note(Event::new(Kind::Failed, me.clone(), Some(me), why));
+        }
+    }
+
+    /// Forgets how `id`'s last turn or run failed, where `over` says that is
+    /// behind it.
+    fn codex_failure_over(&self, id: Uuid, over: impl Fn(&crate::limit::TurnFailure) -> bool) {
+        self.change_unseen(id, |st| {
+            if st.turn_failures.get(&id).is_some_and(over) {
+                st.turn_failures.remove(&id);
+            }
+        });
     }
 
     /// `engine`'s version as last read, as a session records it.
@@ -6628,9 +6703,10 @@ impl Desk {
                 if let Err(e) = codex::observe(
                     socket, follower, tx, answers, steered, line_said, plans, watch,
                 )
+                .instrument(tracing::info_span!("codex_observer", session = %id))
                 .await
                 {
-                    tracing::warn!(error = %e, "codex observer stopped");
+                    tracing::warn!(session = %id, error = %e, "codex observer stopped");
                 }
             }
         });
@@ -8400,6 +8476,10 @@ impl Desk {
                 self.line_steer_refused(id, *row).await;
                 continue;
             }
+            if matches!(event, CodexEvent::Lost) {
+                self.codex_lost(id);
+                continue;
+            }
             // A line message Desk typed in is not the person speaking; whose
             // a prompt is, is read once.
             let at_terminal = match &event {
@@ -8462,7 +8542,19 @@ impl Desk {
             }
             if matches!(event, CodexEvent::TurnStarted) {
                 self.line_turn_started(id);
+                // Asked again: how its last turn failed is behind it.
+                self.codex_failure_over(id, |f| !modes::unapplied(f));
                 continue;
+            }
+            if let CodexEvent::TurnFailed(why) = event {
+                self.change_unseen(id, |st| {
+                    st.turn_failures
+                        .insert(id, crate::limit::TurnFailure::Failed(why));
+                });
+                continue;
+            }
+            if matches!(event, CodexEvent::Thread { .. }) {
+                self.codex_failure_over(id, never_up);
             }
             if let CodexEvent::Elsewhere {
                 request,
@@ -8594,7 +8686,7 @@ impl Desk {
                         }
                     }
                 }
-                CodexEvent::Failed(t) => self.breaker_failed(id, t),
+                CodexEvent::ToolFailed(t) => self.breaker_failed(id, t),
                 CodexEvent::Prompt(_) => {
                     self.breaker_turn(id, prompted == Some(true) && !delivery);
                 }
@@ -8640,11 +8732,21 @@ impl Desk {
                 }
                 _ => None,
             };
-            // Its turn's end, read as Claude Code's is: whether it asks.
-            let prompts = self.0.state.lock().live.get(&id).map(|l| l.prompts);
+            // Its turn's end, read as Claude Code's is: whether it asks. A
+            // turn that failed asks nothing, and its rollout's last reply is
+            // an older turn's.
+            let (prompts, failed) = {
+                let st = self.0.state.lock();
+                (
+                    st.live.get(&id).map(|l| l.prompts),
+                    st.turn_failures
+                        .get(&id)
+                        .is_some_and(|f| !codex_run_failure(f)),
+                )
+            };
             let (asked, unsure) = match &tail {
-                Some((_, t)) => asked_at_end(&[], t.said.as_deref()),
-                None => (None, false),
+                Some((_, t)) if !failed => asked_at_end(&[], t.said.as_deref()),
+                _ => (None, false),
             };
             let reader = unsure.then(|| self.reader()).flatten();
             let said_whole = tail
@@ -8670,7 +8772,7 @@ impl Desk {
             // the card's start with it.
             let heard = match (&event, &tail) {
                 (CodexEvent::Reply(text), _) => self.reply_heard(id, Some(text), None),
-                (CodexEvent::Idle, Some((_, t))) => {
+                (CodexEvent::Idle, Some((_, t))) if !failed => {
                     self.reply_heard(id, t.said.as_deref(), t.last_reply.clone())
                 }
                 _ => None,
@@ -8790,7 +8892,11 @@ impl Desk {
                             codex_wait::clear_wait(r, l);
                         }
                     }
-                    CodexEvent::Answered(_) | CodexEvent::Late(_) | CodexEvent::Failed(_) => {}
+                    CodexEvent::Answered(_)
+                    | CodexEvent::Late(_)
+                    | CodexEvent::ToolFailed(_)
+                    | CodexEvent::TurnFailed(_)
+                    | CodexEvent::Lost => {}
                     CodexEvent::Reply(_) => r.last_reply = heard.or(r.last_reply.take()),
                     CodexEvent::Child(_)
                     | CodexEvent::Usage(_)
