@@ -503,9 +503,9 @@ impl SubAgentTool {
                         let part =
                             |key: &str| o.tool_result.as_ref().and_then(|t| t.get(key).cloned());
                         (
-                            (!o.full_output.is_empty()).then_some(o.full_output),
+                            (!o.full_output.is_empty()).then(|| o.text_for_a_turn(&o.full_output)),
                             part("findings"),
-                            part("package"),
+                            part("package").map(|package| o.value_for_a_turn(package)),
                         )
                     }
                     None => (None, None, None),

@@ -45,6 +45,7 @@ fn agent() -> By {
         suggestion_id: None,
         hop: 0,
         preference: None,
+        outside: None,
     }
 }
 
@@ -432,6 +433,7 @@ async fn no_one_but_the_person_resumes_or_restarts_a_held_session() {
             suggestion_id: None,
             hop: 0,
             preference: None,
+            outside: None,
         };
         assert!(matches!(
             d.restart(id, None, crew.clone()).await,

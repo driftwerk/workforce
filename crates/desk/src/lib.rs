@@ -71,6 +71,7 @@ pub mod knows;
 mod knows_api;
 pub mod knows_collect;
 pub mod knows_items;
+pub mod knows_outside;
 pub mod knows_store;
 pub mod leader;
 pub mod ledger;

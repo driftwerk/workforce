@@ -736,6 +736,7 @@ impl Desk {
                 suggestion_id: None,
                 hop: m.hop,
                 preference: None,
+                outside: None,
             };
             let (engine, dialog, mark) = {
                 let st = self.0.state.lock();

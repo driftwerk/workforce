@@ -142,6 +142,7 @@ fn remote(id: &str, body: &str) -> RemoteComment {
         author: Author {
             kind: AuthorKind::Person,
             name: "Sam".into(),
+            id: None,
             on: "Linear".into(),
         },
         body: body.into(),

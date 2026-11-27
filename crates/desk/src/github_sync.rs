@@ -476,6 +476,10 @@ pub fn issue_of(
         remote_state: Some(state.clone()).filter(|s| !s.is_empty()),
         state_kind: state_kind.clone(),
         reporter: name_of(&v["author"]),
+        reporter_id: v["author"]
+            .as_str()
+            .filter(|login| login_ok(login))
+            .map(str::to_string),
         created: remote_time(&v["created_at"]),
         ..Facts::default()
     };

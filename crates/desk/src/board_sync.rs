@@ -2683,6 +2683,8 @@ fn jira_facts(i: &Value) -> Facts {
         components: names(&i["components"]),
         fix_versions: names(&i["fix_versions"]),
         reporter,
+        reporter_id: id_of(&i["reporter"]["account_id"])
+            .or_else(|| id_of(&i["reporter_account_id"])),
         created: any_time(&i["created"]),
         start: due_of(&i["start_date"]),
         priority_sort: None,
@@ -2793,6 +2795,7 @@ fn linear_facts(i: &Value) -> Facts {
         components: vec![],
         fix_versions: vec![],
         reporter: short(&i["creator"]["name"], 80),
+        reporter_id: id_of(&i["creator"]["id"]),
         created: any_time(&i["createdAt"]),
         start: None,
         priority_sort: i["prioritySortOrder"].as_f64().filter(|p| p.is_finite()),
@@ -2804,6 +2807,14 @@ fn linear_facts(i: &Value) -> Facts {
     };
     set_children(&mut facts, children, &[], false);
     facts
+}
+
+/// A writer's id as a pull gives it.
+fn id_of(v: &Value) -> Option<String> {
+    v.as_str()
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .map(str::to_string)
 }
 
 /// How a Linear relation that isn't blocking reads, from either side.

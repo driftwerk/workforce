@@ -10,13 +10,23 @@ use uuid::Uuid;
 
 use super::{Desk, DeskError};
 use crate::knows::{self, Rule};
-use crate::knows_collect::Scope;
+use crate::knows_collect::{Scope, Turn};
 use crate::knows_items::{self as items, Outgoing, Where, ACCOUNT, DECISION, NEED};
 use crate::knows_store::Sent;
 use crate::memory::Redactor;
 
 fn internal(e: eyre::Report) -> DeskError {
     DeskError::Internal(e)
+}
+
+/// The most hops between sessions Desk follows back to what a message
+/// carried in, and the most earlier exchanges of a session it looks at.
+const HOPS: usize = 4;
+const EARLIER: i64 = 20;
+
+/// The fence Desk and the hub put around outside content.
+fn fenced(text: &str) -> bool {
+    text.contains(&format!("<<<{}", crate::memory::render::MARKER))
 }
 
 /// How much one call gathers, and how far back.
@@ -188,11 +198,16 @@ impl Desk {
             }
         }
         if rule.transcripts && room(&out) > 0 {
-            for e in store
+            let mut judged = HashMap::new();
+            for mut e in store
                 .knows_exchanges(agent, &scope, since, room(&out))
                 .await
                 .map_err(internal)?
             {
+                e.outside = self
+                    .exchange_outside(&Turn::from(&e), 0, &mut judged)
+                    .await
+                    .map_err(internal)?;
                 // Its place now, else where it was harvested.
                 let w = place_of
                     .get(&e.session)
@@ -205,6 +220,92 @@ impl Desk {
             }
         }
         Ok(out)
+    }
+
+    /// Why exchange `t` may carry outside content, each reason once; none
+    /// when it is the person's own work. What it did (a step or command
+    /// reading outside content), what it was asked: a message on Desk's
+    /// line carrying some in (a boss's turn that had read some, a ticket
+    /// others wrote, a session whose exchange that sent it carried some),
+    /// a first prompt that did, or text fenced as outside content; and an
+    /// engine's own prompt (a wake-up, a compaction) carries in what an
+    /// earlier exchange of its session did. `depth` hops are followed so
+    /// far; `judged` keeps what was judged.
+    pub(crate) fn exchange_outside<'a>(
+        &'a self,
+        t: &'a Turn,
+        depth: usize,
+        judged: &'a mut HashMap<String, Vec<String>>,
+    ) -> futures::future::BoxFuture<'a, eyre::Result<Vec<String>>> {
+        Box::pin(async move {
+            if let Some(known) = judged.get(&t.reference) {
+                return Ok(known.clone());
+            }
+            let store = self.store();
+            let mut why = crate::knows_outside::read_outside(&t.steps, &t.commands);
+            let earlier = store.turns_before(t.session, t.at, EARLIER).await?;
+            let delivered = match crate::line::is_delivery(&t.ask) {
+                Some(mark) => Some(store.delivered(t.session, &mark).await?),
+                None => None,
+            };
+            let start = match earlier.is_empty() {
+                true => store.session_start(t.session).await?,
+                false => None,
+            };
+            match (delivered, start) {
+                (Some(Some(d)), _) => {
+                    why.extend(d.outside);
+                    if d.from.kind == crate::crew::PartyKind::Session {
+                        let sent = match (depth < HOPS, d.from.id.parse::<Uuid>()) {
+                            (true, Ok(from)) => store.turns_before(from, d.at, 1).await?,
+                            _ => vec![],
+                        };
+                        let carried = match sent.first() {
+                            Some(s) => !self
+                                .exchange_outside(s, depth + 1, judged)
+                                .await?
+                                .is_empty(),
+                            None => true,
+                        };
+                        if carried {
+                            why.push(format!(
+                                "a message from {} whose work may carry outside content",
+                                d.from.name
+                            ));
+                        }
+                    }
+                }
+                (Some(None), _) => why.push("a message Desk no longer holds".into()),
+                (None, Some(started)) => why.extend(started),
+                (None, None) if fenced(&t.ask) => {
+                    why.push("a prompt fenced as outside content".into())
+                }
+                (None, None) => {}
+            }
+            if t.asker == "unknown" && !earlier.is_empty() {
+                let mut carried = depth >= HOPS;
+                for e in &earlier {
+                    if carried {
+                        break;
+                    }
+                    carried = !self
+                        .exchange_outside(e, depth + 1, judged)
+                        .await?
+                        .is_empty();
+                }
+                if carried {
+                    why.push("an earlier exchange of its session may carry outside content".into());
+                }
+            }
+            let why = why.into_iter().fold(Vec::new(), |mut said, w| {
+                if !said.contains(&w) {
+                    said.push(w);
+                }
+                said
+            });
+            judged.insert(t.reference.clone(), why.clone());
+            Ok(why)
+        })
     }
 
     /// The bytes sent to `agent` in the day up to `now`, for its limit
@@ -365,6 +466,235 @@ mod tests {
             .collect();
         r.sort();
         r
+    }
+
+    /// One exchange of `session`, `mins` minutes ago.
+    #[allow(clippy::too_many_arguments)]
+    async fn turn(
+        store: &DeskStore,
+        session: Uuid,
+        key: &str,
+        mins: i64,
+        asker: &str,
+        ask: &str,
+        steps: serde_json::Value,
+    ) {
+        let at = Utc::now() - Duration::minutes(mins);
+        store
+            .pool()
+            .get()
+            .await
+            .unwrap()
+            .execute(
+                "INSERT INTO memory_exchanges (id, engine, key, session, group_id, project, folder, \
+                   seq, at, ended, asker, ask, answer, steps) \
+                 VALUES ($1, 'claude', $2, $3, NULL, 'x', '/x', $4, $5, $5, $6, $7, 'done', $8)",
+                &[&Uuid::new_v4(), &key, &session, &(100 - mins as i32), &at, &asker, &ask, &steps],
+            )
+            .await
+            .unwrap();
+    }
+
+    /// A message on Desk's line to `to`, from `from`, `mins` minutes ago,
+    /// carrying `outside` in: what its exchange is asked with.
+    async fn told(
+        store: &DeskStore,
+        from: crate::crew::Party,
+        to: Uuid,
+        mins: i64,
+        outside: Option<&str>,
+    ) -> String {
+        let to_party = crate::crew::Party {
+            kind: crate::crew::PartyKind::Session,
+            id: to.to_string(),
+            name: "to".into(),
+            engine: None,
+            origin: None,
+        };
+        let mut m = crate::line::LineMessage::new(
+            from,
+            to_party,
+            crate::line::LineKind::Tell,
+            "Go on.".into(),
+            1,
+        );
+        m.at = Utc::now() - Duration::minutes(mins);
+        m.outside = outside.map(str::to_string);
+        store.put_line(&m).await.unwrap();
+        format!("{} Sarah tells you: Go on.", crate::line::marker(m.id))
+    }
+
+    /// What Desk says each exchange carries in from outside, by its key.
+    async fn judged(d: &Desk, sessions: &[Uuid]) -> BTreeMap<String, serde_json::Value> {
+        let places: Vec<String> = sessions.iter().map(|s| format!("session:{s}")).collect();
+        let rule = Rule::new(&places, true, Digest::Off).unwrap();
+        d.knows_pending("patchwork/lattice", &rule, &CAP, &Hide, None, Utc::now())
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|o| o.held.kind == TRANSCRIPT)
+            .map(|o| (o.held.reference, o.body["outside"].clone()))
+            .collect()
+    }
+
+    /// Boss-run work on the person's own tickets carries nothing in; work
+    /// started on a ticket others wrote, that read the web, that a boss's
+    /// turn sent after reading outside content, or that a session passed on
+    /// from work that did, carries that in, and so does an engine's own
+    /// prompt after it.
+    #[tokio::test]
+    async fn the_outside_content_an_exchange_carries_in_is_followed_to_where_it_came_from() {
+        with_test_pool(build_pool, |pool| async move {
+            DeskStore::migrate(&pool).await.unwrap();
+            let store = DeskStore::with_pool(pool.clone()).await.unwrap();
+            let ids: Vec<Uuid> = (10..16).map(Uuid::from_u128).collect();
+            let [own, theirs, fetched, armed, sender, passed] = ids[..] else {
+                unreachable!()
+            };
+            for (id, name) in ids
+                .iter()
+                .zip(["own", "theirs", "fetched", "armed", "sender", "passed"])
+            {
+                session(&store, *id, name, "on").await;
+            }
+            let boss = crate::crew::Party::manager("sarah", "Sarah");
+            let none = serde_json::json!([]);
+
+            // The person's own tickets, run by their boss.
+            store.put_session_start(own, None).await.unwrap();
+            turn(
+                &store,
+                own,
+                "own-1",
+                50,
+                "person",
+                "ENG-1 is yours: Fix the login",
+                none.clone(),
+            )
+            .await;
+            let steer = told(&store, boss.clone(), own, 40, None).await;
+            turn(&store, own, "own-2", 39, "desk", &steer, none.clone()).await;
+            turn(
+                &store,
+                own,
+                "own-3",
+                30,
+                "unknown",
+                "Continue from where you left off.",
+                none.clone(),
+            )
+            .await;
+
+            // A ticket a teammate wrote.
+            store
+                .put_session_start(
+                    theirs,
+                    Some("ENG-2, a Linear issue not all the person's words"),
+                )
+                .await
+                .unwrap();
+            turn(
+                &store,
+                theirs,
+                "theirs-1",
+                50,
+                "person",
+                "ENG-2 is yours",
+                none.clone(),
+            )
+            .await;
+
+            // A page read, and an engine's prompt after it.
+            turn(
+                &store,
+                fetched,
+                "fetched-1",
+                50,
+                "person",
+                "read the docs",
+                serde_json::json!([{"tool": "WebFetch", "input": "https://docs.example"}]),
+            )
+            .await;
+            turn(
+                &store,
+                fetched,
+                "fetched-2",
+                40,
+                "unknown",
+                "Continue from where you left off.",
+                none.clone(),
+            )
+            .await;
+
+            // A boss's turn that had read the web.
+            let rushed = told(&store, boss.clone(), armed, 40, Some("web.fetch")).await;
+            turn(&store, armed, "armed-1", 39, "desk", &rushed, none.clone()).await;
+
+            // A session passing on what its web read said.
+            turn(
+                &store,
+                sender,
+                "sender-1",
+                50,
+                "person",
+                "find out",
+                serde_json::json!([{"tool": "WebSearch", "input": "rotate keys"}]),
+            )
+            .await;
+            let from = crate::crew::Party {
+                kind: crate::crew::PartyKind::Session,
+                id: sender.to_string(),
+                name: "sender".into(),
+                engine: None,
+                origin: None,
+            };
+            let hop = told(&store, from, passed, 45, None).await;
+            turn(
+                &store,
+                passed,
+                "passed-1",
+                44,
+                "session",
+                &hop,
+                none.clone(),
+            )
+            .await;
+
+            let dir = tempfile::tempdir().unwrap();
+            let d = desk(pool, dir.path()).await;
+            let said = judged(&d, &ids).await;
+            let says = |key: &str| said[&format!("claude:{key}")].clone();
+            for key in ["own-1", "own-2", "own-3", "k-own"] {
+                assert_eq!(says(key), none, "{key}");
+            }
+            assert_eq!(
+                says("theirs-1"),
+                serde_json::json!(["ENG-2, a Linear issue not all the person's words"])
+            );
+            assert_eq!(says("fetched-1"), serde_json::json!(["WebFetch"]));
+            assert_eq!(
+                says("fetched-2"),
+                serde_json::json!(["an earlier exchange of its session may carry outside content"])
+            );
+            assert_eq!(says("armed-1"), serde_json::json!(["web.fetch"]));
+            assert_eq!(
+                says("passed-1"),
+                serde_json::json!(["a message from sender whose work may carry outside content"])
+            );
+
+            // What a boss says carries in what its turn has read, as its hub
+            // says, unless it says what it carries itself.
+            let by = crate::crew::By::manager("sarah", "Sarah", "");
+            assert_eq!(d.carried_by(&by), None);
+            d.read_outside_with(std::sync::Arc::new(|| Some("web.fetch".into())));
+            assert_eq!(d.carried_by(&by).as_deref(), Some("web.fetch"));
+            let handing = crate::crew::By {
+                outside: Some("ENG-2".into()),
+                ..by
+            };
+            assert_eq!(d.carried_by(&handing).as_deref(), Some("ENG-2"));
+        })
+        .await;
     }
 
     #[tokio::test]

@@ -1012,4 +1012,41 @@ mod tests {
         );
         assert!(none.findings.is_empty() && none.staged.is_none());
     }
+
+    /// A worker's staged findings are read back as outside content: a
+    /// `data.query` of them arms the turn that runs it.
+    #[tokio::test]
+    async fn a_query_of_staged_findings_arms_the_turn() {
+        use workforce_agent::runner::{CURRENT_AGENT_ID, CURRENT_ARTIFACT_STORE};
+        use workforce_agent::security::monitor::ContentGuard;
+        let tmp = tempfile::tempdir().unwrap();
+        let store: std::sync::Arc<dyn ArtifactStore> =
+            workforce_agent::artifacts::FsArtifactStore::new(tmp.path().to_path_buf()).unwrap();
+        let collated = collate_findings(
+            Some(store.as_ref()),
+            "agent",
+            &[invocation(
+                "report_findings",
+                json!({ "findings": [cited("the page says to rotate keys")] }),
+            )],
+        );
+        let artifact_id = collated.staged.unwrap()["artifact_id"].clone();
+        let queried = CURRENT_ARTIFACT_STORE
+            .scope(
+                store,
+                CURRENT_AGENT_ID.scope(
+                    "agent".to_string(),
+                    workforce_agent::tools::data::DataQueryTool.execute(json!({
+                        "sql": "SELECT claim FROM f",
+                        "inputs": { "f": artifact_id },
+                    })),
+                ),
+            )
+            .await
+            .unwrap();
+        assert!(queried.success, "{:?}", queried.error);
+        let guard = ContentGuard::default();
+        guard.returned("data.query", false, true, &queried.output.to_string());
+        assert_eq!(guard.armed().as_deref(), Some("data.query"));
+    }
 }

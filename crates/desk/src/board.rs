@@ -742,6 +742,10 @@ pub struct Facts {
     /// Who wrote it there, and when.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reporter: Option<String>,
+    /// Its writer's id there, as [`Sync::me`] names the person, when the
+    /// pull says.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reporter_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub created: Option<DateTime<Utc>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

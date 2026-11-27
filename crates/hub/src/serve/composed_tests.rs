@@ -6426,6 +6426,49 @@ async fn after_a_web_read_everyday_tools_run_and_ways_out_are_still_held() {
             "{name}"
         );
     }
+    // A tool of the agent's own namespaces named as a change runs after
+    // outside content only as one of the local writes looked at here.
+    const LOCAL_WRITES: &[&str] = &[
+        // The agent's own checkout and files: `code.git` is held before
+        // this as a command, whatever it does.
+        "code.edit",
+        "code.edit create",
+        "code.edit delete",
+        "code.edit replace",
+        "code.git push",
+        "code.refactor rename",
+        "filesystem.edit",
+        "filesystem.write",
+        // The agent's own session and the person's own mailbox rules.
+        "compaction set",
+        "email.sort_rules remove",
+        "email.sort_rules set_enabled",
+        "session.set_label",
+    ];
+    let unlooked: Vec<String> = service
+        .tools
+        .names()
+        .into_iter()
+        .filter(|name| workforce_agent::security::monitor::keeps_its_own(name))
+        .flat_map(|name| {
+            let schema = service.tools.get(&name).unwrap().input_schema();
+            let actions: Vec<String> = schema["properties"]["action"]["enum"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(serde_json::Value::as_str)
+                .map(str::to_string)
+                .chain([String::new()])
+                .collect();
+            actions
+                .into_iter()
+                .filter(|action| workforce_agent::security::monitor::names_a_change(&name, action))
+                .map(|action| format!("{name} {action}").trim().to_string())
+                .collect::<Vec<_>>()
+        })
+        .filter(|call| !LOCAL_WRITES.contains(&call.as_str()))
+        .collect();
+    assert!(unlooked.is_empty(), "{unlooked:?}");
     assert!(
         service
             .tools

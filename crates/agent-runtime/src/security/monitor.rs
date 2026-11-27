@@ -1160,7 +1160,7 @@ pub fn assess(
         || tool == "http.request"
         || (browser && BROWSER_READS.contains(&leaf));
     let own = declared(Reach::Stays)
-        || OWN_NAMESPACES.contains(&root)
+        || keeps_its_own(tool)
         || (namespace == "google.gmail" && OWN_MAILBOX.contains(&leaf));
     if reads || own {
         return None;
@@ -1212,6 +1212,13 @@ fn persists(tool: &str, action: &str) -> bool {
         };
         !reads.contains(&asked)
     })
+}
+
+/// Whether `tool` is in a namespace that keeps the agent's own working
+/// state ([`OWN_NAMESPACES`]): its calls stay with the agent whatever they
+/// are named.
+pub fn keeps_its_own(tool: &str) -> bool {
+    OWN_NAMESPACES.contains(&tool.split('.').next().unwrap_or(tool))
 }
 
 /// Whether a call of `tool` doing `action` is named as sending or changing

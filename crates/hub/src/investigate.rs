@@ -353,6 +353,7 @@ impl Tool for InvestigateTool {
                 runner.as_ref(),
                 &synth_job_id,
                 delivery_deadline(adversarial),
+                true,
             )
             .await
             {
@@ -547,6 +548,7 @@ impl ProgressReporter {
                 self.runner.as_ref(),
                 &self.synth_job_id,
                 delivery_deadline(self.adversarial),
+                false,
             )
             .await
             .map_err(|e| e.to_string())
@@ -637,15 +639,21 @@ fn with_note(mut output: Value, note: Option<&str>) -> Value {
 }
 
 /// Poll the synth job until it reaches a terminal state, returning its report
-/// text (on success) or the failure reason.
+/// text (on success) or the failure reason; fenced when `for_a_turn` and the
+/// research read outside content.
 async fn await_report(
     runner: &dyn crate::hosts::JobHost,
     synth_job_id: &str,
     wait: Duration,
+    for_a_turn: bool,
 ) -> Result<String> {
     let deadline = Instant::now() + wait;
     loop {
-        let res = runner.get_result(synth_job_id, None).await?;
+        let res = if for_a_turn {
+            runner.result_for_a_turn(synth_job_id, None).await?
+        } else {
+            runner.get_result(synth_job_id, None).await?
+        };
         match res
             .get("status")
             .and_then(Value::as_str)

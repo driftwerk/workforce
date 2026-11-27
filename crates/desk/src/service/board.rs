@@ -1492,9 +1492,13 @@ impl Desk {
         let mut text = format!("gave {key} to {}", view.label());
         if tell {
             let needs = self.need_keys(&t).await?;
+            let teller = By {
+                outside: self.carried_by(by).or(self.ticket_carries(&t).await),
+                ..by.clone()
+            };
             let said = self
                 .line_send(
-                    sender_of(by),
+                    sender_of(&teller),
                     Send::Tell {
                         to: Target::Session(view.id),
                         text: board::handed_text(key, &t, &needs),
@@ -1735,6 +1739,7 @@ impl Desk {
             suggestion_id: None,
             hop: 0,
             preference: None,
+            outside: None,
         };
         let why = format!("pull request #{} {}", pr.number, pr.state.as_str());
         match board::follows_pr(t.state, pr.state) {
@@ -1953,6 +1958,7 @@ impl Desk {
             suggestion_id: None,
             hop: 0,
             preference: None,
+            outside: None,
         };
         let say = |e: DeskError| match e {
             DeskError::NotFound => "That ticket is gone.".to_string(),
@@ -2095,6 +2101,21 @@ impl Desk {
                 Ok(json!({ "key": v.key, "state": v.ticket.state }))
             }
         }
+    }
+}
+
+impl Desk {
+    /// Why ticket `t`'s words, as a session is given them, may carry
+    /// outside content ([`crate::knows_outside::ticket_outside`]); taken
+    /// as carrying some when they can't be read.
+    pub(super) async fn ticket_carries(&self, t: &Ticket) -> Option<String> {
+        let read = async {
+            let b = self.board_of(t.board).await?;
+            let comments = self.ticket_comments(t.id).await?;
+            Ok::<_, DeskError>(crate::knows_outside::ticket_outside(t, &b, &comments))
+        };
+        read.await
+            .unwrap_or_else(|_| Some("a ticket whose writers couldn't be read".into()))
     }
 }
 

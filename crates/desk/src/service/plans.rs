@@ -3772,7 +3772,11 @@ impl Desk {
             group,
             review_of: None,
         };
-        self.create_for_as(session, new, boss, by.clone()).await
+        let by = By {
+            outside: self.carried_by(by).or(self.ticket_carries(t).await),
+            ..by.clone()
+        };
+        self.create_for_as(session, new, boss, by).await
     }
 
     /// Gives `t` to the session started for it, as it is now: the person's

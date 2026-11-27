@@ -715,6 +715,7 @@ impl Desk {
             suggestion_id: None,
             hop: 0,
             preference: None,
+            outside: None,
         };
         let mut problems = Vec::new();
         let made = match &row.item {

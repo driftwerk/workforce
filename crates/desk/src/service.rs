@@ -1318,6 +1318,9 @@ struct Inner {
     rush: urgent::Rush,
     /// What answers sessions' MCP requests on their lines.
     line_mcp: std::sync::OnceLock<Arc<dyn line::SessionMcp>>,
+    /// What the boss's turn now calling Desk has read from outside, as its
+    /// hub says ([`Desk::read_outside_with`]).
+    read_outside: std::sync::OnceLock<crate::line::ReadOutside>,
     /// Where sessions' Linear and Jira calls go ([`crate::issues`]).
     issues: std::sync::OnceLock<Arc<dyn crate::issues::Issues>>,
     /// The crew whose overseer answers sessions on their lines.
@@ -2156,6 +2159,7 @@ impl Desk {
             line_pump: tokio::sync::Mutex::new(()),
             rush: Default::default(),
             line_mcp: std::sync::OnceLock::new(),
+            read_outside: std::sync::OnceLock::new(),
             issues: std::sync::OnceLock::new(),
             line_crew: Mutex::new(None),
             boss_bounds: Mutex::new(None),
@@ -4125,6 +4129,17 @@ impl Desk {
                 .map_err(DeskError::Internal);
         }
         drop(reviewing);
+        // What its first prompt carries in from outside, as the agents Desk
+        // shares its work with are told it.
+        if let (Ok(()), Some(_)) = (&placed, &prompt) {
+            let outside = by.as_ref().and_then(|by| self.carried_by(by));
+            placed = self
+                .0
+                .store
+                .put_session_start(id, outside.as_deref())
+                .await
+                .map_err(DeskError::Internal);
+        }
         let launched = match placed {
             Ok(()) => self.launch(&record, false, prompt.as_deref()).await,
             Err(e) => Err(e),
@@ -8909,6 +8924,7 @@ impl Desk {
                             suggestion_id: None,
                             hop: 0,
                             preference: None,
+                            outside: None,
                         };
                         if let Err(e) = self.interrupt(id, Some(breaker)) {
                             tracing::warn!(%id, error = %e, "couldn't end a held Codex turn");

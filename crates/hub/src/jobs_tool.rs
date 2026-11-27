@@ -752,7 +752,7 @@ impl JobsTool {
                 start.elapsed().as_millis() as u64,
             ));
         }
-        match self.runner.get_result(&job_id, input.tail).await {
+        match self.runner.result_for_a_turn(&job_id, input.tail).await {
             Ok(result) => Ok(ToolResult::success(
                 result,
                 start.elapsed().as_millis() as u64,
