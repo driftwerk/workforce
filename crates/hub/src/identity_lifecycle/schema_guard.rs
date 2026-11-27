@@ -208,6 +208,12 @@ const CLAIMS: &[(&str, &str, &str, Claim)] = &[
     ),
     (
         "desk",
+        "typed_prompts",
+        "sender",
+        NotPersonal("the boss agent or agent that typed a prompt into a session, never a person's id"),
+    ),
+    (
+        "desk",
         "boss_decisions",
         "owner",
         NotPersonal("`you`, the one person of the Desk whose own hub this is"),
