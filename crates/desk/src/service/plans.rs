@@ -3246,6 +3246,9 @@ impl Desk {
             crew::MachineRefused::Refused(why) => sure(DeskError::Invalid(format!(
                 "{machine} didn't start {key}: {why}"
             ))),
+            crew::MachineRefused::WorktreeTaken(why, holder) => {
+                sure(DeskError::WorktreeTaken { why, holder })
+            }
             e @ crew::MachineRefused::Unknown(_) => failed(DeskError::Invalid(e.to_string()), true),
             e => sure(DeskError::Invalid(e.to_string())),
         };
@@ -3255,22 +3258,24 @@ impl Desk {
         let held = (p.group.is_none() && crate::engine::boss_safe(engine))
             .then(|| crate::grant::plan_key(p.id));
         let group = p.group.as_deref();
-        let listed = crew
-            .machine_call(
-                machine,
-                group,
-                &boss.id,
-                "desk.sessions",
-                serde_json::json!({}),
-            )
-            .await
-            .map_err(read_refused)?;
-        let listed: Vec<crew::MachineSession> = serde_json::from_value(listed).map_err(|_| {
-            failed(
-                DeskError::Invalid(format!("{machine}'s sessions couldn't be read.")),
-                retry,
-            )
-        })?;
+        let read = || async {
+            let listed = crew
+                .machine_call(
+                    machine,
+                    group,
+                    &boss.id,
+                    "desk.sessions",
+                    serde_json::json!({}),
+                )
+                .await
+                .map_err(read_refused)?;
+            serde_json::from_value::<Vec<crew::MachineSession>>(listed).map_err(|_| {
+                failed(
+                    DeskError::Invalid(format!("{machine}'s sessions couldn't be read.")),
+                    retry,
+                )
+            })
+        };
         let made_in = |cwd: &str| {
             cwd == folder
                 || cwd.starts_with(&format!("{}/.worktrees/", folder.trim_end_matches('/')))
@@ -3280,37 +3285,49 @@ impl Desk {
         // (a start not held, or a machine that doesn't take its id), one of
         // its key made since: an older session of the same key (the ticket
         // was sent back and started again) is never taken up. Wide enough
-        // for the two computers' clocks to differ. A held start takes up
-        // only one its boss has there: never the person's own of that name.
+        // for the two computers' clocks to differ. A held start takes up its
+        // own session there by its id, whatever that machine's clock says;
+        // by its name, only one its boss has there, never the person's own,
+        // and never one resting there made before this start began: that is
+        // an earlier start's, which `free_resting` replaces.
         let after = since - chrono::Duration::minutes(10);
+        let earlier = |s: &crew::MachineSession, made: chrono::DateTime<chrono::Utc>| {
+            made < since && matches!(s.state.as_str(), "idle" | "done")
+        };
         // There, a boss of this hub goes by its agent's id
         // ([`crate::grant::BossRef::name`]).
         let made_for = |s: &crew::MachineSession| match held {
             Some(_) => {
-                s.created_at.is_some_and(|c| c >= after)
+                s.created_at.is_some_and(|c| c >= after && !earlier(s, c))
                     && s.boss_has.as_deref() == Some(boss.id.as_str())
             }
             None => s.created_at.is_none_or(|c| c >= after),
         };
-        let by_name = || {
+        let there = |listed: &[crew::MachineSession]| {
+            let by_name = || {
+                listed
+                    .iter()
+                    .filter(|s| {
+                        s.name == key
+                            && made_in(&s.cwd)
+                            && !matches!(s.state.as_str(), "closed" | "stopped")
+                            && made_for(s)
+                    })
+                    .max_by_key(|s| s.created_at)
+            };
             listed
                 .iter()
-                .filter(|s| {
-                    s.name == key
-                        && made_in(&s.cwd)
-                        && !matches!(s.state.as_str(), "closed" | "stopped")
-                        && made_for(s)
+                .find(|s| held.is_some() && s.id == session)
+                .or_else(by_name)
+                .map(|s| Started {
+                    id: s.id,
+                    machine: Some(machine.to_string()),
+                    name: s.label().to_string(),
+                    note: None,
                 })
-                .max_by_key(|s| s.created_at)
         };
-        let by_id = listed.iter().find(|s| held.is_some() && s.id == session);
-        if let Some(there) = by_id.or_else(by_name) {
-            return Ok(Started {
-                id: there.id,
-                machine: Some(machine.to_string()),
-                name: there.label().to_string(),
-                note: None,
-            });
+        if let Some(started) = there(&read().await?) {
+            return Ok(started);
         }
         let prompt = format!(
             "{}{}\n\n{}",
@@ -3333,6 +3350,22 @@ impl Desk {
         if worktree {
             body["worktree"] = branch_for(&key).into();
         }
+        // Held there for its boss, its boss's own earlier session of it
+        // resting in that worktree gives way, as here; a Desk there older
+        // than that ignores it, and the start is refused as taken.
+        if worktree && held.is_some() {
+            body["free_resting"] = true.into();
+            // The session its ticket names there now (`<machine>/<id>`, as
+            // [`Self::assign_machine_session`] names it), which never gives way.
+            let assigned = t
+                .assignee
+                .as_ref()
+                .and_then(|a| a.id.strip_prefix(machine)?.strip_prefix('/'))
+                .and_then(|id| id.parse::<Uuid>().ok());
+            if let Some(a) = assigned {
+                body["assigned"] = a.to_string().into();
+            }
+        }
         body["deps"] = true.into();
         if let Some(model) = &runs.model {
             body["model"] = model.clone().into();
@@ -3340,7 +3373,7 @@ impl Desk {
         if held.is_some() {
             body["id"] = session.to_string().into();
         }
-        let made = crew
+        let made = match crew
             .machine_call(
                 machine,
                 held.as_deref().or(group),
@@ -3349,7 +3382,18 @@ impl Desk {
                 body,
             )
             .await
-            .map_err(refused)?;
+        {
+            // A retry's worktree may be held by the session its first try
+            // made there: taken up when it is.
+            Err(crew::MachineRefused::WorktreeTaken(why, holder)) if retry => {
+                return read()
+                    .await
+                    .ok()
+                    .and_then(|listed| there(&listed))
+                    .ok_or_else(|| sure(DeskError::WorktreeTaken { why, holder }));
+            }
+            made => made.map_err(refused)?,
+        };
         let made: crew::MachineSession = serde_json::from_value(made).map_err(|_| {
             // Started there, its answer unread: found there next time.
             failed(
@@ -3450,20 +3494,18 @@ impl Desk {
             )));
         };
         // Its own worktree, when another of the plan's tickets works in the
-        // same folder and it is a repository: made once, and found again by
-        // a start cut off after.
-        let worktree = worktree && crate::worktree::in_repo(Path::new(&folder)).await;
-        let (cwd, branch) = match worktree {
-            false => (folder, None),
-            true => {
-                let branch = branch_for(&key);
-                let made = crate::worktree::existing(Path::new(&folder), &branch).await;
-                match made {
-                    Some(path) => (path.to_string_lossy().into_owned(), None),
-                    None => (folder, Some(branch)),
-                }
+        // same folder and it is a repository: made once, and started in
+        // again by each later start of it.
+        let branch = (worktree && crate::worktree::in_repo(Path::new(&folder)).await)
+            .then(|| branch_for(&key));
+        // Its session from an earlier start, resting there since it was
+        // moved back to To do, gives way.
+        if let Some(b) = &branch {
+            if let Ok((_, tree)) = crate::worktree::located(Path::new(&folder), b).await {
+                let assigned = t.assignee.as_ref().map(|a| a.id.as_str());
+                self.free_resting(&tree, &key, assigned, boss).await?;
             }
-        };
+        }
         let group = p
             .group
             .clone()
@@ -3473,7 +3515,7 @@ impl Desk {
             engine,
             view: runs.view,
             name: key.clone(),
-            cwd,
+            cwd: folder,
             goal: board::goal_of(&key, t),
             worktree: branch,
             prompt: Some(format!(

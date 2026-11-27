@@ -440,7 +440,7 @@ impl Desk {
             tokio::time::sleep(Duration::from_millis(40)).await;
         }
         self.0.state.lock().acted.insert(id);
-        self.resume_checked(id, None, None, None).await
+        self.resume_checked(id, None, None, None, false).await
     }
 
     /// The mode a boss's resume or restart of `id` starts it in, where Desk

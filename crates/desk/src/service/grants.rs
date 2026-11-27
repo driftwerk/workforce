@@ -293,6 +293,7 @@ impl Desk {
         boss: &str,
         id: Option<Uuid>,
         deps: bool,
+        free_resting: Option<Option<Uuid>>,
     ) -> Result<crate::model::SessionView, DeskError> {
         let Some(group) = new.group.clone().filter(|g| grant::plan_of(g).is_some()) else {
             return Err(DeskError::Invalid(
@@ -331,6 +332,23 @@ impl Desk {
                     there.id
                 ))),
             };
+        }
+        // Its plan starting it again in its worktree: its boss's own earlier
+        // session of it resting there gives way, as on the boss's own
+        // computer ([`Desk::free_resting`]).
+        let branch = new
+            .worktree
+            .as_deref()
+            .map(str::trim)
+            .filter(|b| free_resting.is_some() && !b.is_empty() && !new.fresh_worktree);
+        if let (Some(branch), Some(assigned)) = (branch, free_resting) {
+            if let Ok((_, tree)) =
+                crate::worktree::located(std::path::Path::new(&new.cwd), branch).await
+            {
+                let assigned = assigned.map(|a| a.to_string());
+                self.free_resting(&tree, &new.name, assigned.as_deref(), &party)
+                    .await?;
+            }
         }
         let by = crate::crew::By::manager(
             &party.id,
