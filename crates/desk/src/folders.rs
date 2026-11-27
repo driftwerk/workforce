@@ -194,7 +194,14 @@ fn git_dir(dir: &Path, up: bool, may: &dyn Fn(&Path) -> bool) -> Option<PathBuf>
 /// Where `dir`'s repository comes from, if it is in one with a remote:
 /// looked for above it with `up`, and nowhere `may` doesn't allow.
 pub fn remote_of(dir: &Path, up: bool, may: &dyn Fn(&Path) -> bool) -> Option<String> {
-    let config = std::fs::read_to_string(git_dir(dir, up, may)?.join("config")).ok()?;
+    remote_in(&git_dir(dir, up, may)?, may)
+}
+
+/// The remote the repository whose `.git` folder is `git` comes from: its
+/// origin, else its first; its config read only where `may` allows.
+fn remote_in(git: &Path, may: &dyn Fn(&Path) -> bool) -> Option<String> {
+    let config = git.join("config").canonicalize().ok().filter(|c| may(c))?;
+    let config = std::fs::read_to_string(config).ok()?;
     let mut section = String::new();
     let mut first: Option<String> = None;
     for line in config.lines().map(str::trim) {
@@ -241,12 +248,14 @@ pub fn repo_around(dir: &Path, may: &dyn Fn(&Path) -> bool) -> Option<InRepo> {
         .take_while(|d| may(d))
         .find(|d| std::fs::symlink_metadata(d.join(".git")).is_ok())?
         .to_path_buf();
-    let root = git_dir(&top, false, may)
+    let git = git_dir(&top, false, may);
+    let root = git
+        .as_deref()
         .filter(|g| g.file_name().is_some_and(|n| n == ".git"))
-        .and_then(|g| g.parent().map(Path::to_path_buf))
-        .unwrap_or_else(|| top.clone());
+        .and_then(Path::parent)
+        .map_or_else(|| top.clone(), Path::to_path_buf);
     Some(InRepo {
-        remote: remote_of(&top, false, may),
+        remote: git.as_deref().and_then(|g| remote_in(g, may)),
         root,
         top,
     })

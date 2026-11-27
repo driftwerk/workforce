@@ -937,3 +937,30 @@ async fn a_grant_at_act_fully_says_what_its_sessions_spent_today() {
     })
     .await;
 }
+
+/// A grant written waits for no plan, and one taken away, which deletes
+/// its group, waits for a plan being written: none writes the group back.
+#[tokio::test]
+async fn only_a_grant_taken_away_waits_for_a_plan_being_written() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = engine(pool, dir.path(), true).await;
+        let writing = d.0.plan_write.lock().await;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            put(&d, "g-acme", body(1, "Acme", &[])),
+        )
+        .await
+        .expect("a grant written doesn't wait for plans");
+        let deleting = tokio::spawn({
+            let d = d.clone();
+            async move { d.delete_grant(native(), "g-acme").await }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert!(!deleting.is_finished(), "taking a grant away waits");
+        drop(writing);
+        deleting.await.unwrap().unwrap();
+        assert!(d.layout().groups.iter().all(|g| g.id != "g-acme"));
+    })
+    .await;
+}

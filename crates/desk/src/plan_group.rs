@@ -142,18 +142,17 @@ fn within(folder: &str, cwd: &str) -> bool {
             .is_some_and(|rest| rest.is_empty() || rest.starts_with(SEPARATORS))
 }
 
-/// The group `w`'s repository names: its folders below the root (the
-/// deepest first), the root, its origin's name and owner, then the
-/// repository the ticket names.
+/// The group `w`'s repository names: by what the repository is (its root,
+/// its origin's name and owner, the repository the ticket names), and only
+/// when that names none, by its folders below the root (the deepest
+/// first).
 fn named<'a>(w: &Work, groups: &[Choice<'a>]) -> Option<(&'a str, Why)> {
-    w.checkout
-        .iter()
-        .flat_map(|c| {
-            deepest(c.below)
-                .chain([c.root])
-                .chain(name_and_owner(c.remote))
-        })
+    let checkout = w.checkout.iter();
+    checkout
+        .clone()
+        .flat_map(|c| [c.root].into_iter().chain(name_and_owner(c.remote)))
         .chain(name_and_owner(w.repo))
+        .chain(checkout.flat_map(|c| deepest(c.below)))
         .find_map(|seg| {
             groups
                 .iter()
@@ -268,7 +267,7 @@ mod tests {
             picked(&[checked_out("/w/x", "atlas", None)], &[]),
             Some(("g-atlas".into(), Why::Named("atlas".into())))
         );
-        let below = Work {
+        let below = |remote| Work {
             checkout: Some(Checkout {
                 root: "monorepo",
                 remote,
@@ -277,9 +276,14 @@ mod tests {
             ..work("/w/mantis-crm/monorepo/services/atlas")
         };
         assert_eq!(
-            picked(&[below], &[]),
+            picked(&[below(remote)], &[]),
+            Some(("g-mantis".into(), Why::Named("mantis-crm".into()))),
+            "what the repository is before a folder in it"
+        );
+        assert_eq!(
+            picked(&[below(None)], &[]),
             Some(("g-atlas".into(), Why::Named("atlas".into()))),
-            "a folder below the root before the root and its origin"
+            "a folder in it when the repository names nothing"
         );
         let by_repo = Work {
             repo: Some("github.com/acme/Atlas.git"),

@@ -359,7 +359,7 @@ impl Desk {
         let said = match why {
             Paused::StartFailing => p.paused_why.clone(),
             Paused::Budget => self
-                .plan_starts_held(p.group.as_deref(), p.id)
+                .plan_starts_held(self.live_group(p), p.id)
                 .map(|(_, ask)| ask)
                 .filter(|a| !a.is_empty()),
             Paused::BossHeld => self
@@ -457,7 +457,7 @@ impl Desk {
         if matches!(p.state, PlanState::Done | PlanState::Dropped) {
             return None;
         }
-        self.plan_starts_held(p.group.as_deref(), p.id)
+        self.plan_starts_held(self.live_group(p), p.id)
             .map(|(_, ask)| ask)
     }
 
@@ -2635,7 +2635,7 @@ impl Desk {
         let p = self.plan_of(id).await?;
         let lifted = match p.paused {
             Some(Paused::BossHeld) => self.agent_held(&p.boss).is_none(),
-            Some(Paused::Budget) => self.plan_starts_held(p.group.as_deref(), p.id).is_none(),
+            Some(Paused::Budget) => self.plan_starts_held(self.live_group(&p), p.id).is_none(),
             _ => false,
         };
         if !lifted {
@@ -2971,7 +2971,7 @@ impl Desk {
         }
         let _one = self.0.plan_starting.lock().await;
         let p = &self.plan_of(p.id).await?;
-        if let Some((_, ask)) = self.plan_starts_held(p.group.as_deref(), p.id) {
+        if let Some((_, ask)) = self.plan_starts_held(self.live_group(p), p.id) {
             return Err(StartRefused::Skipped(format!(
                 "Desk's breaker holds new sessions: {ask} The person can say Continue on Desk's Floor."
             )));
@@ -3239,7 +3239,7 @@ impl Desk {
         let still = t.state == TicketState::Doing && t.assignee.is_none();
         let held = p
             .as_ref()
-            .and_then(|p| self.plan_starts_held(p.group.as_deref(), p.id))
+            .and_then(|p| self.plan_starts_held(self.live_group(p), p.id))
             .is_some();
         // A start on a machine that may have made its session there keeps
         // its link while it can't be looked for (no boss, paused or held):
