@@ -19,8 +19,7 @@ workforce run "Summarize the main points from the team meeting notes"
 
 Options:
 - `--agent <id>` — Which agent to use (default: `"default"`).
-- `--model <name>` — LLM model to use.
-- `--provider <name>` — Choose an LLM provider (`anthropic`, `openrouter`, etc.).
+- `--provider <name>` — Choose an LLM provider (`anthropic`, `openrouter`, `grok`, `gemini` or `ollama`).
 - `--workdir <path>` — Working directory for any file operations.
 - `--max-rounds <N>` — Limit how many steps of tool execution the agent can take (default `20`).
 
@@ -33,10 +32,9 @@ workforce chat --gateway ws://localhost:8091 --token <your-token>
 ```
 
 Options:
-- `--gateway <url>` — The WebSocket address of the Workforce hub (defaults to the `workforce.toml` setting).
-- `--token <token>` — Authentication token (found in `workforce.toml` or as `WORKFORCE_GATEWAY_TOKEN` environment variable).
-- `--agent <id>` — Select a specific agent for the session.
-- `--model <name>` — Override the default model for the session.
+- `--gateway <url>` — The WebSocket address of the Workforce hub (required; can come from the `WORKFORCE_GATEWAY_URL` environment variable).
+- `--token <token>` — Authentication token (required; can come from the `WORKFORCE_GATEWAY_TOKEN` environment variable).
+- `--agent <id>` — Select a specific agent for the session (default: `default`).
 
 The chat provides a full terminal interface with real‑time streaming, file attachments, slash commands, and tab completion. See the [TUI Chat](#tui-chat) section for details.
 
@@ -183,7 +181,7 @@ workforce cron add --name "Daily standup" --message "What are you working on tod
 
 Schedule types:
 - `--cron <expr>` — Classic cron expression, e.g., `"0 9 * * *"` for 9 AM daily.
-- `--in <duration>` — Run after a delay, e.g., `"2h"` or `"30m"`.
+- `--in-time <duration>` — Run after a delay, e.g., `"2h"` or `"30m"`.
 - `--every <seconds>` — Repeat every N seconds.
 
 ### `workforce cron remove`
