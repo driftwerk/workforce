@@ -269,8 +269,8 @@ async fn a_resting_session_not_left_by_the_tickets_start_is_left_alone() {
     .await;
 }
 
-/// Desk's own restore at its start brings back sessions that ran together
-/// in a worktree; anyone's resume there is checked.
+/// Desk's own restore at its launch brings back sessions that ran together
+/// in a worktree; any other resume there, even by no one, is checked.
 #[tokio::test]
 async fn desks_own_restore_brings_back_sessions_sharing_a_worktree() {
     with_test_pool(build_pool, |pool| async move {
@@ -290,7 +290,12 @@ async fn desks_own_restore_brings_back_sessions_sharing_a_worktree() {
             d.resume(first.id, None, Some(By::you())).await.unwrap_err(),
             "second",
         );
-        d.resume(first.id, None, None).await.unwrap();
+        assert!(matches!(
+            d.resume(first.id, None, None).await.unwrap_err(),
+            DeskError::WorktreeTaken { .. }
+        ));
+        d.restore_at_launch(&[first.id]).await;
+        assert!(d.record(first.id).unwrap().state.is_running());
         assert!(d.record(second.id).unwrap().state.is_running());
         // Back together, neither is started again over the other: not by a
         // restart, nor by a change of its mode.
@@ -299,7 +304,8 @@ async fn desks_own_restore_brings_back_sessions_sharing_a_worktree() {
             "second",
         );
         assert!(!d.record(first.id).unwrap().state.is_running());
-        d.resume(first.id, None, None).await.unwrap();
+        d.restore_at_launch(&[first.id]).await;
+        assert!(d.record(first.id).unwrap().state.is_running());
         d.set_mode(first.id, crate::mode::Mode::Plan, By::you())
             .await
             .unwrap();

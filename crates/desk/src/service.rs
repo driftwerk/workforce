@@ -2195,7 +2195,7 @@ impl Desk {
                 })
                 .map(|s| s.id)
                 .collect::<Vec<_>>();
-            desk.restore(&ids, None).await;
+            desk.restore_at_launch(&ids).await;
         }
         *desk.0.restoring_since.lock() = None;
         tokio::spawn({
@@ -4233,6 +4233,19 @@ impl Desk {
         prompt: Option<String>,
         by: Option<By>,
     ) -> Result<SessionView, DeskError> {
+        self.resume_as(id, prompt, by, false).await
+    }
+
+    /// [`Self::resume`]; `restoring` only for Desk's restore at its launch
+    /// ([`Self::restore_at_launch`]), which brings back what ran together
+    /// in a worktree before. Every other resume is checked against its hold.
+    async fn resume_as(
+        &self,
+        id: Uuid,
+        prompt: Option<String>,
+        by: Option<By>,
+        restoring: bool,
+    ) -> Result<SessionView, DeskError> {
         // A session Desk's breaker holds goes on only by the person: anyone
         // else's resume, or a prompt with it, is refused. A restore at start
         // (no one, no prompt) starts no turn, and the hold stays.
@@ -4243,8 +4256,6 @@ impl Desk {
             self.breaker_refuses_prompt(id, by.as_ref())?;
         }
         let carrier = by.clone();
-        // A restore (no one, no prompt) brings back what ran before.
-        let restoring = by.is_none() && prompt.is_none();
         self.resume_checked(id, prompt, by, carrier.as_ref(), restoring)
             .await
     }
@@ -4624,9 +4635,19 @@ impl Desk {
     /// Resumes each id, returning those that came back; failures are logged
     /// and leave the session on offer.
     pub async fn restore(&self, ids: &[Uuid], by: Option<By>) -> Vec<SessionView> {
+        self.restore_as(ids, by, false).await
+    }
+
+    /// [`Self::restore`] at Desk's launch: what ran together in a worktree
+    /// before comes back together.
+    pub(crate) async fn restore_at_launch(&self, ids: &[Uuid]) -> Vec<SessionView> {
+        self.restore_as(ids, None, true).await
+    }
+
+    async fn restore_as(&self, ids: &[Uuid], by: Option<By>, restoring: bool) -> Vec<SessionView> {
         let mut back = Vec::new();
         for &id in ids {
-            match self.resume(id, None, by.clone()).await {
+            match self.resume_as(id, None, by.clone(), restoring).await {
                 Ok(v) => back.push(v),
                 Err(e) => tracing::warn!(%id, error = %e, "desk session could not be restored"),
             }
