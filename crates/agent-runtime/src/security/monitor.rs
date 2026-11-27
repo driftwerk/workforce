@@ -2231,7 +2231,10 @@ mod tests {
             ("issue.comment", json!({})),
             ("ticket", json!({ "action": "send_reply" })),
         ] {
-            assert!(names_a_change(tool, input["action"].as_str().unwrap_or_default()));
+            assert!(names_a_change(
+                tool,
+                input["action"].as_str().unwrap_or_default()
+            ));
             for reach in [Reach::Reads, Reach::Stays] {
                 assert!(
                     matches!(
