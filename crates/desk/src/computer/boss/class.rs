@@ -7,8 +7,9 @@
 //! whatever can't be read for certain, is [`Class::Other`].
 
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 
-use super::{push, split, Cmd, Here, PushKind, Walk, Word};
+use super::{push, split, Cmd, Here, Join, PushKind, Walk, Word};
 
 crate::model::text_enum!(Class {
     LocalGit => "local_git",
@@ -970,38 +971,92 @@ fn gh_merges(args: &[&str]) -> bool {
 /// wherever it runs ([`runs`]): what Desk refuses a session before it
 /// runs while a boss acting fully has it.
 pub fn merges_a_pull(command: &str) -> bool {
-    runs(command, &|program, args| program == "gh" && gh_merges(args))
+    runs(command, &|_, program, args| {
+        program == "gh" && gh_merges(args)
+    })
 }
 
-/// Whether `found` holds for a program and its arguments that `command`
-/// runs: chained, in a shell (`sh -c`, `eval`) or by a wrapper (`env`,
-/// `xargs`, `timeout`, [`unwrapped`]). What can't be read as plain
-/// commands is never said to.
-pub(super) fn runs(command: &str, found: &dyn Fn(&str, &[&str]) -> bool) -> bool {
-    runs_within(command, 0, found)
+/// Whether `found` holds for a program, its arguments and the folder it
+/// runs in, that `command` runs: chained, in a shell (`sh -c`, `eval`) or
+/// by a wrapper (`env`, `xargs`, `timeout`, [`unwrapped`]). Its folder is
+/// where the `cd`s before it in the line lead, each from the one before,
+/// when it follows them with `&&` or `;`: none, where the line starts.
+/// What can't be read as plain commands is never said to.
+pub(super) fn runs(command: &str, found: &dyn Fn(Option<&Path>, &str, &[&str]) -> bool) -> bool {
+    runs_within(command, None, 0, found)
 }
 
-fn runs_within(command: &str, depth: usize, found: &dyn Fn(&str, &[&str]) -> bool) -> bool {
-    depth <= DEPTH && split(command).is_ok_and(|cmds| cmds.iter().any(|c| runs_in(c, depth, found)))
+fn runs_within(
+    command: &str,
+    dir: Option<&Path>,
+    depth: usize,
+    found: &dyn Fn(Option<&Path>, &str, &[&str]) -> bool,
+) -> bool {
+    if depth > DEPTH {
+        return false;
+    }
+    let Ok(cmds) = split(command) else {
+        return false;
+    };
+    let mut here = dir.map(Path::to_path_buf);
+    let mut moved: Option<PathBuf> = None;
+    for cmd in &cmds {
+        if let Some(to) = moved.take() {
+            if matches!(cmd.join, Join::And | Join::Seq) {
+                here = Some(to);
+            }
+        }
+        let words = run_words(cmd);
+        let Some((program, args)) = words.split_first() else {
+            continue;
+        };
+        let runs = match program_name(program) {
+            Some("cd") => {
+                moved = cd_to(args).map(|to| match &here {
+                    Some(h) => h.join(to),
+                    None => PathBuf::from(to),
+                });
+                false
+            }
+            Some(name) => match scripted(name, args) {
+                Some(script) => runs_within(&script, here.as_deref(), depth + 1, found),
+                None => found(here.as_deref(), name, args),
+            },
+            None => false,
+        };
+        if runs {
+            return true;
+        }
+    }
+    false
 }
 
-fn runs_in(cmd: &Cmd, depth: usize, found: &dyn Fn(&str, &[&str]) -> bool) -> bool {
+/// The words `cmd` runs: past what it sets (`A=b`) and its wrappers
+/// ([`unwrapped`]).
+fn run_words(cmd: &Cmd) -> Vec<&str> {
     let env = cmd
         .words
         .iter()
         .take_while(|w| super::assigned(w).is_some())
         .count();
     let words = &cmd.words[env..];
-    let words = texts(&words[unwrapped(words)..]);
-    let Some((program, args)) = words.split_first() else {
-        return false;
+    texts(&words[unwrapped(words)..])
+}
+
+/// Where `cd` given `args` goes: its one folder, past its options; none
+/// for its home or the folder before (`cd`, `cd -`).
+fn cd_to<'a>(args: &[&'a str]) -> Option<&'a str> {
+    let operands: Vec<&str> = match args.iter().position(|a| *a == "--") {
+        Some(at) => args[at + 1..].to_vec(),
+        None => args
+            .iter()
+            .copied()
+            .filter(|a| !a.starts_with('-'))
+            .collect(),
     };
-    match program_name(program) {
-        Some(name) => match scripted(name, args) {
-            Some(script) => runs_within(&script, depth + 1, found),
-            None => found(name, args),
-        },
-        None => false,
+    match operands.as_slice() {
+        [to] if *to != "-" => Some(to),
+        _ => None,
     }
 }
 

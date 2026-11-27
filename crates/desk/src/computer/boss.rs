@@ -3078,15 +3078,19 @@ pub struct Pushing {
 
 /// Whether `command` pushes straight to `origin`'s own default branch of a
 /// repository it pushes from that `counts`, wherever it runs it
-/// ([`class::runs`]): `from` reads that repository, given a push's `git -C`
-/// folder (none: where the command starts). A branch that only reads as
-/// the default one (`release-…`) isn't it.
+/// ([`class::runs`]): `from` reads that repository, given the folder a
+/// push runs in, as the `cd`s before it and its `git -C`s lead (none:
+/// where the command starts). A branch that only reads as the default one
+/// (`release-…`) isn't it.
 pub fn pushes_a_default(
     command: &str,
     from: &dyn Fn(Option<&Path>) -> Option<Pushing>,
     counts: &dyn Fn(&Pushing) -> bool,
 ) -> bool {
-    class::runs(command, &|program, args| match git_subcommand(args, None) {
+    class::runs(command, &|dir, program, args| match git_subcommand(
+        args,
+        dir.map(Path::to_path_buf),
+    ) {
         Some((dir, "push", rest)) if program == "git" => from(dir.as_deref())
             .is_some_and(|repo| pushes_its_default(&repo, rest) && counts(&repo)),
         _ => false,
@@ -5224,10 +5228,10 @@ pub(crate) mod tests {
         ));
     }
 
-    /// A push is judged in the repository its `git -C` folders lead to,
-    /// each from the one before.
+    /// A push is judged in the repository the `cd`s before it and its
+    /// `git -C` folders lead to, each from the one before.
     #[test]
-    fn a_push_is_judged_where_git_c_runs_it() {
+    fn a_push_is_judged_where_cd_and_git_c_run_it() {
         let from = |dir: Option<&Path>| {
             let default = match dir.map(|d| d.to_string_lossy().into_owned()).as_deref() {
                 None => "main",
@@ -5248,6 +5252,15 @@ pub(crate) mod tests {
         assert!(past("git -C ../api -C sub push origin trunk"));
         assert!(past("git -C /srv/web push origin develop"));
         assert!(!past("git -C /srv/web push origin main"));
+        assert!(past("cd ../api && git -C sub push origin trunk"));
+        assert!(past("cd ../api; cd sub; git push origin trunk"));
+        assert!(!past("cd ../api/sub && git push origin main"));
+        assert!(
+            past("cd ../api/sub || git push origin main"),
+            "only after it"
+        );
+        assert!(past("cd /srv/web && sh -c 'git push origin develop'"));
+        assert!(past("cd && git push origin main"), "its home: unsaid");
     }
 
     /// Every spelling of a push is classed by what it sends and where, and

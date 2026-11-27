@@ -1092,22 +1092,26 @@ impl Desk {
     /// Whether `id`'s request `pending` pushes straight to the default
     /// branch of the repository it pushes from
     /// ([`crate::computer::boss::pushes_a_default`]), read now where its
-    /// `git -C` leads from where it runs (where it runs, when that isn't a
-    /// repository), and GitHub requires a pull request to change that
-    /// branch ([`Self::requires_pull_requests`]).
+    /// `cd`s and `git -C` lead from where it runs (where it runs, when that
+    /// isn't a repository; the session's folder, when Desk can't tell where
+    /// it runs), and GitHub requires a pull request to change that branch
+    /// ([`Self::requires_pull_requests`]).
     fn pushes_past_review(&self, id: Uuid, pending: &crate::model::PendingApproval) -> bool {
         let (Some(bounds), Ok(view)) = (self.judging_bounds(), self.view(id)) else {
             return false;
         };
         let moved = self.0.state.lock().live.get(&id).is_some_and(|l| l.moved);
         let facts = charge::facts_of(view.engine, pending, &view, &bounds.home, moved);
-        let (charge::What::Command(command), Some(cwd)) = (&facts.what, facts.cwd.as_deref())
-        else {
+        let charge::What::Command(command) = &facts.what else {
             return false;
         };
+        let cwd = facts
+            .cwd
+            .clone()
+            .unwrap_or_else(|| std::path::PathBuf::from(&view.cwd));
         let from = |dir: Option<&std::path::Path>| {
             dir.and_then(|d| pushing_from(&cwd.join(d)))
-                .or_else(|| pushing_from(cwd))
+                .or_else(|| pushing_from(&cwd))
         };
         crate::computer::boss::pushes_a_default(command, &from, &|repo| {
             repo.pulls_into
@@ -2493,8 +2497,8 @@ fn pushing_from(dir: &std::path::Path) -> Option<crate::computer::boss::Pushing>
     })
 }
 
-/// What `cmd` prints, once it ends well before `until`: none when it
-/// fails, or is killed for taking longer.
+/// What `cmd` prints, read as it prints it, once it ends well before
+/// `until`: none when it fails, or is killed for taking longer.
 fn output_until(mut cmd: std::process::Command, until: std::time::Instant) -> Option<String> {
     use std::io::Read;
     let mut child = cmd
@@ -2503,6 +2507,12 @@ fn output_until(mut cmd: std::process::Command, until: std::time::Instant) -> Op
         .stderr(std::process::Stdio::null())
         .spawn()
         .ok()?;
+    let mut stdout = child.stdout.take()?;
+    let (said, heard) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut out = String::new();
+        let _ = said.send(stdout.read_to_string(&mut out).map(|_| out));
+    });
     loop {
         match child.try_wait() {
             Ok(Some(status)) if status.success() => break,
@@ -2515,9 +2525,10 @@ fn output_until(mut cmd: std::process::Command, until: std::time::Instant) -> Op
             Ok(None) => std::thread::sleep(std::time::Duration::from_millis(25)),
         }
     }
-    let mut out = String::new();
-    child.stdout.take()?.read_to_string(&mut out).ok()?;
-    Some(out)
+    heard
+        .recv_timeout(until.saturating_duration_since(std::time::Instant::now()))
+        .ok()?
+        .ok()
 }
 
 /// [`git_line`], given `within` to answer, never asking for a password or

@@ -2232,8 +2232,9 @@ async fn a_push_straight_to_a_default_branch_github_protects_is_refused_before_i
             "a branch GitHub is asked about however it is spelled"
         );
 
-        // `git -C` pushes from the repository it leads to, from where the
-        // session runs; from a folder that isn't one, the session's own.
+        // `git -C` and a `cd` before it push from the repository they lead
+        // to, from where the session runs; from a folder that isn't one,
+        // the session's own.
         std::fs::create_dir_all(base.join("plain")).unwrap();
         for (id, command, refusal, what) in [
             (web, "git -C ../open push origin HEAD:main", None, "an unprotected one"),
@@ -2250,6 +2251,13 @@ async fn a_push_straight_to_a_default_branch_github_protects_is_refused_before_i
                 "not a repository",
             ),
             (elsewhere, "git -C ../plain push origin HEAD:main", None, "not a repository"),
+            (
+                elsewhere,
+                "cd ../web && git push origin HEAD:main",
+                Some(crate::plan::default_push_refused()),
+                "a cd to a protected one",
+            ),
+            (web, "cd ../open; git push origin HEAD:main", None, "a cd to an unprotected one"),
         ] {
             assert_eq!(refused(id, command).await, refusal, "{what}: {command}");
         }
@@ -2259,6 +2267,13 @@ async fn a_push_straight_to_a_default_branch_github_protects_is_refused_before_i
             refused(fresh, "git push origin HEAD:main").await,
             None,
             "a new repository's first push"
+        );
+
+        d.0.state.lock().live.get_mut(&web).unwrap().moved = true;
+        assert_eq!(
+            refused(web, "git push origin HEAD:main").await,
+            Some(crate::plan::default_push_refused()),
+            "where it runs unknown: the session's folder"
         );
 
         d.person_typing(web).unwrap();
@@ -2386,4 +2401,20 @@ async fn a_login_environment_desk_helper_didnt_read_keeps_the_login_shell() {
         );
     })
     .await;
+}
+
+/// A command's output is read as it prints it, so one that prints more
+/// than a pipe holds ends, and is heard whole, long before its deadline.
+#[test]
+fn a_long_answer_is_read_as_it_is_printed() {
+    let mut cmd = std::process::Command::new("sh");
+    cmd.args(["-c", "head -c 300000 /dev/zero | tr '\\0' a"]);
+    let started = std::time::Instant::now();
+    let out = super::output_until(cmd, started + Duration::from_secs(20)).unwrap();
+    assert_eq!(out.len(), 300_000);
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "{:?}",
+        started.elapsed()
+    );
 }
