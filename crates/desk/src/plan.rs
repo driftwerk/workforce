@@ -1715,13 +1715,65 @@ impl PrRef {
 }
 
 /// What a review session is started to review: a pull request, at its
-/// head as it starts, which its verdict names ([`REVIEW_VERDICT`]).
+/// head as it starts, which its verdict names ([`REVIEW_VERDICT`]), and
+/// the session whose work it is, when its boss runs one.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ReviewOf {
     #[serde(flatten)]
     pub pr: PrRef,
     pub head_sha: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub for_session: Option<Uuid>,
+}
+
+/// A review session as Desk linked it: the pull request it reviews, at
+/// the head it was started at, for the session whose work that is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReviewLink {
+    pub session: Uuid,
+    pub boss: String,
+    pub pr: PrRef,
+    pub head_sha: Option<String>,
+    pub for_session: Option<Uuid>,
+    /// Desk is done with it: its verdict recorded, or nothing left to
+    /// record ([`crate::store::DeskStore::pr_review_settle`]).
+    pub settled: bool,
+}
+
+/// The worktree a review of `pr` at `head` reads it in, under its
+/// repository's `.worktrees/`: `review-<number>-<short head>`.
+pub fn review_worktree(pr: &PrRef, head: &str) -> String {
+    format!("review-{}-{}", pr.number, &head[..head.len().min(7)])
+}
+
+/// Why a session's own merge of a pull request is refused while a boss
+/// acting fully has it.
+pub const OWN_MERGE: &str = "At Act fully a pull request is merged only by your boss, with \
+crew.github_merge, once a clean review is recorded at its head.";
+
+/// What a session does instead of merging its own pull request.
+pub const OWN_MERGE_INSTEAD: &str = "Don't merge it yourself: tell your boss on your Desk line \
+that it is ready to merge; your boss merges it once it has a clean review at its head.";
+
+/// [`OWN_MERGE`] and [`OWN_MERGE_INSTEAD`], as a refused call says them.
+pub fn own_merge_refused() -> String {
+    format!("{OWN_MERGE} {OWN_MERGE_INSTEAD}")
+}
+
+/// Why a session's push straight to a default branch that pull requests
+/// merge into is refused while a boss acting fully has it.
+pub const DEFAULT_PUSH: &str = "At Act fully the default branch changes only by a pull request \
+your boss merges once a clean review is recorded at its head.";
+
+/// What a session does instead of pushing its default branch.
+pub const DEFAULT_PUSH_INSTEAD: &str = "Push your own branch and open a pull request for it; Desk \
+has it reviewed, and your boss merges it.";
+
+/// [`DEFAULT_PUSH`] and [`DEFAULT_PUSH_INSTEAD`], as a refused call says
+/// them.
+pub fn default_push_refused() -> String {
+    format!("{DEFAULT_PUSH} {DEFAULT_PUSH_INSTEAD}")
 }
 
 impl ReviewOf {

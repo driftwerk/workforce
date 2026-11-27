@@ -2509,12 +2509,26 @@ async fn terminal_hook(
     }
 }
 
+/// A `gh` command a session's shell is about to run ([`crate::gh_shim`]),
+/// as its body: answered with why Desk refuses it, or nothing.
+async fn gh_asked(
+    State(desk): State<Desk>,
+    Path((id, token)): Path<(Uuid, String)>,
+    body: String,
+) -> Response {
+    match desk.gh_asked(id, &token, &body).await {
+        Some(why) => why.unwrap_or_default().into_response(),
+        None => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
 /// Served on its own loopback listener; the per-session token in the URL is
 /// the credential.
 pub(crate) fn hook_router(desk: Desk) -> Router {
     Router::new()
         .route("/hook/{id}/{token}", post(hook))
         .route("/hook/terminal/{terminal}/{token}", post(terminal_hook))
+        .route("/gh/{id}/{token}", post(gh_asked))
         .merge(crate::line_api::hook_routes())
         .with_state(desk)
 }

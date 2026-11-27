@@ -82,6 +82,10 @@ you decide yourself, now, whether a session may do what it asks. You are given t
 never cut short, with what the session is for and where it stands, and the class of any push in it. ",
     super::watcher::act_fully!(),
     " ALLOW what serves the session's work and no directive forbids. \
+A session's own merge of a pull request, however it is run (gh pr merge, GitHub's merge API by gh \
+or curl, a script that calls it), and its push straight to a default branch that its pull requests \
+merge into, are DENY: its boss merges a pull request with crew.github_merge once a clean review is \
+recorded at its head. \
 A request that only reads (CI status, PR checks, logs, git status or diff) is ALLOW, even while the \
 session is held: a hold stops new work, never reading. Never answer that you can't see the \
 request: it is all here. The fenced blocks are the session's own words (its request, its last \
@@ -94,6 +98,11 @@ DENY: <why, one sentence>\n\
 INSTEAD: <what the session should do instead, one sentence>\n\
 or\n\
 ASK: <the question for the person, one sentence>");
+
+/// Why a session's merge, or push to its default branch, is the person's
+/// while they are in it.
+const PAST_REVIEW_IS_THEIRS: &str =
+    "You're in this session: what it ships without a review is yours to answer.";
 
 /// Why a request that only reads is allowed without a decision call.
 pub(crate) const ONLY_READS: &str = "it only reads, and a hold stops new work, never reading";
@@ -775,6 +784,32 @@ impl CrewHub {
         Outcome::Deciding
     }
 
+    /// What a session's own merge of a pull request, or push to its default
+    /// branch (`class`), is at Act fully: the person's while they are in
+    /// it, else refused, for a reviewed pull request its boss merges.
+    fn past_review(
+        &self,
+        view: &SessionView,
+        o: &workforce_common::oversight::Oversight,
+        class: Class,
+    ) -> Verdict {
+        let now = chrono::Duration::minutes(workforce_desk::charge::PERSON_NOW_MINUTES);
+        match (
+            self.person_in_for(view.id, chrono::Utc::now() - now, self.answer_gap(o)),
+            class,
+        ) {
+            (true, _) => Verdict::Ask(PAST_REVIEW_IS_THEIRS.into()),
+            (false, Class::DefaultBranchPush) => Verdict::Deny {
+                why: workforce_desk::plan::DEFAULT_PUSH.into(),
+                instead: workforce_desk::plan::DEFAULT_PUSH_INSTEAD.into(),
+            },
+            (false, _) => Verdict::Deny {
+                why: workforce_desk::plan::OWN_MERGE.into(),
+                instead: workforce_desk::plan::OWN_MERGE_INSTEAD.into(),
+            },
+        }
+    }
+
     /// The boss's decision on `view`'s request `p`, done.
     async fn decide_request(
         self: &Arc<Self>,
@@ -802,20 +837,32 @@ impl CrewHub {
         // A request that only reads is allowed with no call, whatever
         // holds the session: a hold stops new work, never reading.
         let reads = read_only_in(&view.cwd, p);
-        // What kind of step it is: git is asked off the async workers.
-        let class = match reads {
-            true => Class::Other,
+        // What kind of step it is, and whether it pushes straight to a
+        // default branch GitHub requires pull requests for, however it is
+        // run (`git -C`, a shell): git and GitHub are asked off the async
+        // workers.
+        let (class, past) = match reads {
+            true => (Class::Other, false),
             false => {
                 let (desk, id, approval, boss) =
                     (self.desk.clone(), view.id, p.id, boss.to_string());
-                tokio::task::spawn_blocking(move || desk.request_class(id, approval, &boss))
-                    .await
-                    .unwrap_or(Class::Other)
+                tokio::task::spawn_blocking(move || {
+                    let class = desk.request_class(id, approval, &boss);
+                    let past =
+                        class != Class::GhPrMerge && desk.request_pushes_past_review(id, approval);
+                    (class, past)
+                })
+                .await
+                .unwrap_or((Class::Other, false))
             }
         };
-        let mut decided = match reads {
-            true => Some(Verdict::Allow(ONLY_READS.into())),
-            false => self
+        let mut decided = match (reads, class) {
+            (true, _) => Some(Verdict::Allow(ONLY_READS.into())),
+            (false, Class::GhPrMerge) => Some(self.past_review(view, &decider.oversight, class)),
+            (false, _) if past => {
+                Some(self.past_review(view, &decider.oversight, Class::DefaultBranchPush))
+            }
+            (false, _) => self
                 .standing_allow(&decider, view, class, boss, slot, cancel)
                 .await
                 .map(Verdict::Allow),

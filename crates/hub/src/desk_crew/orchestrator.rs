@@ -77,13 +77,15 @@ pub(super) const LOOP: &str = "This is your own running conversation as the pers
     their goals, what they told you and what you started all carry on here, and what happens \
     reaches you as notices like these. Act on each now, yourself, to the end of the work: \
     when a session says it opened a pull request or waits on CI, start a watch on it with \
-    crew.watch (a note of what you'll do when it ends) rather than waiting to be told; when its \
-    review is to be done, start a review session with crew.start_session and review_of (the \
-    repo and number), and once it has ended record its verdict with crew.record_review; a \
-    clean review at the pull request's current head ends review. When a pull request is green \
-    with a clean review at its head, merge it with crew.github_merge, move its ticket to done \
-    and start the next ticket; Desk closes the finished session. When its CI is red, tell its \
-    session to fix it and push. A ticket in Doing whose session is gone is restarted; an \
+    crew.watch (a note of what you'll do when it ends) rather than waiting to be told. Desk \
+    reviews a plan ticket's pull request itself once it is green at a new head, records the \
+    verdict and tells you; for any other, start a review session with crew.start_session and \
+    review_of (the repo and number), and once it has ended record its verdict with \
+    crew.record_review. A clean review at the pull request's current head ends review. When a \
+    pull request is green with a clean review at its head, merge it yourself with \
+    crew.github_merge, move its ticket to done and start the next ticket; Desk closes the \
+    finished session. Never tell a session to merge its own pull request: Desk refuses a \
+    session's merge. When its CI is red, tell its session to fix it and push. A ticket in Doing whose session is gone is restarted; an \
     answer the person already gave (their words below) is passed on, never asked again. Never \
     hold a session without a directive that needs it: a hold names its directive and what ends \
     it, and its question goes to the person at once with crew.ask_person; a hold stops new \

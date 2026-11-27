@@ -2313,7 +2313,10 @@ impl CrewHub {
                 let busy = self.desk.charges_busy(&boss.id)
                     + self.desk.starts_under_way(&boss.id).await
                     + self.machine_busy(&boss.id);
-                let held = plan::held(&tickets, |s| self.desk.session_busy(s));
+                let reviewing = self.reviewing(&boss.id).await;
+                let held = plan::held(&tickets, |s| {
+                    self.desk.session_busy(s) || reviewing.contains(s)
+                });
                 let room = plan::room(&p, held, busy, limit);
                 for s in plan::next_starts(&p, &rows, room, standing) {
                     match self.desk.plan_start(&p, &s, &boss, &by).await {
@@ -2658,7 +2661,10 @@ impl CrewHub {
         };
         let mut rows = tickets.to_vec();
         mark(&mut rows, &open);
-        let held = plan::held(&rows, |s| self.desk.session_busy(s));
+        let reviewing = self.reviewing(boss).await;
+        let held = plan::held(&rows, |s| {
+            self.desk.session_busy(s) || reviewing.contains(s)
+        });
         mark(&mut rows, &settled);
         let opened = self
             .desk
@@ -2875,7 +2881,7 @@ impl CrewHub {
 
     /// The plan, ticket and key of the plan's ticket `session` (one on this
     /// computer) is linked to, or is being started on, if any.
-    async fn plan_ticket_of(&self, session: Uuid) -> Option<(Uuid, Uuid, String)> {
+    pub(super) async fn plan_ticket_of(&self, session: Uuid) -> Option<(Uuid, Uuid, String)> {
         let store = self.desk.store();
         let linked = store.linked_tickets(&[session]).await.ok()?;
         let starting = store.starting().await.unwrap_or_default();

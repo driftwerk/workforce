@@ -26,13 +26,19 @@
 //!   closes the session and the next tickets start) or what is left is
 //!   the boss's judgement, never this code's; a wait on a scheduled run is
 //!   the boss's promise to check, not a session left open.
+//! - **At Act fully, its pull request green** at a head no one reviewed:
+//!   Desk starts its review itself, as its boss, in a worktree detached at
+//!   that head ([`super::review::step`]); once the review's turn ends its
+//!   verdict is recorded and the review closed. Clean, its boss is told
+//!   once a head to merge it; changes asked for, the ticket's session is
+//!   given them.
 //! - **Nothing moved** for `stall_minutes` while a ticket is ready or in
 //!   Doing and none works: the person is told once, in plain words, what
 //!   is stuck and why. A plan whose goal the person agreed is its goal's
 //!   check's instead ([`super::goal_check`]), which tells its boss alone,
 //!   paused or not.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
@@ -47,8 +53,12 @@ use workforce_desk::open_item_store::Opened;
 use workforce_desk::plan::PlanState;
 use workforce_desk::{DeskError, PlanDetail, PlanTicketView};
 
+use workforce_desk::plan::{PrRef, ReviewOf};
+
 use super::actions::{Action, Gate, Target};
 use super::github_seen::Pull;
+use super::review::{self, short, Reviewing, Step, Unrecorded};
+use super::workspace::{self, Workspace};
 use super::{AgentService, CrewHub};
 
 /// What a session started again is told first.
@@ -62,7 +72,14 @@ const STOPPED_KEY: &str = "plan-stopped:";
 #[derive(Default)]
 pub(crate) struct Watch {
     done: HashSet<String>,
+    /// Each review Desk couldn't record yet, by its session: how many
+    /// times it tried, and when it tries again.
+    unrecorded: HashMap<Uuid, (u32, std::time::Instant)>,
 }
+
+/// How many times Desk tries to record a review it can't before it tells
+/// the boss, once, and leaves it to them.
+const RECORD_TRIES: u32 = 5;
 
 /// Where one of a plan's tickets stands, as the watchdog reads it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -172,11 +189,6 @@ pub(crate) fn landed(pulls: &[(u64, Option<Pull>)]) -> Option<Landed> {
     (!merged.is_empty()).then_some(Landed::Merged(merged))
 }
 
-/// The short form of commit `sha`.
-fn short(sha: &str) -> &str {
-    &sha[..sha.len().min(7)]
-}
-
 /// When the plan last moved: its newest ticket change.
 pub(crate) fn last_moved(tickets: &[PlanTicketView]) -> Option<DateTime<Utc>> {
     tickets.iter().map(|t| t.ticket.ticket.state_at).max()
@@ -195,6 +207,9 @@ impl CrewHub {
                 return;
             }
         };
+        for (service, o) in self.overseers() {
+            self.sweep_reviews(&service, &o).await;
+        }
         for summary in plans {
             let p = summary.plan;
             if p.paused.is_some() {
@@ -242,6 +257,7 @@ impl CrewHub {
 
     async fn watch_plan(&self, service: &Arc<AgentService>, o: &Oversight, p: &PlanDetail) {
         let boss = service.agent_id.as_str();
+        let full = self.level_now(boss, o).0 == Level::Full;
         let now = Utc::now();
         let minute = chrono::Duration::from_std(self.timing.minute).unwrap_or_default();
         let grace = minute * o.work.orphan_grace_minutes as i32;
@@ -312,6 +328,7 @@ impl CrewHub {
                 busy = true;
             }
             let ours = self.bosss_ticket(boss, session, view.is_none());
+            busy |= ours && self.reviews_work(boss, session).await;
             let runs = view
                 .as_ref()
                 .is_some_and(|v| v.live && v.state != SessionState::Closed);
@@ -344,7 +361,10 @@ impl CrewHub {
                                 "{key}'s session finished its turn; the ticket is still in {}",
                                 ticket.state.title()
                             ));
-                            self.rests_on(service, o, p, t, &key, v).await;
+                            if full {
+                                self.review_green(service, o, p, &key, v).await;
+                            }
+                            self.rests_on(service, o, p, t, &key, v, full).await;
                         }
                     }
                 }
@@ -533,7 +553,9 @@ impl CrewHub {
     }
 
     /// `v`, ticket `t`'s session, finished its turn with the ticket open:
-    /// what its pull requests did since is said, once each.
+    /// what its pull requests did since is said, once each; at Act fully
+    /// (`full`), a green one with what follows.
+    #[allow(clippy::too_many_arguments)]
     async fn rests_on(
         &self,
         service: &Arc<AgentService>,
@@ -542,6 +564,7 @@ impl CrewHub {
         t: &PlanTicketView,
         key: &str,
         v: &workforce_desk::model::SessionView,
+        full: bool,
     ) {
         let pulls = self.pulls_of(service, v).await;
         match landed(&pulls) {
@@ -581,8 +604,12 @@ impl CrewHub {
                 }
                 let message = match failed {
                     0 => format!(
-                        "Desk checked GitHub: CI on #{n}'s head {} is green. That is CI's result only; carry on with your ticket as it stands.",
-                        short(&head)
+                        "Desk checked GitHub: CI on #{n}'s head {} is green. That is CI's result only; carry on with your ticket as it stands.{}",
+                        short(&head),
+                        match full {
+                            true => " Desk has it reviewed at that head, and your boss merges it once the review is clean: don't merge it yourself.",
+                            false => "",
+                        }
                     ),
                     f => format!(
                         "Desk checked GitHub: CI on #{n}'s head {} is red ({f} failed {}). Look at the failed jobs and fix them.",
@@ -654,6 +681,409 @@ impl CrewHub {
                 );
                 self.wake_plan(p.summary.plan.id, line);
             }
+        }
+    }
+
+    /// Ticket `key`'s session `v` rests with its own pull request (its
+    /// folder's branch, in its origin) open and green: reviewed, merged by
+    /// its boss, or left as its review says ([`review::step`]).
+    async fn review_green(
+        &self,
+        service: &Arc<AgentService>,
+        o: &Oversight,
+        p: &PlanDetail,
+        key: &str,
+        v: &workforce_desk::model::SessionView,
+    ) {
+        let boss = service.agent_id.as_str();
+        let Workspace::Repo(r) = workspace::workspace_of(&v.cwd).await else {
+            return;
+        };
+        let (Some(origin), Some(branch)) = (r.origin, r.branch) else {
+            return;
+        };
+        let Some((owner, name)) = workforce_desk::goal::github_repo(&origin) else {
+            return;
+        };
+        let Ok(seen) = self.branch_pull(service, &origin, &branch).await else {
+            return;
+        };
+        let Some(pull) = seen
+            .value
+            .filter(|p| p.open && p.checks.as_deref() == Some("success"))
+        else {
+            return;
+        };
+        let Some(head) = pull
+            .head
+            .clone()
+            .filter(|h| workforce_desk::plan::is_sha(h))
+        else {
+            return;
+        };
+        let Ok(number) = i64::try_from(pull.number) else {
+            return;
+        };
+        let pr = PrRef::new(owner, name, number);
+        let store = self.desk.store();
+        let (Ok(newest), Ok(started)) = (
+            store.pr_review_newest(boss, &pr).await,
+            store.pr_reviews_at(boss, &pr, &head).await,
+        ) else {
+            return;
+        };
+        let at_head = Reviewing::of(
+            started
+                .iter()
+                .map(|s| self.desk.view(*s).ok().map(|r| r.state)),
+        );
+        let id = p.summary.plan.id;
+        match review::step(&head, newest.as_ref(), at_head) {
+            Step::Merge => self.ready_once(id, key, &pr, &head, pull.draft),
+            Step::Settled | Step::Underway => {}
+            Step::Lost => {
+                self.unreviewed_once(id, key, &pr, &head, "its review ended with no verdict")
+            }
+            Step::Start => self.start_review(service, o, id, key, v, pr, head).await,
+        }
+    }
+
+    /// Tells plan `id`'s turn, once a head, that ticket `key`'s `pr` is
+    /// green with a clean review at `head`, for its boss to merge.
+    fn ready_once(&self, id: Uuid, key: &str, pr: &PrRef, head: &str, draft: bool) {
+        if self
+            .plan_watch
+            .lock()
+            .done
+            .insert(format!("merge:{}:{head}", review::named(pr)))
+        {
+            self.wake_plan(id, review::ready_line(key, pr, head, draft));
+        }
+    }
+
+    /// Tells plan `id`'s turn, once a head, that ticket `key`'s `pr` is
+    /// green at `head` with no review, and why.
+    fn unreviewed_once(&self, id: Uuid, key: &str, pr: &PrRef, head: &str, why: &str) {
+        if self
+            .plan_watch
+            .lock()
+            .done
+            .insert(format!("unreviewed:{}:{head}", review::named(pr)))
+        {
+            self.wake_plan(id, review::unreviewed_line(key, pr, head, why));
+        }
+    }
+
+    /// Starts the review of ticket `key`'s `pr` at `head` as its boss, in
+    /// `v`'s repository: once a head, again next look while no slot is
+    /// free or it didn't start, its boss told once why it didn't.
+    #[allow(clippy::too_many_arguments)]
+    async fn start_review(
+        &self,
+        service: &Arc<AgentService>,
+        o: &Oversight,
+        id: Uuid,
+        key: &str,
+        v: &workforce_desk::model::SessionView,
+        pr: PrRef,
+        head: String,
+    ) {
+        let boss = service.agent_id.as_str();
+        if self.desk.charges_busy(boss) >= o.work.parallel as usize {
+            return;
+        }
+        let once = format!("review:{}:{head}", review::named(&pr));
+        if !self.plan_watch.lock().done.insert(once.clone()) {
+            return;
+        }
+        let action = Action::StartSession {
+            folder: v.cwd.clone(),
+            goal: review::goal(&pr, &head, key),
+            name: Some(format!("Review {key}")),
+            engine: None,
+            model: None,
+            view: None,
+            worktree: None,
+            fresh: false,
+            review_of: Some(ReviewOf {
+                pr: pr.clone(),
+                head_sha: head.clone(),
+                for_session: Some(v.id),
+            }),
+        };
+        let why = format!("{key}'s pull request is green at a head no one has reviewed.");
+        let started = match self.gate(&action, o) {
+            Gate::Run => {
+                let by = self.by_at_level(self.by_boss(service, &why), o);
+                self.perform(&action, by).await
+            }
+            _ => Err("you may not start sessions yourself".into()),
+        };
+        match started {
+            Ok(done) => {
+                tracing::info!(%key, pr = %review::named(&pr), %done, "a pull request's review started")
+            }
+            Err(e) => {
+                tracing::info!(%key, pr = %review::named(&pr), error = %e, "a pull request's review didn't start");
+                self.plan_watch.lock().done.remove(&once);
+                self.unreviewed_once(
+                    id,
+                    key,
+                    &pr,
+                    &head,
+                    &format!("Desk couldn't start one: {e}"),
+                );
+            }
+        }
+    }
+
+    /// Whether a review Desk started for `boss` of `session`'s work is at
+    /// it: its ticket moves.
+    async fn reviews_work(&self, boss: &str, session: Uuid) -> bool {
+        self.desk
+            .store()
+            .pr_reviews_for(session)
+            .await
+            .unwrap_or_default()
+            .iter()
+            .filter(|l| l.boss == boss && !l.settled)
+            .any(|l| self.desk.view(l.session).is_ok_and(|r| r.state.busy()))
+    }
+
+    /// One look at every review `boss` started that Desk isn't done with,
+    /// at any level, whether or not the session whose work it reads is
+    /// still there: each whose turn ended, or that was closed, has its
+    /// verdict recorded, and is closed and settled once Desk is done with
+    /// it (its verdict kept, the head it read moved on, or its session
+    /// gone). A clean one is told its plan's boss to merge only at Act
+    /// fully; one asking for changes is given to the ticket's session.
+    pub(super) async fn sweep_reviews(&self, service: &Arc<AgentService>, o: &Oversight) {
+        let boss = service.agent_id.as_str();
+        let Ok(links) = self.desk.store().pr_reviews_unsettled(boss).await else {
+            return;
+        };
+        let full = self.level_now(boss, o).0 == Level::Full;
+        let settle = *self.close_settle.lock();
+        for l in links {
+            let Some(head) = l.head_sha.as_deref() else {
+                continue;
+            };
+            let r = match self.desk.view(l.session) {
+                Ok(r) => r,
+                Err(DeskError::NotFound) => {
+                    self.settle_review(l.session).await;
+                    continue;
+                }
+                Err(_) => continue,
+            };
+            let closed = r.state == SessionState::Closed;
+            if !closed && !super::closing::at_rest(&r, Utc::now(), settle) {
+                continue;
+            }
+            if !self.record_due(r.id) {
+                continue;
+            }
+            let plan = match l.for_session {
+                Some(s) => self
+                    .plan_ticket_of(s)
+                    .await
+                    .map(|(plan, _, key)| (plan, key)),
+                None => None,
+            };
+            let tell = |line: String| {
+                if let Some((id, _)) = &plan {
+                    self.wake_plan(*id, line);
+                }
+            };
+            let key = plan.as_ref().map_or("A review", |(_, k)| k.as_str());
+            match self.record_of(service, boss, r.id).await {
+                Ok((done, said)) => {
+                    self.settle_review(r.id).await;
+                    match (done.clean, &plan, l.for_session) {
+                        (true, Some((id, key)), _) if full => {
+                            let draft = self
+                                .pull(
+                                    service,
+                                    &review::full_name(&done.pr),
+                                    done.pr.number.unsigned_abs(),
+                                )
+                                .await
+                                .is_some_and(|p| p.draft);
+                            self.ready_once(*id, key, &done.pr, &done.head_sha, draft);
+                        }
+                        (false, Some((id, key)), Some(work)) => {
+                            self.changes_asked(
+                                service,
+                                o,
+                                *id,
+                                key,
+                                work,
+                                &done.pr,
+                                &done.head_sha,
+                                &said,
+                            )
+                            .await
+                        }
+                        _ => {}
+                    }
+                    self.close_review(service, o, &r, &l.pr, head).await;
+                }
+                Err(Unrecorded::NoVerdict) if closed => {
+                    self.settle_review(r.id).await;
+                    tell(format!(
+                        "{key}: its review {} was closed with no verdict line, so nothing was recorded. {}",
+                        r.label(),
+                        review::NO_VERDICT
+                    ));
+                }
+                Err(Unrecorded::NoVerdict) => {
+                    let first = self
+                        .plan_watch
+                        .lock()
+                        .done
+                        .insert(format!("verdict:{}:{}", r.id, r.prompts));
+                    match first {
+                        true => {
+                            let action = Action::Nudge {
+                                to: Target::Session(r.id),
+                                message: workforce_desk::plan::review_instruction(head),
+                                reply_to: None,
+                            };
+                            let by = self.by_at_level(
+                                self.by_boss(service, "Its review ended with no verdict line."),
+                                o,
+                            );
+                            if let Err(e) = self.perform(&action, by).await {
+                                tracing::info!(session = %r.id, error = %e, "a review with no verdict wasn't asked for one");
+                            }
+                        }
+                        false => tell(format!(
+                            "{key}: its review {} ended again with no verdict line. {}",
+                            r.label(),
+                            review::NO_VERDICT
+                        )),
+                    }
+                }
+                Err(Unrecorded::Moved(why)) => {
+                    tracing::info!(session = %r.id, %why, "a review of a head that moved on is closed");
+                    self.settle_review(r.id).await;
+                    self.close_review(service, o, &r, &l.pr, head).await;
+                }
+                // Given up on, its boss is told, and Desk is done with it:
+                // nothing holds it open any more.
+                Err(Unrecorded::No(why)) => {
+                    if self.record_failed(r.id) {
+                        tell(format!(
+                            "{key}: Desk couldn't record its review {} after {RECORD_TRIES} tries ({why}): record it with crew.record_review while it is open, or close it.",
+                            r.label()
+                        ));
+                        self.settle_review(r.id).await;
+                    }
+                    tracing::info!(session = %r.id, %why, "a review wasn't recorded");
+                }
+            }
+        }
+    }
+
+    /// Whether Desk tries to record review session `id` now: not while it
+    /// waits to try again, nor once it gave up on it.
+    fn record_due(&self, id: Uuid) -> bool {
+        self.plan_watch
+            .lock()
+            .unrecorded
+            .get(&id)
+            .is_none_or(|(tries, at)| *tries < RECORD_TRIES && *at <= std::time::Instant::now())
+    }
+
+    /// Review session `id` couldn't be recorded: it is tried again a look
+    /// later each time, twice as long each time. Whether Desk gives up on
+    /// it now, its boss to be told.
+    fn record_failed(&self, id: Uuid) -> bool {
+        let mut w = self.plan_watch.lock();
+        let (tries, at) = w
+            .unrecorded
+            .entry(id)
+            .or_insert((0, std::time::Instant::now()));
+        *tries += 1;
+        *at = std::time::Instant::now() + self.timing.minute * 2u32.pow(*tries - 1);
+        *tries == RECORD_TRIES
+    }
+
+    /// Keeps that Desk is done with review session `id`.
+    async fn settle_review(&self, id: Uuid) {
+        self.plan_watch.lock().unrecorded.remove(&id);
+        if let Err(e) = self.desk.store().pr_review_settle(id).await {
+            tracing::info!(session = %id, error = %e, "a review Desk is done with stays to settle");
+        }
+    }
+
+    /// Gives ticket `key`'s session `work` the changes its review of `pr` at
+    /// `head` asked for (`said`, its reviewer's final reply), as its boss,
+    /// and tells plan `id`'s turn.
+    #[allow(clippy::too_many_arguments)]
+    async fn changes_asked(
+        &self,
+        service: &Arc<AgentService>,
+        o: &Oversight,
+        id: Uuid,
+        key: &str,
+        work: Uuid,
+        pr: &PrRef,
+        head: &str,
+        said: &str,
+    ) {
+        let action = Action::Nudge {
+            to: Target::Session(work),
+            message: review::changes_message(pr, head, said),
+            reply_to: None,
+        };
+        let by = self.by_at_level(self.by_boss(service, "Its review asked for changes."), o);
+        match self.perform(&action, by).await {
+            Ok(_) => self.wake_plan(id, review::changes_line(key, pr, head)),
+            Err(e) => {
+                tracing::info!(session = %work, error = %e, "a review's changes weren't given to its session");
+                self.wake_plan(
+                    id,
+                    format!(
+                        "{key}: the review of {} at {} asked for changes, and Desk couldn't tell its session ({e}): tell it with crew.nudge.",
+                        review::named(pr),
+                        short(head)
+                    ),
+                );
+            }
+        }
+    }
+
+    /// Closes review session `r` of `pr` at `head`, its review done, as
+    /// its boss, and removes the worktree Desk made it read in: kept while
+    /// it holds work.
+    async fn close_review(
+        &self,
+        service: &Arc<AgentService>,
+        o: &Oversight,
+        r: &workforce_desk::model::SessionView,
+        pr: &PrRef,
+        head: &str,
+    ) {
+        let closed = match r.state {
+            SessionState::Closed => Ok(()),
+            _ => {
+                let by = self.by_at_level(self.by_boss(service, "Its review is done."), o);
+                self.perform(&Action::Close { session: r.id }, by)
+                    .await
+                    .map(drop)
+            }
+        };
+        match closed {
+            Ok(()) if review::made_for(&r.cwd, pr, head) => {
+                if let Err(e) =
+                    workforce_desk::worktree::remove(std::path::Path::new(&r.cwd), head).await
+                {
+                    tracing::info!(session = %r.id, error = %e, "a closed review's worktree stays");
+                }
+            }
+            Ok(()) => {}
+            Err(why) => tracing::info!(session = %r.id, %why, "a review session stays open"),
         }
     }
 

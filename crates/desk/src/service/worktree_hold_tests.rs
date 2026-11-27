@@ -357,13 +357,13 @@ async fn a_review_in_a_worktree_holds_nothing() {
             .create(on(repo.path(), "review", Some("man-22")), None)
             .await
             .unwrap();
-        let pr = crate::plan::PrRef {
-            owner: "acme".into(),
-            repo: "atlas".into(),
-            number: 22,
+        let of = crate::plan::ReviewOf {
+            pr: crate::plan::PrRef::new("acme", "atlas", 22),
+            head_sha: "a".repeat(40),
+            for_session: None,
         };
         d.0.store
-            .pr_review_link(review.id, "sarah", &pr)
+            .pr_review_link(review.id, "sarah", &of)
             .await
             .unwrap();
         let work = d

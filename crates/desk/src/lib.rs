@@ -54,6 +54,7 @@ pub mod find;
 mod first_run;
 pub mod floor;
 pub mod folders;
+mod gh_shim;
 pub mod gist;
 pub mod github_sync;
 pub mod goal;

@@ -703,6 +703,7 @@ impl CrewTool {
             o.remove("brief_was");
             if let Some(r) = o.get_mut("review_of").and_then(Value::as_object_mut) {
                 r.remove("head_sha");
+                r.remove("for_session");
             }
             // What it applies is checked below and cited, never read as
             // part of the action or kept with a suggestion.
