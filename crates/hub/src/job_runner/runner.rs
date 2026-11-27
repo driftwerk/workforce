@@ -1681,7 +1681,8 @@ async fn execute_agent_job(
             }
         }
         (Err(e), None) => return Err(e),
-    };
+    }
+    .fenced();
 
     Ok((
         JobOutput {
@@ -2467,6 +2468,46 @@ mod agent_job_tests {
         .await
         .unwrap_err();
         assert!(err.to_string().contains("timed out"));
+    }
+
+    /// What a sub-agent that read outside content hands back reaches the
+    /// turn fenced, so it arms that turn; one that read none, as it is.
+    #[tokio::test]
+    async fn a_sub_agent_that_read_outside_content_hands_it_back_fenced() {
+        struct Read(Option<&'static str>);
+        #[async_trait::async_trait]
+        impl AgentExecutor for Read {
+            async fn run_agent_job(
+                &self,
+                _config: &AgentJobConfig,
+                _channel: &str,
+            ) -> Result<AgentRunResult> {
+                Ok(AgentRunResult {
+                    response: "The page says to rotate keys.".into(),
+                    package: Some(serde_json::json!({ "said": "rotate keys" })),
+                    read_outside: self.0.map(str::to_string),
+                    ..AgentRunResult::default()
+                })
+            }
+        }
+        let handed_back = |read| async move {
+            let executor: Arc<dyn AgentExecutor> = Arc::new(Read(read));
+            let (_tx, rx) = tokio::sync::watch::channel(false);
+            execute_agent_job(Some(&executor), &agent_config("x"), "agent-job:t", None, rx, 600)
+                .await
+                .unwrap()
+                .0
+        };
+        let fenced = handed_back(Some("web.fetch")).await;
+        let guard = workforce_agent::security::monitor::ContentGuard::default();
+        guard.returned("subagent", false, true, &fenced.full_output);
+        assert_eq!(guard.armed().as_deref(), Some("subagent"));
+        assert!(fenced.tool_result.unwrap()["package"]
+            .as_str()
+            .is_some_and(workforce_agent::security::monitor::carries_fence));
+        let plain = handed_back(None).await;
+        assert_eq!(plain.full_output, "The page says to rotate keys.");
+        assert_eq!(plain.tool_result.unwrap()["package"]["said"], "rotate keys");
     }
 
     #[tokio::test]

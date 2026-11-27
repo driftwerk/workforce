@@ -20,7 +20,8 @@ pub const BOARD: &str = "board";
 pub const EXCHANGE_TEXT: usize = 48_000;
 pub const EXCHANGE_ASK: usize = 8_000;
 /// The most steps, files, commands or errors an exchange carries, and the
-/// most characters of each.
+/// most characters of each; how many steps and commands it had in all goes
+/// with them, so the agent's hub knows when they were cut.
 const LIST_ITEMS: usize = 40;
 const LIST_CHARS: usize = 300;
 /// The most of an account's done items.
@@ -423,8 +424,10 @@ pub fn exchange(e: &ExchangeRow, place: &Where, redactor: &dyn Redactor) -> Outg
         "asker": e.asker,
         "ask": cut(&e.ask, EXCHANGE_ASK),
         "steps": steps,
+        "steps_total": e.steps.as_array().map_or(0, Vec::len),
         "files": list(&e.files),
         "commands": list(&e.commands),
+        "commands_total": e.commands.len(),
         "errors": list(&e.errors),
         "flagged": e.flagged,
         "text": cut(&format!("{}\n\n{}", e.ask, e.answer), EXCHANGE_TEXT),
@@ -477,6 +480,43 @@ mod tests {
 
     fn at() -> DateTime<Utc> {
         "2026-11-13T10:00:00Z".parse().unwrap()
+    }
+
+    /// An exchange sends how many steps and commands it had, so the agent's
+    /// hub knows when the lists were cut.
+    #[test]
+    fn an_exchange_says_how_many_steps_and_commands_it_had() {
+        let place = Where {
+            group: None,
+            group_name: None,
+        };
+        let steps: Vec<Value> = (0..LIST_ITEMS + 5)
+            .map(|i| json!({"tool": "Bash", "input": format!("step {i}")}))
+            .collect();
+        let e = exchange(
+            &ExchangeRow {
+                reference: "claude:k".into(),
+                session: Uuid::from_u128(1),
+                session_name: None,
+                group: None,
+                at: at(),
+                ended: at(),
+                asker: "person".into(),
+                ask: "go".into(),
+                answer: "done".into(),
+                steps: Value::Array(steps),
+                files: vec![],
+                commands: (0..LIST_ITEMS + 3).map(|i| format!("echo {i}")).collect(),
+                errors: vec![],
+                flagged: vec![],
+            },
+            &place,
+            &Hide,
+        );
+        assert_eq!(e.body["steps"].as_array().unwrap().len(), LIST_ITEMS);
+        assert_eq!(e.body["steps_total"], LIST_ITEMS + 5);
+        assert_eq!(e.body["commands"].as_array().unwrap().len(), LIST_ITEMS);
+        assert_eq!(e.body["commands_total"], LIST_ITEMS + 3);
     }
 
     #[test]

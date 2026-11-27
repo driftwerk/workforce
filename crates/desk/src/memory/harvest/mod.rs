@@ -178,6 +178,27 @@ mod tests {
         }
     }
 
+    /// A web search Codex ran is a step of its exchange, as Claude Code's are.
+    #[test]
+    fn a_codex_web_search_is_a_step() {
+        let lines = [
+            r#"{"timestamp":"2026-10-31T10:05:00.000Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-10-31T10:05:00.300Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"What changed in v2?"}]}}"#,
+            r#"{"timestamp":"2026-10-31T10:05:01.000Z","type":"response_item","payload":{"type":"web_search_call","id":"ws_1","status":"completed","action":{"type":"search","query":"atlas v2 changelog"}}}"#,
+            r#"{"timestamp":"2026-10-31T10:05:02.000Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"It drops v1 tokens."}]}}"#,
+            r#"{"timestamp":"2026-10-31T10:05:02.100Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1"}}"#,
+        ];
+        let (_, closed) = fold(None, codex(&lines, &mut CodexParts::default()), &Plain);
+        assert_eq!(
+            closed[0]
+                .steps
+                .iter()
+                .map(|s| (s.tool.as_str(), s.input.as_str()))
+                .collect::<Vec<_>>(),
+            [("web_search", "atlas v2 changelog")]
+        );
+    }
+
     #[test]
     fn a_codex_rollout_folds_into_its_exchanges() {
         let lines: Vec<&str> = CODEX.lines().collect();

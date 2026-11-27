@@ -195,6 +195,13 @@ mod tests {
                 !op.split('_').any(|word| WRITE_OPS.contains(&word)),
                 "{name} names a change"
             );
+            assert!(
+                !workforce_agent::security::monitor::names_a_change(name, ""),
+                "{name} is named as a change"
+            );
+        }
+        for name in tool_helpers::OTHERS_WORDS {
+            assert!(tool_helpers::READS.contains(name), "{name} is not a read");
         }
     }
 

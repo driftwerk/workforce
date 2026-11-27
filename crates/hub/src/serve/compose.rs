@@ -1542,18 +1542,35 @@ impl crate::job_runner::AgentExecutor for ServiceAgentExecutor {
         config: &crate::hub_core::jobs::AgentJobConfig,
         channel: &str,
     ) -> eyre::Result<crate::hub_core::jobs::AgentRunResult> {
-        crate::scheduler::descending_from(
+        let read = Arc::new(std::sync::Mutex::new(None::<String>));
+        let keeper: workforce_agent::security::monitor::Keeper = {
+            let read = Arc::clone(&read);
+            Arc::new(move |scope| {
+                if let Some(armed) = &scope.armed {
+                    read.lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .get_or_insert_with(|| armed.clone());
+                }
+            })
+        };
+        let result = crate::scheduler::descending_from(
             config.automated_origin.clone(),
-            workforce_agent::runner::with_content_guard(
-                config.guarded_as.clone().map(|scope| {
-                    Arc::new(workforce_agent::security::monitor::ContentGuard::new(
-                        *scope,
-                    ))
-                }),
-                self.run_as_submitted(config, channel),
+            workforce_agent::runner::with_guard_keeper(
+                Some(keeper),
+                workforce_agent::runner::with_content_guard(
+                    config.guarded_as.clone().map(|scope| {
+                        Arc::new(workforce_agent::security::monitor::ContentGuard::new(*scope))
+                    }),
+                    self.run_as_submitted(config, channel),
+                ),
             ),
         )
-        .await
+        .await?;
+        let read_outside = read.lock().unwrap_or_else(|e| e.into_inner()).take();
+        Ok(crate::hub_core::jobs::AgentRunResult {
+            read_outside,
+            ..result
+        })
     }
 }
 

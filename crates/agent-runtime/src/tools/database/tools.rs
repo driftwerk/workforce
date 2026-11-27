@@ -28,7 +28,8 @@ trait DbTool: Send + Sync {
     fn tool_name(&self) -> &'static str;
     fn tool_description(&self) -> &'static str;
     fn tool_schema(&self) -> Value;
-    /// Whether it only reads the database.
+    /// Whether it only reads what the database is made of: its instances,
+    /// schemas, tables and columns. Its rows are others' words.
     fn reads(&self) -> bool;
     async fn run(&self, input: Value) -> Result<Value>;
 }
@@ -430,7 +431,7 @@ impl DbTool for QueryTool {
         })
     }
     fn reads(&self) -> bool {
-        true
+        false
     }
     async fn run(&self, input: Value) -> Result<Value> {
         let sql = sql_arg(&input)?;
@@ -489,7 +490,7 @@ impl DbTool for ExplainTool {
         })
     }
     fn reads(&self) -> bool {
-        true
+        false
     }
     async fn run(&self, input: Value) -> Result<Value> {
         let sql = sql_arg(&input)?;

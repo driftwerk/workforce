@@ -68,6 +68,7 @@ pub(crate) fn knowledge() -> Knowledge {
             .collect(),
         outside_reads: workforce_skills::adapters::outside_reads()
             .into_iter()
+            .chain(crate::aws::BODY_TOOLS.iter().map(|tool| tool.to_string()))
             .collect(),
         runs_commands: Some(|tool, input| {
             crate::authz::tool_capability(tool, input) == Some(crate::authz::Capability::ShellExec)
@@ -633,6 +634,15 @@ mod tests {
                     .any(|tool| tool == read),
                 "{read} is offered unnamed"
             );
+        }
+        for (tool, arms) in [
+            ("aws.s3.get", true),
+            ("aws.s3.collect", true),
+            ("aws.s3.list", false),
+        ] {
+            let fresh = ContentGuard::new(ContentScope::default());
+            fresh.returned(tool, false, true, "the object");
+            assert_eq!(fresh.armed().is_some(), arms, "{tool}: an object's body is others' words");
         }
     }
 

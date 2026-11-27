@@ -193,7 +193,7 @@ impl Tool for FreeAgentTool {
     }
 
     fn reach(&self, _input: &serde_json::Value) -> Option<workforce_agent::tools::Reach> {
-        (!self.spec.require_approval).then_some(workforce_agent::tools::Reach::Reads)
+        self.spec.reads.then_some(workforce_agent::tools::Reach::Reads)
     }
 
     async fn execute(&self, input: Value) -> Result<ToolResult> {
@@ -209,6 +209,8 @@ struct ToolSpec {
     description: &'static str,
     schema: Value,
     require_approval: bool,
+    /// Whether it only reads the books.
+    reads: bool,
     handler: Handler,
 }
 
@@ -224,6 +226,7 @@ impl ToolSpec {
             description,
             schema,
             require_approval: false,
+            reads: true,
             handler,
         }
     }
@@ -239,6 +242,7 @@ impl ToolSpec {
             description,
             schema,
             require_approval: true,
+            reads: false,
             handler,
         }
     }

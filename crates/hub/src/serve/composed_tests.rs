@@ -6402,8 +6402,6 @@ async fn after_a_web_read_everyday_tools_run_and_ways_out_are_still_held() {
         "database.schemas",
         "database.tables",
         "database.columns",
-        "database.query",
-        "database.explain",
         "store.get",
         "store.list",
         "store.query",
@@ -6418,6 +6416,23 @@ async fn after_a_web_read_everyday_tools_run_and_ways_out_are_still_held() {
     assert_eq!(
         weigh("budget", serde_json::json!({ "action": "status" })),
         None
+    );
+    // No tool's own word is given for a call named as a change.
+    for name in service.tools.names() {
+        let tool = service.tools.get(&name).unwrap();
+        assert!(
+            tool.reach(&nothing).is_none()
+                || !workforce_agent::security::monitor::names_a_change(&name, ""),
+            "{name}"
+        );
+    }
+    assert!(
+        service
+            .tools
+            .get("view_attachment")
+            .unwrap()
+            .reads_outside_content(),
+        "an attachment arms the turn that reads it"
     );
     // As the person was asked about them (DW-767): the agent's own work.
     for (tool, input) in [
@@ -6455,10 +6470,13 @@ async fn after_a_web_read_everyday_tools_run_and_ways_out_are_still_held() {
     ));
     for (tool, input) in [
         ("budget", serde_json::json!({ "action": "set_override" })),
+        ("budget", nothing.clone()),
         ("store.set", nothing.clone()),
         ("store.claim", nothing.clone()),
         ("pipeline.record", nothing.clone()),
         ("database.execute", nothing.clone()),
+        ("database.query", nothing.clone()),
+        ("database.explain", nothing.clone()),
         ("github.clone", nothing.clone()),
     ] {
         assert!(weigh(tool, input).is_some(), "{tool}");

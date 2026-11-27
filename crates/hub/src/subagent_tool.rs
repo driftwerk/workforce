@@ -186,10 +186,14 @@ impl Tool for SubAgentTool {
     /// A spawn naming a channel announces its result there.
     fn surface_effect(&self, input: &serde_json::Value) -> Option<SurfaceEffect> {
         (input["action"] == "spawn")
-            .then(|| input["channel_id"].as_str())
+            .then(|| named(input["channel_id"].as_str()))
             .flatten()
             .map(|channel| {
-                writes(&serde_json::json!({ "channel": channel, "thread_id": input["thread_id"] }))
+                writes(&serde_json::json!({
+                    "channel": channel,
+                    "thread_id": named(input["thread_id"].as_str()),
+                    "platform": workforce_agent::security::monitor::turn_platform(),
+                }))
             })
     }
 
@@ -273,8 +277,11 @@ impl SubAgentTool {
         let timeout_secs = input.timeout_secs.unwrap_or(DEFAULT_TIMEOUT_SECS);
 
         // Resolve messaging context so the runner announces the result in-thread.
-        let (channel_id, thread_id) = if input.channel_id.is_some() {
-            (input.channel_id, input.thread_id)
+        let (channel_id, thread_id) = if let Some(channel) = named(input.channel_id.as_deref()) {
+            (
+                Some(channel.to_string()),
+                named(input.thread_id.as_deref()).map(str::to_string),
+            )
         } else if let Some(ref sched) = self.service.scheduler {
             let session_key = CURRENT_SESSION_KEY
                 .try_with(|k| k.clone())
@@ -558,6 +565,11 @@ fn handed_back(
     out
 }
 
+/// `value` unless it is blank.
+fn named(value: Option<&str>) -> Option<&str> {
+    value.filter(|value| !value.trim().is_empty())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -634,6 +646,36 @@ mod tests {
         let fetch = |url: &str| job.check("web.fetch", &serde_json::json!({ "url": url }), None);
         assert!(fetch("https://docs.example/next").is_none());
         assert!(fetch("https://elsewhere.example/?d=1").is_some());
+    }
+
+    /// A spawn naming a channel writes there on the turn's platform; a blank
+    /// one, or none, writes nowhere.
+    #[tokio::test]
+    async fn a_spawn_naming_a_channel_writes_there_on_the_turns_platform() {
+        let dir = tempfile::tempdir().unwrap();
+        let tool = SubAgentTool::new(crate::serve::testing::plain_service(dir.path()).await);
+        let spawn = |channel: &str| {
+            serde_json::json!({ "action": "spawn", "task": "t", "channel_id": channel, "thread_id": "" })
+        };
+        assert_eq!(tool.surface_effect(&spawn(" ")), None);
+        assert_eq!(
+            tool.surface_effect(&serde_json::json!({ "action": "spawn", "task": "t" })),
+            None
+        );
+        assert_eq!(
+            tool.surface_effect(&serde_json::json!({ "action": "list", "channel_id": "C9" })),
+            None
+        );
+        let on_teams = CURRENT_SESSION_KEY.sync_scope("teams:19:abc".to_string(), || {
+            tool.surface_effect(&spawn("C9"))
+        });
+        assert_eq!(
+            on_teams,
+            Some(SurfaceEffect::Writes {
+                platform: "teams".into(),
+                destination: "C9".into(),
+            })
+        );
     }
 
     /// An overseer that prefers real sessions spawns only read-only

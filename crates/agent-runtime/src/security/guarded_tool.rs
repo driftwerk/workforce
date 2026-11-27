@@ -1,6 +1,4 @@
-//! A tool run under a turn's content guard outside the turn's own gates,
-//! where nobody can be asked: by a loop a tool runs for itself, such as the
-//! advisor's research.
+//! A tool run under a content guard where nobody can be asked, such as the advisor's research.
 
 use std::sync::Arc;
 

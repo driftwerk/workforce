@@ -52,24 +52,28 @@ MCP servers' own tools (`mcp.<server>.<tool>`), WASM and external skills stay he
 
    `Reads`: the call only looks. `Stays`: what it does stays with the agent: a consultation, a file it makes for its own conversation. `None`, the default, keeps today's judgement, so a tool that says nothing is held as before. `delegate_call_facts!` forwards it, so no wrapper (`ConnectionWrite`, `mcp_turn`, `sessions_only`, `boss_links::hold`) drops it.
 
-2. **The declaration only places what nothing else holds.** `Call` carries `reach`; `Call::told_by(tool)` fills it and `standing` from the tool, and `guarded_call` (R/tools/dispatch.rs) uses it. `assess` reads it only in its last step, beside `KEPT_READS` and `OWN_NAMESPACES`. Credentials, unseen URLs, writes somewhere new, outbound delivery, commands, identity files, persistence, setup and standing automation are all decided before it, so no declaration lifts them.
+2. **The declaration only places what nothing else holds.** `Call` carries `reach`; `Call::told_by(tool)` fills it and `standing` from the tool, and `guarded_call` (R/tools/dispatch.rs) uses it. `assess` reads it only in its last step, beside `KEPT_READS` and `OWN_NAMESPACES`. Credentials, unseen URLs, writes somewhere new, outbound delivery, commands, identity files, persistence, setup and standing automation are all decided before it, so no declaration lifts them. Nor does a declaration place a call whose leaf or action is named as a change (`outward`, exposed as `monitor::names_a_change`): that call is held as a send. The listed reads and own namespaces keep their place (`filesystem.write` is the agent's own work), so the check applies to the declaration alone.
 
 3. **Where a module already declares its reads, the guard uses it.** `Knowledge::reads` (H/monitor/scope.rs `knowledge()`) adds `aws::read_tool_names()` ("every `aws.*` tool is read-only by construction") and `bank::READ_TOOLS`. They are added to the guard's knowledge only, not to `scope::reads()`: that list is also what a monitor's turn is offered, and it stays as it is.
 
 4. **Each tool declares itself where it is defined:**
-   - `advisor`: `Stays`. Its answer is advice, never an action, from a provider the agent already uses. Its in-process loop's own tools (`filesystem.read`/`grep`/`glob`, `web.fetch`, `web.search`) run under a branch of the asking turn's guard (`ContentGuard::branch`: armed and scoped as the turn is, with its seen URLs, arming apart from it), through a new `security::guarded_tool::GuardedTool` wrapper (`build_advisor_tools` wraps each with one branch per consultation): a call the branch holds is refused to the advisor with the hold's reason (nobody watches an advisor round) and doesn't run, and what a call returns arms the branch as a runner's result arms a turn. That keeps a steered advisor from fetching a URL the turn never saw, whether the turn read outside content first or the advisor did, and what the advisor reads never arms the turn itself, so it asks the person nothing new. The arming rule is one `ContentGuard::returned(tool, outside, success, output)`, which the runner's `arm_on_result` now calls too. The Claude Code advisor round is already guarded through `RoundTools::bind`.
-   - `XeroTool`, `FreeAgentTool`: `Reads` for a spec built with `ToolSpec::read`, from `spec.require_approval`.
+   - `advisor`: `Stays`. Its answer is advice, never an action, from a provider the agent already uses. `AdvisorTool::execute` runs the whole consultation under a branch of the asking turn's guard (`ContentGuard::branch`: linked to the turn, so it is armed and given URLs whenever the turn is, even after the branch was made, and arming apart from it). Every route uses that guard:
+     - the in-process loop's tools (`filesystem.read`/`grep`/`glob`, `web.fetch`, `web.search`) run through a new `security::guarded_tool::GuardedTool` wrapper (`build_advisor_tools`): a call the branch holds is refused to the advisor with the hold's reason (nobody watches an advisor round) and doesn't run, and what a call returns arms the branch as a runner's result arms a turn;
+     - the Claude Code round's tools go through `RoundTools::bind`, which captures the branch and arms it on each result.
+
+     When the branch is armed, the advice reaches the turn fenced with `wrap_external_content` (`for_the_turn`), so the turn is armed by it and may open its URLs as by any fence. A steered advisor can't fetch a URL the turn never saw, and advice built from a page arms the turn, so what the turn does next is held as after any outside read. The arming rule is one `ContentGuard::returned(tool, outside, success, output)`, which the runner's `arm_on_result` now calls too.
+   - `XeroTool`, `FreeAgentTool`: `Reads` for a spec built with `ToolSpec::read`, from a `reads` flag on the spec.
    - `StoreTool`, `PipelineTool`: `Reads` for an op whose `access()` is `Access::Read`.
-   - `GoogleTool`: `Reads` for a name in `OUTSIDE_READS` or a new `READS` beside it (its reads of the person's own account).
+   - `GoogleTool`: `Reads` for a name in `OUTSIDE_READS` or a new `READS` beside it (its reads of the person's own account). `OTHERS_WORDS`, a part of `READS` (`drive.search`, `contacts.*`, `people.get`/`search`), returns what others wrote, so it arms the turn as `OUTSIDE_READS` does (`reads_outside_content`).
    - `SpotifyTool`: `Reads` for `spotify.devices` and `spotify.now_playing`, from a `reads` flag on its `Spec`.
-   - `DeskWorkTool`, the `database.*` reads, `security.audit`, `http.endpoints`, `activity_history`, `costs.*`, `heartbeat.list`/`read`, `policy.proposals`, `pricing.list`, `relationship_status`, `sentinel.*`, `github.repos`, `training_citations`, `approval.status`, `read_source.list`, `messaging.get_mode`/`list_modes`, `slack.app_scaffold`, `view_attachment`, `get_user_photo`: `Reads`.
+   - `DeskWorkTool`, the `database.*` introspection (`list_instances`, `schemas`, `tables`, `columns`; `query` and `explain` return rows others wrote and stay held), `security.audit`, `http.endpoints`, `activity_history`, `costs.*`, `heartbeat.list`/`read`, `policy.proposals`, `pricing.list`, `relationship_status`, `sentinel.*`, `github.repos`, `training_citations`, `approval.status`, `read_source.list`, `messaging.get_mode`/`list_modes`, `slack.app_scaffold`, `view_attachment`, `get_user_photo`: `Reads`. `view_attachment` returns what someone else sent, so it also arms the turn (`reads_outside_content`), as `aws.s3.get`/`collect` do (`aws::BODY_TOOLS` joins the hub's `Knowledge::outside_reads`).
    - `budget`: `Reads` for `action: "status"` only.
    - `chart`, `diagram`, `generate_report`, the image, speech and video generators and editors: `Stays`. They make a file the system delivers in the turn's own conversation.
 
 5. **Existing grammar takes the rest.**
    - `obscura` is a browser: the guard's browser rule (`BROWSER_READS`, "would act on a web page") applies to every browser namespace (`BROWSERS = ["browser", "obscura"]`), so its looks run and its actions are held as acting on a page.
    - `watch` joins `STANDING_RULES` (it polls and messages later, on its own).
-   - `know_how` joins `PERSISTING` with `search` and `list` as its reads: what it learns is shared with everyone the agent works for.
+   - `know_how` joins `PERSISTING` with `search`, `list` and `pending` as its reads: what it learns is shared with everyone the agent works for.
 
 6. **What is held says why, plainly.** The held reason becomes
 
@@ -81,20 +85,26 @@ MCP servers' own tools (`mcp.<server>.<tool>`), WASM and external skills stay he
 
    so a person reads what the tool might do and why they are asked.
 
-7. **The person's own Desk is theirs, not outside content.** `desk_knows::tools::wrapped` fences what it reads with `wrap_own_content` (read as data, never as instructions, arming nothing) and with `wrap_external_content` only when the text may carry outside content, which then arms the turn as any fence does:
-   - it shows an exchange with a caveat (`caveats`): one Desk flagged at harvest, or one whose steps read outside content (a web step as Desk names them, `webfetch`/`web_fetch`/`websearch`/`web_search`, or an `mcp__` step of a connected service), each labelled in the result;
+7. **The person's own Desk is theirs, not outside content.** `desk_knows::tools::wrapped` fences what it reads with `wrap_own_content` (read as data, never as instructions, arming nothing). It uses `wrap_external_content`, which arms the turn as any fence does, when the text may carry outside content:
+   - it shows an exchange with a caveat (`caveats`), each labelled in the result:
+     - Desk flagged it at harvest;
+     - it may have read outside content: a step that reads the web or hands work on (`webfetch`, `web_fetch`, `websearch`, `web_search`, `google_web_search`, Claude Code's `task`/`agent`, case-insensitive), any engine's MCP step (`<server>__<tool>`), a command that reaches the network (`curl`, `wget`, `gh`, `http`, `https`, `xh`, `nc`, `ncat`, `netcat`, by word), or a step or command list Desk cut short (`steps_total`/`commands_total` above what it sent);
+     - its `asker` isn't `person` (`desk`, `session`, `unknown`): its ask may be a ticket, a hand-off or another session's words;
    - it carries a fence of outside content (`monitor::carries_fence`, which `arm_if_fenced` now uses too);
    - `scan_for_injection` finds it suspicious.
 
-   The digest goes through the same rule. An exchange's `asker` (`person`, `desk`, `session`, `unknown`) names the person or their own agents, never someone else, so it decides nothing.
+   The digest goes through the same rule. Sessions' accounts, needs and decisions are Desk's own summaries and carry no caveat. Desk (crates/desk, released to the app through its `hub.ref`) sends `steps_total` and `commands_total` with each exchange, and harvests Codex's `web_search_call` as a `web_search` step. An older Desk sends no totals; its lists are then taken as they are.
 
-8. **A sub-agent is the agent's own work, guarded as the turn that spawned it.** `subagent` declares `Stays`. Its job runs detached, in a fresh turn, so `AgentJobConfig` gains `guarded_as`: the spawning turn's `ContentScope` when outside content armed it (its seen URLs and places included, its refusals left out), captured by the `subagent` tool like `user_id`. `ServiceAgentExecutor` runs a job with one under a guard made from it, so every call the sub-agent makes is held as the turn's would be. A `spawn` naming a `channel_id` announces its result there, so it declares that as a `surface_effect` write (`messaging_routing::writes`): somewhere new is held as any send is.
+8. **A sub-agent is the agent's own work, guarded as the turn that spawned it.** `subagent` declares `Stays`. Its job runs detached, in a fresh turn:
+   - `AgentJobConfig` gains `guarded_as`: the spawning turn's `ContentScope` when outside content armed it (its seen URLs and places included, its refusals left out), captured by the `subagent` tool like `user_id`. `ServiceAgentExecutor` runs a job with one under a guard made from it, so every call the sub-agent makes is held as the turn's would be.
+   - `ServiceAgentExecutor` keeps, through a guard keeper, what armed the job's guard as `AgentRunResult::read_outside`, and the job runner hands the run back `fenced()`: its response and package go out with `wrap_external_content`, so the `result` action, the announcement and the session it is injected into are armed by it.
+   - A `spawn` naming a non-blank `channel_id` announces its result there, so it declares that as a `surface_effect` write on the turn's platform (`messaging_routing::writes`): somewhere new is held as any send is. A blank `channel_id` is none.
 
 ## Not changed
 
 - A monitor's turn: its tool set (`turn_tools`), its refusing guard and what it tells the owner.
 - What is held for a specific reason, and the order it is decided in.
-- `investigate` and `coding.fanout` stay held: the turns they start don't run under the caller's guard.
+- `investigate` and `coding.fanout` stay held: their jobs don't carry the caller's guard.
 - A `notes` write after outside content is still held as persistence: what later turns trust. Reading the person's own Desk no longer arms the turn, so it isn't held there.
 - MCP, WASM and external skills' tools stay held.
 
@@ -112,7 +122,13 @@ MCP servers' own tools (`mcp.<server>.<tool>`), WASM and external skills stay he
 - H (composed): `build_advisor_tools` under an armed turn's guard refuses a `web.fetch` of a URL the turn never saw.
 - R/tools/registry.rs: a connector write wrapped in `ConnectionWrite` answers `reach` as the tool it wraps.
 - S: `XeroTool`/`FreeAgentTool` reads declare `Reads` and writes (`xero.invoice_email`) don't; every `GoogleTool` `READS` name is a real Google tool and none is mutating (the `WRITE_OPS` check); `spotify.devices` reads and `spotify.play` doesn't.
-- H/desk_knows/tools.rs: each `desk_work.*` read of the person's own sessions leaves a guard unarmed; a transcript showing a flagged exchange, or one whose steps fetched the web, arms it (`desk_work.transcript`); text carrying a fence, or reading like an injection, is fenced as outside content; the digest is own data.
-- H/subagent_tool.rs: a sub-agent spawned under an armed guard carries its scope to its job, where a fetch of a URL the turn saw runs and one it didn't is held; one spawned under no armed guard carries none.
-- H (composed): a sub-agent job guarded as an armed turn, whose model asks for a `scheduler` `create`, creates no job, and the same job unguarded creates it; after a web read, `subagent` (`list`, `spawn`), `view_attachment` (`desk:<uuid>`) and `advisor` run, a `spawn` naming another channel is held as a send, and a `notes` `write_daily` is held as persistence.
+- H/desk_knows/tools.rs: each `desk_work.*` read of the person's own sessions leaves a guard unarmed; a transcript showing a flagged exchange, or one whose steps fetched the web, arms it (`desk_work.transcript`); every caveat case (each web/sub-agent/MCP step name, each network command, a cut list, each asker other than `person`) is labelled, and an account isn't; text carrying a fence, or reading like an injection, is fenced as outside content; the digest is own data.
+- crates/desk: an exchange sends `steps_total`/`commands_total` beyond its cut lists; a Codex `web_search_call` is a `web_search` step.
+- H/subagent_tool.rs: a sub-agent spawned under an armed guard carries its scope to its job, where a fetch of a URL the turn saw runs and one it didn't is held; one spawned under no armed guard carries none; a spawn naming a channel writes there on the turn's platform, and a blank or missing one writes nowhere.
+- H/job_runner: a run that read outside content hands back its response and package fenced, arming the turn; one that read none, as it is.
+- H/advisor.rs: an unarmed turn whose advisor's research read a page is armed by the advice and an `exec.run` after is held; advice that read nothing leaves it unarmed.
+- R/security/monitor.rs: a branch made before the turn read outside content is armed with it and may open the URLs it saw; a declared call named as a change (`issue.comment`, `send_reply`) is held as a send.
+- H (composed): a sub-agent job guarded as an armed turn, whose model asks for a `scheduler` `create`, creates no job, and the same job unguarded creates it; after a web read, `subagent` (`list`, `spawn`), `view_attachment` (`desk:<uuid>`) and `advisor` run, a `spawn` naming another channel is held as a send, `database.query`/`explain` and `budget` without `status` are held, a `notes` `write_daily` is held as persistence, no registered tool declaring `reach` is named as a change, and `view_attachment` arms the turn.
+- H/monitor/scope.rs: `aws.s3.get`/`collect` arm a guard, `aws.s3.list` doesn't.
+- S/google: no `READS` name is named as a change, and `OTHERS_WORDS` is part of `READS`.
 - R/tools/video_compose.rs: after a web read, `compose_video` (`segments: "none"`), `trim_video` and `video_to_gif` run.

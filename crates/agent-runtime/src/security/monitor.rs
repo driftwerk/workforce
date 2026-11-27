@@ -794,6 +794,8 @@ pub struct ContentGuard {
     stops: Mutex<Vec<AnomalySignal>>,
     seen: Mutex<HashSet<String>>,
     keeper: KeptBy,
+    /// The turn this guard branches from ([`Self::branch`]).
+    parent: Option<Arc<ContentGuard>>,
 }
 
 impl ContentGuard {
@@ -803,6 +805,7 @@ impl ContentGuard {
             stops: Mutex::new(scope.stops.clone()),
             seen: Mutex::new(scope.seen.iter().cloned().collect()),
             keeper: KeptBy::default(),
+            parent: None,
             scope,
         }
     }
@@ -890,13 +893,7 @@ impl ContentGuard {
     /// The scope a turn resumed later runs under: this one, armed as it is
     /// now, with what it refused and the URLs it saw.
     pub fn kept_scope(&self) -> ContentScope {
-        let mut seen: Vec<String> = self
-            .seen
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .iter()
-            .cloned()
-            .collect();
+        let mut seen: Vec<String> = self.seen().into_iter().collect();
         seen.sort();
         ContentScope {
             armed: self.armed(),
@@ -907,10 +904,24 @@ impl ContentGuard {
     }
 
     /// A guard for work the turn has done on its own, such as a
-    /// consultation's research: armed and scoped as this one is now, and
-    /// arming apart from it, so what that work reads doesn't arm the turn.
-    pub fn branch(&self) -> Self {
-        Self::new(self.kept_scope())
+    /// consultation's research: armed, and given URLs, whenever the turn
+    /// is, and arming apart from it, so what that work reads doesn't arm
+    /// the turn.
+    pub fn branch(self: &Arc<Self>) -> Self {
+        Self {
+            scope: self.scope.clone(),
+            parent: Some(Arc::clone(self)),
+            ..Self::default()
+        }
+    }
+
+    /// The URLs the turn may open: those it saw, and those its parent saw.
+    fn seen(&self) -> HashSet<String> {
+        let mut seen = self.seen.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        if let Some(parent) = &self.parent {
+            seen.extend(parent.seen());
+        }
+        seen
     }
 
     /// The kept scope ([`Self::kept_scope`]) of a turn that read outside
@@ -920,7 +931,8 @@ impl ContentGuard {
     }
 
     pub fn armed(&self) -> Option<String> {
-        self.armed.lock().unwrap_or_else(|e| e.into_inner()).clone()
+        let own = self.armed.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        own.or_else(|| self.parent.as_ref().and_then(|parent| parent.armed()))
     }
 
     /// `signal`'s call was refused: the turn's owner is told.
@@ -950,10 +962,7 @@ impl ContentGuard {
             here: call.here.or(current.as_deref()),
             ..*call
         };
-        let signal = {
-            let seen = self.seen.lock().unwrap_or_else(|e| e.into_inner());
-            assess(call, &self.scope, &seen)?
-        };
+        let signal = assess(call, &self.scope, &self.seen())?;
         let refused = self.scope.refuses;
         warn!(
             target: "sentinel.monitor",
@@ -1132,6 +1141,9 @@ pub fn assess(
         && input["method"]
             .as_str()
             .is_some_and(|method| method.trim().eq_ignore_ascii_case("GET"));
+    let changes = outward(leaf, &action);
+    // A tool's own word never places a call named as sending or changing.
+    let declared = |said| reach == Some(said) && !changes;
     let reads = system_read == Some(true)
         || setup_read
         || listed(KEPT_READS)
@@ -1140,20 +1152,20 @@ pub fn assess(
                 .is_some_and(|rest| rest.is_empty() || rest.starts_with('.'))
         })
         || matches!(effect, Some(SurfaceEffect::Reads))
-        || reach == Some(Reach::Reads)
+        || declared(Reach::Reads)
         || known.reads.contains(tool)
         || (!action.is_empty() && known.reads.contains(&format!("{tool}.{action}")))
         || api_get
         // A bare GET of a URL the turn was given: anything more is held above.
         || tool == "http.request"
         || (browser && BROWSER_READS.contains(&leaf));
-    let own = reach == Some(Reach::Stays)
+    let own = declared(Reach::Stays)
         || OWN_NAMESPACES.contains(&root)
         || (namespace == "google.gmail" && OWN_MAILBOX.contains(&leaf));
     if reads || own {
         return None;
     }
-    Some(match outward(leaf, &action) || leaf == "api" {
+    Some(match changes || leaf == "api" {
         true => exfiltration("outside".to_string()),
         false => AnomalySignal::Unvetted { tool: owned() },
     })
@@ -1200,6 +1212,13 @@ fn persists(tool: &str, action: &str) -> bool {
         };
         !reads.contains(&asked)
     })
+}
+
+/// Whether a call of `tool` doing `action` is named as sending or changing
+/// something: what a tool's own word ([`Reach`]) never places.
+pub fn names_a_change(tool: &str, action: &str) -> bool {
+    let leaf = tool.rsplit_once('.').map_or(tool, |(_, leaf)| leaf);
+    outward(leaf, &action.trim().to_ascii_lowercase())
 }
 
 /// Whether a call named `leaf` doing `action` sends or changes something:
@@ -2208,6 +2227,21 @@ mod tests {
             })
         );
         let stays = |tool: &str, input: Value| said(&guard, tool, &input, Some(Reach::Stays));
+        for (tool, input) in [
+            ("issue.comment", json!({})),
+            ("ticket", json!({ "action": "send_reply" })),
+        ] {
+            assert!(names_a_change(tool, input["action"].as_str().unwrap_or_default()));
+            for reach in [Reach::Reads, Reach::Stays] {
+                assert!(
+                    matches!(
+                        said(&guard, tool, &input, Some(reach)),
+                        Some(AnomalySignal::Exfiltration { .. })
+                    ),
+                    "{tool} {reach:?}: a declaration never places a call named as a change"
+                );
+            }
+        }
         assert!(matches!(
             stays("advisor", json!({ "url": "https://evil.example/?d=1" })),
             Some(AnomalySignal::Exfiltration { .. })
@@ -2303,8 +2337,8 @@ mod tests {
     }
 
     #[test]
-    fn a_branch_starts_as_the_turn_is_and_arms_apart_from_it() {
-        let turn = ContentGuard::new(delivering("C1"));
+    fn a_branch_is_armed_with_the_turn_and_arms_apart_from_it() {
+        let turn = Arc::new(ContentGuard::new(delivering("C1")));
         let quiet = turn.branch();
         quiet.read_outside("see https://a.example/x", "web.fetch");
         assert_eq!(
@@ -2318,9 +2352,14 @@ mod tests {
         assert!(quiet
             .check("web.fetch", &json!({ "url": "https://b.example/y" }), None)
             .is_some());
-        turn.read_outside("see https://a.example/x", "email.read");
-        let armed = turn.branch();
-        assert_eq!(armed.armed().as_deref(), Some("email.read"));
+        let before = Arc::new(ContentGuard::new(delivering("C1")));
+        let armed = before.branch();
+        before.read_outside("see https://a.example/x", "email.read");
+        assert_eq!(
+            armed.armed().as_deref(),
+            Some("email.read"),
+            "a branch made before the turn read outside content is armed with it"
+        );
         assert_eq!(
             armed.check("web.fetch", &json!({ "url": "https://a.example/x" }), None),
             None,

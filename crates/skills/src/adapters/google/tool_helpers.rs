@@ -92,6 +92,20 @@ pub const READS: &[&str] = &[
     "google.slides.list_slides",
 ];
 
+/// The reads of the person's account ([`READS`]) that return what others
+/// wrote: files found, contacts and people. A turn that reads one is
+/// guarded from then on, as by [`OUTSIDE_READS`].
+pub const OTHERS_WORDS: &[&str] = &[
+    "google.drive.search",
+    "google.contacts.list",
+    "google.contacts.get",
+    "google.contacts.search",
+    "google.contacts.other_list",
+    "google.contacts.directory_search",
+    "google.people.get",
+    "google.people.search",
+];
+
 impl GoogleTool {
     pub fn new(
         name: impl Into<String>,
@@ -134,7 +148,9 @@ impl Tool for GoogleTool {
     }
 
     fn reads_outside_content(&self) -> bool {
-        OUTSIDE_READS.contains(&self.name.as_str())
+        [OUTSIDE_READS, OTHERS_WORDS]
+            .iter()
+            .any(|tools| tools.contains(&self.name.as_str()))
     }
 
     fn reach(&self, _input: &serde_json::Value) -> Option<workforce_agent::tools::Reach> {

@@ -1067,6 +1067,8 @@ pub struct AgentRunResult {
     pub findings: Option<serde_json::Value>,
     pub claims: Vec<crate::hub_core::jobs::Finding>,
     pub package: Option<serde_json::Value>,
+    /// The outside content the run's guard was armed by, if any.
+    pub read_outside: Option<String>,
 }
 
 impl AgentRunResult {
@@ -1079,6 +1081,27 @@ impl AgentRunResult {
                 true => earlier.claims,
                 false => self.claims,
             },
+            ..self
+        }
+    }
+
+    /// This run as a turn reads it: what it hands back fenced as outside
+    /// content when the run read some, so that turn is armed by it.
+    pub fn fenced(self) -> Self {
+        let Some(read) = self.read_outside.clone() else {
+            return self;
+        };
+        let source = format!("a sub-agent's work ({read})");
+        let fence = |text: &str| {
+            workforce_agent::security::external_content::wrap_external_content(text, &source)
+                .wrapped_content
+        };
+        Self {
+            response: fence(&self.response),
+            package: self
+                .package
+                .as_ref()
+                .map(|package| serde_json::Value::String(fence(&package.to_string()))),
             ..self
         }
     }
