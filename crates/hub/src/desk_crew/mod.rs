@@ -340,7 +340,7 @@ pub struct CrewHub {
     plan_failures: Mutex<Vec<(uuid::Uuid, String)>>,
     /// What the plan guard last said of each boss's own wake, by boss
     /// ([`plan_limit`]).
-    wakes: Mutex<HashMap<String, plan_limit::Wake>>,
+    limits: Mutex<plan_limit::Noted>,
     /// What its boss is told of how a ticket started, when it isn't as
     /// asked ([`workforce_desk::Started::note`]), for its plan's next turn.
     plan_notes: Mutex<Vec<(uuid::Uuid, String)>>,
@@ -857,7 +857,7 @@ impl CrewHub {
             goal_checks: Mutex::default(),
             jobs_read: measure::JobsRead::default(),
             plan_failures: Mutex::default(),
-            wakes: Mutex::default(),
+            limits: Mutex::default(),
             plan_notes: Mutex::default(),
             plan_waiting: Mutex::default(),
             machine_seen: Mutex::default(),

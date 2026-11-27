@@ -27,7 +27,7 @@ use chrono_tz::Tz;
 use std::sync::Arc;
 use tracing::warn;
 use workforce_common::persistence::MeteredSpend;
-use workforce_common::settings::{BudgetConfig, PlanGuardConfig};
+use workforce_common::settings::BudgetConfig;
 use workforce_common::telemetry::TelemetryStore;
 use workforce_core::budget::{self, Budget, Period, Standing, Unit};
 
@@ -217,27 +217,23 @@ impl CostGovernor {
         &self.plan_guard
     }
 
-    /// `[budget.plan]`, with the person's own threshold when they set one.
-    fn plan_config(&self) -> std::borrow::Cow<'_, PlanGuardConfig> {
-        match self.ceilings().and_then(|c| c.plan_pause_at()) {
-            Some(pause_at_percent) => std::borrow::Cow::Owned(PlanGuardConfig {
-                pause_at_percent,
-                ..self.cfg.plan.clone()
-            }),
-            None => std::borrow::Cow::Borrowed(&self.cfg.plan),
-        }
+    /// The share of a window background work on a plan pauses from: the
+    /// person's own when they set one, else `[budget.plan]`'s.
+    fn plan_pause_at(&self) -> f64 {
+        self.ceilings()
+            .and_then(|c| c.plan_pause_at())
+            .unwrap_or_else(|| self.cfg.plan.pause_at())
     }
 
-    /// The share of a window background work on a plan pauses from, while
-    /// the plan guard is on.
+    /// [`Self::plan_pause_at`], while the plan guard is on.
     pub fn plan_threshold(&self) -> Option<f64> {
-        let cfg = self.plan_config();
-        cfg.enabled.then(|| cfg.pause_at())
+        self.cfg.plan.enabled.then(|| self.plan_pause_at())
     }
 
     /// Whether the plan threshold holds background work on `login` at `now`.
     pub fn plan_holds(&self, login: &Login, now: DateTime<Utc>) -> Option<Held> {
-        self.plan_guard.holds(&self.plan_config(), login, now)
+        self.plan_threshold()
+            .and_then(|threshold| self.plan_guard.holds(threshold, login, now))
     }
 
     /// This governor with `ceilings` in place of the hub's.
@@ -444,10 +440,13 @@ impl CostGovernor {
         // person's own turns, which run outside any background work.
         if let Some(work) = workforce_common::work_use::current() {
             use crate::hub_core::plan_guard::Verdict as Plan;
-            match self
-                .plan_guard
-                .check(&self.plan_config(), &work, on.login, Utc::now())
-            {
+            match self.plan_guard.check(
+                &self.cfg.plan,
+                self.plan_pause_at(),
+                &work,
+                on.login,
+                Utc::now(),
+            ) {
                 Plan::Proceed => {}
                 Plan::Waits(why) => return Admission::Waits(why),
                 Plan::Stopped { why, first } => {
@@ -1001,7 +1000,10 @@ mod tests {
             workforce_common::work_use::within(job.clone(), async { g.preflight_on("a", None, on) })
         };
         assert!(matches!(admitted().await, Admission::Waits(_)));
-        assert_eq!(g.plan_holds(&login, Utc::now()).map(|h| h.at), Some(80.0));
+        assert_eq!(
+            g.plan_holds(&login, Utc::now()).map(|h| h.threshold),
+            Some(80.0)
+        );
         assert_eq!(g.plan_threshold(), Some(80.0));
         g.use_ceilings(Arc::new(PausesAt(95.0)));
         assert_eq!(g.plan_threshold(), Some(95.0));
@@ -1011,7 +1013,16 @@ mod tests {
         assert!(
             matches!(admitted().await, Admission::Waits(why) if why.contains("pauses from 85%"))
         );
-        assert_eq!(g.plan_holds(&login, Utc::now()).map(|h| h.at), Some(85.0));
+        assert_eq!(
+            g.plan_holds(&login, Utc::now()).map(|h| h.threshold),
+            Some(85.0)
+        );
+        let mut off = cfg();
+        off.plan.enabled = false;
+        let off = governor(off, &[]).with_plan_guard(Arc::clone(&guard));
+        off.use_ceilings(Arc::new(PausesAt(85.0)));
+        assert_eq!(off.plan_threshold(), None, "the guard turned off");
+        assert_eq!(off.plan_holds(&login, Utc::now()), None);
     }
 
     #[tokio::test]

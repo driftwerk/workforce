@@ -1480,6 +1480,11 @@ impl CrewHub {
                 })?;
             return Ok("Sent.".into());
         }
+        let kept = self
+            .keep_plan_limit(&item, answer)
+            .await
+            .transpose()
+            .map_err(ItemRefused::Cant)?;
         let closed = store
             .item_close(
                 id,
@@ -1489,12 +1494,12 @@ impl CrewHub {
             .await
             .map_err(|e| ItemRefused::Cant(Self::item_err(e)))?
             .ok_or(ItemRefused::Closed)?;
+        if let Some(kept) = kept {
+            return Ok(self.plan_limit_answered(&closed, kept).await);
+        }
         // "You undid … Should I change that preference?": keeping or
         // forgetting it is done here; changing it goes to the boss.
         if let Some(done) = self.overrule_answered(&closed, answer).await {
-            return Ok(done);
-        }
-        if let Some(done) = self.plan_limit_answered(&closed, answer).await {
             return Ok(done);
         }
         let Some((service, _)) = self.overseer_named(&closed.boss) else {

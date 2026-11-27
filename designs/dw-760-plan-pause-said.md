@@ -33,17 +33,18 @@ G = `crates/hub-core/src/hub_core`, D = `crates/desk/src`, H = `crates/hub/src/d
 
 1. **The plan limit pauses the plan, as `BossHeld` does.** A new `Paused::PlanLimit` (`plan_limit`). A plan whose boss's own turns are held by the plan guard starts nothing more ("Nothing will move until …"), its card and the Floor say why, and it goes on by itself when the limit stops holding the boss. A person's pause is never replaced (`pause_plan_saying` already keeps `Person`). A boss held by the breaker keeps `BossHeld`: that check runs first in `run_plan`.
 2. **What starts it is a real hold, not a guess.** The plan guard's rule is per turn: the plan of the model that turn resolves to (the session's override, prompt routing). So the runner never predicts. Each time `run_turn_with` judges a boss's own wake, the hub notes what the guard said of it, per boss, in memory (`CrewHub::wakes`):
-   `Wake { login: Option<Login>, held: bool }`:
-   - `held: true`: the guard holds it for the plan limit (`CostGovernor::plan_holds` is `Some` for that turn's login).
-   - `held: false`: the guard has a reading of that login's plan under the threshold, or the turn is on no plan at all (`login: None`).
-   - nothing changes when the guard has no reading of it (after a restart it is blind until a call reads the plan).
+   `Wake { login: Option<Login>, held: bool, at }`, kept per boss and per login (`CrewHub::limits`, a `Noted`), each newer wake on a login replacing the older:
+   - `held` is read off the admission itself: `Admission::Waits(why)` with `why` starting `plan_guard::WAITS_PREFIX`, the guard's own words for the threshold. One source: what the guard said is what is noted.
+   - not held: the guard has a reading of that login's plan under the threshold, or the turn is on no plan at all (`login: None`).
+   - nothing is noted when the guard has no reading of it (after a restart it is blind until a call reads the plan).
+   - only the last hour's wakes count (`recent()`).
    A dollar budget or a runaway that holds the turn is not the plan limit: `plan_holds` is `None`, and the plan isn't paused for it.
 3. **Whether the limit still holds is asked of the guard, never polled through `check`.** `check` also judges runaways and records a stop on its first finding, which must reach the real turn. A new pure `PlanGuard::holds(cfg, login, now) -> Option<Held>` answers "does the threshold hold background work on this login now", and `check` uses it, so the rule is in one place. `Held` carries the standing, the threshold and `until`: the window's reset, or (with none said) when the window read lapses (`read_at + minutes`, the guard's own `live` rule). `until` is always known.
-4. **The limit is the person's, changeable while Desk runs.** The person's threshold is kept by the desk beside its breaker rules: `state` key `hub.plan.pause_at`, loaded in `breaker_load`, cached in `BreakerRun`, set by `Desk::set_plan_pause_at`. It reaches the governor through the existing runtime path for the person's limits: `Ceilings` (installed by `[desk]` alone) gains `fn plan_pause_at(&self) -> Option<f64>` (default `None`, so other `Ceilings` impls are unchanged), and `CostGovernor::plan_config()` is `[budget.plan]` with `pause_at_percent` replaced by it when set. Every plan-guard check, jobs and monitors included, reads `plan_config()`: "your 80% limit" is one limit. A hub without Desk is unchanged. No migration: the `state` table exists.
+4. **The limit is the person's, changeable while Desk runs.** The person's threshold is kept by the desk beside its breaker rules: `state` key `hub.plan.pause_at`, loaded in `breaker_load`, cached in `BreakerRun`, set by `Desk::set_plan_pause_at`. It reaches the governor through the existing runtime path for the person's limits: `Ceilings` (installed by `[desk]` alone) gains `fn plan_pause_at(&self) -> Option<f64>` (default `None`, so other `Ceilings` impls are unchanged), and `CostGovernor::plan_pause_at()` is it when set, else `[budget.plan]`'s, an `f64` passed to `PlanGuard::check`/`holds` (no config is copied per admit). Every plan-guard check, jobs and monitors included, reads it: "your 80% limit" is one limit. A hub without Desk is unchanged. No migration: the `state` table exists.
 5. **Pause, tell once, lift, tell again: the runner does it.** Every pass (`run_plans`, every 30 s and on every Desk event):
-   - `run_plan`, after the `BossHeld` check: `Limit::Holds(held)` for the boss pauses the plan with `Paused::PlanLimit`, its words, and `until` (`Desk::pause_plan_limit`). A pause that is new tells the person (6). The runner returns: nothing starts.
-   - `lift_hold` for a plan paused `PlanLimit`: `Holds(held)` keeps it paused and refreshes its words and `until` when they changed (a five-hour window took over from the weekly one, the percentage rose). `Lifted` resumes it (`resume_plan(id, &[PlanLimit])`), closes its open ask and tells the person (7). `Unknown` (nothing noted since the hub started) resumes only once its kept `until` has passed. A restart doesn't resume it while the guard is blind, and nothing is said twice.
-   - `Limit` for a boss: a held wake asks `CostGovernor::plan_holds(login, now)` again: `Some` → `Holds`, `None` → `Lifted(standing)`. An unheld wake → `Lifted`. Nothing noted → `Unknown`. `Desk::resume_plan_limit` says whether it resumed, so only a real resume is told.
+   - `run_plan`, after the `BossHeld` check: `Limit::Holds(held)` for the boss pauses the plan with `Paused::PlanLimit`, its words, and `until` (`Desk::pause_plan_limit`), and asks the person (6). The runner returns: nothing starts.
+   - `lift_hold` for a plan paused `PlanLimit`: `Holds(held)` keeps it paused and refreshes its words and `until` only when they changed (a five-hour window took over from the weekly one, the percentage rose): an unchanged pass writes nothing. Every held pass asks (6), which the key keeps to once a window. `Lifted` resumes it (`resume_plan(id, &[PlanLimit])`), closes its open ask and tells the person (7). `Unknown` (nothing noted since the hub started) resumes only once its kept `until` has passed. A restart doesn't resume it while the guard is blind, and nothing is said twice: the going on of a pause (its plan and `until`) is said once (`Noted::resumed`), so a pause that comes back in the same window and lifts again says nothing new.
+   - `Limit` for a boss: held while any login its recent own wakes were held on still is (`plan_holds` again, the fullest); else `Lifted` with the standing of its latest wake on a plan; with no recent wake `Unknown`. Before: a held wake asked `CostGovernor::plan_holds(login, now)` again: `Some` → `Holds`, `None` → `Lifted(standing)`. An unheld wake → `Lifted`. Nothing noted → `Unknown`. `Desk::resume_plan_limit` says whether it resumed, so only a real resume is told.
 6. **The person is told once, straight away, in plain words, in the DM and on the plan card.** When `run_plan` pauses a plan for the limit (it wasn't paused for it before) the hub opens an `Ask` item keyed `plan-limit:{plan}:{until}` (`workforce_desk::plan::limit_key`), only if no item ever had that key (`item_ever_keyed`). So it is once per plan per window, across restarts:
    > “Eden” is paused: your weekly ChatGPT plan is at 88%, over your 80% limit. Nothing will move until Fri 09:00 unless you raise the limit.
 
@@ -52,13 +53,13 @@ G = `crates/hub-core/src/hub_core`, D = `crates/desk/src`, H = `crates/hub/src/d
    > “Eden” goes on: your weekly ChatGPT plan is at 12%, under your 80% limit.
 
    It says "reset at 09:00" when nothing was read since the window reset, and "your limit is 95% now" when the person raised it.
-8. **Raise and Keep are answered by Desk, never by the boss.** A boss can't change its own limits (H/own_settings.rs). `answer_item` handles them after closing the item, as it does `overrule_answered` (`plan_limit_answered`), and `goes_to_boss` is false for them:
+8. **Raise and Keep are answered by Desk, never by the boss.** A boss can't change its own limits (H/own_settings.rs). `answer_item` keeps the limit first (`keep_plan_limit`: only an answer among the item's own options counts; a raise to no more than the limit already is changes nothing and says so; a raise that can't be kept refuses the answer and leaves the item open), then closes the item and says what came of it (`plan_limit_answered`). `goes_to_boss` is false for them:
    - `Raise to N%`: `Desk::set_plan_pause_at(N)`, then lifts at once the boss's plans paused `PlanLimit` that no longer hold (the same lift as 5, without waiting for the next pass). It answers "Raised: background work on your plans now pauses from 95%."
    - `Keep`: nothing changes. It answers "Kept at 80%. “Eden” goes on by itself after Fri 09:00."
    - The raise offered (`raise_to(held)`) is the first of 95 and 100 above both the plan's use and the threshold. A raise that wouldn't lift the pause is never offered.
-9. **The card and the Floor say "Paused by plan limit until Fri 09:00".** The hub's words for the pause (`paused_why`, in the person's time zone, `desk.timezone()`) are `by plan limit until Fri 09:00: your weekly ChatGPT plan is at 88%, over your 80% limit`. The desk returns them for `PlanLimit` as it does for `StartFailing`. The app joins them to "Paused" with a space for `plan_limit` and with ": " for every other reason (`pausedLabel`), on the card's chip, its progress line, its note, the board row's title and the Floor's plan line. So the Floor needs the reason: `floor::PlanProgress` gains `paused`. An older Desk shows "Paused: by plan limit until …", still plain words. The time is "09:00" today, else "Fri 09:00".
+9. **The card and the Floor say "Paused by plan limit until Fri 09:00".** The hub's words for the pause (`paused_why`, in the person's time zone, `desk.timezone()`) are `by plan limit until Fri 09:00: your weekly ChatGPT plan is at 88%, over your 80% limit`. The desk returns them for `PlanLimit` as it does for `StartFailing`. The app joins them to "Paused" with a space for `plan_limit` and with ": " for every other reason (`pausedLabel`), The chip, the progress line and the Floor's plan line cut the words at ": " ("Paused by plan limit until Fri 09:00"); the card's note and the board row's title say them whole. So the Floor needs the reason: `floor::PlanProgress` gains `paused`. An older Desk shows "Paused: by plan limit until …", still plain words. The time is "09:00" today, else "Fri 09:00".
 10. **The plan card carries the ask's buttons.** `PlanSummary` gains `ask: Option<MentionedItem>`: for a plan paused `PlanLimit`, its open item keyed `plan-limit:{plan}:`, as the chat carries it (`mention_at(true)`, so the options show at any level). The card's paused note shows them with the chat's own `Answers` (exported from A/rooms/Overseer.tsx), which answer through `answerItem`, the existing open-item path. Answered in the chat, the card's buttons go (the item is closed). Answered on the card, the chat's do.
-11. **The boss warns before the person leaves a plan running.** `context::block` (every boss turn, the person's own included) gains a line from `CrewHub::plan_limit_line` whenever the plan its own wakes run on is within 10 points of the threshold, or held. The login is the one `wake_login` resolves for a wake in its DM: heavy model, DM session, no prompt. When held, the last held turn's.
+11. **The boss warns before the person leaves a plan running.** `context::block` (every boss turn, the person's own included) gains a line from `CrewHub::plan_limit_line` whenever the plan its own wakes run on is within 10 points of the threshold, or held. It reads `limit_of` for the boss: nothing is looked up when nothing is noted.
     - Near: "Your own turns (check-ins, notices, wake-ups) run on your weekly ChatGPT plan, now at 76%. They pause from 80%, the person's limit, until it resets Fri 09:00, and your plans pause with them. If the person asks you to keep a plan going, or to watch one while they are away, tell them plainly it will pause at 80% unless they raise the limit; only they can."
     - Held: "Your own turns are paused now: your weekly ChatGPT plan is at 88%, over the person's 80% limit, until Fri 09:00. Your plans are paused with them. If the person asks you to keep one going, tell them plainly it can't until then unless they raise the limit; only they can."
 
@@ -74,7 +75,7 @@ G = `crates/hub-core/src/hub_core`, D = `crates/desk/src`, H = `crates/hub/src/d
   - `check` uses `holds`: `Verdict::Waits(waits_why(&held))`, and `waits_why` takes `&Held`.
 - G/cost_governor.rs
   - `Ceilings::plan_pause_at(&self) -> Option<f64> { None }`.
-  - `fn plan_config(&self) -> Cow<'_, PlanGuardConfig>`: owned with `pause_at_percent` replaced when the ceilings say one, else borrowed.
+  - `fn plan_pause_at(&self) -> f64`: the ceilings' when they say one, else `[budget.plan]`'s.
   - `admit` passes `&self.plan_config()` to `check`.
   - `pub fn plan_holds(&self, login: &Login, now) -> Option<Held>`.
   - `pub fn plan_threshold(&self) -> Option<f64>`: the threshold in force (the person's or the config's), `None` while the guard is off; the words the boss and the person read use it.
@@ -91,7 +92,7 @@ G = `crates/hub-core/src/hub_core`, D = `crates/desk/src`, H = `crates/hub/src/d
   - `pause_plan_saying` takes `until`; a pause for the same reason keeps the newer `(said, until)`.
   - `pub async fn pause_plan_limit(&self, id, said: &str, until, by)`. It answers whether the pause is new: `(PlanDetail, bool)`, the bool being that it wasn't paused `PlanLimit` before.
   - `paused_why` returns `p.paused_why` for `PlanLimit`.
-  - `PlanSummary::ask` for a plan paused `PlanLimit` (from `items_not_closed(Some(boss))`, by `limit_prefix`). Absent from JSON when none.
+  - `PlanSummary::ask` for a plan paused `PlanLimit` (the newest open item keyed from `limit_prefix`, whatever its boss: `OpenItemStore::items_keyed_from`, so a plan passed to another boss still carries it). Absent from JSON when none.
   - `floor_plans` fills `PlanProgress::paused`.
 - D/floor.rs: `PlanProgress::paused: Option<Paused>` (skipped when none).
 - D/service/breaker.rs
@@ -106,20 +107,22 @@ G = `crates/hub-core/src/hub_core`, D = `crates/desk/src`, H = `crates/hub/src/d
   - `wake_login(service, owner, work, on) -> Option<Login>` is the login half of `plan_admits`. `plan_admits` is `wake_login` then `preflight_on`.
   - `held_by_plan` notes the wake (`self.note_wake(agent_id, login, now)`) before matching the admission.
 - H/plan_limit.rs (new, `mod plan_limit;`) holds everything the limit does on Desk, so no other module grows:
-  - `pub(super) struct Wake { login: Option<Login>, held: bool }` and `enum Limit { Holds(Held), Lifted(Option<PlanStanding>), Unknown }`.
+  - `pub(super) struct Noted { wakes, resumed }`, `struct Wake { login, held, at }`, `enum Limit { Holds(Held), Lifted(Option<PlanStanding>), Unknown }`, `enum Kept { Raised(u8), Already(f64), Unchanged }`.
   - `CrewHub::note_wake`, `CrewHub::limit_of(boss, now) -> Limit`.
   - `CrewHub::held_by_limit(&Plan) -> bool` (pause, ask once).
   - `CrewHub::lift_limit(&Plan)` (lift, close, tell) and `lift_limits` (every plan the limit pauses, after a Raise).
   - `CrewHub::limit_ask_past(&OpenItem)` for `past()`: a limit ask whose plan is no longer paused `PlanLimit` is closed.
-  - `CrewHub::plan_limit_answered(&OpenItem, &str) -> Option<String>`.
-  - `CrewHub::plan_limit_line(&AgentService, owner) -> Option<String>`.
+  - `CrewHub::keep_plan_limit(&OpenItem, &str) -> Option<Result<Kept, String>>` and `CrewHub::plan_limit_answered(&OpenItem, Kept) -> String`.
+  - `CrewHub::plan_limit_line(&AgentService) -> Option<String>`.
   - The pure helpers: `raise_to(&Held) -> Option<u8>`, `answer_of(&OpenItem, &str) -> Option<Answer>` (`Raise(u8)` / `Keep`), `paused_words(&Held, tz)`, `told_words(goal, &Held, raise, tz)`, `resumed_words(goal, Option<PlanStanding>, at, tz)`, `near_words` / `held_words`, `at_time(until, now, tz)` ("09:00" today, else "Fri 09:00").
-- H/mod.rs: `wakes: Mutex<HashMap<String, plan_limit::Wake>>` on `CrewHub`.
+- H/mod.rs: `limits: Mutex<plan_limit::Noted>` on `CrewHub`.
+- Every share is said in whole points by one helper, `plan_guard::points`.
+- The app's `Answers` (and what it remembers of answers) moves to `rooms/Answers.tsx`, shared by the chat and the plan card; an answer given in one shows as given in the other.
 - H/plan.rs
   - `run_plan`, after the breaker check: `if let Limit::Holds(held) = self.limit_of(&p.boss, now) { self.pause_for_limit(&p, &held).await; return; }`.
   - `lift_hold` calls `self.lift_limit(p, now)` for `Paused::PlanLimit`.
 - H/items.rs
-  - `answer_item` calls `plan_limit_answered` after `overrule_answered`.
+  - `answer_item` calls `keep_plan_limit` before closing the item, `plan_limit_answered` after.
   - `goes_to_boss` is false for an answer `answer_of` reads.
 - H/context.rs: `plan_limit_line` joins the goals block (never dropped for room).
 
@@ -142,6 +145,9 @@ Styles: no new class. The note, chip and buttons use the card's existing `pc-not
 
 ## Edge cases
 
+- **A new window holds the plan** (the week reset into a five-hour window over the limit): its ask of the older window is closed as lapsed before the new one is asked.
+- **A boss whose wakes run on two plans:** held while either login it was held on in the last hour still is, so its plans don't flip between paused and going on.
+- **A plan passed to another boss while the limit pauses it:** a paused plan keeps its reason through `pass_plan`; its ask is found by key whatever its boss.
 - **Two plans of one boss:** each is paused and told, by its own key. One Raise lifts both: the threshold is the person's.
 - **The plan is at 100%:** no raise is offered; the ask has only Keep. It resumes once the window resets.
 - **The threshold is raised while another window of the plan is also over it:** `holds` reads the fullest live window, so it stays paused, with new words, and a raise to 100 is offered next time (a new key, since `until` differs) only if the window changes. The Raise answer says the new threshold; the plan is lifted only if nothing holds it.

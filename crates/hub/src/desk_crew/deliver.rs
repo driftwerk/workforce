@@ -420,7 +420,7 @@ impl CrewHub {
         use crate::cost_governor::Admission;
         let login = wake_login(service, owner, work, on).await;
         let admitted = plan_admits_on(service, owner, work, login.as_ref());
-        self.note_wake(service, login, chrono::Utc::now());
+        self.note_wake(service, login, &admitted, chrono::Utc::now());
         match admitted {
             Admission::Waits(why) => Some(why),
             Admission::Stopped { why, first } => {

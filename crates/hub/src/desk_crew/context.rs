@@ -341,7 +341,7 @@ pub(crate) async fn block(service: &AgentService, channel: &str, owner: &str) ->
                 .into_iter()
                 .map(|(_, line)| line),
         )
-        .chain(Box::pin(crew.plan_limit_line(&boss, owner)).await)
+        .chain(crew.plan_limit_line(&boss))
         .collect();
     let goals = goals.join("\n\n");
     let Some(body) = body(

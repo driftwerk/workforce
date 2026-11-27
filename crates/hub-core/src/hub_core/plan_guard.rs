@@ -86,12 +86,17 @@ impl PlanStanding {
     /// "your weekly Claude plan is at 83%".
     pub fn says(&self) -> String {
         format!(
-            "your {} {} plan is at {}%",
+            "your {} {} plan is at {}",
             window_words(self.window_minutes),
             plan_words(self.plan),
-            self.used_percent.floor() as i64
+            points(self.used_percent)
         )
     }
+}
+
+/// "83%": a share of a window as every plan word says it, whole points.
+pub fn points(share: f64) -> String {
+    format!("{}%", share.floor() as i64)
 }
 
 /// "weekly", "five-hour", "3-hour", "2-day".
@@ -133,7 +138,7 @@ fn lapses(w: &Window, read_at: DateTime<Utc>) -> DateTime<Utc> {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Held {
     pub standing: PlanStanding,
-    pub at: f64,
+    pub threshold: f64,
     pub until: DateTime<Utc>,
 }
 
@@ -363,16 +368,13 @@ impl PlanGuard {
         self.fullest(login, now).map(|(standing, _)| standing)
     }
 
-    /// Whether the threshold holds background work on `login` at `now`.
-    pub fn holds(&self, cfg: &PlanGuardConfig, login: &Login, now: DateTime<Utc>) -> Option<Held> {
-        let at = cfg.pause_at();
-        cfg.enabled
-            .then(|| self.fullest(login, now))
-            .flatten()
-            .filter(|(standing, _)| standing.used_percent >= at)
+    /// Whether `threshold` holds background work on `login` at `now`.
+    pub fn holds(&self, threshold: f64, login: &Login, now: DateTime<Utc>) -> Option<Held> {
+        self.fullest(login, now)
+            .filter(|(standing, _)| standing.used_percent >= threshold)
             .map(|(standing, until)| Held {
                 standing,
-                at,
+                threshold,
                 until,
             })
     }
@@ -383,6 +385,7 @@ impl PlanGuard {
     pub fn check(
         &self,
         cfg: &PlanGuardConfig,
+        threshold: f64,
         work: &Work,
         login: Option<&Login>,
         now: DateTime<Utc>,
@@ -394,7 +397,7 @@ impl PlanGuard {
         if let Some(why) = self.stopped(&work.key, allowed.resumed_at, now) {
             return Verdict::Stopped { why, first: false };
         }
-        if let Some(held) = login.and_then(|l| self.holds(cfg, l, now)) {
+        if let Some(held) = login.and_then(|l| self.holds(threshold, l, now)) {
             return Verdict::Waits(waits_why(&held));
         }
         let since = [
@@ -538,9 +541,9 @@ fn waits_why(held: &Held) -> String {
         format!(", or until it resets at {}", r.format("%a %H:%M UTC"))
     });
     format!(
-        "{WAITS_PREFIX} {}, and background work pauses from {}% so the plan is left for you. It goes on by itself once usage is under that{until}.",
+        "{WAITS_PREFIX} {}, and background work pauses from {} so the plan is left for you. It goes on by itself once usage is under that{until}.",
         held.standing.says(),
-        held.at.floor() as i64
+        points(held.threshold)
     )
 }
 
@@ -890,28 +893,29 @@ mod tests {
         let job = Work::job("atlas", "j1", "email check");
         let now = at("2026-11-19T10:00:00Z");
         assert_eq!(
-            guard.check(&cfg(), &job, Some(&l), now),
+            guard.check(&cfg(), 80.0, &job, Some(&l), now),
             Verdict::Proceed,
             "nothing read: it runs"
         );
         guard.observe(&l, &[week(83.0, "2026-11-23T09:00:00Z")], now);
-        match guard.check(&cfg(), &job, Some(&l), now) {
+        match guard.check(&cfg(), 80.0, &job, Some(&l), now) {
             Verdict::Waits(why) => {
                 assert!(why.contains("your weekly Claude plan is at 83%"), "{why}");
                 assert!(why.contains("pauses from 80%"), "{why}");
             }
             other => panic!("{other:?}"),
         }
-        let mut lower = cfg();
-        lower.pause_at_percent = 90.0;
         assert_eq!(
-            guard.check(&lower, &job, Some(&l), now),
+            guard.check(&cfg(), 90.0, &job, Some(&l), now),
             Verdict::Proceed,
             "configurable"
         );
         // Past the reset, with nothing read since: it goes on.
         let after = at("2026-11-23T09:00:01Z");
-        assert_eq!(guard.check(&cfg(), &job, Some(&l), after), Verdict::Proceed);
+        assert_eq!(
+            guard.check(&cfg(), 80.0, &job, Some(&l), after),
+            Verdict::Proceed
+        );
         // A newer, lower reading frees it too.
         guard.observe(
             &l,
@@ -919,11 +923,11 @@ mod tests {
             at("2026-11-23T10:00:00Z"),
         );
         assert_eq!(
-            guard.check(&cfg(), &job, Some(&l), at("2026-11-23T10:00:00Z")),
+            guard.check(&cfg(), 80.0, &job, Some(&l), at("2026-11-23T10:00:00Z")),
             Verdict::Proceed
         );
         assert_eq!(
-            guard.check(&cfg(), &job, None, now),
+            guard.check(&cfg(), 80.0, &job, None, now),
             Verdict::Proceed,
             "not on a plan"
         );
@@ -935,7 +939,7 @@ mod tests {
             at("2026-11-23T11:00:00Z"),
         );
         assert_eq!(
-            guard.check(&off, &job, Some(&l), at("2026-11-23T11:00:00Z")),
+            guard.check(&off, 80.0, &job, Some(&l), at("2026-11-23T11:00:00Z")),
             Verdict::Proceed
         );
     }
@@ -946,9 +950,9 @@ mod tests {
         let l = login("ab");
         let job = Work::job("atlas", "j1", "email check");
         let now = at("2026-11-19T10:00:00Z");
-        assert_eq!(guard.holds(&cfg(), &l, now), None, "nothing read");
+        assert_eq!(guard.holds(80.0, &l, now), None, "nothing read");
         guard.observe(&l, &[week(79.9, "2026-11-23T09:00:00Z")], now);
-        assert_eq!(guard.holds(&cfg(), &l, now), None, "under");
+        assert_eq!(guard.holds(80.0, &l, now), None, "under");
         guard.observe(
             &l,
             &[
@@ -961,20 +965,17 @@ mod tests {
             ],
             now,
         );
-        let held = guard.holds(&cfg(), &l, now).unwrap();
+        let held = guard.holds(80.0, &l, now).unwrap();
         assert_eq!(
-            (held.standing.used_percent, held.at, held.until),
+            (held.standing.used_percent, held.threshold, held.until),
             (80.0, 80.0, at("2026-11-23T09:00:00Z"))
         );
         assert!(matches!(
-            guard.check(&cfg(), &job, Some(&l), now),
+            guard.check(&cfg(), 80.0, &job, Some(&l), now),
             Verdict::Waits(_)
         ));
-        let mut off = cfg();
-        off.enabled = false;
-        assert_eq!(guard.holds(&off, &l, now), None, "turned off");
         assert_eq!(
-            guard.holds(&cfg(), &l, at("2026-11-23T09:00:00Z")),
+            guard.holds(80.0, &l, at("2026-11-23T09:00:00Z")),
             None,
             "its window reset"
         );
@@ -989,13 +990,14 @@ mod tests {
             now,
         );
         assert_eq!(
-            guard.holds(&cfg(), &unsaid, now).unwrap().until,
+            guard.holds(80.0, &unsaid, now).unwrap().until,
             now + chrono::Duration::hours(5),
             "a window with no reset said lapses its length after it was read"
         );
         assert_eq!(
             guard.check(
                 &cfg(),
+                80.0,
                 &job,
                 Some(&unsaid),
                 now + chrono::Duration::hours(5)
@@ -1197,12 +1199,12 @@ mod tests {
             guard.began(&job, Some("p"));
         }
         let now = Utc::now();
-        let first = guard.check(&cfg(), &job, None, now);
+        let first = guard.check(&cfg(), 80.0, &job, None, now);
         assert!(
             matches!(first, Verdict::Stopped { first: true, .. }),
             "{first:?}"
         );
-        let again = guard.check(&cfg(), &job, None, now);
+        let again = guard.check(&cfg(), 80.0, &job, None, now);
         assert!(
             matches!(again, Verdict::Stopped { first: false, .. }),
             "{again:?}"
@@ -1210,7 +1212,7 @@ mod tests {
         // Resumed: what it did before is not held against it.
         guard.release(&job.key);
         assert_eq!(
-            guard.check(&cfg(), &job, None, Utc::now()),
+            guard.check(&cfg(), 80.0, &job, None, Utc::now()),
             Verdict::Proceed
         );
         // A job resumed (kept on the job itself, across restarts) likewise.
@@ -1221,11 +1223,11 @@ mod tests {
             ..Allowed::default()
         });
         assert_eq!(
-            other.check(&cfg(), &resumed, None, Utc::now()),
+            other.check(&cfg(), 80.0, &resumed, None, Utc::now()),
             Verdict::Proceed
         );
         assert!(matches!(
-            other.check(&cfg(), &job, None, Utc::now()),
+            other.check(&cfg(), 80.0, &job, None, Utc::now()),
             Verdict::Stopped { first: true, .. }
         ));
         // The same guard, the job turned back on after it was stopped: it
@@ -1237,6 +1239,7 @@ mod tests {
         assert_eq!(
             other.check(
                 &cfg(),
+                80.0,
                 &back_on,
                 None,
                 Utc::now() + chrono::Duration::seconds(2)

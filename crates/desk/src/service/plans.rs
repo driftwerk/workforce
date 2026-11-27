@@ -445,15 +445,13 @@ impl Desk {
         if p.paused != Some(Paused::PlanLimit) {
             return Ok(None);
         }
-        let prefix = plan::limit_prefix(p.id);
         Ok(self
             .0
             .store
-            .items_not_closed(Some(p.boss.as_str()))
+            .items_keyed_from(&plan::limit_prefix(p.id))
             .await
             .map_err(internal)?
-            .into_iter()
-            .find(|i| i.dedupe_key.starts_with(&prefix))
+            .first()
             .map(|i| i.mention_at(true)))
     }
 
