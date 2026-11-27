@@ -633,7 +633,7 @@ async fn on_a_granted_machine_only_a_grant_moves_a_session_between_groups() {
         let item = session_item(s);
         for change in [
             Box::new(|l: &Layout| l.put(&item, "g-globex", None))
-                as Box<dyn FnOnce(&Layout) -> Result<Layout, DeskError> + Send>,
+                as Box<dyn Fn(&Layout) -> Result<Layout, DeskError> + Send>,
             Box::new(|l: &Layout| l.remove(&item)),
         ] {
             let e = d.change_layout(change).await.unwrap_err();
@@ -934,6 +934,33 @@ async fn a_grant_at_act_fully_says_what_its_sessions_spent_today() {
         .await;
         assert_eq!(code, 200, "{one}");
         assert_eq!(one["spentTodayUsd"], json!(1.25), "{one}");
+    })
+    .await;
+}
+
+/// A grant written waits for no plan, and one taken away, which deletes
+/// its group, waits for a plan being written: none writes the group back.
+#[tokio::test]
+async fn only_a_grant_taken_away_waits_for_a_plan_being_written() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = engine(pool, dir.path(), true).await;
+        let writing = d.0.plan_write.lock().await;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            put(&d, "g-acme", body(1, "Acme", &[])),
+        )
+        .await
+        .expect("a grant written doesn't wait for plans");
+        let deleting = tokio::spawn({
+            let d = d.clone();
+            async move { d.delete_grant(native(), "g-acme").await }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert!(!deleting.is_finished(), "taking a grant away waits");
+        drop(writing);
+        deleting.await.unwrap().unwrap();
+        assert!(d.layout().groups.iter().all(|g| g.id != "g-acme"));
     })
     .await;
 }

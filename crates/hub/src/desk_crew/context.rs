@@ -57,6 +57,36 @@ pub(super) struct Entry {
     pub stale: Option<Staleness>,
 }
 
+/// Session `v`'s entry, with its `account` and why that is `stale`: failed
+/// as its card says it (not while Desk still reads what a rate limit was,
+/// nor once it is closed).
+fn entry_of(
+    v: &workforce_desk::model::SessionView,
+    account: Option<Account>,
+    stale: Option<Staleness>,
+) -> Entry {
+    Entry {
+        id: v.id,
+        name: v.label().to_string(),
+        state: v.state,
+        failed: v.failed.is_some(),
+        login: v.account.as_ref().map(|a| a.name.clone()),
+        on_login: v.failure.as_ref().and_then(|f| {
+            let login = v
+                .account
+                .as_ref()
+                .map_or("this computer's sign-in", |a| a.name.as_str());
+            match (f.limit(), f.refused()) {
+                (Some(_), _) => Some(format!("stopped on {login}'s usage limit")),
+                (None, true) => Some(format!("was turned away by the provider on {login}")),
+                (None, false) => None,
+            }
+        }),
+        account,
+        stale,
+    }
+}
+
 /// One of the boss's own DM posts.
 #[derive(Debug, Clone)]
 pub(super) struct Post {
@@ -272,25 +302,9 @@ pub(crate) async fn block(service: &AgentService, channel: &str, owner: &str) ->
     let stale = crew.desk.accounts_staleness(&read);
     let entries: Vec<Entry> = views
         .iter()
-        .map(|v| Entry {
-            id: v.id,
-            name: v.label().to_string(),
-            state: v.state,
-            failed: v.failure.is_some(),
-            login: v.account.as_ref().map(|a| a.name.clone()),
-            on_login: v.failure.as_ref().and_then(|f| {
-                let login = v
-                    .account
-                    .as_ref()
-                    .map_or("this computer's sign-in", |a| a.name.as_str());
-                match (f.limit(), f.refused()) {
-                    (Some(_), _) => Some(format!("stopped on {login}'s usage limit")),
-                    (None, true) => Some(format!("was turned away by the provider on {login}")),
-                    (None, false) => None,
-                }
-            }),
-            account: accounts.iter().find(|a| a.session == v.id).cloned(),
-            stale: stale.get(&v.id).copied(),
+        .map(|v| {
+            let account = accounts.iter().find(|a| a.session == v.id).cloned();
+            entry_of(v, account, stale.get(&v.id).copied())
         })
         .collect();
     let posts = recent_posts(&boss, owner);
@@ -422,6 +436,47 @@ mod tests {
             account: Some(a),
             stale: None,
         }
+    }
+
+    #[test]
+    fn a_session_failed_only_as_its_card_says_it() {
+        use workforce_desk::limit::TurnFailure;
+        use workforce_desk::model::{Approvals, Engine, Origin, SessionRecord, SessionView, View};
+        let now = Utc::now();
+        let r = SessionRecord {
+            id: Uuid::new_v4(),
+            engine: Engine::Claude,
+            view: View::Terminal,
+            engine_version: None,
+            approve_for_me: false,
+            fast: false,
+            model: None,
+            account: None,
+            name: "acme-web".into(),
+            goal: String::new(),
+            cwd: "/tmp/repo".into(),
+            branch: None,
+            origin: Origin::Desk,
+            state: SessionState::Done,
+            approvals: Approvals::Desk,
+            cli_session_id: None,
+            transcript: None,
+            last_prompt: None,
+            last_reply: None,
+            external_pid: None,
+            restore_offer: false,
+            terminal_id: None,
+            display_name: None,
+            folder_chosen: false,
+            asked: None,
+            created_at: now,
+            updated_at: now,
+        };
+        let mut v = SessionView::new(&r, true, None, None);
+        v.failure = Some(TurnFailure::Failed("rate_limit".into()));
+        assert!(!entry_of(&v, None, None).failed, "its verdict still read");
+        v.failed = Some(v.failure.as_ref().unwrap().said());
+        assert!(entry_of(&v, None, None).failed);
     }
 
     #[test]

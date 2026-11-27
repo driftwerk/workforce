@@ -339,7 +339,14 @@ async fn a_ticket_someone_holds_is_refused_plainly() {
             d.0.store.adopt_ticket(four.id, &runs, None).await,
             Err(Adopt::Held(id)) if id == four.id
         ));
-        // A ticket not on a board of the plan's group isn't found.
+        // A ticket not on a board of a group the plan's boss runs isn't found.
+        d.change_layout(|l| l.create("g-other", "Other", &[], None))
+            .await
+            .unwrap();
+        d.set_bosses(vec![
+            super::group_tests::boss("sarah", "Sarah", None),
+            super::group_tests::boss("ada", "Ada", Some("g-other")),
+        ]);
         let mut elsewhere = plan_of(vec![adopt(two.id, dir.path(), &[])]);
         elsewhere.group = Some("g-other".into());
         let e = d
@@ -348,7 +355,7 @@ async fn a_ticket_someone_holds_is_refused_plainly() {
             .unwrap_err();
         assert!(
             e.to_string()
-                .contains("isn't on a board of the plan's group"),
+                .contains("isn't on a board of a group the plan's boss runs"),
             "{e}"
         );
     })

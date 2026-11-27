@@ -322,9 +322,15 @@ impl Desk {
         Ok(b)
     }
 
+    /// Announces what a layout's write left in no group.
+    pub(super) async fn orphans_heard(&self, o: &super::Orphaned) {
+        self.boards_ungrouped(&o.boards).await;
+        self.plans_ungrouped(&o.plans).await;
+    }
+
     /// Boards whose sidebar group was deleted, now ungrouped: every Desk
     /// hears of them.
-    pub(super) async fn boards_ungrouped(&self, ids: &[Uuid]) {
+    async fn boards_ungrouped(&self, ids: &[Uuid]) {
         for id in ids {
             match self.0.store.board(*id).await {
                 Ok(Some(b)) => self.announce(DeskEvent::Board { board: Box::new(b) }),

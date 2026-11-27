@@ -1731,14 +1731,17 @@ async fn the_transcript_decides_what_a_rate_limit_was() {
             super::transition::finished(v.last_reply.as_deref().unwrap_or_default(), &v).0,
             Outcome::Failed
         );
+        // Not said while its transcript is still to say what it was.
+        assert_eq!(v.failed, None);
         assert!(!full(&d));
         std::fs::write(&transcript, error_line(true)).unwrap();
         until(|| full(&d).then_some(())).await;
-        assert!(d
-            .view(a)
-            .unwrap()
-            .failure
-            .is_some_and(|f| f.limit().is_some()));
+        let v = d.view(a).unwrap();
+        assert!(v.failure.is_some_and(|f| f.limit().is_some()));
+        assert_eq!(
+            v.failed.as_deref(),
+            Some("It stopped on its plan's usage limit")
+        );
         let (env, args) = started(dir.path(), a, 1).await;
         assert_eq!(env["TOKEN_ON_FD"], OTHER);
         assert!(told_desk_moved_it(&args), "{args}");

@@ -120,6 +120,37 @@ impl TurnFailure {
     pub fn refused(&self) -> bool {
         matches!(self, TurnFailure::Failed(e) if e == ACCOUNT_REFUSED)
     }
+
+    /// How it failed, in plain words, as its card and its boss read it.
+    pub fn said(&self) -> String {
+        match self {
+            TurnFailure::Limit(_) => "It stopped on its plan's usage limit".into(),
+            TurnFailure::Failed(_) if self.refused() => {
+                "The provider turned its account away".into()
+            }
+            TurnFailure::Failed(e) => match code_words(e) {
+                Some(words) => words.into(),
+                // A code Desk doesn't know, or Codex's own words.
+                None if !e.contains(char::is_whitespace) => format!("Its turn failed ({e})"),
+                None => e.clone(),
+            },
+        }
+    }
+}
+
+/// What Claude Code's `StopFailure` code stands for, in plain words.
+fn code_words(code: &str) -> Option<&'static str> {
+    Some(match code {
+        "rate_limit" => "The provider limited its requests for now",
+        "overloaded" => "The provider was overloaded",
+        "server_error" => "The provider had a server error",
+        "authentication_failed" => "Its sign-in was refused",
+        "billing_error" => "Its account has a billing problem",
+        "invalid_request" => "The provider refused its request",
+        "max_output_tokens" => "Its reply ran past the most it may write",
+        "unknown" => "Its turn failed",
+        _ => return None,
+    })
 }
 
 /// Why the provider refused a login, in plain words, from what the turn
@@ -205,6 +236,23 @@ pub fn in_transcript_line(v: &Value) -> Option<TurnFailure> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_failure_is_said_in_plain_words_never_as_a_code_desk_knows() {
+        let said = |e: &str| TurnFailure::Failed(e.into()).said();
+        assert_eq!(
+            said("rate_limit"),
+            "The provider limited its requests for now"
+        );
+        assert_eq!(said("server_error"), "The provider had a server error");
+        assert_eq!(said("unknown"), "Its turn failed");
+        assert_eq!(said("new_code"), "Its turn failed (new_code)");
+        assert_eq!(said("stream disconnected"), "stream disconnected");
+        assert_eq!(
+            said(ACCOUNT_REFUSED),
+            "The provider turned its account away"
+        );
+    }
 
     #[test]
     fn a_refusal_of_the_account_itself_is_told_from_a_limit_and_other_failures() {

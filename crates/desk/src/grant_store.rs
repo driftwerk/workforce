@@ -57,8 +57,8 @@ pub struct Projection<'a> {
 /// What a write did.
 #[derive(Debug, Clone, Default)]
 pub struct Written {
-    /// Boards in a group the machine's sidebar no longer has.
-    pub ungrouped_boards: Vec<Uuid>,
+    /// Boards and plans in a group the machine's sidebar no longer has.
+    pub orphaned: crate::service::Orphaned,
     /// The sessions restamped by it.
     pub restamped: Vec<Uuid>,
 }
@@ -496,7 +496,7 @@ async fn project(tx: &tokio_postgres::Transaction<'_>, p: &Projection<'_>) -> Re
     let since: DateTime<Utc> = r.try_get(0)?;
     let was: HashMap<String, String> =
         serde_json::from_value(r.try_get::<_, serde_json::Value>(1)?).unwrap_or_default();
-    let ungrouped_boards = crate::service::put_layout_in(tx, p.layout, true).await?;
+    let orphaned = crate::service::put_layout_in(tx, p.layout, true).await?;
     // Only into a group: a session the home put in Ungrouped keeps its
     // rows where they are, since a restamp only ever narrows.
     let (sessions, groups): (Vec<Uuid>, Vec<String>) = p
@@ -519,7 +519,7 @@ async fn project(tx: &tokio_postgres::Transaction<'_>, p: &Projection<'_>) -> Re
         .collect();
     if fresh.is_empty() {
         return Ok(Written {
-            ungrouped_boards,
+            orphaned,
             restamped: Vec::new(),
         });
     }
@@ -592,7 +592,7 @@ async fn project(tx: &tokio_postgres::Transaction<'_>, p: &Projection<'_>) -> Re
         .context("taking the old groups' budgets along")?;
     }
     Ok(Written {
-        ungrouped_boards,
+        orphaned,
         restamped: ids,
     })
 }
