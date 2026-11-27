@@ -977,9 +977,11 @@ pub enum Said {
     Answering,
     /// Asking, unprompted, for a plan to be ended or removed: at least 4
     /// words and 15 characters of one message that name the plan and its
-    /// ending ([`asks_to_end`]), in a message that doesn't say no ("don't
-    /// stop the plan yet"). A shorter reply ("yes") counts only as the
-    /// answer to the boss's own question about it ([`replied_to_end`]).
+    /// ending ([`asks_to_end`]), in a message asking for it now
+    /// ([`asked_by`]: not "don't stop the plan yet", "should we end the
+    /// plan?" or "wrap up the plan later"). A shorter reply ("yes") counts
+    /// only as the answer to the boss's own question about it
+    /// ([`replied_to_end`]).
     Asking,
 }
 
@@ -1061,10 +1063,6 @@ pub fn said_by(
 ) -> Result<DateTime<Utc>, NotSaid> {
     found(messages, quote, since, said, &|text| match said {
         Said::Changing => Consent::Yes,
-        Said::Asking => match consent(text) {
-            Consent::No => Consent::No,
-            _ => Consent::Yes,
-        },
         _ => consent(text),
     })
 }
@@ -1151,33 +1149,131 @@ const ENDING: [&str; 13] = [
     "delete", "scrap", "wrap",
 ];
 
-/// Whether `text` asks for the plan of `goal` to be ended or removed: it
-/// names the plan (the word plan, or its goal) and its ending (end, stop,
-/// drop, remove, finish, close, cancel, delete, scrap, wrap). "Close the
-/// PR" or "finish the tests first" name no plan.
-pub fn asks_to_end(text: &str, goal: &str) -> bool {
-    let words = compared_words(text);
-    let ends = words.iter().any(|w| ENDING.contains(&w.as_str()));
-    let names = words.iter().any(|w| w == "plan" || w == "plans") || says_goal(text, goal);
-    ends && names
+/// Words that put an ending off ("wrap up the plan later", "end it once
+/// CI is green"): not asking for it now.
+const DEFERRING: &[&str] = &[
+    "later",
+    "tomorrow",
+    "tonight",
+    "soon",
+    "eventually",
+    "after",
+    "afterwards",
+    "once",
+    "when",
+    "until",
+    "till",
+    "monday",
+    "tuesday",
+    "wednesday",
+    "thursday",
+    "friday",
+    "weekend",
+];
+/// Phrases that put an ending off, as [`DEFERRING`]'s words do.
+const DEFERRING_PHRASES: &[&[&str]] = &[&["next", "week"], &["next", "month"], &["next", "sprint"]];
+
+/// The plan an ending is asked for, among its boss's: its goal, the goals
+/// of the boss's other plans (finished ones too), and whether none of
+/// those is open.
+#[derive(Debug, Clone, Copy)]
+pub struct EndingOf<'a> {
+    pub goal: &'a str,
+    pub others: &'a [&'a str],
+    pub alone: bool,
+}
+
+impl EndingOf<'_> {
+    /// Whether `text` names this plan: by its goal, said whole, when it
+    /// has at least 3 words, or a shorter one with the word plan; or,
+    /// `bare` allowing and the boss having no other open plan (`alone`),
+    /// by the word plan alone. Never when it names another of the boss's
+    /// plans.
+    fn named(&self, text: &str, bare: bool) -> bool {
+        let words = compared_words(text);
+        let plan = words.iter().any(|w| w == "plan" || w == "plans");
+        let by_goal =
+            |goal: &str| says_goal(text, goal) && (plan || compared_words(goal).len() >= 3);
+        !self.others.iter().any(|g| by_goal(g))
+            && (by_goal(self.goal) || (bare && plan && self.alone))
+    }
+}
+
+/// Whether `text` asks for the plan `of` to be ended or removed: it names
+/// that plan ([`EndingOf::named`]) and its ending (end, stop, drop,
+/// remove, finish, close, cancel, delete, scrap, wrap). "Close the PR",
+/// "finish the tests first" or another plan's goal name no ending of it.
+pub fn asks_to_end(text: &str, of: EndingOf) -> bool {
+    compared_words(text)
+        .iter()
+        .any(|w| ENDING.contains(&w.as_str()))
+        && of.named(text, true)
+}
+
+/// What the person's message `text` says of an ending it asks for: yes
+/// only when it asks for it now; no with a refusing word ("don't", any
+/// "n't", "not", "wait"), the ending's own words aside; unclear when it
+/// asks back ("Should we end the plan?") or puts it off ("later", "once
+/// CI is green", "next week").
+fn asks_now(text: &str) -> Consent {
+    let words = plain_words(text);
+    let others = || words.iter().filter(|w| !ENDING.contains(&w.as_str()));
+    if others().any(|w| refusing(w)) {
+        Consent::No
+    } else if text.trim_end().ends_with('?')
+        || others().any(|w| DEFERRING.contains(&w.as_str()))
+        || DEFERRING_PHRASES.iter().any(|p| holds(&words, p))
+    {
+        Consent::Unclear
+    } else {
+        Consent::Yes
+    }
+}
+
+/// [`said_by`] for the person asking for the plan `of` to be ended or
+/// removed ([`Said::Asking`]): each message read by [`asks_now`], and
+/// one naming another of the boss's plans refuses.
+pub fn asked_by(
+    messages: &[(DateTime<Utc>, String)],
+    quote: &str,
+    since: DateTime<Utc>,
+    of: EndingOf,
+) -> Result<DateTime<Utc>, NotSaid> {
+    found(messages, quote, since, Said::Asking, &|text| {
+        let other = |goal| EndingOf {
+            goal,
+            others: &[],
+            alone: false,
+        };
+        match of.others.iter().any(|g| other(g).named(text, false)) {
+            true => Consent::No,
+            false => asks_now(text),
+        }
+    })
 }
 
 /// When the person's `quote` is their plain reply ("yes") to the boss's
 /// last message before it in `boss`, which asked them about ending or
-/// removing the plan of `goal` ([`asks_to_end`]): as [`replied_to`] reads
-/// a reply.
+/// removing the plan `of`, naming it by its goal (the word plan alone
+/// never does, since the boss writes the question): as [`replied_to`]
+/// reads a reply.
 pub fn replied_to_end(
     theirs: &[(DateTime<Utc>, String)],
     boss: &[(DateTime<Utc>, String)],
     quote: &str,
-    goal: &str,
+    of: EndingOf,
     since: DateTime<Utc>,
 ) -> Result<DateTime<Utc>, NotReplied> {
     let at = replied_to(theirs, boss, quote, &[], since)?;
     boss.iter()
         .filter(|(when, _)| *when < at)
         .max_by_key(|(when, _)| *when)
-        .filter(|(_, asked)| asks_to_end(asked, goal))
+        .filter(|(_, asked)| {
+            compared_words(asked)
+                .iter()
+                .any(|w| ENDING.contains(&w.as_str()))
+                && of.named(asked, false)
+        })
         .map(|_| at)
         .ok_or(NotReplied::NothingProposed)
 }

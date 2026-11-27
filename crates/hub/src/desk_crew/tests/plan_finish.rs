@@ -255,48 +255,76 @@ async fn then(boss: &AgentService, says: fn(&AgentService, &str), text: &str) {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_plan_is_ended_only_on_words_naming_it_and_its_end_or_a_yes_to_the_bosss_question_about_it(
+async fn a_plan_is_ended_only_on_words_naming_it_and_its_end_now_or_a_yes_to_the_bosss_question_naming_it(
 ) {
     with_test_pool(workforce_desk::store::build_pool, |pool| async move {
         let dir = tempfile::tempdir().unwrap();
         let (overseer, state, d, _llm) = hub_with(dir.path(), pool, ACTS).await;
-        let first = proposed(&d, dir.path(), 1).await.summary.plan.id;
-        d.approve_plan(first, 1, &By::you()).await.unwrap();
-        let second = proposed(&d, dir.path(), 1).await.summary.plan.id;
-        d.approve_plan(second, 1, &By::you()).await.unwrap();
+        let party = workforce_desk::crew::Party::manager("desk", "Desk");
+        let running = async |goal: &str| {
+            let mut new = proposal(dir.path(), 1);
+            new.draft.goal = goal.into();
+            let id = d
+                .propose_plan(new, &party, &By::you())
+                .await
+                .unwrap()
+                .summary
+                .plan
+                .id;
+            d.approve_plan(id, 1, &By::you()).await.unwrap();
+            id
+        };
+        let mantis = running("Mantis bugs").await;
+        let eden = running("Eden v1 for staff").await;
         let _crew = CrewHub::start(state, d.clone(), FAST, CancellationToken::new());
         eventually("the plan tools", async || {
             overseer.tools.has("crew.plan_update").then_some(())
         })
         .await;
-        let running = async |id| d.plan(id).await.unwrap().summary.plan.state == PlanState::Running;
+        let going = async |id| d.plan(id).await.unwrap().summary.plan.state == PlanState::Running;
 
-        for words in [
+        let refused = [
             "ok",
             "the tests are green on main",
             "don't stop the plan yet",
+            "Please don't end the plan yet",
+            "I don't want to stop the plan",
+            "We shouldn't end the plan",
+            "Should we end the plan?",
+            "let's wrap up the plan later",
             "close the PR when CI is green",
             "finish the tests first",
-        ] {
+            "end the Mantis plan",
+            "close the Mantis bugs PR",
+        ];
+        for words in refused {
             then(&overseer, person_says, words).await;
         }
-        for quote in [
-            "ok",
-            "the tests",
-            "don't stop the plan yet",
-            "close the PR when CI is green",
-            "finish the tests first",
-        ] {
-            let r = run(&overseer, "crew.plan_update", ending(first, "end", quote)).await;
-            assert!(!r.success, "{quote} asks for no end of the plan");
+        for quote in refused {
+            let quote = quote.trim_end_matches('?');
+            let r = run(&overseer, "crew.plan_update", ending(eden, "end", quote)).await;
+            assert!(!r.success, "{quote} asks for no end of the Eden plan");
         }
-        assert!(running(first).await);
+        let r = run(
+            &overseer,
+            "crew.plan_update",
+            ending(mantis, "end", "close the Mantis bugs PR"),
+        )
+        .await;
+        assert!(!r.success, "the Mantis bugs PR isn't its plan");
+        assert!(going(eden).await && going(mantis).await);
 
-        then(&overseer, boss_says, "Shall I close the old PR?").await;
-        then(&overseer, person_says, "yes").await;
-        let r = run(&overseer, "crew.plan_update", ending(first, "end", "yes")).await;
-        assert!(!r.success, "a yes to something else");
-        assert!(running(first).await);
+        for asked in [
+            "Shall I close the old PR?",
+            "Shall I close out the plan's old PR?",
+            "Shall I end the plan?",
+        ] {
+            then(&overseer, boss_says, asked).await;
+            then(&overseer, person_says, "yes").await;
+            let r = run(&overseer, "crew.plan_update", ending(mantis, "end", "yes")).await;
+            assert!(!r.success, "a yes to “{asked}”");
+        }
+        assert!(going(mantis).await);
 
         then(
             &overseer,
@@ -305,31 +333,33 @@ async fn a_plan_is_ended_only_on_words_naming_it_and_its_end_or_a_yes_to_the_bos
         )
         .await;
         then(&overseer, person_says, "yes").await;
-        let r = run(&overseer, "crew.plan_update", ending(first, "end", "yes")).await;
+        let r = run(&overseer, "crew.plan_update", ending(mantis, "end", "yes")).await;
         assert!(r.success, "{r:?}");
         assert_eq!(
-            d.plan(first).await.unwrap().summary.plan.state,
+            d.plan(mantis).await.unwrap().summary.plan.state,
             PlanState::Dropped
         );
-        let r = run(
-            &overseer,
-            "crew.plan_update",
-            ending(second, "end", "end the"),
-        )
-        .await;
-        assert!(!r.success, "too little of their words");
-        assert!(running(second).await);
+        assert!(going(eden).await);
 
+        // Its boss's one open plan now: the word plan names it.
         then(&overseer, person_says, "end the Mantis bugs plan").await;
         let r = run(
             &overseer,
             "crew.plan_update",
-            ending(second, "end", "end the Mantis bugs plan"),
+            ending(eden, "end", "end the Mantis bugs plan"),
+        )
+        .await;
+        assert!(!r.success, "it names the Mantis bugs plan");
+        then(&overseer, person_says, "end the plan for Eden now").await;
+        let r = run(
+            &overseer,
+            "crew.plan_update",
+            ending(eden, "end", "end the plan for Eden now"),
         )
         .await;
         assert!(r.success, "{r:?}");
         assert_eq!(
-            d.plan(second).await.unwrap().summary.plan.state,
+            d.plan(eden).await.unwrap().summary.plan.state,
             PlanState::Dropped
         );
     })

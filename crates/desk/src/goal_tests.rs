@@ -1165,16 +1165,20 @@ fn a_plan_is_ended_on_the_persons_words_asking_for_it_or_their_reply_to_the_boss
     let said = |texts: &[(i64, &str)]| -> Vec<(DateTime<Utc>, String)> {
         texts.iter().map(|(m, t)| (at(*m), t.to_string())).collect()
     };
-    let goal = "Fix the Mantis bugs";
-    let theirs = said(&[
-        (1, "ok"),
-        (2, "don't stop the plan yet"),
-        (3, "Please end the Mantis bugs plan now"),
-    ]);
-    let asking = |quote: &str| said_by(&theirs, quote, at(-60), Said::Asking);
-    assert!(asks_to_end("end the Mantis bugs plan", goal));
+    let of = |goal, others, alone| EndingOf {
+        goal,
+        others,
+        alone,
+    };
+    let alone = of("Fix the Mantis bugs", &[], true);
+    let two = of("Fix the Mantis bugs", &["Ship Eden v1 to staff"], false);
+    let eden = of("Ship Eden v1 to staff", &["Fix the Mantis bugs"], false);
+    let docs = of("docs", &[], true);
+
+    // What names the plan and its ending.
+    assert!(asks_to_end("end the Mantis bugs plan", alone));
     assert!(
-        asks_to_end("stop fix the Mantis bugs", goal),
+        asks_to_end("stop fix the Mantis bugs", two),
         "named by its goal"
     );
     for quote in [
@@ -1183,21 +1187,111 @@ fn a_plan_is_ended_on_the_persons_words_asking_for_it_or_their_reply_to_the_boss
         "close the PR when CI is green",
         "finish the tests first",
     ] {
-        assert!(!asks_to_end(quote, goal), "{quote}");
+        assert!(!asks_to_end(quote, alone), "{quote}");
     }
-    assert_eq!(asking("end the Mantis bugs plan"), Ok(at(3)));
-    assert_eq!(asking("don't stop the plan yet"), Err(NotSaid::Refuses));
-    assert!(asking("ok").is_err(), "a short whole message isn't asking");
-    assert!(matches!(asking("end the"), Err(NotSaid::TooShort { .. })));
-
-    let yes = said(&[(5, "yes")]);
-    let reply = |boss: &str| replied_to_end(&yes, &said(&[(4, boss)]), "yes", goal, at(-60));
-    assert_eq!(reply("Shall I end the Mantis bugs plan?"), Ok(at(5)));
-    assert_eq!(
-        reply("Shall I close the old PR?"),
-        Err(NotReplied::NothingProposed),
-        "a yes to something else"
+    assert!(
+        !asks_to_end("end the Mantis plan", eden),
+        "the bare word with two plans"
     );
-    let boss = said(&[(4, "Shall I end the Mantis bugs plan?")]);
-    assert!(replied_to_end(&said(&[(5, "no")]), &boss, "no", goal, at(-60)).is_err());
+    assert!(
+        !asks_to_end("end the plan, fix the Mantis bugs", eden),
+        "another plan's goal"
+    );
+    assert!(
+        !asks_to_end("close the docs PR", docs),
+        "a short goal alone"
+    );
+    assert!(!asks_to_end(
+        "close the CI green PR",
+        of("CI green", &[], true)
+    ));
+    let past = of("Ship Eden v1 to staff", &["Fix the Mantis bugs"], true);
+    assert!(
+        asks_to_end("end the plan for Eden now", past),
+        "its one open plan"
+    );
+    assert!(
+        !asks_to_end("end the plan, fix the Mantis bugs", past),
+        "a finished plan's goal"
+    );
+    assert!(
+        asks_to_end("close the docs plan", docs),
+        "a short goal with the word plan"
+    );
+
+    // Said now, and not taken back.
+    let theirs = said(&[
+        (1, "ok"),
+        (2, "don't stop the plan yet"),
+        (3, "Please don't end the plan yet"),
+        (4, "I don't want to stop the plan"),
+        (5, "We shouldn't end the plan"),
+        (6, "Should we end the plan now?"),
+        (7, "let's wrap up the plan later"),
+        (8, "end the plan once CI is green"),
+        (9, "close the plan next week please"),
+        (10, "Please end the Mantis bugs plan now"),
+    ]);
+    let asking = |quote: &str, of| asked_by(&theirs, quote, at(-60), of);
+    assert_eq!(asking("end the Mantis bugs plan", alone), Ok(at(10)));
+    for quote in [
+        "don't stop the plan yet",
+        "Please don't end the plan yet",
+        "I don't want to stop the plan",
+        "We shouldn't end the plan",
+    ] {
+        assert_eq!(asking(quote, alone), Err(NotSaid::Refuses), "{quote}");
+    }
+    for quote in [
+        "Should we end the plan now",
+        "let's wrap up the plan later",
+        "end the plan once CI is green",
+        "close the plan next week",
+    ] {
+        assert!(asking(quote, alone).is_err(), "{quote}");
+    }
+    assert!(
+        asking("ok", alone).is_err(),
+        "a short whole message isn't asking"
+    );
+    assert!(matches!(
+        asking("end the", alone),
+        Err(NotSaid::TooShort { .. })
+    ));
+    let mixed = said(&[(1, "end the plan, fix the Mantis bugs first")]);
+    assert!(
+        asked_by(&mixed, "end the plan", at(-60), eden).is_err(),
+        "it names another plan"
+    );
+
+    // A yes, to the boss's question naming the plan by its goal.
+    let yes = said(&[(5, "yes")]);
+    let reply = |boss: &str, of| replied_to_end(&yes, &said(&[(4, boss)]), "yes", of, at(-60));
+    assert_eq!(
+        reply("Shall I end the Fix the Mantis bugs plan?", alone),
+        Ok(at(5))
+    );
+    assert_eq!(reply("Shall I end “Fix the Mantis bugs”?", two), Ok(at(5)));
+    let mantis = of("Mantis bugs", &["Eden v1 for staff"], false);
+    assert_eq!(
+        reply("Shall I end the Mantis bugs plan?", mantis),
+        Ok(at(5))
+    );
+    for asked in [
+        "Shall I close the old PR?",
+        "Shall I end the Mantis bugs plan?",
+        "Shall I close out the plan's old PR?",
+    ] {
+        assert_eq!(
+            reply(asked, alone),
+            Err(NotReplied::NothingProposed),
+            "{asked}"
+        );
+    }
+    assert!(
+        reply("Shall I end “Fix the Mantis bugs”?", eden).is_err(),
+        "another plan's"
+    );
+    let boss = said(&[(4, "Shall I end “Fix the Mantis bugs”?")]);
+    assert!(replied_to_end(&said(&[(5, "no")]), &boss, "no", alone, at(-60)).is_err());
 }
