@@ -142,6 +142,7 @@ mod unread;
 mod urgent;
 #[cfg(test)]
 mod urgent_tests;
+mod worktree_hold;
 
 use transition::Transition;
 
@@ -261,6 +262,12 @@ pub enum DeskError {
     /// answered as a 409 with its own `code`, so the start waits for it.
     #[error("{0}")]
     NotHeld(String),
+    /// A start's worktree is held by something else ([`worktree::Unmade::Taken`]),
+    /// or by the session (`holder`) still running in it: answered as a 409
+    /// with its own `code` and `holder`, so a plan pauses on it rather than
+    /// trying it again.
+    #[error("{why}")]
+    WorktreeTaken { why: String, holder: Option<Uuid> },
     /// A grant asked to last longer than this engine gives, `most` hours.
     /// Answered as a 400 with its own `code` and `mostHours`.
     #[error("{why}")]
@@ -2188,7 +2195,7 @@ impl Desk {
                 })
                 .map(|s| s.id)
                 .collect::<Vec<_>>();
-            desk.restore(&ids, None).await;
+            desk.restore_at_launch(&ids).await;
         }
         *desk.0.restoring_since.lock() = None;
         tokio::spawn({
@@ -3925,12 +3932,20 @@ impl Desk {
                 (path, Some(branch))
             }
             Some(branch) => (
-                worktree::create(&cwd, branch)
-                    .await
-                    .map_err(|e| DeskError::Invalid(e.to_string()))?,
+                worktree::create(&cwd, branch).await.map_err(|e| match e {
+                    worktree::Unmade::Taken(why) => DeskError::WorktreeTaken { why, holder: None },
+                    worktree::Unmade::Failed(e) => DeskError::Invalid(e.to_string()),
+                })?,
                 Some(branch.to_string()),
             ),
             None => (cwd, None),
+        };
+        // A review reads a worktree beside the session that works in it.
+        let held =
+            worktree_hold::held_folder(&cwd, branch.is_some()).filter(|_| new.review_of.is_none());
+        let hold = match held {
+            Some(folder) => Some(self.worktree_hold(folder).await),
+            None => None,
         };
         let ready = match deps {
             true => {
@@ -3992,6 +4007,9 @@ impl Desk {
         };
         let placing = {
             let mut st = self.0.state.lock();
+            if let Some(e) = hold.as_ref().and_then(|h| h.refuses(&st, id)) {
+                return Err(e);
+            }
             st.records.insert(id, record.clone());
             boss.map(|boss| self.reserve_charge(&mut st, id, boss, group.as_deref()))
         };
@@ -4215,6 +4233,19 @@ impl Desk {
         prompt: Option<String>,
         by: Option<By>,
     ) -> Result<SessionView, DeskError> {
+        self.resume_as(id, prompt, by, false).await
+    }
+
+    /// [`Self::resume`]; `restoring` only for Desk's restore at its launch
+    /// ([`Self::restore_at_launch`]), which brings back what ran together
+    /// in a worktree before. Every other resume is checked against its hold.
+    async fn resume_as(
+        &self,
+        id: Uuid,
+        prompt: Option<String>,
+        by: Option<By>,
+        restoring: bool,
+    ) -> Result<SessionView, DeskError> {
         // A session Desk's breaker holds goes on only by the person: anyone
         // else's resume, or a prompt with it, is refused. A restore at start
         // (no one, no prompt) starts no turn, and the hold stays.
@@ -4225,16 +4256,19 @@ impl Desk {
             self.breaker_refuses_prompt(id, by.as_ref())?;
         }
         let carrier = by.clone();
-        self.resume_checked(id, prompt, by, carrier.as_ref()).await
+        self.resume_checked(id, prompt, by, carrier.as_ref(), restoring)
+            .await
     }
 
-    /// [`Self::resume`], the breaker already asked.
+    /// [`Self::resume`], the breaker already asked; `restoring` when it is
+    /// Desk's restore, which brings back what ran together before.
     async fn resume_checked(
         &self,
         id: Uuid,
         prompt: Option<String>,
         by: Option<By>,
         carrier: Option<&By>,
+        restoring: bool,
     ) -> Result<SessionView, DeskError> {
         // A Devin session's run before ends whole first ([`Self::on_exit`]),
         // and it is read after: what that end said is never saved over.
@@ -4291,6 +4325,15 @@ impl Desk {
             }
             self.end_held(id).await?;
         }
+        // Desk's own restore brings back what ran together before; any
+        // other resume (anyone's, a restart, a start again) is checked.
+        let held = (!restoring)
+            .then(|| worktree_hold::held_folder(Path::new(&r.cwd), r.branch.is_some()))
+            .flatten();
+        let hold = match held {
+            Some(folder) => Some(self.worktree_hold(folder).await),
+            None => None,
+        };
         let _starting = Starting::of(self, id)?;
         // Devin's conversation, as Devin still lists it in its folder; a new
         // one, the person told why, when it doesn't.
@@ -4320,6 +4363,9 @@ impl Desk {
         }
         {
             let mut st = self.0.state.lock();
+            if let Some(e) = hold.as_ref().and_then(|h| h.refuses(&st, id)) {
+                return Err(e);
+            }
             if by.is_some() {
                 st.acted.insert(id);
             }
@@ -4571,7 +4617,7 @@ impl Desk {
         }
         self.0.state.lock().acted.insert(id);
         let view = self
-            .resume_checked(id, prompt.clone(), None, Some(&by))
+            .resume_checked(id, prompt.clone(), None, Some(&by), false)
             .await?;
         let text = match &prompt {
             Some(p) => format!(
@@ -4589,9 +4635,19 @@ impl Desk {
     /// Resumes each id, returning those that came back; failures are logged
     /// and leave the session on offer.
     pub async fn restore(&self, ids: &[Uuid], by: Option<By>) -> Vec<SessionView> {
+        self.restore_as(ids, by, false).await
+    }
+
+    /// [`Self::restore`] at Desk's launch: what ran together in a worktree
+    /// before comes back together.
+    pub(crate) async fn restore_at_launch(&self, ids: &[Uuid]) -> Vec<SessionView> {
+        self.restore_as(ids, None, true).await
+    }
+
+    async fn restore_as(&self, ids: &[Uuid], by: Option<By>, restoring: bool) -> Vec<SessionView> {
         let mut back = Vec::new();
         for &id in ids {
-            match self.resume(id, None, by.clone()).await {
+            match self.resume_as(id, None, by.clone(), restoring).await {
                 Ok(v) => back.push(v),
                 Err(e) => tracing::warn!(%id, error = %e, "desk session could not be restored"),
             }

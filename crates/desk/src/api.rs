@@ -101,6 +101,14 @@ impl IntoResponse for DeskError {
                 )
                     .into_response()
             }
+            DeskError::WorktreeTaken { why, holder } => {
+                let body = json!({
+                    "error": why,
+                    "code": crate::worktree::TAKEN,
+                    "holder": holder,
+                });
+                return (StatusCode::CONFLICT, Json(body)).into_response();
+            }
             DeskError::Invalid(_) => StatusCode::BAD_REQUEST,
             DeskError::TooLong { most, .. } => {
                 let most = *most;
@@ -780,12 +788,31 @@ struct Start {
     id: Option<Uuid>,
     #[serde(default)]
     deps: bool,
+    /// A plan's start of its ticket again (only its hub's plan runner says
+    /// so): its boss's own earlier session of it, resting in its worktree,
+    /// gives way ([`crate::Desk::create_held`]).
+    #[serde(default)]
+    free_resting: bool,
+    /// With `free_resting`, the session its ticket names now, which never
+    /// gives way.
+    #[serde(default)]
+    assigned: Option<Uuid>,
 }
 
 async fn create(State(s): S, h: HeaderMap, Query(q): Q, Json(start): Json<Start>) -> Response {
     guarded!(s, h, q);
     match (start.boss, start.id) {
-        (Some(boss), id) => s.desk.create_held(start.new, &boss, id, start.deps).await,
+        (Some(boss), id) => {
+            s.desk
+                .create_held(
+                    start.new,
+                    &boss,
+                    id,
+                    start.deps,
+                    start.free_resting.then_some(start.assigned),
+                )
+                .await
+        }
         (None, None) => s.desk.create_chosen(start.new, start.deps).await,
         (None, Some(_)) => Err(DeskError::Invalid(
             "Only a plan's ticket started for its boss names its session.".into(),
@@ -2586,6 +2613,35 @@ mod tests {
         assert_eq!(body["code"], GRANT_TOO_LONG);
         assert_eq!(body["mostHours"], 12);
         assert!(body["error"].as_str().unwrap().contains("1 to 12 hours"));
+    }
+
+    #[tokio::test]
+    async fn a_start_whose_worktree_is_taken_says_so_by_its_code() {
+        use super::{DeskError, IntoResponse, StatusCode};
+        let holder = uuid::Uuid::new_v4();
+        let res = DeskError::WorktreeTaken {
+            why: "/dev/atlas/.worktrees/man-5 is in use".into(),
+            holder: Some(holder),
+        }
+        .into_response();
+        assert_eq!(res.status(), StatusCode::CONFLICT);
+        let bytes = axum::body::to_bytes(res.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["code"], crate::worktree::TAKEN);
+        assert_eq!(body["error"], "/dev/atlas/.worktrees/man-5 is in use");
+        assert_eq!(body["holder"], holder.to_string());
+        let held_by_nothing = DeskError::WorktreeTaken {
+            why: "a folder is there".into(),
+            holder: None,
+        }
+        .into_response();
+        let bytes = axum::body::to_bytes(held_by_nothing.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(body["holder"].is_null());
     }
 
     #[tokio::test]

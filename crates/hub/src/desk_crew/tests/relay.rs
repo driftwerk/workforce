@@ -963,8 +963,9 @@ const START_FIELDS: [&str; 8] = [
 
 /// Desk's native side for devbox, as it carries each call: devbox's
 /// sessions (each with the grant there that holds it, or none; none said at
-/// all by an `older` Desk there), and each start as Desk sends it (its own fields, and a plan's
-/// grant and the call's boss when it is under one), to devbox's sessions
+/// all by an `older` Desk there), and each start as Desk sends it (its own
+/// fields, a plan's start again freeing its worktree unless `older`, with
+/// the session its ticket names, and a plan's grant and the call's boss when it is under one), to devbox's sessions
 /// route; each crew call to devbox's served route, kept in `carried`.
 fn carrying(
     crew: &Arc<CrewHub>,
@@ -1006,6 +1007,12 @@ fn carrying(
                             .iter()
                             .filter_map(|k| Some((k.to_string(), c.input.get(*k)?.clone())))
                             .collect();
+                        if !older && c.input["free_resting"] == json!(true) {
+                            start.insert("free_resting".into(), true.into());
+                            if let Some(a) = c.input.get("assigned") {
+                                start.insert("assigned".into(), a.clone());
+                            }
+                        }
                         if workforce_desk::grant::plan_of(&c.group).is_some() {
                             start.insert("group".into(), c.group.clone().into());
                             start.insert("boss".into(), c.boss.clone().into());
@@ -1039,7 +1046,12 @@ fn carrying(
                     },
                     false => RelayAnswer {
                         status: ServedStatus::Refused,
-                        body: json!({"error": body["error"], "code": body["code"]}),
+                        body: match body.get("holder").filter(|h| !older && h.is_string()) {
+                            Some(h) => {
+                                json!({"error": body["error"], "code": body["code"], "holder": h})
+                            }
+                            None => json!({"error": body["error"], "code": body["code"]}),
+                        },
                     },
                 };
                 crew.relay_answer(c.id, answer);
@@ -2321,4 +2333,236 @@ async fn a_machine_whose_listing_doesnt_say_its_grants_is_never_written_ungroupe
         .await;
     })
     .await;
+}
+
+/// A repository at `dir` with one commit on `main`.
+async fn git_repo(dir: &std::path::Path) {
+    for args in [
+        vec!["init", "-q", "-b", "main"],
+        vec![
+            "-c",
+            "user.email=d@e",
+            "-c",
+            "user.name=d",
+            "commit",
+            "-q",
+            "--allow-empty",
+            "-m",
+            "init",
+        ],
+    ] {
+        let out = crate::git_hardening::hardened_git()
+            .arg("-C")
+            .arg(dir)
+            .args(&args)
+            .output()
+            .await
+            .unwrap();
+        assert!(out.status.success(), "{out:?}");
+    }
+}
+
+/// A plan's ticket on devbox, sent back to To do while its session rests
+/// in its worktree there, starts again in that worktree: the start, as Desk
+/// carries it, says it is its plan's start again, and devbox stops the
+/// boss's own resting session for it. A Desk there older than that (it
+/// carries no such word) leaves the session, and the plan pauses saying
+/// the worktree is taken.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_machine_ticket_started_again_frees_its_worktree_of_its_resting_session() {
+    for older in [false, true] {
+        with_test_pool(workforce_desk::store::build_pool, |mac_pool| async move {
+            with_test_pool(
+                workforce_desk::store::build_pool,
+                |devbox_pool| async move {
+                    started_again_on_devbox(mac_pool, devbox_pool, older).await;
+                },
+            )
+            .await;
+        })
+        .await;
+    }
+}
+
+async fn started_again_on_devbox(
+    mac_pool: workforce_postgres::PostgresPool,
+    devbox_pool: workforce_postgres::PostgresPool,
+    older: bool,
+) {
+    use workforce_desk::board::TicketState;
+    let (mac_dir, devbox_dir, repo) = (
+        tempfile::tempdir().unwrap(),
+        tempfile::tempdir().unwrap(),
+        tempfile::tempdir().unwrap(),
+    );
+    git_repo(repo.path()).await;
+    let (main, state, d, _llm) = super::plans::hub_with(mac_dir.path(), mac_pool, MAIN).await;
+    let crew = CrewHub::start(state, d.clone(), FAST, CancellationToken::new());
+    let (theirs, _llm) = agent(devbox_dir.path(), "desk", "ok").await;
+    write_config(&theirs, MAIN);
+    let there_state = hub(std::slice::from_ref(&theirs));
+    let there = machine_desk(devbox_pool, devbox_dir.path()).await;
+    let there_crew = CrewHub::start(
+        Arc::clone(&there_state),
+        there.clone(),
+        FAST,
+        CancellationToken::new(),
+    );
+    let served = super::super::relay::routes(Arc::clone(&there_state), Arc::clone(&there_crew));
+    let token = there_state.auth_token.clone();
+    let carried: Arc<parking_lot::Mutex<Vec<RelayCall>>> = Arc::default();
+    let poller = carrying(&crew, &there, &served, &token, &carried, older);
+
+    // Two tickets in one folder there: the second works in its own
+    // worktree beside the first.
+    let folder = repo.path().to_string_lossy().into_owned();
+    let tickets = json!([
+        {"title": "Speed up recall", "folder": folder},
+        {"title": "Cache the index", "folder": folder},
+    ]);
+    let r = run(
+        &main,
+        "crew.plan",
+        json!({"result": super::plans::judged(), "goal": "Faster recall", "machine": "devbox", "tickets": tickets}),
+    )
+    .await;
+    assert!(r.success, "{r:?}");
+    let plan: uuid::Uuid = r.output["proposed"]["plan_id"]
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    d.approve_plan(plan, 1, &By::you()).await.unwrap();
+    let key = workforce_desk::grant::plan_key(plan);
+    carry(&crew, &there, &key, 1).await;
+    let doing = |n: usize| {
+        let d = d.clone();
+        async move {
+            let t = d
+                .plan(plan)
+                .await
+                .ok()?
+                .tickets
+                .get(n)?
+                .ticket
+                .ticket
+                .clone();
+            t.assignee
+                .filter(|_| t.state == TicketState::Doing)
+                .map(|a| (t.id, a.id))
+        }
+    };
+    eventually("the first started there", async || doing(0).await).await;
+    let (ticket, first) = eventually("the second started there", async || doing(1).await).await;
+    let (_, first) = super::super::relay::machine_session(&first).unwrap();
+    let earlier = there.view(first).unwrap();
+    assert!(earlier.cwd.contains("/.worktrees/"), "{}", earlier.cwd);
+    assert!(there.charge_of(first).is_some_and(|c| c.live()));
+
+    // Its turn ends and it rests there.
+    super::plan_watch::turn_ends(&there, devbox_dir.path(), &earlier, "Done for now.").await;
+    // A start again there naming it as its ticket's session leaves it be,
+    // and is refused as taken by it (said by an `older` Desk without it).
+    {
+        use workforce_desk::crew::{Crew, MachineRefused};
+        let start = json!({
+            "engine": "claude", "name": earlier.name, "cwd": folder, "goal": "Again",
+            "prompt": "Again", "worktree": earlier.branch, "free_resting": true,
+            "assigned": first.to_string(), "id": uuid::Uuid::new_v4().to_string(),
+        });
+        let refused = crew
+            .machine_call(
+                "devbox",
+                Some(&key),
+                main.agent_id.as_str(),
+                "desk.session_start",
+                start,
+            )
+            .await
+            .unwrap_err();
+        let MachineRefused::WorktreeTaken(_, holder) = refused else {
+            panic!("{refused:?}");
+        };
+        assert_eq!(holder, (!older).then_some(first));
+        assert!(
+            there.view(first).unwrap().state.is_running(),
+            "still the ticket's"
+        );
+    }
+    // The person sends its ticket back.
+    d.move_ticket(
+        ticket,
+        workforce_desk::Move {
+            state: TicketState::Todo,
+            before: None,
+            after: None,
+        },
+        &By::you(),
+    )
+    .await
+    .unwrap();
+
+    match older {
+        false => {
+            let (_, again) = eventually("started again there", async || {
+                doing(1)
+                    .await
+                    .filter(|(_, s)| !s.ends_with(&first.to_string()))
+            })
+            .await;
+            let (_, again) = super::super::relay::machine_session(&again).unwrap();
+            let now = there.view(again).unwrap();
+            assert_eq!(now.cwd, earlier.cwd, "in the same worktree");
+            assert_eq!(
+                there.view(first).unwrap().state,
+                workforce_desk::model::SessionState::Stopped
+            );
+            assert!(there.view(first).unwrap().ended_as_started().is_none());
+        }
+        true => {
+            let why = eventually("the plan paused", async || {
+                let p = d.plan(plan).await.ok()?;
+                (p.summary.plan.paused == Some(workforce_desk::plan::Paused::StartFailing))
+                    .then_some(p.summary.paused_why)
+                    .flatten()
+            })
+            .await;
+            assert!(
+                why.contains("can't start on devbox") && why.contains("is in use"),
+                "{why}"
+            );
+            assert!(there.view(first).unwrap().state.is_running(), "left alone");
+        }
+    }
+    poller.abort();
+}
+
+/// A machine's refusal of a start as its worktree taken says the session
+/// holding it when it names one by its id; one that isn't an id, or none,
+/// is no holder.
+#[test]
+fn a_machines_taken_refusal_carries_its_holder() {
+    use workforce_desk::crew::MachineRefused;
+    let h = uuid::Uuid::new_v4();
+    let taken = |holder: Value| {
+        super::super::machine_refusal(
+            "devbox",
+            &json!({"error": "In use.", "code": workforce_desk::worktree::TAKEN, "holder": holder}),
+        )
+    };
+    assert!(
+        matches!(taken(json!(h.to_string())), MachineRefused::WorktreeTaken(w, Some(x)) if w == "In use." && x == h)
+    );
+    assert!(matches!(
+        taken(json!("nope")),
+        MachineRefused::WorktreeTaken(_, None)
+    ));
+    assert!(matches!(
+        taken(Value::Null),
+        MachineRefused::WorktreeTaken(_, None)
+    ));
+    assert!(matches!(
+        super::super::machine_refusal("devbox", &json!({"code": workforce_desk::grant::NOT_HELD})),
+        MachineRefused::NotHeld(w) if w == "devbox refused it."
+    ));
 }

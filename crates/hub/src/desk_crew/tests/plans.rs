@@ -3159,3 +3159,278 @@ async fn a_resting_review_frees_its_slot_a_resumed_one_is_n_plus_one_and_a_done_
     })
     .await;
 }
+
+/// devbox, as Desk's native side carries to it: no sessions, and every
+/// start refused with `refusal`; when each start came.
+fn refusing_devbox(
+    crew: &Arc<CrewHub>,
+    refusal: Value,
+) -> (
+    tokio::task::JoinHandle<()>,
+    Arc<parking_lot::Mutex<Vec<std::time::Instant>>>,
+) {
+    use super::super::relay::RelayAnswer;
+    use super::super::served::ServedStatus;
+    let starts: Arc<parking_lot::Mutex<Vec<std::time::Instant>>> = Arc::default();
+    let (crew, seen) = (Arc::clone(crew), Arc::clone(&starts));
+    let poller = tokio::spawn(async move {
+        loop {
+            for c in crew.relay_take(Duration::from_millis(100)).await {
+                let answer = match c.tool.as_str() {
+                    "desk.sessions" => RelayAnswer {
+                        status: ServedStatus::Ok,
+                        body: json!([]),
+                    },
+                    "desk.session_start" => {
+                        seen.lock().push(std::time::Instant::now());
+                        RelayAnswer {
+                            status: ServedStatus::Refused,
+                            body: refusal.clone(),
+                        }
+                    }
+                    super::super::relayed_work::WORK_TAKE | super::super::relayed_decide::TAKE => {
+                        continue
+                    }
+                    other => panic!("{other} relayed"),
+                };
+                crew.relay_answer(c.id, answer);
+            }
+        }
+    });
+    (poller, starts)
+}
+
+/// A running plan of one ticket on devbox, proposed by the boss and
+/// approved: its id and its ticket's key.
+async fn approved_on_devbox(overseer: &AgentService, d: &Desk) -> (uuid::Uuid, String) {
+    eventually("the plan tools", async || {
+        overseer.tools.has("crew.plan").then_some(())
+    })
+    .await;
+    let r = overseer
+        .tools
+        .get("crew.plan")
+        .unwrap()
+        .execute(json!({
+            "result": judged(),
+            "goal": "Fix the CRM's bugs",
+            "machine": "devbox",
+            "tickets": [{"title": "Fix the login race", "folder": "/home/dev/crm"}],
+        }))
+        .await
+        .unwrap();
+    assert!(r.success, "{r:?}");
+    let id: uuid::Uuid = r.output["proposed"]["plan_id"]
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    let key = r.output["proposed"]["tickets"][0]["key"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    d.approve_plan(id, 1, &By::you()).await.unwrap();
+    (id, key)
+}
+
+async fn paused_failing(d: &Desk, id: uuid::Uuid) -> String {
+    eventually("the plan paused", async || {
+        let p = d.plan(id).await.unwrap();
+        (p.summary.plan.paused == Some(workforce_desk::plan::Paused::StartFailing))
+            .then_some(p.summary.paused_why)
+            .flatten()
+    })
+    .await
+}
+
+/// A ticket whose worktree on its machine is held by something else isn't
+/// tried again: its plan pauses at once saying why, once, for the person to
+/// continue when it is put right, and its boss is told once.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_machine_ticket_whose_worktree_there_is_taken_pauses_its_plan_once() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (overseer, state, d, llm) = hub_with(dir.path(), pool, ACTS).await;
+        let crew = CrewHub::start(state, d.clone(), FAST, CancellationToken::new());
+        let held = "/home/dev/crm/.worktrees/des-1 is there already on someone-else, not des-1";
+        let (poller, starts) = refusing_devbox(
+            &crew,
+            json!({ "error": held, "code": workforce_desk::worktree::TAKEN }),
+        );
+        let (id, key) = approved_on_devbox(&overseer, &d).await;
+        let why = paused_failing(&d, id).await;
+        assert_eq!(why, format!("{key} can't start on devbox: {held}"));
+        assert!(d.plan_needs().iter().any(|n| n.ask.contains(&why)));
+        let told = format!("{key} didn't start on devbox: {held}");
+        eventually("the boss told", async || {
+            (said(&llm, &told).await >= 1).then_some(())
+        })
+        .await;
+        tokio::time::sleep(Duration::from_millis(1_500)).await;
+        assert_eq!(starts.lock().len(), 1, "never tried again by itself");
+        assert_eq!(said(&llm, &told).await, 1);
+        assert_eq!(
+            d.plan(id).await.unwrap().tickets[0].ticket.ticket.state,
+            TicketState::Todo
+        );
+        // Continued with it still taken, it is tried once more and pauses
+        // again: no loop.
+        let revision = d.plan(id).await.unwrap().summary.plan.revision;
+        d.decide_plan(id, revision, true, None, &By::you())
+            .await
+            .unwrap();
+        eventually("tried once more", async || {
+            (starts.lock().len() == 2).then_some(())
+        })
+        .await;
+        assert_eq!(paused_failing(&d, id).await, why);
+        tokio::time::sleep(Duration::from_millis(1_500)).await;
+        assert_eq!(starts.lock().len(), 2, "not tried again by itself");
+        poller.abort();
+    })
+    .await;
+}
+
+/// A machine ticket whose starts keep being refused is tried again later
+/// each time, and its plan pauses at the fifth.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_machine_ticket_that_keeps_failing_to_start_backs_off_and_pauses() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (overseer, state, d, _llm) = hub_with(dir.path(), pool, ACTS).await;
+        let crew = CrewHub::start(state, d.clone(), FAST, CancellationToken::new());
+        let (poller, starts) = refusing_devbox(&crew, json!({ "error": "the disk is full" }));
+        let (id, key) = approved_on_devbox(&overseer, &d).await;
+        let why = paused_failing(&d, id).await;
+        assert!(
+            why.starts_with(&format!("{key} couldn't start 5 times:"))
+                && why.contains("the disk is full"),
+            "{why}"
+        );
+        let at = starts.lock().clone();
+        assert_eq!(at.len(), 5, "{at:?}");
+        for (n, pair) in at.windows(2).enumerate() {
+            let waited = pair[1] - pair[0];
+            assert!(
+                waited >= FAST.minute * 2u32.pow(n as u32),
+                "the wait before start {} was {waited:?}",
+                n + 2
+            );
+        }
+        poller.abort();
+    })
+    .await;
+}
+
+/// The boss's changes of its plan, as it hears of a ticket failing to
+/// start, don't count its failures afresh: it still pauses at the fifth.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_bosss_changes_between_failures_still_pause_at_the_fifth() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (overseer, state, d, _llm) = hub_with(dir.path(), pool, ACTS).await;
+        let crew = CrewHub::start(state, d.clone(), FAST, CancellationToken::new());
+        let (poller, starts) = refusing_devbox(&crew, json!({ "error": "the disk is full" }));
+        let (id, key) = approved_on_devbox(&overseer, &d).await;
+        for n in 1..=3 {
+            eventually("a failed start", async || {
+                (starts.lock().len() >= n).then_some(())
+            })
+            .await;
+            d.change_plan(
+                id,
+                workforce_desk::PlanEdit {
+                    goal: Some(format!("Fix the CRM's bugs, take {n}")),
+                    ..Default::default()
+                },
+                Engine::Claude,
+                false,
+                &By::manager("desk", "Desk", "It didn't start."),
+            )
+            .await
+            .unwrap();
+        }
+        let why = paused_failing(&d, id).await;
+        assert!(
+            why.starts_with(&format!("{key} couldn't start 5 times:")),
+            "{why}"
+        );
+        assert_eq!(starts.lock().len(), 5);
+        poller.abort();
+    })
+    .await;
+}
+
+/// A restart of the hub keeps how often a ticket failed to start: its plan
+/// still pauses at the fifth, not five more.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_restart_keeps_how_often_a_ticket_failed_to_start() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (overseer, state, d, _llm) = hub_with(dir.path(), pool, ACTS).await;
+        let first_cancel = CancellationToken::new();
+        let first = CrewHub::start(state.clone(), d.clone(), FAST, first_cancel.clone());
+        let refusal = json!({ "error": "the disk is full" });
+        let (poller, before) = refusing_devbox(&first, refusal.clone());
+        let (id, key) = approved_on_devbox(&overseer, &d).await;
+        eventually("two failed starts", async || {
+            (before.lock().len() >= 2).then_some(())
+        })
+        .await;
+        first_cancel.cancel();
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        poller.abort();
+        // What was kept: a start cut off by the restart, its answer never
+        // read, isn't counted.
+        let kept = d
+            .store()
+            .state("hub.crew.plan_failed")
+            .await
+            .unwrap()
+            .expect("kept")
+            .value;
+        let counted = kept
+            .as_object()
+            .unwrap()
+            .values()
+            .map(|f| f["count"].as_u64().unwrap())
+            .sum::<u64>() as usize;
+        assert!(counted >= 2, "{kept}");
+        // A clock that jumped (a next try a century off) waits no longer
+        // than its wait; a plan gone since is forgotten.
+        let mut kept = kept;
+        for f in kept.as_object_mut().unwrap().values_mut() {
+            f["next"] = json!("2126-01-01T00:00:00Z");
+        }
+        let mut gone = kept.as_object().unwrap().values().next().unwrap().clone();
+        gone["plan"] = json!(uuid::Uuid::new_v4());
+        let gone_ticket = uuid::Uuid::new_v4().to_string();
+        kept[&gone_ticket] = gone;
+        d.store()
+            .put_state("hub.crew.plan_failed", &kept)
+            .await
+            .unwrap();
+        let second = CrewHub::start(state, d.clone(), FAST, CancellationToken::new());
+        let (poller, after) = refusing_devbox(&second, refusal);
+        let why = paused_failing(&d, id).await;
+        assert!(
+            why.starts_with(&format!("{key} couldn't start 5 times:")),
+            "{why}"
+        );
+        assert_eq!(
+            after.lock().len(),
+            5 - counted,
+            "{counted} kept over the restart"
+        );
+        let now = d
+            .store()
+            .state("hub.crew.plan_failed")
+            .await
+            .unwrap()
+            .expect("kept")
+            .value;
+        assert!(now.get(&gone_ticket).is_none(), "{now}");
+        poller.abort();
+    })
+    .await;
+}
