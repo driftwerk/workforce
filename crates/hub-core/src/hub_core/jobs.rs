@@ -223,10 +223,11 @@ pub struct AgentJobConfig {
     /// sub-agent's own session no longer names it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub automated_origin: Option<String>,
-    /// The outside content that armed the submitting turn's guard, captured
-    /// like `user_id`: the sub-agent's calls are guarded as that turn's are.
+    /// The guard of the submitting turn when outside content armed it,
+    /// captured like `user_id`: the sub-agent's calls are guarded as that
+    /// turn's are.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub armed_by: Option<String>,
+    pub guarded_as: Option<Box<workforce_agent::security::monitor::ContentScope>>,
 }
 
 impl AgentJobConfig {
@@ -243,7 +244,7 @@ impl AgentJobConfig {
             research: None,
             handoff: None,
             automated_origin: crate::hub_core::origins::automated_origin(),
-            armed_by: None,
+            guarded_as: None,
         }
     }
 

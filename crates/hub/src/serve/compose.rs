@@ -1545,26 +1545,16 @@ impl crate::job_runner::AgentExecutor for ServiceAgentExecutor {
         crate::scheduler::descending_from(
             config.automated_origin.clone(),
             workforce_agent::runner::with_content_guard(
-                armed_guard(config.armed_by.as_deref()),
+                config.guarded_as.clone().map(|scope| {
+                    Arc::new(workforce_agent::security::monitor::ContentGuard::new(
+                        *scope,
+                    ))
+                }),
                 self.run_as_submitted(config, channel),
             ),
         )
         .await
     }
-}
-
-/// The guard a job submitted from a turn armed by `armed_by` runs under,
-/// armed as that turn was; a job from any other turn makes its own.
-fn armed_guard(
-    armed_by: Option<&str>,
-) -> Option<Arc<workforce_agent::security::monitor::ContentGuard>> {
-    use workforce_agent::security::monitor::{ContentGuard, ContentScope};
-    armed_by.map(|by| {
-        Arc::new(ContentGuard::new(ContentScope {
-            armed: Some(by.to_string()),
-            ..ContentScope::default()
-        }))
-    })
 }
 
 impl ServiceAgentExecutor {

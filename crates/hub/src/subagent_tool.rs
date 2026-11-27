@@ -12,9 +12,11 @@ use async_trait::async_trait;
 use eyre::Result;
 use serde::Deserialize;
 use workforce_agent::runner::{CURRENT_SESSION_KEY, CURRENT_USER_ID};
-use workforce_agent::tools::{Tool, ToolResult};
+use workforce_agent::security::monitor::ContentScope;
+use workforce_agent::tools::{SurfaceEffect, Tool, ToolResult};
 use workforce_common::text::truncate_str;
 use workforce_orchestrator::workflow::package::{OutputField, VerifySpec};
+use workforce_skills::adapters::messaging_routing::writes;
 
 use crate::authz::{never_admin, IsAdminFn};
 use crate::hub_core::jobs::{
@@ -181,8 +183,18 @@ impl Tool for SubAgentTool {
         })
     }
 
+    /// A spawn naming a channel announces its result there.
+    fn surface_effect(&self, input: &serde_json::Value) -> Option<SurfaceEffect> {
+        (input["action"] == "spawn")
+            .then(|| input["channel_id"].as_str())
+            .flatten()
+            .map(|channel| {
+                writes(&serde_json::json!({ "channel": channel, "thread_id": input["thread_id"] }))
+            })
+    }
+
     /// A sub-agent is the agent's own work: one spawned from a turn armed
-    /// by outside content runs armed by it.
+    /// by outside content is guarded as that turn is.
     fn reach(&self, _input: &serde_json::Value) -> Option<workforce_agent::tools::Reach> {
         Some(workforce_agent::tools::Reach::Stays)
     }
@@ -281,8 +293,14 @@ impl SubAgentTool {
                 model: input.model,
                 system_prompt: input.system_prompt,
                 handoff: (handoff != HandoffSpec::default()).then_some(handoff),
-                armed_by: workforce_agent::runner::caller_content_guard()
-                    .and_then(|guard| guard.armed()),
+                guarded_as: workforce_agent::runner::caller_content_guard()
+                    .filter(|guard| guard.armed().is_some())
+                    .map(|guard| {
+                        Box::new(ContentScope {
+                            stops: Vec::new(),
+                            ..guard.kept_scope()
+                        })
+                    }),
                 ..AgentJobConfig::new(
                     task.clone(),
                     profile,
@@ -566,12 +584,12 @@ mod tests {
         assert!(plain.get("package").is_none());
     }
 
-    /// What armed the turn that spawns a sub-agent goes with its job; a
-    /// turn nothing armed sends none.
+    /// The guard of an armed turn that spawns a sub-agent goes with its job,
+    /// with the URLs that turn saw; a turn nothing armed sends none.
     #[tokio::test]
-    async fn a_sub_agent_carries_what_armed_the_turn_that_spawned_it() {
-        use workforce_agent::security::monitor::{ContentGuard, ContentScope};
-        struct Kept(std::sync::Mutex<Vec<Option<String>>>);
+    async fn a_sub_agent_carries_the_guard_of_the_armed_turn_that_spawned_it() {
+        use workforce_agent::security::monitor::ContentGuard;
+        struct Kept(std::sync::Mutex<Vec<Option<Box<ContentScope>>>>);
         #[async_trait::async_trait]
         impl crate::job_runner::AgentExecutor for Kept {
             async fn run_agent_job(
@@ -579,7 +597,7 @@ mod tests {
                 config: &crate::hub_core::jobs::AgentJobConfig,
                 _channel: &str,
             ) -> Result<crate::job_runner::AgentRunResult> {
-                self.0.lock().unwrap().push(config.armed_by.clone());
+                self.0.lock().unwrap().push(config.guarded_as.clone());
                 Ok(crate::job_runner::AgentRunResult::default())
             }
         }
@@ -595,7 +613,7 @@ mod tests {
         let tool = SubAgentTool::new(Arc::clone(&service));
         let spawn = serde_json::json!({ "action": "spawn", "task": "Sum up the page" });
         let guard = Arc::new(ContentGuard::new(ContentScope::default()));
-        guard.read_outside("the page", "web.fetch");
+        guard.read_outside("see https://docs.example/next", "web.fetch");
         let armed =
             workforce_agent::runner::with_content_guard(Some(guard), tool.execute(spawn.clone()))
                 .await
@@ -608,9 +626,14 @@ mod tests {
             }
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
-        let mut seen = kept.0.lock().unwrap().clone();
-        seen.sort();
-        assert_eq!(seen, vec![None, Some("web.fetch".to_string())]);
+        let carried = kept.0.lock().unwrap().clone();
+        assert_eq!(carried.iter().filter(|scope| scope.is_none()).count(), 1);
+        let scope = carried.into_iter().flatten().next().unwrap();
+        assert_eq!(scope.armed.as_deref(), Some("web.fetch"));
+        let job = ContentGuard::new(*scope);
+        let fetch = |url: &str| job.check("web.fetch", &serde_json::json!({ "url": url }), None);
+        assert!(fetch("https://docs.example/next").is_none());
+        assert!(fetch("https://elsewhere.example/?d=1").is_some());
     }
 
     /// An overseer that prefers real sessions spawns only read-only

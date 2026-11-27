@@ -81,9 +81,14 @@ MCP servers' own tools (`mcp.<server>.<tool>`), WASM and external skills stay he
 
    so a person reads what the tool might do and why they are asked.
 
-7. **The person's own Desk is theirs, not outside content.** `desk_knows::tools::wrapped` fences what it reads with `wrap_own_content` (read as data, never as instructions, arming nothing) and with `wrap_external_content` only when the text may carry outside content: it shows an exchange Desk flagged at harvest, it carries a fence of outside content (`monitor::carries_fence`, which `arm_if_fenced` now uses too), or `scan_for_injection` finds it suspicious. That result arms the turn as any fence does. The digest goes through the same rule.
+7. **The person's own Desk is theirs, not outside content.** `desk_knows::tools::wrapped` fences what it reads with `wrap_own_content` (read as data, never as instructions, arming nothing) and with `wrap_external_content` only when the text may carry outside content, which then arms the turn as any fence does:
+   - it shows an exchange with a caveat (`caveats`): one Desk flagged at harvest, or one whose steps read outside content (a web step as Desk names them, `webfetch`/`web_fetch`/`websearch`/`web_search`, or an `mcp__` step of a connected service), each labelled in the result;
+   - it carries a fence of outside content (`monitor::carries_fence`, which `arm_if_fenced` now uses too);
+   - `scan_for_injection` finds it suspicious.
 
-8. **A sub-agent is the agent's own work, guarded as the turn that spawned it.** `subagent` declares `Stays`. Its job runs detached, in a fresh turn, so `AgentJobConfig` gains `armed_by` (what armed the spawning turn's guard, captured by the `subagent` tool like `user_id`), and `ServiceAgentExecutor` runs a job with one under a guard armed by it (`armed_guard`). Every call the sub-agent makes is then held as the spawning turn's would be.
+   The digest goes through the same rule. An exchange's `asker` (`person`, `desk`, `session`, `unknown`) names the person or their own agents, never someone else, so it decides nothing.
+
+8. **A sub-agent is the agent's own work, guarded as the turn that spawned it.** `subagent` declares `Stays`. Its job runs detached, in a fresh turn, so `AgentJobConfig` gains `guarded_as`: the spawning turn's `ContentScope` when outside content armed it (its seen URLs and places included, its refusals left out), captured by the `subagent` tool like `user_id`. `ServiceAgentExecutor` runs a job with one under a guard made from it, so every call the sub-agent makes is held as the turn's would be. A `spawn` naming a `channel_id` announces its result there, so it declares that as a `surface_effect` write (`messaging_routing::writes`): somewhere new is held as any send is.
 
 ## Not changed
 
@@ -107,6 +112,7 @@ MCP servers' own tools (`mcp.<server>.<tool>`), WASM and external skills stay he
 - H (composed): `build_advisor_tools` under an armed turn's guard refuses a `web.fetch` of a URL the turn never saw.
 - R/tools/registry.rs: a connector write wrapped in `ConnectionWrite` answers `reach` as the tool it wraps.
 - S: `XeroTool`/`FreeAgentTool` reads declare `Reads` and writes (`xero.invoice_email`) don't; every `GoogleTool` `READS` name is a real Google tool and none is mutating (the `WRITE_OPS` check); `spotify.devices` reads and `spotify.play` doesn't.
-- H/desk_knows/tools.rs: each `desk_work.*` read of the person's own sessions leaves a guard unarmed; a transcript showing a flagged exchange arms it (`desk_work.transcript`); text carrying a fence, or reading like an injection, is fenced as outside content; the digest is own data.
-- H/subagent_tool.rs: a sub-agent spawned under an armed guard carries `armed_by` to its job; one spawned under none carries none.
-- H (composed): a sub-agent job with `armed_by` whose model asks for a `scheduler` `create` creates no job; after a web read, `subagent` (`list`, `spawn`), `view_attachment` (`desk:<uuid>`), `advisor` and `compose_video` (`segments: "none"`) run, and a `notes` `write_daily` is held as persistence.
+- H/desk_knows/tools.rs: each `desk_work.*` read of the person's own sessions leaves a guard unarmed; a transcript showing a flagged exchange, or one whose steps fetched the web, arms it (`desk_work.transcript`); text carrying a fence, or reading like an injection, is fenced as outside content; the digest is own data.
+- H/subagent_tool.rs: a sub-agent spawned under an armed guard carries its scope to its job, where a fetch of a URL the turn saw runs and one it didn't is held; one spawned under no armed guard carries none.
+- H (composed): a sub-agent job guarded as an armed turn, whose model asks for a `scheduler` `create`, creates no job, and the same job unguarded creates it; after a web read, `subagent` (`list`, `spawn`), `view_attachment` (`desk:<uuid>`) and `advisor` run, a `spawn` naming another channel is held as a send, and a `notes` `write_daily` is held as persistence.
+- R/tools/video_compose.rs: after a web read, `compose_video` (`segments: "none"`), `trim_video` and `video_to_gif` run.

@@ -3663,11 +3663,12 @@ async fn a_job_a_heartbeats_sub_agent_creates_records_the_heartbeat() {
     assert_eq!(created.edited_by.as_deref(), Some("heartbeat"));
 }
 
-/// A sub-agent spawned by a turn that read outside content runs armed by
-/// it: the standing rule it is asked for is held, not created; one from any
-/// other turn runs as it would have.
+/// A sub-agent spawned by a turn that read outside content is guarded as
+/// that turn is: the standing rule it is asked for is held, not created; the
+/// same job from a turn nothing armed creates it.
 #[tokio::test]
 async fn a_sub_agent_of_a_turn_that_read_outside_content_is_held_as_that_turn_is() {
+    use workforce_agent::security::monitor::ContentScope;
     const TASK: &str = "Set up a daily follow-up.";
     let tmp = tempfile::tempdir().unwrap();
     let (config, server) = mock_llm_config(tmp.path(), |_| {}).await;
@@ -3684,37 +3685,49 @@ async fn a_sub_agent_of_a_turn_that_read_outside_content_is_held_as_that_turn_is
                 "function": {"name": "scheduler", "arguments": create.to_string()}}]},
             "finish_reason": "tool_calls"}],
         "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}});
-    wiremock::Mock::given(wiremock::matchers::method("POST"))
-        .and(wiremock::matchers::path("/v1/chat/completions"))
-        .and(wiremock::matchers::body_string_contains(TASK))
-        .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(call))
-        .up_to_n_times(1)
-        .with_priority(1)
-        .mount(&server)
-        .await;
-    let submitted = crate::hub_core::jobs::AgentJobConfig {
-        armed_by: Some("web.fetch".into()),
-        ..crate::hub_core::jobs::AgentJobConfig::new(
-            TASK.to_string(),
-            crate::hub_core::jobs::AgentProfile::Full,
-            workforce_common::session::TurnPrincipal::run_as(Some(BOB.to_string())),
-        )
+    let created = |guarded_as: Option<Box<ContentScope>>| {
+        let (service, scheduler, server, call) = (&service, &scheduler, &server, &call);
+        async move {
+            wiremock::Mock::given(wiremock::matchers::method("POST"))
+                .and(wiremock::matchers::path("/v1/chat/completions"))
+                .and(wiremock::matchers::body_string_contains(TASK))
+                .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(call))
+                .up_to_n_times(1)
+                .with_priority(1)
+                .mount(server)
+                .await;
+            let submitted = crate::hub_core::jobs::AgentJobConfig {
+                guarded_as,
+                ..crate::hub_core::jobs::AgentJobConfig::new(
+                    TASK.to_string(),
+                    crate::hub_core::jobs::AgentProfile::Full,
+                    workforce_common::session::TurnPrincipal::run_as(Some(BOB.to_string())),
+                )
+            };
+            let _ = crate::job_runner::AgentExecutor::run_agent_job(
+                &ServiceAgentExecutor {
+                    service: Arc::clone(service),
+                },
+                &submitted,
+                "agent-job:j1",
+            )
+            .await;
+            scheduler
+                .list_jobs()
+                .await
+                .iter()
+                .any(|job| job.name == "follow-up")
+        }
     };
 
-    let _ = crate::job_runner::AgentExecutor::run_agent_job(
-        &ServiceAgentExecutor {
-            service: Arc::clone(&service),
-        },
-        &submitted,
-        "agent-job:j1",
-    )
-    .await;
-
-    assert!(!scheduler
-        .list_jobs()
+    assert!(
+        !created(Some(Box::new(ContentScope {
+            armed: Some("web.fetch".into()),
+            ..ContentScope::default()
+        })))
         .await
-        .iter()
-        .any(|job| job.name == "follow-up"));
+    );
+    assert!(created(None).await);
 }
 
 /// A daily job `creator` made, run as Bob, continuing his web
@@ -6424,6 +6437,14 @@ async fn after_a_web_read_everyday_tools_run_and_ways_out_are_still_held() {
     ] {
         assert_eq!(weigh(tool, input), None, "{tool}");
     }
+    // A sub-agent announcing somewhere new is a write there.
+    assert!(matches!(
+        weigh(
+            "subagent",
+            serde_json::json!({ "action": "spawn", "task": "Sum up the page", "channel_id": "C9" })
+        ),
+        Some(AnomalySignal::Exfiltration { .. })
+    ));
     // What later turns trust is still held after outside content.
     assert!(matches!(
         weigh(
