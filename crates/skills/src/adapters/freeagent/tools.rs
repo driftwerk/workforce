@@ -192,6 +192,10 @@ impl Tool for FreeAgentTool {
         with_workspace(self.spec.schema.clone(), workspace_prop())
     }
 
+    fn reach(&self, _input: &serde_json::Value) -> Option<workforce_agent::tools::Reach> {
+        (!self.spec.require_approval).then_some(workforce_agent::tools::Reach::Reads)
+    }
+
     async fn execute(&self, input: Value) -> Result<ToolResult> {
         run(&self.ctx, input, |client, input| {
             (self.spec.handler)(client, input)
@@ -873,5 +877,17 @@ mod tests {
             .unwrap();
         assert!(!res.success);
         assert!(res.error.unwrap().contains("invoice"));
+    }
+
+    #[tokio::test]
+    async fn a_read_says_it_only_reads_and_a_write_does_not() {
+        let server = MockServer::start().await;
+        let ctx = ctx_for(&server);
+        let reach = |name| tool(name, &ctx).reach(&json!({}));
+        assert_eq!(
+            reach("freeagent.invoices_list"),
+            Some(workforce_agent::tools::Reach::Reads)
+        );
+        assert_eq!(reach("freeagent.invoice_create"), None);
     }
 }

@@ -1977,13 +1977,12 @@ pub fn arm_on_result(
     success: bool,
     output: &str,
 ) {
-    let outside = tools.get(tool).is_some_and(|t| t.reads_outside_content())
-        || crate::security::monitor::reads_outside(tool);
-    if success && outside {
-        guard.read_outside(output, tool);
-    } else {
-        guard.arm_if_fenced(output, tool);
-    }
+    guard.returned(
+        tool,
+        tools.get(tool).is_some_and(|t| t.reads_outside_content()),
+        success,
+        output,
+    );
 }
 
 /// The outcome of a call that ran, for the loop that reports no progress.

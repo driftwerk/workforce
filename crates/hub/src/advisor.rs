@@ -67,6 +67,7 @@ use tracing::{info, warn};
 
 use workforce_agent::llm::anthropic::Effort;
 use workforce_agent::llm::provider::{with_effort_override, ProviderKind};
+use workforce_agent::security::guarded_tool::GuardedTool;
 use workforce_agent::tools::filesystem::{Glob, Grep, ReadFile};
 use workforce_agent::tools::web::{WebFetchTool, WebSearchTool};
 use workforce_agent::tools::{Tool, ToolResult};
@@ -222,14 +223,19 @@ fn render_panel_for_synth(question: Option<&str>, panel: &[(String, String)]) ->
 /// Build the read-only tool set the advisor's in-process loop exposes
 /// for `source = "model"` and `source = "agent"`. The set is built for each
 /// consultation, so WebSearch is offered only when the person it runs for
-/// has a Brave API key at some vault level (or the install has one).
-fn build_advisor_tools(service: &AgentService) -> Vec<Arc<dyn Tool>> {
+/// has a Brave API key at some vault level (or the install has one). Each
+/// runs under the content guard of the turn that asked.
+pub(crate) fn build_advisor_tools(service: &AgentService) -> Vec<Arc<dyn Tool>> {
     let brave =
         crate::credentials::brave_source(service.vault.clone(), service.global_vault.clone());
+    let guard = workforce_agent::runner::caller_content_guard();
     make_advisor_tool_set(
         service.workspace.clone(),
         current_key(&brave).is_some().then_some(brave),
     )
+    .into_iter()
+    .map(|tool| GuardedTool::wrap(tool, guard.as_ref()))
+    .collect()
 }
 
 /// Pure helper exposed for unit testing — assembles the tool set from
@@ -1828,6 +1834,10 @@ impl Tool for AdvisorTool {
             },
             "required": []
         })
+    }
+
+    fn reach(&self, _input: &serde_json::Value) -> Option<workforce_agent::tools::Reach> {
+        Some(workforce_agent::tools::Reach::Stays)
     }
 
     async fn execute(&self, input: serde_json::Value) -> Result<ToolResult> {

@@ -628,12 +628,10 @@ fn guarded_call<'a>(
     input: &'a Value,
     effect: &'a Option<SurfaceEffect>,
 ) -> crate::security::monitor::Call<'a> {
-    crate::security::monitor::Call {
-        standing: tools
-            .get(tool_name)
-            .is_some_and(|tool| tool.standing_choice(input)),
-        ..crate::security::monitor::Call::new(tool_name, input, effect.as_ref())
-    }
+    let call = crate::security::monitor::Call::new(tool_name, input, effect.as_ref());
+    tools
+        .get(tool_name)
+        .map_or(call, |tool| call.told_by(tool.as_ref()))
 }
 
 /// The content guard's hold on a call, where the gate would ask about it:

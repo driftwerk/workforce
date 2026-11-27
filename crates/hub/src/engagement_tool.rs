@@ -238,6 +238,10 @@ impl Tool for MessagingGetModeTool {
         })
     }
 
+    fn reach(&self, _input: &serde_json::Value) -> Option<workforce_agent::tools::Reach> {
+        Some(workforce_agent::tools::Reach::Reads)
+    }
+
     async fn execute(&self, input: serde_json::Value) -> Result<ToolResult> {
         let start = Instant::now();
         let params: GetModeInput =
@@ -311,6 +315,10 @@ impl Tool for MessagingListModesTool {
             "properties": {},
             "required": []
         })
+    }
+
+    fn reach(&self, _input: &serde_json::Value) -> Option<workforce_agent::tools::Reach> {
+        Some(workforce_agent::tools::Reach::Reads)
     }
 
     async fn execute(&self, _input: serde_json::Value) -> Result<ToolResult> {

@@ -50,12 +50,22 @@ pub(crate) fn reads() -> Vec<String> {
         .collect()
 }
 
-/// What every guard in the hub knows of its tools: what only reads, what
-/// returns other people's words, and the authorisation's command-running
-/// class. Installed at boot, and by a test that needs it, always the same.
+/// What every guard in the hub knows of its tools: what only reads (the
+/// reads a monitor's turn is offered, and the connectors read-only by
+/// construction), what returns other people's words, and the
+/// authorisation's command-running class. Installed at boot, and by a test
+/// that needs it, always the same.
 pub(crate) fn knowledge() -> Knowledge {
     Knowledge {
-        reads: reads().into_iter().collect(),
+        reads: reads()
+            .into_iter()
+            .chain(
+                crate::aws::read_tool_names()
+                    .into_iter()
+                    .chain(workforce_skills::adapters::bank::READ_TOOLS.iter().copied())
+                    .map(str::to_string),
+            )
+            .collect(),
         outside_reads: workforce_skills::adapters::outside_reads()
             .into_iter()
             .collect(),
@@ -607,6 +617,23 @@ mod tests {
         assert!(!workforce_agent::security::monitor::reads_outside(
             "linear.issue_create"
         ));
+    }
+
+    #[test]
+    fn the_connectors_read_only_by_construction_run_but_are_not_offered_to_a_monitor() {
+        workforce_agent::security::monitor::know(knowledge());
+        let guard = ContentGuard::new(ContentScope::default());
+        guard.on_untrusted_content("web.fetch");
+        let input = serde_json::json!({});
+        for read in ["aws.ecs.list_clusters", "aws.s3.get", "bank.transactions"] {
+            assert_eq!(guard.check(read, &input, None), None, "{read}");
+            assert!(
+                !turn_tools(&Delivery::Told, &[])
+                    .iter()
+                    .any(|tool| tool == read),
+                "{read} is offered unnamed"
+            );
+        }
     }
 
     #[tokio::test]

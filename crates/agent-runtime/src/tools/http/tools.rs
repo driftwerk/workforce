@@ -156,6 +156,10 @@ impl Tool for HttpEndpointsTool {
         json!({ "type": "object", "properties": {} })
     }
 
+    fn reach(&self, _input: &serde_json::Value) -> Option<crate::tools::Reach> {
+        Some(crate::tools::Reach::Reads)
+    }
+
     async fn execute(&self, _input: Value) -> Result<ToolResult> {
         let started = Instant::now();
         let endpoints = self.runtime.endpoints();

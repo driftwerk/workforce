@@ -113,6 +113,10 @@ impl Tool for ChartTool {
         input_schema()
     }
 
+    fn reach(&self, _input: &serde_json::Value) -> Option<crate::tools::Reach> {
+        Some(crate::tools::Reach::Stays)
+    }
+
     async fn execute(&self, input: Value) -> Result<ToolResult> {
         let start = Instant::now();
         let elapsed = |t: Instant| t.elapsed().as_millis() as u64;

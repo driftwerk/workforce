@@ -703,6 +703,10 @@ impl Tool for DeskWorkTool {
         workforce_core::computer::Effect::None
     }
 
+    fn reach(&self, _input: &serde_json::Value) -> Option<workforce_agent::tools::Reach> {
+        Some(workforce_agent::tools::Reach::Reads)
+    }
+
     async fn execute(&self, input: Value) -> Result<ToolResult> {
         let start = Instant::now();
         let elapsed = || start.elapsed().as_millis() as u64;

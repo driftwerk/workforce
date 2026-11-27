@@ -202,6 +202,10 @@ impl Tool for ReadSourceListTool {
         json!({ "type": "object", "properties": {} })
     }
 
+    fn reach(&self, _input: &serde_json::Value) -> Option<workforce_agent::tools::Reach> {
+        Some(workforce_agent::tools::Reach::Reads)
+    }
+
     async fn execute(&self, _input: Value) -> Result<ToolResult> {
         let start = Instant::now();
         let configured = crate::skill_loader::agent_configured_builtin_skills(

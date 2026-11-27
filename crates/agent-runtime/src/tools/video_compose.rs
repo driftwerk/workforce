@@ -254,6 +254,10 @@ impl Tool for VideoComposeTool {
         })
     }
 
+    fn reach(&self, _input: &serde_json::Value) -> Option<crate::tools::Reach> {
+        Some(crate::tools::Reach::Stays)
+    }
+
     async fn execute(&self, input: Value) -> Result<ToolResult, eyre::Error> {
         let started = Instant::now();
 
@@ -500,6 +504,10 @@ impl Tool for TrimVideoTool {
         })
     }
 
+    fn reach(&self, _input: &serde_json::Value) -> Option<crate::tools::Reach> {
+        Some(crate::tools::Reach::Stays)
+    }
+
     async fn execute(&self, input: Value) -> Result<ToolResult, eyre::Error> {
         let started = Instant::now();
 
@@ -663,6 +671,10 @@ impl Tool for VideoToGifTool {
             },
             "required": ["artifact_id"]
         })
+    }
+
+    fn reach(&self, _input: &serde_json::Value) -> Option<crate::tools::Reach> {
+        Some(crate::tools::Reach::Stays)
     }
 
     async fn execute(&self, input: Value) -> Result<ToolResult, eyre::Error> {

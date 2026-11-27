@@ -298,6 +298,10 @@ impl Tool for ViewAttachmentTool {
         })
     }
 
+    fn reach(&self, _input: &serde_json::Value) -> Option<workforce_agent::tools::Reach> {
+        Some(workforce_agent::tools::Reach::Reads)
+    }
+
     async fn execute(&self, input: serde_json::Value) -> Result<ToolResult> {
         let start = Instant::now();
         let elapsed = || start.elapsed().as_millis() as u64;

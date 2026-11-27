@@ -81,6 +81,10 @@ impl Tool for SentinelStatusTool {
             "required": []})
     }
 
+    fn reach(&self, _input: &serde_json::Value) -> Option<workforce_agent::tools::Reach> {
+        Some(workforce_agent::tools::Reach::Reads)
+    }
+
     async fn execute(&self, _input: serde_json::Value) -> eyre::Result<ToolResult> {
         let start = Instant::now();
 
@@ -233,6 +237,10 @@ impl Tool for SentinelScanTool {
         })
     }
 
+    fn reach(&self, _input: &serde_json::Value) -> Option<workforce_agent::tools::Reach> {
+        Some(workforce_agent::tools::Reach::Reads)
+    }
+
     async fn execute(&self, input: serde_json::Value) -> eyre::Result<ToolResult> {
         let start = std::time::Instant::now();
 
@@ -347,6 +355,10 @@ impl Tool for SentinelHistoryTool {
             "required": []})
     }
 
+    fn reach(&self, _input: &serde_json::Value) -> Option<workforce_agent::tools::Reach> {
+        Some(workforce_agent::tools::Reach::Reads)
+    }
+
     async fn execute(&self, input: serde_json::Value) -> eyre::Result<ToolResult> {
         let start = Instant::now();
 
@@ -427,6 +439,10 @@ impl Tool for SentinelIntegrityTool {
             }
         ,
             "required": []})
+    }
+
+    fn reach(&self, _input: &serde_json::Value) -> Option<workforce_agent::tools::Reach> {
+        Some(workforce_agent::tools::Reach::Reads)
     }
 
     async fn execute(&self, input: serde_json::Value) -> eyre::Result<ToolResult> {

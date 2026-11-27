@@ -1,6 +1,7 @@
 pub mod classifier;
 pub mod credential_refs;
 pub mod external_content;
+pub mod guarded_tool;
 pub mod heuristic;
 pub mod monitor;
 pub mod pipeline;

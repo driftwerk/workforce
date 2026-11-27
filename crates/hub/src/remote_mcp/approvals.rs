@@ -294,6 +294,10 @@ impl Tool for StatusTool {
         })
     }
 
+    fn reach(&self, _input: &serde_json::Value) -> Option<workforce_agent::tools::Reach> {
+        Some(workforce_agent::tools::Reach::Reads)
+    }
+
     async fn execute(&self, input: serde_json::Value) -> eyre::Result<ToolResult> {
         let args: StatusArgs = match serde_json::from_value(input) {
             Ok(a) => a,
