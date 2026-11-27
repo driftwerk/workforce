@@ -158,6 +158,7 @@ kinds! {
     PlanPaused => "plan_paused",
     PlanDropped => "plan_dropped",
     PlanDone => "plan_done",
+    PlanRemoved => "plan_removed",
     Moved => "moved",
     // Desk moved sessions off a login that can't serve (at its limit, or
     // turned away) to another of the same provider's (`detail`: from, to,

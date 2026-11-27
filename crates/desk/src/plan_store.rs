@@ -664,6 +664,48 @@ impl DeskStore {
         Ok(n == 1)
     }
 
+    /// Removes plan `plan` at once: every ticket still its own let go as
+    /// [`Self::release_ticket`] does, the needs `unneeded` (`(ticket,
+    /// needs)`) gone and the rest it added kept as no plan's, its watches
+    /// and asks no longer naming it, and the plan with its revisions,
+    /// readings and facts deleted. The tickets it let go, by id; none when
+    /// there was no such plan.
+    pub async fn remove_plan(&self, plan: Uuid, unneeded: &[(Uuid, Uuid)]) -> Result<Vec<Uuid>> {
+        let mut client = self.pool().get().await?;
+        let tx = client.transaction().await?;
+        let released = tx
+            .query(
+                "UPDATE tickets SET plan = NULL, engine = NULL, folder = NULL, view = NULL, \
+                 machine = NULL, model = NULL, repo = NULL, adopted = false, held_back = NULL, \
+                 version = version + 1 \
+                 WHERE plan = $1 RETURNING id",
+                &[&plan],
+            )
+            .await?
+            .iter()
+            .map(|r| r.get::<_, Uuid>(0))
+            .collect();
+        for (t, needs) in unneeded {
+            tx.execute(
+                "DELETE FROM ticket_needs WHERE ticket = $1 AND needs = $2 AND plan = $3",
+                &[t, needs, &plan],
+            )
+            .await?;
+        }
+        for sql in [
+            "UPDATE ticket_needs SET plan = NULL WHERE plan = $1",
+            "UPDATE boss_watches SET plan = NULL WHERE plan = $1",
+            "UPDATE boss_open_items SET plan = NULL WHERE plan = $1",
+        ] {
+            tx.execute(sql, &[&plan]).await?;
+        }
+        let gone = tx
+            .execute("DELETE FROM plans WHERE id = $1", &[&plan])
+            .await?;
+        tx.commit().await.context("removing a plan")?;
+        Ok(if gone == 1 { released } else { Vec::new() })
+    }
+
     /// Writes a new plan, its tickets (numbered on its board, with where
     /// each runs and what each needs), the tickets it takes on (`adopt`:
     /// each claimed with where it runs, and given what it needs) and its

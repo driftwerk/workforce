@@ -27,7 +27,8 @@ tickets that aren't done), each with its key (like ACM-12), who has it (with the
 id) and what it waits on. Hand a ready ticket out with crew.assign_ticket and move one with \
 crew.move_ticket, both by its key; read one in full with crew.ticket. With plan_id, one plan's tickets instead, in its order: each \
 with its key, column, needs and where it runs (machine, folder, engine, model), and with briefs \
-(true, or a list of keys) what each says, so you can read a ticket back before you change it.";
+(true, or a list of keys) what each says, so you can read a ticket back before you change it. \
+Its plans are the ones running or waiting; finished_plans the done and ended ones still on the board.";
 
 pub fn schema() -> Value {
     json!({ "type": "object", "properties": {
@@ -262,28 +263,34 @@ impl CrewHub {
             },
             "table": reported(&out, "the board's tickets"),
             "plans": self.plans_seen(seen).await,
+            "finished_plans": self.finished_plans_seen(seen).await,
         }))
+    }
+
+    /// The plans `seen` sees, finished or not as `finished` says.
+    async fn seen_plans(&self, seen: &Seen, finished: bool) -> Vec<workforce_desk::PlanSummary> {
+        use workforce_desk::plan::PlanState;
+        match self.desk.plans(None, None).await {
+            Ok(plans) => plans
+                .into_iter()
+                .filter(|s| seen.sees(s.plan.group.as_deref()))
+                .filter(|s| {
+                    matches!(s.plan.state, PlanState::Done | PlanState::Dropped) == finished
+                })
+                .collect(),
+            Err(e) => {
+                tracing::warn!(error = %e, "reading the plans for the overseer failed");
+                Vec::new()
+            }
+        }
     }
 
     /// The plans `seen` sees that haven't ended, with where they stand.
     pub(super) async fn plans_seen(&self, seen: &Seen) -> Value {
-        let plans = match self.desk.plans(None, None).await {
-            Ok(p) => p,
-            Err(e) => {
-                tracing::warn!(error = %e, "reading the plans for the overseer failed");
-                return json!([]);
-            }
-        };
-        let shown: Vec<Value> = plans
+        let shown: Vec<Value> = self
+            .seen_plans(seen, false)
+            .await
             .into_iter()
-            .filter(|s| seen.sees(s.plan.group.as_deref()))
-            .filter(|s| {
-                !matches!(
-                    s.plan.state,
-                    workforce_desk::plan::PlanState::Done
-                        | workforce_desk::plan::PlanState::Dropped
-                )
-            })
             .map(|s| {
                 json!({
                     "plan_id": s.plan.id.to_string(),
@@ -293,6 +300,24 @@ impl CrewHub {
                     "revision": s.plan.revision,
                     "approved_revision": s.plan.approved_revision,
                     "progress": s.progress,
+                })
+            })
+            .collect();
+        json!(shown)
+    }
+
+    /// The plans `seen` sees that are done or ended, still on the board
+    /// until removed (`crew.plan_update` remove).
+    async fn finished_plans_seen(&self, seen: &Seen) -> Value {
+        let shown: Vec<Value> = self
+            .seen_plans(seen, true)
+            .await
+            .into_iter()
+            .map(|s| {
+                json!({
+                    "plan_id": s.plan.id.to_string(),
+                    "goal": reported(&s.plan.goal, "a plan's goal"),
+                    "state": s.plan.state.as_str(),
                 })
             })
             .collect();

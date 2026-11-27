@@ -117,6 +117,13 @@ pub(super) fn not_said(quote: &str, why: NotSaid, said: Said) -> String {
         (NotSaid::NotFound, Said::Changing) => format!(
             "Desk looked for “{q}” in {WHERE_LOOKED} over the last 24 hours and didn't find it word for word. Quote one message of theirs exactly as they wrote it.{ask}"
         ),
+        (NotSaid::TooOld(at), Said::Asking) => format!(
+            "The person wrote “{q}” at {}, more than 24 hours ago: ask them in your DM whether they still want it, then quote their reply.",
+            at.format("%Y-%m-%d %H:%M UTC")
+        ),
+        (NotSaid::NotFound, Said::Asking) => format!(
+            "Desk looked for “{q}” in {WHERE_LOOKED} over the last 24 hours and didn't find it word for word. Quote their message asking for it exactly as they wrote it: only they end or remove a plan."
+        ),
     }
 }
 
@@ -683,6 +690,23 @@ impl CrewHub {
                 Err(_) => not_said(quote, e, Said::Agreeing),
             }
         })
+    }
+
+    /// When the person asked, in `quote`, for what the boss `service` is
+    /// to do: their own words in its DM within a day, whole or in part.
+    pub(super) fn asked_at(
+        &self,
+        service: &AgentService,
+        quote: &str,
+    ) -> Result<DateTime<Utc>, String> {
+        let now = crew::now();
+        goal::said_by(
+            &self.person_words(service, now - WORDS_LOOKED),
+            quote,
+            now - AGREED_WITHIN,
+            Said::Asking,
+        )
+        .map_err(|e| not_said(quote, e, Said::Asking))
     }
 
     /// The person's word for `applying`, a change to plan `p`'s goal, in

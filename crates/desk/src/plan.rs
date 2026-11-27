@@ -1438,6 +1438,33 @@ pub fn settled(tickets: &[PlanTicket]) -> bool {
             .all(|t| matches!(t.state, TicketState::Done | TicketState::Dropped))
 }
 
+/// How a plan whose work is done closes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Closing {
+    /// Its goal is met, or every ticket is settled and it has no goal.
+    Now,
+    /// Every ticket is settled and its goal isn't met: its boss has one
+    /// turn to add the work it needs or ask the person, then it closes.
+    AfterTurn,
+}
+
+/// How plan `p`, with `tickets`, closes, when nothing is left of it to
+/// do: running, or paused by Desk (never under the person's own pause),
+/// and its goal met or every ticket settled.
+pub fn closing(p: &Plan, tickets: &[PlanTicket]) -> Option<Closing> {
+    let open = match p.state {
+        PlanState::Running => true,
+        PlanState::Paused => p.paused != Some(Paused::Person),
+        PlanState::Proposed | PlanState::Done | PlanState::Dropped => false,
+    };
+    match (open, p.met.is_some(), settled(tickets)) {
+        (false, _, _) | (true, false, false) => None,
+        (true, true, _) => Some(Closing::Now),
+        (true, false, true) if p.goal_open() => Some(Closing::AfterTurn),
+        (true, false, true) => Some(Closing::Now),
+    }
+}
+
 /// What changing the plan from `applied`, the revision the runner follows,
 /// to `next` is: nothing (`None`), a minor change, or a change of scope.
 ///

@@ -975,20 +975,24 @@ pub enum Said {
     /// however short ("yes"), as does at least 2 words and 6 characters of
     /// a longer one.
     Answering,
+    /// Asking for something to be done, as ending or removing a plan: the
+    /// whole of one of their messages, or at least 2 words and 6 characters
+    /// of it, read as the request it is.
+    Asking,
 }
 
 impl Said {
     /// The fewest words and characters a quote of part of a message has.
     pub fn floor(self) -> (usize, usize) {
         match self {
-            Self::Agreeing | Self::Answering => (2, 6),
+            Self::Agreeing | Self::Answering | Self::Asking => (2, 6),
             Self::Changing => (4, 15),
         }
     }
 
     /// Whether the whole of a message counts, however short.
     fn whole_counts(self) -> bool {
-        matches!(self, Self::Agreeing | Self::Answering)
+        matches!(self, Self::Agreeing | Self::Answering | Self::Asking)
     }
 }
 
@@ -1054,7 +1058,7 @@ pub fn said_by(
     said: Said,
 ) -> Result<DateTime<Utc>, NotSaid> {
     found(messages, quote, since, said, &|text| match said {
-        Said::Changing => Consent::Yes,
+        Said::Changing | Said::Asking => Consent::Yes,
         _ => consent(text),
     })
 }
