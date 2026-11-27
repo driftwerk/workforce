@@ -912,7 +912,7 @@ impl Placed {
             Self::Picked(plan_group::Why::Folder(f)) => {
                 format!(", where the sessions working in {f} are")
             }
-            Self::Picked(plan_group::Why::Named(n)) => format!(": its folder names it ({n})"),
+            Self::Picked(plan_group::Why::Named(n)) => format!(": its repository names it ({n})"),
             Self::Own => match group {
                 UNGROUPED_NAME => ": nothing of it names a group".to_string(),
                 _ => ", your group".to_string(),
@@ -1457,10 +1457,13 @@ impl CrewHub {
                 self.desk.group_of_board(id).await.map_err(plain)?,
                 Placed::Board,
             ),
-            (None, None) => match self.desk.work_group(&tickets, |g| b.seen.sees(g)) {
-                Some(p) => (Some(p.group), Placed::Picked(p.why)),
-                None => (self.boss_group(&b.service, o), Placed::Own),
-            },
+            (None, None) => {
+                let found = self.desk.checkouts(&tickets).await;
+                match self.desk.work_group(&tickets, &found, |g| b.seen.sees(g)) {
+                    Some(p) => (Some(p.group), Placed::Picked(p.why)),
+                    None => (self.boss_group(&b.service, o), Placed::Own),
+                }
+            }
         };
         let mut tickets = tickets;
         let machine = self.plan_machine(input, group.as_deref());

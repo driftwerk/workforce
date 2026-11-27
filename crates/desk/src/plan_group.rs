@@ -1,7 +1,8 @@
 //! The group a plan's work belongs to when nothing names one, read from its
 //! tickets: each votes for at most one group, by the first of the session
-//! it takes on, the sessions working in its folder, and a group named in
-//! its folder's or repository's path below the home folder. The group with
+//! it takes on, the sessions working in its folder, and a group its
+//! repository names (its root folder, its origin's owner and name, or its
+//! folders below the root; never the folders it sits in). The group with
 //! the most votes wins; a tie or no vote picks none.
 
 use std::collections::BTreeMap;
@@ -10,9 +11,42 @@ use std::collections::BTreeMap;
 #[derive(Debug, Clone, Copy)]
 pub struct Work<'a> {
     pub folder: &'a str,
+    /// The repository it names, `owner/name` or a URL.
     pub repo: Option<&'a str>,
     /// The group of the session it takes on, when that session is in one.
     pub session: Option<&'a str>,
+    /// The repository its folder is in, when there is one.
+    pub checkout: Option<Checkout<'a>>,
+}
+
+/// The repository a ticket's folder is in.
+#[derive(Debug, Clone, Copy)]
+pub struct Checkout<'a> {
+    /// Its root folder's name (a worktree's: the repository it was made
+    /// from).
+    pub root: &'a str,
+    /// Its origin remote, `host/owner/name`.
+    pub remote: Option<&'a str>,
+    /// The ticket's folder below the checkout's top; empty at the top.
+    pub below: &'a str,
+}
+
+/// A [`Checkout`] as it was read from disk.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Found {
+    pub root: String,
+    pub remote: Option<String>,
+    pub below: String,
+}
+
+impl Found {
+    pub fn checkout(&self) -> Checkout<'_> {
+        Checkout {
+            root: &self.root,
+            remote: self.remote.as_deref(),
+            below: &self.below,
+        }
+    }
 }
 
 /// One of this computer's open sessions in a group.
@@ -36,7 +70,7 @@ pub enum Why {
     Session,
     /// The group's sessions work in this folder.
     Folder(String),
-    /// Its path names the group.
+    /// Its repository names the group, by this name.
     Named(String),
 }
 
@@ -46,19 +80,15 @@ pub struct Picked {
     pub why: Why,
 }
 
-/// The group `work` belongs to among `groups`, by `working`'s sessions;
-/// `home` is the person's home folder.
-pub fn pick(work: &[Work], working: &[Working], groups: &[Choice], home: &str) -> Option<Picked> {
-    let votes = work
-        .iter()
-        .filter_map(|w| vote(w, working, groups, home))
-        .fold(
-            BTreeMap::<&str, (usize, Why)>::new(),
-            |mut votes, (g, why)| {
-                votes.entry(g).and_modify(|v| v.0 += 1).or_insert((1, why));
-                votes
-            },
-        );
+/// The group `work` belongs to among `groups`, by `working`'s sessions.
+pub fn pick(work: &[Work], working: &[Working], groups: &[Choice]) -> Option<Picked> {
+    let votes = work.iter().filter_map(|w| vote(w, working, groups)).fold(
+        BTreeMap::<&str, (usize, Why)>::new(),
+        |mut votes, (g, why)| {
+            votes.entry(g).and_modify(|v| v.0 += 1).or_insert((1, why));
+            votes
+        },
+    );
     most(votes, |(n, _)| *n).map(|(group, (_, why))| Picked {
         group: group.to_string(),
         why,
@@ -75,12 +105,7 @@ fn most<K, V>(counts: BTreeMap<K, V>, count: impl Fn(&V) -> usize) -> Option<(K,
     }
 }
 
-fn vote<'a>(
-    w: &Work,
-    working: &[Working],
-    groups: &[Choice<'a>],
-    home: &str,
-) -> Option<(&'a str, Why)> {
+fn vote<'a>(w: &Work, working: &[Working], groups: &[Choice<'a>]) -> Option<(&'a str, Why)> {
     let known = |id: &str| groups.iter().find(|g| g.id == id).map(|g| g.id);
     w.session
         .and_then(known)
@@ -88,7 +113,7 @@ fn vote<'a>(
         .or_else(|| {
             by_folder(w.folder, working, groups).map(|g| (g, Why::Folder(w.folder.to_string())))
         })
-        .or_else(|| named(w, groups, home))
+        .or_else(|| named(w, groups))
 }
 
 /// The one group of `groups` most of the sessions working in `folder` (or
@@ -109,30 +134,37 @@ const SEPARATORS: [char; 2] = ['/', '\\'];
 
 /// Whether `cwd` is `folder` or under it.
 fn within(folder: &str, cwd: &str) -> bool {
-    below(folder, cwd).is_some()
-}
-
-/// What of `path` is under `folder` (empty for `folder` itself), when
-/// `path` is `folder` or under it.
-fn below<'p>(folder: &str, path: &'p str) -> Option<&'p str> {
     let folder = folder.trim_end_matches(SEPARATORS);
-    let path = path.trim_end_matches(SEPARATORS);
-    path.strip_prefix(folder)
-        .filter(|rest| !folder.is_empty() && (rest.is_empty() || rest.starts_with(SEPARATORS)))
+    let cwd = cwd.trim_end_matches(SEPARATORS);
+    !folder.is_empty()
+        && cwd
+            .strip_prefix(folder)
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with(SEPARATORS))
 }
 
-/// The group a segment of `w`'s folder (below `home`, when it is under it)
-/// or repository names, the deepest segment first.
-fn named<'a>(w: &Work, groups: &[Choice<'a>], home: &str) -> Option<(&'a str, Why)> {
-    deepest(below(home, w.folder).unwrap_or(w.folder))
-        .chain(w.repo.into_iter().flat_map(deepest))
+/// The group `w`'s repository names: its folders below the root (the
+/// deepest first), the root, its origin's name and owner, then the
+/// repository the ticket names.
+fn named<'a>(w: &Work, groups: &[Choice<'a>]) -> Option<(&'a str, Why)> {
+    w.checkout
+        .iter()
+        .flat_map(|c| {
+            deepest(c.below)
+                .chain([c.root])
+                .chain(name_and_owner(c.remote))
+        })
+        .chain(name_and_owner(w.repo))
         .find_map(|seg| {
-            let folded = fold(seg);
             groups
                 .iter()
-                .find(|g| !folded.is_empty() && fold(g.name) == folded)
+                .find(|g| names(seg, g.name))
                 .map(|g| (g.id, Why::Named(seg.to_string())))
         })
+}
+
+/// A repository's name, then its owner.
+fn name_and_owner(repo: Option<&str>) -> impl Iterator<Item = &str> {
+    repo.into_iter().flat_map(|r| deepest(r).take(2))
 }
 
 /// `path`'s segments, the deepest first, without a `.git` ending.
@@ -140,6 +172,21 @@ fn deepest(path: &str) -> impl Iterator<Item = &str> {
     path.rsplit(SEPARATORS)
         .map(|s| s.strip_suffix(".git").unwrap_or(s))
         .filter(|s| !s.is_empty())
+}
+
+/// Whether `seg` names the group called `name`: the same letters and
+/// digits, or those of its first words (`mantis-crm` names Mantis).
+fn names(seg: &str, name: &str) -> bool {
+    let name = fold(name);
+    !name.is_empty()
+        && seg
+            .split(|c: char| !c.is_ascii_alphanumeric())
+            .filter(|w| !w.is_empty())
+            .scan(String::new(), |words, w| {
+                words.push_str(&fold(w));
+                Some(words.clone())
+            })
+            .any(|words| words == name)
 }
 
 fn fold(s: &str) -> String {
@@ -173,36 +220,66 @@ mod tests {
             folder,
             repo: None,
             session: None,
+            checkout: None,
         }
     }
 
-    const HOME: &str = "/Users/sam";
+    /// `folder`, the top of a checkout of `root` from `remote`.
+    fn checked_out<'a>(folder: &'a str, root: &'a str, remote: Option<&'a str>) -> Work<'a> {
+        Work {
+            checkout: Some(Checkout {
+                root,
+                remote,
+                below: "",
+            }),
+            ..work(folder)
+        }
+    }
 
     fn picked(work: &[Work], working: &[Working]) -> Option<(String, Why)> {
-        pick(work, working, &GROUPS, HOME).map(|p| (p.group, p.why))
+        pick(work, working, &GROUPS).map(|p| (p.group, p.why))
     }
 
     #[test]
-    fn a_tickets_session_then_its_folder_then_its_path_names_its_group() {
+    fn a_tickets_session_then_its_folder_then_its_repository_names_its_group() {
+        let mono = "/w/mantis-crm/monorepo";
+        let remote = Some("github.com/mantis-crm/monorepo");
         let working = [Working {
-            cwd: "/w/mantis/monorepo/.worktrees/man-1",
+            cwd: "/w/mantis-crm/monorepo/.worktrees/man-1",
             group: "g-atlas",
         }];
         let by_session = Work {
             session: Some("g-mantis"),
-            ..work("/w/mantis/monorepo")
+            ..checked_out(mono, "monorepo", remote)
         };
         assert_eq!(
             picked(&[by_session], &working),
             Some(("g-mantis".into(), Why::Session))
         );
         assert_eq!(
-            picked(&[work("/w/mantis/monorepo")], &working),
-            Some(("g-atlas".into(), Why::Folder("/w/mantis/monorepo".into())))
+            picked(&[checked_out(mono, "monorepo", remote)], &working),
+            Some(("g-atlas".into(), Why::Folder(mono.into())))
         );
         assert_eq!(
-            picked(&[work("/w/mantis/monorepo")], &[]),
-            Some(("g-mantis".into(), Why::Named("mantis".into())))
+            picked(&[checked_out(mono, "monorepo", remote)], &[]),
+            Some(("g-mantis".into(), Why::Named("mantis-crm".into())))
+        );
+        assert_eq!(
+            picked(&[checked_out("/w/x", "atlas", None)], &[]),
+            Some(("g-atlas".into(), Why::Named("atlas".into())))
+        );
+        let below = Work {
+            checkout: Some(Checkout {
+                root: "monorepo",
+                remote,
+                below: "services/atlas",
+            }),
+            ..work("/w/mantis-crm/monorepo/services/atlas")
+        };
+        assert_eq!(
+            picked(&[below], &[]),
+            Some(("g-atlas".into(), Why::Named("atlas".into()))),
+            "a folder below the root before the root and its origin"
         );
         let by_repo = Work {
             repo: Some("github.com/acme/Atlas.git"),
@@ -214,7 +291,7 @@ mod tests {
         );
         let unknown_session = Work {
             session: Some("g-gone"),
-            ..work("/w/atlas")
+            ..checked_out("/w/atlas", "atlas", None)
         };
         assert_eq!(
             picked(&[unknown_session], &[]),
@@ -223,11 +300,59 @@ mod tests {
     }
 
     #[test]
+    fn the_folders_a_repository_sits_in_never_name_its_group() {
+        let groups = [
+            Choice {
+                id: "g-dev",
+                name: "Dev",
+            },
+            Choice {
+                id: "g-projects",
+                name: "Projects",
+            },
+            Choice {
+                id: "g-mantis",
+                name: "Mantis",
+            },
+        ];
+        let folder = "/Users/kings/dev/projects/mantis-crm/monorepo";
+        let at = |w: Work| pick(&[w], &[], &groups).map(|p| (p.group, p.why));
+        assert_eq!(
+            at(checked_out(
+                folder,
+                "monorepo",
+                Some("github.com/mantis-crm/monorepo")
+            )),
+            Some(("g-mantis".into(), Why::Named("mantis-crm".into())))
+        );
+        assert_eq!(at(checked_out(folder, "monorepo", None)), None);
+        assert_eq!(at(work(folder)), None, "no repository: no name");
+    }
+
+    #[test]
+    fn a_name_is_the_whole_segment_or_its_first_words() {
+        assert!(names("mantis-crm", "Mantis"));
+        assert!(names("mantis_crm", "Mantis CRM"));
+        assert!(names("Mantis", "mantis"));
+        assert!(!names("crm-mantis", "Mantis"));
+        assert!(!names("mantiscrm", "Mantis"));
+        assert!(!names("anything", "··"));
+    }
+
+    #[test]
     fn the_most_votes_win_and_a_tie_or_nothing_picks_no_group() {
-        let two = [work("/w/mantis/a"), work("/w/mantis/b"), work("/w/atlas")];
+        let two = [
+            checked_out("/w/a", "mantis-a", None),
+            checked_out("/w/b", "mantis-b", None),
+            checked_out("/w/c", "atlas", None),
+        ];
         assert_eq!(picked(&two, &[]).map(|(g, _)| g), Some("g-mantis".into()));
-        assert_eq!(picked(&[work("/w/mantis"), work("/w/atlas")], &[]), None);
-        assert_eq!(picked(&[work("/w/other")], &[]), None);
+        let tie = [
+            checked_out("/w/a", "mantis", None),
+            checked_out("/w/c", "atlas", None),
+        ];
+        assert_eq!(picked(&tie, &[]), None);
+        assert_eq!(picked(&[checked_out("/w/o", "other", None)], &[]), None);
         assert_eq!(picked(&[], &[]), None);
         let split = [
             Working {
@@ -255,32 +380,12 @@ mod tests {
     }
 
     #[test]
-    fn the_home_folder_and_what_is_above_it_name_no_group() {
-        let groups = [
-            Choice {
-                id: "g-sam",
-                name: "Sam",
-            },
-            Choice {
-                id: "g-users",
-                name: "Users",
-            },
-        ];
-        let at = |folder| pick(&[work(folder)], &[], &groups, HOME).map(|p| p.group);
-        assert_eq!(at("/Users/sam/code/acme"), None);
-        assert_eq!(at("/Users/sam"), None);
-        assert_eq!(at("/Users/sam/sam/acme"), Some("g-sam".into()));
-        assert_eq!(
-            at("/srv/users/acme"),
-            Some("g-users".into()),
-            "outside home, every segment counts"
-        );
-    }
-
-    #[test]
-    fn a_group_the_boss_doesnt_see_or_an_empty_name_never_wins() {
+    fn a_group_the_boss_doesnt_see_never_wins() {
         let only_atlas = [GROUPS[1]];
-        assert_eq!(pick(&[work("/w/mantis")], &[], &only_atlas, HOME), None);
+        assert_eq!(
+            pick(&[checked_out("/w/m", "mantis", None)], &[], &only_atlas),
+            None
+        );
         let working = [
             Working {
                 cwd: "/w/mantis",
@@ -296,10 +401,9 @@ mod tests {
             },
         ];
         assert_eq!(
-            pick(&[work("/w/mantis")], &working, &only_atlas, HOME).map(|p| p.group),
+            pick(&[work("/w/mantis")], &working, &only_atlas).map(|p| p.group),
             Some("g-atlas".into()),
             "the group it sees, however many it doesn't see work there"
         );
-        assert_eq!(picked(&[work("/w/··/x")], &[]), None);
     }
 }

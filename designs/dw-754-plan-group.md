@@ -40,7 +40,7 @@ D = `crates/desk/src`, H = `crates/hub/src/desk_crew`, A = the Desk app (`driftw
 5. **When nothing is said, the plan's work picks its group**, through one pure function (`plan_group::pick`). Each ticket votes for at most one group, taking the first of these that gives an answer:
    1. the session it takes on, if that session is in a group;
    2. its folder: the group that the most of this computer's open sessions working in it (or a worktree or subfolder of it) are in, counting only sessions in a group the boss sees;
-   3. its folder's or repository's path segments: a group whose name, folded to lowercase letters and digits, is one of them (`~/dev/mantis/monorepo` and `github.com/mantis/monorepo` both vote Mantis).
+   3. its repository, and only that: the folders below the repository's root (deepest first), the root folder's name, its origin remote's name and owner, then the repository the ticket names. A segment names a group when its letters and digits, lowercased, are the group's, whole or in its first words (`mantis-crm` names Mantis). The folders the repository sits in never vote, so in `/Users/kings/dev/projects/mantis-crm/monorepo` (origin `github.com/mantis-crm/monorepo`) Dev and Projects never win, and Mantis does by its owner. A folder in no repository names nothing.
 
    Only groups the boss sees can win. The group with the most votes wins. A tie, or no votes at all, leaves the boss's own group. The board's group wins before any of this: the board the boss names, or else the board of the first ticket the plan takes on. The boss can also say `group` itself, and what it says comes first. Its tool's answer always says which group the plan is in and why ("It is in Mantis: its folders are Mantis's (~/dev/mantis/monorepo). Tell the person; they can change it on its card."), and the plan card shows it.
 6. **A plan follows its group's boss.** When a running or paused plan's boss no longer sees its group but the group's scope has a boss (Mantis was given a boss, or a group was deleted and its plans went to Ungrouped), the runner hands the plan to that boss with the existing `pass_plan`: noted as handed over, paused with `NoBoss` until the person says Continue. A plan whose boss has left the hub is paused as today. A scope with no boss (a sealed group) leaves the plan waiting, as the Floor already shows ("no one's to lead").
@@ -71,16 +71,18 @@ D = `crates/desk/src`, H = `crates/hub/src/desk_crew`, A = the Desk app (`driftw
 ### D/plan_group.rs (new, pure, unit-tested)
 
 ```rust
-pub struct Work<'a> { pub folder: &'a str, pub repo: Option<&'a str>, pub session: Option<&'a str> }
+pub struct Work<'a> { pub folder: &'a str, pub repo: Option<&'a str>, pub session: Option<&'a str>, pub checkout: Option<Checkout<'a>> }
+pub struct Checkout<'a> { pub root: &'a str, pub remote: Option<&'a str>, pub below: &'a str }
+pub struct Found { pub root: String, pub remote: Option<String>, pub below: String } // owned, .checkout()
 pub struct Working<'a> { pub cwd: &'a str, pub group: &'a str }
 pub struct Choice<'a> { pub id: &'a str, pub name: &'a str }
 pub enum Why { Session, Folder(String), Named(String) }
 pub struct Picked { pub group: String, pub why: Why }
 
-pub fn pick(work: &[Work], working: &[Working], groups: &[Choice], home: &str) -> Option<Picked>
+pub fn pick(work: &[Work], working: &[Working], groups: &[Choice]) -> Option<Picked>
 ```
 
-`groups` holds only the groups the boss sees. `Work.session` is the group of the session a ticket takes on. Each ticket's vote is `vote` (decision 5's three signals, in order, each an `Option` chained with `or_else`). Votes are folded into a `BTreeMap<&str, (usize, Why)>`, where the first ticket's reason is the one kept. The result is the unique maximum (`most`, shared with the folder count). `within(folder, cwd)` is true when `cwd` is `folder` or under it (a `/` or `\` boundary, trailing separators ignored); a session at a parent folder, like the home folder, never votes. `deepest(path)` gives a folder's or repository's segments, deepest first, without a `.git` ending. A folder under `home` (the person's home folder, `$HOME`) names a group only by its segments below it, so the home folder and what is above it (`Users`, the person's name) never win; a folder outside it counts every segment. `fold(s)` keeps ASCII alphanumerics, lowercased. A group whose folded name is empty never matches.
+`groups` holds only the groups the boss sees. `Work.session` is the group of the session a ticket takes on. Each ticket's vote is `vote` (decision 5's three signals, in order, each an `Option` chained with `or_else`). Votes are folded into a `BTreeMap<&str, (usize, Why)>`, where the first ticket's reason is the one kept. The result is the unique maximum (`most`, shared with the folder count). `within(folder, cwd)` is true when `cwd` is `folder` or under it (a `/` or `\` boundary, trailing separators ignored); a session at a parent folder, like the home folder, never votes. `named` reads the ticket's `Checkout` and `repo` as decision 5 says; `deepest(path)` gives segments deepest first without a `.git` ending, and a remote or `repo` gives only its last two (name, owner), never its host. `names(seg, name)` compares `fold`ed words (`fold` keeps ASCII alphanumerics, lowercased): the group's folded name equals the segment's first word, its first two, and so on. A group whose folded name is empty never matches.
 
 ### D/service/plans.rs
 
@@ -92,7 +94,8 @@ pub fn pick(work: &[Work], working: &[Working], groups: &[Choice], home: &str) -
 - `pub fn relay_group<'a>(&self, p: &'a Plan) -> Option<&'a str>` (decision 8), used by `plan_spawn_on` (`held`, the `read` closure, `session_start`) and `plan_checkout`.
 - `PlanSummary.group_name`: what the person calls its group (none in Ungrouped), so the boss and the card name it.
 - `named_group(group) -> Result<String, DeskError>`: the group's name, Ungrouped for none, `Invalid` for a group the sidebar hasn't. `propose_plan` and `regroup_plan` both check with it first.
-- `pub fn work_group(&self, tickets: &[DraftTicket], sees: impl Fn(Option<&str>) -> bool) -> Option<Picked>` gathers `pick`'s inputs from the layout's groups (filtered by `sees`), the views of the sessions the tickets take on (`self.view(id)?.group`), and `self.list()`'s sessions that aren't closed (cwd and group). Then it calls `pick` with `$HOME`.
+- `pub async fn checkouts(&self, tickets) -> Vec<Option<Found>>` reads each ticket folder's repository on a blocking thread with the new `folders::repo_around(dir, may)` (its checkout's top, its root (a worktree's: the repository it was made from), and `remote_of`'s origin), only inside the home folder and never the home folder's own repository (as `remote_where` reads). `below` is the folder relative to the checkout's top.
+- `pub fn work_group(&self, tickets: &[DraftTicket], found: &[Option<Found>], sees: impl Fn(Option<&str>) -> bool) -> Option<Picked>` gathers `pick`'s inputs from the layout's groups (filtered by `sees`), the views of the sessions the tickets take on (`self.view(id)?.group`), `self.list()`'s sessions that aren't closed (cwd and group), and `found`. Then it calls `pick`. The hub's `propose` reads `checkouts` first.
 - `pub async fn regroup_plan(&self, id: Uuid, group: Option<String>, by: &By) -> Result<Regrouped, DeskError>`, `Regrouped { plan: PlanDetail (flattened), unmoved: Option<String> }`:
   1. under `plan_write`, then `plan_starting` (`move_plan`'s order);
   2. `DeskError::Invalid` for a group the layout doesn't have, and for a plan that is done or dropped ("A finished plan stays where it was.");
@@ -152,7 +155,7 @@ D/plan_group.rs (unit):
 - `a_group_the_boss_doesnt_see_or_an_empty_name_never_wins`.
 
 D/service/plans_group_tests.rs (new, Postgres):
-- `a_plans_group_lifecycle_propose_regroup_start_and_a_deleted_group`: groups Mantis and Atlas, the main boss. `work_group` on a board-less draft in `…/mantis/monorepo` picks Mantis (`Why::Named`). Proposed with that group, the plan and its new board are in Mantis. Regroup to Atlas: the plan is in Atlas, its board and keys are unchanged, and a `Plan` event and a `PlanChanged` note are heard. Approve and start a ticket: its session is in Atlas. Regroup to Mantis: the running session moves to Mantis, and a session the person put in another group stays. Delete Mantis: the plan is in Ungrouped, it is announced again, and its Floor need's group is none.
+- `a_plans_group_lifecycle_propose_regroup_start_and_a_deleted_group`: groups Mantis and Atlas, the main boss. `work_group` on a board-less draft in `<home>/dev/projects/mantis-crm/monorepo` picks Mantis (`Why::Named("mantis-crm")`), not Dev or Projects. Proposed with that group, the plan and its new board are in Mantis. Regroup to Atlas: the plan is in Atlas, its board and keys are unchanged, and a `Plan` event and a `PlanChanged` note are heard. Approve and start a ticket: its session is in Atlas. Regroup to Mantis: the running session moves to Mantis, and a session the person put in another group stays. Delete Mantis: the plan is in Ungrouped, it is announced again, and its Floor need's group is none.
 - `a_plan_doesnt_move_across_a_boss_boundary_nor_to_a_group_there_isnt_nor_once_finished`: Acme bossed by Ada (`set_bosses`), and a sealed group (`bound_groups`).
 - `a_start_reads_its_plans_group_as_it_starts`: regroup between the runner's read of the plan and its start; the session lands in the new group.
 - `a_regroup_to_ungrouped_takes_its_running_session_there`.
@@ -160,13 +163,15 @@ D/service/plans_group_tests.rs (new, Postgres):
 - `a_deleted_group_is_never_written_back_and_reads_as_ungrouped`: a delete waits while `plan_write` is held; a row that still names the group reads as Ungrouped (`live_group`, `relay_group`) and its start lands in Ungrouped.
 - `a_finished_plan_keeps_its_deleted_group_unannounced`.
 - `a_plan_moves_within_its_bosss_part_wherever_its_group_is_now`: a main-boss plan in a group that gained a boss moves to an open group, and not back.
-- plan_group.rs: `the_home_folder_and_what_is_above_it_name_no_group`, and `within` across `\`.
+- `a_tickets_repository_is_read_from_its_folder`: a checkout under home and a folder below its root are read; the home folder itself and a folder outside it aren't.
+- The lifecycle test's folder is `<home>/dev/projects/mantis-crm/monorepo`, with Dev and Projects groups: Mantis wins by its origin's owner.
+- plan_group.rs: `the_folders_a_repository_sits_in_never_name_its_group` (`/Users/kings/dev/projects/mantis-crm/monorepo`, Dev and Projects groups), `a_name_is_the_whole_segment_or_its_first_words`, and `within` across `\`.
 - `a_plan_takes_on_tickets_and_boards_of_any_group_its_boss_runs`: propose in Mantis on an Ungrouped board, with an adopted ticket on an Atlas board. A board in a bossed group is refused.
 - `the_persons_route_regroups_a_plan_and_refuses_what_it_cant`: `POST …/group` with an id, with null, without `group` (400), and across a boss (409).
 - `a_plans_machine_calls_carry_its_group_only_when_that_is_a_boundary`.
 
 H/tests/groups.rs (its fixture has bossed Acme and Atlas and open Infra):
-- `the_main_boss_puts_a_plan_in_its_works_group_and_moves_it_only_among_its_own`: a plan in `…/infra/web` with no group is in Infra and the note says why; "ungrouped" by name; Acme (bossed) refused with the names it may use ("Ungrouped and Infra"); `crew.plan_update` with group and board refused, with group alone moved.
+- `the_main_boss_puts_a_plan_in_its_works_group_and_moves_it_only_among_its_own`: a plan in the folder Infra's session works in, with no group, is in Infra and the note says why; "ungrouped" by name; Acme (bossed) refused with the names it may use ("Ungrouped and Infra"); `crew.plan_update` with group and board refused, with group alone moved.
 - `a_plan_whose_group_gets_a_boss_passes_to_that_boss`: Mia is made Infra's boss; the main boss's running Infra plan becomes Mia's, paused `NoBoss`, and one the person paused becomes Mia's still paused by the person; Mia's DM and the main boss's say so.
 - `pointed_at` gains `crew.plan` with another boss's group: refused in the scope words, naming only the boss's own groups.
 

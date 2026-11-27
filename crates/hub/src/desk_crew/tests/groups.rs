@@ -1887,20 +1887,20 @@ async fn a_plans_limit_is_its_bosss_only_in_the_group_it_oversees() {
     .await;
 }
 
-/// The main boss's plan is in the group its work names and says so; the
-/// boss moves it among its own groups, never into a bossed one.
+/// The main boss's plan is in the group its work is in (Infra's session
+/// works in its folder) and says so; the boss moves it among its own
+/// groups, never into a bossed one.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_main_boss_puts_a_plan_in_its_works_group_and_moves_it_only_among_its_own() {
     with_test_pool(workforce_desk::store::build_pool, |pool| async move {
         let dir = tempfile::tempdir().unwrap();
         let c = clients(dir.path(), pool).await;
-        let web = dir.path().join("infra").join("web");
-        std::fs::create_dir_all(&web).unwrap();
+        let web = dir.path().to_string_lossy().into_owned();
         let input = |extra: Value| {
             let mut v = json!({
                 "goal": "Speed up the Infra web build",
                 "result": super::plans::judged(),
-                "tickets": [{ "title": "Cache the build", "folder": web.to_string_lossy() }],
+                "tickets": [{ "title": "Cache the build", "folder": web }],
             });
             if let (Some(o), Value::Object(e)) = (v.as_object_mut(), extra) {
                 o.extend(e);
@@ -1913,7 +1913,9 @@ async fn the_main_boss_puts_a_plan_in_its_works_group_and_moves_it_only_among_it
         assert_eq!(r.output["proposed"]["group"], "Infra");
         let note = r.output["note"].as_str().unwrap();
         assert!(
-            note.contains("Its sessions start in Infra: its folder names it (infra)."),
+            note.contains(&format!(
+                "Its sessions start in Infra, where the sessions working in {web} are."
+            )),
             "{note}"
         );
         let id: uuid::Uuid = r.output["proposed"]["plan_id"]

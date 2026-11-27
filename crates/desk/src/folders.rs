@@ -221,6 +221,37 @@ pub fn remote_of(dir: &Path, up: bool, may: &dyn Fn(&Path) -> bool) -> Option<St
     first.as_deref().and_then(shown_remote)
 }
 
+/// The repository a folder is in, as [`repo_around`] reads it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InRepo {
+    /// Its root folder: for a worktree, the repository it was made from's.
+    pub root: PathBuf,
+    /// The folder's own checkout, which holds it.
+    pub top: PathBuf,
+    /// Its origin remote, as [`remote_of`] shows it.
+    pub remote: Option<String>,
+}
+
+/// The repository `dir` is in, looked for in it and the folders above it
+/// while `may` allows them (as [`remote_of`] looks).
+pub fn repo_around(dir: &Path, may: &dyn Fn(&Path) -> bool) -> Option<InRepo> {
+    let dir = dir.canonicalize().ok()?;
+    let top = dir
+        .ancestors()
+        .take_while(|d| may(d))
+        .find(|d| std::fs::symlink_metadata(d.join(".git")).is_ok())?
+        .to_path_buf();
+    let root = git_dir(&top, false, may)
+        .filter(|g| g.file_name().is_some_and(|n| n == ".git"))
+        .and_then(|g| g.parent().map(Path::to_path_buf))
+        .unwrap_or_else(|| top.clone());
+    Some(InRepo {
+        remote: remote_of(&top, false, may),
+        root,
+        top,
+    })
+}
+
 /// A remote's URL as a person reads it: `host/owner/repo`, with no scheme,
 /// user, token, password, query, fragment or `.git`.
 pub fn shown_remote(url: &str) -> Option<String> {

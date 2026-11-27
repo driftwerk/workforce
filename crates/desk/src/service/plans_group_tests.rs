@@ -47,6 +47,72 @@ fn start_of(p: &PlanDetail, i: usize) -> Start {
     }
 }
 
+/// A checkout of `mantis-crm/monorepo` at `<home>/dev/projects`.
+fn checkout(home: &std::path::Path) -> std::path::PathBuf {
+    let mono = home.join("dev/projects/mantis-crm/monorepo");
+    std::fs::create_dir_all(mono.join(".git")).unwrap();
+    std::fs::write(
+        mono.join(".git/config"),
+        "[remote \"origin\"]\n\turl = git@github.com:mantis-crm/monorepo.git\n",
+    )
+    .unwrap();
+    mono
+}
+
+/// A desk whose person's home folder is `home`.
+async fn desk_at_home(pool: workforce_postgres::PostgresPool, home: &std::path::Path) -> Desk {
+    let mut options = super::super::tests::options(home);
+    options
+        .env
+        .insert("HOME".into(), home.to_string_lossy().into_owned());
+    super::super::tests::desk_on(pool, options).await
+}
+
+/// A ticket's repository is read from where its folder is: its root, its
+/// origin, and the folders below the root; nothing outside the home
+/// folder.
+#[tokio::test]
+async fn a_tickets_repository_is_read_from_its_folder() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let mono = checkout(dir.path());
+        std::fs::create_dir_all(mono.join("services/atlas")).unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        let d = desk_at_home(pool, dir.path()).await;
+        let ticket = |folder: &std::path::Path| DraftTicket {
+            folder: folder.to_string_lossy().into_owned(),
+            ..Default::default()
+        };
+        let found = d
+            .checkouts(&[
+                ticket(&mono),
+                ticket(&mono.join("services/atlas")),
+                ticket(dir.path()),
+                ticket(elsewhere.path()),
+            ])
+            .await;
+        let remote = Some("github.com/mantis-crm/monorepo".to_string());
+        assert_eq!(
+            found,
+            vec![
+                Some(crate::plan_group::Found {
+                    root: "monorepo".into(),
+                    remote: remote.clone(),
+                    below: String::new(),
+                }),
+                Some(crate::plan_group::Found {
+                    root: "monorepo".into(),
+                    remote,
+                    below: "services/atlas".into(),
+                }),
+                None,
+                None,
+            ]
+        );
+    })
+    .await;
+}
+
 /// The plans announced on `events` so far, and the Activity noted.
 fn heard(
     events: &mut tokio::sync::broadcast::Receiver<DeskEvent>,
@@ -68,19 +134,26 @@ fn heard(
 async fn a_plans_group_lifecycle_propose_regroup_start_and_a_deleted_group() {
     with_test_pool(build_pool, |pool| async move {
         let dir = tempfile::tempdir().unwrap();
-        let mono = dir.path().join("mantis").join("monorepo");
-        std::fs::create_dir_all(&mono).unwrap();
-        let d = desk(pool, dir.path()).await;
+        let mono = checkout(dir.path());
+        let d = desk_at_home(pool, dir.path()).await;
         with_groups(&d).await;
+        d.change_layout(|l| {
+            l.create("g-dev", "Dev", &[], None)?
+                .create("g-projects", "Projects", &[], None)
+        })
+        .await
+        .unwrap();
 
-        // Its folders name Mantis, so its work is Mantis's.
+        // Its repository's origin names Mantis, so its work is Mantis's;
+        // the folders it sits in (dev, projects) name nothing.
         let mut new = new_plan(&mono, &[("a", &[]), ("b", &[]), ("c", &[])]);
-        let picked = d.work_group(&new.draft.tickets, |_| true);
+        let found = d.checkouts(&new.draft.tickets).await;
+        let picked = d.work_group(&new.draft.tickets, &found, |_| true);
         assert_eq!(
             picked,
             Some(Picked {
                 group: "g-mantis".into(),
-                why: Why::Named("mantis".into()),
+                why: Why::Named("mantis-crm".into()),
             })
         );
         new.group = picked.map(|p| p.group);

@@ -1699,12 +1699,49 @@ impl Desk {
             .filter(|g| self.layout().groups.iter().any(|x| x.id == *g))
     }
 
+    /// The repository each of `tickets`' folders is in on this computer
+    /// (none outside the home folder, or for the home folder's own), for
+    /// [`Self::work_group`].
+    pub async fn checkouts(
+        &self,
+        tickets: &[DraftTicket],
+    ) -> Vec<Option<crate::plan_group::Found>> {
+        let none = vec![None; tickets.len()];
+        let Some(home) = self.home_folder().and_then(|h| h.canonicalize().ok()) else {
+            return none;
+        };
+        let folders: Vec<std::path::PathBuf> =
+            tickets.iter().map(|t| t.folder.clone().into()).collect();
+        tokio::task::spawn_blocking(move || {
+            let inside = |p: &std::path::Path| p.starts_with(&home) && p != home;
+            folders
+                .iter()
+                .map(|f| {
+                    let r = crate::folders::repo_around(f, &inside)?;
+                    let below = f.canonicalize().ok()?;
+                    Some(crate::plan_group::Found {
+                        root: r.root.file_name()?.to_string_lossy().into_owned(),
+                        remote: r.remote,
+                        below: below
+                            .strip_prefix(&r.top)
+                            .ok()?
+                            .to_string_lossy()
+                            .into_owned(),
+                    })
+                })
+                .collect()
+        })
+        .await
+        .unwrap_or(none)
+    }
+
     /// The group `tickets`' work belongs to among the groups `sees` lets
     /// a boss use ([`crate::plan_group::pick`]), by this computer's open
-    /// sessions.
+    /// sessions and the repositories `found` for them ([`Self::checkouts`]).
     pub fn work_group(
         &self,
         tickets: &[DraftTicket],
+        found: &[Option<crate::plan_group::Found>],
         sees: impl Fn(Option<&str>) -> bool,
     ) -> Option<crate::plan_group::Picked> {
         use crate::plan_group::{pick, Choice, Work, Working};
@@ -1721,7 +1758,7 @@ impl Desk {
         let views = self.list();
         let working: Vec<Working> = views
             .iter()
-            .filter(|v| v.state != crate::model::SessionState::Closed)
+            .filter(|v| !matches!(v.state, crate::model::SessionState::Closed))
             .filter_map(|v| {
                 v.group.as_ref().map(|g| Working {
                     cwd: &v.cwd,
@@ -1731,7 +1768,8 @@ impl Desk {
             .collect();
         let work: Vec<Work> = tickets
             .iter()
-            .map(|t| Work {
+            .zip(found.iter().chain(std::iter::repeat(&None)))
+            .map(|(t, found)| Work {
                 folder: &t.folder,
                 repo: t.repo.as_deref(),
                 session: t
@@ -1739,10 +1777,10 @@ impl Desk {
                     .and_then(|s| views.iter().find(|v| v.id == s))
                     .and_then(|v| v.group.as_ref())
                     .map(|g| g.id.as_str()),
+                checkout: found.as_ref().map(crate::plan_group::Found::checkout),
             })
             .collect();
-        let home = std::env::var("HOME").unwrap_or_default();
-        pick(&work, &working, &groups, &home)
+        pick(&work, &working, &groups)
     }
 
     /// Announces each of `plans` as it is stored now: their group was
