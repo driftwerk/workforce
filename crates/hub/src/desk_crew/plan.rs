@@ -3330,7 +3330,14 @@ impl CrewHub {
             }
             Err(_) => false,
         };
-        still && !self.desk.store().plan_asks_open(p.id).await.unwrap_or(true)
+        if !still {
+            return false;
+        }
+        let asked = self.desk.store().plan_asks_open(p.id).await.unwrap_or(true);
+        if asked {
+            tracing::info!(plan = %p.id, "a settled plan whose goal isn't read met stays open: its boss asked the person about it");
+        }
+        !asked
     }
 
     /// Finishes plan `p` as `by`, and when this made it Done tells the

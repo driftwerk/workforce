@@ -61,7 +61,7 @@ There is also no way to end or remove a plan from its row:
    - `Closing::Now`: its goal is met, or every ticket is settled (Done or Dropped, `plan::settled`) and it has no goal.
    - `Closing::AfterTurn`: every ticket is settled and its goal isn't met (judged or measured alike).
 
-   With `AfterTurn` the boss has one turn: it is told the tickets are settled but the goal isn't read met (`settled_unmet`, with where each part stands), and that Desk finishes the plan once the turn ends if nothing more is to be done, its reply then the closing summary leading with "Not read met: …". After the turn, if the plan is still `AfterTurn` (the boss added no ticket and nothing met the goal) and no question of the boss's about it is open, Desk finishes it as Done, `met` left unset. A question still open holds it: a runner pass starts no turn for it while the person hasn't answered. An info log line says when a plan is settled with its goal unmet, and when a plan finishes (`a plan finished`, with who finished it), so the next stall is visible in hub.log.
+   With `AfterTurn` the boss has one turn: it is told the tickets are settled but the goal isn't read met (`settled_unmet`, with where each part stands), and that Desk finishes the plan once the turn ends if nothing more is to be done, its reply then the closing summary leading with "Not read met: …". After the turn, if the plan is still `AfterTurn` (the boss added no ticket and nothing met the goal) and no question of the boss's about it is open, Desk finishes it as Done, `met` left unset. A question still open holds it (only the boss's goal questions carry a plan, `item_set_goal`), said once in an info log: a runner pass starts no turn for it while the person hasn't answered. A runner pass's closing turn looks again once its boss's turn comes, and takes none if the plan is no longer closing (the person paused it meanwhile). An info log line says when a plan is settled with its goal unmet, and when a plan finishes (`a plan finished`, with who finished it), so the next stall is visible in hub.log.
 3. **Closing goes through one path, whatever can or can't take a turn.** The changes to `plan_turn_now`'s closing:
    - It runs the boss's closing turn when its boss can take one.
    - Otherwise Desk finishes the plan itself. "Otherwise" is any of: no boss for the plan, the boss at Watch, no person, or the boss held by the breaker (which today finishes it silently).
@@ -104,7 +104,7 @@ There is also no way to end or remove a plan from its row:
    - A `chip-btn` "Finished · n" with `aria-pressed` (the `search-filters` pattern) shows the done and ended ones instead.
    - `plansOn` keeps dropped plans now. The board's plan select and its tickets' plan chips leave out ended plans, but the one shown.
    - The row's actions live in a new `PlanRowMenu` (so DW-760's `PlanRow`/`PlanCard` edits merge cleanly): a ⋯ `icon-btn-sm` (`MoreIcon`, `Menu`).
-     - Running or paused: "End plan…", which opens `Confirm` (tone danger): "End “goal”? Its tickets stay where they are, and its sessions working now carry on as yours. It can't be resumed." Action "End plan".
+     - Running or paused: "End plan…", which opens `Confirm` (tone danger), titled "End this plan?": "“goal” stops: its boss starts no more of its tickets and stops watching it. Its tickets stay where they are on the board, and any session on one is left to you. You can remove it from the board once it has ended." Action "End plan".
      - Done or dropped: "Remove", one click, no confirmation: nothing is lost, since its tickets stay on the board.
    - `planStore` gets `end`, and `remove`, which forgets the plan in `plans`, `details`, `unread`, `refusals`, `cards`, `seen` and `looking`, and closes it on the board if shown.
    - `planStore` also handles `planRemoved` the same way.
@@ -128,6 +128,7 @@ H:
   - `crew.plan_update end` is refused without the person's words, with words they never said, and with other changes in the call; with their words it ends the plan leaving its tickets; `crew.board` lists it under `finished_plans`; end again is refused, pointing at remove; remove with their words takes it off, its tickets kept as no plan's.
 - `tests/goals.rs`: a goal unmet with every ticket settled: its turn is told `settled_unmet` and "Not read met:", the plan finishes, and a later turn finds nothing to do.
 - `tests/api/desk_plan_routes.rs`: `end` and `remove` are 404 on a hub without Desk.
+- Closing the finished plan's sessions goes through the one close gate, already tested: `tests/plans.rs` (`…a_done_one_closes`: a plan's session whose ticket is Done is closed) and `tests/closing.rs` (`…never_what_holds_work_or_is_the_persons`: one the person typed in, or holding work, stays).
 
 A (vitest), in `crew/plans.e2e.test.tsx` against its fake hub:
 - a running plan's ⋯ offers "End plan…", which asks first and ends it, its tickets as they were; ended, it leaves the list, a "Finished · 1" chip shows it, its ⋯ offers only Remove, and Remove (announced as `planRemoved`) takes it off the board, the store forgetting it;
