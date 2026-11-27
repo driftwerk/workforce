@@ -28,7 +28,7 @@ const REFUSED: &str = "Error: Permission overrides are not supported when resumi
 /// end at once; its app-server says where it was told to listen; its
 /// TUI writes down how it was started, one line each, and refuses a resume
 /// given a permission (or any, once `refuse` is in `dir`) as 0.166 does;
-/// else it draws its screen, the alternate one, unless `hang` is in `dir`.
+/// else it draws its screen, the alternate one, once `hang` isn't in `dir`.
 fn fake_codex(dir: &Path) -> PathBuf {
     let path = dir.join("fake-codex");
     workforce_common::executable::write(
@@ -43,7 +43,8 @@ fn fake_codex(dir: &Path) -> PathBuf {
              [ -e \"$d/refuse\" ] && refuse\n\
              for a in \"$@\"; do case \"$a\" in approval_policy=*|approvals_reviewer=*|sandbox_mode=*) refuse ;; esac; done\n\
              fi\n\
-             [ -e \"$d/hang\" ] || printf '\\033[?1049h>_ OpenAI Codex (v0.166.0)\\r\\n'\n\
+             while [ -e \"$d/hang\" ]; do sleep 0.2; done\n\
+             printf '\\033[?1049h>_ OpenAI Codex (v0.166.0)\\r\\n'\n\
              exec sleep 60\n",
             d = dir.display()
         ),
@@ -510,7 +511,7 @@ async fn a_resumed_codex_session_is_up_only_once_its_tui_is_on_its_screen() {
         let last = tui_starts(&dir).pop().unwrap();
         assert!(last.contains("tui.alternate_screen=\"always\""), "{last}");
 
-        // Its thread loaded, but its TUI never takes its screen: starting
+        // Its thread loaded, but its TUI doesn't take its screen in time: starting
         // until its start's watch is over, then done, said not to have
         // come up (its screen left out: this Desk has no redactor).
         stopped(&d, s.id).await;
@@ -525,8 +526,11 @@ async fn a_resumed_codex_session_is_up_only_once_its_tui_is_on_its_screen() {
         let v = d.view(s.id).unwrap();
         assert!(v.live);
         assert_eq!(v.failed.as_deref(), Some("Codex didn't come up"));
-        stopped(&d, s.id).await;
+        // Its screen taken after all: up, that behind it.
         std::fs::remove_file(dir.join("hang")).unwrap();
+        until(|| state() == SessionState::Idle).await;
+        assert_eq!(d.view(s.id).unwrap().failure, None);
+        stopped(&d, s.id).await;
         // Started again: that failure is behind it.
         started_again(&d, &dir, std::slice::from_ref(&ok), resume).await;
         until(|| state() == SessionState::Idle).await;

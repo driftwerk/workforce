@@ -1081,6 +1081,8 @@ const CODEX_START_WATCH: Duration = if cfg!(test) {
     Duration::from_secs(60)
 };
 const CODEX_START_LOOK: Duration = Duration::from_millis(250);
+/// How often a Codex TUI that didn't come up in its watch is looked at.
+const CODEX_LATE_LOOK: Duration = Duration::from_secs(1);
 
 /// How a Codex session that never came up says so, before the end of its
 /// screen (at most [`NOT_UP_SHOWN`] characters of it).
@@ -1100,6 +1102,12 @@ fn never_up(f: &crate::limit::TurnFailure) -> bool {
 /// its new permissions. Each is over once it runs again.
 fn codex_run_failure(f: &crate::limit::TurnFailure) -> bool {
     never_up(f) || modes::unapplied(f) || lost_sight(f)
+}
+
+/// Whether a Codex session in `state` that is up is idle now: starting,
+/// or done for not having come up (`came_up`, that failure now behind it).
+fn is_up_now(state: SessionState, came_up: bool) -> bool {
+    state == SessionState::Starting || came_up && state == SessionState::Done
 }
 
 /// Whether `f` is Desk having lost sight of a Codex session.
@@ -6517,7 +6525,8 @@ impl Desk {
     /// 0.166): its session is up once it is on its screen (the alternate
     /// one, which it leaves to refuse), not once it is ready for input. One
     /// still starting at the watch's end is said, with what its terminal
-    /// shows, as its failure ([`NOT_UP`]).
+    /// shows, as its failure ([`NOT_UP`]); one that joins is up once it
+    /// takes its screen after all ([`Self::watch_codex_late`]).
     /// It holds Desk weakly, so Desk ends (and its sessions with it) as it
     /// would without it.
     async fn watch_codex_start(desk: Weak<Inner>, id: Uuid, tui: Weak<Pty>, joins: bool) {
@@ -6536,11 +6545,7 @@ impl Desk {
                 let Some(desk) = desk.upgrade().map(Desk) else {
                     return;
                 };
-                desk.change(id, |r, _| {
-                    if r.state == SessionState::Starting {
-                        r.state = SessionState::Idle;
-                    }
-                });
+                desk.codex_up(id);
             }
             if let Some(why) = watch.look(shown.as_deref()) {
                 tracing::warn!(%id, why, "codex said why it didn't start and stayed up: ending it");
@@ -6549,17 +6554,47 @@ impl Desk {
             }
         }
         let Some(pty) = tui.upgrade() else { return };
-        let Some(desk) = desk.upgrade().map(Desk) else {
+        let Some(d) = desk.upgrade().map(Desk) else {
             return;
         };
-        if desk
-            .record(id)
+        if d.record(id)
             .is_ok_and(|r| r.state == SessionState::Starting)
         {
             let shown = crate::pty::shown_end(&crate::pty::plain_text(pty.text().as_bytes()), 4);
             tracing::warn!(%id, secs = CODEX_START_WATCH.as_secs(), shown = %shown, "a Codex session is still starting");
-            desk.codex_not_up(id, &shown);
+            d.codex_not_up(id, &shown);
+            if joins && !on_screen {
+                drop((pty, d));
+                Self::watch_codex_late(desk, id, tui).await;
+            }
         }
+    }
+
+    /// Looks on, while its TUI runs, for session `id`'s Codex that didn't
+    /// come up in its start's watch to take its screen after all: it is up
+    /// then, that failure behind it.
+    async fn watch_codex_late(desk: Weak<Inner>, id: Uuid, tui: Weak<Pty>) {
+        loop {
+            tokio::time::sleep(CODEX_LATE_LOOK).await;
+            let Some(pty) = tui.upgrade() else { return };
+            if pty.primary_text().is_none() {
+                tracing::info!(target: crate::STARTS, %id, "a resumed Codex session's TUI took its screen late: it's up");
+                if let Some(d) = desk.upgrade().map(Desk) {
+                    d.codex_up(id);
+                }
+                return;
+            }
+        }
+    }
+
+    /// `id`'s Codex is up: idle, and done no longer for not having come up.
+    fn codex_up(&self, id: Uuid) {
+        let came_up = self.codex_failure_over(id, never_up);
+        self.change(id, |r, _| {
+            if is_up_now(r.state, came_up) {
+                r.state = SessionState::Idle;
+            }
+        });
     }
 
     /// Says `id`'s Codex didn't come up, as its screen ends (`shown`,
@@ -8977,10 +9012,7 @@ impl Desk {
                 match event {
                     CodexEvent::Thread { rollout } => {
                         r.transcript = rollout.or(r.transcript.take());
-                        // Up, though late: what said it never came up is over.
-                        if r.state == SessionState::Starting
-                            || came_up && r.state == SessionState::Done
-                        {
+                        if is_up_now(r.state, came_up) {
                             r.state = SessionState::Idle;
                         }
                     }

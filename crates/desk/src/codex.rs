@@ -1622,9 +1622,11 @@ impl Follower {
             .collect()
     }
 
-    /// Whether its subscription is asked and not yet answered.
+    /// Whether its subscription is asked and not yet answered: never its
+    /// own resume of the thread as it joins, which takes as long as the
+    /// thread takes to load, and whose starter hears how it went.
     fn asking(&self) -> bool {
-        self.subscribed && !self.followed
+        self.subscribed && !self.followed && self.priming.is_none()
     }
 
     /// Desk lost sight of it: once followed again, it says so
