@@ -332,8 +332,14 @@ fn toml_string(s: &str) -> String {
     format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
 }
 
+/// What every session's app-server runs its commands with: no login shell
+/// and no snapshot of one, so what the person's profiles put on `PATH`
+/// can't go ahead of the `PATH` Desk gives it (its own `gh` first,
+/// [`crate::gh_shim`]). That `PATH` is already the person's login one.
+pub const COMMAND_SHELL: [&str; 2] = ["allow_login_shell=false", "features.shell_snapshot=false"];
+
 /// How to run a session's app-server, listening on `socket`, with Desk's
-/// line at `line` when it has one.
+/// line at `line` when it has one, and [`COMMAND_SHELL`].
 pub fn app_server(
     program: &Path,
     socket: &Path,
@@ -345,6 +351,9 @@ pub fn app_server(
         "--listen".into(),
         format!("unix://{}", socket.display()),
     ];
+    for setting in COMMAND_SHELL {
+        args.extend(["-c".to_string(), setting.to_string()]);
+    }
     let mut env = env.clone();
     if let Some(line) = line {
         for setting in line_settings(line.url) {

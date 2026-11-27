@@ -2045,15 +2045,124 @@ async fn a_sessions_own_merge_is_refused_before_it_runs_under_a_boss_acting_full
         assert!(!refused(&hook(&d, s.id, call("gh pr view 7")).await));
         let token = d.0.state.lock().live[&s.id].token.clone();
         assert_eq!(
-            d.gh_asked(s.id, &token, "gh 'pr' 'merge' '7'"),
+            d.gh_asked(s.id, &token, "gh 'pr' 'merge' '7'").await,
             Some(Some(crate::plan::own_merge_refused())),
             "a Codex session's gh is told the same"
         );
-        assert_eq!(d.gh_asked(s.id, "not-its-token", "gh pr merge 7"), None);
+        assert_eq!(
+            d.gh_asked(s.id, "not-its-token", "gh pr merge 7").await,
+            None
+        );
 
         d.person_typing(s.id).unwrap();
         assert!(
             !refused(&hook(&d, s.id, call(merge)).await),
+            "the person is in it"
+        );
+    })
+    .await;
+}
+
+/// `base/name` on `feat/x` off `main`, its `origin` at `url`; `origin`
+/// has `main` already, as its `origin/HEAD`, when `published`.
+fn pushing_repo(
+    base: &std::path::Path,
+    name: &str,
+    url: &str,
+    published: bool,
+) -> std::path::PathBuf {
+    let repo = base.join(name);
+    std::fs::create_dir_all(&repo).unwrap();
+    git_in(&repo, &["init", "-q", "-b", "main"]);
+    git_in(&repo, &["commit", "-q", "--allow-empty", "-m", "one"]);
+    git_in(&repo, &["remote", "add", "origin", url]);
+    if published {
+        git_in(&repo, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
+        git_in(
+            &repo,
+            &[
+                "symbolic-ref",
+                "refs/remotes/origin/HEAD",
+                "refs/remotes/origin/main",
+            ],
+        );
+    }
+    git_in(&repo, &["switch", "-q", "-c", "feat/x"]);
+    repo
+}
+
+/// Under a boss acting fully, a push straight to a default branch pull
+/// requests merge into (a GitHub `origin` that has it) is refused before
+/// it runs, in a mode that asks nothing; a release branch, a repository
+/// that isn't on GitHub, or its first push isn't, nor anything while the
+/// person is in the session.
+#[tokio::test]
+async fn a_push_straight_to_a_default_branch_pull_requests_merge_into_is_refused_before_it_runs() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(dir.path()).unwrap();
+        let d = desk(pool, &base).await;
+        d.boss_bounds_with(crate::charge::Bounds {
+            home: base.clone(),
+            ..Default::default()
+        });
+        d.set_full(HashMap::from([(
+            sarah().id,
+            charge::FullGrant {
+                anywhere: true,
+                unbound: true,
+                ..Default::default()
+            },
+        )]));
+        let session = async |repo: &std::path::Path| {
+            let s = d.create(start_in(repo, None), None).await.unwrap();
+            idle(&d, s.id).await;
+            d.take_on(s.id, &sarah(), How::Handed, &Default::default(), &By::you())
+                .await
+                .unwrap();
+            s.id
+        };
+        let refused = async |id: Uuid, command: &str| {
+            let call = json!({"hook_event_name": "PreToolUse", "permission_mode": "bypassPermissions",
+                "tool_name": "Bash", "tool_use_id": "toolu_1", "tool_input": {"command": command}});
+            let answer = hook(&d, id, call).await;
+            (answer["hookSpecificOutput"]["permissionDecision"] == "deny").then(|| {
+                answer["hookSpecificOutput"]["permissionDecisionReason"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string()
+            })
+        };
+        let github = "https://github.com/acme/web.git";
+        let web = session(&pushing_repo(&base, "web", github, true)).await;
+        assert_eq!(
+            refused(web, "git push origin HEAD:main").await,
+            Some(crate::plan::default_push_refused())
+        );
+        assert_eq!(refused(web, "git push origin feat/x").await, None);
+        assert_eq!(
+            refused(web, "git push origin HEAD:release-2026").await,
+            None,
+            "a release branch isn't the default one"
+        );
+        let local = base.join("origin.git").to_string_lossy().into_owned();
+        let elsewhere = session(&pushing_repo(&base, "api", &local, true)).await;
+        assert_eq!(
+            refused(elsewhere, "git push origin HEAD:main").await,
+            None,
+            "no pull requests where it isn't on GitHub"
+        );
+        let fresh = session(&pushing_repo(&base, "new", github, false)).await;
+        assert_eq!(
+            refused(fresh, "git push origin HEAD:main").await,
+            None,
+            "a new repository's first push"
+        );
+
+        d.person_typing(web).unwrap();
+        assert_eq!(
+            refused(web, "git push origin HEAD:main").await,
+            None,
             "the person is in it"
         );
     })

@@ -542,6 +542,8 @@ struct Github {
     server: MockServer,
     head: Arc<parking_lot::Mutex<String>>,
     merged: Arc<AtomicBool>,
+    /// Its pull request can't be read while set.
+    down: Arc<AtomicBool>,
 }
 
 impl Github {
@@ -549,10 +551,14 @@ impl Github {
         let server = MockServer::start().await;
         let head = Arc::new(parking_lot::Mutex::new(head.to_string()));
         let merged = Arc::new(AtomicBool::new(false));
-        let (h, m) = (head.clone(), merged.clone());
+        let down = Arc::new(AtomicBool::new(false));
+        let (h, m, gone) = (head.clone(), merged.clone(), down.clone());
         Mock::given(method("GET"))
             .and(path("/repos/acme/web/pulls/7"))
             .respond_with(move |_: &Request| {
+                if gone.load(Ordering::SeqCst) {
+                    return ResponseTemplate::new(503);
+                }
                 let merged = m.load(Ordering::SeqCst);
                 ResponseTemplate::new(200).set_body_json(json!({
                     "number": 7, "state": if merged { "closed" } else { "open" },
@@ -608,6 +614,7 @@ impl Github {
             server,
             head,
             merged,
+            down,
         }
     }
 }
@@ -957,6 +964,50 @@ async fn a_review_of_a_head_that_moved_on_is_closed_unrecorded_and_the_new_head_
         let first = d.view(first.id).unwrap();
         turn_ends(&d, &base, &first, "Pushed more; CI is green.").await;
         reviewed_by_desk(&d, &next).await;
+        assert!(!gh.merged.load(Ordering::SeqCst), "nothing merged");
+    })
+    .await;
+}
+
+/// A review Desk can't record (its pull request unreadable) is tried
+/// again less often each time; after the last try its boss is told, and
+/// Desk is done with it, so nothing keeps it open.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_review_desk_cant_record_is_given_up_its_boss_told_and_nothing_holds_it_open() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(dir.path()).unwrap();
+        let head = pull_request(&base);
+        let gh = Github::at(&head).await;
+        let (_overseer, crew, d, llm, first) = a_plan_of_two(&base, pool, &gh).await;
+        turn_ends(&d, &base, &first, "Opened #7; CI is green.").await;
+        let review = reviewed_by_desk(&d, &head).await;
+        gh.down.store(true, Ordering::SeqCst);
+        let claude = Claude::started(&base, review.id).await;
+        claude.asked(review.last_prompt.as_deref().unwrap()).await;
+        claude
+            .replies(&d, review.id, &format!("Fine.\n\nREVIEW: clean {head}"))
+            .await;
+        eventually("Desk to give the review up", async || {
+            settled(&d, &review).await.then_some(())
+        })
+        .await;
+        eventually("its boss told", async || {
+            llm.received_requests()
+                .await
+                .unwrap_or_default()
+                .iter()
+                .any(|r| String::from_utf8_lossy(&r.body).contains("couldn't record its review"))
+                .then_some(())
+        })
+        .await;
+        let open = d.view(review.id).unwrap();
+        let held = crew.close_held(&open, "desk").await;
+        assert!(
+            held.as_deref()
+                .is_none_or(|h| !h.contains("review isn't recorded yet")),
+            "{held:?}"
+        );
         assert!(!gh.merged.load(Ordering::SeqCst), "nothing merged");
     })
     .await;

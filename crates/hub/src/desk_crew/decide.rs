@@ -83,8 +83,9 @@ never cut short, with what the session is for and where it stands, and the class
     super::watcher::act_fully!(),
     " ALLOW what serves the session's work and no directive forbids. \
 A session's own merge of a pull request, however it is run (gh pr merge, GitHub's merge API by gh \
-or curl, a script that calls it), and its push to its default branch, are DENY: its boss merges a \
-pull request with crew.github_merge once a clean review is recorded at its head. \
+or curl, a script that calls it), and its push straight to a default branch that its pull requests \
+merge into, are DENY: its boss merges a pull request with crew.github_merge once a clean review is \
+recorded at its head. \
 A request that only reads (CI status, PR checks, logs, git status or diff) is ALLOW, even while the \
 session is held: a hold stops new work, never reading. Never answer that you can't see the \
 request: it is all here. The fenced blocks are the session's own words (its request, its last \
@@ -102,12 +103,6 @@ ASK: <the question for the person, one sentence>");
 /// while they are in it.
 const PAST_REVIEW_IS_THEIRS: &str =
     "You're in this session: what it ships without a review is yours to answer.";
-
-/// Why a session's push to its default branch is refused at Act fully.
-pub(crate) const DEFAULT_PUSH: &str = "At Act fully the default branch changes only by a pull request your boss merges once a clean review is recorded at its head.";
-
-/// What a session does instead of pushing its default branch.
-const DEFAULT_PUSH_INSTEAD: &str = "Push your own branch and open a pull request for it; Desk has it reviewed, and your boss merges it.";
 
 /// Why a request that only reads is allowed without a decision call.
 pub(crate) const ONLY_READS: &str = "it only reads, and a hold stops new work, never reading";
@@ -809,8 +804,8 @@ impl CrewHub {
         ) {
             (true, _) => Verdict::Ask(PAST_REVIEW_IS_THEIRS.into()),
             (false, Class::DefaultBranchPush) => Verdict::Deny {
-                why: DEFAULT_PUSH.into(),
-                instead: DEFAULT_PUSH_INSTEAD.into(),
+                why: workforce_desk::plan::DEFAULT_PUSH.into(),
+                instead: workforce_desk::plan::DEFAULT_PUSH_INSTEAD.into(),
             },
             (false, _) => Verdict::Deny {
                 why: workforce_desk::plan::OWN_MERGE.into(),
@@ -846,20 +841,28 @@ impl CrewHub {
         // A request that only reads is allowed with no call, whatever
         // holds the session: a hold stops new work, never reading.
         let reads = read_only_in(&view.cwd, p);
-        // What kind of step it is: git is asked off the async workers.
-        let class = match reads {
-            true => Class::Other,
+        // What kind of step it is, and whether a push to the default
+        // branch goes past the pull requests that merge into it: git is
+        // asked off the async workers.
+        let (class, past) = match reads {
+            true => (Class::Other, false),
             false => {
                 let (desk, id, approval, boss) =
                     (self.desk.clone(), view.id, p.id, boss.to_string());
-                tokio::task::spawn_blocking(move || desk.request_class(id, approval, &boss))
-                    .await
-                    .unwrap_or(Class::Other)
+                tokio::task::spawn_blocking(move || {
+                    let class = desk.request_class(id, approval, &boss);
+                    let past = class == Class::DefaultBranchPush
+                        && desk.request_pushes_past_review(id, approval, &boss);
+                    (class, past)
+                })
+                .await
+                .unwrap_or((Class::Other, false))
             }
         };
         let mut decided = match (reads, class) {
             (true, _) => Some(Verdict::Allow(ONLY_READS.into())),
-            (false, Class::GhPrMerge | Class::DefaultBranchPush) => {
+            (false, Class::GhPrMerge) => Some(self.past_review(view, &decider.oversight, class)),
+            (false, Class::DefaultBranchPush) if past => {
                 Some(self.past_review(view, &decider.oversight, class))
             }
             (false, _) => self

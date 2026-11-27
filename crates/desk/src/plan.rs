@@ -1761,6 +1761,21 @@ pub fn own_merge_refused() -> String {
     format!("{OWN_MERGE} {OWN_MERGE_INSTEAD}")
 }
 
+/// Why a session's push straight to a default branch that pull requests
+/// merge into is refused while a boss acting fully has it.
+pub const DEFAULT_PUSH: &str = "At Act fully the default branch changes only by a pull request \
+your boss merges once a clean review is recorded at its head.";
+
+/// What a session does instead of pushing its default branch.
+pub const DEFAULT_PUSH_INSTEAD: &str = "Push your own branch and open a pull request for it; Desk \
+has it reviewed, and your boss merges it.";
+
+/// [`DEFAULT_PUSH`] and [`DEFAULT_PUSH_INSTEAD`], as a refused call says
+/// them.
+pub fn default_push_refused() -> String {
+    format!("{DEFAULT_PUSH} {DEFAULT_PUSH_INSTEAD}")
+}
+
 impl ReviewOf {
     /// Why it can't be reviewed as said, when it can't.
     pub fn check(&self) -> Result<(), String> {

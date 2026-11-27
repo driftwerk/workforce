@@ -3016,6 +3016,64 @@ pub fn push_kind(command: &str, here: &Here<'_>) -> Option<PushKind> {
         .max()
 }
 
+/// The operands of `git push`'s `args`: its remote and refspecs, its
+/// flags (and the values of those that take one) left out.
+fn push_operands(args: &[Word]) -> Vec<&str> {
+    const VALUED: &[&str] = &["-o", "--push-option", "--repo", "--receive-pack", "--exec"];
+    let mut operands = Vec::new();
+    let mut it = args.iter().map(|w| w.text.as_str());
+    while let Some(a) = it.next() {
+        match a {
+            "--" => operands.extend(it.by_ref()),
+            _ if VALUED.contains(&a) => {
+                it.next();
+            }
+            _ if a.starts_with('-') => {}
+            _ => operands.push(a),
+        }
+    }
+    operands
+}
+
+/// Whether `command` pushes straight to `origin`'s own default branch, as
+/// `origin/HEAD` names it ([`Here::default_branch`]), from the branch the
+/// folder is on: a branch that only reads as one (`release-…`) isn't it.
+/// Only a push read straight counts; one through a shell, a wrapper or
+/// git's own options is the boss's to judge.
+pub fn pushes_the_default(command: &str, here: &Here<'_>) -> bool {
+    let (Some(default), Some(branch)) = (here.default_branch, here.branch) else {
+        return false;
+    };
+    let Ok(cmds) = split(command) else {
+        return false;
+    };
+    let is_default = |to: &str| to.strip_prefix("refs/heads/").unwrap_or(to) == default;
+    let bare = |remote: Option<&str>| {
+        remote.is_none_or(|r| r == "origin")
+            && here
+                .push_to
+                .and_then(|to| to.split_once('/'))
+                .is_some_and(|(r, b)| r == "origin" && is_default(b))
+    };
+    cmds.iter().any(|cmd| match cmd.words.as_slice() {
+        [g, sub, rest @ ..] if g.text.rsplit('/').next() == Some("git") && sub.text == "push" => {
+            match push_operands(rest).as_slice() {
+                [] => bare(None),
+                [remote] => bare(Some(remote)),
+                [remote, specs @ ..] => {
+                    *remote == "origin"
+                        && specs.iter().any(|spec| {
+                            let spec = spec.trim_start_matches('+');
+                            let (src, to) = spec.split_once(':').unwrap_or((spec, spec));
+                            !src.is_empty() && is_default(if to == "HEAD" { branch } else { to })
+                        })
+                }
+            }
+        }
+        _ => false,
+    })
+}
+
 fn gh(walk: &Walk<'_, '_>, args: &[Word]) -> Judged {
     let words: Vec<&str> = args.iter().map(|a| a.text.as_str()).collect();
     const VIEW: Spec = Spec {
@@ -5013,7 +5071,8 @@ pub(crate) mod tests {
         }
     }
 
-    fn kind_with(command: &str, tweak: impl FnOnce(&mut Here<'_>)) -> Option<PushKind> {
+    /// What `judge` makes of acme-web on `feat/x`, as `tweak` changes it.
+    fn on_a_branch<T>(tweak: impl FnOnce(&mut Here<'_>), judge: impl FnOnce(&Here<'_>) -> T) -> T {
         let home = Path::new("/Users/sam");
         let own = Path::new("/Users/sam/dev/acme-web");
         let scratch = [PathBuf::from("/tmp")];
@@ -5021,11 +5080,64 @@ pub(crate) mod tests {
         let real = fake_real;
         let mut here = here(home, own, &scratch, &withheld, &real, "feat/x");
         tweak(&mut here);
-        push_kind(command, &here)
+        judge(&here)
+    }
+
+    fn kind_with(command: &str, tweak: impl FnOnce(&mut Here<'_>)) -> Option<PushKind> {
+        on_a_branch(tweak, |here| push_kind(command, here))
     }
 
     fn kind(command: &str) -> Option<PushKind> {
         kind_with(command, |_| {})
+    }
+
+    /// Only a push straight to `origin`'s own default branch is one past
+    /// review: not a branch that only reads as one, another remote, a
+    /// deletion, a repository that says no default, or a push Desk can't
+    /// read straight.
+    #[test]
+    fn only_a_push_straight_to_origins_own_default_branch_is_past_review() {
+        let past = |command: &str| on_a_branch(|_| {}, |h| pushes_the_default(command, h));
+        for command in [
+            "git push origin main",
+            "git push origin HEAD:main",
+            "git push origin feat/x:refs/heads/main",
+            "git push -u origin main",
+            "git push --push-option ci.skip origin +HEAD:main",
+            "npm test && git push origin main",
+        ] {
+            assert!(past(command), "{command}");
+        }
+        for command in [
+            "git push origin feat/x",
+            "git push origin HEAD",
+            "git push origin HEAD:release-2026",
+            "git push origin release-2026",
+            "git push upstream main",
+            "git push origin :main",
+            "sh -c 'git push origin main'",
+            "git -C . push origin main",
+            "git push",
+        ] {
+            assert!(!past(command), "{command}");
+        }
+        let on_main = |command: &str, push_to: Option<&'static str>| {
+            on_a_branch(
+                |h| {
+                    h.branch = Some("main");
+                    h.push_to = push_to;
+                },
+                |h| pushes_the_default(command, h),
+            )
+        };
+        assert!(on_main("git push", Some("origin/main")));
+        assert!(on_main("git push origin HEAD", None));
+        assert!(!on_main("git push", None), "where it goes, unsaid");
+        let unsaid = on_a_branch(
+            |h| h.default_branch = None,
+            |h| pushes_the_default("git push origin main", h),
+        );
+        assert!(!unsaid, "no origin/HEAD: a new repository's first push");
     }
 
     /// Every spelling of a push is classed by what it sends and where, and

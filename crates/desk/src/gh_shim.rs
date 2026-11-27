@@ -4,7 +4,10 @@
 //! read from `CODEX_HOME/rules`, so they would hold every session alike;
 //! Desk refuses a merge only while a boss acting fully has the session
 //! ([`crate::Desk::gh_asked`]). Any other `gh` command runs the real one as
-//! it was asked. A merge Desk can't be asked about doesn't run.
+//! it was asked. A merge Desk can't be asked about doesn't run. It guards
+//! against a session merging the plain way, not one set on it (an alias,
+//! the real `gh` by its path, the API by `curl`): GitHub's own protection
+//! of the branch is the boundary.
 
 use std::path::{Path, PathBuf};
 
@@ -25,23 +28,31 @@ fn quoted(text: &str) -> String {
     format!("'{}'", text.replace('\'', r"'\''"))
 }
 
-/// The shim: `real` run as asked, but for a command that may merge, which
-/// is sent to `url` first and runs only when Desk says nothing against it.
+/// The shim: `real` run as asked, but for a command spelled as a merge
+/// (`gh pr merge`, `gh api` of a `…/merge` endpoint or a GraphQL
+/// `mergePullRequest`), which is sent to `url` first, never through a
+/// proxy, and runs only when Desk says nothing against it.
 fn script(url: &str, real: &Path) -> String {
     let real = quoted(&real.to_string_lossy());
     let url = quoted(url);
     format!(
         r#"#!/bin/sh
 # Desk's gh for this session: a merge of a pull request is asked of Desk first.
-case "$*" in
-  *merge*|*Merge*) ;;
-  *) exec {real} "$@" ;;
-esac
+asks=
+[ "$1" = pr ] && [ "$2" = merge ] && asks=1
+if [ "$1" = api ]; then
+  for a in "$@"; do
+    case "$a" in
+      */merge|*/merge/|*/merge\?*|*mergePullRequest*) asks=1 ;;
+    esac
+  done
+fi
+[ -n "$asks" ] || exec {real} "$@"
 cmd=gh
 for a in "$@"; do
   cmd="$cmd '$(printf '%s' "$a" | sed "s/'/'\\\\''/g")'"
 done
-said=$(printf '%s' "$cmd" | curl -sS --fail --max-time 10 -H 'Content-Type: text/plain' --data-binary @- {url}) || {{
+said=$(printf '%s' "$cmd" | curl -sS --fail --noproxy '*' --max-time 10 -H 'Content-Type: text/plain' --data-binary @- {url}) || {{
   echo "gh: Desk couldn't be asked whether this may run, so it doesn't." >&2
   exit 1
 }}
@@ -161,7 +172,28 @@ mod tests {
             said(&run(&path, &["pr", "view", "7"]).await),
             (true, "ran pr view 7".into(), String::new())
         );
+        for args in [
+            &["pr", "list", "--search", "merged"][..],
+            &["pr", "view", "7", "--json", "mergeable,mergeStateStatus"],
+            &["api", "repos/acme/web/pulls/7/merges"],
+            &["merge"],
+        ] {
+            assert!(said(&run(&path, args).await).0, "{args:?}");
+        }
         assert!(asked.lock().is_empty(), "nothing asked of what can't merge");
+        for args in [
+            &["api", "-X", "PUT", "repos/acme/web/pulls/7/merge"][..],
+            &[
+                "api",
+                "graphql",
+                "-f",
+                "query=mutation { mergePullRequest(input: {}) { clientMutationId } }",
+            ],
+        ] {
+            assert!(said(&run(&path, args).await).0, "{args:?}");
+        }
+        assert_eq!(asked.lock().len(), 2, "each merge spelling asked");
+        asked.lock().clear();
         assert_eq!(
             said(&run(&path, &["pr", "merge", "7", "--body", "it's done"]).await),
             (

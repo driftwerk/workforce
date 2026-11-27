@@ -2489,7 +2489,7 @@ async fn gh_asked(
     Path((id, token)): Path<(Uuid, String)>,
     body: String,
 ) -> Response {
-    match desk.gh_asked(id, &token, &body) {
+    match desk.gh_asked(id, &token, &body).await {
         Some(why) => why.unwrap_or_default().into_response(),
         None => StatusCode::NOT_FOUND.into_response(),
     }

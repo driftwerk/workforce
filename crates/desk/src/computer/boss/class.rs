@@ -238,6 +238,23 @@ fn part(cmd: &Cmd, here: &Here<'_>, repo: &Repo<'_>, depth: usize, moved: bool) 
     if writes || !plain_env || words.iter().any(|w| w.glob) {
         return Some(Class::Other);
     }
+    // A wrapper's command is its own risk, never what a standing verdict
+    // answers.
+    let wrapped = unwrapped(words);
+    if wrapped > 0 {
+        let inner = Cmd {
+            join: cmd.join,
+            words: words[wrapped..].to_vec(),
+            redirects: Vec::new(),
+        };
+        return part(&inner, here, repo, depth, moved).map(|c| {
+            if c.cacheable() {
+                Class::Other
+            } else {
+                c
+            }
+        });
+    }
     let (program, args) = words.split_first()?;
     let args = texts(args);
     let Some(name) = program_name(&program.text) else {
@@ -246,9 +263,9 @@ fn part(cmd: &Cmd, here: &Here<'_>, repo: &Repo<'_>, depth: usize, moved: bool) 
     Some(match name {
         "true" | ":" | "echo" | "printf" | "pwd" => return None,
         "git" => git(args.as_slice(), here, repo, depth, moved),
-        "sh" | "bash" | "zsh" => match args.as_slice() {
-            [flag, script] if is_c_flag(flag) => classed(script, here, repo, depth + 1),
-            _ => Class::Other,
+        "sh" | "bash" | "zsh" => match shell_script(&args) {
+            Some(script) => classed(script, here, repo, depth + 1),
+            None => Class::Other,
         },
         "eval" if !args.is_empty() => classed(&args.join(" "), here, repo, depth + 1),
         "gh" => gh(args.as_slice(), here),
@@ -259,11 +276,78 @@ fn part(cmd: &Cmd, here: &Here<'_>, repo: &Repo<'_>, depth: usize, moved: bool) 
     })
 }
 
-/// `-c`, with the login and interactive flags a shell runs a script under
-/// (`-lc`, `-ic`, `-lic`).
-fn is_c_flag(flag: &str) -> bool {
-    flag.strip_prefix('-')
-        .is_some_and(|f| f.ends_with('c') && f.chars().all(|c| matches!(c, 'c' | 'l' | 'i')))
+/// The script a shell given `args` runs with `-c`, its flags apart or
+/// together and its options read past (`sh -c`, `bash -lc`, `bash -l -o
+/// pipefail -c script name args`): none when it runs none.
+fn shell_script<'a>(args: &[&'a str]) -> Option<&'a str> {
+    let mut c = false;
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        match *a {
+            "-o" | "+o" | "-O" | "+O" => {
+                it.next();
+            }
+            _ if a.starts_with("--") || a.starts_with('+') => {}
+            _ if a.starts_with('-') => c |= a.contains('c'),
+            script => return c.then_some(script),
+        }
+    }
+    None
+}
+
+/// How many of `words` are wrappers that run the command after them
+/// (`env`, `command`, `exec`, `nohup`, `nice`, `time`, `timeout`,
+/// `xargs`), with their options and what they take: none when the first
+/// isn't one, or runs nothing.
+fn unwrapped(words: &[Word]) -> usize {
+    let Some(name) = words.first().and_then(|w| program_name(&w.text)) else {
+        return 0;
+    };
+    let (valued, positional): (&[&str], usize) = match name {
+        "env" => (&["-u", "--unset", "-C", "--chdir"], 0),
+        "command" | "nohup" => (&[], 0),
+        "exec" => (&["-a"], 0),
+        "nice" => (&["-n", "--adjustment"], 0),
+        "time" => (&["-f", "--format", "-o", "--output"], 0),
+        "timeout" => (&["-s", "--signal", "-k", "--kill-after"], 1),
+        "xargs" => (
+            &[
+                "-n",
+                "--max-args",
+                "-L",
+                "--max-lines",
+                "-I",
+                "-P",
+                "--max-procs",
+                "-d",
+                "--delimiter",
+                "-E",
+                "-s",
+                "--max-chars",
+                "-a",
+                "--arg-file",
+            ],
+            0,
+        ),
+        _ => return 0,
+    };
+    let mut at = 1;
+    while let Some(t) = words.get(at).map(|w| w.text.as_str()) {
+        match t {
+            "--" => {
+                at += 1;
+                break;
+            }
+            _ if valued.contains(&t) => at += 2,
+            _ if t.starts_with('-') || (name == "env" && t.contains('=')) => at += 1,
+            _ => break,
+        }
+    }
+    let at = at + positional;
+    match at < words.len() {
+        true => at + unwrapped(&words[at..]),
+        false => 0,
+    }
 }
 
 /// Whether `flag` is `--amend`, as git reads a long option from any
@@ -772,7 +856,8 @@ fn gh_merges(args: &[&str]) -> bool {
 
 /// Whether any command in `command` merges a pull request with `gh` (`gh
 /// pr merge`, GitHub's REST merge or its GraphQL `mergePullRequest`),
-/// chained or run in a shell (`sh -c`, `eval`), whatever else it runs:
+/// chained, run in a shell (`sh -c`, `eval`) or by a wrapper (`env`,
+/// `xargs`, `timeout`, [`unwrapped`]), whatever else it runs:
 /// what Desk refuses a session before it runs while a boss acting fully
 /// has it. What can't be read as plain commands is never said to.
 pub fn merges_a_pull(command: &str) -> bool {
@@ -789,14 +874,15 @@ fn merges_in(cmd: &Cmd, depth: usize) -> bool {
         .iter()
         .take_while(|w| super::assigned(w).is_some())
         .count();
-    let words = texts(&cmd.words[env..]);
+    let words = &cmd.words[env..];
+    let words = texts(&words[unwrapped(words)..]);
     let Some((program, args)) = words.split_first() else {
         return false;
     };
     match program_name(program) {
         Some("gh") => gh_merges(args),
         Some("sh" | "bash" | "zsh") => {
-            matches!(args, [flag, script] if is_c_flag(flag) && merges_within(script, depth + 1))
+            shell_script(args).is_some_and(|script| merges_within(script, depth + 1))
         }
         Some("eval") => merges_within(&args.join(" "), depth + 1),
         _ => false,
@@ -1181,6 +1267,13 @@ mod tests {
             "gh api 'repos/{owner}/{repo}/pulls/7/merge' -f sha=abc",
             "gh api graphql -f query='mutation { mergePullRequest(input: {}) { clientMutationId } }'",
             "/usr/local/bin/gh pr merge 7",
+            "env GH_TOKEN=x gh pr merge 7",
+            "env -u GH_HOST command gh pr merge 7",
+            "echo 7 | xargs -n 1 gh pr merge --squash",
+            "timeout -s KILL 60 nohup nice -n 5 gh pr merge 7",
+            "time exec gh pr merge 7",
+            "bash -l -c 'gh pr merge 7' merging 7",
+            "sh -e -o pipefail -c 'gh pr merge 7'",
         ] {
             assert!(super::merges_a_pull(c), "{c}");
         }
@@ -1191,9 +1284,29 @@ mod tests {
             "git merge main",
             "gh pr checks 7 && git log",
             "gh api repos/acme/web/pulls/7/merge {",
+            "command -v gh",
+            "timeout 60",
+            "bash -l 'gh pr merge 7'",
         ] {
             assert!(!super::merges_a_pull(c), "{c}");
         }
+    }
+
+    /// A wrapped command is classed by what it runs when that is a risk
+    /// of its own, and never as a step a standing verdict answers; a
+    /// GraphQL call whose query is read from a file is the boss's to judge.
+    #[test]
+    fn a_wrapped_command_keeps_its_risk_and_never_a_standing_class() {
+        assert_eq!(class("env GH_TOKEN=x gh pr merge 7"), Class::GhPrMerge);
+        assert_eq!(
+            class("timeout 60 git push origin main"),
+            Class::DefaultBranchPush
+        );
+        assert_eq!(class("timeout 60 cargo test"), Class::Other);
+        assert_eq!(class("bash -l -c 'cargo test' tests"), Class::TestBuild);
+        let from_file = class("gh api graphql -F query=@merge.graphql -F id=PR_1");
+        assert_eq!(from_file, Class::Other);
+        assert!(!from_file.cacheable());
     }
 
     #[test]

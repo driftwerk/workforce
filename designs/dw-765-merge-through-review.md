@@ -88,7 +88,7 @@ Below Act fully nothing changes, because the boss can't merge there.
   - **No verdict line:** the review session is nudged once to end with `REVIEW: clean|changes <head>`. The next time its turn ends without one, the boss is told once, with `NO_VERDICT`. A closed one with no verdict is settled and the boss told once.
   - **Head moved on, or the folder moved:** nothing is recorded; the link is settled and the session closed. The next green head is reviewed afresh (decision 1).
   - **Session gone from Desk:** the link is settled.
-  - **Anything else (GitHub unreadable, say):** tried again with a doubling wait from one minute; after `RECORD_TRIES` (5) the boss is told once why.
+  - **Anything else (GitHub unreadable, say):** tried again with a doubling wait from one minute. After `RECORD_TRIES` (5) the boss is told once why, and the link is settled, so nothing holds the review open: the boss may still record it with `crew.record_review` while it is open, or close it.
 - **Closing.** A review session's whole job is its verdict.
   - Once a verdict is recorded, or once the PR's head has moved past the head it reviewed, the sweep closes it as the boss (`Action::Close`). It then removes its worktree with `git worktree remove`, without `--force`, and only while its HEAD is still the reviewed head, so a worktree holding work stays.
   - In `close_held`, a review session's open pull request doesn't keep it open: it carries no work, as `superseded` already says. Its unsettled link does: a boss can't close a review before its verdict is recorded or its head moved on. The person's own close always goes, and the sweep then records it from what it said.
@@ -114,7 +114,7 @@ After the merge, `Landed::Merged` and the close sweep carry on as they do now, a
 - **Classifier** (`class.rs`):
   - `gh pr merge` stays `GhPrMerge`;
   - `gh api` writing `repos/<o>/<r>/pulls/<n>/merge`, and `gh api graphql` with a `mergePullRequest` mutation, are now `GhPrMerge` too, rather than `Other`.
-  - A session's push to its default branch (`DefaultBranchPush`) at Act fully is denied the same way, in favour of review, never cached and never given to the model, unless the person is in the session.
+  - A session's push straight to a default branch that pull requests merge into is denied the same way, in favour of review, with no model call, unless the person is in the session. That holds only where there is a pull-request flow (`Facts::pr_flow`): `origin` is a GitHub repository and its default branch is already there (`origin/HEAD` names it and `origin/<default>` exists). The push must target that branch exactly (`boss::pushes_the_default`), read straight from the command. A branch that only reads as a default one (`release-…`, `production`), a repository not on GitHub, a new repository's first push, or a push through a shell or wrapper stays `DefaultBranchPush`. It goes to the boss's model as before, never cached, so the person's directives weigh in.
 - **Decision** (`decide.rs::decide_request`, reached only at Act fully):
   - while the person is in the session (`person_in_for`, as `close_held` reads it), its merge is theirs. It is left to them, never denied over their own word;
   - otherwise a `GhPrMerge` request is denied by the boss's decision without a model call. `Verdict::Deny` is recorded as the boss's decision, as every verdict is.
@@ -122,9 +122,19 @@ After the merge, `Landed::Merged` and the close sweep carry on as they do now, a
   - Instead: "Don't merge it yourself: tell your boss on your Desk line that it is ready to merge; your boss merges it once it has a clean review at its head."
 - Below Act fully, Act's judge already gives a merge to the person, and that is unchanged.
 - **Before it runs, whatever the mode.** Desk refuses a session's own merge before the tool runs, not only when it asks:
-  - **Claude and Devin:** in the `ToolStart` hook (`PreToolUse`), beside the breaker. A `Bash` call whose command `merges_a_pull` (a `gh pr merge`, a merging `gh api`, anywhere in the line, including inside `sh -c`/`bash -c` and `eval`) is denied with `plan::own_merge_refused()` when the session is in a boss's charge, the boss acts fully, and the person isn't in the session (`PERSON_NOW_MINUTES`). This holds in `bypassPermissions` too, since a hook's deny binds every mode.
-  - **Codex** has no pre-tool hook. Its exec-policy rules (`prefix_rule`) are read only from `CODEX_HOME/rules`, which every Codex session on the machine shares, so they can't be set for one session. Desk instead puts a `gh` shim first on the app-server's `PATH` (`gh_shim.rs`): any `gh` call that may merge is sent to Desk's hook route `/gh/{id}/{token}`, which answers with the same check. An allowed call execs the real `gh`. A refused one prints the reason and exits 1. If Desk can't be asked, the merge doesn't run.
-- **What stays the model's:** a merge Desk can't see as one: `curl` to the API, a script file, an unquoted `gh api repos/{owner}/{repo}/…/merge` (it doesn't split as a plain command, so it is `Other`), or `gh` run through `env` or `xargs`. These reach the boss's decision as `Other`, and `SYSTEM` tells it a session's own merge, however it is run, is DENY.
+  - **Claude and Devin:** in the `ToolStart` hook (`PreToolUse`), beside the breaker (`past_review_refused`). The call is refused when the session is in a boss's charge, the boss acts fully, and the person isn't in the session (`PERSON_NOW_MINUTES`), and it is a `Bash` call whose command does one of these:
+    - `merges_a_pull`: a `gh pr merge` or a merging `gh api`, anywhere in the line, inside `sh -c`/`bash -l -c … args` and `eval`, or behind a wrapper (`env`, `command`, `exec`, `nohup`, `nice`, `time`, `timeout`, `xargs`). It is denied with `plan::own_merge_refused()`.
+    - pushes past review, as above. It is denied with `plan::default_push_refused()`. The repository is read off the async workers.
+
+    This holds in `bypassPermissions` too, since a hook's deny binds every mode.
+  - **Codex** has no pre-tool hook. Its exec-policy rules (`prefix_rule`) are read only from `CODEX_HOME/rules`, which every Codex session on the machine shares, so they can't be set for one session. Desk instead puts a `gh` shim first on the app-server's `PATH` (`gh_shim.rs`).
+    - The shim asks Desk's hook route `/gh/{id}/{token}`, never through a proxy (`--noproxy '*'`), only for a call spelled as a merge: `gh pr merge`, `gh api` of a `…/merge` endpoint, or a GraphQL `mergePullRequest`. Everything else (`gh pr list --search merged`, `--json mergeable`) runs the real `gh` unasked.
+    - Desk answers with the same check. An allowed call execs the real `gh`. A refused one prints the reason and exits 1. If Desk can't be asked, the merge doesn't run.
+    - **Its PATH holds whatever the person's profiles say.** By default Codex runs each command in a login shell. Its profiles (`/etc/profile`'s `path_helper`, `~/.zprofile`'s `brew shellenv`) would put `/opt/homebrew/bin` ahead of the shim. So Desk starts every app-server with `-c allow_login_shell=false -c features.shell_snapshot=false` (`codex::COMMAND_SHELL`, CLI 0.166). Commands then run in a plain shell, with no snapshot of a login shell replayed before them. The `PATH` Desk gives is already the person's login one, so their tools are still found. A command that asks for a login shell is refused by Codex with its own reason.
+    - The real-Codex test proves it with profiles that put another `gh` first, and with snapshots switched on in Codex's own config.
+  - **A guard for honest mistakes, not a boundary.** The shim, and the hook's reading of a command, stop a session that merges the plain way. They don't stop a determined one: a `gh` alias (`gh alias set m 'pr merge'`), a query read from a file (`-F query=@file`), `--input` with a body, the real `gh` by its absolute path, `curl` with `gh auth token`, or a `~/.zshenv` or `BASH_ENV` that puts another `gh` first. The boundary is GitHub's own: branch protection and the merge going through `crew.github_merge`'s checks. The boss's wording keeps a session from being told to merge.
+- **What stays the model's:** a merge Desk can't see as one: `curl` to the API, a script file, an unquoted `gh api repos/{owner}/{repo}/…/merge` (it doesn't split as a plain command), or a GraphQL query read from a file (`-F query=@file`). These reach the boss's decision as `Other`, which no standing verdict answers. `SYSTEM` tells the model a session's own merge, however it is run, is DENY.
+- **Wrappers in the classifier:** a wrapped command (`env`, `timeout`, `xargs`, …) keeps its inner class when that is a risk of its own (`GhPrMerge`, `DefaultBranchPush`). Otherwise it is `Other`, so a standing verdict never allows what a wrapper runs.
 
 ### 5. Wording
 
@@ -171,9 +181,13 @@ After the merge, `Landed::Merged` and the close sweep carry on as they do now, a
   - a boss naming the ticket's own worktree gets Desk's review worktree instead;
   - a launch that fails leaves no link and no worktree it made;
   - in `bypassPermissions`, a session's own merge is denied before it runs under a boss acting fully, a read isn't, the shim's route answers the same, a wrong token is refused, and the person typing in the session lets it go.
-- **`gh` shim** (unit, real shell and server): a merge runs only as Desk says, anything else runs as asked.
+- **`gh` shim** (unit, real shell and server): a merge spelling runs only as Desk says; anything else runs as asked and unasked, `gh pr list --search merged` and `--json mergeable` among them.
+- **Real Codex** (`codex_real_tests`): with every profile putting another `gh` first, and Codex's shell snapshots on, `command -v gh` in a Codex session finds Desk's shim.
+- **Push past review** (`charge_tests`, bypass mode): refused for a GitHub `origin` that has `main`; not for a release branch, a repository not on GitHub, a first push, or while the person types. In the hub (`tests/standing.rs`): denied at once with no model call, while a release branch is the boss's call. A local `origin` is still the model's (the standing test).
+- **`pushes_the_default`** (unit): every spelling of a push straight to `origin`'s default branch, and none of the others.
+- **Giving up** (hub): a review whose pull request can't be read is settled after the last try, its boss told, and nothing holds it open.
 - **`worktree::remove`** (unit): kept when its HEAD has moved off the reviewed head.
-- **Classifier**: `gh api graphql` with `mergePullRequest` is `GhPrMerge`; `merges_a_pull` finds a merge wherever a line runs it.
+- **Classifier**: `gh api graphql` with `mergePullRequest` is `GhPrMerge`; `merges_a_pull` finds a merge wherever a line runs it, wrappers and split `-c` flags included; a wrapped command keeps only a risky class; `-F query=@file` is `Other`.
 - **`workspace_of`** (unit): a plain file under `.worktrees/` is uncommitted work, a registered worktree there isn't.
 - **Decision** (hub, `tests/ships.rs`): a session's `gh pr merge` at Act fully is denied at once with the `crew.github_merge` instead, and the boss's model is never asked.
 - **Lifecycle** (hub, `tests/ships.rs`, from the ticket), run at Act fully:

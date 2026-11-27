@@ -969,12 +969,15 @@ impl CrewHub {
                     self.settle_review(r.id).await;
                     self.close_review(service, o, &r, &l.pr, head).await;
                 }
+                // Given up on, its boss is told, and Desk is done with it:
+                // nothing holds it open any more.
                 Err(Unrecorded::No(why)) => {
                     if self.record_failed(r.id) {
                         tell(format!(
-                            "{key}: Desk couldn't record its review {} after {RECORD_TRIES} tries ({why}): record it with crew.record_review.",
+                            "{key}: Desk couldn't record its review {} after {RECORD_TRIES} tries ({why}): record it with crew.record_review while it is open, or close it.",
                             r.label()
                         ));
+                        self.settle_review(r.id).await;
                     }
                     tracing::info!(session = %r.id, %why, "a review wasn't recorded");
                 }

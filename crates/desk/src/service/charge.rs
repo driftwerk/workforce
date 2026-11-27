@@ -1023,20 +1023,56 @@ impl Desk {
 
 impl Desk {
     /// Why `id`'s call of `tool` with `input` is refused before it runs,
-    /// whatever its mode or its own allow rules say: a merge of a pull
-    /// request ([`crate::computer::boss::merges_a_pull`]) while a boss
-    /// acting fully has it and the person isn't in it. That boss merges
-    /// it, once a clean review is recorded at its head.
-    pub(crate) fn own_merge_refused(
+    /// whatever its mode or its own allow rules say, while a boss acting
+    /// fully has it and the person isn't in it: a merge of a pull request
+    /// ([`crate::computer::boss::merges_a_pull`]), which that boss makes
+    /// once a clean review is recorded at its head, or a push straight to
+    /// a default branch pull requests merge into
+    /// ([`Self::pushes_past_review`]).
+    pub(crate) async fn past_review_refused(
         &self,
         id: Uuid,
         tool: &str,
         input: &serde_json::Value,
     ) -> Option<String> {
+        use crate::computer::boss::{may_push, merges_a_pull};
         let command = input["command"].as_str().filter(|_| tool == "Bash")?;
-        if !crate::computer::boss::merges_a_pull(command) {
+        let merges = merges_a_pull(command);
+        if !merges && !may_push(command) {
             return None;
         }
+        let boss = self.acting_fully_alone(id)?;
+        if merges {
+            return Some(crate::plan::own_merge_refused());
+        }
+        let (desk, command) = (self.clone(), command.to_string());
+        let pending = crate::model::PendingApproval {
+            id: Uuid::new_v4(),
+            tool: "Bash".into(),
+            detail: command.clone(),
+            since: Utc::now(),
+            answerable: false,
+            choices: Vec::new(),
+            why: None,
+            options: None,
+            request: Some(crate::model::Request {
+                tool: "Bash".into(),
+                input: serde_json::json!({ "command": command }),
+                cwd: None,
+                read_only: false,
+            }),
+            call: None,
+            agent: None,
+            cli_session: None,
+        };
+        tokio::task::spawn_blocking(move || desk.pushes_past_review(id, &pending, &boss))
+            .await
+            .unwrap_or(false)
+            .then(crate::plan::default_push_refused)
+    }
+
+    /// The boss acting fully that has `id` while the person isn't in it.
+    fn acting_fully_alone(&self, id: Uuid) -> Option<String> {
         let boss = self.charge_of(id).filter(Charge::live)?.boss;
         let fully = match crate::grant::is_served(&boss) {
             true => self
@@ -1050,7 +1086,29 @@ impl Desk {
         let now = Utc::now() - chrono::Duration::minutes(charge::PERSON_NOW_MINUTES);
         let person_in = self.last_input_of(id).is_some_and(|at| at > now)
             || self.wheel_of(id).is_some_and(Wheel::person);
-        (fully && !person_in).then(crate::plan::own_merge_refused)
+        (fully && !person_in).then_some(boss)
+    }
+
+    /// Whether `id`'s request `pending` pushes straight to its default
+    /// branch where work reaches it by pull request
+    /// ([`charge::pushes_past_review`]), its repository read now.
+    fn pushes_past_review(
+        &self,
+        id: Uuid,
+        pending: &crate::model::PendingApproval,
+        boss: &str,
+    ) -> bool {
+        self.judged_facts(id, pending, boss)
+            .is_ok_and(|(facts, bounds)| {
+                charge::pushes_past_review(&facts, &bounds, &crate::computer::boss::resolve_real)
+            })
+    }
+
+    /// Whether `id`'s request `approval` pushes past review
+    /// ([`Self::pushes_past_review`]), for `boss`.
+    pub fn request_pushes_past_review(&self, id: Uuid, approval: Uuid, boss: &str) -> bool {
+        self.pending_of(id, approval)
+            .is_some_and(|p| self.pushes_past_review(id, &p, boss))
     }
 
     /// Whether a call of `id` Desk doesn't judge safe is asked, for `boss`
@@ -1293,6 +1351,23 @@ impl Desk {
                 facts.workflows = grant.workflows;
                 facts.any_workflow = grant.anywhere;
                 if let Some(repo) = repo_of_own(&facts.own) {
+                    facts.pr_flow = repo
+                        .origin
+                        .as_deref()
+                        .and_then(crate::repos::repo_of)
+                        .is_some_and(|r| r.host == "github.com")
+                        && facts.default_branch.as_deref().is_some_and(|d| {
+                            git_line(
+                                &cwd,
+                                &[
+                                    "rev-parse",
+                                    "-q",
+                                    "--verify",
+                                    &format!("refs/remotes/origin/{d}"),
+                                ],
+                            )
+                            .is_some()
+                        });
                     facts.follow_tags = repo.follow_tags;
                     facts.hooks = repo.hooks;
                     facts.ships =
