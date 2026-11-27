@@ -2142,6 +2142,82 @@ async fn a_plan_limit_ask_answered_twice_at_once_is_settled_once() {
     .await;
 }
 
+/// A plan the limit paused under a boss before its own is handed over once
+/// the limit lets its boss go: it waits for Continue, never said to go on.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_plan_the_limit_paused_under_another_boss_waits_for_continue_once_it_lifts() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (overseer, state, d, _llm) = hub_with(dir.path(), pool, ACTS).await;
+        let id = proposed(&d, dir.path(), 1).await.summary.plan.id;
+        d.approve_plan(id, 1, &By::you()).await.unwrap();
+        let words =
+            "by plan limit until 09:00: your weekly Claude plan is at 88%, over your 80% limit";
+        let until = chrono::Utc::now() + chrono::Duration::hours(2);
+        let (paused, _) = d.pause_plan_limit(id, words, until).await.unwrap();
+        let mut p = paused.summary.plan;
+        p.paused_for = Some("ada".into());
+        d.store().put_plan(&p).await.unwrap();
+        let login = on_plan(&overseer, &state, &d, 40.0).await;
+        *overseer.active_model.write() = None;
+        let crew = CrewHub::start(
+            Arc::clone(&state),
+            d.clone(),
+            FAST,
+            CancellationToken::new(),
+        );
+        crew.note_wake(
+            &overseer,
+            Some(login),
+            &crate::cost_governor::Admission::Proceed,
+            chrono::Utc::now(),
+        );
+        eventually("the plan handed over", async || {
+            let p = d.plan(id).await.unwrap().summary.plan;
+            (p.paused == Some(workforce_desk::plan::Paused::NoBoss)).then_some(())
+        })
+        .await;
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert!(started(&d).is_empty());
+        assert!(super::items::dm_posts(&overseer, GOES_ON).is_empty());
+    })
+    .await;
+}
+
+/// A plan-limit ask settled by an answer that didn't take, and that couldn't
+/// be opened again, is asked anew while its pause lasts.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_plan_limit_ask_whose_answer_didnt_take_is_asked_anew() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (overseer, crew, d, _login, id) = limit_held(dir.path(), pool, 88.0).await;
+        let (first, _) = limit_ask(&d, id, None).await;
+        told_times(&overseer, TOLD, 1).await;
+        let closed = d
+            .store()
+            .item_close(
+                first,
+                workforce_desk::open_item::ClosedBy::Person,
+                "You answered: Raise to 95%",
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        crew.limit_unsettled(&closed);
+        let (again, options) = limit_ask(&d, id, Some(first)).await;
+        assert_eq!(options, ["Raise to 95%", "Keep"]);
+        told_times(&overseer, TOLD, 2).await;
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert_eq!(
+            super::items::dm_posts(&overseer, TOLD).len(),
+            2,
+            "asked anew once"
+        );
+        assert_eq!(limit_ask(&d, id, None).await.0, again);
+    })
+    .await;
+}
+
 /// After a restart nothing is noted of the boss's wakes: a plan the limit
 /// paused stays paused until its window lapses, then goes on, said, whatever
 /// was asked of it; one the limit paused under a boss before its own waits

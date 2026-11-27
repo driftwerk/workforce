@@ -46,7 +46,15 @@ fn recent() -> Duration {
 #[derive(Default)]
 pub(super) struct Noted {
     wakes: HashMap<String, Vec<Wake>>,
-    asked: HashMap<Uuid, String>,
+    asked: HashMap<Uuid, Asked>,
+}
+
+/// What the person was asked of a plan the limit pauses, by its ask's key.
+enum Asked {
+    Said(String),
+    /// Settled by an answer that didn't take and couldn't be opened again:
+    /// asked anew.
+    Unsettled(String),
 }
 
 /// One of a boss's own wakes as the plan guard judged it: the plan login
@@ -346,19 +354,23 @@ impl CrewHub {
         let Some(key) = p.limit_key() else {
             return;
         };
-        if self.limits.lock().asked.get(&p.id) == Some(&key) {
-            return;
-        }
+        let again = match self.limits.lock().asked.get(&p.id) {
+            Some(Asked::Said(k)) if *k == key => return,
+            Some(Asked::Unsettled(k)) => *k == key,
+            _ => false,
+        };
         let store = self.desk.store();
-        match store.item_ever_keyed(&p.boss, &key).await {
-            Ok(false) => {}
-            Ok(true) => {
-                self.limits.lock().asked.insert(p.id, key);
-                return;
-            }
-            Err(e) => {
-                tracing::info!(error = %e, "whether a plan's limit pause was said couldn't be read");
-                return;
+        if !again {
+            match store.item_ever_keyed(&p.boss, &key).await {
+                Ok(false) => {}
+                Ok(true) => {
+                    self.limits.lock().asked.insert(p.id, Asked::Said(key));
+                    return;
+                }
+                Err(e) => {
+                    tracing::info!(error = %e, "whether a plan's limit pause was said couldn't be read");
+                    return;
+                }
             }
         }
         if let Err(e) = store
@@ -384,7 +396,7 @@ impl CrewHub {
         new.holding_up = Some(format!("{} and its tickets", named(&p.goal)));
         match store.item_open(&new).await {
             Ok(opened) => {
-                self.limits.lock().asked.insert(p.id, key);
+                self.limits.lock().asked.insert(p.id, Asked::Said(key));
                 if let Opened::New(i) = opened {
                     self.post_item(&p.boss, &i, super::items::needs_you(&i), Vec::new())
                         .await;
@@ -393,6 +405,17 @@ impl CrewHub {
             Err(e) => {
                 tracing::warn!(error = %format!("{e:#}"), "asking the person about a plan's limit pause failed")
             }
+        }
+    }
+
+    /// `closed`, a plan-limit ask settled by an answer that didn't take and
+    /// couldn't be opened again, is asked anew while its pause lasts.
+    pub(super) fn limit_unsettled(&self, closed: &OpenItem) {
+        if let Some(plan) = plan::limit_plan(&closed.dedupe_key) {
+            self.limits
+                .lock()
+                .asked
+                .insert(plan, Asked::Unsettled(closed.dedupe_key.clone()));
         }
     }
 
@@ -410,7 +433,8 @@ impl CrewHub {
     /// Resumes `p`, paused by the plan limit, once that no longer holds its
     /// boss (or, with nothing noted lately, once its window lapsed), and
     /// tells its boss's person, once a pause, while the boss still runs it;
-    /// while it holds, the pause is kept current.
+    /// while it holds, the pause is kept current. One paused under a boss
+    /// before its own is handed over instead.
     pub(super) async fn lift_limit(&self, p: &Plan) {
         let now = Utc::now();
         let standing = match self.limit_of(&p.boss, now) {
@@ -419,7 +443,7 @@ impl CrewHub {
                 return;
             }
             Limit::Unknown if p.paused_until.is_some_and(|u| u > now) => return,
-            Limit::Unknown if p.paused_for_another() => {
+            _ if p.paused_for_another() => {
                 self.limit_handed_over(p).await;
                 return;
             }
@@ -460,9 +484,9 @@ impl CrewHub {
         self.tell_dm(&p.boss, &text).await;
     }
 
-    /// `p`, paused by its former boss's plan limit, once that window lapsed:
-    /// it waits for the person to say Continue, as a plan passed on does,
-    /// its limit asks closed.
+    /// `p`, paused by its former boss's plan limit, once that no longer
+    /// holds it: it waits for the person to say Continue, as a plan passed
+    /// on does, its limit asks closed.
     async fn limit_handed_over(&self, p: &Plan) {
         let by = By::desk("The plan limit that paused it held its former boss.");
         if let Err(e) = self.desk.pause_plan(p.id, Paused::NoBoss, &by).await {
@@ -513,6 +537,7 @@ impl CrewHub {
                 tracing::warn!(error = %e, "the person's plan limit wasn't kept");
                 if let Err(e) = self.desk.store().item_reopen(closed.id).await {
                     tracing::warn!(error = %format!("{e:#}"), "a plan-limit ask whose answer wasn't kept wasn't opened again");
+                    self.limit_unsettled(closed);
                 }
                 Err("Desk couldn't change your limit just now. Try again.".into())
             }
