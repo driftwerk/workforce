@@ -48,14 +48,13 @@ export GOOGLE_API_KEY=...
 
 ### Try a Simple Chat
 
-Test your setup with a one-on-one chat:
+Chat connects to a running hub, so it needs a gateway URL and an auth token (as `--gateway` and `--token`, or the `WORKFORCE_GATEWAY_URL` and `WORKFORCE_GATEWAY_TOKEN` environment variables):
 
 ```bash
-# With standard Anthropic API (default)
-./target/release/workforce chat
+./target/release/workforce chat --agent default --gateway <gateway-url> --token <token>
 ```
 
-This starts an interactive session where you can ask questions and get help.
+This starts an interactive session with the chosen agent (`default` if you omit `--agent`).
 
 ## Initialise Your Project
 
