@@ -147,10 +147,10 @@ mod worktree_hold;
 use transition::Transition;
 
 pub use grants::{GrantView, GrantWritten, GrantsView, Native, Paused};
-pub(crate) use groups::put_layout_in;
 pub use groups::{
     local_agent_item, session_item, Group, Import, Imported, Layout, Ungrouped, UNGROUPED,
 };
+pub(crate) use groups::{put_layout_in, Orphaned};
 pub use sight::{
     ProcessRow, ProcessTree, Processes, RecordInfo, Sample, SightOptions, Transcript, TranscriptAsk,
 };
@@ -1743,12 +1743,12 @@ fn cli_env(base: &BTreeMap<String, String>) -> BTreeMap<String, String> {
 /// The layout without sessions the registry no longer has (forgotten
 /// before the hub took them out of it, or by an older hub). A failure to
 /// save it is only logged: the next start tries again. With it, the boards
-/// it ungrouped (their group was gone).
+/// and plans it ungrouped (their group was gone).
 async fn prune_layout(
     store: &DeskStore,
     layout: Layout,
     records: &HashMap<Uuid, SessionRecord>,
-) -> (Layout, Vec<Uuid>) {
+) -> (Layout, Orphaned) {
     // A closed session is still the registry's: it keeps its group, which
     // what is harvested of it and its ledger rows are stamped with.
     let closed: HashSet<Uuid> = match store.every_session().await {
@@ -1758,21 +1758,21 @@ async fn prune_layout(
                 error = format!("{e:#}"),
                 "couldn't read the closed sessions; the sidebar's layout is left as it is"
             );
-            return (layout, vec![]);
+            return (layout, Orphaned::default());
         }
     };
     let pruned = layout.without_sessions(|id| !records.contains_key(&id) && !closed.contains(&id));
     if pruned == layout {
-        return (layout, vec![]);
+        return (layout, Orphaned::default());
     }
     match store.put_layout(&pruned).await {
-        Ok(ungrouped) => (pruned, ungrouped),
+        Ok(orphaned) => (pruned, orphaned),
         Err(e) => {
             tracing::warn!(
                 error = format!("{e:#}"),
                 "couldn't take forgotten sessions out of the sidebar's layout"
             );
-            (layout, vec![])
+            (layout, Orphaned::default())
         }
     }
 }
@@ -2001,7 +2001,7 @@ impl Desk {
             }
             records.insert(r.id, r);
         }
-        let (layout, ungrouped_boards) = prune_layout(&store, layout, &records).await;
+        let (layout, orphaned) = prune_layout(&store, layout, &records).await;
         // Taken up before anything the sessions do is seen, so what they do
         // next carries on the turns they were in.
         let (turns, open_waits) = match floor.turns.as_deref() {
@@ -2154,7 +2154,7 @@ impl Desk {
         desk.charge_load().await;
         tokio::spawn(desk.clone().charge_loop());
         desk.plans_load().await;
-        desk.boards_ungrouped(&ungrouped_boards).await;
+        desk.orphans_heard(&orphaned).await;
         tokio::spawn(desk.clone().watch_background());
         desk.line_load().await;
         tokio::spawn(desk.clone().line_loop());

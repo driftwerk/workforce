@@ -478,6 +478,16 @@ fn pointed_at(name: &str, mine: Option<&str>, other: &Client, dir: &Path) -> Vec
                 }),
                 true,
             ),
+            // Another's group, by its id.
+            (
+                json!({
+                    "goal": "Ship it",
+                    "result": super::plans::judged(),
+                    "group": other.group,
+                    "tickets": [{ "title": "Look around", "folder": dir.to_string_lossy() }],
+                }),
+                true,
+            ),
         ],
         // A new board in another's group, by its id or its name.
         super::super::plan::BOARD_CREATE => vec![
@@ -672,6 +682,7 @@ async fn kept_out(
                         boss.agent_id
                     );
                 } else if input.pointer("/new_board/group").is_some()
+                    || input.get("group").is_some()
                     || *name == super::super::plan::BOARD_CREATE
                 {
                     assert!(
@@ -1872,6 +1883,140 @@ async fn a_plans_limit_is_its_bosss_only_in_the_group_it_oversees() {
             .plan
             .id;
         assert_eq!(limit(elsewhere).await, None);
+    })
+    .await;
+}
+
+/// The main boss's plan is in the group its work names and says so; the
+/// boss moves it among its own groups, never into a bossed one.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_main_boss_puts_a_plan_in_its_works_group_and_moves_it_only_among_its_own() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let c = clients(dir.path(), pool).await;
+        let web = dir.path().join("infra").join("web");
+        std::fs::create_dir_all(&web).unwrap();
+        let input = |extra: Value| {
+            let mut v = json!({
+                "goal": "Speed up the Infra web build",
+                "result": super::plans::judged(),
+                "tickets": [{ "title": "Cache the build", "folder": web.to_string_lossy() }],
+            });
+            if let (Some(o), Value::Object(e)) = (v.as_object_mut(), extra) {
+                o.extend(e);
+            }
+            v
+        };
+        let plan = c.desk.tools.get("crew.plan").unwrap();
+        let r = plan.execute(input(json!({}))).await.unwrap();
+        assert!(r.success, "{r:?}");
+        assert_eq!(r.output["proposed"]["group"], "Infra");
+        let note = r.output["note"].as_str().unwrap();
+        assert!(
+            note.contains("Its sessions start in Infra: its folder names it (infra)."),
+            "{note}"
+        );
+        let id: uuid::Uuid = r.output["proposed"]["plan_id"]
+            .as_str()
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert_eq!(
+            c.d.plan(id).await.unwrap().summary.plan.group.as_deref(),
+            Some("infra")
+        );
+
+        let r = plan
+            .execute(input(json!({ "group": "ungrouped" })))
+            .await
+            .unwrap();
+        assert_eq!(r.output["proposed"]["group"], "Ungrouped", "{r:?}");
+        let r = plan
+            .execute(input(json!({ "group": "Acme" })))
+            .await
+            .unwrap();
+        assert_eq!(
+            r.error.as_deref(),
+            Some("That isn't one of yours. Name one of your groups: Ungrouped and Infra.")
+        );
+
+        let update = c.desk.tools.get("crew.plan_update").unwrap();
+        let why = "The person said.";
+        let r = update
+            .execute(json!({ "plan_id": id.to_string(), "group": "Ungrouped", "board": "INF", "why": why }))
+            .await
+            .unwrap();
+        assert_eq!(r.error.as_deref(), Some("Say group or board, not both."));
+        let r = update
+            .execute(json!({ "plan_id": id.to_string(), "group": "Ungrouped", "why": why }))
+            .await
+            .unwrap();
+        assert!(r.success, "{r:?}");
+        assert_eq!(
+            (&r.output["change"], &r.output["plan"]["group"]),
+            (&json!("group"), &json!("Ungrouped"))
+        );
+        assert_eq!(c.d.plan(id).await.unwrap().summary.plan.group, None);
+    })
+    .await;
+}
+
+/// A running plan of the main boss's in a group that gets a boss of its
+/// own passes to that boss, paused until the person says Continue.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_running_plan_whose_group_gets_a_boss_passes_to_that_boss() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let c = clients(dir.path(), pool).await;
+        let p =
+            c.d.propose_plan(
+                workforce_desk::NewPlan {
+                    draft: workforce_desk::plan::Draft {
+                        goal: "Keep Infra green".into(),
+                        tickets: vec![workforce_desk::plan::DraftTicket {
+                            title: "Fix the flaky deploy".into(),
+                            folder: dir.path().to_string_lossy().into_owned(),
+                            ..Default::default()
+                        }],
+                    },
+                    board: None,
+                    parallel: None,
+                    engine: Engine::Claude,
+                    group: Some("infra".into()),
+                    budget: None,
+                    result: None,
+                    goal_ticket: None,
+                },
+                &Party::manager("desk", "Desk"),
+                &By::manager("desk", "Desk", "For the test."),
+            )
+            .await
+            .unwrap();
+        let id = p.summary.plan.id;
+        c.d.approve_plan(id, 1, &By::you()).await.unwrap();
+        crate::agent_config_write::save(
+            &c.mia,
+            "mia",
+            None,
+            &format!("[oversight]\nenabled = true\ngroup = \"infra\"\n{ACTS}"),
+            workforce_orchestrator::workflow_store::EditContext::new("web", None),
+            |_| true,
+        )
+        .await
+        .unwrap();
+        let now = eventually("the plan to pass to Mia", async || {
+            let p = c.d.plan(id).await.ok()?.summary.plan;
+            (p.boss == "mia").then_some(p)
+        })
+        .await;
+        assert_eq!(
+            (now.state, now.paused, now.group.as_deref()),
+            (
+                workforce_desk::plan::PlanState::Paused,
+                Some(workforce_desk::plan::Paused::NoBoss),
+                Some("infra")
+            )
+        );
     })
     .await;
 }

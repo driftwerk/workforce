@@ -977,7 +977,7 @@ impl Desk {
         }
         self.0.state.lock().layout = layout.clone();
         self.scopes_follow(&layout);
-        self.boards_ungrouped(&written.ungrouped_boards).await;
+        self.orphans_heard(&written.orphaned).await;
         drop(one);
         self.announce(DeskEvent::Layout {
             layout: layout.clone(),

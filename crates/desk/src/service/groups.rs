@@ -406,16 +406,16 @@ impl DeskStore {
         Ok(layout)
     }
 
-    /// Replaces the layout, in one transaction. Boards in a group it no
-    /// longer has become ungrouped: which ones.
-    pub async fn put_layout(&self, layout: &Layout) -> Result<Vec<Uuid>> {
+    /// Replaces the layout, in one transaction. Boards and plans in a group
+    /// it no longer has become ungrouped: which ones.
+    pub async fn put_layout(&self, layout: &Layout) -> Result<Orphaned> {
         self.put_layout_with(layout, true).await
     }
 
     /// [`Self::put_layout`]; with `moves`, each session whose group it
     /// changes is kept as moved then. Desk's first push of its layout moves
     /// nothing: it says where sessions already were.
-    pub async fn put_layout_with(&self, layout: &Layout, moves: bool) -> Result<Vec<Uuid>> {
+    pub async fn put_layout_with(&self, layout: &Layout, moves: bool) -> Result<Orphaned> {
         let mut client = self.pool().get().await?;
         let tx = client.transaction().await?;
         let ungrouped = put_layout_in(&tx, layout, moves).await?;
@@ -463,13 +463,21 @@ impl DeskStore {
     }
 }
 
-/// [`DeskStore::put_layout_with`] within `tx`: the boards in a group it
-/// no longer has, which become ungrouped.
+/// What a layout's write left in no group: the boards and plans of the
+/// groups it no longer has.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Orphaned {
+    pub boards: Vec<Uuid>,
+    pub plans: Vec<Uuid>,
+}
+
+/// [`DeskStore::put_layout_with`] within `tx`: the boards and plans in a
+/// group it no longer has, which become ungrouped.
 pub(crate) async fn put_layout_in(
     tx: &tokio_postgres::Transaction<'_>,
     layout: &Layout,
     moves: bool,
-) -> Result<Vec<Uuid>> {
+) -> Result<Orphaned> {
     // Where each session was, to say which moved.
     let before: Vec<(String, Option<String>)> = tx
         .query(
@@ -528,17 +536,25 @@ pub(crate) async fn put_layout_in(
         .await?;
     }
     let kept: Vec<&str> = layout.groups.iter().map(|g| g.id.as_str()).collect();
-    let ungrouped = tx
-        .query(
-            "UPDATE boards SET group_id = NULL, updated_at = now() \
-             WHERE group_id IS NOT NULL AND NOT group_id = ANY($1) RETURNING id",
-            &[&kept],
-        )
-        .await?
-        .iter()
-        .map(|r| r.try_get(0))
-        .collect::<Result<Vec<Uuid>, _>>()?;
-    Ok(ungrouped)
+    let ungroup = async |table: &str| -> Result<Vec<Uuid>> {
+        Ok(tx
+            .query(
+                format!(
+                    "UPDATE {table} SET group_id = NULL, updated_at = now() \
+                     WHERE group_id IS NOT NULL AND NOT group_id = ANY($1) RETURNING id"
+                )
+                .as_str(),
+                &[&kept],
+            )
+            .await?
+            .iter()
+            .map(|r| r.try_get(0))
+            .collect::<Result<Vec<Uuid>, _>>()?)
+    };
+    Ok(Orphaned {
+        boards: ungroup("boards").await?,
+        plans: ungroup("plans").await?,
+    })
 }
 
 /// The sessions whose group `after` changes from `before` (each item and
@@ -702,10 +718,10 @@ impl Desk {
                 "a group was called {used:?} before; each group needs an id of its own"
             )));
         }
-        let ungrouped = self.0.store.put_layout_with(&after, fresh_ids).await?;
+        let orphaned = self.0.store.put_layout_with(&after, fresh_ids).await?;
         self.0.state.lock().layout = after.clone();
         self.scopes_follow(&after);
-        self.boards_ungrouped(&ungrouped).await;
+        self.orphans_heard(&orphaned).await;
         self.announce(DeskEvent::Layout {
             layout: after.clone(),
         });

@@ -100,6 +100,7 @@ pub mod picture;
 pub mod picture_store;
 pub mod plan;
 mod plan_api;
+pub mod plan_group;
 pub mod plan_store;
 pub mod pr_review_store;
 pub mod preference;
