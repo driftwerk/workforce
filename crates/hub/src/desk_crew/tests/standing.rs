@@ -3,7 +3,7 @@
 //! the boss's own decision while its verdicts are asked for beside it, one
 //! call a session; the next of a class it allows is allowed with no call
 //! of its own, and one of a class never cached (a push to the default
-//! branch) always reaches the boss's own decision.
+//! branch) is the boss's own refusal every time, in favour of review.
 
 use super::act_fully::git;
 use super::decides_at_once::{asked, behavior, calls_about, decides, THEIRS};
@@ -48,12 +48,6 @@ async fn a_standing_verdict_allows_its_class_at_once_and_never_a_push_to_main() 
         )
         .await;
         decides(&llm, "git commit -m first", "ALLOW: its own work").await;
-        decides(
-            &llm,
-            "git push origin main",
-            "DENY: not to main\nINSTEAD: push your branch",
-        )
-        .await;
         eventually("Desk to know it is unbound", async || {
             d.boss_unbound("desk").then_some(())
         })
@@ -83,11 +77,21 @@ async fn a_standing_verdict_allows_its_class_at_once_and_never_a_push_to_main() 
         assert!(calls_about(&llm, "git commit -m second").await.is_empty());
         assert_eq!(calls_about(&llm, STANDING).await.len(), 1, "asked once");
 
-        // Never cached: the boss's own decision every time.
-        assert_eq!(decided("git push origin main").await, "deny");
-        let call = calls_about(&llm, "git push origin main").await;
-        assert_eq!(call.len(), 1);
-        assert!(call[0].contains("default_branch_push"), "its class is said");
+        // Never cached, never the model's: the boss's own refusal every
+        // time, in favour of review.
+        for _ in 0..2 {
+            let answer =
+                tokio::time::timeout(Duration::from_secs(20), asked(&url, "git push origin main"))
+                    .await
+                    .expect("decided within seconds")
+                    .unwrap();
+            assert_eq!(behavior(&answer), "deny");
+            let why = answer["hookSpecificOutput"]["decision"]["message"]
+                .as_str()
+                .unwrap_or_default();
+            assert!(why.contains(super::super::decide::DEFAULT_PUSH), "{answer}");
+        }
+        assert!(calls_about(&llm, "git push origin main").await.is_empty());
 
         // Desk's own refusal (an agent's own settings, as the hub serves
         // them) wins over a standing allow of its class: never allowed.
