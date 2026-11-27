@@ -13,7 +13,7 @@
 //!   message is their words, never read as the person's own typing: no
 //!   consent to anything else, no reply to what the boss proposed, no order
 //!   to another agent. They agree one thing alone: a new plan's goal that
-//!   they say ([`CrewHub::handed_agreed`]).
+//!   they say, and only once ([`CrewHub::agreed_or_handed`]).
 //! - **Said back in Desk's own words.** Whether the boss keeps it as a goal,
 //!   and each stall of that goal after (`CrewHub::flag_handed`); never the
 //!   boss's answer or an error.
@@ -44,6 +44,8 @@ const NO_BOSS: &str = "You have no boss in Desk yet: open an agent's settings in
 const TOO_LONG: &str =
     "Your request is too long for your Desk to take: ask me again in a shorter message.";
 const SESSION_GONE: &str = "Desk doesn't have the session you named any more, so nothing was handed on. Ask me again about the work as it is now.";
+const AGREED_ALREADY: &str = "The person's request these words come from already agreed a plan of yours, so it agrees no other. Ask them in your DM whether they want this one too.";
+const UNCLAIMED: &str = "Desk couldn't keep which plan the person's request agreed, so nothing was saved. Try again in a moment.";
 const SESSION_UNREADABLE: &str = "Your Desk couldn't tell which session your request is about, so nothing was handed on. Ask me again, naming the session as Desk shows it.";
 
 /// The requests whose boss's turn runs in this process now, by agent and
@@ -132,6 +134,13 @@ fn place_of(session: &str) -> Option<Place> {
             super::relay::machine_session(session).map(|(m, id)| Place::Machine(m.into(), id))
         }
     }
+}
+
+/// The person's agreement to a new plan's goal: when, and the requests of
+/// theirs it came in, when it didn't come in the DM itself.
+pub(super) struct Agreed {
+    pub at: DateTime<Utc>,
+    pub handed: Vec<(String, Uuid)>,
 }
 
 impl CrewHub {
@@ -309,15 +318,18 @@ impl CrewHub {
 
     /// When the person agreed `goal` in `quote` for boss `service`: in their
     /// DM ([`Self::agreed_at`]), or in a request of theirs delivered to it
-    /// ([`Self::handed_agreed`]).
+    /// ([`Self::handed_agreed`]), with the requests that may agree it.
     pub(super) async fn agreed_or_handed(
         &self,
         service: &AgentService,
         quote: &str,
         goal: &str,
-    ) -> Result<DateTime<Utc>, String> {
+    ) -> Result<Agreed, String> {
         match self.agreed_at(service, quote, goal) {
-            Ok(at) => Ok(at),
+            Ok(at) => Ok(Agreed {
+                at,
+                handed: Vec::new(),
+            }),
             Err(why) => self
                 .handed_agreed(service.agent_id.as_str(), quote, goal)
                 .await
@@ -327,14 +339,9 @@ impl CrewHub {
 
     /// When a request handed to boss `boss` within the last day agreed a
     /// new plan's goal `goal` in `quote`: its words hold `quote`, say `goal`
-    /// and agree it, and no plan carries it yet. Then, when it reached the
-    /// boss.
-    pub(super) async fn handed_agreed(
-        &self,
-        boss: &str,
-        quote: &str,
-        goal: &str,
-    ) -> Option<DateTime<Utc>> {
+    /// and agree it. Each that does may agree one plan alone, claimed as it
+    /// is saved ([`Self::claim_handed`]).
+    async fn handed_agreed(&self, boss: &str, quote: &str, goal: &str) -> Option<Agreed> {
         let since = Utc::now() - super::goal::AGREED_WITHIN;
         let running: Vec<Handed> = DELIVERING
             .lock()
@@ -348,15 +355,54 @@ impl CrewHub {
             .handed_of_boss(boss)
             .await
             .unwrap_or_default();
-        for h in running.into_iter().chain(kept) {
-            let fits = h.delivered_at.is_some_and(|at| at > since)
-                && workforce_desk::goal::says_goal(&h.words, quote)
-                && agrees(&h, goal);
-            if fits && self.covering_goal(&h).await.is_none() {
-                return h.delivered_at;
+        let mut fit: Vec<(DateTime<Utc>, (String, Uuid))> = running
+            .into_iter()
+            .chain(kept)
+            .filter(|h| workforce_desk::goal::says_goal(&h.words, quote) && agrees(h, goal))
+            .filter_map(|h| {
+                let at = h.delivered_at.filter(|at| *at > since)?;
+                Some((at, (h.agent, h.id)))
+            })
+            .collect();
+        fit.sort();
+        fit.dedup_by(|a, b| a.1 == b.1);
+        let at = fit.first()?.0;
+        Some(Agreed {
+            at,
+            handed: fit.into_iter().map(|(_, k)| k).collect(),
+        })
+    }
+
+    /// The first of the requests `a` agreed on that no plan claimed yet,
+    /// claimed now for the plan about to be saved: none when the person
+    /// agreed it in the DM itself.
+    pub(super) async fn claim_handed(&self, a: &Agreed) -> Result<Option<(String, Uuid)>, String> {
+        if a.handed.is_empty() {
+            return Ok(None);
+        }
+        let store = self.desk.store();
+        for (agent, id) in &a.handed {
+            match store.handed_use(agent, *id).await {
+                Ok(true) => return Ok(Some((agent.clone(), *id))),
+                Ok(false) => {}
+                Err(e) => {
+                    tracing::warn!(error = %format!("{e:#}"), "a handed request couldn't be claimed");
+                    return Err(UNCLAIMED.into());
+                }
             }
         }
-        None
+        Err(AGREED_ALREADY.into())
+    }
+
+    /// The request `claimed` agrees no plan after all: the plan wasn't
+    /// saved.
+    pub(super) async fn unclaim_handed(&self, claimed: Option<&(String, Uuid)>) {
+        let Some((agent, id)) = claimed else {
+            return;
+        };
+        if let Err(e) = self.desk.store().handed_unuse(agent, *id).await {
+            tracing::warn!(error = %format!("{e:#}"), "a handed request's claim wasn't let go");
+        }
     }
 
     /// Says `line`, boss `service`'s word on its goal plan `plan` stalling,

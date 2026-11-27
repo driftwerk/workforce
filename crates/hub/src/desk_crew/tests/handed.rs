@@ -251,8 +251,12 @@ async fn a_request_handed_from_slack_is_kept_as_a_goal_on_the_persons_words_and_
                 "tickets": [{ "session": s.id.to_string() }],
             })
         };
-        let r = super::goals::run(&boss, "crew.plan", plan(GOAL)).await;
-        assert!(r.success, "{r:?}");
+        let (a, b) = tokio::join!(
+            super::goals::run(&boss, "crew.plan", plan(GOAL)),
+            super::goals::run(&boss, "crew.plan", plan(GOAL))
+        );
+        assert!(a.success ^ b.success, "one plan of two at once: {a:?} {b:?}");
+        let r = if a.success { a } else { b };
         let id: uuid::Uuid = r.output["proposed"]["plan_id"].as_str().unwrap().parse().unwrap();
         let p = d.plan(id).await.unwrap().summary.plan;
         assert_eq!(p.agreed.as_deref(), Some(GOAL));
@@ -270,6 +274,16 @@ async fn a_request_handed_from_slack_is_kept_as_a_goal_on_the_persons_words_and_
         assert_eq!(stalled[0].0, "D1");
         assert_eq!(stalled[0].1.as_deref(), Some("1700.1"));
         assert!(stalled[0].2.contains(GOAL));
+
+        // Its plan ended, the request agrees no other.
+        d.drop_plan(id, workforce_desk::OnDrop::Leave, &By::you())
+            .await
+            .unwrap();
+        let mut untaken = plan(GOAL);
+        untaken["tickets"] = json!([]);
+        let after = super::goals::run(&boss, "crew.plan", untaken).await;
+        assert!(!after.success, "{after:?}");
+        assert!(format!("{after:?}").contains("already agreed a plan"), "{after:?}");
     })
     .await;
 }

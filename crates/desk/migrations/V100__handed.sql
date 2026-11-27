@@ -11,6 +11,8 @@ CREATE TABLE IF NOT EXISTS handed (
     taken_at TIMESTAMPTZ NOT NULL,
     boss TEXT,
     delivered_at TIMESTAMPTZ,
+    -- When it agreed a plan's goal: it agrees no other after.
+    used_at TIMESTAMPTZ,
     PRIMARY KEY (agent, id)
 );
 

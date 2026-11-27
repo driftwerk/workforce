@@ -4,6 +4,7 @@
 use chrono::{DateTime, Utc};
 use eyre::{Context, Result};
 use tokio_postgres::Row;
+use uuid::Uuid;
 
 use crate::handed::{Handed, Kept, Owed};
 use crate::store::DeskStore;
@@ -95,6 +96,35 @@ impl DeskStore {
             .collect()
     }
 
+    /// Claims agent `agent`'s request `id` for the plan its words agree,
+    /// unless one claimed it already: whether this did.
+    pub async fn handed_use(&self, agent: &str, id: Uuid) -> Result<bool> {
+        let client = self.pool().get().await?;
+        let claimed = client
+            .query_opt(
+                "UPDATE handed SET used_at = now() \
+                 WHERE agent = $1 AND id = $2 AND used_at IS NULL RETURNING id",
+                &[&agent, &id],
+            )
+            .await
+            .context("claiming a handed request for a plan")?;
+        Ok(claimed.is_some())
+    }
+
+    /// Lets go the claim on agent `agent`'s request `id`: its plan wasn't
+    /// saved.
+    pub async fn handed_unuse(&self, agent: &str, id: Uuid) -> Result<()> {
+        let client = self.pool().get().await?;
+        client
+            .execute(
+                "UPDATE handed SET used_at = NULL WHERE agent = $1 AND id = $2",
+                &[&agent, &id],
+            )
+            .await
+            .context("letting go a handed request's claim")?;
+        Ok(())
+    }
+
     /// One word owed back for `h`.
     pub async fn handed_say(&self, h: &Handed, text: &str) -> Result<()> {
         let client = self.pool().get().await?;
@@ -181,7 +211,6 @@ impl DeskStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use uuid::Uuid;
     use workforce_postgres::test_support::with_test_pool;
 
     fn handed(agent: &str) -> Handed {
@@ -257,6 +286,15 @@ mod tests {
             let given_up = store.handed_owed(10).await.unwrap();
             assert_eq!(given_up.len(), 1, "tried too often");
             assert_eq!(given_up[0].text, "refused");
+
+            let (a, b) = tokio::join!(
+                store.handed_use(&h.agent, h.id),
+                store.handed_use(&h.agent, h.id)
+            );
+            assert!(a.unwrap() ^ b.unwrap(), "claimed by one plan alone");
+            assert!(!store.handed_use(&h.agent, h.id).await.unwrap());
+            store.handed_unuse(&h.agent, h.id).await.unwrap();
+            assert!(store.handed_use(&h.agent, h.id).await.unwrap(), "let go, it may be claimed again");
 
             assert_eq!(store.handed_prune().await.unwrap(), 0, "taken lately");
             store
