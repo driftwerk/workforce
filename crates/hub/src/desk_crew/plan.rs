@@ -34,7 +34,7 @@ use workforce_desk::crew::{
 };
 use workforce_desk::model::{DeskEvent, Engine, Exited, SessionState};
 use workforce_desk::plan::{self, Closing, Draft, DraftTicket, Plan, PlanState, PlanTicket};
-use workforce_desk::{Changed, NewPlan, PlanDetail, PlanEdit};
+use workforce_desk::{plan_group, Changed, NewPlan, PlanDetail, PlanEdit, UNGROUPED_NAME};
 
 use super::actions::{Action, Handout};
 use super::goal;
@@ -197,7 +197,7 @@ const MACHINE_DOWN_SAID: u32 = 4;
 /// How long what happens to a plan is gathered into one turn.
 pub(super) const GATHER: Duration = Duration::from_secs(3);
 
-pub const DESCRIPTION: &str = "Propose a plan for a goal the person gave you: tickets on your \
+pub const DESCRIPTION: &str = "Propose a plan for a goal the person gave you: tickets on its \
 group's board, each a piece of work a real session (Claude Code, Codex) does in a project folder, \
 with what it needs done first (needs: the places, from 0, of earlier tickets in the list). A plan \
 is a draft: its tickets wait in Backlog for the person to review on the board, change where and \
@@ -212,7 +212,10 @@ and keeps it until it is met; to put work already running under the goal, give i
 ticket ({session: its id}), which starts nothing. engine defaults to your default engine. board names a board you have by its prefix; when the person \
 asks for a new board, or the work deserves its own, pass new_board ({name, prefix}) instead and \
 Desk makes it in your group first, so you never ask the person to make one. With neither, it goes \
-on your group's board. To plan work on tickets already on a board (a synced Linear or Jira board \
+on its group's board. group is the sidebar group the work belongs to (like Mantis, or Ungrouped), \
+where its sessions start: pass the one the person said; left out, Desk picks it from the plan's \
+board, the tickets it takes on, and its folders and repositories, and says which. Tell the person \
+which group it is in. To plan work on tickets already on a board (a synced Linear or Jira board \
 too, like \"fix the recent bugs on Mantis\"), find them with crew.find_tickets and give each as \
 {adopt: its key, folder} instead of a title: the plan runs sessions on those tickets as they are, \
 none is copied, and their moves, comments and PR links go back to their issues; one someone has, \
@@ -247,7 +250,9 @@ ticket says, or moving one to a machine or folder the approved plan doesn't use 
 person to approve, while the plan runs on as approved. A draft the person hasn't approved stays \
 one: unbound, start_now with the person's own words asking to start it approves it. board (a \
 prefix) or new_board moves the whole plan to that board in your group, each ticket re-filed under \
-a new key; it applies at once. On a goal: goal, result and met are the person's, so propose \
+a new key; it applies at once. group (by name, or Ungrouped) moves the plan to that group at once: \
+its running sessions move there and the ones it starts from now on start there; its tickets keep \
+their keys. Not with board. On a goal: goal, result and met are the person's, so propose \
 them in your DM in the words you pass (or crew.ask_person with plan_id and proposal) and pass \
 their reply (person_said), a plain “yes” counting; record what \
 you report as done as facts, a judged part's progress as a checkpoint, and fix where a part is \
@@ -403,8 +408,9 @@ fn start_now_of(input: &Value) -> Result<Option<String>, String> {
 pub fn schema() -> Value {
     json!({ "type": "object", "properties": {
         "goal": { "type": "string", "description": "What the plan achieves, in the person's terms" },
-        "board": { "type": "string", "description": "A board you have, by its prefix, like ACM; your group's when neither this nor new_board is said" },
+        "board": { "type": "string", "description": "A board you have, by its prefix, like ACM; its group's when neither this nor new_board is said" },
         "new_board": new_board_schema(),
+        "group": { "type": "string", "description": "The sidebar group the work belongs to, where its sessions start: by name, like Mantis, or Ungrouped. Left out, Desk picks it from its board, the tickets it takes on, and its folders and repositories" },
         "machine": machine_schema("Where its tickets run when one doesn't say"),
         "model": { "type": "string", "description": "The model its tickets' sessions run when one doesn't say" },
         "parallel": { "type": "integer", "minimum": 1, "maximum": 12,
@@ -424,6 +430,7 @@ pub fn update_schema() -> Value {
         "revision": { "type": "integer", "description": "The revision you read; a newer one refuses the change" },
         "board": { "type": "string", "description": "Move the plan to this board of yours (its prefix, like ACM): every ticket of it is re-filed there under a new key, with its needs, links and history" },
         "new_board": new_board_schema(),
+        "group": { "type": "string", "description": "Move the plan to this sidebar group (by name, or Ungrouped): its running sessions move there, and the ones it starts from now on start there. Not with board" },
         "machine": machine_schema("Where its new tickets run when one doesn't say"),
         "model": { "type": "string", "description": "The model its new tickets' sessions run when one doesn't say" },
         "goal": { "type": "string", "description": "The goal, as the person agreed to change it" },
@@ -895,6 +902,43 @@ pub(crate) fn machine_of_items<'a>(items: impl IntoIterator<Item = &'a String>) 
     on
 }
 
+/// Why a new plan is in its group.
+enum Placed {
+    Said,
+    Board,
+    Picked(plan_group::Why),
+    Own,
+}
+
+impl Placed {
+    /// What the boss is told of it, the plan being in `group`.
+    fn said(&self, group: &str) -> String {
+        let why = match self {
+            Self::Said => ", as you said".to_string(),
+            Self::Board => ", its board's group".to_string(),
+            Self::Picked(plan_group::Why::Session) => {
+                ", where a session it takes on is".to_string()
+            }
+            Self::Picked(plan_group::Why::Folder(f)) => {
+                format!(", where the sessions working in {f} are")
+            }
+            Self::Picked(plan_group::Why::Named(n)) => format!(": its repository names it ({n})"),
+            Self::Own => match group {
+                UNGROUPED_NAME => ": nothing of it names a group".to_string(),
+                _ => ", your group".to_string(),
+            },
+        };
+        format!(
+            "Its sessions start in {group}{why}. Tell the person; they can change it on its card, or you can with crew.plan_update's group."
+        )
+    }
+}
+
+/// What the person calls the group a plan is in.
+fn group_said(p: &PlanDetail) -> &str {
+    p.summary.group_name.as_deref().unwrap_or(UNGROUPED_NAME)
+}
+
 /// A plan as the boss reads it back: its tickets by key, id and place.
 fn plan_out(p: &PlanDetail) -> Value {
     plan_out_with(p, &Briefs::None)
@@ -1024,6 +1068,7 @@ fn plan_view(p: &PlanDetail) -> Value {
         "revision": plan.revision,
         "approved_revision": plan.approved_revision,
         "goal": plan.goal,
+        "group": group_said(p),
         "progress": p.summary.progress,
         "budget": p.summary.budget,
         "held": p.summary.held,
@@ -1110,24 +1155,43 @@ impl CrewHub {
     /// The group `named` (by name or id) among the sidebar's, when the
     /// boss sees it; the boss's own when nothing is named.
     fn board_group_of(&self, b: &Bound, named: Option<&str>) -> Result<Option<String>, String> {
-        let own = self.boss_group(&b.service, &b.oversight);
-        let Some(named) = named.map(str::trim).filter(|n| !n.is_empty()) else {
-            return Ok(own);
-        };
-        let found = self
+        match named.map(str::trim).filter(|n| !n.is_empty()) {
+            Some(named) => self.group_named(b, named),
+            None => Ok(self.boss_group(&b.service, &b.oversight)),
+        }
+    }
+
+    /// The group `named` (by id or name, or Ungrouped: none) among those
+    /// the boss `b` sees; refused with their names otherwise.
+    fn group_named(&self, b: &Bound, named: &str) -> Result<Option<String>, String> {
+        let ungrouped = b.seen.sees(None);
+        if ungrouped && named.eq_ignore_ascii_case("ungrouped") {
+            return Ok(None);
+        }
+        let groups: Vec<(String, String)> = self
             .desk
             .layout()
             .groups
             .into_iter()
-            .find(|g| g.id == named || g.name.eq_ignore_ascii_case(named))
-            .map(|g| g.id);
-        match found {
-            Some(g) if b.seen.sees(Some(&g)) => Ok(Some(g)),
-            _ => Err(format!(
-                "{} Name one of your groups, or leave group out for your own.",
-                self.not_ours(&b.oversight.scope)
-            )),
+            .filter(|g| b.seen.sees(Some(&g.id)))
+            .map(|g| (g.id, g.name))
+            .collect();
+        if let Some((id, _)) = groups
+            .iter()
+            .find(|(id, name)| id == named || name.eq_ignore_ascii_case(named))
+        {
+            return Ok(Some(id.clone()));
         }
+        let names: Vec<String> = ungrouped
+            .then(|| UNGROUPED_NAME.to_string())
+            .into_iter()
+            .chain(groups.into_iter().map(|(_, name)| name))
+            .collect();
+        Err(format!(
+            "{} Name one of your groups: {}.",
+            self.not_ours(&b.oversight.scope),
+            listed(&names)
+        ))
     }
 
     /// The board `new` asks for in the boss's sight: its own with that
@@ -1397,13 +1461,22 @@ impl CrewHub {
             None => None,
         };
         let engine = Engine::parse(o.work.engine.trim()).unwrap_or(Engine::Claude);
-        let group = self.boss_group(&b.service, o);
-        let board_group = match board {
-            Some(id) => self.desk.group_of_board(id).await.map_err(plain)?,
-            None => group,
+        let (group, placed) = match (str_of(input, "group"), board) {
+            (Some(named), _) => (self.group_named(b, named)?, Placed::Said),
+            (None, Some(id)) => (
+                self.desk.group_of_board(id).await.map_err(plain)?,
+                Placed::Board,
+            ),
+            (None, None) => {
+                let found = self.desk.checkouts(&tickets).await;
+                match self.desk.work_group(&tickets, &found, |g| b.seen.sees(g)) {
+                    Some(p) => (Some(p.group), Placed::Picked(p.why)),
+                    None => (self.boss_group(&b.service, o), Placed::Own),
+                }
+            }
         };
         let mut tickets = tickets;
-        let machine = self.plan_machine(input, board_group.as_deref());
+        let machine = self.plan_machine(input, group.as_deref());
         fill_where(
             &mut tickets,
             machine.as_deref(),
@@ -1423,7 +1496,7 @@ impl CrewHub {
             board,
             parallel,
             engine,
-            group: board_group,
+            group,
             budget: budget_of(input)?.flatten(),
             result: Some(result.clone()),
             goal_ticket,
@@ -1443,6 +1516,7 @@ impl CrewHub {
             p.summary.plan.goal,
             self.plan_lines(&p)
         );
+        let placed = placed.said(group_said(&p));
         self.post_plan(&b.service, &p.summary.plan, &text).await;
         let unbound = self.unbound_given(b.service.agent_id.as_str(), o);
         // Agreed with the person, or asked by them to start it (the same,
@@ -1450,24 +1524,26 @@ impl CrewHub {
         // Otherwise a draft for them to review.
         let approves = agreed.is_some() || unbound || o.level != Level::Suggest;
         let Some((words, at)) = said.filter(|_| approves) else {
+            let note = match start_now.is_some() {
+                true => "It is a draft: only the person approves a plan at your level, so it waits in Backlog on the board for them to review and approve. Say it is ready for review on the board.",
+                false => "It is a draft: its tickets wait in Backlog on the board for the person to review (where and how each runs too) and approve; nothing of it runs until they do. Say it is ready for review on the board.",
+            };
             return Ok(json!({
                 "proposed": plan_out(&p),
-                "note": match start_now.is_some() {
-                    true => "It is a draft: only the person approves a plan at your level, so it waits in Backlog on the board for them to review and approve. Say it is ready for review on the board.",
-                    false => "It is a draft: its tickets wait in Backlog on the board for the person to review (where and how each runs too) and approve; nothing of it runs until they do. Say it is ready for review on the board.",
-                },
+                "note": format!("{note} {placed}"),
             }));
         };
         self.approve_words(b, &p, &words, at).await?;
         let approved = self.desk.plan(id).await.map_err(plain)?;
         self.read_back(&b.service, &approved).await;
         self.met_at_once(&approved).await;
+        let note = match agreed.is_some() {
+            true => "The person agreed it, so it is approved and Desk starts its ready tickets. Desk said the goal back to them in your DM and keeps it until it is met.",
+            false => "The person asked you to start it, so it is approved and Desk starts its ready tickets; they see it as a plan card in your DM and on the board.",
+        };
         Ok(json!({
             "proposed": plan_out(&approved),
-            "note": match agreed.is_some() {
-                true => "The person agreed it, so it is approved and Desk starts its ready tickets. Desk said the goal back to them in your DM and keeps it until it is met.",
-                false => "The person asked you to start it, so it is approved and Desk starts its ready tickets; they see it as a plan card in your DM and on the board.",
-            },
+            "note": format!("{note} {placed}"),
         }))
     }
 
@@ -1630,6 +1706,16 @@ impl CrewHub {
         let engine = Engine::parse(o.work.engine.trim()).unwrap_or(Engine::Claude);
         let by = self.by_boss(&b.service, why);
         let name = name_of(&b.service);
+        let regroup = match str_of(input, "group") {
+            Some(named) => Some(self.group_named(b, named)?),
+            None => None,
+        };
+        let boards = ["board", "new_board"]
+            .iter()
+            .any(|k| input.get(*k).is_some_and(|v| !v.is_null()));
+        if regroup.is_some() && boards {
+            return Err("Say group or board, not both.".into());
+        }
         let to = self
             .board_named(b, input)
             .await?
@@ -1644,11 +1730,12 @@ impl CrewHub {
             || edit.tickets.is_some()
             || edit.ticket_edits.is_some()
             || edit.budget.is_some()
-            || to.is_some();
+            || to.is_some()
+            || regroup.is_some();
         if goal_edit.answer().is_some() && others {
             return Err(ANSWER_ALONE.into());
         }
-        if !more && to.is_none() && goal_edit.any() {
+        if !more && to.is_none() && regroup.is_none() && goal_edit.any() {
             let (now, said) = self.goal_answered(b, detail, &goal_edit).await?;
             let mut out = self.goal_kept(b, &now, goal_edit).await?;
             out["plan"] = plan_out(&self.desk.plan(id).await.map_err(plain)?);
@@ -1659,9 +1746,9 @@ impl CrewHub {
         }
         // The change first, by the keys the boss read: the move after it
         // renumbers them.
-        let changed = match (more, to) {
-            (false, Some(_)) => None,
-            _ => {
+        let changed = match !more && (to.is_some() || regroup.is_some()) {
+            true => None,
+            false => {
                 let asks = o.level == Level::Suggest;
                 let changed: Changed = self
                     .desk
@@ -1687,24 +1774,36 @@ impl CrewHub {
                 "It waits for the person to approve; the plan runs on as approved until they do."
             }
         };
-        // Onto another board, at once: where its tickets are filed is no
+        let unmoved = |e| {
+            let why = plain(e);
+            match &changed {
+                Some(c) => format!(
+                    "The change is made ({}), but the plan didn't move: {why}",
+                    change_note(c)
+                ),
+                None => why,
+            }
+        };
+        // Onto another board, or into another group, at once: neither is a
         // change of what the person approved.
+        let regrouped = match regroup {
+            None => None,
+            Some(group) => {
+                let now = self
+                    .desk
+                    .regroup_plan(id, group, &by)
+                    .await
+                    .map_err(unmoved)?;
+                let text = format!("{name} moved the plan to {}.", group_said(&now.plan));
+                self.post_plan(&b.service, &now.plan.summary.plan, &text)
+                    .await;
+                Some(now)
+            }
+        };
         let moved = match to {
             None => None,
             Some(to) => {
-                let moved = match self.desk.move_plan(id, to, &by).await {
-                    Ok(m) => m,
-                    Err(e) => {
-                        let why = plain(e);
-                        return Err(match &changed {
-                            Some(c) => format!(
-                                "The change is made ({}), but the plan didn't move: {why}",
-                                change_note(c)
-                            ),
-                            None => why,
-                        });
-                    }
-                };
+                let moved = self.desk.move_plan(id, to, &by).await.map_err(unmoved)?;
                 let board = self
                     .desk
                     .store()
@@ -1721,17 +1820,21 @@ impl CrewHub {
                 Some((moved, board))
             }
         };
-        let change = changed
-            .as_ref()
-            .map_or(Some("board"), |c| c.change.map(|c| c.as_str()));
+        let change = changed.as_ref().map_or(
+            Some(match regrouped {
+                Some(_) => "group",
+                None => "board",
+            }),
+            |c| c.change.map(|c| c.as_str()),
+        );
         let applied = changed.as_ref().is_none_or(|c| c.applied);
         let mut note = changed
             .as_ref()
             .map(change_note)
             .unwrap_or_default()
             .to_string();
-        let now = match (moved, changed) {
-            (Some((m, board)), _) => {
+        let now = match (moved, regrouped, changed) {
+            (Some((m, board)), ..) => {
                 note = format!(
                     "{note} Every ticket of it is on {board} now, under new keys; use those keys from here on."
                 )
@@ -1739,8 +1842,23 @@ impl CrewHub {
                 .to_string();
                 m
             }
-            (None, Some(c)) => c.plan,
-            (None, None) => return Err("Say what to change, or which board to move it to.".into()),
+            (None, Some(g), _) => {
+                let sessions = match &g.unmoved {
+                    None => "its running sessions moved there".to_string(),
+                    Some(why) => format!("{why}; tell the person"),
+                };
+                note = format!(
+                    "{note} It is in {} now: {sessions}, and the ones it starts from now on start there.",
+                    group_said(&g.plan)
+                )
+                .trim()
+                .to_string();
+                g.plan
+            }
+            (None, None, Some(c)) => c.plan,
+            (None, None, None) => {
+                return Err("Say what to change, which board to move it to, or which group.".into())
+            }
         };
         let (now, answered) = self.goal_answered(b, now, &goal_edit).await?;
         if let Some(answered) = answered {
@@ -1897,7 +2015,9 @@ impl CrewHub {
             Ok(paused) => {
                 for s in paused {
                     self.close_if_finished(&s).await;
-                    self.lift_hold(&s.plan).await;
+                    if self.boss_of_plan(&s.plan).is_some() || !self.follow_group(&s.plan).await {
+                        self.lift_hold(&s.plan).await;
+                    }
                 }
             }
             Err(e) => tracing::warn!(error = %e, "couldn't read the paused plans"),
@@ -2021,7 +2141,7 @@ impl CrewHub {
                 let row = &t.ticket.ticket;
                 if let Some(m) = t.machine.as_ref().filter(|_| {
                     s.plan.state == PlanState::Running
-                        && s.plan.group.is_none()
+                        && self.desk.relay_group(&s.plan).is_none()
                         && t.engine.is_some_and(workforce_desk::engine::boss_safe)
                         && matches!(row.state, TicketState::Todo | TicketState::Doing)
                 }) {
@@ -2069,7 +2189,7 @@ impl CrewHub {
                 on.entry(machine.to_string()).or_default().push((
                     a.id.clone(),
                     seen,
-                    s.plan.group.clone(),
+                    self.desk.relay_group(&s.plan).map(str::to_string),
                     row.state == TicketState::Review,
                 ));
             }
@@ -2259,7 +2379,55 @@ impl CrewHub {
     /// plan is in.
     pub(super) fn boss_of_plan(&self, p: &Plan) -> Option<(Arc<AgentService>, Oversight)> {
         self.overseer_named(&p.boss)
-            .filter(|(_, o)| self.desk.seen_by(&o.scope).sees(p.group.as_deref()))
+            .filter(|(_, o)| self.desk.seen_by(&o.scope).sees(self.desk.live_group(p)))
+    }
+
+    /// `p`, whose boss no longer runs its group, passes to the boss that
+    /// does now, when there is one: whether it passed.
+    async fn follow_group(&self, p: &Plan) -> bool {
+        let lead = self
+            .desk
+            .boss_of(&self.desk.scope_of_group(self.desk.live_group(p)))
+            .filter(|l| l.agent != p.boss);
+        match lead {
+            Some(lead) => self.plan_follows(p, &lead).await,
+            None => false,
+        }
+    }
+
+    /// `p` passes to `lead`, who runs its group's part of Desk now that its
+    /// own boss doesn't: paused until the person says Continue (a plan
+    /// paused already keeps its pause, so one Continue goes on). Both
+    /// bosses' DMs say so, the person reading each.
+    async fn plan_follows(&self, p: &Plan, lead: &workforce_desk::Boss) -> bool {
+        let to = Party::manager(&lead.agent, &lead.name);
+        let by = By::desk("Its group has a boss of its own now.");
+        let now = match self.desk.pass_plan(p.id, &to, &by).await {
+            Ok(now) => now,
+            Err(e) => {
+                tracing::info!(plan = %p.id, error = %e, "a plan wasn't passed to its group's boss");
+                return false;
+            }
+        };
+        if let Some((service, _)) = self.overseer_named(&lead.agent) {
+            let text = format!(
+                "This plan is yours now: {} runs {}. It waits for the person to say Continue.\n\n{}",
+                lead.name,
+                group_said(&now),
+                self.plan_lines(&now)
+            );
+            self.post_plan(&service, &now.summary.plan, &text).await;
+        }
+        if let Some((service, _)) = self.overseer_named(&p.boss) {
+            let text = format!(
+                "{} runs {} now, so this plan is theirs: {}",
+                lead.name,
+                group_said(&now),
+                crew::one_line(&p.goal, 120)
+            );
+            self.post_plan(&service, &now.summary.plan, &text).await;
+        }
+        true
     }
 
     async fn run_plan(&self, p: Plan) {
@@ -2270,6 +2438,8 @@ impl CrewHub {
                 if let Err(e) = self.desk.pause_plan(p.id, plan::Paused::NoBoss, &by).await {
                     tracing::info!(plan = %p.id, error = %e, "a plan with no boss wasn't paused");
                 }
+            } else {
+                self.follow_group(&p).await;
             }
             return;
         };
@@ -2292,7 +2462,7 @@ impl CrewHub {
         // Its own budget, its group's or Desk's at its warning or over, and
         // the breaker holding new starts for it: the person has the need,
         // with Continue; the plan pauses until they say, and nothing starts.
-        let held = self.desk.plan_starts_held(p.group.as_deref(), p.id);
+        let held = self.desk.plan_starts_held(self.desk.live_group(&p), p.id);
         if held.is_some() {
             let by = By::desk("Desk's breaker holds its new starts.");
             if let Err(e) = self.desk.pause_plan(p.id, plan::Paused::Budget, &by).await {

@@ -31,6 +31,7 @@ use crate::plan::{
     Problem, Progress, Revision, Snapshot, Start, TicketEdit,
 };
 use crate::plan_store::{Adopt, BeginStart, Claim, Runs, Starting};
+use crate::scope;
 use workforce_core::budget::{BudgetScope, Standing};
 
 /// What a ticket's session is told when a session worked on it before
@@ -54,6 +55,8 @@ pub struct PlanSummary {
     #[serde(flatten)]
     pub plan: Plan,
     pub boss_name: String,
+    /// What the person calls its group; none in Ungrouped.
+    pub group_name: Option<String>,
     /// Why it is paused, in the person's words, while it is.
     pub paused_why: Option<String>,
     pub progress: Progress,
@@ -101,6 +104,17 @@ pub struct PlanTicketView {
     pub session_closed: bool,
 }
 
+/// A plan moved to another group, and why its running sessions weren't
+/// moved with it, when they weren't.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Regrouped {
+    #[serde(flatten)]
+    pub plan: PlanDetail,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unmoved: Option<String>,
+}
+
 /// A plan in full: its tickets, its waves, and every revision.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -129,7 +143,7 @@ pub struct NewPlan {
     pub parallel: Option<i16>,
     /// The engine of a ticket that names none: the boss's default.
     pub engine: Engine,
-    /// The boss's group; none is the main boss's.
+    /// The group its work belongs to; none is Ungrouped.
     pub group: Option<String>,
     /// What it may spend, as the boss proposes it.
     pub budget: Option<PlanBudget>,
@@ -354,7 +368,7 @@ impl Desk {
         let said = match why {
             Paused::StartFailing => p.paused_why.clone(),
             Paused::Budget => self
-                .plan_starts_held(p.group.as_deref(), p.id)
+                .plan_starts_held(self.live_group(p), p.id)
                 .map(|(_, ask)| ask)
                 .filter(|a| !a.is_empty()),
             Paused::BossHeld => self
@@ -432,6 +446,7 @@ impl Desk {
         let budget = self.applied(&p).await?.budget;
         Ok(PlanSummary {
             boss_name: self.plan_boss_name(&p),
+            group_name: p.group.as_deref().and_then(|g| self.group_name(g)),
             paused_why: self.paused_why(&p),
             progress: plan::progress(&tickets, |s| self.session_busy(s)),
             budget,
@@ -451,7 +466,7 @@ impl Desk {
         if matches!(p.state, PlanState::Done | PlanState::Dropped) {
             return None;
         }
-        self.plan_starts_held(p.group.as_deref(), p.id)
+        self.plan_starts_held(self.live_group(p), p.id)
             .map(|(_, ask)| ask)
     }
 
@@ -550,6 +565,7 @@ impl Desk {
             waves: plan::waves(&rows),
             summary: PlanSummary {
                 boss_name: self.plan_boss_name(&p),
+                group_name: p.group.as_deref().and_then(|g| self.group_name(g)),
                 paused_why: self.paused_why(&p),
                 progress: plan::progress(&rows, |s| self.session_busy(s)),
                 budget: applied.budget.clone(),
@@ -732,6 +748,11 @@ impl Desk {
     /// Writes `p`, keeps its need, and announces it.
     async fn plan_saved(&self, p: &Plan) -> Result<PlanDetail, DeskError> {
         self.0.store.put_plan(p).await.map_err(internal)?;
+        self.plan_heard(p).await
+    }
+
+    /// Keeps `p`'s need, as it is stored, and announces it.
+    async fn plan_heard(&self, p: &Plan) -> Result<PlanDetail, DeskError> {
         self.plan_awaits(p).await;
         let detail = self.plan_detail(p.clone()).await?;
         self.announce(DeskEvent::Plan {
@@ -787,6 +808,7 @@ impl Desk {
         by: &By,
     ) -> Result<PlanDetail, DeskError> {
         let _write = self.0.plan_write.lock().await;
+        self.named_group(new.group.as_deref())?;
         let mut draft = new.draft;
         let goal = draft.goal.clone();
         self.take_sessions_on(
@@ -845,9 +867,9 @@ impl Desk {
         let b = match new.board.or(first_taken) {
             Some(id) => {
                 let b = self.board_of(id).await?;
-                if b.group != new.group {
+                if !self.in_scope(b.group.as_deref(), new.group.as_deref()) {
                     return Err(DeskError::Invalid(
-                        "That board isn't in the group you run.".into(),
+                        "That board isn't in a group the plan's boss runs.".into(),
                     ));
                 }
                 b
@@ -863,7 +885,7 @@ impl Desk {
         let p = Plan {
             id: Uuid::new_v4(),
             board: b.id,
-            group: b.group.clone(),
+            group: new.group.clone(),
             boss: boss.id.clone(),
             goal: s.goal.clone(),
             state: PlanState::Proposed,
@@ -1015,7 +1037,7 @@ impl Desk {
             }
             let outside = || {
                 DeskError::Invalid(format!(
-                    "Ticket {} takes on a ticket that isn't on a board of the plan's group.",
+                    "Ticket {} takes on a ticket that isn't on a board of a group the plan's boss runs.",
                     i + 1
                 ))
             };
@@ -1024,7 +1046,7 @@ impl Desk {
                 Err(DeskError::NotFound) => return Err(outside()),
                 Err(e) => return Err(e),
             };
-            if self.board_of(t.board).await?.group.as_deref() != group {
+            if !self.in_scope(self.board_of(t.board).await?.group.as_deref(), group) {
                 return Err(outside());
             }
             let why = match d.session {
@@ -1496,9 +1518,9 @@ impl Desk {
 
     /// Re-files plan `id` on board `board`, as `by`: every ticket of it
     /// moves there under a new key, still in the plan, with what it needs,
-    /// its links, history and whoever has it. The board is in the plan's
-    /// group and one of Desk's own; nothing moves while a ticket of it is
-    /// starting.
+    /// its links, history and whoever has it. The board is one of Desk's
+    /// own, in a group the plan's boss runs; nothing moves while a ticket
+    /// of it is starting.
     pub async fn move_plan(&self, id: Uuid, board: Uuid, by: &By) -> Result<PlanDetail, DeskError> {
         let _write = self.0.plan_write.lock().await;
         let mut p = self.plan_of(id).await?;
@@ -1506,9 +1528,9 @@ impl Desk {
             return self.plan_detail(p).await;
         }
         let to = self.board_of(board).await?;
-        if to.group != p.group {
+        if !self.in_scope(to.group.as_deref(), p.group.as_deref()) {
             return Err(DeskError::Invalid(format!(
-                "{} isn't in the plan's group: name a board of that group, or pass new_board to make one there.",
+                "{} isn't in a group the plan's boss runs: name a board of one, or pass new_board to make one there.",
                 to.name
             )));
         }
@@ -1584,6 +1606,228 @@ impl Desk {
             ),
         );
         self.plan_saved(&p).await
+    }
+
+    /// Moves plan `id` to `group` (none: Ungrouped), as `by`: the group its
+    /// work belongs to, where the sessions it starts from now on start. Its
+    /// sessions still in its old group move there too; its tickets stay on
+    /// their boards, under their keys. Only to a group its boss runs (as
+    /// its group's scope, when its boss isn't one now).
+    pub async fn regroup_plan(
+        &self,
+        id: Uuid,
+        group: Option<String>,
+        by: &By,
+    ) -> Result<Regrouped, DeskError> {
+        let _write = self.0.plan_write.lock().await;
+        let _one = self.0.plan_starting.lock().await;
+        let mut p = self.plan_of(id).await?;
+        let name = self.named_group(group.as_deref())?;
+        if matches!(p.state, PlanState::Done | PlanState::Dropped) {
+            return Err(DeskError::Invalid(
+                "A finished plan stays where it was.".into(),
+            ));
+        }
+        if p.group == group {
+            return Ok(Regrouped {
+                plan: self.plan_detail(p).await?,
+                unmoved: None,
+            });
+        }
+        let bossed = self.bossed();
+        let theirs = scope::scope_of(group.as_deref(), &bossed);
+        let ours = self
+            .scope_of_boss(&p.boss)
+            .unwrap_or_else(|| scope::scope_of(p.group.as_deref(), &bossed));
+        if ours != theirs {
+            return Err(DeskError::Conflict(
+                match self.boss_of(&theirs) {
+                    Some(b) => format!(
+                        "{name} is {}'s to run, not this plan's boss's: a plan moves only between groups its own boss runs.",
+                        b.name
+                    ),
+                    None => format!(
+                        "No boss runs {name}: a plan moves only between groups its own boss runs."
+                    ),
+                },
+            ));
+        }
+        let layout = self.layout();
+        let moving: Vec<String> = self
+            .0
+            .store
+            .plan_tickets(p.id)
+            .await
+            .map_err(internal)?
+            .into_iter()
+            .filter(|t| matches!(t.state, TicketState::Doing | TicketState::Review))
+            .filter_map(|t| t.assignee.filter(|a| a.kind == PartyKind::Session))
+            .map(|a| format!("session:{}", a.id))
+            .filter(|item| scope::group_of(item, &layout) == p.group.as_deref())
+            .collect();
+        p.group = group;
+        p.updated_at = crew::now();
+        self.plan_note(
+            &p,
+            by,
+            Kind::PlanChanged,
+            format!("moved the plan to {name}: {}", crew::one_line(&p.goal, 120)),
+        );
+        let plan = self.plan_saved(&p).await?;
+        let to = p.group.as_deref().unwrap_or(super::UNGROUPED);
+        let unmoved = match moving.is_empty() {
+            true => None,
+            false => self
+                .change_layout(|l| {
+                    moving
+                        .iter()
+                        .try_fold(l.clone(), |l, item| l.put(item, to, None))
+                })
+                .await
+                .err()
+                .map(|e| {
+                    tracing::warn!(plan = %p.id, error = %e, "a plan's sessions weren't moved to its group");
+                    let said = format!("Its running sessions stayed where they were: {e}");
+                    self.plan_note(
+                        &p,
+                        &By::desk("Moving its sessions failed."),
+                        Kind::PlanChanged,
+                        format!("{said} ({})", crew::one_line(&p.goal, 120)),
+                    );
+                    said
+                }),
+        };
+        Ok(Regrouped { plan, unmoved })
+    }
+
+    /// What the person calls `group` (none: Ungrouped), when the sidebar
+    /// has it.
+    fn named_group(&self, group: Option<&str>) -> Result<String, DeskError> {
+        match group {
+            None => Ok(super::UNGROUPED_NAME.into()),
+            Some(g) => self
+                .group_name(g)
+                .ok_or_else(|| DeskError::Invalid("The sidebar has no such group.".into())),
+        }
+    }
+
+    /// Whether rows of groups `a` and `b` are the same boss's.
+    fn in_scope(&self, a: Option<&str>, b: Option<&str>) -> bool {
+        let bossed = self.bossed();
+        scope::scope_of(a, &bossed) == scope::scope_of(b, &bossed)
+    }
+
+    /// The group plan `p`'s calls to the person's machines go under: its
+    /// group, when that is a boundary; none in the main overseer's part,
+    /// whose plans run in grants of their own there.
+    pub fn relay_group<'a>(&self, p: &'a Plan) -> Option<&'a str> {
+        self.live_group(p).filter(|g| self.bossed().contains(*g))
+    }
+
+    /// Plan `p`'s group while the sidebar has it; none (Ungrouped) once it
+    /// is deleted.
+    pub fn live_group<'a>(&self, p: &'a Plan) -> Option<&'a str> {
+        p.group
+            .as_deref()
+            .filter(|g| self.layout().groups.iter().any(|x| x.id == *g))
+    }
+
+    /// The repository each of `tickets`' folders is in on this computer
+    /// (none outside the home folder, or for the home folder's own), for
+    /// [`Self::work_group`].
+    pub async fn checkouts(
+        &self,
+        tickets: &[DraftTicket],
+    ) -> Vec<Option<crate::plan_group::Found>> {
+        let none = vec![None; tickets.len()];
+        let Some(home) = self.home_folder().and_then(|h| h.canonicalize().ok()) else {
+            return none;
+        };
+        let folders: Vec<std::path::PathBuf> =
+            tickets.iter().map(|t| t.folder.clone().into()).collect();
+        tokio::task::spawn_blocking(move || {
+            let inside = |p: &std::path::Path| p.starts_with(&home) && p != home;
+            folders
+                .iter()
+                .map(|f| {
+                    let r = crate::folders::repo_around(f, &inside)?;
+                    let below = f.canonicalize().ok()?;
+                    Some(crate::plan_group::Found {
+                        root: r.root.file_name()?.to_string_lossy().into_owned(),
+                        remote: r.remote,
+                        below: below
+                            .strip_prefix(&r.top)
+                            .ok()?
+                            .to_string_lossy()
+                            .into_owned(),
+                    })
+                })
+                .collect()
+        })
+        .await
+        .unwrap_or(none)
+    }
+
+    /// The group `tickets`' work belongs to among the groups `sees` lets
+    /// a boss use ([`crate::plan_group::pick`]), by this computer's open
+    /// sessions and the repositories `found` for them ([`Self::checkouts`]).
+    pub fn work_group(
+        &self,
+        tickets: &[DraftTicket],
+        found: &[Option<crate::plan_group::Found>],
+        sees: impl Fn(Option<&str>) -> bool,
+    ) -> Option<crate::plan_group::Picked> {
+        use crate::plan_group::{pick, Choice, Work, Working};
+        let layout = self.layout();
+        let groups: Vec<Choice> = layout
+            .groups
+            .iter()
+            .filter(|g| sees(Some(&g.id)))
+            .map(|g| Choice {
+                id: &g.id,
+                name: &g.name,
+            })
+            .collect();
+        let views = self.list();
+        let working: Vec<Working> = views
+            .iter()
+            .filter(|v| !matches!(v.state, crate::model::SessionState::Closed))
+            .filter_map(|v| {
+                v.group.as_ref().map(|g| Working {
+                    cwd: &v.cwd,
+                    group: &g.id,
+                })
+            })
+            .collect();
+        let work: Vec<Work> = tickets
+            .iter()
+            .zip(found.iter().chain(std::iter::repeat(&None)))
+            .map(|(t, found)| Work {
+                folder: &t.folder,
+                repo: t.repo.as_deref(),
+                session: t
+                    .session
+                    .and_then(|s| views.iter().find(|v| v.id == s))
+                    .and_then(|v| v.group.as_ref())
+                    .map(|g| g.id.as_str()),
+                checkout: found.as_ref().map(crate::plan_group::Found::checkout),
+            })
+            .collect();
+        pick(&work, &working, &groups)
+    }
+
+    /// Announces each of `plans` as it is stored now: their group was
+    /// deleted, so they are ungrouped.
+    pub(super) async fn plans_ungrouped(&self, plans: &[Uuid]) {
+        for id in plans {
+            let heard = match self.plan_of(*id).await {
+                Ok(p) => self.plan_heard(&p).await.map(drop),
+                Err(e) => Err(e),
+            };
+            if let Err(e) = heard {
+                tracing::warn!(plan = %id, error = %e, "an ungrouped plan wasn't announced");
+            }
+        }
     }
 
     async fn add_revision(
@@ -2424,7 +2668,7 @@ impl Desk {
         let p = self.plan_of(id).await?;
         let lifted = match p.paused {
             Some(Paused::BossHeld) => self.agent_held(&p.boss).is_none(),
-            Some(Paused::Budget) => self.plan_starts_held(p.group.as_deref(), p.id).is_none(),
+            Some(Paused::Budget) => self.plan_starts_held(self.live_group(&p), p.id).is_none(),
             _ => false,
         };
         if !lifted {
@@ -2826,7 +3070,8 @@ impl Desk {
             self.plan_prepare(p, start.ticket, boss).await?;
         }
         let _one = self.0.plan_starting.lock().await;
-        if let Some((_, ask)) = self.plan_starts_held(p.group.as_deref(), p.id) {
+        let p = &self.plan_of(p.id).await?;
+        if let Some((_, ask)) = self.plan_starts_held(self.live_group(p), p.id) {
             return Err(StartRefused::Skipped(format!(
                 "Desk's breaker holds new sessions: {ask} The person can say Continue on Desk's Floor."
             )));
@@ -2936,7 +3181,7 @@ impl Desk {
                 })?;
                 let body = serde_json::json!({ "remote": repo.key(), "folder": folder });
                 let answer = crew
-                    .machine_call(machine, p.group.as_deref(), &boss.id, "desk.checkout", body)
+                    .machine_call(machine, self.relay_group(p), &boss.id, "desk.checkout", body)
                     .await
                     .map_err(|e| {
                         StartRefused::Failed(DeskError::Invalid(match e {
@@ -3094,7 +3339,7 @@ impl Desk {
         let still = t.state == TicketState::Doing && t.assignee.is_none();
         let held = p
             .as_ref()
-            .and_then(|p| self.plan_starts_held(p.group.as_deref(), p.id))
+            .and_then(|p| self.plan_starts_held(self.live_group(p), p.id))
             .is_some();
         // A start on a machine that may have made its session there keeps
         // its link while it can't be looked for (no boss, paused or held):
@@ -3355,9 +3600,9 @@ impl Desk {
         // Started in its plan's grant there, run by its boss from launch, for
         // a plan of the main boss on an engine Desk checks every call of;
         // Desk carries the start's grant and boss from the call itself.
-        let held = (p.group.is_none() && crate::engine::boss_safe(engine))
+        let group = self.relay_group(p);
+        let held = (group.is_none() && crate::engine::boss_safe(engine))
             .then(|| crate::grant::plan_key(p.id));
-        let group = p.group.as_deref();
         let read = || async {
             let listed = crew
                 .machine_call(
@@ -3533,11 +3778,7 @@ impl Desk {
     /// that session in the plan's group in the sidebar, and the ticket its.
     async fn plan_link_on(&self, p: &Plan, t: Ticket, started: &Started, by: &By) {
         let item = started.item();
-        if let Some(g) = p
-            .group
-            .clone()
-            .filter(|g| self.layout().groups.iter().any(|x| &x.id == g))
-        {
+        if let Some(g) = self.live_group(p).map(str::to_string) {
             if self.group_of_member(&item).as_deref() != Some(g.as_str()) {
                 if let Err(e) = self.change_layout(|l| l.put(&item, &g, None)).await {
                     tracing::info!(%item, error = %e, "a machine's plan session wasn't put in its group");
@@ -3606,10 +3847,7 @@ impl Desk {
                 self.free_resting(&tree, &key, assigned, boss).await?;
             }
         }
-        let group = p
-            .group
-            .clone()
-            .filter(|g| self.layout().groups.iter().any(|x| &x.id == g));
+        let group = self.live_group(p).map(str::to_string);
         let new = NewSession {
             fresh_worktree: false,
             engine,
@@ -3789,3 +4027,7 @@ mod adopt_tests;
 #[cfg(test)]
 #[path = "plans_end_tests.rs"]
 mod end_tests;
+
+#[cfg(test)]
+#[path = "plans_group_tests.rs"]
+mod group_tests;

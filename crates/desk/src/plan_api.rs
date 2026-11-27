@@ -1,5 +1,5 @@
 //! Plans over HTTP, for the person: the list, one in full, their edit,
-//! pausing, resuming, dropping, ending and removing. Approving a plan, or turning down a
+//! pausing, resuming, moving to another group, dropping, ending and removing. Approving a plan, or turning down a
 //! change to one, is the hub holder's alone, through the Floor's
 //! `POST /api/desk/needs/decide` (`DecideRef::Plan`). A boss proposes and
 //! changes plans with its crew tools, never here.
@@ -129,6 +129,34 @@ async fn resume(State(s): S, h: HeaderMap, Query(q): Q, Path(id): Path<Uuid>) ->
 }
 
 #[derive(Deserialize)]
+struct GroupBody {
+    /// The group's id; `null` for Ungrouped.
+    #[serde(default, deserialize_with = "crate::model::present")]
+    group: Option<Option<String>>,
+}
+
+/// Moves a plan to another group: its sessions move with it.
+async fn regroup(
+    State(s): S,
+    h: HeaderMap,
+    Query(q): Q,
+    Path(id): Path<Uuid>,
+    body: Option<Json<Value>>,
+) -> Response {
+    guarded!(s, h, q);
+    let Some(Ok(GroupBody { group: Some(group) })) =
+        body.map(|Json(v)| serde_json::from_value::<GroupBody>(v))
+    else {
+        return bad("say the group: its id, or null for Ungrouped");
+    };
+    s.desk
+        .regroup_plan(id, group, &By::you())
+        .await
+        .map(Json)
+        .into_response()
+}
+
+#[derive(Deserialize)]
 struct DropBody {
     /// What becomes of the sessions working on it: `stop` or `leave`.
     sessions: OnDrop,
@@ -179,6 +207,7 @@ pub(crate) fn api_routes(desk: Desk, auth: Arc<dyn Authorize>) -> Router {
         .route("/api/desk/plans/{id}", get(read).patch(edit))
         .route("/api/desk/plans/{id}/pause", post(pause))
         .route("/api/desk/plans/{id}/resume", post(resume))
+        .route("/api/desk/plans/{id}/group", post(regroup))
         .route("/api/desk/plans/{id}/drop", post(drop_plan))
         .route("/api/desk/plans/{id}/end", post(end))
         .route("/api/desk/plans/{id}/remove", post(remove))

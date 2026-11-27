@@ -1365,7 +1365,7 @@ async fn replace_layout(
             Some(expected) if expected != before => Err(DeskError::Conflict(
                 "The layout changed since it was read: read it again.".into(),
             )),
-            _ => Ok(r.layout),
+            _ => Ok(r.layout.clone()),
         })
         .await
         .map(Json)
