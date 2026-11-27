@@ -1997,6 +1997,7 @@ impl CrewHub {
         });
         match self.desk.plans(Some(PlanState::Paused), None).await {
             Ok(paused) => {
+                self.forget_asked(paused.iter().map(|s| &s.plan));
                 for s in paused {
                     if self.boss_of_plan(&s.plan).is_some() || !self.follow_group(&s.plan).await {
                         self.lift_hold(&s.plan).await;
@@ -2305,6 +2306,10 @@ impl CrewHub {
     /// Continue, or the hold's period ended. Its boss can't: no crew tool
     /// lets a hold go.
     async fn lift_hold(&self, p: &Plan) {
+        if p.paused == Some(plan::Paused::PlanLimit) {
+            self.lift_limit(p).await;
+            return;
+        }
         if !matches!(
             p.paused,
             Some(plan::Paused::BossHeld | plan::Paused::Budget)
@@ -2325,8 +2330,12 @@ impl CrewHub {
     }
 
     /// `p`, whose boss no longer runs its group, passes to the boss that
-    /// does now, when there is one: whether it passed.
+    /// does now, when there is one: whether it passed. One the plan limit
+    /// pauses stays its boss's, whose limit holds it, until that lifts.
     async fn follow_group(&self, p: &Plan) -> bool {
+        if p.paused == Some(plan::Paused::PlanLimit) {
+            return false;
+        }
         let lead = self
             .desk
             .boss_of(&self.desk.scope_of_group(self.desk.live_group(p)))
@@ -2399,6 +2408,9 @@ impl CrewHub {
             {
                 tracing::info!(plan = %p.id, error = %e, "a plan whose boss is held wasn't paused");
             }
+            return;
+        }
+        if self.held_by_limit(&p).await {
             return;
         }
         // Its own budget, its group's or Desk's at its warning or over, and

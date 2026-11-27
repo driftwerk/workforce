@@ -367,34 +367,44 @@ pub(super) struct TurnOn<'a> {
     pub(super) model: Option<&'a str>,
 }
 
-/// The plan guard's word on the boss's own turn `work` for `owner`, judged
-/// on the owner's plan for the model the turn runs on.
-pub(super) async fn plan_admits(
+/// The plan login the boss's own turn `work` for `owner` runs on: the
+/// owner's, for the model the turn runs on.
+pub(super) async fn wake_login(
     service: &AgentService,
     owner: &str,
     work: &workforce_common::work_use::Work,
     on: TurnOn<'_>,
-) -> crate::cost_governor::Admission {
+) -> Option<crate::hub_core::logins::resolve::Login> {
     let runs_on = on.model.map_or_else(
         || service.resolve_chat_model(on.session, on.prompt),
         str::to_string,
     );
     let person = owner.parse::<uuid::Uuid>().ok();
-    workforce_common::work_use::within(work.clone(), async {
-        let login = crate::user_config::billed_to(
+    workforce_common::work_use::within(
+        work.clone(),
+        crate::user_config::billed_to(
             person,
             crate::turn_loop::plan_login(service, Some(&runs_on)),
-        )
-        .await;
+        ),
+    )
+    .await
+}
+
+/// The plan guard's word on the boss's own turn `work` for `owner`, on
+/// `login`.
+fn plan_admits_on(
+    service: &AgentService,
+    owner: &str,
+    work: &workforce_common::work_use::Work,
+    login: Option<&crate::hub_core::logins::resolve::Login>,
+) -> crate::cost_governor::Admission {
+    workforce_common::work_use::sync_within_opt(Some(work.clone()), || {
         service.cost_governor.preflight_on(
             service.agent_id.as_str(),
             Some(owner),
-            crate::cost_governor::OnPlan {
-                login: login.as_ref(),
-            },
+            crate::cost_governor::OnPlan { login },
         )
     })
-    .await
 }
 
 impl CrewHub {
@@ -408,7 +418,10 @@ impl CrewHub {
         on: TurnOn<'_>,
     ) -> Option<String> {
         use crate::cost_governor::Admission;
-        match plan_admits(service, owner, work, on).await {
+        let login = wake_login(service, owner, work, on).await;
+        let admitted = plan_admits_on(service, owner, work, login.as_ref());
+        self.note_wake(service, login, &admitted, chrono::Utc::now());
+        match admitted {
             Admission::Waits(why) => Some(why),
             Admission::Stopped { why, first } => {
                 if first {
@@ -596,7 +609,7 @@ fn ran_call(call: &workforce_agent::runner::ToolInvocation) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{plan_admits, TurnOn};
+    use super::{plan_admits_on, wake_login, TurnOn};
     use crate::cost_governor::Admission;
     use crate::serve::AgentService;
     use workforce_common::session::Session;
@@ -667,7 +680,8 @@ mod tests {
             prompt: "Notices: MAN-544 is waiting.",
             model: None,
         };
-        plan_admits(service, owner, &work, on).await
+        let login = wake_login(service, owner, &work, on).await;
+        plan_admits_on(service, owner, &work, login.as_ref())
     }
 
     fn waits_on(admitted: &Admission, plan: &str) {
