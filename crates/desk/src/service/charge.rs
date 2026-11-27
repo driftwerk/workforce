@@ -1022,6 +1022,168 @@ impl Desk {
 }
 
 impl Desk {
+    /// Why `id`'s call of `tool` with `input` is refused before it runs,
+    /// whatever its mode or its own allow rules say, while a boss acting
+    /// fully has it and the person isn't in it: a merge of a pull request
+    /// ([`crate::computer::boss::merges_a_pull`]), which that boss makes
+    /// once a clean review is recorded at its head, or a push straight to
+    /// a default branch pull requests merge into
+    /// ([`Self::pushes_past_review`]).
+    pub(crate) async fn past_review_refused(
+        &self,
+        id: Uuid,
+        tool: &str,
+        input: &serde_json::Value,
+    ) -> Option<String> {
+        use crate::computer::boss::{may_push, merges_a_pull};
+        let command = input["command"].as_str().filter(|_| tool == "Bash")?;
+        let merges = merges_a_pull(command);
+        if !merges && !may_push(command) {
+            return None;
+        }
+        self.acting_fully_alone(id)?;
+        if merges {
+            return Some(crate::plan::own_merge_refused());
+        }
+        let (desk, command) = (self.clone(), command.to_string());
+        let pending = crate::model::PendingApproval {
+            id: Uuid::new_v4(),
+            tool: "Bash".into(),
+            detail: command.clone(),
+            since: Utc::now(),
+            answerable: false,
+            choices: Vec::new(),
+            why: None,
+            options: None,
+            request: Some(crate::model::Request {
+                tool: "Bash".into(),
+                input: serde_json::json!({ "command": command }),
+                cwd: None,
+                read_only: false,
+            }),
+            call: None,
+            agent: None,
+            cli_session: None,
+        };
+        tokio::task::spawn_blocking(move || desk.pushes_past_review(id, &pending))
+            .await
+            .unwrap_or(false)
+            .then(crate::plan::default_push_refused)
+    }
+
+    /// The boss acting fully that has `id` while the person isn't in it.
+    fn acting_fully_alone(&self, id: Uuid) -> Option<String> {
+        let boss = self.charge_of(id).filter(Charge::live)?.boss;
+        let fully = match crate::grant::is_served(&boss) {
+            true => self
+                .0
+                .served_full
+                .lock()
+                .clone()
+                .is_some_and(|j| j.full_of(&boss).is_some()),
+            false => self.0.state.lock().charges.full.contains_key(&boss),
+        };
+        let now = Utc::now() - chrono::Duration::minutes(charge::PERSON_NOW_MINUTES);
+        let person_in = self.last_input_of(id).is_some_and(|at| at > now)
+            || self.wheel_of(id).is_some_and(Wheel::person);
+        (fully && !person_in).then_some(boss)
+    }
+
+    /// Whether `id`'s request `pending` pushes straight to the default
+    /// branch of the repository it pushes from
+    /// ([`crate::computer::boss::pushes_a_default`]), read now where its
+    /// `cd`s and `git -C` lead from where it runs (where it runs, when that
+    /// isn't a repository; the session's folder, when Desk can't tell where
+    /// it runs), and GitHub requires a pull request to change that branch
+    /// ([`Self::requires_pull_requests`]).
+    fn pushes_past_review(&self, id: Uuid, pending: &crate::model::PendingApproval) -> bool {
+        let (Some(bounds), Ok(view)) = (self.judging_bounds(), self.view(id)) else {
+            return false;
+        };
+        let moved = self.0.state.lock().live.get(&id).is_some_and(|l| l.moved);
+        let facts = charge::facts_of(view.engine, pending, &view, &bounds.home, moved);
+        let charge::What::Command(command) = &facts.what else {
+            return false;
+        };
+        let cwd = facts
+            .cwd
+            .clone()
+            .unwrap_or_else(|| std::path::PathBuf::from(&view.cwd));
+        let from = |dir: Option<&std::path::Path>| {
+            dir.and_then(|d| pushing_from(&cwd.join(d)))
+                .or_else(|| pushing_from(&cwd))
+        };
+        crate::computer::boss::pushes_a_default(command, &from, &|repo| {
+            repo.pulls_into
+                .as_ref()
+                .zip(repo.default_branch.as_deref())
+                .is_some_and(|(repo, branch)| self.requires_pull_requests(repo, branch))
+        })
+    }
+
+    /// Whether GitHub requires a pull request to change `repo`'s `branch`,
+    /// as its rulesets (`rules/branches/<branch>`) or its classic
+    /// protection (`branches/<branch>/protection`) say, both read at once
+    /// with the person's own `gh` within [`GITHUB_WITHIN`], and kept for
+    /// [`PROTECTION_FOR`], or [`UNREAD_FOR`] when GitHub couldn't say.
+    /// Unprotected, unreadable, or not the person's to read: no.
+    fn requires_pull_requests(&self, repo: &crate::repos::Repo, branch: &str) -> bool {
+        let key = (repo.key(), branch.to_string());
+        let now = std::time::Instant::now();
+        if let Some(&(until, required)) = self.0.protections.lock().get(&key) {
+            if now < until {
+                return required;
+            }
+        }
+        let env = crate::repos::kept_env(self.login_env());
+        let home = self.home_folder().unwrap_or_default();
+        let gh = crate::repos::program("gh", &home, &env);
+        let until = now + GITHUB_WITHIN;
+        let read = |tail: &[&str]| {
+            let mut cmd = std::process::Command::new(gh.as_ref()?);
+            cmd.args(["api", &github_path(repo, tail)])
+                .env_clear()
+                .envs(env.iter().map(|(k, v)| (k, v)))
+                .env("HOME", &home)
+                .env("GH_PROMPT_DISABLED", "1");
+            output_until(cmd, until)
+                .and_then(|out| serde_json::from_str::<serde_json::Value>(&out).ok())
+        };
+        let (rules, classic) = std::thread::scope(|s| {
+            let classic = s.spawn(|| read(&["branches", branch, "protection"]));
+            let rules = read(&["rules", "branches", branch]);
+            (rules, classic.join().ok().flatten())
+        });
+        let rules = rules.and_then(|rules| rules.as_array().cloned());
+        let required = rules
+            .iter()
+            .flatten()
+            .any(|rule| rule["type"] == "pull_request")
+            || classic.is_some_and(|p| !p["required_pull_request_reviews"].is_null());
+        let kept = match required || rules.is_some() {
+            true => PROTECTION_FOR,
+            false => UNREAD_FOR,
+        };
+        self.0
+            .protections
+            .lock()
+            .insert(key, (now + kept, required));
+        required
+    }
+
+    /// Whether `id`'s request `approval` pushes past review
+    /// ([`Self::pushes_past_review`]): its repository is read only when its
+    /// words may push.
+    pub fn request_pushes_past_review(&self, id: Uuid, approval: Uuid) -> bool {
+        self.pending_of(id, approval)
+            .filter(|p| {
+                p.request
+                    .as_ref()
+                    .is_some_and(|r| crate::computer::boss::may_push(&r.input.to_string()))
+            })
+            .is_some_and(|p| self.pushes_past_review(id, &p))
+    }
+
     /// Whether a call of `id` Desk doesn't judge safe is asked, for `boss`
     /// (served from a grant) to decide: while it is at Act fully in force,
     /// a live grant of it holds the session, and the session's mode, as
@@ -2282,30 +2444,75 @@ fn has_hooks(own: &std::path::Path) -> bool {
 /// How long `origin` has to say where its default branch is.
 const LS_REMOTE_WITHIN: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// [`git_line`], given `within` to answer, never asking for a password or
-/// a passphrase; `None` when it doesn't answer in time.
-fn git_line_within(
-    dir: &std::path::Path,
-    args: &[&str],
-    within: std::time::Duration,
-) -> Option<String> {
+/// How long GitHub has to say how a branch is protected.
+const GITHUB_WITHIN: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// How long what GitHub said of a branch's protection is kept.
+const PROTECTION_FOR: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+
+/// How long a branch's protection GitHub couldn't say is taken as none.
+const UNREAD_FOR: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// GitHub's REST path for `repo` and `tail`, each of `tail` one segment
+/// however it is spelled (a branch's `#`, `%` or `/`).
+fn github_path(repo: &crate::repos::Repo, tail: &[&str]) -> String {
+    let mut url = url::Url::parse("https://api.github.com").expect("a base");
+    url.path_segments_mut()
+        .expect("a base")
+        .extend(["repos", repo.owner.as_str(), repo.name.as_str()])
+        .extend(tail);
+    url.path().trim_start_matches('/').to_string()
+}
+
+/// What a push from `dir` reads of its repository
+/// ([`crate::computer::boss::Pushing`]): none outside one.
+fn pushing_from(dir: &std::path::Path) -> Option<crate::computer::boss::Pushing> {
+    git_line(dir, &["rev-parse", "--show-toplevel"])?;
+    let default_branch = git_line(
+        dir,
+        &["symbolic-ref", "--short", "-q", "refs/remotes/origin/HEAD"],
+    )
+    .map(|d| d.strip_prefix("origin/").map(str::to_string).unwrap_or(d));
+    let published = default_branch.as_deref().is_some_and(|d| {
+        git_line(
+            dir,
+            &[
+                "rev-parse",
+                "-q",
+                "--verify",
+                &format!("refs/remotes/origin/{d}"),
+            ],
+        )
+        .is_some()
+    });
+    let pulls_into = git_line(dir, &["remote", "get-url", "--push", "origin"])
+        .as_deref()
+        .and_then(crate::repos::repo_of)
+        .filter(|r| published && r.host == "github.com");
+    Some(crate::computer::boss::Pushing {
+        branch: git_line(dir, &["symbolic-ref", "--short", "-q", "HEAD"]),
+        default_branch,
+        push_to: push_to(dir),
+        pulls_into,
+    })
+}
+
+/// What `cmd` prints, read as it prints it, once it ends well before
+/// `until`: none when it fails, or is killed for taking longer.
+fn output_until(mut cmd: std::process::Command, until: std::time::Instant) -> Option<String> {
     use std::io::Read;
-    let mut cmd = std::process::Command::new("git");
-    cmd.arg("-C")
-        .arg(dir)
-        .args(args)
-        .env("GIT_TERMINAL_PROMPT", "0")
+    let mut child = cmd
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null());
-    if std::env::var_os("GIT_SSH_COMMAND").is_none() {
-        cmd.env(
-            "GIT_SSH_COMMAND",
-            "ssh -o BatchMode=yes -o ConnectTimeout=5",
-        );
-    }
-    let mut child = cmd.spawn().ok()?;
-    let until = std::time::Instant::now() + within;
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .ok()?;
+    let mut stdout = child.stdout.take()?;
+    let (said, heard) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut out = String::new();
+        let _ = said.send(stdout.read_to_string(&mut out).map(|_| out));
+    });
     loop {
         match child.try_wait() {
             Ok(Some(status)) if status.success() => break,
@@ -2318,8 +2525,31 @@ fn git_line_within(
             Ok(None) => std::thread::sleep(std::time::Duration::from_millis(25)),
         }
     }
-    let mut out = String::new();
-    child.stdout.take()?.read_to_string(&mut out).ok()?;
+    heard
+        .recv_timeout(until.saturating_duration_since(std::time::Instant::now()))
+        .ok()?
+        .ok()
+}
+
+/// [`git_line`], given `within` to answer, never asking for a password or
+/// a passphrase; `None` when it doesn't answer in time.
+fn git_line_within(
+    dir: &std::path::Path,
+    args: &[&str],
+    within: std::time::Duration,
+) -> Option<String> {
+    let mut cmd = std::process::Command::new("git");
+    cmd.arg("-C")
+        .arg(dir)
+        .args(args)
+        .env("GIT_TERMINAL_PROMPT", "0");
+    if std::env::var_os("GIT_SSH_COMMAND").is_none() {
+        cmd.env(
+            "GIT_SSH_COMMAND",
+            "ssh -o BatchMode=yes -o ConnectTimeout=5",
+        );
+    }
+    let out = output_until(cmd, std::time::Instant::now() + within)?;
     let line = out.lines().next().unwrap_or_default().trim().to_string();
     (!line.is_empty()).then_some(line)
 }

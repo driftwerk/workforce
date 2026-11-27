@@ -8,7 +8,7 @@ use serde_json::{json, Value};
 use uuid::Uuid;
 use workforce_postgres::test_support::with_test_pool;
 
-use super::super::tests::{desk, new_session, went_in};
+use super::super::tests::{desk, desk_on, new_session, options, went_in};
 use super::*;
 use crate::computer::boss::PushKind;
 use crate::line::{Delivery, Send, Target, Wait, When};
@@ -1816,41 +1816,75 @@ async fn a_boss_acting_fully_cancels_only_the_requests_it_decides() {
     .await;
 }
 
-/// A session started to review a pull request is asked for its verdict on
-/// the head it was given, and linked to that pull request before it runs.
+/// `base/web`, a repository two commits deep: git run in it, and its
+/// first commit, the head its pull request is reviewed at.
+fn reviewed_repo(base: &std::path::Path) -> (std::path::PathBuf, String) {
+    let repo = base.join("web");
+    std::fs::create_dir_all(&repo).unwrap();
+    git_in(&repo, &["init", "-q", "-b", "main"]);
+    git_in(&repo, &["commit", "-q", "--allow-empty", "-m", "one"]);
+    let head = git_in(&repo, &["rev-parse", "HEAD"]);
+    git_in(&repo, &["commit", "-q", "--allow-empty", "-m", "two"]);
+    (repo, head)
+}
+
+fn git_in(dir: &std::path::Path, args: &[&str]) -> String {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(["-c", "user.email=d@e", "-c", "user.name=d"])
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    String::from_utf8(out.stdout).unwrap().trim().to_string()
+}
+
+fn review_of(head: &str, for_session: Option<Uuid>) -> crate::plan::ReviewOf {
+    crate::plan::ReviewOf {
+        pr: crate::plan::PrRef::new("acme", "web", 7),
+        head_sha: head.into(),
+        for_session,
+    }
+}
+
+/// A review session is asked for its verdict at the head it reviews, and
+/// linked to its pull request for the session whose work it is; one named
+/// by a short head is refused.
 #[tokio::test]
 async fn a_review_session_is_asked_for_its_verdict_and_linked_to_its_pull_request() {
-    use crate::plan::{review_instruction, PrRef, ReviewOf};
+    use crate::plan::{review_instruction, ReviewLink};
     with_test_pool(build_pool, |pool| async move {
         let dir = tempfile::tempdir().unwrap();
-        let d = desk(pool, dir.path()).await;
-        let head = "0123456789abcdef0123456789abcdef01234567";
-        let pr = PrRef {
-            owner: "acme".into(),
-            repo: "web".into(),
-            number: 42,
-        };
+        let base = std::fs::canonicalize(dir.path()).unwrap();
+        let (repo, head) = reviewed_repo(&base);
+        let d = desk(pool, &base).await;
         let by = || By::manager("sarah", "Sarah", "Review it.");
-        let mut new = start_in(dir.path(), None);
-        new.prompt = Some("Review pull request 42.".into());
-        new.review_of = Some(ReviewOf {
-            pr: pr.clone(),
-            head_sha: head.into(),
-        });
+        let mut new = start_in(&repo, None);
+        new.prompt = Some("Review pull request 7.".into());
+        let work = Uuid::new_v4();
+        new.review_of = Some(review_of(&head, Some(work)));
         let s = d.create_for(new, &sarah(), by()).await.unwrap();
         assert_eq!(
             d.view(s.id).unwrap().last_prompt,
             Some(format!(
-                "Review pull request 42.\n\n{}",
-                review_instruction(head)
+                "Review pull request 7.\n\n{}",
+                review_instruction(&head)
             ))
         );
         assert_eq!(
             d.store().pr_review_of(s.id).await.unwrap(),
-            Some((sarah().id, pr.clone()))
+            Some(ReviewLink {
+                session: s.id,
+                boss: sarah().id,
+                pr: crate::plan::PrRef::new("acme", "web", 7),
+                head_sha: Some(head.clone()),
+                for_session: Some(work),
+                settled: false,
+            })
         );
 
-        let mut plain = start_in(dir.path(), None);
+        let mut plain = start_in(&repo, None);
         plain.prompt = Some("Fix the date picker.".into());
         let p = d.create_for(plain, &sarah(), by()).await.unwrap();
         assert_eq!(
@@ -1859,15 +1893,395 @@ async fn a_review_session_is_asked_for_its_verdict_and_linked_to_its_pull_reques
         );
         assert_eq!(d.store().pr_review_of(p.id).await.unwrap(), None);
 
-        let mut short = start_in(dir.path(), None);
-        short.review_of = Some(ReviewOf {
-            pr,
-            head_sha: head[..12].into(),
-        });
+        let mut short = start_in(&repo, None);
+        short.review_of = Some(review_of(&head[..12], None));
         assert!(matches!(
             d.create_for(short, &sarah(), by()).await,
             Err(DeskError::Invalid(_))
         ));
+    })
+    .await;
+}
+
+/// A review is read in a worktree of its own, detached at the head it
+/// reviews and named for it, whatever worktree its boss names, a ticket's
+/// own among them; a second review of that head is refused while the
+/// first is open, and may start once it is closed.
+#[tokio::test]
+async fn a_review_reads_its_head_in_a_detached_worktree_and_one_head_has_one_open_review() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(dir.path()).unwrap();
+        let (repo, head) = reviewed_repo(&base);
+        let d = desk(pool, &base).await;
+        let by = || By::manager("sarah", "Sarah", "Review it.");
+        let mut ticket = start_in(&repo, None);
+        ticket.worktree = Some("des-1".into());
+        let ticket = d.create_for(ticket, &sarah(), by()).await.unwrap();
+        let review = || {
+            let mut new = start_in(&repo, None);
+            new.worktree = Some("des-1".into());
+            new.review_of = Some(review_of(&head, Some(ticket.id)));
+            new
+        };
+        let s = d.create_for(review(), &sarah(), by()).await.unwrap();
+        let folder = repo.join(format!(".worktrees/review-7-{}", &head[..7]));
+        assert_eq!(s.cwd, folder.to_string_lossy(), "never the ticket's own");
+        assert_eq!(s.branch, None);
+        assert_eq!(git_in(&folder, &["rev-parse", "HEAD"]), head);
+        assert_eq!(git_in(&folder, &["branch", "--show-current"]), "");
+
+        let again = d.create_for(review(), &sarah(), by()).await.unwrap_err();
+        assert!(
+            matches!(&again, DeskError::Conflict(why) if why.contains("at that head already")),
+            "{again:?}"
+        );
+        d.end(s.id, Some(by())).await.unwrap();
+        let next = d.create_for(review(), &sarah(), by()).await.unwrap();
+        assert_eq!(next.cwd, s.cwd, "its worktree found again at the head");
+    })
+    .await;
+}
+
+/// A review whose session doesn't start leaves nothing behind: no link,
+/// and no worktree it made; one it found there already stays.
+#[tokio::test]
+async fn a_review_that_doesnt_start_leaves_no_link_and_no_worktree_it_made() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(dir.path()).unwrap();
+        let (repo, head) = reviewed_repo(&base);
+        crate::store::DeskStore::migrate(&pool).await.unwrap();
+        let mut opts = super::super::tests::options(&base);
+        let nowhere = base.join("no-such-claude");
+        opts.programs = crate::testing::programs(nowhere.clone(), nowhere);
+        let d = Desk::start(
+            crate::store::DeskStore::from_pool(pool),
+            opts,
+            Default::default(),
+            tokio_util::sync::CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        let by = || By::manager("sarah", "Sarah", "Review it.");
+        let review = || {
+            let mut new = start_in(&repo, None);
+            new.review_of = Some(review_of(&head, None));
+            new
+        };
+        let folder = repo.join(format!(".worktrees/review-7-{}", &head[..7]));
+        d.create_for(review(), &sarah(), by()).await.unwrap_err();
+        assert!(!folder.exists(), "the worktree it made is removed");
+        assert!(d
+            .store()
+            .pr_reviews_at(
+                &sarah().id,
+                &crate::plan::PrRef::new("acme", "web", 7),
+                &head
+            )
+            .await
+            .unwrap()
+            .is_empty());
+
+        git_in(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "--detach",
+                &folder.to_string_lossy(),
+                &head,
+            ],
+        );
+        d.create_for(review(), &sarah(), by()).await.unwrap_err();
+        assert!(folder.exists(), "one it found stays");
+    })
+    .await;
+}
+
+/// A session's own merge is refused before it runs while a boss acting
+/// fully has it, in a mode that asks nothing too, and whatever else the
+/// command runs; not while the person is in it, nor under a boss that
+/// doesn't act fully, nor what only reads.
+#[tokio::test]
+async fn a_sessions_own_merge_is_refused_before_it_runs_under_a_boss_acting_fully() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk(pool, dir.path()).await;
+        let call = |command: &str| {
+            json!({"hook_event_name": "PreToolUse", "permission_mode": "bypassPermissions",
+                "tool_name": "Bash", "tool_use_id": "toolu_1", "tool_input": {"command": command}})
+        };
+        let refused = |answer: &Value| answer["hookSpecificOutput"]["permissionDecision"] == "deny";
+        let s = d.create(start_in(dir.path(), None), None).await.unwrap();
+        idle(&d, s.id).await;
+        d.take_on(s.id, &sarah(), How::Handed, &Default::default(), &By::you())
+            .await
+            .unwrap();
+        let merge = "git push && gh pr merge 7 --squash";
+        assert!(
+            !refused(&hook(&d, s.id, call(merge)).await),
+            "she doesn't act fully"
+        );
+
+        d.set_full(HashMap::from([(
+            sarah().id,
+            charge::FullGrant {
+                anywhere: true,
+                unbound: true,
+                ..Default::default()
+            },
+        )]));
+        let answer = hook(&d, s.id, call(merge)).await;
+        assert!(refused(&answer), "{answer}");
+        let why = answer["hookSpecificOutput"]["permissionDecisionReason"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(
+            why.contains(crate::plan::OWN_MERGE) && why.contains(crate::plan::OWN_MERGE_INSTEAD),
+            "{why}"
+        );
+        assert!(!refused(&hook(&d, s.id, call("gh pr view 7")).await));
+        let token = d.0.state.lock().live[&s.id].token.clone();
+        assert_eq!(
+            d.gh_asked(s.id, &token, "gh 'pr' 'merge' '7'").await,
+            Some(Some(crate::plan::own_merge_refused())),
+            "a Codex session's gh is told the same"
+        );
+        assert_eq!(
+            d.gh_asked(s.id, "not-its-token", "gh pr merge 7").await,
+            None
+        );
+
+        d.person_typing(s.id).unwrap();
+        assert!(
+            !refused(&hook(&d, s.id, call(merge)).await),
+            "the person is in it"
+        );
+    })
+    .await;
+}
+
+/// `base/name` on `feat/x` off `main`, its `origin` at `url`; `origin`
+/// has `main` already, as its `origin/HEAD`, when `published`.
+fn pushing_repo(
+    base: &std::path::Path,
+    name: &str,
+    url: &str,
+    published: Option<&str>,
+) -> std::path::PathBuf {
+    let repo = base.join(name);
+    std::fs::create_dir_all(&repo).unwrap();
+    git_in(&repo, &["init", "-q", "-b", published.unwrap_or("main")]);
+    git_in(&repo, &["commit", "-q", "--allow-empty", "-m", "one"]);
+    git_in(&repo, &["remote", "add", "origin", url]);
+    if let Some(default) = published {
+        let tip = format!("refs/remotes/origin/{default}");
+        git_in(&repo, &["update-ref", &tip, "HEAD"]);
+        git_in(&repo, &["symbolic-ref", "refs/remotes/origin/HEAD", &tip]);
+    }
+    git_in(&repo, &["switch", "-q", "-c", "feat/x"]);
+    repo
+}
+
+/// A `gh` under `base` whose `gh api <endpoint>` prints what `answers`
+/// gives that endpoint and fails for any other, each endpoint it is asked
+/// written to `base`'s `asked`; the folder it is in.
+fn gh_answering(base: &std::path::Path, answers: &[(&str, &str)]) -> std::path::PathBuf {
+    let tools = base.join("tools");
+    let said = base.join("github");
+    std::fs::create_dir_all(&said).unwrap();
+    std::fs::create_dir_all(&tools).unwrap();
+    for (endpoint, answer) in answers {
+        std::fs::write(said.join(endpoint.replace('/', "_")), answer).unwrap();
+    }
+    workforce_common::executable::write(
+        &tools.join("gh"),
+        format!(
+            "#!/bin/sh\necho \"$2\" >> '{}'\nf='{}'/$(printf %s \"$2\" | tr / _)\n[ \"$1\" = api ] && [ -f \"$f\" ] && exec cat \"$f\"\nexit 1\n",
+            base.join("asked").display(),
+            said.display()
+        ),
+    )
+    .unwrap();
+    tools
+}
+
+/// Under a boss acting fully, a push straight to a default branch GitHub
+/// requires a pull request for (by a ruleset or its classic protection)
+/// is refused before it runs, in a mode that asks nothing, GitHub asked
+/// once for a while; one GitHub doesn't protect so, or can't say about, a
+/// release branch, a repository that isn't on GitHub, or its first push
+/// isn't, nor anything while the person is in the session.
+#[tokio::test]
+async fn a_push_straight_to_a_default_branch_github_protects_is_refused_before_it_runs() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(dir.path()).unwrap();
+        let tools = gh_answering(
+            &base,
+            &[
+                (
+                    "repos/acme/web/rules/branches/main",
+                    r#"[{"type":"deletion"},{"type":"pull_request","parameters":{}}]"#,
+                ),
+                ("repos/acme/classic/rules/branches/main", "[]"),
+                (
+                    "repos/acme/classic/branches/main/protection",
+                    r#"{"required_pull_request_reviews":{"required_approving_review_count":1}}"#,
+                ),
+                ("repos/acme/checked/rules/branches/main", "[]"),
+                (
+                    "repos/acme/checked/branches/main/protection",
+                    r#"{"required_status_checks":{"strict":true,"contexts":["ci"]}}"#,
+                ),
+                ("repos/acme/open/rules/branches/main", "[]"),
+                (
+                    "repos/acme/hash/rules/branches/main%231%25",
+                    r#"[{"type":"pull_request","parameters":{}}]"#,
+                ),
+            ],
+        );
+        let mut o = options(&base);
+        o.env
+            .insert("PATH".into(), format!("{}:/usr/bin:/bin", tools.display()));
+        let d = desk_on(pool, o).await;
+        d.boss_bounds_with(crate::charge::Bounds {
+            home: base.clone(),
+            ..Default::default()
+        });
+        d.set_full(HashMap::from([(
+            sarah().id,
+            charge::FullGrant {
+                anywhere: true,
+                unbound: true,
+                ..Default::default()
+            },
+        )]));
+        let session = async |repo: &std::path::Path| {
+            let s = d.create(start_in(repo, None), None).await.unwrap();
+            idle(&d, s.id).await;
+            d.take_on(s.id, &sarah(), How::Handed, &Default::default(), &By::you())
+                .await
+                .unwrap();
+            s.id
+        };
+        let refused = async |id: Uuid, command: &str| {
+            let call = json!({"hook_event_name": "PreToolUse", "permission_mode": "bypassPermissions",
+                "tool_name": "Bash", "tool_use_id": "toolu_1", "tool_input": {"command": command}});
+            let answer = hook(&d, id, call).await;
+            (answer["hookSpecificOutput"]["permissionDecision"] == "deny").then(|| {
+                answer["hookSpecificOutput"]["permissionDecisionReason"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string()
+            })
+        };
+        let github = |name: &str| format!("https://github.com/acme/{name}.git");
+        let web = session(&pushing_repo(&base, "web", &github("web"), Some("main"))).await;
+        for _ in 0..2 {
+            assert_eq!(
+                refused(web, "git push origin HEAD:main").await,
+                Some(crate::plan::default_push_refused())
+            );
+        }
+        let asked = std::fs::read_to_string(base.join("asked")).unwrap();
+        let mut asked: Vec<&str> = asked.lines().collect();
+        asked.sort_unstable();
+        assert_eq!(
+            asked,
+            [
+                "repos/acme/web/branches/main/protection",
+                "repos/acme/web/rules/branches/main",
+            ],
+            "GitHub asked once"
+        );
+        assert_eq!(
+            refused(web, "timeout 60 sh -c 'git -C . push origin main'").await,
+            Some(crate::plan::default_push_refused()),
+            "however it is run"
+        );
+        assert_eq!(refused(web, "git push origin feat/x").await, None);
+        assert_eq!(
+            refused(web, "git push origin HEAD:release-2026").await,
+            None,
+            "a release branch isn't the default one"
+        );
+        let local = base.join("origin.git").to_string_lossy().into_owned();
+        let elsewhere = session(&pushing_repo(&base, "api", &local, Some("main"))).await;
+        assert_eq!(
+            refused(elsewhere, "git push origin HEAD:main").await,
+            None,
+            "no pull requests where it isn't on GitHub"
+        );
+        for (name, refusal, what) in [
+            ("classic", Some(crate::plan::default_push_refused()), "classic protection"),
+            ("checked", None, "protected without pull requests"),
+            ("open", None, "unprotected"),
+            ("down", None, "GitHub can't say"),
+        ] {
+            let id = session(&pushing_repo(&base, name, &github(name), Some("main"))).await;
+            assert_eq!(refused(id, "git push origin HEAD:main").await, refusal, "{what}");
+        }
+        let hash = pushing_repo(&base, "hash", &github("hash"), Some("main#1%"));
+        let hash = session(&hash).await;
+        assert_eq!(
+            refused(hash, "git push origin HEAD:main#1%").await,
+            Some(crate::plan::default_push_refused()),
+            "a branch GitHub is asked about however it is spelled"
+        );
+
+        // `git -C` and a `cd` before it push from the repository they lead
+        // to, from where the session runs; from a folder that isn't one,
+        // the session's own.
+        std::fs::create_dir_all(base.join("plain")).unwrap();
+        for (id, command, refusal, what) in [
+            (web, "git -C ../open push origin HEAD:main", None, "an unprotected one"),
+            (
+                elsewhere,
+                "git -C ../web push origin HEAD:main",
+                Some(crate::plan::default_push_refused()),
+                "a protected one",
+            ),
+            (
+                web,
+                "git -C ../plain push origin HEAD:main",
+                Some(crate::plan::default_push_refused()),
+                "not a repository",
+            ),
+            (elsewhere, "git -C ../plain push origin HEAD:main", None, "not a repository"),
+            (
+                elsewhere,
+                "cd ../web && git push origin HEAD:main",
+                Some(crate::plan::default_push_refused()),
+                "a cd to a protected one",
+            ),
+            (web, "cd ../open; git push origin HEAD:main", None, "a cd to an unprotected one"),
+        ] {
+            assert_eq!(refused(id, command).await, refusal, "{what}: {command}");
+        }
+
+        let fresh = session(&pushing_repo(&base, "new", &github("new"), None)).await;
+        assert_eq!(
+            refused(fresh, "git push origin HEAD:main").await,
+            None,
+            "a new repository's first push"
+        );
+
+        d.0.state.lock().live.get_mut(&web).unwrap().moved = true;
+        assert_eq!(
+            refused(web, "git push origin HEAD:main").await,
+            Some(crate::plan::default_push_refused()),
+            "where it runs unknown: the session's folder"
+        );
+
+        d.person_typing(web).unwrap();
+        assert_eq!(
+            refused(web, "git push origin HEAD:main").await,
+            None,
+            "the person is in it"
+        );
     })
     .await;
 }
@@ -1924,5 +2338,83 @@ fn git_says_its_own_commands_and_those_the_sessions_shell_finds() {
     assert_eq!(
         super::git_commands("/nonexistent/sh", work.path(), &env),
         None
+    );
+}
+
+/// A desk whose environment Desk Helper says is the person's login one
+/// ([`super::super::LOGIN_ENV_READ`]) when `read`.
+async fn desk_read(
+    pool: workforce_postgres::PostgresPool,
+    dir: &std::path::Path,
+    read: bool,
+) -> Desk {
+    let mut o = options(dir);
+    if read {
+        o.env
+            .insert(super::super::LOGIN_ENV_READ.into(), "1".into());
+    }
+    desk_on(pool, o).await
+}
+
+/// Where Desk Helper read the login environment, a Codex session a boss
+/// starts runs its commands in a plain shell, its `gh` Desk's whatever the
+/// profiles say; the person's own in their login shell; and what said so
+/// is never passed on.
+#[tokio::test]
+async fn only_a_session_a_boss_starts_runs_its_commands_in_a_plain_shell() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk_read(pool, dir.path(), true).await;
+        assert!(!d.login_env().contains_key(super::super::LOGIN_ENV_READ));
+        let by = By::manager("sarah", "Sarah", "Acme's web upgrade");
+        let started = d
+            .create_for(start_in(dir.path(), None), &sarah(), by)
+            .await
+            .unwrap();
+        assert_eq!(
+            d.command_shell(started.id),
+            crate::codex::CommandShell::Plain
+        );
+        let own = d.create(start_in(dir.path(), None), None).await.unwrap();
+        assert_eq!(d.command_shell(own.id), crate::codex::CommandShell::Login);
+    })
+    .await;
+}
+
+/// Where Desk Helper didn't say it read the login environment (a hub run
+/// by hand, an older Desk Helper, a login shell it couldn't read), even a
+/// session a boss starts keeps the login shell, its commands finding the
+/// person's tools.
+#[tokio::test]
+async fn a_login_environment_desk_helper_didnt_read_keeps_the_login_shell() {
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let d = desk_read(pool, dir.path(), false).await;
+        let by = By::manager("sarah", "Sarah", "Acme's web upgrade");
+        let started = d
+            .create_for(start_in(dir.path(), None), &sarah(), by)
+            .await
+            .unwrap();
+        assert_eq!(
+            d.command_shell(started.id),
+            crate::codex::CommandShell::Login
+        );
+    })
+    .await;
+}
+
+/// A command's output is read as it prints it, so one that prints more
+/// than a pipe holds ends, and is heard whole, long before its deadline.
+#[test]
+fn a_long_answer_is_read_as_it_is_printed() {
+    let mut cmd = std::process::Command::new("sh");
+    cmd.args(["-c", "head -c 300000 /dev/zero | tr '\\0' a"]);
+    let started = std::time::Instant::now();
+    let out = super::output_until(cmd, started + Duration::from_secs(20)).unwrap();
+    assert_eq!(out.len(), 300_000);
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "{:?}",
+        started.elapsed()
     );
 }

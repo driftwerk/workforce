@@ -7,8 +7,9 @@
 //! whatever can't be read for certain, is [`Class::Other`].
 
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 
-use super::{push, split, Cmd, Here, PushKind, Walk, Word};
+use super::{push, split, Cmd, Here, Join, PushKind, Walk, Word};
 
 crate::model::text_enum!(Class {
     LocalGit => "local_git",
@@ -238,6 +239,17 @@ fn part(cmd: &Cmd, here: &Here<'_>, repo: &Repo<'_>, depth: usize, moved: bool) 
     if writes || !plain_env || words.iter().any(|w| w.glob) {
         return Some(Class::Other);
     }
+    // A wrapper's command is its own risk, never what a standing verdict
+    // answers.
+    let wrapped = unwrapped(words);
+    if wrapped > 0 {
+        let inner = Cmd {
+            join: cmd.join,
+            words: words[wrapped..].to_vec(),
+            redirects: Vec::new(),
+        };
+        return part(&inner, here, repo, depth, moved).map(own_risk);
+    }
     let (program, args) = words.split_first()?;
     let args = texts(args);
     let Some(name) = program_name(&program.text) else {
@@ -246,24 +258,208 @@ fn part(cmd: &Cmd, here: &Here<'_>, repo: &Repo<'_>, depth: usize, moved: bool) 
     Some(match name {
         "true" | ":" | "echo" | "printf" | "pwd" => return None,
         "git" => git(args.as_slice(), here, repo, depth, moved),
-        "sh" | "bash" | "zsh" => match args.as_slice() {
-            [flag, script] if is_c_flag(flag) => classed(script, here, repo, depth + 1),
-            _ => Class::Other,
-        },
-        "eval" if !args.is_empty() => classed(&args.join(" "), here, repo, depth + 1),
         "gh" => gh(args.as_slice(), here),
-        name => build(name, args.as_slice())
-            .or_else(|| install(name, args.as_slice()))
-            .or_else(|| shipping(name, args.as_slice()))
-            .unwrap_or(Class::Other),
+        name => match (scripted(name, &args), name) {
+            (Some(script), "sh" | "bash" | "zsh" | "eval") => {
+                classed(&script, here, repo, depth + 1)
+            }
+            (Some(script), _) => own_risk(classed(&script, here, repo, depth + 1)),
+            (None, "sh" | "bash" | "zsh") => Class::Other,
+            (None, _) => build(name, args.as_slice())
+                .or_else(|| install(name, args.as_slice()))
+                .or_else(|| shipping(name, args.as_slice()))
+                .unwrap_or(Class::Other),
+        },
     })
 }
 
-/// `-c`, with the login and interactive flags a shell runs a script under
-/// (`-lc`, `-ic`, `-lic`).
-fn is_c_flag(flag: &str) -> bool {
-    flag.strip_prefix('-')
-        .is_some_and(|f| f.ends_with('c') && f.chars().all(|c| matches!(c, 'c' | 'l' | 'i')))
+/// What a command another runs is classed as: its own risk, never a step
+/// a standing verdict answers.
+fn own_risk(class: Class) -> Class {
+    match class.cacheable() {
+        true => Class::Other,
+        false => class,
+    }
+}
+
+/// The command line `name` given `args` runs, when it runs one: a shell's
+/// `-c` ([`shell_script`]), `eval`'s words, `env`'s split string ([`env_split`]),
+/// `flock`'s `-c`, and `find`'s `-exec` ([`find_execs`]).
+fn scripted(name: &str, args: &[&str]) -> Option<String> {
+    match name {
+        "sh" | "bash" | "zsh" => shell_script(args).map(str::to_string),
+        "eval" => (!args.is_empty()).then(|| args.join(" ")),
+        "env" => env_split(args),
+        "flock" => args.iter().enumerate().find_map(|(at, a)| match *a {
+            "-c" | "--command" => args.get(at + 1).map(|s| s.to_string()),
+            _ => a.strip_prefix("--command=").map(str::to_string),
+        }),
+        "find" => find_execs(args),
+        _ => None,
+    }
+}
+
+/// The command line `env` given `args` runs from its split string (`-S
+/// 'gh pr merge'`, `-S'…'`, `--split-string=…`), with what follows it as
+/// its arguments: none when it has none.
+fn env_split(args: &[&str]) -> Option<String> {
+    let mut it = args.iter().copied();
+    while let Some(a) = it.next() {
+        let split = match a {
+            "-u" | "--unset" | "-C" | "--chdir" => {
+                it.next();
+                continue;
+            }
+            "-S" | "--split-string" => it.next()?,
+            _ if a.starts_with("--split-string=") => &a["--split-string=".len()..],
+            _ if a.starts_with("--") || a.starts_with("-u") || a.starts_with("-C") => continue,
+            _ if a.starts_with('-') => match a.split_once('S') {
+                Some((_, "")) => it.next()?,
+                Some((_, attached)) => attached,
+                None => continue,
+            },
+            _ if a.contains('=') => continue,
+            _ => return None,
+        };
+        let line = std::iter::once(split.to_string())
+            .chain(it.map(shell_word))
+            .collect::<Vec<_>>();
+        return Some(line.join(" "));
+    }
+    None
+}
+
+/// The commands `find` given `args` runs on what it finds (`-exec`,
+/// `-execdir`, `-ok`, `-okdir`, each to its `;`, or a `+` after `{}`), as
+/// one command line: none when it runs none.
+fn find_execs(args: &[&str]) -> Option<String> {
+    let mut execs: Vec<String> = Vec::new();
+    let mut it = args.iter().copied();
+    while let Some(a) = it.next() {
+        if matches!(a, "-exec" | "-execdir" | "-ok" | "-okdir") {
+            let mut words: Vec<&str> = Vec::new();
+            for w in it.by_ref() {
+                if w == ";" || (w == "+" && words.last() == Some(&"{}")) {
+                    break;
+                }
+                words.push(w);
+            }
+            let words: Vec<String> = words.into_iter().map(shell_word).collect();
+            execs.push(words.join(" "));
+        }
+    }
+    (!execs.is_empty()).then(|| execs.join(" ; "))
+}
+
+/// The script a shell given `args` runs with `-c`, its flags apart or
+/// together and its options read past (`sh -c`, `bash -lc`, `bash -l -o
+/// pipefail -c script name args`): none when it runs none.
+fn shell_script<'a>(args: &[&'a str]) -> Option<&'a str> {
+    let mut c = false;
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        match *a {
+            "-o" | "+o" | "-O" | "+O" => {
+                it.next();
+            }
+            _ if a.starts_with("--") || a.starts_with('+') => {}
+            _ if a.starts_with('-') => c |= a.contains('c'),
+            script => return c.then_some(script),
+        }
+    }
+    None
+}
+
+/// How many of `words` are wrappers that run the command after them
+/// (`env`, `command`, `exec`, `nohup`, `nice`, `time`, `timeout`,
+/// `xargs`, `stdbuf`, `flock`, `caffeinate`, `sudo`), with their options
+/// and what they take: none when the first isn't one, runs nothing, or
+/// runs a command line ([`scripted`]).
+fn unwrapped(words: &[Word]) -> usize {
+    let Some(name) = words.first().and_then(|w| program_name(&w.text)) else {
+        return 0;
+    };
+    if scripted(name, &texts(&words[1..])).is_some() {
+        return 0;
+    }
+    let (valued, positional): (&[&str], usize) = match name {
+        "env" => (&["-u", "--unset", "-C", "--chdir"], 0),
+        "command" | "nohup" => (&[], 0),
+        "stdbuf" => (&["-i", "--input", "-o", "--output", "-e", "--error"], 0),
+        "flock" => (
+            &["-w", "--wait", "--timeout", "-E", "--conflict-exit-code"],
+            1,
+        ),
+        "caffeinate" => (&["-t", "-w"], 0),
+        "sudo" => (
+            &[
+                "-u",
+                "--user",
+                "-g",
+                "--group",
+                "-h",
+                "--host",
+                "-p",
+                "--prompt",
+                "-C",
+                "--close-from",
+                "-D",
+                "--chdir",
+                "-r",
+                "--role",
+                "-t",
+                "--type",
+                "-T",
+                "--command-timeout",
+                "-U",
+                "--other-user",
+            ],
+            0,
+        ),
+        "exec" => (&["-a"], 0),
+        "nice" => (&["-n", "--adjustment"], 0),
+        "time" => (&["-f", "--format", "-o", "--output"], 0),
+        "timeout" => (&["-s", "--signal", "-k", "--kill-after"], 1),
+        "xargs" => (
+            &[
+                "-n",
+                "--max-args",
+                "-L",
+                "--max-lines",
+                "-I",
+                "-P",
+                "--max-procs",
+                "-d",
+                "--delimiter",
+                "-E",
+                "-s",
+                "--max-chars",
+                "-a",
+                "--arg-file",
+            ],
+            0,
+        ),
+        _ => return 0,
+    };
+    let mut at = 1;
+    while let Some(t) = words.get(at).map(|w| w.text.as_str()) {
+        match t {
+            "--" => {
+                at += 1;
+                break;
+            }
+            _ if valued.contains(&t) => at += 2,
+            _ if t.starts_with('-') || (matches!(name, "env" | "sudo") && t.contains('=')) => {
+                at += 1
+            }
+            _ => break,
+        }
+    }
+    let at = at + positional;
+    match at < words.len() {
+        true => at + unwrapped(&words[at..]),
+        false => 0,
+    }
 }
 
 /// Whether `flag` is `--amend`, as git reads a long option from any
@@ -689,60 +885,186 @@ fn gh(args: &[&str], here: &Here<'_>) -> Class {
             is(Class::GhPrCreate, own)
         }
         ["pr", "merge", ..] => Class::GhPrMerge,
-        ["api", rest @ ..] => {
-            let known = Known {
-                valued: &[
-                    "-X",
-                    "--method",
-                    "-f",
-                    "--raw-field",
-                    "-F",
-                    "--field",
-                    "-H",
-                    "--header",
-                    "--jq",
-                    "-q",
-                    "--template",
-                    "-t",
-                    "--cache",
-                    "--hostname",
-                    "-p",
-                    "--preview",
-                ],
-                bare: &[
-                    "--paginate",
-                    "--slurp",
-                    "-i",
-                    "--include",
-                    "--silent",
-                    "--verbose",
-                ],
-            };
-            let Some((flags, ops)) = known.read(rest) else {
-                return Class::Other;
-            };
-            let methods: Vec<&str> = flags
-                .iter()
-                .filter(|(n, _)| matches!(*n, "-X" | "--method"))
-                .filter_map(|(_, v)| *v)
-                .collect();
-            // A field makes gh send a POST unless a GET is named, and the
-            // last method named is the one it sends.
-            let fields = flags
-                .iter()
-                .any(|(n, _)| matches!(*n, "-f" | "--raw-field" | "-F" | "--field"));
-            let reads = match methods.last() {
-                Some(m) => m.eq_ignore_ascii_case("GET"),
-                None => !fields,
-            };
-            let graphql = ops
-                .first()
-                .is_none_or(|e| e.trim_start_matches('/') == "graphql");
-            is(Class::GhRead, reads && ops.len() == 1 && !graphql)
-        }
+        ["api", rest @ ..] => gh_api(rest),
         ["workflow", "run", ..] | ["release", "create", ..] => Class::Deploy,
         _ => Class::Other,
     }
+}
+
+/// `gh api`'s `rest`: a read only it reads, the merge of a pull request
+/// by GitHub's REST or GraphQL API, else [`Class::Other`].
+fn gh_api(rest: &[&str]) -> Class {
+    let is = |c: Class, ok: bool| if ok { c } else { Class::Other };
+    let known = Known {
+        valued: &[
+            "-X",
+            "--method",
+            "-f",
+            "--raw-field",
+            "-F",
+            "--field",
+            "-H",
+            "--header",
+            "--jq",
+            "-q",
+            "--template",
+            "-t",
+            "--cache",
+            "--hostname",
+            "-p",
+            "--preview",
+        ],
+        bare: &[
+            "--paginate",
+            "--slurp",
+            "-i",
+            "--include",
+            "--silent",
+            "--verbose",
+        ],
+    };
+    let Some((flags, ops)) = known.read(rest) else {
+        return Class::Other;
+    };
+    let methods: Vec<&str> = flags
+        .iter()
+        .filter(|(n, _)| matches!(*n, "-X" | "--method"))
+        .filter_map(|(_, v)| *v)
+        .collect();
+    // A field makes gh send a POST unless a GET is named, and the
+    // last method named is the one it sends.
+    let fields = flags
+        .iter()
+        .any(|(n, _)| matches!(*n, "-f" | "--raw-field" | "-F" | "--field"));
+    let reads = match methods.last() {
+        Some(m) => m.eq_ignore_ascii_case("GET"),
+        None => !fields,
+    };
+    let graphql = ops
+        .first()
+        .is_none_or(|e| e.trim_start_matches('/') == "graphql");
+    // GraphQL's merge names its mutation in a field: `-f query=…`.
+    let merges_by_graphql = graphql
+        && flags.iter().any(|(n, v)| {
+            matches!(*n, "-f" | "--raw-field" | "-F" | "--field")
+                && v.is_some_and(|v| v.contains("mergePullRequest"))
+        });
+    match ops[..] {
+        [e] if !reads && merges(e) => Class::GhPrMerge,
+        _ if merges_by_graphql => Class::GhPrMerge,
+        _ => is(Class::GhRead, reads && ops.len() == 1 && !graphql),
+    }
+}
+
+/// Whether `gh` run with `args` merges a pull request ([`gh`]'s
+/// [`Class::GhPrMerge`]).
+fn gh_merges(args: &[&str]) -> bool {
+    match args {
+        ["pr", "merge", ..] => true,
+        ["api", rest @ ..] => gh_api(rest) == Class::GhPrMerge,
+        _ => false,
+    }
+}
+
+/// Whether any command in `command` merges a pull request with `gh` (`gh
+/// pr merge`, GitHub's REST merge or its GraphQL `mergePullRequest`),
+/// wherever it runs ([`runs`]): what Desk refuses a session before it
+/// runs while a boss acting fully has it.
+pub fn merges_a_pull(command: &str) -> bool {
+    runs(command, &|_, program, args| {
+        program == "gh" && gh_merges(args)
+    })
+}
+
+/// Whether `found` holds for a program, its arguments and the folder it
+/// runs in, that `command` runs: chained, in a shell (`sh -c`, `eval`) or
+/// by a wrapper (`env`, `xargs`, `timeout`, [`unwrapped`]). Its folder is
+/// where the `cd`s before it in the line lead, each from the one before,
+/// when it follows them with `&&` or `;`: none, where the line starts.
+/// What can't be read as plain commands is never said to.
+pub(super) fn runs(command: &str, found: &dyn Fn(Option<&Path>, &str, &[&str]) -> bool) -> bool {
+    runs_within(command, None, 0, found)
+}
+
+fn runs_within(
+    command: &str,
+    dir: Option<&Path>,
+    depth: usize,
+    found: &dyn Fn(Option<&Path>, &str, &[&str]) -> bool,
+) -> bool {
+    if depth > DEPTH {
+        return false;
+    }
+    let Ok(cmds) = split(command) else {
+        return false;
+    };
+    let mut here = dir.map(Path::to_path_buf);
+    let mut moved: Option<PathBuf> = None;
+    for cmd in &cmds {
+        if let Some(to) = moved.take() {
+            if matches!(cmd.join, Join::And | Join::Seq) {
+                here = Some(to);
+            }
+        }
+        let words = run_words(cmd);
+        let Some((program, args)) = words.split_first() else {
+            continue;
+        };
+        let runs = match program_name(program) {
+            Some("cd") => {
+                moved = cd_to(args).map(|to| match &here {
+                    Some(h) => h.join(to),
+                    None => PathBuf::from(to),
+                });
+                false
+            }
+            Some(name) => match scripted(name, args) {
+                Some(script) => runs_within(&script, here.as_deref(), depth + 1, found),
+                None => found(here.as_deref(), name, args),
+            },
+            None => false,
+        };
+        if runs {
+            return true;
+        }
+    }
+    false
+}
+
+/// The words `cmd` runs: past what it sets (`A=b`) and its wrappers
+/// ([`unwrapped`]).
+fn run_words(cmd: &Cmd) -> Vec<&str> {
+    let env = cmd
+        .words
+        .iter()
+        .take_while(|w| super::assigned(w).is_some())
+        .count();
+    let words = &cmd.words[env..];
+    texts(&words[unwrapped(words)..])
+}
+
+/// Where `cd` given `args` goes: its one folder, past its options; none
+/// for its home or the folder before (`cd`, `cd -`).
+fn cd_to<'a>(args: &[&'a str]) -> Option<&'a str> {
+    let operands: Vec<&str> = match args.iter().position(|a| *a == "--") {
+        Some(at) => args[at + 1..].to_vec(),
+        None => args
+            .iter()
+            .copied()
+            .filter(|a| !a.starts_with('-'))
+            .collect(),
+    };
+    match operands.as_slice() {
+        [to] if *to != "-" => Some(to),
+        _ => None,
+    }
+}
+
+/// Whether `endpoint` is GitHub's merge of a pull request
+/// (`repos/<owner>/<repo>/pulls/<number>/merge`).
+fn merges(endpoint: &str) -> bool {
+    let parts: Vec<&str> = endpoint.trim_matches('/').split('/').collect();
+    matches!(parts[..], ["repos", _, _, "pulls", n, "merge"] if !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
 }
 
 /// What a test run takes after its `--`: test names, and what only says
@@ -1102,6 +1424,92 @@ mod tests {
         class_with(command, false)
     }
 
+    /// A merge is found in any command of a line, chained or in a shell;
+    /// what only reads, or names a merge in words, isn't one.
+    #[test]
+    fn a_merge_is_found_wherever_a_line_runs_it() {
+        for c in [
+            "gh pr merge 7 --squash",
+            "cd web && gh pr merge 7",
+            "git push && GH_TOKEN=x gh pr merge 7 --auto",
+            "bash -lc 'gh pr merge 7 --squash'",
+            "eval gh pr merge 7",
+            "gh api -X PUT repos/acme/web/pulls/7/merge",
+            "gh api 'repos/{owner}/{repo}/pulls/7/merge' -f sha=abc",
+            "gh api graphql -f query='mutation { mergePullRequest(input: {}) { clientMutationId } }'",
+            "/usr/local/bin/gh pr merge 7",
+            "env GH_TOKEN=x gh pr merge 7",
+            "env -u GH_HOST command gh pr merge 7",
+            "echo 7 | xargs -n 1 gh pr merge --squash",
+            "timeout -s KILL 60 nohup nice -n 5 gh pr merge 7",
+            "time exec gh pr merge 7",
+            "bash -l -c 'gh pr merge 7' merging 7",
+            "sh -e -o pipefail -c 'gh pr merge 7'",
+            "env -S 'gh pr merge' 7",
+            "env -i -S'gh pr merge 7'",
+            "env --split-string='gh pr merge 7'",
+            "/usr/bin/env -vS 'GH_TOKEN=x gh pr merge 7'",
+            "stdbuf -oL -e0 gh pr merge 7",
+            "flock -w 5 /tmp/merge.lock gh pr merge 7",
+            "flock /tmp/merge.lock -c 'gh pr merge 7'",
+            "caffeinate -i -t 60 gh pr merge 7",
+            "sudo -u kat GH_TOKEN=x gh pr merge 7",
+            "find . -name x -exec gh pr merge 7 ';'",
+            "find . -execdir echo {} ';' -exec gh pr merge {} +",
+            "timeout 60 env -S 'flock /tmp/l -c \"gh pr merge 7\"'",
+        ] {
+            assert!(super::merges_a_pull(c), "{c}");
+        }
+        for c in [
+            "gh pr view 7",
+            "gh api repos/acme/web/pulls/7/merge",
+            "echo gh pr merge 7",
+            "git merge main",
+            "gh pr checks 7 && git log",
+            "gh api repos/acme/web/pulls/7/merge {",
+            "command -v gh",
+            "timeout 60",
+            "bash -l 'gh pr merge 7'",
+            "env -S 'echo gh pr merge 7'",
+            "env -u GH_TOKEN",
+            "flock /tmp/l echo gh pr merge 7",
+            "find . -name merge",
+            "find . -exec echo gh pr merge 7 ';'",
+            "sudo -l",
+        ] {
+            assert!(!super::merges_a_pull(c), "{c}");
+        }
+    }
+
+    /// A wrapped command is classed by what it runs when that is a risk
+    /// of its own, and never as a step a standing verdict answers; a
+    /// GraphQL call whose query is read from a file is the boss's to judge.
+    #[test]
+    fn a_wrapped_command_keeps_its_risk_and_never_a_standing_class() {
+        assert_eq!(class("env GH_TOKEN=x gh pr merge 7"), Class::GhPrMerge);
+        assert_eq!(
+            class("timeout 60 git push origin main"),
+            Class::DefaultBranchPush
+        );
+        assert_eq!(class("timeout 60 cargo test"), Class::Other);
+        assert_eq!(class("bash -l -c 'cargo test' tests"), Class::TestBuild);
+        for (command, want) in [
+            ("env -S 'git push origin main'", Class::DefaultBranchPush),
+            ("sudo git push origin main", Class::DefaultBranchPush),
+            ("stdbuf -oL git push origin main", Class::DefaultBranchPush),
+            ("flock /tmp/l -c 'gh pr merge 7'", Class::GhPrMerge),
+            ("find . -exec gh pr merge 7 ';'", Class::GhPrMerge),
+            ("env -S 'cargo test'", Class::Other),
+            ("caffeinate -i cargo test", Class::Other),
+            ("find . -name '*.rs' -exec cargo fmt ';'", Class::Other),
+        ] {
+            assert_eq!(class(command), want, "{command}");
+        }
+        let from_file = class("gh api graphql -F query=@merge.graphql -F id=PR_1");
+        assert_eq!(from_file, Class::Other);
+        assert!(!from_file.cacheable());
+    }
+
     #[test]
     fn only_the_branch_its_on_to_origin_is_its_own_push() {
         assert_eq!(class("git push origin feat/x"), Class::OwnBranchPush);
@@ -1294,7 +1702,27 @@ mod tests {
         assert_eq!(class("gh pr create --fill"), Class::GhPrCreate);
         assert_eq!(class("gh pr create --head feat/x"), Class::GhPrCreate);
         assert_eq!(class("gh pr create --head main"), Class::Other);
-        assert_eq!(class("gh pr merge 12 --squash"), Class::GhPrMerge);
+        for c in [
+            "gh pr merge 12 --squash",
+            "gh api -X PUT repos/acme/web/pulls/12/merge",
+            "gh api -XPUT /repos/acme/web/pulls/12/merge -f merge_method=squash",
+            "gh api 'repos/{owner}/{repo}/pulls/12/merge' -f sha=abc",
+        ] {
+            assert_eq!(class(c), Class::GhPrMerge, "{c}");
+        }
+        assert_eq!(
+            class("gh api graphql -f query='mutation { mergePullRequest(input: {pullRequestId: \"x\"}) { clientMutationId } }'"),
+            Class::GhPrMerge
+        );
+        assert_eq!(
+            class("gh api graphql -f query='query { viewer { login } }'"),
+            Class::Other
+        );
+        assert_eq!(class("gh api repos/acme/web/pulls/12/merge"), Class::GhRead);
+        assert_eq!(
+            class("gh api -X PUT repos/acme/web/pulls/12/reviews"),
+            Class::Other
+        );
         assert_eq!(class("gh workflow run deploy.yml"), Class::Deploy);
     }
 
@@ -1424,7 +1852,6 @@ mod tests {
     #[test]
     fn gh_reads_every_spelling_of_a_method_field_and_flag() {
         for c in [
-            "gh api -XPUT repos/acme/web/pulls/1/merge",
             "gh api -XDELETE repos/acme/web/git/refs/heads/main",
             "gh api -X GET -X POST repos/acme/web/issues",
             "gh api --method=GET --method=PATCH repos/acme/web",

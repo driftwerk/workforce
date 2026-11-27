@@ -617,7 +617,11 @@ async fn a_review_session_on_its_ticket_never_supersedes_the_session_it_reviews(
             .pr_review_link(
                 review.id,
                 "desk",
-                &workforce_desk::plan::PrRef::new("acme", "web", 7),
+                &workforce_desk::plan::ReviewOf {
+                    pr: workforce_desk::plan::PrRef::new("acme", "web", 7),
+                    head_sha: "1".repeat(40),
+                    for_session: Some(work.id),
+                },
             )
             .await
             .unwrap();

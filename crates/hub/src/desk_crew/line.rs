@@ -879,7 +879,7 @@ impl CrewHub {
             Level::Watch => "You only watch.",
             Level::Suggest => "You suggest: an answer you give becomes a draft the person sends.",
             Level::Act => "You may answer within what the person allowed; anything else becomes a draft for them.",
-            Level::Full => "You act fully, as the standing rule below says; your own limits stay the person's.",
+            Level::Full => "You act fully, as the standing rule below says; your own limits stay the person's. A session's pull request is merged by you with crew.github_merge, never by the session.",
         }
     }
 

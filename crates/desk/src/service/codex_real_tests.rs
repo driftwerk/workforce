@@ -57,6 +57,7 @@ type Heard = Arc<parking_lot::Mutex<Vec<Value>>>;
 async fn model(dir: &Path) -> (String, Heard) {
     let heard = Heard::default();
     let cmd = format!("touch {}", dir.join("made.txt").display());
+    let which = format!("command -v gh > {}", dir.join("gh.txt").display());
     let app = axum::Router::new().route(
         "/v1/responses",
         axum::routing::post({
@@ -78,6 +79,14 @@ async fn model(dir: &Path) -> (String, Heard) {
                         "r3",
                         json!({"type": "function_call", "call_id": "c3",
                         "name": "request_permissions", "arguments": args.to_string()}),
+                    )
+                } else if text.contains("say which gh") {
+                    let args = json!({"cmd": which, "sandbox_permissions": "require_escalated",
+                        "justification": "say which gh"});
+                    reply(
+                        "r4",
+                        json!({"type": "function_call", "call_id": "c4",
+                        "name": "exec_command", "arguments": args.to_string()}),
                     )
                 } else if text.contains("make the file") {
                     let args = json!({"cmd": cmd, "sandbox_permissions": "require_escalated",
@@ -140,6 +149,16 @@ async fn on_real_codex(
     dir: &Path,
     bin: PathBuf,
 ) -> (Desk, PathBuf, Heard) {
+    on_real_codex_on(pool, dir, bin, std::env::var("PATH").unwrap_or_default()).await
+}
+
+/// [`on_real_codex`], its sessions' `PATH` as `path` says.
+async fn on_real_codex_on(
+    pool: workforce_postgres::PostgresPool,
+    dir: &Path,
+    bin: PathBuf,
+    path: String,
+) -> (Desk, PathBuf, Heard) {
     let work = dir.join("work");
     std::fs::create_dir_all(&work).unwrap();
     let (url, heard) = model(&work).await;
@@ -147,9 +166,10 @@ async fn on_real_codex(
     codex_home(&home, &url, &work);
     let mut opts = options(dir).with_program(Engine::Codex, bin);
     opts.env = std::collections::BTreeMap::from([
-        ("PATH".into(), std::env::var("PATH").unwrap_or_default()),
+        ("PATH".into(), path),
         ("HOME".into(), dir.to_string_lossy().into_owned()),
         ("CODEX_HOME".into(), home.to_string_lossy().into_owned()),
+        (super::LOGIN_ENV_READ.into(), "1".into()),
         ("OPENAI_API_KEY".into(), "sk-test-not-real".into()),
         ("TERM".into(), "xterm-256color".into()),
     ]);
@@ -470,6 +490,94 @@ async fn the_real_codex_runs_each_typed_turn_in_what_desk_set() {
         ran_in(&d, s.id, "auto_review");
         assert_eq!(d.record(s.id).unwrap().cli_session_id, thread);
         assert_eq!(said("other permissions than Desk asked").await, 0);
+    })
+    .await;
+}
+
+/// A command a real Codex session a boss starts runs finds Desk's `gh`
+/// first, whatever the person's profiles put ahead of it on `PATH` and
+/// however Codex is set to snapshot its shell; the person's own session
+/// runs its commands in their login shell, their profiles' `gh` first.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn the_real_codex_a_boss_starts_runs_desks_gh_whatever_the_profile_puts_first() {
+    use std::os::unix::fs::PermissionsExt;
+    let Some(bin) = codex_bin() else {
+        return;
+    };
+    with_test_pool(build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let dir = dir.path().canonicalize().unwrap();
+        let gh_in = |folder: &str| {
+            let at = dir.join(folder);
+            std::fs::create_dir_all(&at).unwrap();
+            let gh = at.join("gh");
+            std::fs::write(&gh, "#!/bin/sh\n").unwrap();
+            std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+            at
+        };
+        let installed = gh_in("installed");
+        let profiled = gh_in("profiled");
+        let ahead = format!("export PATH=\"{}:$PATH\"\n", profiled.display());
+        for profile in [
+            ".profile",
+            ".bash_profile",
+            ".bash_login",
+            ".zprofile",
+            ".zlogin",
+        ] {
+            std::fs::write(dir.join(profile), &ahead).unwrap();
+        }
+        let path = format!(
+            "{}:{}",
+            installed.display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        let (d, work, heard) = on_real_codex_on(pool, &dir, bin, path).await;
+        let config = dir.join("codex-home/config.toml");
+        let snapshots = std::fs::read_to_string(&config)
+            .unwrap()
+            .replace("shell_snapshot = false", "shell_snapshot = true");
+        std::fs::write(&config, snapshots).unwrap();
+
+        let new = || {
+            let mut new = codex_session(&work, false);
+            new.prompt = Some("say which gh".into());
+            new
+        };
+        let which_gh = async |id: uuid::Uuid| {
+            until("its command asked", Duration::from_secs(60), || {
+                d.view(id).unwrap().pending.is_some_and(|p| p.answerable)
+            })
+            .await;
+            let p = d.view(id).unwrap().pending.unwrap();
+            d.decide(id, p.id, Decision::Allow, Some(By::you()))
+                .unwrap();
+            until("its turn's end", Duration::from_secs(30), || ended(&d, id)).await;
+            let gh = std::fs::read_to_string(work.join("gh.txt")).unwrap_or_else(|e| {
+                let said: Vec<String> = heard
+                    .lock()
+                    .iter()
+                    .flat_map(|b| b["input"].as_array().cloned().unwrap_or_default())
+                    .filter(|i| i["type"] == "function_call_output")
+                    .map(|i| i["output"].to_string())
+                    .collect();
+                panic!("{e}: {said:?}")
+            });
+            std::fs::remove_file(work.join("gh.txt")).unwrap();
+            gh.trim().to_string()
+        };
+        let crew = crate::crew::Party::manager("crew", "Crew");
+        let s = d
+            .create_for(new(), &crew, By::manager("crew", "Crew", "it should say"))
+            .await
+            .unwrap();
+        let gh = which_gh(s.id).await;
+        assert!(gh.ends_with(&format!("{}-bin/gh", s.id.simple())), "{gh}");
+
+        let own = d.create(new(), None).await.unwrap();
+        let gh = which_gh(own.id).await;
+        assert!(gh.ends_with("profiled/gh"), "the person's own: {gh}");
     })
     .await;
 }

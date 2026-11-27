@@ -332,19 +332,40 @@ fn toml_string(s: &str) -> String {
     format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
 }
 
+/// What shell a session's app-server runs its commands in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommandShell {
+    /// The person's login shell, its profiles read first: Codex's own.
+    Login,
+    /// A plain one, with no login shell and no snapshot of one
+    /// ([`PLAIN_SHELL`]): what the person's profiles put on `PATH` can't go
+    /// ahead of the `PATH` Desk gives it (its own `gh` first,
+    /// [`crate::gh_shim`]), which must already be the person's login one.
+    Plain,
+}
+
+/// The settings of a [`CommandShell::Plain`] (CLI 0.166).
+pub const PLAIN_SHELL: [&str; 2] = ["allow_login_shell=false", "features.shell_snapshot=false"];
+
 /// How to run a session's app-server, listening on `socket`, with Desk's
-/// line at `line` when it has one.
+/// line at `line` when it has one, its commands run in `shell`.
 pub fn app_server(
     program: &Path,
     socket: &Path,
     env: &BTreeMap<String, String>,
     line: Option<LineMcp<'_>>,
+    shell: CommandShell,
 ) -> Spawn {
     let mut args = vec![
         "app-server".to_string(),
         "--listen".into(),
         format!("unix://{}", socket.display()),
     ];
+    if shell == CommandShell::Plain {
+        for setting in PLAIN_SHELL {
+            args.extend(["-c".to_string(), setting.to_string()]);
+        }
+    }
     let mut env = env.clone();
     if let Some(line) = line {
         for setting in line_settings(line.url) {
@@ -442,9 +463,10 @@ impl AppServer {
         socket: PathBuf,
         env: &BTreeMap<String, String>,
         line: Option<LineMcp<'_>>,
+        shell: CommandShell,
     ) -> Result<Self> {
         prepare_socket(&socket).await?;
-        let spec = app_server(program, &socket, env, line);
+        let spec = app_server(program, &socket, env, line, shell);
         let child = Command::new(&spec.program)
             .args(&spec.args)
             .env_clear()
@@ -1946,6 +1968,28 @@ pub(crate) mod tests {
         );
     }
 
+    /// Only a plain command shell takes Codex's login shell and its
+    /// snapshot away.
+    #[test]
+    fn an_app_server_runs_its_commands_in_the_shell_it_is_given() {
+        let settings = |shell| {
+            let spec = app_server(
+                Path::new("/bin/codex"),
+                Path::new("/run/s.sock"),
+                &BTreeMap::new(),
+                None,
+                shell,
+            );
+            spec.args
+                .windows(2)
+                .filter(|w| w[0] == "-c")
+                .map(|w| w[1].clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(settings(CommandShell::Plain), PLAIN_SHELL);
+        assert!(settings(CommandShell::Login).is_empty());
+    }
+
     #[test]
     fn resume_reattaches_the_tui_to_the_session_app_server() {
         let env = BTreeMap::new();
@@ -2637,7 +2681,7 @@ pub(crate) mod tests {
             ),
         );
         let env = BTreeMap::from([("PATH".to_string(), "/usr/bin:/bin".to_string())]);
-        let server = AppServer::start(&program, socket.clone(), &env, None)
+        let server = AppServer::start(&program, socket.clone(), &env, None, CommandShell::Login)
             .await
             .unwrap();
         let pid = server.pid().unwrap();

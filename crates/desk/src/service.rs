@@ -1217,6 +1217,9 @@ struct Inner {
     palette_save: tokio::sync::Mutex<()>,
     store: Arc<DeskStore>,
     env: BTreeMap<String, String>,
+    /// Whether [`Self::env`] is the person's login shell's
+    /// ([`LOGIN_ENV_READ`]).
+    login_read: bool,
     /// The shell terminals run.
     shell: String,
     state: Mutex<State>,
@@ -1304,6 +1307,13 @@ struct Inner {
     /// Held from reading a plan to writing it back: a plan is written
     /// whole, so two changes at once would undo one another.
     plan_write: tokio::sync::Mutex<()>,
+    /// Held from finding no review open at a head to linking the one
+    /// started there, so one head has one open review.
+    review_starts: tokio::sync::Mutex<()>,
+    /// Whether GitHub requires a pull request to change a repository's
+    /// (`host/owner/name`) branch, and until when that is kept
+    /// ([`Self::requires_pull_requests`]).
+    protections: Mutex<HashMap<(String, String), (std::time::Instant, bool)>>,
     /// Held while the modes Desk keeps are read and written
     /// ([`crate::mode`]).
     modes_write: tokio::sync::Mutex<()>,
@@ -1712,13 +1722,17 @@ fn asking(p: &PendingApproval) -> String {
     }
 }
 
+/// Set (to `1`) by Desk Helper in the environment Desk is given when that
+/// is the person's login shell's, as it read it: never passed on.
+pub const LOGIN_ENV_READ: &str = "DESK_LOGIN_ENV_READ";
+
 /// The environment sessions, terminals and the CLIs Desk runs start from:
 /// the hub's, without what a parent Claude Code left in it (`CLAUDE*`) and
-/// without the hub's own secrets.
+/// without the hub's own secrets, nor [`LOGIN_ENV_READ`].
 fn cli_env(base: &BTreeMap<String, String>) -> BTreeMap<String, String> {
     let mut env: BTreeMap<String, String> = base
         .iter()
-        .filter(|(k, _)| !k.starts_with("CLAUDE") && !hub_secret(k))
+        .filter(|(k, _)| !k.starts_with("CLAUDE") && !hub_secret(k) && *k != LOGIN_ENV_READ)
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect();
     env.insert("TERM".into(), "xterm-256color".into());
@@ -2027,6 +2041,7 @@ impl Desk {
         let hook_base = format!("http://127.0.0.1:{hook_port}");
         let (persist, persist_rx) = mpsc::unbounded_channel();
         let env = cli_env(&opts.env);
+        let login_read = opts.env.get(LOGIN_ENV_READ).is_some_and(|v| v == "1");
         let (ledger, ledger_jobs) =
             ledger::LedgerRun::new(floor.pricer.clone(), floor.redactor.clone());
         let desk = Self(Arc::new(Inner {
@@ -2036,6 +2051,7 @@ impl Desk {
             palette_save: Default::default(),
             shell: terminals::login_shell(&env, terminals::account_shell, |p| p.is_file()),
             env,
+            login_read,
             opts,
             store: Arc::clone(&store),
             state: Mutex::new(State {
@@ -2108,6 +2124,8 @@ impl Desk {
             group_counts: std::sync::atomic::AtomicUsize::new(0),
             boss_plans: Mutex::default(),
             plan_write: tokio::sync::Mutex::new(()),
+            review_starts: tokio::sync::Mutex::new(()),
+            protections: Mutex::default(),
             modes_write: tokio::sync::Mutex::new(()),
             modes_restoring: tokio::sync::Mutex::new(()),
             modes_dirty: std::sync::atomic::AtomicBool::new(false),
@@ -3861,9 +3879,19 @@ impl Desk {
             ));
         }
         check_env(&new.env)?;
-        if let Some(r) = &new.review_of {
-            r.check().map_err(DeskError::Invalid)?;
-        }
+        let reviewing = match (&new.review_of, boss) {
+            (Some(r), Some(b)) => {
+                r.check().map_err(DeskError::Invalid)?;
+                let held = self.0.review_starts.lock().await;
+                self.no_review_open_at(&b.id, r).await?;
+                Some(held)
+            }
+            (Some(r), None) => {
+                r.check().map_err(DeskError::Invalid)?;
+                None
+            }
+            (None, _) => None,
+        };
         let view = new
             .view
             .or_else(|| engine::views(new.engine).first().copied())
@@ -3919,26 +3947,42 @@ impl Desk {
         if !cwd.is_dir() {
             return Err(DeskError::Invalid(format!("{} is not a folder", new.cwd)));
         }
-        let (cwd, branch) = match new
-            .worktree
-            .as_deref()
-            .map(str::trim)
-            .filter(|b| !b.is_empty())
-        {
-            Some(base) if new.fresh_worktree => {
+        // A review reads its head in a worktree of its own, named for it
+        // whatever else was said.
+        let mut made = None;
+        let (cwd, branch) = match (
+            new.worktree
+                .as_deref()
+                .map(str::trim)
+                .filter(|b| !b.is_empty()),
+            &new.review_of,
+        ) {
+            (_, Some(r)) => {
+                let (path, fresh) = worktree::detached(
+                    &cwd,
+                    &crate::plan::review_worktree(&r.pr, &r.head_sha),
+                    &r.head_sha,
+                    &format!("refs/pull/{}/head", r.pr.number),
+                )
+                .await
+                .map_err(|e| DeskError::Invalid(e.to_string()))?;
+                made = fresh.then(|| path.clone());
+                (path, None)
+            }
+            (Some(base), None) if new.fresh_worktree => {
                 let (path, branch) = worktree::create_fresh(&cwd, base)
                     .await
                     .map_err(|e| DeskError::Invalid(e.to_string()))?;
                 (path, Some(branch))
             }
-            Some(branch) => (
+            (Some(branch), None) => (
                 worktree::create(&cwd, branch).await.map_err(|e| match e {
                     worktree::Unmade::Taken(why) => DeskError::WorktreeTaken { why, holder: None },
                     worktree::Unmade::Failed(e) => DeskError::Invalid(e.to_string()),
                 })?,
                 Some(branch.to_string()),
             ),
-            None => (cwd, None),
+            (None, _) => (cwd, None),
         };
         // A review reads a worktree beside the session that works in it.
         let held =
@@ -4029,15 +4073,26 @@ impl Desk {
             placed = self
                 .0
                 .store
-                .pr_review_link(id, &b.id, &r.pr)
+                .pr_review_link(id, &b.id, r)
                 .await
                 .map_err(DeskError::Internal);
         }
+        drop(reviewing);
         let launched = match placed {
             Ok(()) => self.launch(&record, false, prompt.as_deref()).await,
             Err(e) => Err(e),
         };
         if let Err(e) = launched {
+            if let Some(r) = &new.review_of {
+                if let Err(e) = self.0.store.pr_review_unlink(id).await {
+                    tracing::warn!(session = %id, error = %e, "a review that didn't start stays linked");
+                }
+                if let Some(path) = &made {
+                    if let Err(e) = worktree::remove(path, &r.head_sha).await {
+                        tracing::warn!(session = %id, error = %e, "the worktree of a review that didn't start stays");
+                    }
+                }
+            }
             self.0.state.lock().records.remove(&id);
             self.start_unplaced(id, group.is_some(), boss.is_some())
                 .await;
@@ -4058,6 +4113,35 @@ impl Desk {
             self.started_note(&view, boss).await;
         }
         Ok(view)
+    }
+
+    /// Refuses a second review of `r`'s pull request at its head while a
+    /// review session `boss` started there is still open.
+    async fn no_review_open_at(
+        &self,
+        boss: &str,
+        r: &crate::plan::ReviewOf,
+    ) -> Result<(), DeskError> {
+        let started = self
+            .0
+            .store
+            .pr_reviews_at(boss, &r.pr, &r.head_sha)
+            .await
+            .map_err(DeskError::Internal)?;
+        match started.into_iter().find_map(|s| {
+            self.view(s)
+                .ok()
+                .filter(|v| v.state != SessionState::Closed)
+        }) {
+            Some(v) => Err(DeskError::Conflict(format!(
+                "{} reviews {}/{}#{} at that head already: nudge it, or record its verdict",
+                v.label(),
+                r.pr.owner,
+                r.pr.repo,
+                r.pr.number
+            ))),
+            None => Ok(()),
+        }
     }
 
     /// Puts `id`, about to run, in `group` and in `boss`'s charge.
@@ -6061,8 +6145,9 @@ impl Desk {
                     url: &line,
                     token: &token,
                 };
+                let shimmed = self.gh_shimmed(r.id, &token);
                 let server = self
-                    .start_app_server(r.id, &socket, line)
+                    .start_app_server(r.id, &socket, line, &shimmed)
                     .await
                     .inspect_err(|e| tracing::warn!(session = %r.id, error = %e, "a Codex session's app-server didn't start"))?;
                 let thread = r.cli_session_id.as_deref().filter(|_| resume);
@@ -6454,15 +6539,17 @@ impl Desk {
         id: Uuid,
         socket: &Path,
         line: codex::LineMcp<'_>,
+        env: &BTreeMap<String, String>,
     ) -> Result<Server, DeskError> {
         let program = self.program_of(Engine::Codex)?;
+        let shell = self.command_shell(id);
         let Some(holder) = self.holder().await else {
             let server =
-                AppServer::start(program, socket.to_path_buf(), &self.0.env, Some(line)).await?;
+                AppServer::start(program, socket.to_path_buf(), env, Some(line), shell).await?;
             return Ok(Server::Local(server));
         };
         codex::prepare_socket(socket).await?;
-        let spec = codex::app_server(program, socket, &self.0.env, Some(line));
+        let spec = codex::app_server(program, socket, env, Some(line), shell);
         let meta = serde_json::json!({
             "kind": "codex-app-server",
             "session": id,
@@ -6475,6 +6562,53 @@ impl Desk {
             return Err(e.into());
         }
         Ok(Server::Held(pty))
+    }
+
+    /// What shell a Codex session `id`'s app-server runs its commands in: a
+    /// plain one while a boss that decides its requests has it as it starts
+    /// (a plan's or the crew's start), so no profile puts another `gh`
+    /// ahead of Desk's ([`codex::CommandShell::Plain`]); else the person's
+    /// login shell, as their own sessions keep it. One a boss takes on once
+    /// it runs keeps its shell until it starts again: until then a merge it
+    /// runs past Desk's `gh` is the boss's model's to refuse, and GitHub's
+    /// protection of the branch. Only where Desk Helper says Desk's
+    /// environment is the login shell's ([`LOGIN_ENV_READ`]): elsewhere (a
+    /// hub run by hand, an older Desk Helper, a login shell it couldn't
+    /// read) the login shell stays, as without it a command might not find
+    /// the person's tools.
+    fn command_shell(&self, id: Uuid) -> codex::CommandShell {
+        let charged = self
+            .charge_of(id)
+            .is_some_and(|c| c.live() && self.boss_decides_requests(&c.boss));
+        match (charged, self.0.login_read) {
+            (true, true) => codex::CommandShell::Plain,
+            (true, false) => {
+                tracing::warn!(session = %id, "a Codex session a boss runs keeps the login shell: Desk Helper didn't say Desk's environment is the person's login one, so without it its commands might not find their tools, and a gh their profile puts first runs merges without Desk's check");
+                codex::CommandShell::Login
+            }
+            (false, _) => codex::CommandShell::Login,
+        }
+    }
+
+    /// What a Codex session `id`'s app-server runs its commands with:
+    /// Desk's own environment, its `gh` asking Desk before a merge
+    /// ([`crate::gh_shim`]), `token` its credential. Without the shim, as
+    /// it is, and said.
+    fn gh_shimmed(&self, id: Uuid, token: &str) -> BTreeMap<String, String> {
+        let mut env = self.0.env.clone();
+        let url = format!("{}/gh/{id}/{token}", self.0.hook_base);
+        let dir = self.0.opts.run_dir.join(format!("{}-bin", id.simple()));
+        let path = env.get("PATH").cloned().unwrap_or_default();
+        match crate::gh_shim::install(&dir, &url, &path) {
+            Ok(Some(path)) => {
+                env.insert("PATH".into(), path);
+            }
+            Ok(None) => {}
+            Err(e) => {
+                tracing::warn!(session = %id, error = %e, "a Codex session's gh runs without Desk's check of its merges")
+            }
+        }
+        env
     }
 
     /// What a Codex session `id` runs in where Desk sets it
@@ -6848,6 +6982,27 @@ impl Desk {
         Some(self.apply_hook(id, hook, claude::agent_of(body)).await)
     }
 
+    /// What Desk says of `command`, a `gh` command a session's shell
+    /// ([`crate::gh_shim`]) is about to run, with `token` its session's:
+    /// why it is refused ([`Self::past_review_refused`]), else nothing;
+    /// none when the token isn't `id`'s.
+    pub async fn gh_asked(&self, id: Uuid, token: &str, command: &str) -> Option<Option<String>> {
+        let authorised = self
+            .0
+            .state
+            .lock()
+            .live
+            .get(&id)
+            .is_some_and(|l| l.token == token);
+        match authorised {
+            true => Some(
+                self.past_review_refused(id, "Bash", &serde_json::json!({ "command": command }))
+                    .await,
+            ),
+            false => None,
+        }
+    }
+
     /// Keeps the mode `hook` (its `body`) says session `id` runs in. A tool
     /// call's hook that says none, or one Desk doesn't know, leaves none
     /// kept: what a call of a session a boss served from a grant meets
@@ -6948,9 +7103,15 @@ impl Desk {
             _ => false,
         };
         // Desk's breaker holding it from this turn refuses the call, why
-        // said; otherwise the call is watched (when loops are).
+        // said, and so does what goes past review while a boss acting
+        // fully has it; otherwise the call is watched (when loops are).
         let held = match &hook {
-            Hook::ToolStart { tool, .. } => self.breaker_tool(id, tool),
+            Hook::ToolStart {
+                tool, call, input, ..
+            } => match self.breaker_tool(id, tool) {
+                Some(why) => Some(why),
+                None => self.past_review_refused(id, &call.tool, input).await,
+            },
             _ => None,
         };
         // A session a boss served from a grant runs: every call Desk doesn't
@@ -9428,10 +9589,15 @@ mod tests {
     }
 
     pub(super) async fn desk(pool: workforce_postgres::PostgresPool, dir: &Path) -> Desk {
+        desk_on(pool, options(dir)).await
+    }
+
+    /// A desk keeping `options`.
+    pub(super) async fn desk_on(pool: workforce_postgres::PostgresPool, options: Options) -> Desk {
         DeskStore::migrate(&pool).await.unwrap();
         let d = Desk::start(
             DeskStore::from_pool(pool),
-            options(dir),
+            options,
             Default::default(),
             CancellationToken::new(),
         )
@@ -13189,7 +13355,7 @@ mod codex_stop_tests {
         let sock = dir.join("run/s.sock");
         codex::prepare_socket(&sock).await.unwrap();
         let env = BTreeMap::from([("PATH".to_string(), "/usr/bin:/bin".to_string())]);
-        let spec = codex::app_server(program, &sock, &env, None);
+        let spec = codex::app_server(program, &sock, &env, None, codex::CommandShell::Login);
         let (pty, _) = holder
             .spawn(
                 &spec,

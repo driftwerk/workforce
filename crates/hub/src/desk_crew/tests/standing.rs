@@ -261,3 +261,125 @@ async fn a_standing_verdict_gives_way_to_the_person_a_hold_a_conditional_directi
     })
     .await;
 }
+
+/// A repository `name` under `base` on its own branch `feat/x` off
+/// `main`, its `origin` GitHub's `acme/<name>`, which has `main` as its
+/// `origin/HEAD`.
+fn on_github(base: &std::path::Path, name: &str) -> std::path::PathBuf {
+    let repo = base.join(name);
+    std::fs::create_dir_all(&repo).unwrap();
+    let origin = format!("https://github.com/acme/{name}.git");
+    for args in [
+        &["init", "-q", "-b", "main"][..],
+        &["commit", "-q", "--allow-empty", "-m", "x"],
+        &["remote", "add", "origin", &origin],
+        &["update-ref", "refs/remotes/origin/main", "HEAD"],
+        &[
+            "symbolic-ref",
+            "refs/remotes/origin/HEAD",
+            "refs/remotes/origin/main",
+        ],
+        &["switch", "-q", "-c", "feat/x"],
+    ] {
+        git(&repo, args);
+    }
+    repo
+}
+
+/// A `gh` under `base` whose `gh api <endpoint>` prints what `answers`
+/// gives that endpoint, and fails for any other; the folder it is in.
+fn gh_answering(base: &std::path::Path, answers: &[(&str, &str)]) -> std::path::PathBuf {
+    let tools = base.join("tools");
+    let said = base.join("github");
+    std::fs::create_dir_all(&said).unwrap();
+    std::fs::create_dir_all(&tools).unwrap();
+    for (endpoint, answer) in answers {
+        std::fs::write(said.join(endpoint.replace('/', "_")), answer).unwrap();
+    }
+    workforce_common::executable::write(
+        &tools.join("gh"),
+        format!(
+            "#!/bin/sh\nf='{}'/$(printf %s \"$2\" | tr / _)\n[ \"$1\" = api ] && [ -f \"$f\" ] && exec cat \"$f\"\nexit 1\n",
+            said.display()
+        ),
+    )
+    .unwrap();
+    tools
+}
+
+/// Where GitHub requires a pull request to change the default branch, a
+/// session's push straight to it is the boss's own refusal at once, with
+/// no call, in favour of review. Where it doesn't, or can't say, the push
+/// is the boss's to decide, as a push to a release branch is.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_push_straight_to_a_default_branch_github_protects_is_refused_at_once() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(dir.path()).unwrap();
+        let tools = gh_answering(
+            &base,
+            &[
+                (
+                    "repos/acme/web/rules/branches/main",
+                    r#"[{"type":"pull_request","parameters":{"required_approving_review_count":1}}]"#,
+                ),
+                ("repos/acme/open/rules/branches/main", "[]"),
+            ],
+        );
+        let cli = fake_cli(&base);
+        let mut o = options(&base, cli.clone(), cli);
+        o.env
+            .insert("PATH".into(), format!("{}:/usr/bin:/bin", tools.display()));
+        let d = desk_on(pool, o, Default::default()).await;
+        let (_overseer, _crew, d, llm) = overseeing_on(&base, d, "ok", THEIRS, &[], FAST).await;
+        d.boss_bounds_with(workforce_desk::charge::Bounds {
+            home: base.clone(),
+            ..Default::default()
+        });
+        decides(&llm, STANDING, "commit: allow ordinary work on its branch").await;
+        for command in [
+            "git push origin HEAD:release-2026",
+            "git push origin HEAD:main",
+            "git push origin feat/x:main",
+        ] {
+            decides(&llm, command, "DENY: not yet\nINSTEAD: wait for review").await;
+        }
+        eventually("Desk to know it is unbound", async || {
+            d.boss_unbound("desk").then_some(())
+        })
+        .await;
+        let mut urls = HashMap::new();
+        for name in ["web", "open", "down"] {
+            let s = new_session(&d, &on_github(&base, name), name).await;
+            urls.insert(name, hook_url(&base, s.id).await);
+        }
+        let decided = async |name: &str, command: &str| {
+            tokio::time::timeout(Duration::from_secs(20), asked(&urls[name], command))
+                .await
+                .expect("decided within seconds")
+                .unwrap()
+        };
+
+        for command in [
+            "git push origin main",
+            "git push origin main",
+            "timeout 60 git -C . push origin main",
+        ] {
+            let answer = decided("web", command).await;
+            assert_eq!(behavior(&answer), "deny", "{answer}");
+            let why = answer["hookSpecificOutput"]["decision"]["message"].to_string();
+            assert!(why.contains(workforce_desk::plan::DEFAULT_PUSH), "{why}");
+            assert!(calls_about(&llm, command).await.is_empty(), "{command}");
+        }
+
+        for (name, command, what) in [
+            ("web", "git push origin HEAD:release-2026", "a release branch"),
+            ("open", "git push origin HEAD:main", "an unprotected default branch"),
+            ("down", "git push origin feat/x:main", "a protection GitHub can't say"),
+        ] {
+            assert_eq!(behavior(&decided(name, command).await), "deny", "{what}");
+            assert_eq!(calls_about(&llm, command).await.len(), 1, "{what}: the boss's own call");
+        }
+    })
+    .await;
+}

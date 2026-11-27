@@ -9,23 +9,35 @@
 //!   the pull request's head; a review asking for changes, or a branch the
 //!   person took back, merges nothing;
 //! - a directive that releases need the person's OK has the boss ask them
-//!   at once instead of merging; without it, the boss merges.
+//!   at once instead of merging; without it, the boss merges;
+//! - a plan's ticket, end to end (DW-765): its pull request green, Desk
+//!   starts its review with no model asked, records the verdict, and the
+//!   boss merges it with `crew.github_merge` and the next ticket starts;
+//!   changes asked for go to the ticket's session, and its next head is
+//!   reviewed again.
 
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
-use wiremock::matchers::{body_partial_json, method, path};
-use wiremock::{Mock, MockServer, ResponseTemplate};
+use wiremock::matchers::{body_partial_json, method, path, path_regex};
+use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 use workforce_desk::charge::How;
 use workforce_desk::crew::Party;
 use workforce_desk::model::SessionView;
 use workforce_desk::plan::{PrRef, PrReview};
 
 use super::super::directives::NAME as DIRECTIVES;
+use super::super::github_seen::Pull;
 use super::super::review::{tests::github, MERGE, NO_VERDICT, RECORD};
 use super::act_fully::{git, repo};
 use super::goals::{boss_over, run};
+use super::plan_watch::{asked_with, turn_ends};
+use super::plans::started;
 use super::unbound::UNBOUND;
 use super::*;
+use workforce_desk::board::TicketState;
+use workforce_desk::model::SessionState;
+use workforce_desk::plan::{Draft, DraftTicket, ReviewLink};
+use workforce_desk::NewPlan;
 
 const MERGED: &str = "3333333333333333333333333333333333333333";
 
@@ -35,6 +47,16 @@ async fn shipping(
     base: &Path,
     pool: workforce_postgres::PostgresPool,
     gh: &MockServer,
+) -> (Arc<AgentService>, Arc<CrewHub>, Desk, MockServer) {
+    shipping_with(base, pool, gh, UNBOUND).await
+}
+
+/// [`shipping`], its boss set as `oversight` says.
+async fn shipping_with(
+    base: &Path,
+    pool: workforce_postgres::PostgresPool,
+    gh: &MockServer,
+    oversight: &str,
 ) -> (Arc<AgentService>, Arc<CrewHub>, Desk, MockServer) {
     let home = base.join("home");
     std::fs::create_dir_all(home.join(".claude/projects/-acme-web")).unwrap();
@@ -47,7 +69,8 @@ async fn shipping(
         ..Default::default()
     };
     let d = desk_on(pool, options, floor).await;
-    let (overseer, crew, d, llm) = boss_over(base, d, UNBOUND, gh, CancellationToken::new()).await;
+    let (overseer, crew, d, llm) =
+        boss_over(base, d, oversight, gh, CancellationToken::new()).await;
     crew.read_spent_today(&crew.overseers()).await;
     // As the hub sets it at start.
     d.boss_bounds_with(workforce_desk::charge::Bounds {
@@ -62,7 +85,7 @@ async fn shipping(
 }
 
 /// `acme/web` checked out at `base/web` on `dw-761`, a commit ahead of
-/// `main`, and a detached worktree of it at that commit in
+/// `main` and pushed, and a detached worktree of it at that commit in
 /// `base/web-review`: its head.
 fn pull_request(base: &Path) -> String {
     let web = base.join("web");
@@ -71,6 +94,7 @@ fn pull_request(base: &Path) -> String {
     std::fs::write(web.join("picker.ts"), "export const picker = 1;\n").unwrap();
     git(&web, &["add", "picker.ts"]);
     git(&web, &["commit", "-q", "-m", "The date picker"]);
+    git(&web, &["update-ref", "refs/remotes/origin/dw-761", "HEAD"]);
     let review = base.join("web-review");
     git(
         &web,
@@ -254,12 +278,20 @@ async fn a_pull_request_reviewed_clean_at_its_head_is_recorded_and_merged_at_tha
         merges(&gh, &head).await;
         let (overseer, _crew, d, _llm) = shipping(&base, pool, &gh).await;
         let since = chrono::Utc::now();
-        implementing(&d, &overseer, &base).await;
+        let web = implementing(&d, &overseer, &base).await;
 
         let review = reviewing(&d, &overseer, &base).await;
         assert_eq!(
             d.store().pr_review_of(review.id).await.unwrap(),
-            Some(("desk".into(), PrRef::new("acme", "web", 7)))
+            Some(ReviewLink {
+                session: review.id,
+                boss: "desk".into(),
+                pr: PrRef::new("acme", "web", 7),
+                head_sha: Some(head.clone()),
+                for_session: Some(web.id),
+                settled: false,
+            }),
+            "linked to the session whose branch it is"
         );
         let claude = Claude::started(&base, review.id).await;
         claude.asked("Review acme/web#7.").await;
@@ -375,15 +407,15 @@ async fn a_review_is_recorded_only_as_its_session_said_it_at_the_head() {
         );
 
         // Its folder moved on from the head it reviewed.
-        let folder = base.join("web-review");
+        let folder = Path::new(&review.cwd);
         std::fs::write(folder.join("later.ts"), "export {};\n").unwrap();
-        git(&folder, &["add", "later.ts"]);
-        git(&folder, &["commit", "-q", "-m", "Later"]);
+        git(folder, &["add", "later.ts"]);
+        git(folder, &["commit", "-q", "-m", "Later"]);
         let moved = record(review.id).await.unwrap_err();
         assert!(
             moved.starts_with(&format!(
                 "Its folder is at {}, the PR is at {head}",
-                head_of(&folder)
+                head_of(folder)
             )),
             "{moved}"
         );
@@ -500,6 +532,581 @@ async fn a_directive_that_releases_need_the_persons_ok_has_the_boss_ask_instead_
             Some("Your directive: releases need your OK.")
         );
         assert_eq!(merges_asked(&gh).await, 1, "nothing more merged");
+    })
+    .await;
+}
+
+/// GitHub as it stands for `acme/web#7` from `dw-761`: its head is what
+/// `head` holds now, every check on it passes, and it merges once asked.
+struct Github {
+    server: MockServer,
+    head: Arc<parking_lot::Mutex<String>>,
+    merged: Arc<AtomicBool>,
+    /// Its pull request can't be read while set.
+    down: Arc<AtomicBool>,
+}
+
+impl Github {
+    async fn at(head: &str) -> Self {
+        let server = MockServer::start().await;
+        let head = Arc::new(parking_lot::Mutex::new(head.to_string()));
+        let merged = Arc::new(AtomicBool::new(false));
+        let down = Arc::new(AtomicBool::new(false));
+        let (h, m, gone) = (head.clone(), merged.clone(), down.clone());
+        Mock::given(method("GET"))
+            .and(path("/repos/acme/web/pulls/7"))
+            .respond_with(move |_: &Request| {
+                if gone.load(Ordering::SeqCst) {
+                    return ResponseTemplate::new(503);
+                }
+                let merged = m.load(Ordering::SeqCst);
+                ResponseTemplate::new(200).set_body_json(json!({
+                    "number": 7, "state": if merged { "closed" } else { "open" },
+                    "merged": merged, "draft": false,
+                    "mergeable": true, "mergeable_state": "clean",
+                    "head": {"ref": "dw-761", "sha": *h.lock(), "repo": {"full_name": "acme/web"}},
+                    "base": {"ref": "main", "repo": {"full_name": "acme/web"}},
+                }))
+            })
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/repos/acme/web/pulls"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+                {"number": 7, "state": "open", "merged_at": null,
+                 "head": {"ref": "dw-761"}, "base": {"ref": "main"}},
+            ])))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path_regex(
+                r"^/repos/acme/web/commits/[0-9a-f]{40}/check-runs$",
+            ))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!({"check_runs": [
+                    {"name": "Test", "status": "completed", "conclusion": "success"},
+                ]})),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/repos/acme/web"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "full_name": "acme/web", "allow_squash_merge": true, "allow_merge_commit": true,
+            })))
+            .mount(&server)
+            .await;
+        let m = merged.clone();
+        Mock::given(method("PUT"))
+            .and(path("/repos/acme/web/pulls/7/merge"))
+            .respond_with(move |_: &Request| {
+                m.store(true, Ordering::SeqCst);
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({ "merged": true, "sha": MERGED, "message": "Merged" }))
+            })
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+            .mount(&server)
+            .await;
+        Self {
+            server,
+            head,
+            merged,
+            down,
+        }
+    }
+}
+
+/// The boss at Act fully running a plan of two tickets in `acme/web`, one
+/// at a time, its first one's session started on `dw-761` with #7 open:
+/// the plan's first ticket's session.
+async fn a_plan_of_two(
+    base: &Path,
+    pool: workforce_postgres::PostgresPool,
+    gh: &Github,
+) -> (
+    Arc<AgentService>,
+    Arc<CrewHub>,
+    Desk,
+    MockServer,
+    SessionView,
+) {
+    let one_at_a_time = format!("{UNBOUND}[oversight.work]\nparallel = 1\n");
+    let (overseer, crew, d, llm) = shipping_with(base, pool, &gh.server, &one_at_a_time).await;
+    *crew.close_settle.lock() = chrono::Duration::zero();
+    let p = d
+        .propose_plan(
+            NewPlan {
+                draft: Draft {
+                    goal: "Ship the date picker".into(),
+                    tickets: ["The date picker", "Its empty state"]
+                        .into_iter()
+                        .map(|title| DraftTicket {
+                            title: title.into(),
+                            folder: base.join("web").to_string_lossy().into_owned(),
+                            ..Default::default()
+                        })
+                        .collect(),
+                },
+                board: None,
+                parallel: None,
+                engine: Engine::Claude,
+                group: None,
+                budget: None,
+                result: None,
+                goal_ticket: None,
+            },
+            &Party::manager("desk", "Desk"),
+            &By::manager("desk", "Desk", "Sam asked for the date picker."),
+        )
+        .await
+        .unwrap();
+    d.approve_plan(p.summary.plan.id, 1, &By::you())
+        .await
+        .unwrap();
+    let first = eventually("its first ticket's session", async || {
+        started(&d).into_iter().find(|v| v.name == "DES-1")
+    })
+    .await;
+    (overseer, crew, d, llm, first)
+}
+
+/// The review session Desk started of `acme/web#7` at `head`.
+async fn reviewed_by_desk(d: &Desk, head: &str) -> SessionView {
+    let r = eventually("Desk to start its review", async || {
+        d.list()
+            .into_iter()
+            .find(|v| v.goal.starts_with("Review acme/web#7") && v.goal.contains(&head[..7]))
+    })
+    .await;
+    assert_eq!(r.name, "Review DES-1");
+    assert_eq!(r.branch, None, "detached");
+    assert!(
+        r.cwd
+            .ends_with(&format!(".worktrees/review-7-{}", &head[..7])),
+        "{}",
+        r.cwd
+    );
+    assert_eq!(head_of(Path::new(&r.cwd)), head, "at the head it reviews");
+    r
+}
+
+/// `dw-761` a commit on, pushed, and #7 green at it: its new head.
+fn pushed_again(base: &Path, gh: &Github, crew: &CrewHub, file: &str) -> String {
+    let web = base.join("web");
+    std::fs::write(web.join(file), "export const more = 1;\n").unwrap();
+    git(&web, &["add", file]);
+    git(&web, &["commit", "-q", "-m", file]);
+    git(&web, &["update-ref", "refs/remotes/origin/dw-761", "HEAD"]);
+    let next = head_of(&web);
+    *gh.head.lock() = next.clone();
+    crew.pull_seen(
+        "acme/web",
+        7,
+        Pull {
+            number: 7,
+            open: true,
+            head: Some(next.clone()),
+            checks: Some("success".into()),
+            ..Default::default()
+        },
+    );
+    next
+}
+
+/// Whether Desk is done with `review`'s link.
+async fn settled(d: &Desk, review: &SessionView) -> bool {
+    d.store()
+        .pr_review_of(review.id)
+        .await
+        .unwrap()
+        .is_some_and(|l| l.settled)
+}
+
+/// Waits for `review` to be closed and its worktree removed.
+async fn closed(d: &Desk, review: &SessionView) {
+    eventually("the review closed and its worktree removed", async || {
+        (!Path::new(&review.cwd).exists()
+            && d.view(review.id)
+                .map_or(true, |v| v.state == SessionState::Closed))
+        .then_some(())
+    })
+    .await;
+}
+
+/// The ticket's lifecycle (DW-765): its session opens #7 and CI goes
+/// green; Desk starts the review with no model asked; its verdict is
+/// recorded and the review closed; the boss's plan turn is told, merges
+/// with `crew.github_merge` at the reviewed head and moves the ticket to
+/// Done; the next ticket starts.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_green_pull_request_is_reviewed_by_desk_merged_by_the_boss_and_the_next_ticket_starts() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(dir.path()).unwrap();
+        let head = pull_request(&base);
+        let gh = Github::at(&head).await;
+        let (_overseer, _crew, d, llm, first) = a_plan_of_two(&base, pool, &gh).await;
+        calls_tool_once(
+            &llm,
+            "Desk recorded a clean review of acme/web#7",
+            "crew_github_merge",
+            merge_7(),
+        )
+        .await;
+        calls_tool_once(
+            &llm,
+            "merge_method",
+            "crew_move_ticket",
+            json!({ "ticket": "DES-1", "state": "done", "reason": "#7 merged." }),
+        )
+        .await;
+
+        turn_ends(&d, &base, &first, "Opened #7; CI is green.").await;
+        let review = reviewed_by_desk(&d, &head).await;
+        assert_eq!(
+            d.store().pr_review_of(review.id).await.unwrap(),
+            Some(ReviewLink {
+                session: review.id,
+                boss: "desk".into(),
+                pr: PrRef::new("acme", "web", 7),
+                head_sha: Some(head.clone()),
+                for_session: Some(first.id),
+                settled: false,
+            })
+        );
+        assert_eq!(
+            asked_with(&llm, &["acme/web#7"]).await,
+            0,
+            "no model chose to start it"
+        );
+
+        let claude = Claude::started(&base, review.id).await;
+        claude.asked(review.last_prompt.as_deref().unwrap()).await;
+        claude
+            .replies(
+                &d,
+                review.id,
+                &format!("It reads well.\n\nREVIEW: clean {head}"),
+            )
+            .await;
+        eventually("the boss to merge #7", async || {
+            gh.merged.load(Ordering::SeqCst).then_some(())
+        })
+        .await;
+        let recorded = d
+            .store()
+            .pr_review_newest("desk", &PrRef::new("acme", "web", 7))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(recorded.clean);
+        assert_eq!(
+            (recorded.head_sha.as_str(), recorded.by_session),
+            (head.as_str(), review.id)
+        );
+        let put: Vec<Value> = gh
+            .server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|r| r.method.as_str() == "PUT")
+            .map(|r| serde_json::from_slice(&r.body).unwrap())
+            .collect();
+        assert_eq!(put.len(), 1);
+        assert_eq!(
+            (put[0]["sha"].as_str(), put[0]["merge_method"].as_str()),
+            (Some(head.as_str()), Some("squash"))
+        );
+
+        eventually("the next ticket to start", async || {
+            started(&d).into_iter().find(|v| v.name == "DES-2")
+        })
+        .await;
+        closed(&d, &review).await;
+        let des1 = d.store().linked_tickets(&[first.id]).await.unwrap();
+        assert!(
+            des1.iter().all(|t| t.state == TicketState::Done),
+            "{des1:?}"
+        );
+    })
+    .await;
+}
+
+/// A review that asks for changes merges nothing: Desk gives the changes
+/// to the ticket's session, and its next green head is reviewed again.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_review_asking_for_changes_goes_to_its_session_and_the_next_head_is_reviewed_again() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(dir.path()).unwrap();
+        let head = pull_request(&base);
+        let gh = Github::at(&head).await;
+        let (_overseer, crew, d, _llm, first) = a_plan_of_two(&base, pool, &gh).await;
+
+        turn_ends(&d, &base, &first, "Opened #7; CI is green.").await;
+        let review = reviewed_by_desk(&d, &head).await;
+        let claude = Claude::started(&base, review.id).await;
+        claude.asked(review.last_prompt.as_deref().unwrap()).await;
+        claude
+            .replies(
+                &d,
+                review.id,
+                &format!("The empty state is missing.\n\nREVIEW: changes {head}"),
+            )
+            .await;
+        let told = eventually("its session given the changes", async || {
+            d.line_thread(first.id, None, Some(30))
+                .await
+                .unwrap()
+                .into_iter()
+                .find(|m| m.text.contains("asked for changes"))
+        })
+        .await;
+        assert!(
+            told.text.contains("> The empty state is missing."),
+            "{}",
+            told.text
+        );
+        assert!(
+            told.text.contains("Don't merge it yourself."),
+            "{}",
+            told.text
+        );
+        let recorded = d
+            .store()
+            .pr_review_newest("desk", &PrRef::new("acme", "web", 7))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!recorded.clean);
+        closed(&d, &review).await;
+
+        let next = pushed_again(&base, &gh, &crew, "empty.ts");
+        let first = d.view(first.id).unwrap();
+        turn_ends(&d, &base, &first, "Pushed the empty state; CI is green.").await;
+        reviewed_by_desk(&d, &next).await;
+        assert!(!gh.merged.load(Ordering::SeqCst), "nothing merged");
+    })
+    .await;
+}
+
+/// A session's own merge at Act fully reaches its boss's decision as the
+/// merge class, and is refused at once for `crew.github_merge`, with no
+/// model asked.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_sessions_own_merge_is_refused_at_once_for_its_bosss_merge() {
+    use super::decides_at_once::{asked, behavior, calls_about};
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(dir.path()).unwrap();
+        pull_request(&base);
+        let gh = MockServer::start().await;
+        super::super::github::tests::no_writes(&gh).await;
+        let (overseer, _crew, d, llm) = shipping(&base, pool, &gh).await;
+        let web = implementing(&d, &overseer, &base).await;
+        let url = hook_url(&base, web.id).await;
+        let answer = tokio::time::timeout(
+            Duration::from_secs(10),
+            asked(&url, "gh pr merge 7 --squash"),
+        )
+        .await
+        .expect("decided within seconds")
+        .unwrap();
+        assert_eq!(behavior(&answer), "deny", "{answer}");
+        let message = answer["hookSpecificOutput"]["decision"]["message"].to_string();
+        assert!(
+            message.contains(workforce_desk::plan::OWN_MERGE)
+                && message.contains(workforce_desk::plan::OWN_MERGE_INSTEAD),
+            "{message}"
+        );
+        assert!(
+            calls_about(&llm, "gh pr merge").await.is_empty(),
+            "no model asked"
+        );
+    })
+    .await;
+}
+
+/// A review whose pull request moved on while it read records nothing of
+/// the head it read: it is closed, its worktree removed, and the new head
+/// is reviewed once its ticket's session rests.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_review_of_a_head_that_moved_on_is_closed_unrecorded_and_the_new_head_reviewed() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(dir.path()).unwrap();
+        let head = pull_request(&base);
+        let gh = Github::at(&head).await;
+        let (_overseer, crew, d, _llm, first) = a_plan_of_two(&base, pool, &gh).await;
+        turn_ends(&d, &base, &first, "Opened #7; CI is green.").await;
+        let review = reviewed_by_desk(&d, &head).await;
+        let next = pushed_again(&base, &gh, &crew, "more.ts");
+
+        let claude = Claude::started(&base, review.id).await;
+        claude.asked(review.last_prompt.as_deref().unwrap()).await;
+        claude
+            .replies(&d, review.id, &format!("Fine.\n\nREVIEW: clean {head}"))
+            .await;
+        closed(&d, &review).await;
+        assert!(settled(&d, &review).await);
+        assert_eq!(
+            d.store()
+                .pr_review_newest("desk", &PrRef::new("acme", "web", 7))
+                .await
+                .unwrap(),
+            None,
+            "nothing recorded of the head it read"
+        );
+        let first = d.view(first.id).unwrap();
+        turn_ends(&d, &base, &first, "Pushed more; CI is green.").await;
+        reviewed_by_desk(&d, &next).await;
+        assert!(!gh.merged.load(Ordering::SeqCst), "nothing merged");
+    })
+    .await;
+}
+
+/// A review Desk can't record (its pull request unreadable) is tried
+/// again less often each time; after the last try its boss is told, and
+/// Desk is done with it, so nothing keeps it open.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_review_desk_cant_record_is_given_up_its_boss_told_and_nothing_holds_it_open() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(dir.path()).unwrap();
+        let head = pull_request(&base);
+        let gh = Github::at(&head).await;
+        let (_overseer, crew, d, llm, first) = a_plan_of_two(&base, pool, &gh).await;
+        turn_ends(&d, &base, &first, "Opened #7; CI is green.").await;
+        let review = reviewed_by_desk(&d, &head).await;
+        gh.down.store(true, Ordering::SeqCst);
+        let claude = Claude::started(&base, review.id).await;
+        claude.asked(review.last_prompt.as_deref().unwrap()).await;
+        claude
+            .replies(&d, review.id, &format!("Fine.\n\nREVIEW: clean {head}"))
+            .await;
+        eventually("Desk to give the review up", async || {
+            settled(&d, &review).await.then_some(())
+        })
+        .await;
+        eventually("its boss told", async || {
+            llm.received_requests()
+                .await
+                .unwrap_or_default()
+                .iter()
+                .any(|r| String::from_utf8_lossy(&r.body).contains("couldn't record its review"))
+                .then_some(())
+        })
+        .await;
+        let open = d.view(review.id).unwrap();
+        let held = crew.close_held(&open, "desk").await;
+        assert!(
+            held.as_deref()
+                .is_none_or(|h| !h.contains("review isn't recorded yet")),
+            "{held:?}"
+        );
+        assert!(!gh.merged.load(Ordering::SeqCst), "nothing merged");
+    })
+    .await;
+}
+
+/// A review its boss would close before Desk recorded it stays open; one
+/// the person closes first is still recorded from what it said, and its
+/// pull request merged by its boss.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_review_closed_before_it_was_recorded_is_recorded_from_what_it_said() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(dir.path()).unwrap();
+        let head = pull_request(&base);
+        let gh = Github::at(&head).await;
+        let (_overseer, crew, d, llm, first) = a_plan_of_two(&base, pool, &gh).await;
+        calls_tool_once(
+            &llm,
+            "Desk recorded a clean review of acme/web#7",
+            "crew_github_merge",
+            merge_7(),
+        )
+        .await;
+        turn_ends(&d, &base, &first, "Opened #7; CI is green.").await;
+        let review = reviewed_by_desk(&d, &head).await;
+        // Its turn never rests long enough for Desk to record it.
+        *crew.close_settle.lock() = chrono::Duration::hours(1);
+        let claude = Claude::started(&base, review.id).await;
+        claude.asked(review.last_prompt.as_deref().unwrap()).await;
+        claude
+            .replies(&d, review.id, &format!("Good.\n\nREVIEW: clean {head}"))
+            .await;
+        let unrecorded = d.view(review.id).unwrap();
+        let held = crew.close_held(&unrecorded, "desk").await;
+        assert!(
+            held.as_deref()
+                .is_some_and(|h| h.contains("review isn't recorded yet")),
+            "{held:?}"
+        );
+
+        d.end(review.id, Some(By::you())).await.unwrap();
+        eventually("the boss to merge #7", async || {
+            gh.merged.load(Ordering::SeqCst).then_some(())
+        })
+        .await;
+        let recorded = d
+            .store()
+            .pr_review_newest("desk", &PrRef::new("acme", "web", 7))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!((recorded.clean, recorded.by_session), (true, review.id));
+        closed(&d, &review).await;
+        assert!(settled(&d, &review).await);
+    })
+    .await;
+}
+
+/// A review Desk started at Act fully is still recorded and closed once
+/// its boss acts at a lower level, but its boss isn't told to merge.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_review_is_recorded_and_closed_after_its_boss_drops_below_act_fully_and_nothing_merges() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(dir.path()).unwrap();
+        let head = pull_request(&base);
+        let gh = Github::at(&head).await;
+        let (overseer, _crew, d, llm, first) = a_plan_of_two(&base, pool, &gh).await;
+        turn_ends(&d, &base, &first, "Opened #7; CI is green.").await;
+        let review = reviewed_by_desk(&d, &head).await;
+        write_config(
+            &overseer,
+            &format!(
+                "{}[oversight.work]\nparallel = 1\n",
+                UNBOUND.replace("level = \"full\"", "level = \"act\"")
+            ),
+        );
+
+        let claude = Claude::started(&base, review.id).await;
+        claude.asked(review.last_prompt.as_deref().unwrap()).await;
+        claude
+            .replies(&d, review.id, &format!("Good.\n\nREVIEW: clean {head}"))
+            .await;
+        closed(&d, &review).await;
+        assert!(settled(&d, &review).await);
+        let recorded = d
+            .store()
+            .pr_review_newest("desk", &PrRef::new("acme", "web", 7))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(recorded.clean);
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(
+            asked_with(&llm, &["Desk recorded a clean review"]).await,
+            0,
+            "no merge is asked for below Act fully"
+        );
+        assert!(!gh.merged.load(Ordering::SeqCst));
     })
     .await;
 }
