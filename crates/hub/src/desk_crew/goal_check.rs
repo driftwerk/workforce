@@ -89,7 +89,7 @@ pub(crate) struct GoalChecks {
     notes: HashMap<String, Vec<GoalNote>>,
     /// Whether a look is under way: the next waits for it.
     looking: bool,
-    /// The met plans whose closing turn was started.
+    /// The plans whose closing turn was started.
     closing: HashSet<Uuid>,
     /// Each running goal's heads as it was agreed: kept (none), or last
     /// tried at, as GitHub couldn't be asked.
@@ -749,6 +749,29 @@ impl CrewHub {
     /// that it is run once whichever way its goal was met.
     pub(crate) fn closing_started(&self, id: Uuid) -> bool {
         self.goal_checks.lock().closing.insert(id)
+    }
+
+    /// Whether plan `id`'s closing turn was started and isn't over.
+    #[cfg(test)]
+    pub(super) fn closing_started_for(&self, id: Uuid) -> bool {
+        self.goal_checks.lock().closing.contains(&id)
+    }
+
+    /// Plan `id` is no longer closing: a later look may close it again.
+    pub(crate) fn closing_over(&self, id: Uuid) {
+        self.goal_checks.lock().closing.remove(&id);
+    }
+
+    /// Forgets what the goal checks keep of plan `id`, ended or removed.
+    pub(crate) fn goal_checks_forget(&self, id: Uuid) {
+        let mut c = self.goal_checks.lock();
+        c.closing.remove(&id);
+        c.pulled.remove(&id);
+        c.heads.remove(&id);
+        c.pulls.retain(|(plan, _, _), _| *plan != id);
+        for notes in c.notes.values_mut() {
+            notes.retain(|n| n.plan != id);
+        }
     }
 
     /// Whether a pull request goal plan `id` names (`refs`) moved since

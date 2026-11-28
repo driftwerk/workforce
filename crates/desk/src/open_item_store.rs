@@ -749,6 +749,32 @@ impl DeskStore {
             .await?)
     }
 
+    /// Whether a boss's item about plan `plan` is still open: a question of
+    /// its boss's the person hasn't answered.
+    pub async fn plan_asks_open(&self, plan: Uuid) -> Result<bool> {
+        let client = self.pool().get().await?;
+        Ok(client
+            .query_one(
+                "SELECT EXISTS (SELECT 1 FROM boss_open_items WHERE plan = $1 AND state <> 'closed')",
+                &[&plan],
+            )
+            .await?
+            .get(0))
+    }
+
+    /// Closes every boss's item not closed about plan `plan`, as lapsed for
+    /// `why`: how many.
+    pub async fn items_close_of_plan(&self, plan: Uuid, why: &str) -> Result<u64> {
+        let client = self.pool().get().await?;
+        Ok(client
+            .execute(
+                "UPDATE boss_open_items SET state = 'closed', closed_at = now(), changed_at = now(), \
+                 closed_by = $2, closed_why = $3 WHERE plan = $1 AND state <> 'closed'",
+                &[&plan, &ClosedBy::Lapsed.as_str(), &why],
+            )
+            .await?)
+    }
+
     /// Opens item `id` again, closed by a step that then didn't take: false
     /// when it isn't closed, or another of its key is open by now.
     pub async fn item_reopen(&self, id: Uuid) -> Result<bool> {

@@ -57,6 +57,11 @@ async fn a_hub_without_desk_serves_no_plan_routes() {
         ),
         (reqwest::Method::POST, format!("/api/desk/plans/{id}/drop")),
         (reqwest::Method::POST, format!("/api/desk/plans/{id}/group")),
+        (reqwest::Method::POST, format!("/api/desk/plans/{id}/end")),
+        (
+            reqwest::Method::POST,
+            format!("/api/desk/plans/{id}/remove"),
+        ),
     ] {
         let status = client
             .request(method.clone(), format!("http://{addr}{path}"))

@@ -2719,7 +2719,7 @@ async fn a_goal_ends_only_once_it_is_met_and_desk_closes_its_ticket() {
         );
         assert!(ran.summary.plan.covered());
         let refused = d.finish_plan(id, &by_sarah()).await.unwrap_err();
-        assert!(refused.to_string().contains("goal isn't met"), "{refused}");
+        assert!(refused.to_string().contains("aren't done yet"), "{refused}");
 
         let met = Met {
             at: crew::now(),
@@ -2732,8 +2732,12 @@ async fn a_goal_ends_only_once_it_is_met_and_desk_closes_its_ticket() {
             d.ticket(t.ticket.id).await.unwrap().ticket.state,
             TicketState::Done
         );
-        let done = d.finish_plan(id, &by_sarah()).await.unwrap();
+        let done = d.finish_plan(id, &by_sarah()).await.unwrap().unwrap();
         assert_eq!(done.summary.plan.state, PlanState::Done);
+        assert!(
+            d.finish_plan(id, &by_sarah()).await.unwrap().is_none(),
+            "done once"
+        );
     })
     .await;
 }

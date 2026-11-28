@@ -27,7 +27,8 @@ tickets that aren't done), each with its key (like ACM-12), who has it (with the
 id) and what it waits on. Hand a ready ticket out with crew.assign_ticket and move one with \
 crew.move_ticket, both by its key; read one in full with crew.ticket. With plan_id, one plan's tickets instead, in its order: each \
 with its key, column, needs and where it runs (machine, folder, engine, model), and with briefs \
-(true, or a list of keys) what each says, so you can read a ticket back before you change it.";
+(true, or a list of keys) what each says, so you can read a ticket back before you change it. \
+Its plans are the ones running or waiting; finished_plans the done and ended ones still on the board.";
 
 pub fn schema() -> Value {
     json!({ "type": "object", "properties": {
@@ -254,6 +255,7 @@ impl CrewHub {
             out.push_str("No ticket is ready, being done or blocked.");
         }
         let count = |c: Column| counts.get(&c).copied().unwrap_or(0);
+        let (plans, finished_plans) = self.plans_seen(seen).await;
         Ok(json!({
             "counts": {
                 "ready": count(Column::Ready),
@@ -261,29 +263,29 @@ impl CrewHub {
                 "blocked": count(Column::Blocked),
             },
             "table": reported(&out, "the board's tickets"),
-            "plans": self.plans_seen(seen).await,
+            "plans": plans,
+            "finished_plans": finished_plans,
         }))
     }
 
-    /// The plans `seen` sees that haven't ended, with where they stand.
-    pub(super) async fn plans_seen(&self, seen: &Seen) -> Value {
+    /// The plans `seen` sees, read once: those that haven't ended, with
+    /// where they stand, and those done or ended, still on the board until
+    /// removed (`crew.plan_update` remove).
+    pub(super) async fn plans_seen(&self, seen: &Seen) -> (Value, Value) {
+        use workforce_desk::plan::PlanState;
         let plans = match self.desk.plans(None, None).await {
             Ok(p) => p,
             Err(e) => {
                 tracing::warn!(error = %e, "reading the plans for the overseer failed");
-                return json!([]);
+                return (json!([]), json!([]));
             }
         };
-        let shown: Vec<Value> = plans
+        let (finished, going): (Vec<_>, Vec<_>) = plans
             .into_iter()
             .filter(|s| seen.sees(s.plan.group.as_deref()))
-            .filter(|s| {
-                !matches!(
-                    s.plan.state,
-                    workforce_desk::plan::PlanState::Done
-                        | workforce_desk::plan::PlanState::Dropped
-                )
-            })
+            .partition(|s| matches!(s.plan.state, PlanState::Done | PlanState::Dropped));
+        let going: Vec<Value> = going
+            .into_iter()
             .map(|s| {
                 json!({
                     "plan_id": s.plan.id.to_string(),
@@ -296,7 +298,17 @@ impl CrewHub {
                 })
             })
             .collect();
-        json!(shown)
+        let finished: Vec<Value> = finished
+            .into_iter()
+            .map(|s| {
+                json!({
+                    "plan_id": s.plan.id.to_string(),
+                    "goal": reported(&s.plan.goal, "a plan's goal"),
+                    "state": s.plan.state.as_str(),
+                })
+            })
+            .collect();
+        (json!(going), json!(finished))
     }
 
     /// `line`, the wake for `session`'s turn ending, with its ticket if that

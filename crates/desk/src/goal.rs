@@ -975,6 +975,13 @@ pub enum Said {
     /// however short ("yes"), as does at least 2 words and 6 characters of
     /// a longer one.
     Answering,
+    /// Asking, unprompted, for a plan to be ended or removed: at least 4
+    /// words and 15 characters of one message that name the plan and its
+    /// ending ([`asks_to_end`]), in a message asking for it now
+    /// ([`asked_by`]: not "don't stop the plan yet", "should we end the
+    /// plan?" or "wrap up the plan later"). A shorter reply counts for
+    /// nothing: the boss asks Desk's own End or Keep question instead.
+    Asking,
 }
 
 impl Said {
@@ -982,7 +989,7 @@ impl Said {
     pub fn floor(self) -> (usize, usize) {
         match self {
             Self::Agreeing | Self::Answering => (2, 6),
-            Self::Changing => (4, 15),
+            Self::Changing | Self::Asking => (4, 15),
         }
     }
 
@@ -1132,6 +1139,204 @@ pub fn stands_alone(text: &str) -> bool {
     let words = compared_words(text);
     let (least_words, least_chars) = Said::Changing.floor();
     words.len() >= least_words && words.join(" ").chars().count() >= least_chars
+}
+
+/// The words that ask for a plan to end or go: one of them in the
+/// person's words says it.
+const ENDING: [&str; 13] = [
+    "end", "ends", "ending", "stop", "drop", "remove", "finish", "finished", "close", "cancel",
+    "delete", "scrap", "wrap",
+];
+
+/// Words that put an ending off ("wrap up the plan later", "end it once
+/// CI is green"): not asking for it now.
+const DEFERRING: &[&str] = &[
+    "later",
+    "tomorrow",
+    "tonight",
+    "soon",
+    "eventually",
+    "after",
+    "afterwards",
+    "once",
+    "when",
+    "until",
+    "till",
+    "monday",
+    "tuesday",
+    "wednesday",
+    "thursday",
+    "friday",
+    "weekend",
+];
+/// Phrases that put an ending off, as [`DEFERRING`]'s words do.
+const DEFERRING_PHRASES: &[&[&str]] = &[&["next", "week"], &["next", "month"], &["next", "sprint"]];
+
+/// The plan an ending is asked for, among its boss's: its goal, the goals
+/// of the boss's other plans (finished ones too), and whether none of
+/// those is open.
+#[derive(Debug, Clone, Copy)]
+pub struct EndingOf<'a> {
+    pub goal: &'a str,
+    pub others: &'a [&'a str],
+    pub alone: bool,
+}
+
+impl EndingOf<'_> {
+    /// What `text` (its [`compared_words`], `words`) says of this plan:
+    /// where it names it, or none when it doesn't. It names it by its goal,
+    /// said whole, when that has at least 3 words, or a shorter one with
+    /// the word plan outside the goal's own words; or, `bare` allowing and
+    /// the boss having no other open plan (`alone`), by the word plan
+    /// alone. Never when it names another of the boss's plans, outside
+    /// this one's goal ("Mantis bugs" within "Mantis bugs round 2" is
+    /// this one's). Where it is named: the start of its goal, the word
+    /// plan and "it", each a word an ending may govern.
+    fn named(&self, words: &[String], bare: bool) -> Option<Vec<usize>> {
+        let read = self.read(words);
+        let named = goal_names(self.goal, &read.own, &read.plans)
+            || (bare && self.alone && !read.plans.is_empty());
+        (named && !read.other).then(|| {
+            let its = (0..words.len()).filter(|&i| words[i] == "it");
+            read.own
+                .iter()
+                .map(|&(s, _)| s)
+                .chain(read.plans)
+                .chain(its)
+                .collect()
+        })
+    }
+
+    /// Whether `text` names another of the boss's plans ([`Self::named`]).
+    fn names_other(&self, text: &str) -> bool {
+        self.read(&compared_words(text)).other
+    }
+
+    /// What `words` say of the boss's plans, as [`Self::named`] reads them.
+    fn read(&self, words: &[String]) -> Read {
+        let own = spans(words, self.goal);
+        let inside = |s: usize, e: usize| own.iter().any(|&(os, oe)| os <= s && e <= oe);
+        let plans: Vec<usize> = (0..words.len())
+            .filter(|&i| matches!(words[i].as_str(), "plan" | "plans") && !inside(i, i + 1))
+            .collect();
+        let other = self.others.iter().any(|g| {
+            let hits: Vec<_> = spans(words, g)
+                .into_iter()
+                .filter(|&(s, e)| !inside(s, e))
+                .collect();
+            goal_names(g, &hits, &plans)
+        });
+        Read { own, plans, other }
+    }
+}
+
+/// What a message says of the boss's plans: where it says this plan's
+/// goal, where the word plan stands outside it, and whether it names
+/// another plan.
+struct Read {
+    own: Vec<(usize, usize)>,
+    plans: Vec<usize>,
+    other: bool,
+}
+
+/// Whether `goal`, said at `hits`, names its plan: a goal of at least 3
+/// words alone, a shorter one with the word plan (at `plans`).
+fn goal_names(goal: &str, hits: &[(usize, usize)], plans: &[usize]) -> bool {
+    !hits.is_empty() && (!plans.is_empty() || compared_words(goal).len() >= 3)
+}
+
+/// Where `goal`'s words are said whole in `words`: each start and end.
+fn spans(words: &[String], goal: &str) -> Vec<(usize, usize)> {
+    let goal = compared_words(goal);
+    match goal.is_empty() {
+        true => Vec::new(),
+        false => words
+            .windows(goal.len())
+            .enumerate()
+            .filter(|(_, w)| *w == goal.as_slice())
+            .map(|(i, _)| (i, i + goal.len()))
+            .collect(),
+    }
+}
+
+/// How far an ending word may stand before the plan it ends: "end the
+/// Mantis bugs plan", "close out the whole plan".
+const GOVERNS: usize = 4;
+
+/// Whether `text` asks for the plan `of` to be ended or removed: it names
+/// that plan ([`EndingOf::named`]), and an ending (end, stop, drop,
+/// remove, finish, close, cancel, delete, scrap, wrap) governs it: in the
+/// same clause, within 3 words before where it is named. "Close the PR",
+/// "finish the tests first", "The Mantis bugs plan looks good, close the
+/// PR" or another plan's goal ask no ending of it.
+pub fn asks_to_end(text: &str, of: EndingOf) -> bool {
+    let words = compared_words(text);
+    let Some(named) = of.named(&words, true) else {
+        return false;
+    };
+    let clause = clauses(text, words.len());
+    (0..words.len())
+        .filter(|&i| ENDING.contains(&words[i].as_str()))
+        .any(|e| {
+            named
+                .iter()
+                .any(|&n| n > e && n - e <= GOVERNS && clause[n] == clause[e])
+        })
+}
+
+/// The clause of each of `text`'s `count` words ([`compared_words`]),
+/// clauses parted by , . ; : ! ? — or one clause when they can't be told.
+fn clauses(text: &str, count: usize) -> Vec<usize> {
+    let parted: Vec<usize> = text
+        .split([',', '.', ';', ':', '!', '?'])
+        .enumerate()
+        .flat_map(|(i, part)| std::iter::repeat_n(i, compared_words(part).len()))
+        .collect();
+    match parted.len() == count {
+        true => parted,
+        false => vec![0; count],
+    }
+}
+
+/// What the person's message `text` says of an ending it asks for: yes
+/// only when it asks for it now; no with a refusing word ("don't", any
+/// "n't", "not", "wait"), the ending's own words aside; unclear when it
+/// asks back ("Should we end the plan?") or puts it off ("later", "once
+/// CI is green", "next week").
+fn asks_now(text: &str) -> Consent {
+    let words = plain_words(text);
+    let others = || words.iter().filter(|w| !ENDING.contains(&w.as_str()));
+    if others().any(|w| refusing(w)) {
+        Consent::No
+    } else if text.trim_end().ends_with('?')
+        || others().any(|w| DEFERRING.contains(&w.as_str()))
+        || DEFERRING_PHRASES.iter().any(|p| holds(&words, p))
+    {
+        Consent::Unclear
+    } else {
+        Consent::Yes
+    }
+}
+
+/// [`said_by`] for the person asking for the plan `of` to be ended or
+/// removed ([`Said::Asking`]): each message read by [`asks_now`], and
+/// one naming another of the boss's plans refuses.
+pub fn asked_by(
+    messages: &[(DateTime<Utc>, String)],
+    quote: &str,
+    since: DateTime<Utc>,
+    of: EndingOf,
+) -> Result<DateTime<Utc>, NotSaid> {
+    found(
+        messages,
+        quote,
+        since,
+        Said::Asking,
+        &|text| match of.names_other(text) {
+            true => Consent::No,
+            false => asks_now(text),
+        },
+    )
 }
 
 /// Whether the person's message `text` holds `goal` in their own words:

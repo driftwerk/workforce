@@ -622,6 +622,10 @@ pub enum DeskEvent {
     Plan {
         plan: Box<crate::service::PlanSummary>,
     },
+    /// A finished or ended plan was removed: its tickets stay, as no plan's.
+    PlanRemoved {
+        id: Uuid,
+    },
     /// A handover note's draft changed: its old boss wrote it.
     Handover {
         handover: Box<crate::moves::Handover>,

@@ -1159,3 +1159,148 @@ fn a_short_answer_or_agreement_counts_only_when_it_agrees_and_none_that_refuses(
         assert_eq!(by("Yes, that looks right to me"), Ok(at(4)), "{said:?}");
     }
 }
+
+#[test]
+fn a_plan_is_ended_on_the_persons_words_asking_for_it_or_their_reply_to_the_bosss_question() {
+    let said = |texts: &[(i64, &str)]| -> Vec<(DateTime<Utc>, String)> {
+        texts.iter().map(|(m, t)| (at(*m), t.to_string())).collect()
+    };
+    let of = |goal, others, alone| EndingOf {
+        goal,
+        others,
+        alone,
+    };
+    let alone = of("Fix the Mantis bugs", &[], true);
+    let two = of("Fix the Mantis bugs", &["Ship Eden v1 to staff"], false);
+    let eden = of("Ship Eden v1 to staff", &["Fix the Mantis bugs"], false);
+    let docs = of("docs", &[], true);
+
+    // What names the plan and its ending.
+    assert!(asks_to_end("end the Mantis bugs plan", alone));
+    assert!(
+        asks_to_end("stop fix the Mantis bugs", two),
+        "named by its goal"
+    );
+    for quote in [
+        "ok",
+        "the tests",
+        "close the PR when CI is green",
+        "finish the tests first",
+    ] {
+        assert!(!asks_to_end(quote, alone), "{quote}");
+    }
+    assert!(
+        !asks_to_end("end the Mantis plan", eden),
+        "the bare word with two plans"
+    );
+    assert!(
+        !asks_to_end("end the plan, fix the Mantis bugs", eden),
+        "another plan's goal"
+    );
+    assert!(
+        !asks_to_end("close the docs PR", docs),
+        "a short goal alone"
+    );
+    assert!(!asks_to_end(
+        "close the CI green PR",
+        of("CI green", &[], true)
+    ));
+    let past = of("Ship Eden v1 to staff", &["Fix the Mantis bugs"], true);
+    assert!(
+        asks_to_end("end the plan for Eden now", past),
+        "its one open plan"
+    );
+    assert!(
+        !asks_to_end("end the plan, fix the Mantis bugs", past),
+        "a finished plan's goal"
+    );
+    assert!(
+        asks_to_end("close the docs plan", docs),
+        "a short goal with the word plan"
+    );
+
+    // Said now, and not taken back.
+    let theirs = said(&[
+        (1, "ok"),
+        (2, "don't stop the plan yet"),
+        (3, "Please don't end the plan yet"),
+        (4, "I don't want to stop the plan"),
+        (5, "We shouldn't end the plan"),
+        (6, "Should we end the plan now?"),
+        (7, "let's wrap up the plan later"),
+        (8, "end the plan once CI is green"),
+        (9, "close the plan next week please"),
+        (10, "Please end the Mantis bugs plan now"),
+    ]);
+    let asking = |quote: &str, of| asked_by(&theirs, quote, at(-60), of);
+    assert_eq!(asking("end the Mantis bugs plan", alone), Ok(at(10)));
+    for quote in [
+        "don't stop the plan yet",
+        "Please don't end the plan yet",
+        "I don't want to stop the plan",
+        "We shouldn't end the plan",
+    ] {
+        assert_eq!(asking(quote, alone), Err(NotSaid::Refuses), "{quote}");
+    }
+    for quote in [
+        "Should we end the plan now",
+        "let's wrap up the plan later",
+        "end the plan once CI is green",
+        "close the plan next week",
+    ] {
+        assert!(asking(quote, alone).is_err(), "{quote}");
+    }
+    assert!(
+        asking("ok", alone).is_err(),
+        "a short whole message isn't asking"
+    );
+    assert!(matches!(
+        asking("end the", alone),
+        Err(NotSaid::TooShort { .. })
+    ));
+    let mixed = said(&[(1, "end the plan, fix the Mantis bugs first")]);
+    assert!(
+        asked_by(&mixed, "end the plan", at(-60), eden).is_err(),
+        "it names another plan"
+    );
+
+    // An ending governs the plan, within 3 words before it.
+    assert!(!asks_to_end(
+        "The Mantis bugs plan looks good, close the PR",
+        alone
+    ));
+    assert!(!asks_to_end(
+        "Close the PR, the plan for Mantis bugs is fine",
+        alone
+    ));
+    assert!(asks_to_end(
+        "Fix the Mantis bugs is done: please end it",
+        alone
+    ));
+    assert!(asks_to_end("close out the whole plan", alone));
+
+    // Another plan's goal within this one's is this one's.
+    let round = of("Mantis bugs round 2", &["Mantis bugs"], false);
+    let bugs = of("Mantis bugs", &["Mantis bugs round 2"], false);
+    assert!(asks_to_end("Close the Mantis bugs round 2 plan", round));
+    assert!(
+        !asks_to_end("Close the Mantis bugs round 2 plan", bugs),
+        "the other's whole goal"
+    );
+    assert!(asks_to_end("Close the Mantis bugs plan", bugs));
+    let mention = said(&[(1, "Close the Mantis bugs round 2 plan now")]);
+    assert_eq!(
+        asked_by(
+            &mention,
+            "Close the Mantis bugs round 2 plan",
+            at(-60),
+            round
+        ),
+        Ok(at(1))
+    );
+
+    // The word plan counts outside the goal's own words.
+    let offsite = of("plan offsite", &[], true);
+    assert!(!asks_to_end("drop plan offsite", offsite));
+    assert!(asks_to_end("drop the plan offsite plan", offsite));
+}

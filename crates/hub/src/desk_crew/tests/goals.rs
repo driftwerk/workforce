@@ -4,7 +4,8 @@
 //! the session already on the work is taken on and starts nothing; the
 //! goal's ticket is held until it is met; facts reach every turn; the goal
 //! and its result change only on the person's answer to the very proposal
-//! asked; settled tickets don't finish an unmet goal; and work sent with no
+//! asked; settled tickets finish an unmet goal after its boss's turn, said
+//! not read met; and work sent with no
 //! goal saved is said at once.
 
 use super::*;
@@ -315,8 +316,9 @@ async fn a_goal_the_person_agreed_is_kept_by_desk_until_it_is_met() {
             .unwrap()
             .starts_with("No question of yours proposed that it is met"));
 
-        // Every ticket settled while the goal isn't met: the plan runs on,
-        // and its turn is told once.
+        // Every ticket settled while the goal isn't met: its turn is told so,
+        // and with nothing more done for it the plan finishes, said once in
+        // the DM as not read met.
         d.move_ticket(
             ticket,
             workforce_desk::Move { state: TicketState::Done, before: None, after: None },
@@ -325,9 +327,14 @@ async fn a_goal_the_person_agreed_is_kept_by_desk_until_it_is_met() {
         .await
         .unwrap();
         let unmet = "Every ticket is settled but the goal isn't met";
+        // This turn, or the runner pass's closing turn that saw it first.
         crew.plan_turn_now(id, vec!["MAN-1 is done.".into()]).await;
-        crew.plan_turn_now(id, vec!["Still done.".into()]).await;
-        assert_eq!(d.plan(id).await.unwrap().summary.plan.state, PlanState::Running);
+        eventually("the plan finished", async || {
+            (d.plan(id).await.ok()?.summary.plan.state == PlanState::Done).then_some(())
+        })
+        .await;
+        let p = d.plan(id).await.unwrap().summary.plan;
+        assert!(p.met.is_none(), "never read met");
         let bodies: Vec<String> = llm
             .received_requests()
             .await
@@ -335,14 +342,16 @@ async fn a_goal_the_person_agreed_is_kept_by_desk_until_it_is_met() {
             .iter()
             .map(|r| String::from_utf8_lossy(&r.body).to_string())
             .collect();
-        let turn = |marker: &str| -> Vec<&String> {
-            bodies.iter().filter(|b| b.contains(marker)).collect()
-        };
-        assert!(turn("MAN-1 is done.").iter().any(|b| b.contains(unmet)));
-        assert!(!turn("Still done.").is_empty());
+        let turns = bodies
+            .iter()
+            .filter(|b| b.contains(unmet) && b.contains("“Not read met:”"))
+            .count();
+        assert!(turns >= 1, "its one closing turn was told so");
+        crew.plan_turn_now(id, vec!["Still done.".into()]).await;
+        let again = llm.received_requests().await.unwrap();
         assert!(
-            turn("Still done.").iter().all(|b| b.matches(unmet).count() <= 1),
-            "told once"
+            !again.iter().any(|r| String::from_utf8_lossy(&r.body).contains("Still done.")),
+            "a finished plan has no turn left"
         );
     })
     .await;
@@ -1374,7 +1383,7 @@ async fn desk_posts(boss: &AgentService, text: &str) {
 }
 
 /// The boss writes `text` in its DM with the person.
-fn boss_says(boss: &AgentService, text: &str) {
+pub(super) fn boss_says(boss: &AgentService, text: &str) {
     let mut dm = boss
         .sessions
         .get_or_create(DESK_CHANNEL, PERSON, "desk")

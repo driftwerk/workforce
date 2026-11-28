@@ -391,6 +391,19 @@ impl CrewHub {
                 .map(str::to_string)
         };
         let cant_decide = some_of("cant_decide");
+        // Whether to end or remove a plan of its own: asked in Desk's words,
+        // on Desk's buttons, and done by the person's answer there alone.
+        if let Some(ending) = input["proposal"]["ending"].as_str() {
+            let ending = workforce_desk::plan::Ending::parse(ending.trim())
+                .ok_or("proposal.ending is end or remove.")?;
+            let id: Uuid = input["plan_id"]
+                .as_str()
+                .ok_or("Give the plan's plan_id, from crew.board, to ask about ending it.")?
+                .trim()
+                .parse()
+                .map_err(|_| "plan_id is a plan's id, from crew.board.".to_string())?;
+            return self.ask_ending(b, id, ending).await;
+        }
         // A question about a goal of its own: what it proposes is checked
         // now, so the person's answer applies only that.
         let about_goal = match input["plan_id"].as_str() {
@@ -1492,6 +1505,9 @@ impl CrewHub {
         if let Some(said) = self.plan_limit_answer(&closed, answer).await {
             return said.map_err(ItemRefused::Cant);
         }
+        if let Some(said) = self.ending_answer(&closed, answer).await {
+            return said.map_err(ItemRefused::Cant);
+        }
         // "You undid … Should I change that preference?": keeping or
         // forgetting it is done here; changing it goes to the boss.
         if let Some(done) = self.overrule_answered(&closed, answer).await {
@@ -2293,6 +2309,7 @@ fn goes_to_boss(item: &OpenItem, answer: &str) -> bool {
         && item.line_message.is_none()
         && super::preferences::overrule_of(item, answer).is_none()
         && !super::plan_limit::answers(item, answer)
+        && super::plan::ending_answered(item, answer).is_none()
 }
 
 /// The id the person's answer to `item` is said to its boss under: the

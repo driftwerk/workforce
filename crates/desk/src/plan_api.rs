@@ -1,6 +1,7 @@
 //! Plans over HTTP, for the person: the list, one in full, their edit,
-//! pausing, resuming, moving to another group and dropping. Approving a plan, or turning down a
-//! change to one, is the hub holder's alone, through the Floor's
+//! pausing, resuming, moving to another group, dropping, ending and
+//! removing. Approving a plan, or turning down a change to one, is the hub
+//! holder's alone, through the Floor's
 //! `POST /api/desk/needs/decide` (`DecideRef::Plan`). A boss proposes and
 //! changes plans with its crew tools, never here.
 
@@ -180,6 +181,26 @@ async fn drop_plan(
         .into_response()
 }
 
+/// Ends a running or paused plan, leaving its tickets as they are.
+async fn end(State(s): S, h: HeaderMap, Query(q): Q, Path(id): Path<Uuid>) -> Response {
+    guarded!(s, h, q);
+    s.desk
+        .end_plan(id, &By::you())
+        .await
+        .map(Json)
+        .into_response()
+}
+
+/// Removes a finished or ended plan; its tickets stay on their board.
+async fn remove(State(s): S, h: HeaderMap, Query(q): Q, Path(id): Path<Uuid>) -> Response {
+    guarded!(s, h, q);
+    s.desk
+        .remove_plan(id, &By::you())
+        .await
+        .map(|()| Json(json!({ "removed": id })))
+        .into_response()
+}
+
 /// The person's plan routes.
 pub(crate) fn api_routes(desk: Desk, auth: Arc<dyn Authorize>) -> Router {
     Router::new()
@@ -189,5 +210,7 @@ pub(crate) fn api_routes(desk: Desk, auth: Arc<dyn Authorize>) -> Router {
         .route("/api/desk/plans/{id}/resume", post(resume))
         .route("/api/desk/plans/{id}/group", post(regroup))
         .route("/api/desk/plans/{id}/drop", post(drop_plan))
+        .route("/api/desk/plans/{id}/end", post(end))
+        .route("/api/desk/plans/{id}/remove", post(remove))
         .with_state(Arc::new(Api { desk, auth }))
 }

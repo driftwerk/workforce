@@ -417,7 +417,7 @@ impl CrewTool {
                     "counts": o.counts,
                     "table": reported(&table(&o.items, &o.groups, &charged), "the crew's sessions and agents"),
                     "slots": { "busy": crew.desk.charges_busy(&boss), "parallel": parallel },
-                    "plans": crew.plans_seen(seen).await,
+                    "plans": crew.plans_seen(seen).await.0,
                 });
                 Ok(self.with_machines(crew, b, &boss, local).await)
             }

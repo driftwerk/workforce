@@ -276,6 +276,15 @@ pub enum OnDrop {
     Leave,
 }
 
+/// How a plan is stopped before it is done.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Stopping {
+    /// Its tickets not started are dropped; its working sessions as `OnDrop` says.
+    Drop(OnDrop),
+    /// Its tickets stay as they are; its working sessions go on as the person's.
+    End,
+}
+
 fn internal(e: eyre::Report) -> DeskError {
     DeskError::Internal(e)
 }
@@ -592,6 +601,15 @@ impl Desk {
             revisions,
             spend,
         })
+    }
+
+    /// How `p` closes now its work is done ([`plan::closing`]), as its
+    /// tickets stand; none while some is left.
+    pub async fn plan_closing(&self, p: &Plan) -> Result<Option<plan::Closing>, DeskError> {
+        if !matches!(p.state, PlanState::Running | PlanState::Paused) {
+            return Ok(None);
+        }
+        Ok(plan::closing(p, &self.plan_tickets(p.id).await?))
     }
 
     /// Whether a ticket on this computer may run in a folder: one there, or
@@ -1387,13 +1405,30 @@ impl Desk {
                 }
             }
         }
-        // Only the needs the plan added go; one the person or the tracker
-        // had stays, as does one its issue has there now too.
+        let unneeded = self.plan_unneeded(p.id, id).await?;
+        self.0
+            .store
+            .release_ticket(p.id, id, &unneeded)
+            .await
+            .map_err(internal)?;
+        self.announce_tickets(unneeded.iter().map(|(a, _)| *a).chain([id]))
+            .await;
+        Ok(())
+    }
+
+    /// The needs plan `plan` added that `ticket` is in which go with the
+    /// plan: one the person or the tracker had stays, as does one its issue
+    /// has there now too.
+    async fn plan_unneeded(
+        &self,
+        plan: Uuid,
+        ticket: Uuid,
+    ) -> Result<Vec<(Uuid, Uuid)>, DeskError> {
         let mut unneeded = Vec::new();
         for (a, b) in self
             .0
             .store
-            .plan_added_needs(p.id, id)
+            .plan_added_needs(plan, ticket)
             .await
             .map_err(internal)?
         {
@@ -1408,20 +1443,18 @@ impl Desk {
                 unneeded.push((a, b));
             }
         }
-        self.0
-            .store
-            .release_ticket(p.id, id, &unneeded)
-            .await
-            .map_err(internal)?;
-        let touched = unneeded.iter().map(|(a, _)| *a).chain([id]);
-        for t in touched.collect::<HashSet<_>>() {
+        Ok(unneeded)
+    }
+
+    /// Announces each of `ids`' tickets as it now is, once.
+    async fn announce_tickets(&self, ids: impl IntoIterator<Item = Uuid>) {
+        for t in ids.into_iter().collect::<HashSet<_>>() {
             if let Ok(v) = self.ticket(t).await {
                 self.announce(DeskEvent::Ticket {
                     ticket: Box::new(v),
                 });
             }
         }
-        Ok(())
     }
 
     /// The board a plan in `group` goes on: the group's first, or one made
@@ -2852,12 +2885,28 @@ impl Desk {
     /// working on the rest are stopped, or left running as the person's
     /// own (`on`).
     pub async fn drop_plan(&self, id: Uuid, on: OnDrop, by: &By) -> Result<PlanDetail, DeskError> {
+        self.stop_plan(id, Stopping::Drop(on), by).await
+    }
+
+    /// Ends running or paused plan `id`, leaving its tickets as they are:
+    /// the sessions working on them go on as the person's own, and the
+    /// tickets it took on are let go where they are.
+    pub async fn end_plan(&self, id: Uuid, by: &By) -> Result<PlanDetail, DeskError> {
+        self.stop_plan(id, Stopping::End, by).await
+    }
+
+    async fn stop_plan(&self, id: Uuid, how: Stopping, by: &By) -> Result<PlanDetail, DeskError> {
         let _write = self.0.plan_write.lock().await;
-        // No start is under way while it drops: one begun finished first.
+        // No start is under way while it stops: one begun finished first.
         let _one = self.0.plan_starting.lock().await;
         let mut p = self.plan_of(id).await?;
         if p.state == PlanState::Dropped {
             return self.plan_detail(p).await;
+        }
+        if how == Stopping::End && !matches!(p.state, PlanState::Running | PlanState::Paused) {
+            return Err(DeskError::Conflict(
+                "Only a running or paused plan can be ended.".into(),
+            ));
         }
         let rows = self.0.store.plan_tickets(p.id).await.map_err(internal)?;
         // A start a stop cut off never starts now.
@@ -2878,6 +2927,10 @@ impl Desk {
             .filter(|(_, r)| r.adopted)
             .map(|(id, _)| id)
             .collect();
+        let on = match how {
+            Stopping::Drop(on) => on,
+            Stopping::End => OnDrop::Leave,
+        };
         for t in rows {
             // One taken on goes back where it is, whatever its column: one
             // done stays the plan's record.
@@ -2898,16 +2951,17 @@ impl Desk {
                 .collect();
             let working = matches!(t.state, TicketState::Doing | TicketState::Review);
             match (on, working) {
-                (_, false) if matches!(t.state, TicketState::Done | TicketState::Dropped) => {}
+                _ if matches!(t.state, TicketState::Done | TicketState::Dropped) => {}
                 (OnDrop::Leave, true) => {
                     for s in sessions {
                         if self.charge_of(s).is_some_and(|c| c.live()) {
                             if let Err(e) = self.release(s, by).await {
-                                tracing::info!(session = %s, error = %e, "a dropped plan's session wasn't let go");
+                                tracing::info!(session = %s, error = %e, "a stopped plan's session wasn't let go");
                             }
                         }
                     }
                 }
+                (_, false) if how == Stopping::End => {}
                 (OnDrop::Stop, true) | (_, false) => {
                     for s in sessions {
                         if let Err(e) = self.stop(s, Some(by.clone())) {
@@ -2926,46 +2980,120 @@ impl Desk {
         p.state = PlanState::Dropped;
         p.unpause();
         p.updated_at = crew::now();
-        self.plan_budget_ends(&p, by).await;
-        self.plan_note(
-            &p,
-            by,
-            Kind::PlanDropped,
-            format!("dropped the plan: {}", crew::one_line(&p.goal, 120)),
-        );
+        let goal = crew::one_line(&p.goal, 120);
+        let text = match how {
+            Stopping::Drop(_) => format!("dropped the plan: {goal}"),
+            Stopping::End => format!("ended the plan, leaving its tickets as they are: {goal}"),
+        };
+        self.plan_closed(&p, by, Kind::PlanDropped, text).await;
         self.plan_saved(&p).await
     }
 
-    /// Plan `id` is done: every ticket of it is Done or Dropped.
-    pub async fn finish_plan(&self, id: Uuid, by: &By) -> Result<PlanDetail, DeskError> {
+    /// Plan `id` is done: nothing is left of it to do ([`plan::closing`]).
+    /// The plan as this call made it Done; none when it was Done already.
+    pub async fn finish_plan(&self, id: Uuid, by: &By) -> Result<Option<PlanDetail>, DeskError> {
         let _write = self.0.plan_write.lock().await;
         let mut p = self.plan_of(id).await?;
         if p.state == PlanState::Done {
-            return self.plan_detail(p).await;
+            return Ok(None);
         }
-        let tickets = self.plan_tickets(id).await?;
-        if !p.goal_done() {
-            return Err(DeskError::Conflict(
-                "Its goal isn't met yet: only a met reading or the person's own words close it."
-                    .into(),
-            ));
-        }
-        if p.met.is_none() && !plan::settled(&tickets) {
-            return Err(DeskError::Conflict(
-                "Some of the plan's tickets aren't done yet.".into(),
-            ));
+        if self.plan_closing(&p).await?.is_none() {
+            return Err(DeskError::Conflict(match p.paused {
+                Some(Paused::Person) => {
+                    "The person paused it: it isn't finished under them.".into()
+                }
+                _ => "Some of the plan's tickets aren't done yet.".into(),
+            }));
         }
         p.state = PlanState::Done;
         p.unpause();
         p.updated_at = crew::now();
-        self.plan_budget_ends(&p, by).await;
+        let text = format!("finished the plan: {}", crew::one_line(&p.goal, 120));
+        self.plan_closed(&p, by, Kind::PlanDone, text).await;
+        self.plan_saved(&p).await.map(Some)
+    }
+
+    /// What `p` leaving the running ones does once, noted as `kind` for
+    /// `text`: its budget ends, its watches end and its asks close.
+    async fn plan_closed(&self, p: &Plan, by: &By, kind: Kind, text: String) {
+        const ENDED: &str = "its plan ended";
+        self.plan_budget_ends(p, by).await;
+        if let Err(e) = self.0.store.watches_end_plan(p.id, ENDED).await {
+            tracing::warn!(plan = %p.id, error = %e, "an ended plan's watches weren't ended");
+        }
+        if let Err(e) = self
+            .0
+            .store
+            .items_close_of_plan(p.id, "Its plan ended.")
+            .await
+        {
+            tracing::warn!(plan = %p.id, error = %e, "an ended plan's asks weren't closed");
+        }
+        // Its plan-limit asks and the person's End or Keep carry no plan,
+        // only their key: closed by it, parked ones too.
+        let keys = [
+            plan::limit_prefix(p.id),
+            plan::ending_key(p.id, plan::Ending::End),
+        ];
+        self.close_keyed(p.id, &keys, "Its plan ended.").await;
+        self.plan_note(p, by, kind, text);
+    }
+
+    /// Closes plan `id`'s items keyed from any of `keys`, as lapsed, for
+    /// `why`.
+    async fn close_keyed(&self, id: Uuid, keys: &[String], why: &str) {
+        for key in keys {
+            if let Err(e) = self
+                .0
+                .store
+                .item_close_of_key_prefix(key, crate::open_item::ClosedBy::Lapsed, why)
+                .await
+            {
+                tracing::warn!(plan = %id, error = %e, "a plan's keyed asks weren't closed");
+            }
+        }
+    }
+
+    /// Removes finished or ended plan `id`: its tickets stay where they
+    /// are, as no plan's, without the needs it added between them.
+    pub async fn remove_plan(&self, id: Uuid, by: &By) -> Result<(), DeskError> {
+        let _write = self.0.plan_write.lock().await;
+        let p = self.plan_of(id).await?;
+        if !matches!(p.state, PlanState::Done | PlanState::Dropped) {
+            return Err(DeskError::Conflict(
+                "End the plan first: only a finished or ended plan can be removed.".into(),
+            ));
+        }
+        let tickets = self.0.store.plan_tickets(id).await.map_err(internal)?;
+        let mut unneeded = Vec::new();
+        for t in &tickets {
+            unneeded.extend(self.plan_unneeded(id, t.id).await?);
+        }
+        unneeded.sort_unstable();
+        unneeded.dedup();
+        let released = self
+            .0
+            .store
+            .remove_plan(id, &unneeded)
+            .await
+            .map_err(internal)?;
+        self.0.boss_plans.lock().awaiting.remove(&id);
         self.plan_note(
             &p,
             by,
-            Kind::PlanDone,
-            format!("finished the plan: {}", crew::one_line(&p.goal, 120)),
+            Kind::PlanRemoved,
+            format!("removed the plan: {}", crew::one_line(&p.goal, 120)),
         );
-        self.plan_saved(&p).await
+        self.close_keyed(
+            id,
+            &[format!("{}{id}:", plan::ENDING_KEY)],
+            "Its plan was removed.",
+        )
+        .await;
+        self.announce(DeskEvent::PlanRemoved { id });
+        self.announce_tickets(released.into_iter().chain(unneeded.iter().map(|(a, _)| *a)))
+            .await;
+        Ok(())
     }
 
     /// Plan `id`'s goal is met as `met` says: kept once, and the ticket
@@ -3985,6 +4113,10 @@ mod tests;
 #[cfg(test)]
 #[path = "plans_adopt_tests.rs"]
 mod adopt_tests;
+
+#[cfg(test)]
+#[path = "plans_end_tests.rs"]
+mod end_tests;
 
 #[cfg(test)]
 #[path = "plans_group_tests.rs"]
