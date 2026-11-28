@@ -86,7 +86,7 @@ pub(super) fn not_said(quote: &str, why: NotSaid, said: Said) -> String {
     let ask = " Or ask them (crew.ask_person with plan_id and proposal) and pass their reply, which counts however short.";
     match (why, said) {
         (NotSaid::TooShort { words, chars }, Said::Asking) => format!(
-            "“{q}” is too little of what the person wrote to end or remove a plan on its own: quote at least {words} words and {chars} characters of their message asking for it, exactly; or ask them in your DM whether to end it and pass their plain reply."
+            "“{q}” is too little of what the person wrote to end or remove a plan on its own: quote at least {words} words and {chars} characters of their message asking for it, exactly; or ask them with crew.ask_person (plan_id, proposal.ending), whose answer on Desk's buttons does it."
         ),
         (NotSaid::TooShort { words, chars }, Said::Changing) => format!(
             "“{q}” is too little of what the person wrote to change their goal on its own: quote at least {words} words and {chars} characters of their message, exactly.{ask}"
@@ -187,8 +187,9 @@ pub(super) fn proposal_schema() -> Value {
     json!({ "type": "object", "properties": {
         "goal": { "type": "string", "description": "The goal you propose it becomes" },
         "result": result_schema(),
-        "met": { "type": "string", "description": "That it is met, with what shows it" }
-    }, "description": "With plan_id: the change to the goal you ask the person about. Their answer applies only this change" })
+        "met": { "type": "string", "description": "That it is met, with what shows it" },
+        "ending": { "type": "string", "enum": ["end", "remove"], "description": "Alone: ask whether to end the plan, or remove it from its board. Desk words the question and its buttons (End or Remove, and Keep), and their answer there does it; text is not shown" }
+    }, "description": "With plan_id: the change to the goal you ask the person about, or whether to end or remove the plan (ending). Their answer applies only this change" })
 }
 
 pub(super) fn facts_schema() -> Value {
@@ -697,8 +698,8 @@ impl CrewHub {
 
     /// When the person asked, in `quote`, for the boss `service`'s plan
     /// `of` to be ended or removed, within a day: their own words saying so
-    /// ([`Said::Asking`]), or their plain reply to its own question about
-    /// it ([`goal::replied_to_end`]).
+    /// ([`Said::Asking`]). A shorter answer counts for nothing here: Desk's
+    /// own question (`crew.ask_person` with `proposal.ending`) takes it.
     pub(super) fn asked_at(
         &self,
         service: &AgentService,
@@ -706,36 +707,19 @@ impl CrewHub {
         quote: &str,
     ) -> Result<DateTime<Utc>, String> {
         let now = crew::now();
-        let since = now - AGREED_WITHIN;
-        if goal::asks_to_end(quote, of) {
-            return goal::asked_by(
-                &self.person_words(service, now - WORDS_LOOKED),
-                quote,
-                since,
-                of,
-            )
-            .map_err(|e| not_said(quote, e, Said::Asking));
+        if !goal::asks_to_end(quote, of) {
+            let q = crew::one_line(quote, 120);
+            return Err(format!(
+                "“{q}” doesn't ask for this plan to end or go now: quote the person's own words where an ending (end, stop, drop, remove, finish, close) governs the plan, named by its goal (with the word plan when the goal is under 3 words; the word plan or “it” alone only while it is your one open plan), at least 4 words and 15 characters of one message that doesn't say no, ask back or put it off. Or ask them with crew.ask_person (plan_id, proposal: {{\"ending\": \"end\"}} or remove): their answer on Desk's buttons does it."
+            ));
         }
-        let replies: Vec<_> = self
-            .person(Some(service))
-            .map(|person| super::orchestrator::dm_talks(service, &person, since, MESSAGES_READ))
-            .unwrap_or_default()
-            .iter()
-            .map(|talk| goal::replied_to_end(&talk.theirs, &talk.boss, quote, of, since))
-            .collect();
-        let q = crew::one_line(quote, 120);
-        match replies.iter().filter_map(|r| r.ok()).max() {
-            Some(at) => Ok(at),
-            None => Err(match replies.iter().find_map(|r| match r {
-                Err(NotReplied::Says(says)) => Some(*says),
-                _ => None,
-            }) {
-                Some(says) => not_yes(&q, says),
-                None => format!(
-                    "“{q}” doesn't ask for this plan to end or go now: quote the person's own words that name it (its goal, with the word plan when the goal is under 3 words; the word plan alone only while it is your one open plan) and its ending (end, stop, drop, remove, finish, close), at least 4 words and 15 characters of one message that doesn't say no, ask back or put it off; or ask them in your DM whether to end it, naming it by its goal, and pass their plain reply."
-                ),
-            }),
-        }
+        goal::asked_by(
+            &self.person_words(service, now - WORDS_LOOKED),
+            quote,
+            now - AGREED_WITHIN,
+            of,
+        )
+        .map_err(|e| not_said(quote, e, Said::Asking))
     }
 
     /// The person's word for `applying`, a change to plan `p`'s goal, in

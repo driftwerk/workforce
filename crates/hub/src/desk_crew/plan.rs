@@ -34,6 +34,8 @@ use workforce_desk::crew::{
     self, By, Crew as _, Extras, Kind, MachineSession, MentionedPlan, Party, PartyKind,
 };
 use workforce_desk::model::{DeskEvent, Engine, Exited, SessionState};
+use workforce_desk::open_item::{NewItem, OpenItem, OpenKind};
+use workforce_desk::open_item_store::Opened;
 use workforce_desk::plan::{self, Closing, Draft, DraftTicket, Plan, PlanState, PlanTicket};
 use workforce_desk::{plan_group, Changed, NewPlan, PlanDetail, PlanEdit, UNGROUPED_NAME};
 
@@ -260,12 +262,12 @@ you report as done as facts, a judged part's progress as a checkpoint, and fix w
 read from with repair once its reads keep failing. When the person asks you to end a plan, \
 give end with their words asking for it (person_said: at least 4 words naming the plan, by the \
 word plan while it is your one open plan, or its goal, with the word plan when the goal is \
-under 3 words, and its end: end, stop, drop, remove, finish or close, asked for now; or their \
-plain reply to your own question whether to end the plan, naming it by its goal): it stops, \
-its tickets stay as they are and its sessions working now carry on as theirs. When they ask to \
-remove one, give remove the same way: a running one is ended first, and its tickets stay on the \
-board as no plan's; crew.board lists finished ones as finished_plans. Either goes in a call of \
-its own. Say why.";
+under 3 words, and its end governing it: end, stop, drop, remove, finish or close, asked for \
+now). Or ask them with crew.ask_person (plan_id, proposal: ending end or remove): Desk words \
+the question, and their End there does it, not you. Ended, it stops, its tickets stay as they \
+are and its sessions working now carry on as theirs. When they ask to remove one, give remove \
+the same way: a running one is ended first, and its tickets stay on the board as no plan's; \
+crew.board lists finished ones as finished_plans. Either goes in a call of its own. Say why.";
 
 /// What `crew.plan_update` with `end` or `remove` may say besides.
 const ENDING_ALONE: [&str; 5] = ["plan_id", "revision", "why", "end", "remove"];
@@ -3457,25 +3459,119 @@ impl CrewHub {
             }
         }
         let by = By::manager(agent, &name_of(&b.service), why);
+        let ending = match remove {
+            true => plan::Ending::Remove,
+            false => plan::Ending::End,
+        };
+        let done = self.end_or_remove(p, ending, &by).await?;
+        Ok(Some(json!({ "plan_id": p.id.to_string(), "done": done })))
+    }
+
+    /// Ends plan `p`, or removes it as `ending` says (ending it first while
+    /// it is open), `by` whoever asked: what was done, in a sentence.
+    async fn end_or_remove(
+        &self,
+        p: &Plan,
+        ending: plan::Ending,
+        by: &By,
+    ) -> Result<&'static str, String> {
+        let remove = ending == plan::Ending::Remove;
         let open = matches!(p.state, PlanState::Running | PlanState::Paused);
         if open {
-            self.desk.end_plan(p.id, &by).await.map_err(plain)?;
+            self.desk.end_plan(p.id, by).await.map_err(plain)?;
         } else if !remove {
             return Err(
                 "This plan has finished or ended already: remove takes it off the board.".into(),
             );
         }
         if remove {
-            self.desk.remove_plan(p.id, &by).await.map_err(plain)?;
+            self.desk.remove_plan(p.id, by).await.map_err(plain)?;
         }
-        Ok(Some(json!({
-            "plan_id": p.id.to_string(),
-            "done": match (open, remove) {
-                (true, false) => "Ended: its tickets stay as they are, and its sessions working now carry on as the person's.",
-                (true, true) => "Ended and removed: its tickets stay on the board as they are, as no plan's.",
-                (false, _) => "Removed: its tickets stay on the board as they are, as no plan's.",
-            },
-        })))
+        Ok(match (open, remove) {
+            (true, false) => "Ended: its tickets stay as they are, and its sessions working now carry on as the person's.",
+            (true, true) => "Ended and removed: its tickets stay on the board as they are, as no plan's.",
+            (false, _) => "Removed: its tickets stay on the board as they are, as no plan's.",
+        })
+    }
+
+    /// The boss `b` asks the person whether to end or remove its plan `id`
+    /// (`ending`), in Desk's own words, on End (or Remove) and Keep: only
+    /// their answer there does it ([`Self::ending_answer`]).
+    pub(super) async fn ask_ending(
+        &self,
+        b: &Bound,
+        id: Uuid,
+        ending: plan::Ending,
+    ) -> Result<Value, String> {
+        let p = self.own_plan(b, id).await?.summary.plan;
+        match (ending, p.state) {
+            (_, PlanState::Proposed) => {
+                return Err(
+                    "A plan not approved yet isn't ended or removed: drop it instead.".into(),
+                )
+            }
+            (plan::Ending::End, PlanState::Done | PlanState::Dropped) => {
+                return Err(
+                    "This plan has finished or ended already: ask to remove it instead.".into(),
+                )
+            }
+            _ => {}
+        }
+        let mut new = NewItem::ask(&p.boss, OpenKind::Ask, None, &ending.question(&p.goal));
+        new.dedupe_key = plan::ending_key(p.id, ending);
+        new.options = vec![ending.label().to_string(), ENDING_KEEP.to_string()];
+        new.cant_decide = Some("Only the person ends or removes a plan.".into());
+        let opened = self
+            .desk
+            .store()
+            .item_open(&new)
+            .await
+            .map_err(|e| format!("Desk couldn't ask the person just now: {e}"))?;
+        self.show_asks().await;
+        Ok(json!(match opened {
+            Opened::New(i) => {
+                self.post_item(&p.boss, &i, super::items::needs_you(&i), Vec::new())
+                    .await;
+                format!(
+                    "Asked, in Desk's words, as item {}: their {} there does it, and Keep leaves it.",
+                    i.id,
+                    ending.label()
+                )
+            }
+            Opened::Again(i) => format!("Already asked, as item {}.", i.id),
+        }))
+    }
+
+    /// What the person's `answer` to `closed`, Desk's question whether to
+    /// end or remove a plan, does: none when it isn't one, or the answer
+    /// isn't one of its buttons. One that couldn't be done is asked again.
+    pub(super) async fn ending_answer(
+        &self,
+        closed: &OpenItem,
+        answer: &str,
+    ) -> Option<Result<String, String>> {
+        let (id, does) = ending_answered(closed, answer)?;
+        if !does {
+            return Some(Ok("Kept the plan as it is.".into()));
+        }
+        let (_, ending) = plan::ending_of(&closed.dedupe_key)?;
+        let done = match self.desk.plan(id).await {
+            Ok(d) => {
+                self.end_or_remove(&d.summary.plan, ending, &By::you())
+                    .await
+            }
+            Err(e) => Err(plain(e)),
+        };
+        Some(match done {
+            Ok(done) => Ok(done.to_string()),
+            Err(e) => {
+                tracing::info!(plan = %id, error = %e, "the person's answer didn't end the plan");
+                if let Err(e) = self.desk.store().item_reopen(closed.id).await {
+                    tracing::warn!(error = %format!("{e:#}"), "an ending ask whose answer didn't take wasn't opened again");
+                }
+                Err(e)
+            }
+        })
     }
 
     /// Spends one of the hour's work turns of `service`, the boss.
@@ -3536,6 +3632,23 @@ impl CrewHub {
         }
         out
     }
+}
+
+/// The button that leaves a plan as it is, on Desk's question whether to
+/// end or remove it.
+const ENDING_KEEP: &str = "Keep";
+
+/// The plan Desk's question `item` asks about ending or removing, and
+/// whether the person's `answer` there does it (its End or Remove) or not
+/// (Keep): none when it isn't one, or the answer isn't one of its buttons.
+pub(super) fn ending_answered(item: &OpenItem, answer: &str) -> Option<(Uuid, bool)> {
+    let (id, _) = plan::ending_of(&item.dedupe_key)?;
+    let offered = item
+        .options
+        .iter()
+        .map(|o| o.trim())
+        .find(|o| o.eq_ignore_ascii_case(answer.trim()))?;
+    Some((id, !offered.eq_ignore_ascii_case(ENDING_KEEP)))
 }
 
 /// Whether plan `p` is paused for a budget (its own, its group's, its

@@ -3029,21 +3029,29 @@ impl Desk {
         {
             tracing::warn!(plan = %p.id, error = %e, "an ended plan's asks weren't closed");
         }
-        // Its plan-limit asks carry no plan, only their key: closed by it,
-        // parked ones too.
-        if let Err(e) = self
-            .0
-            .store
-            .item_close_of_key_prefix(
-                &crate::plan::limit_prefix(p.id),
-                crate::open_item::ClosedBy::Lapsed,
-                "Its plan ended.",
-            )
-            .await
-        {
-            tracing::warn!(plan = %p.id, error = %e, "an ended plan's limit asks weren't closed");
-        }
+        // Its plan-limit asks and the person's End or Keep carry no plan,
+        // only their key: closed by it, parked ones too.
+        let keys = [
+            plan::limit_prefix(p.id),
+            plan::ending_key(p.id, plan::Ending::End),
+        ];
+        self.close_keyed(p.id, &keys, "Its plan ended.").await;
         self.plan_note(p, by, kind, text);
+    }
+
+    /// Closes plan `id`'s items keyed from any of `keys`, as lapsed, for
+    /// `why`.
+    async fn close_keyed(&self, id: Uuid, keys: &[String], why: &str) {
+        for key in keys {
+            if let Err(e) = self
+                .0
+                .store
+                .item_close_of_key_prefix(key, crate::open_item::ClosedBy::Lapsed, why)
+                .await
+            {
+                tracing::warn!(plan = %id, error = %e, "a plan's keyed asks weren't closed");
+            }
+        }
     }
 
     /// Removes finished or ended plan `id`: its tickets stay where they
@@ -3076,6 +3084,12 @@ impl Desk {
             Kind::PlanRemoved,
             format!("removed the plan: {}", crew::one_line(&p.goal, 120)),
         );
+        self.close_keyed(
+            id,
+            &[format!("{}{id}:", plan::ENDING_KEY)],
+            "Its plan was removed.",
+        )
+        .await;
         self.announce(DeskEvent::PlanRemoved { id });
         self.announce_tickets(released.into_iter().chain(unneeded.iter().map(|(a, _)| *a)))
             .await;

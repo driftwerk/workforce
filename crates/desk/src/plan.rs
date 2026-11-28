@@ -55,6 +55,66 @@ pub fn limit_key(plan: Uuid, since: DateTime<Utc>, until: DateTime<Utc>) -> Stri
     )
 }
 
+/// What every item asking the person whether to end or remove a plan, on
+/// Desk's own End or Keep buttons, is keyed by.
+pub const ENDING_KEY: &str = "plan-ending:";
+
+/// Ending a plan, or removing it from its board: what a boss may ask the
+/// person about with Desk's own question.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Ending {
+    End,
+    Remove,
+}
+
+impl Ending {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::End => "end",
+            Self::Remove => "remove",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "end" => Some(Self::End),
+            "remove" => Some(Self::Remove),
+            _ => None,
+        }
+    }
+
+    /// Its button: End or Remove.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::End => "End",
+            Self::Remove => "Remove",
+        }
+    }
+
+    /// The question Desk asks the person of the plan of `goal`.
+    pub fn question(self, goal: &str) -> String {
+        let goal = crate::crew::one_line(goal, 120);
+        match self {
+            Self::End => format!("End the plan “{goal}”? Its tickets stay as they are."),
+            Self::Remove => format!(
+                "Remove the plan “{goal}” from the board? Its tickets stay on the board as no plan's."
+            ),
+        }
+    }
+}
+
+/// The item asking the person whether to end or remove plan `plan`, as
+/// `ending` says.
+pub fn ending_key(plan: Uuid, ending: Ending) -> String {
+    format!("{ENDING_KEY}{plan}:{}", ending.as_str())
+}
+
+/// The plan, and which ending, an item keyed `key` asks the person about.
+pub fn ending_of(key: &str) -> Option<(Uuid, Ending)> {
+    let (plan, ending) = key.strip_prefix(ENDING_KEY)?.split_once(':')?;
+    Some((plan.parse().ok()?, Ending::parse(ending)?))
+}
+
 text_enum!(PlanState {
     Proposed => "proposed",
     Running => "running",

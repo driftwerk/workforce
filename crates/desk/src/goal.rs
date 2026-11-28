@@ -979,9 +979,8 @@ pub enum Said {
     /// words and 15 characters of one message that name the plan and its
     /// ending ([`asks_to_end`]), in a message asking for it now
     /// ([`asked_by`]: not "don't stop the plan yet", "should we end the
-    /// plan?" or "wrap up the plan later"). A shorter reply ("yes") counts
-    /// only as the answer to the boss's own question about it
-    /// ([`replied_to_end`]).
+    /// plan?" or "wrap up the plan later"). A shorter reply counts for
+    /// nothing: the boss asks Desk's own End or Keep question instead.
     Asking,
 }
 
@@ -1184,30 +1183,119 @@ pub struct EndingOf<'a> {
 }
 
 impl EndingOf<'_> {
-    /// Whether `text` names this plan: by its goal, said whole, when it
-    /// has at least 3 words, or a shorter one with the word plan; or,
-    /// `bare` allowing and the boss having no other open plan (`alone`),
-    /// by the word plan alone. Never when it names another of the boss's
-    /// plans.
-    fn named(&self, text: &str, bare: bool) -> bool {
-        let words = compared_words(text);
-        let plan = words.iter().any(|w| w == "plan" || w == "plans");
-        let by_goal =
-            |goal: &str| says_goal(text, goal) && (plan || compared_words(goal).len() >= 3);
-        !self.others.iter().any(|g| by_goal(g))
-            && (by_goal(self.goal) || (bare && plan && self.alone))
+    /// What `text` (its [`compared_words`], `words`) says of this plan:
+    /// where it names it, or none when it doesn't. It names it by its goal,
+    /// said whole, when that has at least 3 words, or a shorter one with
+    /// the word plan outside the goal's own words; or, `bare` allowing and
+    /// the boss having no other open plan (`alone`), by the word plan
+    /// alone. Never when it names another of the boss's plans, outside
+    /// this one's goal ("Mantis bugs" within "Mantis bugs round 2" is
+    /// this one's). Where it is named: the start of its goal, the word
+    /// plan and "it", each a word an ending may govern.
+    fn named(&self, words: &[String], bare: bool) -> Option<Vec<usize>> {
+        let read = self.read(words);
+        let named = goal_names(self.goal, &read.own, &read.plans)
+            || (bare && self.alone && !read.plans.is_empty());
+        (named && !read.other).then(|| {
+            let its = (0..words.len()).filter(|&i| words[i] == "it");
+            read.own
+                .iter()
+                .map(|&(s, _)| s)
+                .chain(read.plans)
+                .chain(its)
+                .collect()
+        })
+    }
+
+    /// Whether `text` names another of the boss's plans ([`Self::named`]).
+    fn names_other(&self, text: &str) -> bool {
+        self.read(&compared_words(text)).other
+    }
+
+    /// What `words` say of the boss's plans, as [`Self::named`] reads them.
+    fn read(&self, words: &[String]) -> Read {
+        let own = spans(words, self.goal);
+        let inside = |s: usize, e: usize| own.iter().any(|&(os, oe)| os <= s && e <= oe);
+        let plans: Vec<usize> = (0..words.len())
+            .filter(|&i| matches!(words[i].as_str(), "plan" | "plans") && !inside(i, i + 1))
+            .collect();
+        let other = self.others.iter().any(|g| {
+            let hits: Vec<_> = spans(words, g)
+                .into_iter()
+                .filter(|&(s, e)| !inside(s, e))
+                .collect();
+            goal_names(g, &hits, &plans)
+        });
+        Read { own, plans, other }
     }
 }
 
+/// What a message says of the boss's plans: where it says this plan's
+/// goal, where the word plan stands outside it, and whether it names
+/// another plan.
+struct Read {
+    own: Vec<(usize, usize)>,
+    plans: Vec<usize>,
+    other: bool,
+}
+
+/// Whether `goal`, said at `hits`, names its plan: a goal of at least 3
+/// words alone, a shorter one with the word plan (at `plans`).
+fn goal_names(goal: &str, hits: &[(usize, usize)], plans: &[usize]) -> bool {
+    !hits.is_empty() && (!plans.is_empty() || compared_words(goal).len() >= 3)
+}
+
+/// Where `goal`'s words are said whole in `words`: each start and end.
+fn spans(words: &[String], goal: &str) -> Vec<(usize, usize)> {
+    let goal = compared_words(goal);
+    match goal.is_empty() {
+        true => Vec::new(),
+        false => words
+            .windows(goal.len())
+            .enumerate()
+            .filter(|(_, w)| *w == goal.as_slice())
+            .map(|(i, _)| (i, i + goal.len()))
+            .collect(),
+    }
+}
+
+/// How far an ending word may stand before the plan it ends: "end the
+/// Mantis bugs plan", "close out the whole plan".
+const GOVERNS: usize = 4;
+
 /// Whether `text` asks for the plan `of` to be ended or removed: it names
-/// that plan ([`EndingOf::named`]) and its ending (end, stop, drop,
-/// remove, finish, close, cancel, delete, scrap, wrap). "Close the PR",
-/// "finish the tests first" or another plan's goal name no ending of it.
+/// that plan ([`EndingOf::named`]), and an ending (end, stop, drop,
+/// remove, finish, close, cancel, delete, scrap, wrap) governs it: in the
+/// same clause, within 3 words before where it is named. "Close the PR",
+/// "finish the tests first", "The Mantis bugs plan looks good, close the
+/// PR" or another plan's goal ask no ending of it.
 pub fn asks_to_end(text: &str, of: EndingOf) -> bool {
-    compared_words(text)
-        .iter()
-        .any(|w| ENDING.contains(&w.as_str()))
-        && of.named(text, true)
+    let words = compared_words(text);
+    let Some(named) = of.named(&words, true) else {
+        return false;
+    };
+    let clause = clauses(text, words.len());
+    (0..words.len())
+        .filter(|&i| ENDING.contains(&words[i].as_str()))
+        .any(|e| {
+            named
+                .iter()
+                .any(|&n| n > e && n - e <= GOVERNS && clause[n] == clause[e])
+        })
+}
+
+/// The clause of each of `text`'s `count` words ([`compared_words`]),
+/// clauses parted by , . ; : ! ? — or one clause when they can't be told.
+fn clauses(text: &str, count: usize) -> Vec<usize> {
+    let parted: Vec<usize> = text
+        .split([',', '.', ';', ':', '!', '?'])
+        .enumerate()
+        .flat_map(|(i, part)| std::iter::repeat_n(i, compared_words(part).len()))
+        .collect();
+    match parted.len() == count {
+        true => parted,
+        false => vec![0; count],
+    }
 }
 
 /// What the person's message `text` says of an ending it asks for: yes
@@ -1239,43 +1327,16 @@ pub fn asked_by(
     since: DateTime<Utc>,
     of: EndingOf,
 ) -> Result<DateTime<Utc>, NotSaid> {
-    found(messages, quote, since, Said::Asking, &|text| {
-        let other = |goal| EndingOf {
-            goal,
-            others: &[],
-            alone: false,
-        };
-        match of.others.iter().any(|g| other(g).named(text, false)) {
+    found(
+        messages,
+        quote,
+        since,
+        Said::Asking,
+        &|text| match of.names_other(text) {
             true => Consent::No,
             false => asks_now(text),
-        }
-    })
-}
-
-/// When the person's `quote` is their plain reply ("yes") to the boss's
-/// last message before it in `boss`, which asked them about ending or
-/// removing the plan `of`, naming it by its goal (the word plan alone
-/// never does, since the boss writes the question): as [`replied_to`]
-/// reads a reply.
-pub fn replied_to_end(
-    theirs: &[(DateTime<Utc>, String)],
-    boss: &[(DateTime<Utc>, String)],
-    quote: &str,
-    of: EndingOf,
-    since: DateTime<Utc>,
-) -> Result<DateTime<Utc>, NotReplied> {
-    let at = replied_to(theirs, boss, quote, &[], since)?;
-    boss.iter()
-        .filter(|(when, _)| *when < at)
-        .max_by_key(|(when, _)| *when)
-        .filter(|(_, asked)| {
-            compared_words(asked)
-                .iter()
-                .any(|w| ENDING.contains(&w.as_str()))
-                && of.named(asked, false)
-        })
-        .map(|_| at)
-        .ok_or(NotReplied::NothingProposed)
+        },
+    )
 }
 
 /// Whether the person's message `text` holds `goal` in their own words:

@@ -7,7 +7,9 @@
 //! or their plain reply to its question, a finished one listed on its board
 //! as finished; and one whose finish was refused (a ticket reopened during
 //! its closing turn) is finished on a later pass once settled again; and
-//! no boss turn is spent on a plan paused at a budget.
+//! no boss turn is spent on a plan paused at a budget; and a boss's
+//! question whether to end or remove one is Desk's, done only by the
+//! person's answer on its buttons.
 
 use super::*;
 use workforce_desk::board::TicketState;
@@ -314,18 +316,7 @@ async fn a_plan_is_ended_only_on_words_naming_it_and_its_end_now_or_a_yes_to_the
         assert!(!r.success, "the Mantis bugs PR isn't its plan");
         assert!(going(eden).await && going(mantis).await);
 
-        for asked in [
-            "Shall I close the old PR?",
-            "Shall I close out the plan's old PR?",
-            "Shall I end the plan?",
-        ] {
-            then(&overseer, boss_says, asked).await;
-            then(&overseer, person_says, "yes").await;
-            let r = run(&overseer, "crew.plan_update", ending(mantis, "end", "yes")).await;
-            assert!(!r.success, "a yes to “{asked}”");
-        }
-        assert!(going(mantis).await);
-
+        // A yes in the DM ends nothing: Desk's own question does.
         then(
             &overseer,
             boss_says,
@@ -334,6 +325,30 @@ async fn a_plan_is_ended_only_on_words_naming_it_and_its_end_now_or_a_yes_to_the
         .await;
         then(&overseer, person_says, "yes").await;
         let r = run(&overseer, "crew.plan_update", ending(mantis, "end", "yes")).await;
+        assert!(!r.success, "a yes in the DM");
+        let r = run(
+            &overseer,
+            "crew.plan_update",
+            ending(
+                mantis,
+                "end",
+                "The Mantis bugs plan looks good, close the PR",
+            ),
+        )
+        .await;
+        assert!(!r.success, "its close governs the PR");
+        then(
+            &overseer,
+            person_says,
+            "Please end the Mantis bugs plan now",
+        )
+        .await;
+        let r = run(
+            &overseer,
+            "crew.plan_update",
+            ending(mantis, "end", "end the Mantis bugs plan"),
+        )
+        .await;
         assert!(r.success, "{r:?}");
         assert_eq!(
             d.plan(mantis).await.unwrap().summary.plan.state,
@@ -463,6 +478,77 @@ async fn a_plan_paused_at_a_budget_gets_no_bosss_turn_desk_finishes_it_or_it_wai
             (0, 0),
             "no boss turn past a budget"
         );
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_bosss_ending_question_is_desks_and_only_the_persons_answer_there_ends_or_removes_a_plan(
+) {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (overseer, state, d, _llm) = hub_with(dir.path(), pool, ACTS).await;
+        let id = proposed(&d, dir.path(), 1).await.summary.plan.id;
+        d.approve_plan(id, 1, &By::you()).await.unwrap();
+        let crew = CrewHub::start(state, d.clone(), FAST, CancellationToken::new());
+        eventually("the plan tools", async || {
+            overseer.tools.has("crew.ask_person").then_some(())
+        })
+        .await;
+        let ask = |ending: &str| {
+            json!({ "text": "Shall I close out the plan's old PR?", "plan_id": id.to_string(),
+                "proposal": { "ending": ending } })
+        };
+        let asked = async |ending: &str| {
+            let r = run(&overseer, "crew.ask_person", ask(ending)).await;
+            assert!(r.success, "{r:?}");
+            let key = workforce_desk::plan::ending_key(
+                id,
+                workforce_desk::plan::Ending::parse(ending).unwrap(),
+            );
+            d.store()
+                .items_keyed_from(&key)
+                .await
+                .unwrap()
+                .into_iter()
+                .find(|i| i.state != workforce_desk::open_item::OpenState::Closed)
+                .expect("Desk's question")
+        };
+        let state_of = async || d.plan(id).await.unwrap().summary.plan.state;
+
+        let item = asked("end").await;
+        assert_eq!(item.text, "End the plan “Make the suite green”? Its tickets stay as they are.");
+        assert_eq!(item.options, ["End", "Keep"]);
+        assert_eq!(crew.answer_item(item.id, "Keep").await.unwrap(), "Kept the plan as it is.");
+        assert_eq!(state_of().await, PlanState::Running);
+
+        let item = asked("end").await;
+        crew.answer_item(item.id, "End").await.unwrap();
+        assert_eq!(state_of().await, PlanState::Dropped);
+        let r = run(&overseer, "crew.ask_person", ask("end")).await;
+        assert!(!r.success, "ended already");
+
+        let item = asked("remove").await;
+        assert!(item.text.starts_with("Remove the plan “Make the suite green”"));
+        assert_eq!(item.options, ["Remove", "Keep"]);
+        crew.answer_item(item.id, "Remove").await.unwrap();
+        assert!(d.plan(id).await.is_err(), "removed");
+
+        // Ended some other way, its question closes.
+        let other = proposed(&d, dir.path(), 1).await.summary.plan.id;
+        d.approve_plan(other, 1, &By::you()).await.unwrap();
+        let r = run(
+            &overseer,
+            "crew.ask_person",
+            json!({ "text": "End it?", "plan_id": other.to_string(), "proposal": { "ending": "end" } }),
+        )
+        .await;
+        assert!(r.success, "{r:?}");
+        let key = workforce_desk::plan::ending_key(other, workforce_desk::plan::Ending::End);
+        let open = async || d.store().items_keyed_from(&key).await.unwrap().len();
+        assert_eq!(open().await, 1);
+        d.end_plan(other, &By::you()).await.unwrap();
+        assert_eq!(open().await, 0, "closed with its plan");
     })
     .await;
 }

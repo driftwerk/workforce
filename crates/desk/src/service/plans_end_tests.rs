@@ -507,7 +507,8 @@ async fn the_persons_routes_end_and_remove_a_plan() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_plan_ending_closes_its_plan_limit_asks_parked_ones_too() {
+async fn a_plan_ending_closes_its_plan_limit_asks_and_end_question_and_removing_its_remove_question(
+) {
     with_test_pool(build_pool, |pool| async move {
         let dir = tempfile::tempdir().unwrap();
         let d = desk(pool, dir.path()).await;
@@ -526,12 +527,28 @@ async fn a_plan_ending_closes_its_plan_limit_asks_parked_ones_too() {
             .item_said(parked, crew::now(), true)
             .await
             .unwrap();
+        let key = crate::plan::ending_key(id, crate::plan::Ending::Remove);
+        assert_eq!(
+            crate::plan::ending_of(&key),
+            Some((id, crate::plan::Ending::Remove))
+        );
+        assert_eq!(crate::plan::ending_of("plan-ending:nope:end"), None);
+        let end = limit_ask(crate::plan::ending_key(id, crate::plan::Ending::End)).await;
+        let remove = limit_ask(crate::plan::ending_key(id, crate::plan::Ending::Remove)).await;
         let state = async |item| d.store().open_item(item).await.unwrap().unwrap().state;
         assert_eq!(state(parked).await, OpenState::Parked);
 
         d.end_plan(id, &By::you()).await.unwrap();
         assert_eq!(state(open).await, OpenState::Closed);
         assert_eq!(state(parked).await, OpenState::Closed);
+        assert_eq!(state(end).await, OpenState::Closed, "ended some other way");
+        assert_eq!(
+            state(remove).await,
+            OpenState::Open,
+            "it may still be removed"
+        );
+        d.remove_plan(id, &By::you()).await.unwrap();
+        assert_eq!(state(remove).await, OpenState::Closed);
     })
     .await;
 }
