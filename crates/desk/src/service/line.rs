@@ -277,9 +277,14 @@ impl Desk {
     /// What `by`'s words carry in from outside: what it says it carries,
     /// else what the hub's turn calling Desk has read.
     pub fn carried_by(&self, by: &By) -> Option<String> {
-        by.outside
-            .clone()
-            .or_else(|| self.0.read_outside.get().and_then(|read| read()))
+        by.outside.clone().or_else(|| self.turn_read_outside())
+    }
+
+    /// What the hub's turn calling Desk now has read of outside content,
+    /// as its hub says ([`Self::read_outside_with`]); none when it says
+    /// nothing.
+    pub fn turn_read_outside(&self) -> Option<String> {
+        self.0.read_outside.get().and_then(|read| read())
     }
 
     /// The answer to an MCP request on `caller`'s line, when lines are served.

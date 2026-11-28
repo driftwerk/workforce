@@ -138,6 +138,7 @@ async fn the_homes_boss_takes_on_a_machines_ungrouped_session_only_as_both_ends_
                     link_id: Some("link-of-mine".into()),
                     call_id: Some("c-1".into()),
                     ceiling: None,
+                    outside: Some(crate::desk_crew::served::SERVED_UNSAID.to_string()),
                 },
                 "ungrouped",
             )
@@ -613,6 +614,7 @@ async fn a_take_is_refused_to_any_boss_but_the_grants_own_from_its_home() {
                     link_id: Some("home-relay".into()),
                     call_id: Some("c-1".into()),
                     ceiling: None,
+                    outside: None,
                 },
                 "ungrouped",
             )

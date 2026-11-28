@@ -28,8 +28,6 @@ pub mod sync;
 pub mod tools;
 
 #[cfg(test)]
-mod loop_tests;
-#[cfg(test)]
 mod revoke_tests;
 
 use std::sync::Arc;

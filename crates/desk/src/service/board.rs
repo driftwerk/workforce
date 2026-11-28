@@ -801,6 +801,7 @@ impl Desk {
         let mut t = self.ticket_of(id).await?;
         let at = now();
         let mut said = vec![];
+        let mut replaced = false;
         if let Some(title) = patch.title.map(|s| s.trim().to_string()) {
             if title.is_empty() {
                 return Err(DeskError::Invalid("A ticket needs a title.".into()));
@@ -821,6 +822,7 @@ impl Desk {
                 if body != t.body {
                     said.push("edited its description".to_string());
                     t.body = body;
+                    replaced = true;
                 }
             }
             (None, Some(more)) => {
@@ -848,7 +850,7 @@ impl Desk {
         }
         if !said.is_empty() {
             t.updated_at = at;
-            self.stamp_written(t.id, by, false)
+            self.stamp_written(t.id, by, replaced)
                 .await
                 .map_err(internal)?;
         }
@@ -2110,12 +2112,16 @@ impl Desk {
 
 impl Desk {
     /// What the boss's turn writing `id` (a ticket or a comment) for `by`
-    /// had read, kept for those its words are given to: every boss's
-    /// `made` one (one with none kept is taken as from before Desk said),
-    /// and any edit that carried some, which stays.
-    pub(super) async fn stamp_written(&self, id: Uuid, by: &By, made: bool) -> eyre::Result<()> {
+    /// had read, kept for those its words are given to: every boss's one
+    /// it `whole`ly wrote (made, or a ticket's description replaced), and
+    /// any edit that carried some, which stays. A boss's ticket with none
+    /// kept is taken as from before Desk said, until a boss whose turn had
+    /// read nothing, or the person, replaces its description: a rename or
+    /// an addition leaves the words it had.
+    pub(super) async fn stamp_written(&self, id: Uuid, by: &By, whole: bool) -> eyre::Result<()> {
         let outside = self.carried_by(by);
-        if outside.is_some() || (made && by.party.kind == PartyKind::Manager) {
+        let vouches = matches!(by.party.kind, PartyKind::Manager | PartyKind::You);
+        if outside.is_some() || (whole && vouches) {
             self.0
                 .store
                 .put_written_outside(id, outside.as_deref())

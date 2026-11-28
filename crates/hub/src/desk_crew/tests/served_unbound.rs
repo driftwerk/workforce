@@ -150,6 +150,7 @@ async fn a_remote_boss_at_act_fully_decides_each_request_on_its_own_hub_and_noth
                     link_id: Some("link-acme".into()),
                     call_id: Some(uuid::Uuid::new_v4().to_string()),
                     ceiling: None,
+                    outside: Some(crate::desk_crew::served::SERVED_UNSAID.to_string()),
                 },
                 "acme",
             )
@@ -220,6 +221,7 @@ async fn a_remote_boss_at_act_fully_decides_each_request_on_its_own_hub_and_noth
                     link_id: Some("link-acme".into()),
                     call_id: Some(uuid::Uuid::new_v4().to_string()),
                     ceiling: None,
+                    outside: Some(crate::desk_crew::served::SERVED_UNSAID.to_string()),
                 },
                 "acme",
             )

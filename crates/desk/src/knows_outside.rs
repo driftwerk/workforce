@@ -31,19 +31,26 @@ const NETWORK_COMMANDS: [&str; 8] = [
     "curl", "wget", "http", "https", "xh", "nc", "ncat", "netcat",
 ];
 
-/// The `gh` subcommands that read what other people wrote.
-const GH_READS: [&[&str]; 11] = [
-    &["issue"],
+/// The `gh` subcommands that read what other people wrote. Those that
+/// only write (`issue create`, `pr comment`) aren't among them.
+const GH_READS: [&[&str]; 17] = [
+    &["issue", "view"],
+    &["issue", "list"],
+    &["issue", "status"],
     &["pr", "view"],
     &["pr", "diff"],
     &["pr", "list"],
+    &["pr", "status"],
     &["pr", "checkout"],
     &["api"],
     &["release", "view"],
-    &["gist"],
+    &["gist", "view"],
+    &["gist", "list"],
+    &["gist", "clone"],
     &["search"],
     &["repo", "view"],
     &["run", "view"],
+    &["status"],
 ];
 
 /// The `gh` flags whose value is the next word.
@@ -82,7 +89,8 @@ fn outside_step(tool: &str) -> bool {
 /// Whether `command` reaches the network for what someone else wrote: a
 /// fetching command anywhere in it (quoted too, as `bash -c "curl …"`
 /// gives it), or `gh` reading issues, pull requests, releases, gists,
-/// searches, repositories, runs or its API.
+/// searches, repositories, runs, the status of what concerns the person
+/// or its API.
 fn networked(command: &str) -> bool {
     command
         .split(['|', ';', '&', '(', ')', '`', '\n'])
@@ -151,7 +159,9 @@ impl Writers<'_> {
 /// (whose turns had read none): one made here by one of them, its
 /// bosses' comments too, or an issue synced from where the person is
 /// known that they wrote, with every one of its comments (as kept) theirs
-/// and none unread, and no description edit of another's in its history.
+/// and none unread, no description edit of another's in its history
+/// ([`edited_by_them`]), and no boss's turn that had read some rewriting
+/// it here.
 pub fn ticket_outside(t: &Ticket, b: &Board, w: Writers<'_>) -> Option<String> {
     let key = t.key(b).unwrap_or_else(|| "The ticket".into());
     // The comments posted here: on a ticket of Desk's own, its bosses'
@@ -173,6 +183,7 @@ pub fn ticket_outside(t: &Ticket, b: &Board, w: Writers<'_>) -> Option<String> {
             .or_else(|| posted(false));
     };
     let me = b.sync.as_ref().and_then(|s| s.me.as_deref());
+    let me_name = b.sync.as_ref().and_then(|s| s.me_name.as_deref());
     let mine = |a: &crate::ticket_comments::Author| {
         a.kind == AuthorKind::Person && me.is_some() && a.id.as_deref() == me
     };
@@ -182,6 +193,7 @@ pub fn ticket_outside(t: &Ticket, b: &Board, w: Writers<'_>) -> Option<String> {
         e.kind == HistoryKind::Field
             && e.field.as_deref() == Some("description")
             && e.by != HistoryBy::Desk
+            && !edited_by_them(e, me, me_name)
     });
     let theirs = me.is_some()
         && facts.reporter_id.as_deref() == me
@@ -191,12 +203,36 @@ pub fn ticket_outside(t: &Ticket, b: &Board, w: Writers<'_>) -> Option<String> {
             Some(_) => true,
             None => mine(&c.author),
         });
+    // What a boss's turn rewrote of it here, through Desk.
+    let rewritten = || match w.stamps.get(&t.id) {
+        Some(Some(read)) => Some(format!("{key}, written by a boss's turn that had read {read}")),
+        _ => None,
+    };
     match theirs {
-        true => posted(true),
+        true => rewritten().or_else(|| posted(true)),
         false => Some(format!(
             "{key}, a {} issue not all the person's words",
             external.system.title()
         )),
+    }
+}
+
+/// Whether history event `e` was the person's own change: by their id
+/// there (`me`) when it says one; without one (a change kept before Desk
+/// kept ids), by their name there (`me_name`) matching its, which can't
+/// tell them from a teammate of the same name: taken as theirs, as the
+/// most Desk can say. One with neither said is another's.
+fn edited_by_them(e: &HistoryEvent, me: Option<&str>, me_name: Option<&str>) -> bool {
+    match (&e.actor_id, me) {
+        (Some(id), Some(me)) => id == me,
+        (Some(_), None) => false,
+        (None, _) => {
+            let named = |n: &str| n.trim().to_lowercase();
+            matches!(
+                (e.actor.as_deref(), me_name),
+                (Some(a), Some(m)) if !m.trim().is_empty() && named(a) == named(m)
+            )
+        }
     }
 }
 

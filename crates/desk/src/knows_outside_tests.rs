@@ -52,6 +52,10 @@ fn gh_reads_outside_content_only_for_others_words() {
         "gh pr checkout 648",
         "gh run view 991 --log-failed",
         "gh run view --log",
+        "gh pr status",
+        "gh status",
+        "gh issue status",
+        "gh gist clone abc",
         "bash -c \"curl -s https://api.example/v1\"",
         "sh -c 'wget https://example.com/x'",
     ] {
@@ -63,6 +67,10 @@ fn gh_reads_outside_content_only_for_others_words() {
         "gh pr merge 648 --squash",
         "gh run watch",
         "gh auth status",
+        "gh issue create --title 'Login times out' --body 'Steps'",
+        "gh issue comment 12 --body 'Fixed in #648'",
+        "gh pr comment 648 --body 'Ready'",
+        "gh gist create notes.md",
         "gh -R acme/issue pr create --fill",
         "gh --repo acme/api pr checks 648",
         "git log --oneline",
@@ -315,4 +323,78 @@ fn a_synced_issue_is_the_persons_only_when_they_wrote_it_and_all_its_comments() 
         read(vec![edit(HistoryBy::Remote)]).is_some(),
         "a teammate's edit"
     );
+}
+
+/// A description edit in a synced issue's history is another's only when
+/// its id there isn't the person's; one kept before Desk kept ids is
+/// another's unless its name is the person's name there; and a boss's
+/// turn that had read some rewriting it here makes it outside.
+#[test]
+fn a_synced_issue_the_person_edited_there_is_still_theirs() {
+    let mut b = board(Some("u-me"));
+    b.sync.as_mut().unwrap().me_name = Some("Allan Reyes".into());
+    let edited_by = |id: &str, name: &str| {
+        crate::ticket_history::linear_history(
+            &json!({ "identifier": "ENG-1", "history": [
+                { "createdAt": "2026-11-02T09:00:00.000Z", "actor": { "id": id, "name": name },
+                  "updatedDescription": true },
+            ] }),
+            None,
+        )
+        .unwrap()
+    };
+    let t = issue("u-me", 0);
+    let read = |events: &[HistoryEvent], stamps: &HashMap<Uuid, Option<String>>| {
+        ticket_outside(
+            &t,
+            &b,
+            Writers {
+                comments: &[],
+                history: Some(events),
+                stamps,
+            },
+        )
+    };
+    assert_eq!(read(&edited_by("u-me", "Allan Reyes"), &none()), None);
+    assert!(
+        read(&edited_by("u-dana", "Dana Kim"), &none()).is_some(),
+        "a teammate's edit"
+    );
+    assert!(
+        read(&edited_by("u-dana", "Allan Reyes"), &none()).is_some(),
+        "a teammate of the same name, told apart by id"
+    );
+    // Kept before Desk kept ids: by name.
+    let old = |actor: Option<&str>| {
+        serde_json::from_value::<HistoryEvent>(json!({
+            "at": Utc::now(), "actor": actor, "by": "remote", "kind": "field", "field": "description"
+        }))
+        .unwrap()
+    };
+    assert_eq!(read(&[old(Some("allan reyes"))], &none()), None);
+    assert!(read(&[old(Some("Dana Kim"))], &none()).is_some());
+    assert!(read(&[old(None)], &none()).is_some(), "no one named");
+    let mut unnamed = board(Some("u-me"));
+    unnamed.sync.as_mut().unwrap().me_name = None;
+    assert!(
+        ticket_outside(
+            &t,
+            &unnamed,
+            Writers {
+                comments: &[],
+                history: Some(&[old(Some("Allan Reyes"))]),
+                stamps: &none(),
+            },
+        )
+        .is_some(),
+        "the person's name there not known"
+    );
+    // Rewritten here by a boss's turn that had read some.
+    let stamps = HashMap::from([(t.id, Some("web.fetch".to_string()))]);
+    assert_eq!(
+        read(&edited_by("u-me", "Allan Reyes"), &stamps).as_deref(),
+        Some("ENG-482, written by a boss's turn that had read web.fetch")
+    );
+    let clean = HashMap::from([(t.id, None)]);
+    assert_eq!(read(&[], &clean), None);
 }

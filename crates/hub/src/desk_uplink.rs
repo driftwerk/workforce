@@ -864,6 +864,9 @@ impl Uplink {
                                     link_id: Some(link.link_id.to_string()),
                                     call_id: Some(call_id.clone()),
                                     ceiling: None,
+                                    outside: Some(
+                                        crate::desk_crew::served::SERVED_UNSAID.to_string(),
+                                    ),
                                 },
                                 &link.group,
                             )

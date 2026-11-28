@@ -89,6 +89,13 @@ pub struct RelayCall {
     /// done later. Desk leaves it out of what it sends the machine, whose
     /// `served` route refuses a field it doesn't know.
     pub left_ms: u64,
+    /// What the boss's turn making it had read of outside content, when it
+    /// had: what it says to a session there carries that in. Said only
+    /// then, so a call of a turn that read none is as a machine older than
+    /// this takes it, and one that had read some is refused there rather
+    /// than taken as carrying nothing.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub outside: Option<String>,
 }
 
 impl RelayCall {
@@ -116,6 +123,7 @@ impl RelayCall {
             level: ceiling.level,
             act: ceiling.relayed_act(),
             left_ms: 0,
+            outside: None,
         }
     }
 
@@ -285,7 +293,10 @@ impl CrewHub {
             return Err(unreached());
         }
         let wait = *self.relay_wait.lock();
-        let call = RelayCall::of(machine, group, tool, input, agent, ceiling);
+        let call = RelayCall {
+            outside: self.desk().turn_read_outside(),
+            ..RelayCall::of(machine, group, tool, input, agent, ceiling)
+        };
         // Too large to carry: never queued, so nothing of it is done.
         if !call.carried() {
             return Err(MachineRefused::Refused(format!(
@@ -502,6 +513,9 @@ struct Relayed {
     level: String,
     #[serde(default)]
     act: Value,
+    /// What the boss's turn had read of outside content; absent, none.
+    #[serde(default)]
+    outside: Option<String>,
 }
 
 /// On the machine: a boss's call relayed from the home, decided under the
@@ -569,6 +583,7 @@ async fn served(State(s): S, h: HeaderMap, Query(q): Query<TokenQuery>, body: By
                         link_id: Some(RELAY_LINK.to_string()),
                         call_id: Some(r.id),
                         ceiling: Some(ceiling),
+                        outside: r.outside.map(|read| super::served::relayed_read(&read)),
                     },
                     &r.group,
                 )

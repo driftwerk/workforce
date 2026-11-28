@@ -2178,6 +2178,7 @@ mod holds;
 
 mod goal_checks;
 mod goals;
+mod knows_loop;
 mod plan_watch;
 mod plans;
 

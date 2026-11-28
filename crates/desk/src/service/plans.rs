@@ -1950,6 +1950,7 @@ impl Desk {
             let was = before.ticket(t.id).filter(|_| !t.adopted);
             let mut row = self.ticket_of(t.id).await?;
             let mut changed = false;
+            let mut replaced = false;
             if was.is_some_and(|w| w.title != t.title) {
                 row.title.clone_from(&t.title);
                 changed = true;
@@ -1957,10 +1958,11 @@ impl Desk {
             if was.is_some_and(|w| w.body != t.body) {
                 row.body.clone_from(&t.body);
                 changed = true;
+                replaced = true;
             }
             if changed {
                 row.updated_at = crew::now();
-                self.stamp_written(row.id, by, false)
+                self.stamp_written(row.id, by, replaced)
                     .await
                     .map_err(internal)?;
                 self.save_ticket(&mut row).await?;

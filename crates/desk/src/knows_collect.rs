@@ -362,7 +362,9 @@ impl DeskStore {
     }
 
     /// The closed exchanges of the sessions `scope` covers, ended since
-    /// `since`, that `agent` wasn't sent, oldest first, at most `limit`.
+    /// `since`, that `agent` wasn't sent, oldest first, at most `limit`:
+    /// those never sent before those going once more (sent before Desk
+    /// said what they carry), so new work is never held behind them.
     pub async fn knows_exchanges(
         &self,
         agent: &str,
@@ -382,7 +384,9 @@ impl DeskStore {
                AND s.memory = 'on' \
                AND NOT EXISTS (SELECT 1 FROM knows_forgotten f WHERE f.session = e.session) \
                AND {} \
-             ORDER BY e.ended, e.id LIMIT $6",
+             ORDER BY EXISTS (SELECT 1 FROM knows_sent k WHERE k.agent = $1 \
+                 AND k.kind = '{TRANSCRIPT}' AND k.ref = e.engine || ':' || e.key), \
+               e.ended, e.id LIMIT $6",
             unsent(TRANSCRIPT, "e.engine || ':' || e.key")
         );
         client

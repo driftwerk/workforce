@@ -19,10 +19,10 @@ fn internal(e: eyre::Report) -> DeskError {
     DeskError::Internal(e)
 }
 
-/// The most hops between sessions Desk follows back to what a message
-/// carried in, and the most earlier exchanges of a session it looks at.
+/// The most hops Desk follows back to what a message or an engine's own
+/// prompt carried in: between sessions, and from one exchange to the one
+/// before it.
 const HOPS: usize = 4;
-const EARLIER: i64 = 20;
 
 /// The fence Desk and the hub put around outside content.
 fn fenced(text: &str) -> bool {
@@ -228,9 +228,9 @@ impl Desk {
     /// line carrying some in (a boss's turn that had read some, a ticket
     /// others wrote, a session whose exchange that sent it carried some),
     /// a first prompt that did, or text fenced as outside content; and an
-    /// engine's own prompt (a wake-up, a compaction) carries in what an
-    /// earlier exchange of its session did. `depth` hops are followed so
-    /// far; `judged` keeps what was judged.
+    /// engine's own prompt (a wake-up, a compaction) carries in what the
+    /// exchange of its session just before it did, and only that one.
+    /// `depth` hops are followed so far; `judged` keeps what was judged.
     pub(crate) fn exchange_outside<'a>(
         &'a self,
         t: &'a Turn,
@@ -243,7 +243,7 @@ impl Desk {
             }
             let store = self.store();
             let mut why = crate::knows_outside::read_outside(&t.steps, &t.commands);
-            let earlier = store.turns_before(t.session, t.at, EARLIER).await?;
+            let earlier = store.turns_before(t.session, t.at, 1).await?;
             let delivered = match crate::line::is_delivery(&t.ask) {
                 Some(mark) => Some(store.delivered(t.session, &mark).await?),
                 None => None,
@@ -282,17 +282,15 @@ impl Desk {
                 }
                 (None, None) => {}
             }
-            if t.asker == "unknown" && !earlier.is_empty() {
-                let mut carried = depth >= HOPS;
-                for e in &earlier {
-                    if carried {
-                        break;
-                    }
-                    carried = !self
-                        .exchange_outside(e, depth + 1, judged)
+            if let (true, Some(before)) = (t.asker == "unknown", earlier.first()) {
+                let carried = match judged.get(&before.reference) {
+                    Some(known) => !known.is_empty(),
+                    None if depth >= HOPS => true,
+                    None => !self
+                        .exchange_outside(before, depth + 1, judged)
                         .await?
-                        .is_empty();
-                }
+                        .is_empty(),
+                };
                 if carried {
                     why.push("an earlier exchange of its session may carry outside content".into());
                 }
@@ -626,6 +624,29 @@ mod tests {
             )
             .await;
 
+            // The person asks again: the engine's prompt after that carries
+            // in only what the exchange just before it did.
+            turn(
+                &store,
+                fetched,
+                "fetched-3",
+                35,
+                "person",
+                "now fix the typo",
+                none.clone(),
+            )
+            .await;
+            turn(
+                &store,
+                fetched,
+                "fetched-4",
+                34,
+                "unknown",
+                "Continue from where you left off.",
+                none.clone(),
+            )
+            .await;
+
             // A boss's turn that had read the web.
             let rushed = told(&store, boss.clone(), armed, 40, Some("web.fetch")).await;
             turn(&store, armed, "armed-1", 39, "desk", &rushed, none.clone()).await;
@@ -696,7 +717,15 @@ mod tests {
             let d = desk(pool, dir.path()).await;
             let said = judged(&d, &ids).await;
             let says = |key: &str| said[&format!("claude:{key}")].clone();
-            for key in ["own-1", "own-2", "own-3", "own-4", "k-own"] {
+            for key in [
+                "own-1",
+                "own-2",
+                "own-3",
+                "own-4",
+                "k-own",
+                "fetched-3",
+                "fetched-4",
+            ] {
                 assert_eq!(says(key), none, "{key}");
             }
             assert_eq!(
@@ -770,6 +799,33 @@ mod tests {
                 .await
                 .unwrap();
             assert!(pending().await.is_empty(), "and then not again");
+
+            // A backlog going once more never holds new work behind it.
+            for n in 0..3 {
+                turn(&store, s, &format!("old-{n}"), 30 - n, "person", "fix it", serde_json::json!([])).await;
+            }
+            let backlog = pending().await;
+            assert_eq!(backlog.len(), 3);
+            d.knows_mark_sent("patchwork/lattice", &backlog, Utc::now())
+                .await
+                .unwrap();
+            pool.get()
+                .await
+                .unwrap()
+                .execute("UPDATE knows_sent SET outside_said = false", &[])
+                .await
+                .unwrap();
+            turn(&store, s, "new", 1, "person", "ship it", serde_json::json!([])).await;
+            let small = Gather { items: 2, ..CAP };
+            let first: Vec<String> = d
+                .knows_pending("patchwork/lattice", &rule, &small, &Hide, None, Utc::now())
+                .await
+                .unwrap()
+                .into_iter()
+                .filter(|o| o.held.kind == TRANSCRIPT)
+                .map(|o| o.held.reference)
+                .collect();
+            assert!(first.contains(&"claude:new".to_string()), "{first:?}");
         })
         .await;
     }
