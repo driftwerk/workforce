@@ -26,6 +26,8 @@ pub struct RuleView {
     pub digest: &'static str,
     pub revision: i64,
     pub changed_at: Option<DateTime<Utc>>,
+    /// Whether it may hand the person's boss requests: off until they say.
+    pub may_hand: bool,
 }
 
 impl RuleView {
@@ -38,6 +40,7 @@ impl RuleView {
                 digest: k.rule.digest.as_str(),
                 revision: k.revision,
                 changed_at: Some(k.changed_at),
+                may_hand: k.may_hand.unwrap_or(false),
             },
             // Nothing set: its own work alone.
             None => Self {
@@ -47,6 +50,7 @@ impl RuleView {
                 digest: knows::Digest::Off.as_str(),
                 revision: 0,
                 changed_at: None,
+                may_hand: false,
             },
         }
     }
@@ -136,9 +140,15 @@ impl Desk {
         Ok(RuleView::of(agent, kept))
     }
 
-    /// Keeps `rule` for `agent`, and says what the agent holds that it no
-    /// longer covers.
-    pub async fn knows_rule_set(&self, agent: &str, rule: &Rule) -> Result<RuleChanged, DeskError> {
+    /// Keeps `rule` for `agent`, and whether it may hand the person's boss
+    /// requests when `may_hand` says, and says what the agent holds that it
+    /// no longer covers.
+    pub async fn knows_rule_set(
+        &self,
+        agent: &str,
+        rule: &Rule,
+        may_hand: Option<bool>,
+    ) -> Result<RuleChanged, DeskError> {
         if !knows::agent_key_ok(agent) {
             return Err(DeskError::Invalid(format!(
                 "{agent:?} isn't an agent: say <hub>/<agent>."
@@ -146,7 +156,7 @@ impl Desk {
         }
         let kept = self
             .store()
-            .knows_rule_put(agent, rule, Utc::now())
+            .knows_rule_put(agent, rule, may_hand, Utc::now())
             .await
             .map_err(internal)?;
         let held_outside = self.knows_outside(agent, rule).await?.1;

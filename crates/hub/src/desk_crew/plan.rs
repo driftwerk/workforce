@@ -1426,10 +1426,18 @@ impl CrewHub {
         if agreed.is_some() && o.level == Level::Suggest {
             return Err(AT_SUGGEST.into());
         }
-        // The person's words are checked before anything is saved.
-        let said = match agreed.as_deref().or(start_now.as_deref()) {
-            Some(w) => Some((w.to_string(), self.agreed_at(&b.service, w, goal)?)),
-            None => None,
+        // The person's words are checked before anything is saved: typed in
+        // the DM, or the request of theirs Desk delivered for this goal.
+        let (said, handed) = match (agreed.as_deref(), start_now.as_deref()) {
+            (Some(w), _) => {
+                let a = self.agreed_or_handed(&b.service, w, goal).await?;
+                (Some((w.to_string(), a.at)), Some(a))
+            }
+            (None, Some(w)) => (
+                Some((w.to_string(), self.agreed_at(&b.service, w, goal)?)),
+                None,
+            ),
+            (None, None) => (None, None),
         };
         let input = &self.sessions_named(b, input, None).await?;
         let adopted = self.adopted_of(b, input).await?;
@@ -1493,11 +1501,17 @@ impl CrewHub {
         };
         let boss = Party::manager(b.service.agent_id.as_str(), &name_of(&b.service));
         let by = self.by_boss(&b.service, "It proposed a plan.");
-        let p = self
-            .desk
-            .propose_plan(new, &boss, &by)
-            .await
-            .map_err(plain)?;
+        let claimed = match &handed {
+            Some(a) => self.claim_handed(a).await?,
+            None => None,
+        };
+        let p = match self.desk.propose_plan(new, &boss, &by).await {
+            Ok(p) => p,
+            Err(e) => {
+                self.unclaim_handed(claimed.as_ref()).await;
+                return Err(plain(e));
+            }
+        };
         let id = p.summary.plan.id;
         self.keep_readings(id, &result, &readings).await;
         let text = format!(

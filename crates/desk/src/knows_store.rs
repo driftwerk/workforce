@@ -22,6 +22,9 @@ pub struct KeptRule {
     pub rule: Rule,
     pub revision: i64,
     pub changed_at: DateTime<Utc>,
+    /// Whether it may hand the person's boss requests: none until the
+    /// person says, which is off.
+    pub may_hand: Option<bool>,
 }
 
 /// One line of an agent's log.
@@ -77,10 +80,11 @@ fn kept(r: &Row) -> Result<KeptRule> {
         .map_err(|e| eyre::eyre!(e))?,
         revision: r.try_get(4)?,
         changed_at: r.try_get(5)?,
+        may_hand: r.try_get(6)?,
     })
 }
 
-const RULE_COLUMNS: &str = "agent, places, transcripts, digest, revision, changed_at";
+const RULE_COLUMNS: &str = "agent, places, transcripts, digest, revision, changed_at, may_hand";
 
 impl DeskStore {
     /// Every agent's rule.
@@ -112,11 +116,13 @@ impl DeskStore {
     }
 
     /// Keeps `rule` for `agent`, the revision after the one it had, and logs
-    /// the change with the places it names, in one transaction.
+    /// the change with the places it names, in one transaction. Whether it
+    /// may hand the person's boss requests is `may_hand`, else as it was.
     pub async fn knows_rule_put(
         &self,
         agent: &str,
         rule: &Rule,
+        may_hand: Option<bool>,
         now: DateTime<Utc>,
     ) -> Result<KeptRule> {
         let mut client = self.pool().get().await?;
@@ -124,11 +130,12 @@ impl DeskStore {
         let row = tx
             .query_one(
                 &format!(
-                    "INSERT INTO knows_rules (agent, places, transcripts, digest, revision, changed_at) \
-                     VALUES ($1, $2, $3, $4, 1, $5) \
+                    "INSERT INTO knows_rules (agent, places, transcripts, digest, revision, changed_at, may_hand) \
+                     VALUES ($1, $2, $3, $4, 1, $5, $6) \
                      ON CONFLICT (agent) DO UPDATE SET places = EXCLUDED.places, \
                        transcripts = EXCLUDED.transcripts, digest = EXCLUDED.digest, \
-                       revision = knows_rules.revision + 1, changed_at = EXCLUDED.changed_at \
+                       revision = knows_rules.revision + 1, changed_at = EXCLUDED.changed_at, \
+                       may_hand = coalesce(EXCLUDED.may_hand, knows_rules.may_hand) \
                      RETURNING {RULE_COLUMNS}"
                 ),
                 &[
@@ -137,6 +144,7 @@ impl DeskStore {
                     &rule.transcripts,
                     &rule.digest.as_str(),
                     &now,
+                    &may_hand,
                 ],
             )
             .await?;
@@ -144,6 +152,7 @@ impl DeskStore {
             "places": rule.texts(),
             "transcripts": rule.transcripts,
             "digest": rule.digest.as_str(),
+            "mayHand": may_hand,
         });
         tx.execute(
             "INSERT INTO knows_log (id, at, agent, what, detail, done_at) VALUES ($1, $2, $3, 'rule', $4, $2)",
@@ -152,6 +161,29 @@ impl DeskStore {
         .await?;
         tx.commit().await?;
         kept(&row)
+    }
+
+    /// Whether `agent`, linked, may hand the person's boss requests now
+    /// (`on`), logged: false when it has no rule kept, so no link.
+    pub async fn knows_hand_put(&self, agent: &str, on: bool, now: DateTime<Utc>) -> Result<bool> {
+        let mut client = self.pool().get().await?;
+        let tx = client.transaction().await?;
+        let changed = tx
+            .execute(
+                "UPDATE knows_rules SET may_hand = $2 WHERE agent = $1",
+                &[&agent, &on],
+            )
+            .await?;
+        if changed == 0 {
+            return Ok(false);
+        }
+        tx.execute(
+            "INSERT INTO knows_log (id, at, agent, what, detail, done_at) VALUES ($1, $2, $3, 'hand', $4, $2)",
+            &[&Uuid::new_v4(), &now, &agent, &serde_json::json!({ "on": on })],
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(true)
     }
 
     /// What `agent` holds now that the person hasn't settled: everything
@@ -629,16 +661,34 @@ mod tests {
             assert_eq!(store.knows_rule("driftwerk/allan").await.unwrap(), None);
             let r = Rule::new(&["all".into()], true, Digest::Live).unwrap();
             let k = store
-                .knows_rule_put("driftwerk/allan", &r, now)
+                .knows_rule_put("driftwerk/allan", &r, None, now)
                 .await
                 .unwrap();
             assert_eq!((k.revision, k.rule.clone()), (1, r));
+            assert_eq!(k.may_hand, None, "off until the person says");
+            assert!(
+                !store
+                    .knows_hand_put("patchwork/lattice", true, now)
+                    .await
+                    .unwrap(),
+                "never linked"
+            );
+            assert!(store
+                .knows_hand_put("driftwerk/allan", true, now)
+                .await
+                .unwrap());
             let r2 = Rule::new(&["group:patchwork".into()], false, Digest::Off).unwrap();
             let k = store
-                .knows_rule_put("driftwerk/allan", &r2, now)
+                .knows_rule_put("driftwerk/allan", &r2, None, now)
                 .await
                 .unwrap();
             assert_eq!(k.revision, 2);
+            assert_eq!(k.may_hand, Some(true), "a rule left without it keeps it");
+            let k = store
+                .knows_rule_put("driftwerk/allan", &r2, Some(false), now)
+                .await
+                .unwrap();
+            assert_eq!(k.may_hand, Some(false));
             assert_eq!(store.knows_rules().await.unwrap().len(), 1);
             let s = Uuid::from_u128(1);
             store
@@ -737,7 +787,8 @@ mod tests {
                 .into_iter()
                 .map(|e| e.what)
                 .collect();
-            assert_eq!(whats.iter().filter(|w| *w == "rule").count(), 2);
+            assert_eq!(whats.iter().filter(|w| *w == "rule").count(), 3);
+            assert_eq!(whats.iter().filter(|w| *w == "hand").count(), 1);
             assert!(whats.contains(&"delete".to_string()) && whats.contains(&"keep".to_string()));
             let shared = store
                 .knows_shared_since("driftwerk/allan", now - chrono::Duration::hours(1))

@@ -1492,6 +1492,9 @@ impl CrewHub {
         if let Some(said) = self.plan_limit_answer(&closed, answer).await {
             return said.map_err(ItemRefused::Cant);
         }
+        if let Some(said) = self.me().hand_answer(&closed, answer).await {
+            return Ok(said);
+        }
         // "You undid … Should I change that preference?": keeping or
         // forgetting it is done here; changing it goes to the boss.
         if let Some(done) = self.overrule_answered(&closed, answer).await {
@@ -2287,12 +2290,14 @@ fn answer_message(item: &OpenItem, answer: &str) -> String {
 }
 
 /// Whether the person's `answer` to `item` is for its boss: not a session's
-/// wait or question it goes to, nor a preference it keeps or forgets.
+/// wait or question it goes to, a preference it keeps or forgets, nor
+/// whether an agent may hand their boss requests.
 fn goes_to_boss(item: &OpenItem, answer: &str) -> bool {
     !waiting::is_waiting(&item.dedupe_key)
         && item.line_message.is_none()
         && super::preferences::overrule_of(item, answer).is_none()
         && !super::plan_limit::answers(item, answer)
+        && super::handed::hand_answers(item, answer).is_none()
 }
 
 /// The id the person's answer to `item` is said to its boss under: the

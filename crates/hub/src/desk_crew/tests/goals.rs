@@ -1240,6 +1240,46 @@ async fn free_dm(boss: &AgentService) -> String {
         .id
 }
 
+/// The person's answer on the Floor reaches the boss as their own words:
+/// it agrees the goal it says, as if typed in the DM.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_answer_on_the_floor_is_the_persons_and_agrees_the_goal_it_says() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(dir.path()).unwrap();
+        let gh = github().await;
+        let (overseer, crew, d, _llm) = boss_on(&base, pool, ACTS, &gh).await;
+        let s = session_on(&overseer, &d, &base.to_string_lossy(), "Fix the docs build").await;
+        let ask = "Shall I keep the docs build green as the goal?";
+        let r = run(&overseer, "crew.ask_person", json!({ "text": ask })).await;
+        assert!(r.success, "{r:?}");
+        let item = d
+            .store()
+            .items_not_closed(Some("desk"))
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|i| i.text == ask)
+            .unwrap()
+            .id;
+        let answer = "Yes, keep the docs build green";
+        crew.answer_item(item, answer).await.unwrap();
+        eventually("their answer in the DM", async || {
+            in_dm(&overseer, &answer_said(ask, answer)).then_some(())
+        })
+        .await;
+        let r = run(
+            &overseer,
+            "crew.plan",
+            json!({ "goal": "Keep the docs build green", "agreed": { "person_said": answer },
+                    "result": judged(), "tickets": [{ "session": s.id.to_string() }] }),
+        )
+        .await;
+        assert!(r.success, "{r:?}");
+    })
+    .await;
+}
+
 /// Clicks that land while a turn that can't take them in runs in the
 /// boss's DM wait for it: each item stays answered, nothing bounces back,
 /// and every answer reaches the boss once the turn ends.

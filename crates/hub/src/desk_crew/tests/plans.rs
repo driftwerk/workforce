@@ -1812,6 +1812,7 @@ async fn own_wake(crew: &CrewHub, overseer: &Arc<AgentService>) -> bool {
         None,
         None,
         None,
+        None,
     )
     .await
     .is_ok()

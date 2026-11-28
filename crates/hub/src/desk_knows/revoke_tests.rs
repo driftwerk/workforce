@@ -20,7 +20,13 @@ use crate::remote_mcp::testing::{bearer, fixture_with_devices, pair_device, Fixt
 
 /// Stores a Desk work token of `person` minted by `device` for `agent`
 /// under `engine`, and returns its id and plaintext.
-fn mint(fx: &Fixture, person: Uuid, device: &str, agent: &str, engine: &str) -> (Uuid, String) {
+pub(super) fn mint(
+    fx: &Fixture,
+    person: Uuid,
+    device: &str,
+    agent: &str,
+    engine: &str,
+) -> (Uuid, String) {
     let minted = remote_mcp_token::mint_as(TokenScope::DeskKnows);
     let now = Utc::now();
     let id = Uuid::new_v4();

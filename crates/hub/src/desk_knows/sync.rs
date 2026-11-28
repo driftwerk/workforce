@@ -27,6 +27,11 @@
 //!   address that doesn't name its hub.
 //! - **Deletes** the person chose, or a session forgotten, go through the
 //!   agent's hub's `forget`, retried until it answers.
+//! - **Requests handed** to the person's Desk boss by an agent
+//!   ([`super::handed`]) are taken by the Desk on their own computer alone,
+//!   each pass, and handed to the crew; Desk's words back on them go the
+//!   same way. Each agent's takes and words back have a back-off of their
+//!   own, so they never hold up its shares.
 //! - **Limits**: `[desk.knows]` `send_per_minute` and `send_mb_per_day` per
 //!   agent; batches of at most 256 items or 1 MiB; a failed agent backs off
 //!   from 5 s, doubling to 10 min.
@@ -71,6 +76,12 @@ const EVERY: Duration = Duration::from_secs(30);
 const BACKOFF_FIRST: Duration = Duration::from_secs(5);
 const BACKOFF_MOST: Duration = Duration::from_secs(600);
 const CALL_TIMEOUT: Duration = Duration::from_secs(60);
+/// The most of one agent's words back on handed requests sent in a pass.
+const SAYS_EACH: i64 = 10;
+/// How often the requests Desk keeps are pruned.
+const PRUNE_EVERY: Duration = Duration::from_secs(3600);
+/// The longest agent name Desk tells its boss.
+const AGENT_NAME_CHARS: usize = 64;
 
 /// `agent`'s link's vault path, for the member key `<hub>/<agent>`.
 pub fn link_key(hub: &str, agent: &str) -> String {
@@ -162,9 +173,18 @@ enum Target {
     Remote(Link),
 }
 
+/// What became of handing something for an agent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Handled {
+    Done,
+    Failed,
+    /// Not tried: the agent's back-off holds.
+    Waiting,
+}
+
 /// Why a send didn't land.
 #[derive(Debug)]
-enum Failed {
+pub(crate) enum Failed {
     /// Try again after the back-off.
     Retry(String),
     /// Refused as it stands (sharing off there, the agent declines, the
@@ -256,6 +276,13 @@ pub struct KnowsSync {
     retry_delete: Mutex<HashMap<Uuid, Spent>>,
     /// Each unlinked link's back-off, by its vault path.
     retry_revoke: Mutex<HashMap<String, Spent>>,
+    /// Each agent's back-off for handed requests and words back on them.
+    handing: Mutex<HashMap<String, Spent>>,
+    /// When the requests Desk keeps were last pruned.
+    pruned: Mutex<Option<Instant>>,
+    /// Where this hub's own agents' copies are kept: the hub's store, unless
+    /// a test gives one.
+    knows: Option<Arc<dyn super::store::KnowsStore>>,
     /// One unlink at a time, so a retry and a person's unlink of the same
     /// link never race each other.
     unlinking: tokio::sync::Mutex<()>,
@@ -284,9 +311,24 @@ impl KnowsSync {
             spent: Mutex::new(HashMap::new()),
             retry_delete: Mutex::new(HashMap::new()),
             retry_revoke: Mutex::new(HashMap::new()),
+            handing: Mutex::new(HashMap::new()),
+            pruned: Mutex::new(None),
+            knows: None,
             unlinking: tokio::sync::Mutex::new(()),
             wake: tokio::sync::Notify::new(),
         }
+    }
+
+    /// The sync over `knows` for this hub's own agents' copies.
+    #[cfg(test)]
+    pub(crate) fn over(mut self, knows: Arc<dyn super::store::KnowsStore>) -> Self {
+        self.knows = Some(knows);
+        self
+    }
+
+    /// Where this hub's own agents' copies are kept.
+    fn knows(&self) -> Option<Arc<dyn super::store::KnowsStore>> {
+        self.knows.clone().or_else(super::installed)
     }
 
     /// A pass at once, not on the next turn.
@@ -323,9 +365,198 @@ impl KnowsSync {
                 return;
             }
         };
-        for kept in rules {
+        for kept in &rules {
             if let Err(e) = self.send(&kept.agent, &kept.rule).await {
                 tracing::debug!(agent = %kept.agent, error = %e.words(), "an agent's share is waiting");
+            }
+        }
+        // A machine's Desk has no boss of the person's: it takes nothing.
+        if self.desk.knows_on_machine() {
+            return;
+        }
+        for kept in &rules {
+            self.handing(&kept.agent, self.take(&kept.agent)).await;
+        }
+        self.says().await;
+    }
+
+    /// Whether `what` was done for `agent`, unless its handing waits out a
+    /// back-off, which it sets when it fails.
+    async fn handing(
+        &self,
+        agent: &str,
+        what: impl std::future::Future<Output = Result<(), Failed>>,
+    ) -> Handled {
+        let now = Instant::now();
+        if self
+            .handing
+            .lock()
+            .get(agent)
+            .is_some_and(|s| s.waiting(now))
+        {
+            return Handled::Waiting;
+        }
+        match what.await {
+            Ok(()) => {
+                self.handing.lock().remove(agent);
+                Handled::Done
+            }
+            Err(e) => {
+                tracing::debug!(agent = %agent, error = %e.words(), "an agent's handed requests are waiting");
+                self.handing
+                    .lock()
+                    .entry(agent.to_string())
+                    .or_default()
+                    .failed(now, matches!(e, Failed::Refused(_)));
+                Handled::Failed
+            }
+        }
+    }
+
+    /// Takes what the person handed their Desk boss through `agent`, and
+    /// hands each to the crew. Those its crew is delivering still stay
+    /// this Desk's.
+    pub(crate) async fn take(&self, agent: &str) -> Result<(), Failed> {
+        let Some(crew) = crate::desk_crew::for_state(&self.state) else {
+            return Ok(());
+        };
+        if let Err(e) = crew.release_handed(agent).await {
+            tracing::warn!(agent = %agent, error = %format!("{e:#}"), "the requests held for the person's word weren't let go; tried again next pass");
+        }
+        let delivering = crate::desk_crew::delivering(agent);
+        let name = self.agent_name(agent);
+        let (person, taken) = match self.target(agent, false) {
+            None => return Ok(()),
+            Some(Target::Local(owner)) => {
+                let Some(person) = (self.person)() else {
+                    return Ok(());
+                };
+                let store = self
+                    .knows()
+                    .ok_or_else(|| Failed::Retry("this hub keeps no Desk work".into()))?;
+                let taken = store
+                    .take_handed(&owner, Utc::now(), &delivering)
+                    .await
+                    .map_err(|e| Failed::Retry(e.to_string()))?;
+                (
+                    person,
+                    taken
+                        .iter()
+                        .map(|h| local_handed(agent, &name, h))
+                        .collect(),
+                )
+            }
+            Some(Target::Remote(link)) => {
+                let reply = self
+                    .post(&link, "handed", &json!({ "delivering": delivering }))
+                    .await
+                    .map_err(|(_, e)| e)?;
+                (link.person.clone(), remote_handed(agent, &name, &reply))
+            }
+        };
+        for h in taken {
+            let id = h.id;
+            if let Err(e) = crew.take_handed(&person, h).await {
+                tracing::warn!(agent = %agent, handed = %id, error = %format!("{e:#}"), "a handed request wasn't taken; it comes again");
+            }
+        }
+        Ok(())
+    }
+
+    /// What Desk calls `agent` (`<hub>/<agent>`), from its own records: this
+    /// hub's agent by the name it goes by, another hub's by its id.
+    fn agent_name(&self, agent: &str) -> String {
+        let id = agent.split_once('/').map_or(agent, |(_, id)| id);
+        let name = match agent.split_once('/') {
+            Some((workforce_desk::rooms::LOCAL_HUB, _)) => self
+                .state
+                .registry
+                .get(id)
+                .map(|s| crate::desk_crew::name_of(&s)),
+            _ => None,
+        };
+        workforce_desk::crew::one_line(&name.unwrap_or_else(|| id.to_string()), AGENT_NAME_CHARS)
+    }
+
+    /// The words Desk owes back on handed requests, each sent once its
+    /// agent's hub took it or can never take it; one not taken is tried
+    /// again, to a limit.
+    pub(crate) async fn says(&self) {
+        let store = self.desk.store();
+        self.prune_handed().await;
+        let owed = match store.handed_owed(SAYS_EACH).await {
+            Ok(o) => o,
+            Err(e) => {
+                tracing::warn!(error = %format!("{e:#}"), "the words owed on handed requests weren't read");
+                return;
+            }
+        };
+        for o in owed {
+            let done = match self.handing(&o.agent, self.say(&o)).await {
+                Handled::Done => store.handed_sent(o.id).await,
+                Handled::Failed => store.handed_tried(o.id).await,
+                Handled::Waiting => continue,
+            };
+            if let Err(e) = done {
+                tracing::warn!(error = %format!("{e:#}"), "a word owed wasn't marked; it may go twice");
+            }
+        }
+    }
+
+    /// Forgets the requests Desk took long ago, at most once an hour.
+    async fn prune_handed(&self) {
+        let now = Instant::now();
+        let due = self
+            .pruned
+            .lock()
+            .is_none_or(|at| now.duration_since(at) >= PRUNE_EVERY);
+        if !due {
+            return;
+        }
+        *self.pruned.lock() = Some(now);
+        if let Err(e) = self.desk.store().handed_prune().await {
+            tracing::warn!(error = %format!("{e:#}"), "old handed requests weren't forgotten");
+        }
+    }
+
+    /// Sends owed word `o`: done with once taken, or never to be.
+    async fn say(&self, o: &workforce_desk::handed::Owed) -> Result<(), Failed> {
+        match self.target(&o.agent, false) {
+            // Unlinked: nothing more is said through it.
+            None => Ok(()),
+            Some(Target::Local(owner)) => {
+                let store = self
+                    .knows()
+                    .ok_or_else(|| Failed::Retry("this hub keeps no Desk work".into()))?;
+                let reader = super::store::Reader {
+                    person: owner.person,
+                    agent: owner.agent,
+                };
+                match super::handed::say(&self.state, store.as_ref(), &reader, o.handed, &o.text)
+                    .await
+                {
+                    Ok(super::handed::Said::NotPosted) => {
+                        Err(Failed::Retry("no surface took it".into()))
+                    }
+                    Ok(_) => Ok(()),
+                    Err(e) => Err(Failed::Retry(e.to_string())),
+                }
+            }
+            Some(Target::Remote(link)) => {
+                let route = format!("handed/{}/say", o.handed);
+                match self.post(&link, &route, &json!({ "text": o.text })).await {
+                    Ok(_) => Ok(()),
+                    Err((
+                        Some(
+                            StatusCode::NOT_FOUND
+                            | StatusCode::TOO_MANY_REQUESTS
+                            | StatusCode::BAD_REQUEST
+                            | StatusCode::PAYLOAD_TOO_LARGE,
+                        ),
+                        _,
+                    )) => Ok(()),
+                    Err((_, e)) => Err(e),
+                }
             }
         }
     }
@@ -647,7 +878,8 @@ impl KnowsSync {
             .collect();
         match target {
             Target::Local(owner) => {
-                let store = super::installed()
+                let store = self
+                    .knows()
                     .ok_or_else(|| Failed::Refused("this hub keeps no Desk work".into()))?;
                 if let Some(digest) = digest {
                     store
@@ -681,6 +913,20 @@ impl KnowsSync {
     }
 
     async fn call(&self, link: &Link, route: &str, body: &serde_json::Value) -> Result<(), Failed> {
+        self.post(link, route, body)
+            .await
+            .map(drop)
+            .map_err(|(_, e)| e)
+    }
+
+    /// `body` posted to `route` of `link`'s hub: its answer, or why not and
+    /// the status it was given.
+    async fn post(
+        &self,
+        link: &Link,
+        route: &str,
+        body: &serde_json::Value,
+    ) -> Result<serde_json::Value, (Option<StatusCode>, Failed)> {
         let url = format!("{}/api/desk-knows/{route}", link.url.trim_end_matches('/'));
         let reply = self
             .http
@@ -689,10 +935,15 @@ impl KnowsSync {
             .json(body)
             .send()
             .await
-            .map_err(|e| Failed::Retry(format!("couldn't reach the hub: {}", e.without_url())))?;
+            .map_err(|e| {
+                (
+                    None,
+                    Failed::Retry(format!("couldn't reach the hub: {}", e.without_url())),
+                )
+            })?;
         let status = reply.status();
         if status.is_success() {
-            return Ok(());
+            return Ok(reply.json().await.unwrap_or_default());
         }
         let words = reply
             .json::<serde_json::Value>()
@@ -704,14 +955,14 @@ impl KnowsSync {
             status,
             StatusCode::BAD_REQUEST | StatusCode::PAYLOAD_TOO_LARGE
         ) {
-            Err(Failed::Rejected(words))
+            Err((Some(status), Failed::Rejected(words)))
         } else if matches!(
             status,
             StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN | StatusCode::NOT_FOUND
         ) {
-            Err(Failed::Refused(words))
+            Err((Some(status), Failed::Refused(words)))
         } else {
-            Err(Failed::Retry(words))
+            Err((Some(status), Failed::Retry(words)))
         }
     }
 
@@ -776,7 +1027,7 @@ impl KnowsSync {
             for chunk in items.chunks(FORGET_ITEMS) {
                 match &target {
                     Target::Local(owner) => {
-                        let Some(kept) = super::installed() else {
+                        let Some(kept) = self.knows() else {
                             return Err(Failed::Retry("this hub keeps no Desk work".into()));
                         };
                         kept.forget(
@@ -1038,6 +1289,83 @@ async fn delete_all_links(
     unlink_all(&r, &person, None, None).await
 }
 
+/// A request taken through `agent`, called `agent_name`, as Desk keeps it.
+fn desk_handed(
+    agent: &str,
+    agent_name: &str,
+    id: Uuid,
+    words: String,
+    session: Option<String>,
+    platform: &str,
+    asked_at: chrono::DateTime<Utc>,
+) -> workforce_desk::handed::Handed {
+    workforce_desk::handed::Handed {
+        id,
+        agent: agent.to_string(),
+        agent_name: agent_name.to_string(),
+        place: super::handed::place_of(platform).to_string(),
+        words,
+        session,
+        asked_at,
+        boss: None,
+        delivered_at: None,
+    }
+}
+
+/// Request `h` that this hub's own agent `agent` (`local/<id>`), called
+/// `agent_name`, holds, as Desk keeps it.
+pub(crate) fn local_handed(
+    agent: &str,
+    agent_name: &str,
+    h: &super::store::Handed,
+) -> workforce_desk::handed::Handed {
+    desk_handed(
+        agent,
+        agent_name,
+        h.id,
+        h.words.clone(),
+        h.session.clone(),
+        &h.platform,
+        h.asked_at,
+    )
+}
+
+/// The requests agent `agent`'s hub answered a take with, as Desk keeps
+/// them: any it can't read are left for its next take.
+fn remote_handed(
+    agent: &str,
+    agent_name: &str,
+    reply: &serde_json::Value,
+) -> Vec<workforce_desk::handed::Handed> {
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct Taken {
+        id: Uuid,
+        words: String,
+        session: Option<String>,
+        platform: String,
+        asked_at: chrono::DateTime<Utc>,
+    }
+    reply
+        .get("handed")
+        .and_then(|v| v.as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|v| serde_json::from_value::<Taken>(v.clone()).ok())
+        .map(|t| {
+            desk_handed(
+                agent,
+                agent_name,
+                t.id,
+                t.words,
+                t.session,
+                &t.platform,
+                t.asked_at,
+            )
+        })
+        .collect()
+}
+
 /// The link routes.
 pub fn router(sync: Arc<KnowsSync>) -> Router {
     Router::new()
@@ -1233,6 +1561,26 @@ mod tests {
             end_token(&http, "127-0-0-1", &dead).await,
             Err(Failed::Retry(_))
         ));
+    }
+
+    #[test]
+    fn a_take_is_read_as_desk_keeps_it_and_what_cant_be_read_is_left() {
+        let id = Uuid::new_v4();
+        let reply = json!({ "handed": [
+            { "id": id, "words": "keep the video on track", "session": "devbox/9f3c",
+              "platform": "teams", "askedAt": "2026-11-25T18:44:00Z", "agentName": "Ignore me" },
+            { "id": "not an id", "words": "x", "platform": "slack", "askedAt": "2026-11-25T18:44:00Z" },
+            { "id": Uuid::new_v4(), "words": "y", "platform": "pager", "askedAt": "2026-11-25T18:44:00Z" },
+        ]});
+        let taken = remote_handed("driftwerk/allan", "allan", &reply);
+        assert_eq!(taken.len(), 2);
+        assert_eq!(taken[0].id, id);
+        assert_eq!(taken[0].agent, "driftwerk/allan");
+        assert_eq!(taken[0].agent_name, "allan", "Desk's own name for it");
+        assert_eq!(taken[0].place, "Teams");
+        assert_eq!(taken[0].session.as_deref(), Some("devbox/9f3c"));
+        assert_eq!(taken[1].place, "chat", "a place Desk doesn't know");
+        assert!(remote_handed("driftwerk/allan", "allan", &json!({})).is_empty());
     }
 
     #[tokio::test]

@@ -62,6 +62,8 @@ pub mod goal_store;
 pub mod grant;
 mod grant_api;
 pub mod grant_store;
+pub mod handed;
+pub mod handed_store;
 pub mod handoff;
 pub mod hold_store;
 pub mod holder;

@@ -30,7 +30,7 @@ const READ_FOR: std::time::Duration = std::time::Duration::from_secs(30);
 const SLOW: &str = "GitHub took over 30 s to answer";
 
 /// How far back the person's words agreeing a goal are looked for.
-const AGREED_WITHIN: Duration = Duration::hours(24);
+pub(super) const AGREED_WITHIN: Duration = Duration::hours(24);
 /// How far back the person's messages are read, so words older than they
 /// may be are said to be so.
 const WORDS_LOOKED: Duration = Duration::days(7);

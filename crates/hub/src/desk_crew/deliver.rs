@@ -47,6 +47,14 @@ pub(super) fn stopped(e: &eyre::Report) -> bool {
     e.chain().any(|c| c.is::<TurnStopped>())
 }
 
+/// What a message of the DM that someone other than the person sent on is
+/// marked with, before its own id: never read as the person's words.
+pub(super) const SENT_ON_MARK: &str = "desk-sent-on:";
+
+/// What a message of the DM Desk sent as the person's own (their answer
+/// on the Floor, their go-ahead) is marked with, before its own id.
+const THEIRS_MARK: &str = "desk-relay:";
+
 tokio::task_local! {
     /// Set around a crew turn whose caller is told once its prompt is kept
     /// in the session, before it runs ([`told_when_asked`]).
@@ -134,6 +142,7 @@ impl CrewHub {
             None,
             Some(author),
             Some(theirs),
+            None,
         )
         .await
         .map(Ran::said)
@@ -154,15 +163,18 @@ impl CrewHub {
         listed: Option<Vec<MentionedApproval>>,
         author: Option<Speaker>,
     ) -> Result<(String, String)> {
-        self.run_turn_with(service, owner, channel, prompt, hop, listed, author, None)
-            .await
-            .map(Ran::said)
+        self.run_turn_with(
+            service, owner, channel, prompt, hop, listed, author, None, None,
+        )
+        .await
+        .map(Ran::said)
     }
 
     /// [`Self::run_turn`], answering `theirs` (the person's words a boss
     /// sent on) when it is an overseer's message in the DM, and saying too
     /// whether the turn did something: a call of a tool not known only to
-    /// look ([`super::tools::only_looks`]).
+    /// look ([`super::tools::only_looks`]). `told` is what the turn is told
+    /// beside the message, never kept with it.
     #[allow(clippy::too_many_arguments)]
     pub(super) async fn run_turn_with(
         &self,
@@ -174,6 +186,7 @@ impl CrewHub {
         listed: Option<Vec<MentionedApproval>>,
         author: Option<Speaker>,
         theirs: Option<String>,
+        told: Option<&str>,
     ) -> Result<Ran> {
         let agent_id = service.agent_id.as_str();
         let in_dm = channel == DESK_CHANNEL;
@@ -192,9 +205,14 @@ impl CrewHub {
         let _relayed = by_overseer.then(|| Relayed::mark(&self.relayed_turns, &sid));
         let theirs = theirs.filter(|_| by_overseer);
         // A message of the DM is found again by a mark of its own.
-        let relay = author
-            .is_some()
-            .then(|| format!("desk-relay:{}", workforce_desk::crew::new_id()));
+        let relay = author.as_ref().map(|a| {
+            let mark = if a.kind == workforce_desk::conversations::SpeakerKind::You {
+                THEIRS_MARK
+            } else {
+                SENT_ON_MARK
+            };
+            format!("{mark}{}", workforce_desk::crew::new_id())
+        });
         let tx = self.state.broadcast_tx.clone();
         // Theirs, relayed: in this boss's picture as their word, before
         // its turn on it begins.
@@ -287,7 +305,7 @@ impl CrewHub {
                     relay.as_deref(),
                     Some(&sid),
                     None,
-                    None,
+                    told,
                     None,
                     None,
                     Some(inbox),

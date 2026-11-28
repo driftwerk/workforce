@@ -21,12 +21,19 @@
 //!   read it (Sees K4).
 //! - **Kept** in its own schema ([`store`]), pruned by `retain_days` and
 //!   `max_mb`, and erased with the person.
+//! - **Handed** ([`handed`]): the person's own request an agent here hands
+//!   to their Desk boss waits here for their own computer's Desk to take it
+//!   (`/api/desk-knows/handed`), and Desk's word on it is told back where
+//!   they asked (`/api/desk-knows/handed/{id}/say`).
 
+pub mod handed;
 pub mod routes;
 pub mod store;
 pub mod sync;
 pub mod tools;
 
+#[cfg(test)]
+mod handed_routes_tests;
 #[cfg(test)]
 mod revoke_tests;
 

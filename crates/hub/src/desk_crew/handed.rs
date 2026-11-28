@@ -1,0 +1,596 @@
+//! A person's request their agent elsewhere handed to their Desk boss
+//! (DW-770, designs/dw-770-remote-goal-to-desk.md): kept once, delivered to
+//! one boss as the person's own words, and Desk's word on it owed back to
+//! where they asked ([`workforce_desk::handed`]).
+//!
+//! - **Only the person's.** A request comes only from a link the person
+//!   whose Desk this is made; any other, or one Desk can't tell is theirs,
+//!   is refused and never delivered.
+//! - **To one boss.** The boss of the session it names (this computer's or
+//!   a machine's), else the main one. With none, the person is told what
+//!   turns one on.
+//! - **Their words, bounded.** One relayed turn of the boss's DM whose
+//!   message is their words, never read as the person's own typing: no
+//!   consent to anything else, no reply to what the boss proposed, no order
+//!   to another agent. They agree one thing alone: a new plan's goal that
+//!   they say, and only once ([`CrewHub::agreed_or_handed`]).
+//! - **Said back in Desk's own words.** Whether the boss keeps it as a goal,
+//!   and each stall of that goal after (`CrewHub::flag_handed`); never the
+//!   boss's answer or an error.
+//! - **Taken again** when the Desk that took it stopped first: delivered
+//!   if it never was, and said to be in the boss's DM if its turn's answer
+//!   was lost.
+
+use std::collections::HashMap;
+use std::sync::{Arc, LazyLock};
+
+use chrono::{DateTime, SubsecRound, Utc};
+use parking_lot::Mutex;
+use uuid::Uuid;
+
+use eyre::Result;
+use workforce_common::channels::DESK_CHANNEL;
+use workforce_common::oversight::Scope;
+use workforce_desk::crew::one_line;
+use workforce_desk::handed::{agrees, covers, Handed, Kept, WORDS_MAX};
+use workforce_desk::open_item::{ClosedBy, NewItem, OpenItem, OpenKind};
+use workforce_desk::open_item_store::Opened;
+use workforce_desk::plan::PlanState;
+use workforce_desk::Speaker;
+
+use super::{name_of, AgentService, CrewHub};
+
+const NOT_YOURS: &str = "This Desk isn't yours: the person whose Desk it is linked me, so it took nothing. Ask me from your own Desk's link.";
+const OWNER_UNKNOWN: &str = "Your Desk can't tell yet whose it is, so it took nothing: open Desk on your computer and say hello to your boss there once. Then ask me again.";
+const NO_BOSS: &str = "You have no boss in Desk yet: open an agent's settings in Desk and turn on Oversees the crew. Then ask me again.";
+const TOO_LONG: &str =
+    "Your request is too long for your Desk to take: ask me again in a shorter message.";
+const SESSION_GONE: &str = "Desk doesn't have the session you named any more, so nothing was handed on. Ask me again about the work as it is now.";
+const AGREED_ALREADY: &str = "The person's request these words come from already agreed a plan of yours, so it agrees no other. Ask them in your DM whether they want this one too.";
+const UNCLAIMED: &str = "Desk couldn't keep which plan the person's request agreed, so nothing was saved. Try again in a moment.";
+const NOT_ON: &str = "Your Desk doesn't let me hand your boss requests, so nothing was handed on: in Desk, open my settings, and under What they see turn on Hand your boss requests. Then ask me again.";
+const SESSION_UNREADABLE: &str = "Your Desk couldn't tell which session your request is about, so nothing was handed on. Ask me again, naming the session as Desk shows it.";
+
+/// The requests whose boss's turn runs in this process now, by agent and
+/// id, as delivered.
+static DELIVERING: LazyLock<Mutex<HashMap<(String, Uuid), Handed>>> =
+    LazyLock::new(Default::default);
+
+/// One request's boss's turn under way, for as long as it is held.
+struct Delivering((String, Uuid));
+
+impl Delivering {
+    /// `h`'s turn, unless one runs for it already.
+    fn begin(h: &Handed) -> Option<Self> {
+        let key = (h.agent.clone(), h.id);
+        let mut running = DELIVERING.lock();
+        if running.contains_key(&key) {
+            return None;
+        }
+        running.insert(key.clone(), h.clone());
+        Some(Self(key))
+    }
+}
+
+impl Drop for Delivering {
+    fn drop(&mut self) {
+        DELIVERING.lock().remove(&self.0);
+    }
+}
+
+/// The ids of the requests taken through `agent` whose boss's turn runs
+/// now: its hub keeps them this Desk's.
+pub(crate) fn delivering(agent: &str) -> Vec<Uuid> {
+    DELIVERING
+        .lock()
+        .keys()
+        .filter(|(a, _)| a == agent)
+        .map(|(_, id)| *id)
+        .collect()
+}
+
+/// What the person's ask, whether an agent may hand their boss requests,
+/// is kept by, before the agent: one open at a time for each.
+const HAND_ASK: &str = "handed-link:";
+const YES: &str = "Yes";
+const NO: &str = "No";
+const ONLY_YOU: &str = "Only you can let an agent elsewhere hand your boss requests.";
+
+/// What the person is told where they asked while `h` waits for their
+/// word in Desk, its boss `boss`.
+fn held_word(boss: &str) -> String {
+    format!("Your Desk asks you first, in {boss}'s DM there, whether I may hand your boss requests. Say yes there and it's passed on; no, and it's dropped.")
+}
+
+/// The person's ask in their boss's DM: may `h`'s agent hand their boss
+/// requests, as it just asked to.
+fn hand_ask(h: &Handed) -> String {
+    let (hub, _) = h.agent.split_once('/').unwrap_or((h.agent.as_str(), ""));
+    let at = if hub == workforce_desk::rooms::LOCAL_HUB {
+        "on this computer's hub".to_string()
+    } else {
+        format!("on {}", one_line(hub, 64))
+    };
+    format!(
+        "{name} {at} asked to pass on your request from {place}: “{words}”. May {name} hand your boss requests from you? Desk holds this one until you say.",
+        name = h.agent_name,
+        place = h.place,
+        words = one_line(&h.words, 200),
+    )
+}
+
+/// The agent the person's ask `key` is about.
+fn hand_ask_agent(key: &str) -> Option<&str> {
+    key.strip_prefix(HAND_ASK)
+}
+
+/// Whether `answer` to `item` is the person's word on an agent handing
+/// their boss requests: Desk keeps it, never the boss.
+pub(super) fn hand_answers(item: &OpenItem, answer: &str) -> Option<bool> {
+    hand_ask_agent(&item.dedupe_key)?;
+    let answer = answer.trim();
+    if answer.eq_ignore_ascii_case(YES) {
+        Some(true)
+    } else if answer.eq_ignore_ascii_case(NO) {
+        Some(false)
+    } else {
+        None
+    }
+}
+
+/// What the person is told of a request boss `boss` holds whose answer
+/// was lost: Desk stopped while its turn ran.
+fn unanswered(boss: &str) -> String {
+    format!("Your Desk boss {boss} has your request in your Desk DM, but Desk stopped before it answered: answer there, or ask me again.")
+}
+
+/// What the person is told when no boss oversees session `name`'s group.
+fn no_group_boss(name: &str) -> String {
+    format!("No boss oversees “{name}”'s group in Desk: open a group's boss settings and turn on Oversees the crew. Then ask me again.")
+}
+
+fn has_it(boss: &str, agreed: &str) -> String {
+    format!(
+        "Your Desk boss {boss} has it: it keeps “{}” as a goal, and Desk tells you here when it stalls.",
+        one_line(agreed, 200)
+    )
+}
+
+fn not_a_goal_yet(boss: &str) -> String {
+    format!("Your Desk boss {boss} has your request in your Desk DM. It isn't kept as a goal yet, so Desk can't flag stalls on it until it is: answer {boss} there if it asks you anything.")
+}
+
+fn could_not_take(boss: &str) -> String {
+    format!("Your Desk boss {boss} couldn't take your request just now. Ask me again in a while.")
+}
+
+/// What boss `boss`'s turn on `h` is told beside the person's words, for
+/// `person` and the session `session` names.
+fn told(h: &Handed, person: &str, session: Option<&str>) -> String {
+    let on = session.map_or_else(String::new, |s| format!(", on the session “{s}”"));
+    format!(
+        "{person} asked {agent} in {place} to pass this on, in their words. They want this kept on track and any stall flagged: keep it as a goal with crew.plan, its goal in their own words and agreed: their words, exactly as here{on}. Their words agree that goal alone, nothing else. Desk tells {agent} of each stall, and {agent} tells them in {place}.",
+        agent = h.agent_name,
+        place = h.place,
+    )
+}
+
+/// A boss and how it oversees.
+type Boss = (Arc<AgentService>, workforce_common::oversight::Oversight);
+
+/// Where the session a request names is, as Desk names it.
+enum Place {
+    Here(Uuid),
+    Machine(String, Uuid),
+}
+
+fn place_of(session: &str) -> Option<Place> {
+    match session.parse() {
+        Ok(id) => Some(Place::Here(id)),
+        Err(_) => {
+            super::relay::machine_session(session).map(|(m, id)| Place::Machine(m.into(), id))
+        }
+    }
+}
+
+/// The person's agreement to a new plan's goal: when, and the requests of
+/// theirs it came in, when it didn't come in the DM itself.
+pub(super) struct Agreed {
+    pub at: DateTime<Utc>,
+    pub handed: Vec<(String, Uuid)>,
+}
+
+impl CrewHub {
+    /// Takes request `h` from the link `person` made: kept once, then
+    /// delivered on its own task, so a long turn never holds up the share.
+    pub(crate) async fn take_handed(self: &Arc<Self>, person: &str, h: Handed) -> Result<()> {
+        if DELIVERING.lock().contains_key(&(h.agent.clone(), h.id)) {
+            return Ok(());
+        }
+        let store = self.desk.store();
+        match store.handed_keep(&h).await? {
+            Kept::New | Kept::Undelivered => {}
+            Kept::Done => return Ok(()),
+            Kept::Unanswered { boss } => {
+                return store
+                    .handed_say(&h, &unanswered(&self.boss_name_of(&boss)))
+                    .await
+            }
+        }
+        let refused = match self.person(None) {
+            Some(p) if p == person => None,
+            Some(_) => Some(NOT_YOURS.to_string()),
+            None => Some(OWNER_UNKNOWN.to_string()),
+        };
+        let refused =
+            refused.or_else(|| (h.words.chars().count() > WORDS_MAX).then(|| TOO_LONG.to_string()));
+        if let Some(why) = refused {
+            return store.handed_say(&h, &why).await;
+        }
+        let (boss, name) = match self.handed_boss(h.session.as_deref()) {
+            Ok(found) => found,
+            Err(why) => return store.handed_say(&h, &why).await,
+        };
+        let may_hand = store.knows_rule(&h.agent).await?.and_then(|k| k.may_hand);
+        match may_hand {
+            Some(true) => self.hand_on(person, h, boss.0, name),
+            Some(false) => store.handed_say(&h, NOT_ON).await,
+            None => self.hold_handed(&boss.0, &h).await,
+        }
+    }
+
+    /// `h` delivered to boss `service`, for `person`, on its own task, so a
+    /// long turn never holds up the share; unless it is under way already.
+    fn hand_on(
+        self: &Arc<Self>,
+        person: &str,
+        h: Handed,
+        service: Arc<AgentService>,
+        name: Option<String>,
+    ) -> Result<()> {
+        let h = Handed {
+            boss: Some(service.agent_id.to_string()),
+            delivered_at: Some(Utc::now().trunc_subsecs(6)),
+            ..h
+        };
+        let Some(delivering) = Delivering::begin(&h) else {
+            return Ok(());
+        };
+        let crew = Arc::clone(self);
+        let owner = person.to_string();
+        let settling = crate::shutdown::Settling::begin();
+        tokio::spawn(async move {
+            let _settling = settling;
+            let _delivering = delivering;
+            crew.deliver_handed(&service, &owner, &h, name.as_deref())
+                .await;
+        });
+        Ok(())
+    }
+
+    /// `h` held for the person's word on its agent handing their boss
+    /// requests: asked once in boss `service`'s DM, and the person told
+    /// where they asked.
+    async fn hold_handed(&self, service: &AgentService, h: &Handed) -> Result<()> {
+        let store = self.desk.store();
+        let boss = service.agent_id.as_str();
+        store.handed_hold(h, boss).await?;
+        let mut new = NewItem::ask(boss, OpenKind::Ask, None, &hand_ask(h));
+        new.dedupe_key = format!("{HAND_ASK}{}", h.agent);
+        new.options = vec![YES.into(), NO.into()];
+        new.cant_decide = Some(ONLY_YOU.into());
+        if let Opened::New(i) = store.item_open(&new).await? {
+            self.post_item(boss, &i, super::items::needs_you(&i), Vec::new())
+                .await;
+        }
+        store.handed_say(h, &held_word(&name_of(service))).await
+    }
+
+    /// The requests of agent `agent` held for the person's word, once they
+    /// said it (on its ask or in What they see): delivered when it may hand
+    /// their boss requests, else dropped, the person told. Its ask is
+    /// closed then.
+    pub(crate) async fn release_handed(self: &Arc<Self>, agent: &str) -> Result<()> {
+        let store = self.desk.store();
+        let Some(on) = store.knows_rule(agent).await?.and_then(|k| k.may_hand) else {
+            return Ok(());
+        };
+        let held = store.handed_held(agent).await?;
+        let person = self.person(None);
+        for h in held {
+            let handed = match (on, &person) {
+                (true, Some(p)) => match self.handed_boss(h.session.as_deref()) {
+                    Ok((boss, name)) => self.hand_on(p, h.clone(), boss.0, name),
+                    Err(why) => store.handed_say(&h, &why).await,
+                },
+                (true, None) => store.handed_say(&h, OWNER_UNKNOWN).await,
+                (false, _) => store.handed_say(&h, NOT_ON).await,
+            };
+            match handed {
+                Ok(()) => store.handed_unhold(&h).await?,
+                Err(e) => {
+                    tracing::warn!(handed = %h.id, error = %format!("{e:#}"), "a held request wasn't let go; it is tried again")
+                }
+            }
+        }
+        let why = if on {
+            "You let it hand your boss requests."
+        } else {
+            "You didn't let it hand your boss requests."
+        };
+        store
+            .item_close_of_key(&format!("{HAND_ASK}{agent}"), ClosedBy::Lapsed, why)
+            .await?;
+        Ok(())
+    }
+
+    /// The person's `answer` to `closed`, when it asks whether an agent may
+    /// hand their boss requests: kept, and what it held let go.
+    pub(super) async fn hand_answer(
+        self: &Arc<Self>,
+        closed: &OpenItem,
+        answer: &str,
+    ) -> Option<String> {
+        let on = hand_answers(closed, answer)?;
+        let agent = hand_ask_agent(&closed.dedupe_key)?;
+        let store = self.desk.store();
+        let kept = match store.knows_hand_put(agent, on, Utc::now()).await {
+            Ok(kept) => kept,
+            Err(e) => {
+                tracing::warn!(error = %format!("{e:#}"), "the person's word on an agent handing requests wasn't kept");
+                if let Err(e) = store.item_reopen(closed.id).await {
+                    tracing::warn!(error = %format!("{e:#}"), "an ask whose answer wasn't kept wasn't opened again");
+                }
+                return Some("Desk couldn't keep that just now. Try again.".into());
+            }
+        };
+        if !kept {
+            return Some("That agent isn't linked any more, so nothing changed.".into());
+        }
+        if let Err(e) = self.release_handed(agent).await {
+            tracing::warn!(error = %format!("{e:#}"), "what an agent handed wasn't let go; Desk's next pass does it");
+        }
+        Some(if on {
+            "Turned on: it may hand your boss requests, and what it asked is passed on now. You can turn it off in its settings, under What they see.".into()
+        } else {
+            "Kept off: what it asked was dropped, and it was told. You can turn it on in its settings, under What they see.".into()
+        })
+    }
+
+    /// The boss a request about `session` goes to, with the session's
+    /// name; or what the person is told when it can go to none.
+    fn handed_boss(&self, session: Option<&str>) -> Result<(Boss, Option<String>), String> {
+        let Some(session) = session else {
+            return self
+                .overseer_for(&Scope::Ungrouped)
+                .map(|b| (b, None))
+                .ok_or_else(|| NO_BOSS.to_string());
+        };
+        match place_of(session) {
+            None => Err(SESSION_UNREADABLE.into()),
+            Some(Place::Here(id)) => {
+                if self.desk.view(id).is_err() {
+                    return Err(SESSION_GONE.into());
+                }
+                let name = self.name_of_session(id);
+                self.overseer_of_session(id)
+                    .map(|b| (b, Some(name.clone())))
+                    .ok_or_else(|| no_group_boss(&name))
+            }
+            Some(Place::Machine(machine, id)) => {
+                let name = format!("{machine}'s session {}", &id.to_string()[..8]);
+                let group = self
+                    .desk
+                    .group_of_member(&format!("session:{machine}/{id}"));
+                self.overseer_of_group(group.as_deref())
+                    .map(|b| (b, Some(name.clone())))
+                    .ok_or_else(|| no_group_boss(&name))
+            }
+        }
+    }
+
+    /// One turn of `service`'s DM with `owner` on `h`, their words relayed,
+    /// kept as delivered once they are in the DM, and the word back it
+    /// earns.
+    async fn deliver_handed(
+        &self,
+        service: &Arc<AgentService>,
+        owner: &str,
+        h: &Handed,
+        session: Option<&str>,
+    ) {
+        let person = crate::desk_surface::person_name(self.state.identity_store.as_ref(), owner);
+        let by = match &person {
+            Some(p) => format!("{}, for {p} in {}", h.agent_name, h.place),
+            None => format!("{}, in {}", h.agent_name, h.place),
+        };
+        let author = Speaker::overseer(&h.agent, &by);
+        let told = told(h, person.as_deref().unwrap_or("the person"), session);
+        let boss = service.agent_id.as_str();
+        let store = self.desk.store();
+        let at = h.delivered_at.unwrap_or_else(Utc::now);
+        let (kept, in_dm) = tokio::sync::oneshot::channel();
+        let ran = self.run_dm_turn_queued(service, owner, || {
+            let (author, told) = (author.clone(), told.as_str());
+            async move {
+                let turn = self.run_turn_with(
+                    service,
+                    owner,
+                    DESK_CHANNEL,
+                    &h.words,
+                    1,
+                    None,
+                    Some(author),
+                    None,
+                    Some(told),
+                );
+                self.with_mind(boss, "a request handed from elsewhere", turn)
+                    .await
+            }
+        });
+        let noted = async {
+            let saved = in_dm.await.is_ok();
+            if saved {
+                if let Err(e) = store.handed_delivered(h, boss, at).await {
+                    tracing::warn!(handed = %h.id, error = %format!("{e:#}"), "where a handed request went wasn't kept");
+                }
+            }
+            saved
+        };
+        let (ran, saved) = tokio::join!(super::deliver::told_when_asked(kept, ran), noted);
+        let name = name_of(service);
+        let said = match (ran, saved) {
+            (Ok(_), _) => match self.covering_goal(h).await {
+                Some(agreed) => has_it(&name, &agreed),
+                None => not_a_goal_yet(&name),
+            },
+            (Err(e), true) => {
+                tracing::warn!(handed = %h.id, boss = %boss, error = %format!("{e:#}"), "a handed request's turn failed");
+                not_a_goal_yet(&name)
+            }
+            (Err(e), false) => {
+                tracing::warn!(handed = %h.id, boss = %boss, error = %format!("{e:#}"), "a handed request's turn never began");
+                could_not_take(&name)
+            }
+        };
+        if let Err(e) = store.handed_say(h, &said).await {
+            tracing::warn!(handed = %h.id, error = %format!("{e:#}"), "a handed request's word back wasn't kept");
+        }
+    }
+
+    /// The words a plan of `h`'s boss that carries `h` was agreed in, if
+    /// one does.
+    async fn covering_goal(&self, h: &Handed) -> Option<String> {
+        let boss = h.boss.as_deref()?;
+        let plans = self.desk.store().plans(None).await.ok()?;
+        for plan in plans
+            .into_iter()
+            .filter(|p| p.boss == boss && matches!(p.state, PlanState::Running | PlanState::Paused))
+        {
+            let Ok(detail) = self.desk.plan(plan.id).await else {
+                continue;
+            };
+            let sessions =
+                super::goal_check::session_ids(&super::goal_check::plan_sessions(&detail));
+            let plan = &detail.summary.plan;
+            if covers(h, plan, &sessions) {
+                return Some(plan.agreed.clone().unwrap_or_else(|| plan.goal.clone()));
+            }
+        }
+        None
+    }
+
+    /// When the person agreed `goal` in `quote` for boss `service`: in their
+    /// DM ([`Self::agreed_at`]), or in a request of theirs delivered to it
+    /// ([`Self::handed_agreed`]), with the requests that may agree it.
+    pub(super) async fn agreed_or_handed(
+        &self,
+        service: &AgentService,
+        quote: &str,
+        goal: &str,
+    ) -> Result<Agreed, String> {
+        match self.agreed_at(service, quote, goal) {
+            Ok(at) => Ok(Agreed {
+                at,
+                handed: Vec::new(),
+            }),
+            Err(why) => self
+                .handed_agreed(service.agent_id.as_str(), quote, goal)
+                .await
+                .ok_or(why),
+        }
+    }
+
+    /// When a request handed to boss `boss` within the last day agreed a
+    /// new plan's goal `goal` in `quote`: its words hold `quote`, say `goal`
+    /// and agree it. Each that does may agree one plan alone, claimed as it
+    /// is saved ([`Self::claim_handed`]).
+    async fn handed_agreed(&self, boss: &str, quote: &str, goal: &str) -> Option<Agreed> {
+        let since = Utc::now() - super::goal::AGREED_WITHIN;
+        let running: Vec<Handed> = DELIVERING
+            .lock()
+            .values()
+            .filter(|h| h.boss.as_deref() == Some(boss))
+            .cloned()
+            .collect();
+        let kept = self
+            .desk
+            .store()
+            .handed_of_boss(boss)
+            .await
+            .unwrap_or_default();
+        let mut fit: Vec<(DateTime<Utc>, (String, Uuid))> = running
+            .into_iter()
+            .chain(kept)
+            .filter(|h| workforce_desk::goal::says_goal(&h.words, quote) && agrees(h, goal))
+            .filter_map(|h| {
+                let at = h.delivered_at.filter(|at| *at > since)?;
+                Some((at, (h.agent, h.id)))
+            })
+            .collect();
+        fit.sort();
+        fit.dedup_by(|a, b| a.1 == b.1);
+        let at = fit.first()?.0;
+        Some(Agreed {
+            at,
+            handed: fit.into_iter().map(|(_, k)| k).collect(),
+        })
+    }
+
+    /// The first of the requests `a` agreed on that no plan claimed yet,
+    /// claimed now for the plan about to be saved: none when the person
+    /// agreed it in the DM itself.
+    pub(super) async fn claim_handed(&self, a: &Agreed) -> Result<Option<(String, Uuid)>, String> {
+        if a.handed.is_empty() {
+            return Ok(None);
+        }
+        let store = self.desk.store();
+        for (agent, id) in &a.handed {
+            match store.handed_use(agent, *id).await {
+                Ok(true) => return Ok(Some((agent.clone(), *id))),
+                Ok(false) => {}
+                Err(e) => {
+                    tracing::warn!(error = %format!("{e:#}"), "a handed request couldn't be claimed");
+                    return Err(UNCLAIMED.into());
+                }
+            }
+        }
+        Err(AGREED_ALREADY.into())
+    }
+
+    /// The request `claimed` agrees no plan after all: the plan wasn't
+    /// saved.
+    pub(super) async fn unclaim_handed(&self, claimed: Option<&(String, Uuid)>) {
+        let Some((agent, id)) = claimed else {
+            return;
+        };
+        if let Err(e) = self.desk.store().handed_unuse(agent, *id).await {
+            tracing::warn!(error = %format!("{e:#}"), "a handed request's claim wasn't let go");
+        }
+    }
+
+    /// Says `line`, boss `service`'s word on its goal plan `plan` stalling,
+    /// back where each request it carries was asked.
+    pub(super) async fn flag_handed(
+        &self,
+        service: &AgentService,
+        plan: &workforce_desk::plan::Plan,
+        sessions: &[String],
+        line: &str,
+    ) {
+        let store = self.desk.store();
+        let handed = match store.handed_of_boss(&plan.boss).await {
+            Ok(h) => h,
+            Err(e) => {
+                tracing::warn!(plan = %plan.id, error = %format!("{e:#}"), "the requests a goal carries weren't read");
+                return;
+            }
+        };
+        let said = format!("{} (your Desk boss): {line}", name_of(service));
+        for h in handed.iter().filter(|h| covers(h, plan, sessions)) {
+            if let Err(e) = store.handed_say(h, &said).await {
+                tracing::warn!(handed = %h.id, error = %format!("{e:#}"), "a stall's word back wasn't kept");
+            }
+        }
+    }
+}

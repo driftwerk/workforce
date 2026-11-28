@@ -172,6 +172,33 @@ impl Work {
         })
     }
 
+    /// The held session `named` names: its id and, when its account is
+    /// held, its name.
+    pub(super) async fn session_named(
+        &self,
+        named: &str,
+    ) -> Result<Option<(String, Option<String>)>> {
+        let Some((id, _)) = self.session_id(named).await? else {
+            return Ok(None);
+        };
+        if !self.holds_session(&id).await? {
+            return Ok(None);
+        }
+        let name = self
+            .kind(
+                "account",
+                Read {
+                    session: Some(id.clone()),
+                    ..Read::default()
+                },
+            )
+            .await?
+            .first()
+            .map(|a| s(&a.body, "name").to_string())
+            .filter(|n| !n.is_empty());
+        Ok(Some((id, name)))
+    }
+
     /// Whether anything of session `id` is held.
     async fn holds_session(&self, id: &str) -> Result<bool> {
         Ok(!self
@@ -643,7 +670,7 @@ pub fn tools(work: &Work) -> Vec<Arc<dyn Tool>> {
     .collect()
 }
 
-fn opt<'a>(input: &'a Value, f: &str) -> Option<&'a str> {
+pub(super) fn opt<'a>(input: &'a Value, f: &str) -> Option<&'a str> {
     input
         .get(f)
         .and_then(Value::as_str)

@@ -235,30 +235,52 @@ pub(crate) fn is_own_conversation(session: &Session) -> bool {
 }
 
 /// The agent's registry for `session`'s turn: with `exec.run` routed to the
-/// local agent the session selected (DW-324), and the tools of the nodes the
+/// local agent the session selected (DW-324), the tools of the nodes the
 /// turn's person has connected, when the node acts for them and the session
-/// is [their own conversation](is_own_conversation).
+/// is [their own conversation](is_own_conversation), and with `private`
+/// what their Desk lets the turn reach ([`desk_tools`]).
 async fn session_registry(
     service: &AgentService,
     session: &Session,
     private: bool,
 ) -> Arc<workforce_agent::tools::registry::ToolRegistry> {
     let base = node_registry(service, session).await;
-    let work = if private {
-        desk_work(service, session).await
-    } else {
-        None
+    let tools = match private {
+        true => desk_tools(service, session).await,
+        false => Vec::new(),
     };
-    match work {
-        Some(work) => {
-            let registry = workforce_agent::tools::registry::ToolRegistry::follow(&base, |_| true);
-            for tool in crate::desk_knows::tools::tools(&work) {
-                registry.register(tool);
-            }
-            Arc::new(registry)
-        }
-        None => base,
+    if tools.is_empty() {
+        return base;
     }
+    let registry = workforce_agent::tools::registry::ToolRegistry::follow(&base, |_| true);
+    for tool in tools {
+        registry.register(tool);
+    }
+    Arc::new(registry)
+}
+
+/// What the person's Desk lets their turn with the agent reach: the reads
+/// of what it shared ([`desk_work`]), and, off Desk itself, handing their
+/// Desk boss a request of theirs ([`crate::desk_knows::handed`]).
+async fn desk_tools(
+    service: &AgentService,
+    session: &Session,
+) -> Vec<Arc<dyn workforce_agent::tools::Tool>> {
+    let Some(work) =
+        crate::desk_knows::installed().and_then(|store| work_for(store, service.agent_id.as_str()))
+    else {
+        return Vec::new();
+    };
+    let on_desk =
+        session.channel.split(':').next() == Some(workforce_common::channels::DESK_CHANNEL);
+    let hand = (!on_desk).then(|| crate::desk_knows::handed::tool(work.clone(), service, session));
+    held(work, session)
+        .await
+        .map(|work| crate::desk_knows::tools::tools(&work))
+        .unwrap_or_default()
+        .into_iter()
+        .chain(hand)
+        .collect()
 }
 
 /// What the person's Desk shared with this agent, for the person's own
@@ -285,16 +307,40 @@ async fn desk_work_in(
     agent: &str,
     session: &Session,
 ) -> Option<crate::desk_knows::tools::Work> {
+    held(work_for(store, agent)?, session).await
+}
+
+/// What `agent` reads for the person whose turn this is.
+fn work_for(
+    store: Arc<dyn crate::desk_knows::store::KnowsStore>,
+    agent: &str,
+) -> Option<crate::desk_knows::tools::Work> {
+    let person = uuid::Uuid::parse_str(&crate::user_config::current_identity_id()?).ok()?;
+    Some(crate::desk_knows::tools::Work {
+        store,
+        reader: crate::desk_knows::store::Reader {
+            person,
+            agent: agent.to_string(),
+        },
+    })
+}
+
+/// `work`, when `session` is its person's own conversation and they hold
+/// something.
+async fn held(
+    work: crate::desk_knows::tools::Work,
+    session: &Session,
+) -> Option<crate::desk_knows::tools::Work> {
     if !is_own_conversation(session) {
         return None;
     }
-    let person = uuid::Uuid::parse_str(&crate::user_config::current_identity_id()?).ok()?;
-    let reader = crate::desk_knows::store::Reader {
-        person,
-        agent: agent.to_string(),
-    };
-    match tokio::time::timeout(crate::desk_knows::tools::READ_WAIT, store.holds(&reader)).await {
-        Ok(Ok(true)) => Some(crate::desk_knows::tools::Work { store, reader }),
+    match tokio::time::timeout(
+        crate::desk_knows::tools::READ_WAIT,
+        work.store.holds(&work.reader),
+    )
+    .await
+    {
+        Ok(Ok(true)) => Some(work),
         Ok(Ok(false)) => None,
         Err(_) => {
             tracing::warn!("what Desk shared took too long to check; left out of this turn");

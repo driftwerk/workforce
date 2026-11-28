@@ -46,6 +46,8 @@ mod github;
 mod github_seen;
 mod goal;
 mod goal_check;
+mod handed;
+pub(crate) use handed::delivering;
 mod handover;
 mod held;
 mod hold;

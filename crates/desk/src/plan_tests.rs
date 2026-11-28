@@ -11,7 +11,7 @@ fn u(n: u128) -> Uuid {
     Uuid::from_u128(0x0000_0000_0000_4000_8000_0000_0000_0000 | n)
 }
 
-fn plan(state: PlanState) -> Plan {
+pub(crate) fn plan(state: PlanState) -> Plan {
     let now = Utc::now();
     Plan {
         id: u(900),
