@@ -113,6 +113,17 @@ pub enum SurfaceEffect {
     },
 }
 
+/// Where a call reaches, as its tool says, for a turn steered by outside
+/// content ([`crate::security::monitor`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Reach {
+    /// It only looks.
+    Reads,
+    /// What it does stays with the agent: a consultation, a file it makes
+    /// for its own conversation.
+    Stays,
+}
+
 /// Where a write lands, as an "Always allow" for it is kept: the platform
 /// and the destination, written one way however a call writes it (`#ops`,
 /// `ops` and `OPS` are one channel; `@ops` is a person, not that channel).
@@ -282,6 +293,13 @@ pub trait Tool: Send + Sync {
         false
     }
 
+    /// Where THIS call reaches, for a guard that can place it no other way:
+    /// it only reads, or stays with the agent. Never lifts a hold the guard
+    /// makes for a reason of its own. `None`, the default, leaves it held.
+    fn reach(&self, _input: &serde_json::Value) -> Option<Reach> {
+        None
+    }
+
     /// Whether the person's standing choice already lets this call with
     /// `input` run for the agent the tool is registered for, as an
     /// overseer's crew tools are let by its oversight level and act
@@ -334,9 +352,10 @@ pub use workforce_core::computer::Effect as CallEffect;
 
 /// The methods a tool wrapping another answers as the tool it wraps,
 /// saying what a call does: where it writes, whether what it returns is
-/// outside content, whether the person's standing choice decides it, and
-/// what it does to this computer. Every wrapper says them through this, so
-/// one added here is never silently dropped by a wrapper that forgot it.
+/// outside content, whether the person's standing choice decides it, where
+/// it reaches and what it does to this computer. Every wrapper says them
+/// through this, so one added here is never silently dropped by a wrapper
+/// that forgot it.
 /// `$inner` is the wrapped tool's field.
 #[macro_export]
 macro_rules! delegate_call_facts {
@@ -354,6 +373,10 @@ macro_rules! delegate_call_facts {
 
         fn standing_choice(&self, input: &serde_json::Value) -> bool {
             self.$($inner)+.standing_choice(input)
+        }
+
+        fn reach(&self, input: &serde_json::Value) -> Option<$crate::tools::Reach> {
+            self.$($inner)+.reach(input)
         }
 
         fn effect(&self, input: &serde_json::Value) -> $crate::tools::CallEffect {

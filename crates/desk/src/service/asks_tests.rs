@@ -950,6 +950,7 @@ async fn only_its_own_boss_clears_a_prompt_its_terminal_shows() {
             suggestion_id: None,
             hop: 0,
             preference: None,
+            outside: None,
         };
         d.interrupt(s.id, Some(agent.clone()))
             .expect_err("an agent clears nothing");

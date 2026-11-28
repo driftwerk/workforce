@@ -387,6 +387,7 @@ pub fn exchange(e: &ExchangeRow, place: &Where, redactor: &dyn Redactor) -> Outg
         files: red_list(r, &e.files),
         commands: red_list(r, &e.commands),
         errors: red_list(r, &e.errors),
+        outside: red_list(r, &e.outside),
         flagged: e
             .flagged
             .iter()
@@ -426,6 +427,7 @@ pub fn exchange(e: &ExchangeRow, place: &Where, redactor: &dyn Redactor) -> Outg
         "files": list(&e.files),
         "commands": list(&e.commands),
         "errors": list(&e.errors),
+        "outside": list(&e.outside),
         "flagged": e.flagged,
         "text": cut(&format!("{}\n\n{}", e.ask, e.answer), EXCHANGE_TEXT),
     });
@@ -479,6 +481,42 @@ mod tests {
         "2026-11-13T10:00:00Z".parse().unwrap()
     }
 
+    /// An exchange sends why Desk judged it may carry outside content,
+    /// redacted: none for the person's own work.
+    #[test]
+    fn an_exchange_says_why_it_may_carry_outside_content() {
+        let place = Where {
+            group: None,
+            group_name: None,
+        };
+        let row = |outside: Vec<String>| ExchangeRow {
+            reference: "claude:k".into(),
+            session: Uuid::from_u128(1),
+            session_name: None,
+            group: None,
+            at: at(),
+            ended: at(),
+            asker: "desk".into(),
+            ask: "go".into(),
+            answer: "done".into(),
+            steps: json!([]),
+            files: vec![],
+            commands: vec![],
+            errors: vec![],
+            flagged: vec![],
+            outside,
+        };
+        let own = exchange(&row(vec![]), &place, &Hide);
+        assert_eq!(own.body["outside"], json!([]));
+        let read = exchange(
+            &row(vec!["curl https://x.example/?secret=abc123".into()]),
+            &place,
+            &Hide,
+        );
+        assert_eq!(read.body["outside"].as_array().unwrap().len(), 1);
+        assert!(!read.body["outside"][0].as_str().unwrap().contains("abc123"));
+    }
+
     #[test]
     fn every_string_of_every_kind_is_redacted_and_home_is_a_tilde() {
         let s = Uuid::from_u128(1);
@@ -522,6 +560,7 @@ mod tests {
                 commands: vec![],
                 errors: vec![],
                 flagged: vec![],
+                outside: vec![],
             },
             &place,
             &Hide,

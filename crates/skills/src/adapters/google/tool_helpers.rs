@@ -53,6 +53,59 @@ pub const OUTSIDE_READS: &[&str] = &[
     "google.slides.read_slide",
 ];
 
+/// The Google tools that only read the person's own account: its
+/// calendars, files, labels, settings, tasks and contacts.
+pub const READS: &[&str] = &[
+    "google.calendar.calendars",
+    "google.calendar.freebusy",
+    "google.calendar.colors",
+    "google.drive.ls",
+    "google.drive.search",
+    "google.drive.get",
+    "google.drive.permissions",
+    "google.drive.drives",
+    "google.sheets.metadata",
+    "google.docs.info",
+    "google.gmail.labels_list",
+    "google.gmail.label_get",
+    "google.gmail.draft_get",
+    "google.gmail.drafts_list",
+    "google.gmail.filters_list",
+    "google.gmail.forwarding_list",
+    "google.gmail.sendas_list",
+    "google.gmail.vacation_get",
+    "google.tasks.lists",
+    "google.tasks.list",
+    "google.tasks.get",
+    "google.contacts.list",
+    "google.contacts.get",
+    "google.contacts.search",
+    "google.contacts.other_list",
+    "google.contacts.directory_search",
+    "google.people.me",
+    "google.people.get",
+    "google.people.search",
+    "google.chat.spaces_list",
+    "google.chat.spaces_find",
+    "google.chat.reactions_list",
+    "google.slides.info",
+    "google.slides.list_slides",
+];
+
+/// The reads of the person's account ([`READS`]) that return what others
+/// wrote: files found, contacts and people. A turn that reads one is
+/// guarded from then on, as by [`OUTSIDE_READS`].
+pub const OTHERS_WORDS: &[&str] = &[
+    "google.drive.search",
+    "google.contacts.list",
+    "google.contacts.get",
+    "google.contacts.search",
+    "google.contacts.other_list",
+    "google.contacts.directory_search",
+    "google.people.get",
+    "google.people.search",
+];
+
 impl GoogleTool {
     pub fn new(
         name: impl Into<String>,
@@ -95,7 +148,16 @@ impl Tool for GoogleTool {
     }
 
     fn reads_outside_content(&self) -> bool {
-        OUTSIDE_READS.contains(&self.name.as_str())
+        [OUTSIDE_READS, OTHERS_WORDS]
+            .iter()
+            .any(|tools| tools.contains(&self.name.as_str()))
+    }
+
+    fn reach(&self, _input: &serde_json::Value) -> Option<workforce_agent::tools::Reach> {
+        [OUTSIDE_READS, READS]
+            .iter()
+            .any(|names| names.contains(&self.name.as_str()))
+            .then_some(workforce_agent::tools::Reach::Reads)
     }
 
     async fn execute(&self, input: serde_json::Value) -> Result<ToolResult> {
@@ -421,6 +483,10 @@ mod tests {
             .into_iter()
             .find(|t| t.name() == "google.workspaces")
             .unwrap();
+        assert_eq!(
+            t.reach(&json!({})),
+            Some(workforce_agent::tools::Reach::Reads)
+        );
         let answer = as_sam(t.execute(json!({}))).await.unwrap().output;
         assert_eq!(
             answer,

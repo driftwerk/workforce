@@ -24,6 +24,7 @@ struct Spec {
     name: &'static str,
     description: &'static str,
     schema: Value,
+    reads: bool,
 }
 
 fn no_input() -> Value {
@@ -65,12 +66,14 @@ fn specs() -> Vec<Spec> {
                 },
                 "additionalProperties": false
             }),
+            reads: false,
         },
         Spec {
             name: "spotify.pause",
             description: "Pause Spotify playback. Spotify has no separate stop; pausing is what \
                           stopping means.",
             schema: no_input(),
+            reads: false,
         },
         Spec {
             name: "spotify.skip",
@@ -86,6 +89,7 @@ fn specs() -> Vec<Spec> {
                 },
                 "additionalProperties": false
             }),
+            reads: false,
         },
         Spec {
             name: "spotify.volume",
@@ -98,17 +102,20 @@ fn specs() -> Vec<Spec> {
                 "required": ["percent"],
                 "additionalProperties": false
             }),
+            reads: false,
         },
         Spec {
             name: "spotify.now_playing",
             description: "What is playing on Spotify right now, and where.",
             schema: no_input(),
+            reads: true,
         },
         Spec {
             name: "spotify.devices",
             description: "Every device Spotify can currently play on. Useful when playback fails \
                           because nothing is available.",
             schema: no_input(),
+            reads: true,
         },
     ]
 }
@@ -264,6 +271,12 @@ impl Tool for SpotifyTool {
         self.spec.schema.clone()
     }
 
+    fn reach(&self, _input: &serde_json::Value) -> Option<workforce_agent::tools::Reach> {
+        self.spec
+            .reads
+            .then_some(workforce_agent::tools::Reach::Reads)
+    }
+
     async fn execute(&self, input: Value) -> Result<ToolResult> {
         let started = Instant::now();
         let elapsed = |s: Instant| s.elapsed().as_millis() as u64;
@@ -326,5 +339,15 @@ mod tests {
             .find(|s| s.name == "spotify.volume")
             .unwrap();
         assert_eq!(volume.schema["required"], json!(["percent"]));
+    }
+
+    #[test]
+    fn only_what_is_playing_and_where_only_reads() {
+        let reads: Vec<&str> = specs()
+            .into_iter()
+            .filter(|spec| spec.reads)
+            .map(|spec| spec.name)
+            .collect();
+        assert_eq!(reads, ["spotify.now_playing", "spotify.devices"]);
     }
 }

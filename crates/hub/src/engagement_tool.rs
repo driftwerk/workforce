@@ -238,6 +238,10 @@ impl Tool for MessagingGetModeTool {
         })
     }
 
+    fn reach(&self, _input: &serde_json::Value) -> Option<workforce_agent::tools::Reach> {
+        Some(workforce_agent::tools::Reach::Reads)
+    }
+
     async fn execute(&self, input: serde_json::Value) -> Result<ToolResult> {
         let start = Instant::now();
         let params: GetModeInput =
@@ -311,6 +315,10 @@ impl Tool for MessagingListModesTool {
             "properties": {},
             "required": []
         })
+    }
+
+    fn reach(&self, _input: &serde_json::Value) -> Option<workforce_agent::tools::Reach> {
+        Some(workforce_agent::tools::Reach::Reads)
     }
 
     async fn execute(&self, _input: serde_json::Value) -> Result<ToolResult> {
@@ -479,5 +487,24 @@ mod tests {
             .unwrap();
         assert!(result.success);
         assert_eq!(result.output["status"], "no_override");
+    }
+
+    #[test]
+    fn reading_a_mode_only_reads_and_setting_one_does_not() {
+        let overrides = Arc::new(EngagementOverrides::new());
+        let input = serde_json::json!({ "channel": "C123" });
+        let reads = Some(workforce_agent::tools::Reach::Reads);
+        assert_eq!(
+            MessagingGetModeTool::new("atlas", Arc::clone(&overrides)).reach(&input),
+            reads
+        );
+        assert_eq!(
+            MessagingListModesTool::new("atlas", Arc::clone(&overrides)).reach(&input),
+            reads
+        );
+        assert_eq!(
+            MessagingSetModeTool::new("atlas", overrides, None).reach(&input),
+            None
+        );
     }
 }

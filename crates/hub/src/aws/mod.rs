@@ -48,8 +48,9 @@ use workforce_policy::rules::{
 /// Metadata-only tools: plain `Allow` (no body bytes ever leave S3).
 const METADATA_TOOLS: &[&str] = &["aws.s3.list", "aws.s3.head"];
 /// Body-reading tools: subject to the `require_approval_buckets → Ask` gate,
-/// since they surface object contents (potential PII).
-const BODY_TOOLS: &[&str] = &["aws.s3.get", "aws.s3.collect"];
+/// since they surface object contents (potential PII), and outside content
+/// to the turn reading them.
+pub(crate) const BODY_TOOLS: &[&str] = &["aws.s3.get", "aws.s3.collect"];
 
 /// Every read-only `aws.*` tool name (S3 list/head/get + the infra
 /// diagnosis tools). Every `aws.*` tool is read-only by construction, so this

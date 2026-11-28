@@ -63,17 +63,17 @@ fn jira_s_changelog_says_each_kind_of_change() {
     assert_eq!(
         said,
         vec![
-            json!({ "at": "2026-11-01T09:00:00Z", "actor": "Dana Kim", "by": "remote", "kind": "created" }),
-            json!({ "at": at, "actor": "Dana Kim", "by": "remote", "kind": "state", "from": "To Do", "to": "In Review" }),
-            json!({ "at": at, "actor": "Dana Kim", "by": "remote", "kind": "assignee", "to": "Sam" }),
-            json!({ "at": at, "actor": "Dana Kim", "by": "remote", "kind": "priority", "from": "Medium", "to": "High" }),
-            json!({ "at": at, "actor": "Dana Kim", "by": "remote", "kind": "sprint", "to": "Sprint 12" }),
-            json!({ "at": at, "actor": "Dana Kim", "by": "remote", "kind": "points", "from": "3", "to": "5" }),
-            json!({ "at": at, "actor": "Dana Kim", "by": "remote", "kind": "parent", "to": "ACME-9" }),
-            json!({ "at": at, "actor": "Dana Kim", "by": "remote", "kind": "link", "to": "ACME-2" }),
-            json!({ "at": at, "actor": "Dana Kim", "by": "remote", "kind": "field", "field": "Fix Version", "from": "1.0", "to": "1.1" }),
-            json!({ "at": at, "actor": "Dana Kim", "by": "remote", "kind": "field", "field": "description" }),
-            json!({ "at": "2026-11-03T09:00:00Z", "actor": "Dana Kim", "by": "remote", "kind": "field", "field": "link", "from": "ACME-2" }),
+            json!({ "at": "2026-11-01T09:00:00Z", "actor": "Dana Kim", "actorId": "acc-dana", "by": "remote", "kind": "created" }),
+            json!({ "at": at, "actor": "Dana Kim", "actorId": "acc-dana", "by": "remote", "kind": "state", "from": "To Do", "to": "In Review" }),
+            json!({ "at": at, "actor": "Dana Kim", "actorId": "acc-dana", "by": "remote", "kind": "assignee", "to": "Sam" }),
+            json!({ "at": at, "actor": "Dana Kim", "actorId": "acc-dana", "by": "remote", "kind": "priority", "from": "Medium", "to": "High" }),
+            json!({ "at": at, "actor": "Dana Kim", "actorId": "acc-dana", "by": "remote", "kind": "sprint", "to": "Sprint 12" }),
+            json!({ "at": at, "actor": "Dana Kim", "actorId": "acc-dana", "by": "remote", "kind": "points", "from": "3", "to": "5" }),
+            json!({ "at": at, "actor": "Dana Kim", "actorId": "acc-dana", "by": "remote", "kind": "parent", "to": "ACME-9" }),
+            json!({ "at": at, "actor": "Dana Kim", "actorId": "acc-dana", "by": "remote", "kind": "link", "to": "ACME-2" }),
+            json!({ "at": at, "actor": "Dana Kim", "actorId": "acc-dana", "by": "remote", "kind": "field", "field": "Fix Version", "from": "1.0", "to": "1.1" }),
+            json!({ "at": at, "actor": "Dana Kim", "actorId": "acc-dana", "by": "remote", "kind": "field", "field": "description" }),
+            json!({ "at": "2026-11-03T09:00:00Z", "actor": "Dana Kim", "actorId": "acc-dana", "by": "remote", "kind": "field", "field": "link", "from": "ACME-2" }),
         ]
     );
 }
@@ -207,13 +207,14 @@ fn linear_s_history_says_each_kind_of_change() {
         let mut v = v;
         v["at"] = json!(at);
         v["actor"] = json!("Dana Kim");
+        v["actorId"] = json!("u-dana");
         v["by"] = json!("remote");
         v
     };
     assert_eq!(
         said,
         vec![
-            json!({ "at": "2026-11-01T09:00:00Z", "actor": "Hub key", "by": "desk", "kind": "created" }),
+            json!({ "at": "2026-11-01T09:00:00Z", "actor": "Hub key", "actorId": "u-key", "by": "desk", "kind": "created" }),
             dana(json!({ "kind": "state", "from": "Todo", "to": "In Progress" })),
             dana(json!({ "kind": "assignee", "to": "Sam" })),
             dana(json!({ "kind": "priority", "from": "Medium", "to": "Urgent" })),
@@ -230,7 +231,7 @@ fn linear_s_history_says_each_kind_of_change() {
             dana(json!({ "kind": "field", "field": "description" })),
             json!({ "at": "2026-11-03T08:00:00Z", "by": "github", "kind": "link", "to": "#248" }),
             json!({ "at": "2026-11-03T09:00:00Z", "actor": "GitHub", "by": "github", "kind": "state", "from": "In Progress", "to": "Done" }),
-            json!({ "at": "2026-11-04T10:00:00Z", "actor": "Hub key", "by": "desk", "kind": "assignee", "from": "Sam" }),
+            json!({ "at": "2026-11-04T10:00:00Z", "actor": "Hub key", "actorId": "u-key", "by": "desk", "kind": "assignee", "from": "Sam" }),
         ],
         "an entry that changed nothing says nothing"
     );

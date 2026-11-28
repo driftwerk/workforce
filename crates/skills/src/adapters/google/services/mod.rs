@@ -147,6 +147,7 @@ mod tests {
             HashSet::from_iter(
                 crate::adapters::google::tool_helpers::OUTSIDE_READS
                     .iter()
+                    .chain(crate::adapters::google::tool_helpers::OTHERS_WORDS)
                     .copied()
             ),
             "every listed read is a real tool"

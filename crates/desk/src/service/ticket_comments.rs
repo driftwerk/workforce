@@ -299,6 +299,13 @@ impl Desk {
                 (Uuid::nil(), false)
             }
         };
+        // A boss's comment whose turn's reading isn't kept is taken as from
+        // before Desk said.
+        if kept_ok {
+            if let Err(e) = self.stamp_written(cid, by, true).await {
+                tracing::warn!(ticket = %id, error = %e, "what a comment's writer had read wasn't kept");
+            }
+        }
         let group = self.board_of(t.board).await.ok().and_then(|b| b.group);
         self.note(
             by.event(

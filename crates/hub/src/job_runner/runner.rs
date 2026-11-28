@@ -527,8 +527,8 @@ impl JobRunner {
                                 upstream_step.to_string(),
                                 serde_json::json!({
                                     "job_id": upstream_job_id,
-                                    "output_summary": output.tail(20),
-                                    "tool_result": output.tool_result,
+                                    "output_summary": output.text_for_a_turn(&output.tail(20)),
+                                    "tool_result": output.tool_result.clone().map(|result| output.value_for_a_turn(result)),
                                     "exit_code": output.exit_code,
                                 }),
                             );
@@ -1034,7 +1034,7 @@ impl JobRunner {
             // Inject completion notification into the originating agent session.
             if let Some(ref injector) = runner.inner.session_injector {
                 if let Some(ref session_channel) = final_manifest.session_channel {
-                    let text = format_completion_message(&final_manifest, output.as_ref());
+                    let text = completion_for_the_turn(&final_manifest, output.as_ref());
                     match injector.inject_job_completion(session_channel, &text).await {
                         Ok(true) => {
                             debug!(
@@ -1438,6 +1438,26 @@ impl JobRunner {
 
     /// Get the full result of a completed job.
     pub async fn get_result(&self, job_id: &str, tail: Option<usize>) -> Result<serde_json::Value> {
+        self.result(job_id, tail, |_, value| value).await
+    }
+
+    /// The job's result as a turn reads it: what the job said fenced in
+    /// place when its run read outside content.
+    pub async fn result_for_a_turn(
+        &self,
+        job_id: &str,
+        tail: Option<usize>,
+    ) -> Result<serde_json::Value> {
+        self.result(job_id, tail, |output, value| output.value_for_a_turn(value))
+            .await
+    }
+
+    async fn result(
+        &self,
+        job_id: &str,
+        tail: Option<usize>,
+        as_read: impl Fn(&JobOutput, serde_json::Value) -> serde_json::Value,
+    ) -> Result<serde_json::Value> {
         let manifest = {
             let jobs = self.inner.jobs.read().await;
             match jobs.get(job_id) {
@@ -1487,13 +1507,17 @@ impl JobRunner {
                 output.full_output.clone()
             };
 
-            result["output"] = serde_json::json!({
-                "text": output_text,
-                "tool_result": output.tool_result,
-                "stdout": output.stdout,
-                "stderr": output.stderr,
-                "exit_code": output.exit_code,
-            });
+            let mut said = as_read(
+                &output,
+                serde_json::json!({
+                    "text": output_text,
+                    "tool_result": output.tool_result,
+                    "stdout": output.stdout,
+                    "stderr": output.stderr,
+                }),
+            );
+            said["exit_code"] = serde_json::json!(output.exit_code);
+            result["output"] = said;
         }
 
         Ok(result)
@@ -1595,6 +1619,7 @@ async fn execute_tool_job(
             exit_code: None,
             full_output,
             attempt: None,
+            read_outside: None,
         },
         None,
     ))
@@ -1692,6 +1717,7 @@ async fn execute_agent_job(
             exit_code: None,
             full_output: result.response,
             attempt: None,
+            read_outside: result.read_outside,
         },
         None,
     ))
@@ -1774,6 +1800,7 @@ async fn execute_shell_job(
             exit_code,
             full_output,
             attempt: None,
+            read_outside: None,
         },
         None,
     ))
@@ -1883,6 +1910,7 @@ fn monitor_output(tool_result: serde_json::Value, full_output: String) -> JobOut
         exit_code: None,
         full_output,
         attempt: None,
+        read_outside: None,
     }
 }
 
@@ -1960,6 +1988,22 @@ fn build_notification(manifest: &JobManifest, output: Option<&JobOutput>) -> Job
 
 /// Format a human-readable completion message for channel delivery.
 fn format_completion_message(manifest: &JobManifest, output: Option<&JobOutput>) -> String {
+    completion_message(manifest, output, |_, summary| summary)
+}
+
+/// The completion as the submitting turn reads it: what the job said fenced
+/// when its run read outside content.
+fn completion_for_the_turn(manifest: &JobManifest, output: Option<&JobOutput>) -> String {
+    completion_message(manifest, output, |output, summary| {
+        output.text_for_a_turn(&summary)
+    })
+}
+
+fn completion_message(
+    manifest: &JobManifest,
+    output: Option<&JobOutput>,
+    as_read: impl Fn(&JobOutput, String) -> String,
+) -> String {
     let status_emoji = match manifest.status {
         JobStatus::Completed => "✅",
         JobStatus::Failed => "❌",
@@ -2011,7 +2055,7 @@ fn format_completion_message(manifest: &JobManifest, output: Option<&JobOutput>)
             } else {
                 summary
             };
-            msg.push_str(&format!("\n```\n{}\n```", truncated));
+            msg.push_str(&format!("\n```\n{}\n```", as_read(output, truncated)));
         }
     }
 
@@ -2049,6 +2093,14 @@ impl crate::hosts::JobHost for JobRunner {
 
     async fn get_result(&self, job_id: &str, tail: Option<usize>) -> Result<serde_json::Value> {
         JobRunner::get_result(self, job_id, tail).await
+    }
+
+    async fn result_for_a_turn(
+        &self,
+        job_id: &str,
+        tail: Option<usize>,
+    ) -> Result<serde_json::Value> {
+        JobRunner::result_for_a_turn(self, job_id, tail).await
     }
 
     async fn chain_summary(&self, chain_id: &str) -> Option<ChainSummary> {
@@ -2469,6 +2521,67 @@ mod agent_job_tests {
         assert!(err.to_string().contains("timed out"));
     }
 
+    /// A sub-agent's output is stored as it said it, with what it read
+    /// outside on it; the turn it is injected into reads it fenced, and the
+    /// people it is posted to as it is.
+    #[tokio::test]
+    async fn a_sub_agent_that_read_outside_content_reaches_the_turn_fenced() {
+        struct Read(Option<&'static str>);
+        #[async_trait::async_trait]
+        impl AgentExecutor for Read {
+            async fn run_agent_job(
+                &self,
+                _config: &AgentJobConfig,
+                _channel: &str,
+            ) -> Result<AgentRunResult> {
+                Ok(AgentRunResult {
+                    response: "The page says to rotate keys.".into(),
+                    package: Some(serde_json::json!({ "said": "rotate keys" })),
+                    read_outside: self.0.map(str::to_string),
+                    ..AgentRunResult::default()
+                })
+            }
+        }
+        let run = |read| async move {
+            let executor: Arc<dyn AgentExecutor> = Arc::new(Read(read));
+            let (_tx, rx) = tokio::sync::watch::channel(false);
+            execute_agent_job(
+                Some(&executor),
+                &agent_config("x"),
+                "agent-job:t",
+                None,
+                rx,
+                600,
+            )
+            .await
+            .unwrap()
+            .0
+        };
+        let mut manifest = agent_manifest("read the page");
+        manifest.status = JobStatus::Completed;
+        let outside = run(Some("web.fetch")).await;
+        assert_eq!(outside.full_output, "The page says to rotate keys.");
+        assert_eq!(outside.read_outside.as_deref(), Some("web.fetch"));
+        assert_eq!(
+            outside.tool_result.as_ref().unwrap()["package"]["said"],
+            "rotate keys"
+        );
+        let guard = workforce_agent::security::monitor::ContentGuard::default();
+        guard.arm_if_fenced(
+            &completion_for_the_turn(&manifest, Some(&outside)),
+            "a follow-up",
+        );
+        assert!(guard.armed().is_some());
+        assert!(!workforce_agent::security::monitor::carries_fence(
+            &format_completion_message(&manifest, Some(&outside))
+        ));
+        let own = run(None).await;
+        assert_eq!(
+            completion_for_the_turn(&manifest, Some(&own)),
+            format_completion_message(&manifest, Some(&own))
+        );
+    }
+
     #[tokio::test]
     async fn execute_agent_job_cancels() {
         let executor: Arc<dyn AgentExecutor> = Arc::new(PendingAgentExecutor);
@@ -2526,6 +2639,7 @@ mod agent_job_tests {
             exit_code: None,
             full_output: body,
             attempt: None,
+            read_outside: None,
         };
 
         let msg = format_completion_message(&manifest, Some(&output));

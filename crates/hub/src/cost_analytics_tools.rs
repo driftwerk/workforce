@@ -75,6 +75,10 @@ impl Tool for CostsAnalyzeTool {
             "required": []})
     }
 
+    fn reach(&self, _input: &serde_json::Value) -> Option<workforce_agent::tools::Reach> {
+        Some(workforce_agent::tools::Reach::Reads)
+    }
+
     async fn execute(&self, input: serde_json::Value) -> eyre::Result<ToolResult> {
         let start = Instant::now();
         let params: AnalyzeInput = serde_json::from_value(input).unwrap_or(AnalyzeInput {
@@ -166,6 +170,10 @@ impl Tool for CostsForecastTool {
             }
         ,
             "required": []})
+    }
+
+    fn reach(&self, _input: &serde_json::Value) -> Option<workforce_agent::tools::Reach> {
+        Some(workforce_agent::tools::Reach::Reads)
     }
 
     async fn execute(&self, input: serde_json::Value) -> eyre::Result<ToolResult> {

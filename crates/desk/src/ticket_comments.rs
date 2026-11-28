@@ -62,6 +62,10 @@ pub enum AuthorKind {
 pub struct Author {
     pub kind: AuthorKind,
     pub name: String,
+    /// Its writer's id there, as the board's sync names the person, when
+    /// the read says.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
     /// Where it is one: "Linear", "Jira", or "Desk".
     pub on: String,
 }
@@ -124,7 +128,7 @@ fn name_of(v: &Value) -> Option<String> {
 
 /// Who wrote a comment there: an app or a person, never Desk or the person
 /// themselves, whatever its words or name say ([`RESERVED_NAMES`]).
-fn author_of(system: System, name: Option<String>, app: bool) -> Author {
+fn author_of(system: System, name: Option<String>, id: Option<&str>, app: bool) -> Author {
     let on = system.title().to_string();
     let name = name.map(
         |n| match RESERVED_NAMES.contains(&n.trim().to_lowercase().as_str()) {
@@ -139,6 +143,10 @@ fn author_of(system: System, name: Option<String>, app: bool) -> Author {
             AuthorKind::Person
         },
         name: name.unwrap_or_else(|| "Someone".into()),
+        id: id
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+            .map(str::to_string),
         on,
     }
 }
@@ -217,7 +225,12 @@ pub fn jira_comments(answer: &Value) -> Result<RemoteRead, String> {
         let body = held(&crate::board_sync::html_text(&html));
         let app = c["author_account_type"].as_str() == Some("app");
         Entry::Read(RemoteComment {
-            author: author_of(System::Jira, name_of(&c["author"]), app),
+            author: author_of(
+                System::Jira,
+                name_of(&c["author"]),
+                c["author_account_id"].as_str(),
+                app,
+            ),
             remote_id: id,
             // Jira's comments are flat.
             parent: None,
@@ -307,13 +320,14 @@ pub fn linear_comments(answer: &Value) -> Result<RemoteRead, String> {
         let (body, flagged) = unfence(c["body"].as_str().unwrap_or_default());
         let body = held(&body);
         let bot = c.get("botActor").filter(|b| b.is_object());
+        // An app writing, even for a person (an integration's), is an app's.
         let (name, app) = match (c["user"]["name"].as_str(), bot) {
-            (Some(_), _) => (name_of(&c["user"]["name"]), false),
+            (Some(_), b) => (name_of(&c["user"]["name"]), b.is_some()),
             (None, Some(b)) => (name_of(&b["name"]), true),
             (None, None) => (None, false),
         };
         Entry::Read(RemoteComment {
-            author: author_of(System::Linear, name, app),
+            author: author_of(System::Linear, name, c["user"]["id"].as_str(), app),
             remote_id: id.to_string(),
             parent: c["parent"]["id"]
                 .as_str()
@@ -393,6 +407,7 @@ pub fn author_from(party: &Party) -> Author {
             PartyKind::You => "You".into(),
             _ => crate::crew::one_line(&party.name, 80),
         },
+        id: None,
         on: "Desk".into(),
     }
 }

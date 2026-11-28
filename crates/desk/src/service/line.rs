@@ -263,6 +263,30 @@ impl Desk {
         }
     }
 
+    /// Asks `read` what outside content the boss's turn calling Desk has
+    /// read: what it says to a session, or starts one with, carries that
+    /// in.
+    pub fn read_outside_with(&self, read: line::ReadOutside) {
+        if self.0.read_outside.set(read).is_err() {
+            tracing::warn!(
+                "desk was told twice how to read a turn's outside content; the first stays"
+            );
+        }
+    }
+
+    /// What `by`'s words carry in from outside: what it says it carries,
+    /// else what the hub's turn calling Desk has read.
+    pub fn carried_by(&self, by: &By) -> Option<String> {
+        by.outside.clone().or_else(|| self.turn_read_outside())
+    }
+
+    /// What the hub's turn calling Desk now has read of outside content,
+    /// as its hub says ([`Self::read_outside_with`]); none when it says
+    /// nothing.
+    pub fn turn_read_outside(&self) -> Option<String> {
+        self.0.read_outside.get().and_then(|read| read())
+    }
+
     /// The answer to an MCP request on `caller`'s line, when lines are served.
     pub(crate) async fn line_mcp(&self, caller: Uuid, body: &str) -> Option<Option<String>> {
         let mcp = self.0.line_mcp.get()?;
@@ -733,6 +757,7 @@ impl Desk {
             suggestion_id: None,
             hop: 0,
             preference: None,
+            outside: None,
         };
         let mut said = Vec::new();
         for effect in crate::scope::move_effects(from, to, &ids, charged, &bossed) {
@@ -1031,6 +1056,9 @@ impl Desk {
         };
         let mut m = LineMessage::new(party, recipient, kind, text, hop);
         m.in_reply_to = in_reply_to;
+        if let Sender::Overseer(by) = &from {
+            m.outside = self.carried_by(by);
+        }
         // The person's and the overseer's to a session are its group's.
         m.group = group.or_else(|| self.line_group(&m));
         if let Send::Answer { to, turn, .. } = &hop_send {

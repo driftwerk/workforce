@@ -298,6 +298,15 @@ impl Tool for ViewAttachmentTool {
         })
     }
 
+    fn reach(&self, _input: &serde_json::Value) -> Option<workforce_agent::tools::Reach> {
+        Some(workforce_agent::tools::Reach::Reads)
+    }
+
+    /// An attachment is what someone else sent or made.
+    fn reads_outside_content(&self) -> bool {
+        true
+    }
+
     async fn execute(&self, input: serde_json::Value) -> Result<ToolResult> {
         let start = Instant::now();
         let elapsed = || start.elapsed().as_millis() as u64;

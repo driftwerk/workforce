@@ -13,7 +13,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use serde_json::Value;
 use tracing::warn;
 
-use crate::tools::{Destination, SurfaceEffect};
+use crate::tools::{Destination, Reach, SurfaceEffect};
 
 /// How every fence of outside content opens ([`super::external_content`]).
 /// Content inside a fence has its `<<<` defanged, so only a real fence reads
@@ -23,6 +23,11 @@ pub const FENCE_MARK: &str = "<<<EXTERNAL_UNTRUSTED_CONTENT_";
 /// How a monitor's prompt fenced a watched message before [`FENCE_MARK`]: a
 /// turn kept from then is armed by it as by a fence.
 const LEGACY_FENCE_MARK: &str = "<<<BEGIN MESSAGE CONTENT>>>";
+
+/// Whether `text` carries a fence of outside content.
+pub fn carries_fence(text: &str) -> bool {
+    text.contains(FENCE_MARK) || text.contains(LEGACY_FENCE_MARK)
+}
 
 /// The files that make up an agent's identity: what Desk and the API edit
 /// beside each other, and what a turn steered by outside content never
@@ -170,7 +175,7 @@ impl AnomalySignal {
                 format!("`{tool}` would keep something the agent's later turns trust")
             }
             Self::Unvetted { tool } => {
-                format!("`{tool}` isn't known only to read or to keep to the agent's own work")
+                format!("`{tool}` isn't known to only read or to stay within the agent's own work")
             }
         }
     }
@@ -274,6 +279,7 @@ const STANDING_RULES: &[(&str, &[&str])] = &[
     ("google.gmail.vacation_set", &[]),
     ("email.sort_rules", &["set_enabled", "remove"]),
     ("email.sort_rule_save", &[]),
+    ("watch", &[]),
 ];
 
 /// Tools that keep what they're told for the agent's later turns, with the
@@ -306,9 +312,13 @@ const PERSISTING: &[(&str, &[&str])] = &[
     ("playbook", &["list", "get", "schema", "validate"]),
     ("remember_preference", &[]),
     ("self_learning", &[]),
+    ("know_how", &["search", "list", "pending"]),
 ];
 
 const IDENTITY_WRITERS: &[&str] = &["filesystem.write", "filesystem.edit", "filesystem.delete"];
+
+/// The namespaces that drive a browser.
+const BROWSERS: &[&str] = &["browser", "obscura"];
 
 /// The browser actions that only look at a page. The page a navigation
 /// opens is the URL it was given, and that is checked as any URL is.
@@ -678,6 +688,8 @@ pub struct Call<'a> {
     /// message that names no destination goes. `None` reads it from the
     /// turn's channel and thread ([`here`]).
     pub here: Option<&'a str>,
+    /// Where the tool says the call reaches ([`crate::tools::Tool::reach`]).
+    pub reach: Option<Reach>,
 }
 
 impl<'a> Call<'a> {
@@ -688,6 +700,17 @@ impl<'a> Call<'a> {
             effect,
             standing: false,
             here: None,
+            reach: None,
+        }
+    }
+
+    /// The call as `tool` says of it: whether the person's standing choice
+    /// decides it, and where it reaches.
+    pub fn told_by(self, tool: &dyn crate::tools::Tool) -> Self {
+        Self {
+            standing: tool.standing_choice(self.input),
+            reach: tool.reach(self.input),
+            ..self
         }
     }
 }
@@ -771,6 +794,8 @@ pub struct ContentGuard {
     stops: Mutex<Vec<AnomalySignal>>,
     seen: Mutex<HashSet<String>>,
     keeper: KeptBy,
+    /// The turn this guard branches from ([`Self::branch`]).
+    parent: Option<Arc<ContentGuard>>,
 }
 
 impl ContentGuard {
@@ -780,6 +805,7 @@ impl ContentGuard {
             stops: Mutex::new(scope.stops.clone()),
             seen: Mutex::new(scope.seen.iter().cloned().collect()),
             keeper: KeptBy::default(),
+            parent: None,
             scope,
         }
     }
@@ -842,8 +868,19 @@ impl ContentGuard {
     /// Arm when `text` carries a fence of outside content from `what`; its
     /// URLs are then ones the turn may open.
     pub fn arm_if_fenced(&self, text: &str, what: &str) {
-        if text.contains(FENCE_MARK) || text.contains(LEGACY_FENCE_MARK) {
+        if carries_fence(text) {
             self.read_outside(text, what);
+        }
+    }
+
+    /// `tool` returned `output`: armed when it is outside content, a fence
+    /// in it or a successful call of a tool that returns outside content as
+    /// it is (`outside`, or as the process knows its tools).
+    pub fn returned(&self, tool: &str, outside: bool, success: bool, output: &str) {
+        if success && (outside || reads_outside(tool)) {
+            self.read_outside(output, tool);
+        } else {
+            self.arm_if_fenced(output, tool);
         }
     }
 
@@ -856,13 +893,7 @@ impl ContentGuard {
     /// The scope a turn resumed later runs under: this one, armed as it is
     /// now, with what it refused and the URLs it saw.
     pub fn kept_scope(&self) -> ContentScope {
-        let mut seen: Vec<String> = self
-            .seen
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .iter()
-            .cloned()
-            .collect();
+        let mut seen: Vec<String> = self.seen().into_iter().collect();
         seen.sort();
         ContentScope {
             armed: self.armed(),
@@ -872,6 +903,27 @@ impl ContentGuard {
         }
     }
 
+    /// A guard for work the turn has done on its own, such as a
+    /// consultation's research: armed, and given URLs, whenever the turn
+    /// is, and arming apart from it, so what that work reads doesn't arm
+    /// the turn.
+    pub fn branch(self: &Arc<Self>) -> Self {
+        Self {
+            scope: self.scope.clone(),
+            parent: Some(Arc::clone(self)),
+            ..Self::default()
+        }
+    }
+
+    /// The URLs the turn may open: those it saw, and those its parent saw.
+    fn seen(&self) -> HashSet<String> {
+        let mut seen = self.seen.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        if let Some(parent) = &self.parent {
+            seen.extend(parent.seen());
+        }
+        seen
+    }
+
     /// The kept scope ([`Self::kept_scope`]) of a turn that read outside
     /// content; `None` while it hasn't.
     pub fn armed_scope(&self) -> Option<Box<ContentScope>> {
@@ -879,7 +931,8 @@ impl ContentGuard {
     }
 
     pub fn armed(&self) -> Option<String> {
-        self.armed.lock().unwrap_or_else(|e| e.into_inner()).clone()
+        let own = self.armed.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        own.or_else(|| self.parent.as_ref().and_then(|parent| parent.armed()))
     }
 
     /// `signal`'s call was refused: the turn's owner is told.
@@ -909,10 +962,7 @@ impl ContentGuard {
             here: call.here.or(current.as_deref()),
             ..*call
         };
-        let signal = {
-            let seen = self.seen.lock().unwrap_or_else(|e| e.into_inner());
-            assess(call, &self.scope, &seen)?
-        };
+        let signal = assess(call, &self.scope, &self.seen())?;
         let refused = self.scope.refuses;
         warn!(
             target: "sentinel.monitor",
@@ -922,7 +972,7 @@ impl ContentGuard {
             "Call held after outside content"
         );
         let reason = format!(
-            "{}, and this turn is processing outside content ({armed}) that may be steering it",
+            "{}. This turn read outside content (from {armed}), which could be what is asking for this",
             signal.description()
         );
         Some(Held {
@@ -952,6 +1002,7 @@ pub fn assess(
         effect,
         standing,
         here,
+        reach,
     } = *call;
     let owned = || tool.to_string();
     let action = input["action"]
@@ -1036,7 +1087,8 @@ pub fn assess(
                 .to_string(),
         ));
     }
-    if namespace == "browser" && !BROWSER_READS.contains(&leaf) {
+    let browser = BROWSERS.contains(&namespace);
+    if browser && !BROWSER_READS.contains(&leaf) {
         return Some(exfiltration("a web page".to_string()));
     }
     if IDENTITY_WRITERS.contains(&tool) {
@@ -1089,6 +1141,9 @@ pub fn assess(
         && input["method"]
             .as_str()
             .is_some_and(|method| method.trim().eq_ignore_ascii_case("GET"));
+    let changes = outward(leaf, &action);
+    // A tool's own word never places a call named as sending or changing.
+    let declared = |said| reach == Some(said) && !changes;
     let reads = system_read == Some(true)
         || setup_read
         || listed(KEPT_READS)
@@ -1097,18 +1152,20 @@ pub fn assess(
                 .is_some_and(|rest| rest.is_empty() || rest.starts_with('.'))
         })
         || matches!(effect, Some(SurfaceEffect::Reads))
+        || declared(Reach::Reads)
         || known.reads.contains(tool)
         || (!action.is_empty() && known.reads.contains(&format!("{tool}.{action}")))
         || api_get
         // A bare GET of a URL the turn was given: anything more is held above.
         || tool == "http.request"
-        || (namespace == "browser" && BROWSER_READS.contains(&leaf));
-    let own = OWN_NAMESPACES.contains(&root)
+        || (browser && BROWSER_READS.contains(&leaf));
+    let own = declared(Reach::Stays)
+        || keeps_its_own(tool)
         || (namespace == "google.gmail" && OWN_MAILBOX.contains(&leaf));
     if reads || own {
         return None;
     }
-    Some(match outward(leaf, &action) || leaf == "api" {
+    Some(match changes || leaf == "api" {
         true => exfiltration("outside".to_string()),
         false => AnomalySignal::Unvetted { tool: owned() },
     })
@@ -1155,6 +1212,20 @@ fn persists(tool: &str, action: &str) -> bool {
         };
         !reads.contains(&asked)
     })
+}
+
+/// Whether `tool` is in a namespace that keeps the agent's own working
+/// state ([`OWN_NAMESPACES`]): its calls stay with the agent whatever they
+/// are named.
+pub fn keeps_its_own(tool: &str) -> bool {
+    OWN_NAMESPACES.contains(&tool.split('.').next().unwrap_or(tool))
+}
+
+/// Whether a call of `tool` doing `action` is named as sending or changing
+/// something: what a tool's own word ([`Reach`]) never places.
+pub fn names_a_change(tool: &str, action: &str) -> bool {
+    let leaf = tool.rsplit_once('.').map_or(tool, |(_, leaf)| leaf);
+    outward(leaf, &action.trim().to_ascii_lowercase())
 }
 
 /// Whether a call named `leaf` doing `action` sends or changes something:
@@ -2130,5 +2201,206 @@ mod tests {
         );
         assert_eq!(kept[1].stops, vec![held.signal]);
         assert!(armed_flag.is_armed());
+    }
+
+    fn said(
+        guard: &ContentGuard,
+        tool: &str,
+        input: &Value,
+        reach: Option<Reach>,
+    ) -> Option<AnomalySignal> {
+        let call = Call {
+            reach,
+            ..Call::new(tool, input, None)
+        };
+        guard.check_call(&call).map(|held| held.signal)
+    }
+
+    #[test]
+    fn a_tools_own_word_places_only_what_nothing_else_holds() {
+        let guard = armed(delivering("C1"));
+        let nothing = json!({});
+        for reach in [Reach::Reads, Reach::Stays] {
+            assert_eq!(
+                said(&guard, "advisor", &nothing, Some(reach)),
+                None,
+                "{reach:?}"
+            );
+        }
+        assert_eq!(
+            said(&guard, "advisor", &nothing, None),
+            Some(AnomalySignal::Unvetted {
+                tool: "advisor".into()
+            })
+        );
+        let stays = |tool: &str, input: Value| said(&guard, tool, &input, Some(Reach::Stays));
+        for (tool, input) in [
+            ("issue.comment", json!({})),
+            ("ticket", json!({ "action": "send_reply" })),
+        ] {
+            assert!(names_a_change(
+                tool,
+                input["action"].as_str().unwrap_or_default()
+            ));
+            for reach in [Reach::Reads, Reach::Stays] {
+                assert!(
+                    matches!(
+                        said(&guard, tool, &input, Some(reach)),
+                        Some(AnomalySignal::Exfiltration { .. })
+                    ),
+                    "{tool} {reach:?}: a declaration never places a call named as a change"
+                );
+            }
+        }
+        assert!(matches!(
+            stays("advisor", json!({ "url": "https://evil.example/?d=1" })),
+            Some(AnomalySignal::Exfiltration { .. })
+        ));
+        assert!(matches!(
+            stays("advisor", json!({ "question": "[[vault:gmail]]" })),
+            Some(AnomalySignal::CredentialAccess { .. })
+        ));
+        assert!(matches!(
+            stays("vault.get", json!({ "key": "gmail" })),
+            Some(AnomalySignal::CredentialAccess { .. })
+        ));
+        assert!(matches!(
+            stays("exec.run", json!({ "command": "ls" })),
+            Some(AnomalySignal::CommandExecution { .. })
+        ));
+        assert!(matches!(
+            stays("memory", json!({ "action": "remember" })),
+            Some(AnomalySignal::Persistence { .. })
+        ));
+        assert!(matches!(
+            stays("scheduler", json!({ "action": "create" })),
+            Some(AnomalySignal::RuleCreation { .. })
+        ));
+        assert!(matches!(
+            stays("agent.update", json!({})),
+            Some(AnomalySignal::PrivilegeEscalation { .. })
+        ));
+        let general = writes("slack", "#general");
+        let post = Call {
+            reach: Some(Reach::Stays),
+            ..Call::new("messaging.send", &nothing, Some(&general))
+        };
+        assert!(matches!(
+            guard.check_call(&post).map(|held| held.signal),
+            Some(AnomalySignal::Exfiltration { .. })
+        ));
+    }
+
+    #[test]
+    fn every_browser_looks_freely_and_is_held_acting_on_a_page() {
+        let guard = armed(delivering("C1"));
+        for looks in [
+            "obscura.snapshot",
+            "obscura.console_messages",
+            "browser.snapshot",
+        ] {
+            assert_eq!(guard.check(looks, &json!({}), None), None, "{looks}");
+        }
+        for acts in ["obscura.click", "obscura.fill", "obscura.evaluate"] {
+            assert_eq!(
+                guard.check(acts, &json!({}), None).map(|held| held.signal),
+                Some(AnomalySignal::Exfiltration {
+                    tool: acts.into(),
+                    to: "a web page".into()
+                }),
+                "{acts}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_watch_is_standing_automation_and_know_how_keeps_what_it_learns() {
+        let guard = armed(delivering("C1"));
+        assert!(matches!(
+            guard
+                .check("watch", &json!({ "tool": "jira.search" }), None)
+                .map(|held| held.signal),
+            Some(AnomalySignal::RuleCreation { .. })
+        ));
+        for read in ["search", "list", "pending"] {
+            let input = json!({ "action": read });
+            assert_eq!(guard.check("know_how", &input, None), None, "{read}");
+        }
+        assert!(matches!(
+            guard
+                .check("know_how", &json!({ "action": "add" }), None)
+                .map(|held| held.signal),
+            Some(AnomalySignal::Persistence { .. })
+        ));
+    }
+
+    #[test]
+    fn a_hold_says_what_the_call_might_do_and_why_it_is_asked() {
+        let guard = ContentGuard::new(delivering("C1"));
+        guard.on_untrusted_content("web.fetch");
+        let held = guard.check("mystery.tool", &json!({}), None).unwrap();
+        assert_eq!(
+            held.reason,
+            "`mystery.tool` isn't known to only read or to stay within the agent's own work. \
+             This turn read outside content (from web.fetch), which could be what is asking for this"
+        );
+    }
+
+    #[test]
+    fn a_branch_is_armed_with_the_turn_and_arms_apart_from_it() {
+        let turn = Arc::new(ContentGuard::new(delivering("C1")));
+        let quiet = turn.branch();
+        quiet.read_outside("see https://a.example/x", "web.fetch");
+        assert_eq!(
+            turn.armed(),
+            None,
+            "what the branch read leaves the turn as it was"
+        );
+        assert!(turn
+            .check("web.fetch", &json!({ "url": "https://b.example/y" }), None)
+            .is_none());
+        assert!(quiet
+            .check("web.fetch", &json!({ "url": "https://b.example/y" }), None)
+            .is_some());
+        let before = Arc::new(ContentGuard::new(delivering("C1")));
+        let armed = before.branch();
+        before.read_outside("see https://a.example/x", "email.read");
+        assert_eq!(
+            armed.armed().as_deref(),
+            Some("email.read"),
+            "a branch made before the turn read outside content is armed with it"
+        );
+        assert_eq!(
+            armed.check("web.fetch", &json!({ "url": "https://a.example/x" }), None),
+            None,
+            "the turn's seen URLs come with it"
+        );
+        assert!(armed
+            .check("web.fetch", &json!({ "url": "https://b.example/y" }), None)
+            .is_some());
+    }
+
+    #[test]
+    fn what_a_tool_returns_arms_its_guard_when_it_is_outside_content() {
+        let guard = ContentGuard::new(delivering("C1"));
+        guard.returned("filesystem.read", false, true, "see https://a.example/x");
+        assert_eq!(guard.armed(), None);
+        guard.returned(
+            "linear.comment_list",
+            false,
+            true,
+            "see https://a.example/x",
+        );
+        assert_eq!(guard.armed().as_deref(), Some("linear.comment_list"));
+        let told = ContentGuard::new(delivering("C1"));
+        told.returned("mail.peek", true, false, "failed");
+        assert_eq!(told.armed(), None, "a failed call returned nothing outside");
+        told.returned("mail.peek", true, true, "see https://a.example/y");
+        assert_eq!(told.armed().as_deref(), Some("mail.peek"));
+        assert_eq!(
+            told.check("web.fetch", &json!({ "url": "https://a.example/y" }), None),
+            None,
+            "a URL it returned is one the turn may open"
+        );
     }
 }

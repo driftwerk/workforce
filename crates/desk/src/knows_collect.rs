@@ -13,6 +13,8 @@
 //! A session whose memory is off is never read, nor what of a group whose
 //! harvest is off.
 
+use std::collections::HashMap;
+
 use chrono::{DateTime, Utc};
 use eyre::Result;
 use serde_json::Value;
@@ -104,6 +106,44 @@ pub struct ExchangeRow {
     pub commands: Vec<String>,
     pub errors: Vec<String>,
     pub flagged: Vec<String>,
+    /// Why it may carry outside content, as Desk judges it (`Desk::
+    /// exchange_outside`); none: it is the person's own work.
+    pub outside: Vec<String>,
+}
+
+/// An exchange as Desk judges what it carries in.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Turn {
+    pub reference: String,
+    pub session: Uuid,
+    pub at: DateTime<Utc>,
+    pub asker: String,
+    pub ask: String,
+    pub steps: Value,
+    pub commands: Vec<String>,
+}
+
+impl From<&ExchangeRow> for Turn {
+    fn from(e: &ExchangeRow) -> Self {
+        Self {
+            reference: e.reference.clone(),
+            session: e.session,
+            at: e.at,
+            asker: e.asker.clone(),
+            ask: e.ask.clone(),
+            steps: e.steps.clone(),
+            commands: e.commands.clone(),
+        }
+    }
+}
+
+/// A line message as delivered to a session: what it carried in, and who
+/// sent it when.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Delivered {
+    pub outside: Option<String>,
+    pub from: crate::crew::Party,
+    pub at: DateTime<Utc>,
 }
 
 /// What of the append kinds a rule covers, for the reads below: everything,
@@ -129,9 +169,14 @@ pub fn exchange_ref(engine: &str, key: &str) -> String {
 /// Not yet sent to `$1` as `kind` by `ref_sql`, or sent and deleted: the
 /// append kinds' anti-join. Being deleted counts as sent.
 fn unsent(kind: &str, ref_sql: &str) -> String {
+    // An exchange sent before Desk said what it carries in goes again.
+    let said = match kind {
+        TRANSCRIPT => " AND k.outside_said",
+        _ => "",
+    };
     format!(
         "NOT EXISTS (SELECT 1 FROM knows_sent k WHERE k.agent = $1 AND k.kind = '{kind}' \
-         AND k.ref = {ref_sql} AND (k.deleted_at IS NULL OR k.deleting IS NOT NULL))"
+         AND k.ref = {ref_sql} AND (k.deleted_at IS NULL OR k.deleting IS NOT NULL){said})"
     )
 }
 
@@ -317,7 +362,9 @@ impl DeskStore {
     }
 
     /// The closed exchanges of the sessions `scope` covers, ended since
-    /// `since`, that `agent` wasn't sent, oldest first, at most `limit`.
+    /// `since`, that `agent` wasn't sent, oldest first, at most `limit`:
+    /// those never sent before those going once more (sent before Desk
+    /// said what they carry), so new work is never held behind them.
     pub async fn knows_exchanges(
         &self,
         agent: &str,
@@ -337,7 +384,9 @@ impl DeskStore {
                AND s.memory = 'on' \
                AND NOT EXISTS (SELECT 1 FROM knows_forgotten f WHERE f.session = e.session) \
                AND {} \
-             ORDER BY e.ended, e.id LIMIT $6",
+             ORDER BY EXISTS (SELECT 1 FROM knows_sent k WHERE k.agent = $1 \
+                 AND k.kind = '{TRANSCRIPT}' AND k.ref = e.engine || ':' || e.key), \
+               e.ended, e.id LIMIT $6",
             unsent(TRANSCRIPT, "e.engine || ':' || e.key")
         );
         client
@@ -371,8 +420,146 @@ impl DeskStore {
                     commands: r.try_get(11)?,
                     errors: r.try_get(12)?,
                     flagged: r.try_get(13)?,
+                    outside: vec![],
                 })
             })
             .collect()
+    }
+
+    /// The latest of `session`'s exchanges begun before `before`, newest
+    /// first, at most `limit`.
+    pub async fn turns_before(
+        &self,
+        session: Uuid,
+        before: DateTime<Utc>,
+        limit: i64,
+    ) -> Result<Vec<Turn>> {
+        let client = self.pool().get().await?;
+        client
+            .query(
+                "SELECT engine || ':' || key, session, at, asker, ask, steps, commands \
+                 FROM memory_exchanges WHERE session = $1 AND at < $2 \
+                 ORDER BY at DESC, id DESC LIMIT $3",
+                &[&session, &before, &limit],
+            )
+            .await?
+            .iter()
+            .map(|r| {
+                Ok(Turn {
+                    reference: r.try_get(0)?,
+                    session: r.try_get(1)?,
+                    at: r.try_get(2)?,
+                    asker: r.try_get(3)?,
+                    ask: r.try_get(4)?,
+                    steps: r.try_get(5)?,
+                    commands: r.try_get(6)?,
+                })
+            })
+            .collect()
+    }
+
+    /// The line message to `session`, or the prompt typed into it
+    /// ([`Self::put_typed_prompt`]), its `mark` ([`crate::line::marker`])
+    /// names, newest if more than one does.
+    pub async fn delivered(&self, session: Uuid, mark: &str) -> Result<Option<Delivered>> {
+        let client = self.pool().get().await?;
+        client
+            .query_opt(
+                "SELECT outside, sender, at FROM line_messages \
+                   WHERE recipient ->> 'id' = $1 AND replace(id::text, '-', '') LIKE $2 || '%' \
+                 UNION ALL \
+                 SELECT outside, sender, at FROM typed_prompts \
+                   WHERE session::text = $1 AND replace(id::text, '-', '') LIKE $2 || '%' \
+                 ORDER BY at DESC LIMIT 1",
+                &[&session.to_string(), &mark],
+            )
+            .await?
+            .map(|r| {
+                Ok(Delivered {
+                    outside: r.try_get(0)?,
+                    from: serde_json::from_value(r.try_get(1)?)?,
+                    at: r.try_get(2)?,
+                })
+            })
+            .transpose()
+    }
+
+    /// A prompt `sender` typed into `session` at `at` under the marker of
+    /// `id`, carrying in `outside` (none: nothing).
+    pub async fn put_typed_prompt(
+        &self,
+        id: Uuid,
+        session: Uuid,
+        sender: &crate::crew::Party,
+        outside: Option<&str>,
+        at: DateTime<Utc>,
+    ) -> Result<()> {
+        let client = self.pool().get().await?;
+        client
+            .execute(
+                "INSERT INTO typed_prompts (id, session, sender, outside, at) \
+                 VALUES ($1, $2, $3, $4, $5)",
+                &[&id, &session, &serde_json::to_value(sender)?, &outside, &at],
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// What the boss's turn that wrote ticket or comment `id` had read
+    /// (none: nothing). A reason once said stays, whatever is said after.
+    pub async fn put_written_outside(&self, id: Uuid, outside: Option<&str>) -> Result<()> {
+        let client = self.pool().get().await?;
+        client
+            .execute(
+                "INSERT INTO written_outside (id, outside) VALUES ($1, $2) \
+                 ON CONFLICT (id) DO UPDATE \
+                 SET outside = COALESCE(written_outside.outside, EXCLUDED.outside)",
+                &[&id, &outside],
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// Of `ids` (tickets and comments), what each written by a boss's turn
+    /// said it had read ([`Self::put_written_outside`]): absent, one Desk
+    /// was never told of.
+    pub async fn written_outside(&self, ids: &[Uuid]) -> Result<HashMap<Uuid, Option<String>>> {
+        let client = self.pool().get().await?;
+        client
+            .query(
+                "SELECT id, outside FROM written_outside WHERE id = ANY($1)",
+                &[&ids],
+            )
+            .await?
+            .iter()
+            .map(|r| Ok((r.try_get(0)?, r.try_get(1)?)))
+            .collect()
+    }
+
+    /// `session` started on a prompt carrying in `outside` (none: nothing).
+    pub async fn put_session_start(&self, session: Uuid, outside: Option<&str>) -> Result<()> {
+        let client = self.pool().get().await?;
+        client
+            .execute(
+                "INSERT INTO session_starts (session, outside) VALUES ($1, $2) \
+                 ON CONFLICT (session) DO UPDATE SET outside = EXCLUDED.outside",
+                &[&session, &outside],
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// What `session`'s first prompt carried in, when Desk started it on
+    /// one: `Some(None)` nothing.
+    pub async fn session_start(&self, session: Uuid) -> Result<Option<Option<String>>> {
+        let client = self.pool().get().await?;
+        Ok(client
+            .query_opt(
+                "SELECT outside FROM session_starts WHERE session = $1",
+                &[&session],
+            )
+            .await?
+            .map(|r| r.try_get(0))
+            .transpose()?)
     }
 }

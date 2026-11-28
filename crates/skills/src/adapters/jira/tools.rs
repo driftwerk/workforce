@@ -234,6 +234,10 @@ fn issue_extras(
     }
     if wants("reporter") {
         out.insert("reporter".into(), f["reporter"]["displayName"].clone());
+        out.insert(
+            "reporter_account_id".into(),
+            f["reporter"]["accountId"].clone(),
+        );
     }
     for (role, id) in custom {
         let v = &f[id.as_str()];

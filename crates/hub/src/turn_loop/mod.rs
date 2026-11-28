@@ -4552,6 +4552,7 @@ pub(crate) async fn run_isolated(
         findings: collated.staged,
         claims: collated.findings,
         package: None,
+        read_outside: None,
     })
 }
 

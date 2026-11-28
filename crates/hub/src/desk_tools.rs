@@ -170,6 +170,7 @@ fn caller(id: &str) -> Option<By> {
         suggestion_id: None,
         hop: 0,
         preference: None,
+        outside: None,
     })
 }
 
@@ -281,7 +282,11 @@ impl DeskTool {
             }
             Verb::Prompt => {
                 let i: PromptInput = parse(input)?;
-                out(d.prompt(i.session_id, &i.prompt, caller(&self.agent))?)
+                let typed = match caller(&self.agent) {
+                    Some(by) => d.prompt_for(i.session_id, &i.prompt, by).await,
+                    None => d.prompt(i.session_id, &i.prompt, None),
+                };
+                out(typed?)
             }
             Verb::Read => {
                 let i: ReadInput = parse(input)?;

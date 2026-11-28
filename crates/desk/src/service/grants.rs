@@ -287,6 +287,8 @@ impl Desk {
     /// [`grant::NOT_HELD`]: the start waits for it. Under `id`, the session
     /// id its plan gave it, a start sent again is the one already started
     /// in that grant, as it is now (the person may have it): never a second.
+    /// Its first prompt carries in `outside`, as the hub that handed it
+    /// judged it.
     pub async fn create_held(
         &self,
         new: crate::model::NewSession,
@@ -294,6 +296,7 @@ impl Desk {
         id: Option<Uuid>,
         deps: bool,
         free_resting: Option<Option<Uuid>>,
+        outside: Option<String>,
     ) -> Result<crate::model::SessionView, DeskError> {
         let Some(group) = new.group.clone().filter(|g| grant::plan_of(g).is_some()) else {
             return Err(DeskError::Invalid(
@@ -350,11 +353,14 @@ impl Desk {
                     .await?;
             }
         }
-        let by = crate::crew::By::manager(
-            &party.id,
-            &party.name,
-            "The person approved its plan; Desk started its ticket for it.",
-        );
+        let by = crate::crew::By {
+            outside,
+            ..crate::crew::By::manager(
+                &party.id,
+                &party.name,
+                "The person approved its plan; Desk started its ticket for it.",
+            )
+        };
         self.start_session(new, id, Some(&party), Some(by), true, deps)
             .await
     }

@@ -84,6 +84,10 @@ impl Tool for ActivityTool {
         })
     }
 
+    fn reach(&self, _input: &serde_json::Value) -> Option<workforce_agent::tools::Reach> {
+        Some(workforce_agent::tools::Reach::Reads)
+    }
+
     async fn execute(&self, input: serde_json::Value) -> Result<ToolResult> {
         let start = std::time::Instant::now();
         let query_input: ActivityQueryInput = serde_json::from_value(input)?;

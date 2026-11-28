@@ -34,8 +34,8 @@ impl CodexParts {
 ///   assistant's); Codex's own context it sends as the user's
 ///   (`<environment_context>`, `<user_instructions>`, AGENTS.md) is left
 ///   out;
-/// - `function_call`, `custom_tool_call` and `local_shell_call` are Calls,
-///   and their `*_output`s Results;
+/// - `function_call`, `custom_tool_call`, `local_shell_call` and
+///   `web_search_call` are Calls, and their `*_output`s Results;
 /// - `task_complete` (and `turn_aborted`) are an End, and `compacted` the
 ///   summary Codex keeps at a compaction.
 ///
@@ -138,6 +138,16 @@ fn item(
                 command: None,
             }]
         }
+        "web_search_call" => vec![Part::Call {
+            id: p["id"].as_str().unwrap_or_default().to_string(),
+            tool: "web_search".into(),
+            input: p["action"]["query"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string(),
+            files: Vec::new(),
+            command: None,
+        }],
         "local_shell_call" => {
             let command = command_of(&p["action"]);
             vec![Part::Call {

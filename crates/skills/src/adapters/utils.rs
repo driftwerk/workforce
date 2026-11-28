@@ -464,6 +464,10 @@ impl<C: Send + Sync + 'static> workforce_agent::tools::Tool for WorkspacesTool<C
         json!({ "type": "object", "properties": {}, "required": [] })
     }
 
+    fn reach(&self, _input: &serde_json::Value) -> Option<workforce_agent::tools::Reach> {
+        Some(workforce_agent::tools::Reach::Reads)
+    }
+
     async fn execute(&self, _input: Value) -> eyre::Result<workforce_agent::tools::ToolResult> {
         let start = std::time::Instant::now();
         let (clients, default) = match &self.fixed_default {

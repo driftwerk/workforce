@@ -203,6 +203,44 @@ async fn a_machine_serves_the_homes_boss_its_grant_names_and_nothing_else() {
     .await;
 }
 
+/// On devbox: a relayed call may say what the home's boss's turn had read
+/// (`outside`), and is taken with it as without; what it says is kept with
+/// the boss's words (`tests/served.rs`).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_relayed_call_is_taken_saying_what_the_homes_boss_had_read() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (_any, crew, d, _llm) = overseeing(
+            dir.path(),
+            pool,
+            "ok",
+            "[oversight]\nenabled = false\n",
+            &[],
+        )
+        .await;
+        let s = new_session(&d, dir.path(), "acme-api").await;
+        let item = workforce_desk::session_item(s.id);
+        d.change_layout(|l| l.create("acme", "Acme", std::slice::from_ref(&item), None))
+            .await
+            .unwrap();
+        put_grant(&d, "local:sarah", &[s.id]).await;
+        let app = super::super::relay::routes(Arc::clone(&crew.state), Arc::clone(&crew));
+        let token = crew.state.auth_token.clone();
+        for (id, outside) in [("o-1", None), ("o-2", Some(json!("web.fetch")))] {
+            let mut call = json!({"group": "acme", "tool": "crew.overview", "input": {},
+                   "boss": "local:sarah", "linkId": "home-relay", "id": id,
+                   "level": "act", "act": {"interrupt": true}});
+            if let Some(o) = outside {
+                call["outside"] = o;
+            }
+            let (code, out) = post(&app, "/api/desk/crew/served", &token, call).await;
+            assert_eq!(code, StatusCode::OK, "{out}");
+            assert_eq!(out["status"], "ok", "{out}");
+        }
+    })
+    .await;
+}
+
 /// On the Mac: Sarah's calls on devbox's sessions go to Desk's native side
 /// and come back as devbox answered them; nothing of them is done here,
 /// and nothing outside Acme is sent.
@@ -315,6 +353,28 @@ async fn a_local_boss_reaches_its_groups_machine_sessions_through_desk() {
         );
         let wire = serde_json::to_value(&sent).unwrap();
         assert_eq!(wire["leftMs"], json!(sent.left_ms), "{wire}");
+        // A turn that read nothing outside says nothing of it, as a machine
+        // older than saying it takes the call; one that read some says what.
+        assert_eq!(sent.outside, None);
+        assert!(wire.get("outside").is_none(), "{wire}");
+        d.read_outside_with(Arc::new(|| {
+            workforce_agent::runner::caller_content_guard().and_then(|g| g.armed())
+        }));
+        let guard = Arc::new(workforce_agent::security::monitor::ContentGuard::new(
+            Default::default(),
+        ));
+        guard.returned("web.fetch", true, true, "the page");
+        let r = workforce_agent::runner::with_content_guard(Some(Arc::clone(&guard)), async {
+            tool("crew.interrupt")
+                .execute(interrupt(format!("devbox/{remote}")))
+                .await
+                .unwrap()
+        })
+        .await;
+        assert!(r.success, "{r:?}");
+        let armed = seen.lock().last().cloned().unwrap();
+        assert_eq!(armed.outside, guard.armed());
+        assert!(armed.outside.is_some());
 
         // Too large to carry: refused here, nothing queued.
         let before = seen.lock().len();

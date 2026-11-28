@@ -153,6 +153,10 @@ impl Tool for SecurityAuditTool {
             "required": []})
     }
 
+    fn reach(&self, _input: &serde_json::Value) -> Option<crate::tools::Reach> {
+        Some(crate::tools::Reach::Reads)
+    }
+
     async fn execute(&self, input: serde_json::Value) -> Result<ToolResult> {
         let start = Instant::now();
 

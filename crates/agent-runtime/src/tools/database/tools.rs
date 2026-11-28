@@ -15,7 +15,7 @@ use crate::artifacts::{
 };
 use crate::runner::{CURRENT_AGENT_ID, CURRENT_USER_ID};
 use crate::security::external_content::wrap_external_content;
-use crate::tools::{Tool, ToolResult};
+use crate::tools::{Reach, Tool, ToolResult};
 
 use super::backend::{classify_read_only, Backend, Introspect, QueryResult};
 use super::config::{clamp_limit, InstanceConfig};
@@ -28,6 +28,9 @@ trait DbTool: Send + Sync {
     fn tool_name(&self) -> &'static str;
     fn tool_description(&self) -> &'static str;
     fn tool_schema(&self) -> Value;
+    /// Whether it only reads what the database is made of: its instances,
+    /// schemas, tables and columns. Its rows are others' words.
+    fn reads(&self) -> bool;
     async fn run(&self, input: Value) -> Result<Value>;
 }
 
@@ -41,6 +44,9 @@ impl<T: DbTool> Tool for T {
     }
     fn input_schema(&self) -> Value {
         self.tool_schema()
+    }
+    fn reach(&self, _input: &Value) -> Option<Reach> {
+        self.reads().then_some(Reach::Reads)
     }
     async fn execute(&self, input: Value) -> Result<ToolResult> {
         let start = Instant::now();
@@ -210,6 +216,9 @@ impl DbTool for ListInstancesTool {
     fn tool_schema(&self) -> Value {
         json!({ "type": "object", "properties": {} })
     }
+    fn reads(&self) -> bool {
+        true
+    }
     async fn run(&self, _input: Value) -> Result<Value> {
         let instances: Vec<Value> = self
             .rt
@@ -271,6 +280,9 @@ impl DbTool for SchemasTool {
             "properties": { "instance": instance_schema_prop() }
         })
     }
+    fn reads(&self) -> bool {
+        true
+    }
     async fn run(&self, input: Value) -> Result<Value> {
         let (cfg, backend) = self.rt.resolve(instance_arg(&input)).await?;
         run_introspect(
@@ -310,6 +322,9 @@ impl DbTool for TablesTool {
                 "schema": { "type": "string", "description": "Restrict to this schema/database." }
             }
         })
+    }
+    fn reads(&self) -> bool {
+        true
     }
     async fn run(&self, input: Value) -> Result<Value> {
         let schema = ident_arg(&input, "schema")?;
@@ -353,6 +368,9 @@ impl DbTool for ColumnsTool {
             },
             "required": ["table"]
         })
+    }
+    fn reads(&self) -> bool {
+        true
     }
     async fn run(&self, input: Value) -> Result<Value> {
         let table = ident_arg(&input, "table")?.ok_or_else(|| eyre!("`table` is required"))?;
@@ -412,6 +430,9 @@ impl DbTool for QueryTool {
             "required": ["sql"]
         })
     }
+    fn reads(&self) -> bool {
+        false
+    }
     async fn run(&self, input: Value) -> Result<Value> {
         let sql = sql_arg(&input)?;
         classify_read_only(sql)?;
@@ -468,6 +489,9 @@ impl DbTool for ExplainTool {
             "required": ["sql"]
         })
     }
+    fn reads(&self) -> bool {
+        false
+    }
     async fn run(&self, input: Value) -> Result<Value> {
         let sql = sql_arg(&input)?;
         classify_read_only(sql)?;
@@ -519,6 +543,9 @@ impl DbTool for ExportTool {
             },
             "required": ["sql"]
         })
+    }
+    fn reads(&self) -> bool {
+        false
     }
     async fn run(&self, input: Value) -> Result<Value> {
         let sql = sql_arg(&input)?;
@@ -580,6 +607,9 @@ impl DbTool for ExecuteTool {
             },
             "required": ["sql"]
         })
+    }
+    fn reads(&self) -> bool {
+        false
     }
     async fn run(&self, input: Value) -> Result<Value> {
         if !(self.is_admin)() {

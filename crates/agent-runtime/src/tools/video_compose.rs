@@ -254,6 +254,10 @@ impl Tool for VideoComposeTool {
         })
     }
 
+    fn reach(&self, _input: &serde_json::Value) -> Option<crate::tools::Reach> {
+        Some(crate::tools::Reach::Stays)
+    }
+
     async fn execute(&self, input: Value) -> Result<ToolResult, eyre::Error> {
         let started = Instant::now();
 
@@ -500,6 +504,10 @@ impl Tool for TrimVideoTool {
         })
     }
 
+    fn reach(&self, _input: &serde_json::Value) -> Option<crate::tools::Reach> {
+        Some(crate::tools::Reach::Stays)
+    }
+
     async fn execute(&self, input: Value) -> Result<ToolResult, eyre::Error> {
         let started = Instant::now();
 
@@ -663,6 +671,10 @@ impl Tool for VideoToGifTool {
             },
             "required": ["artifact_id"]
         })
+    }
+
+    fn reach(&self, _input: &serde_json::Value) -> Option<crate::tools::Reach> {
+        Some(crate::tools::Reach::Stays)
     }
 
     async fn execute(&self, input: Value) -> Result<ToolResult, eyre::Error> {
@@ -1762,6 +1774,31 @@ mod tests {
         }
     }
 
+    /// The video tools make the agent's own file: after a web read they run.
+    #[test]
+    fn the_video_tools_stay_with_the_agent_after_outside_content() {
+        use crate::security::monitor::{Call, ContentGuard, ContentScope};
+        let guard = ContentGuard::new(ContentScope::default());
+        guard.read_outside("the page", "web.fetch");
+        let agent_id = || "a".to_string();
+        let tools: [Box<dyn Tool>; 3] = [
+            Box::new(VideoComposeTool {
+                agent_id: agent_id(),
+            }),
+            Box::new(TrimVideoTool {
+                agent_id: agent_id(),
+            }),
+            Box::new(VideoToGifTool {
+                agent_id: agent_id(),
+            }),
+        ];
+        let input = serde_json::json!({ "segments": "none" });
+        for tool in &tools {
+            let call = Call::new(tool.name(), &input, None).told_by(tool.as_ref());
+            assert!(guard.check_call(&call).is_none(), "{}", tool.name());
+        }
+    }
+
     #[test]
     fn sniff_classifies_common_magics() {
         assert_eq!(sniff_ext(&[0x89, b'P', b'N', b'G', 0x0D]), "png");
@@ -2687,5 +2724,29 @@ mod tests {
         // An explicit size is honoured even if it has to wrap.
         let (_, fixed) = plan_caption(long, 480, 480.0 * 0.5, m, Some(50));
         assert_eq!(fixed, 50);
+    }
+
+    #[test]
+    fn what_it_makes_stays_with_the_agents_conversation() {
+        let agent_id = || "atlas".to_string();
+        let tools: [&dyn Tool; 3] = [
+            &VideoComposeTool {
+                agent_id: agent_id(),
+            },
+            &TrimVideoTool {
+                agent_id: agent_id(),
+            },
+            &VideoToGifTool {
+                agent_id: agent_id(),
+            },
+        ];
+        for tool in tools {
+            assert_eq!(
+                tool.reach(&serde_json::json!({})),
+                Some(crate::tools::Reach::Stays),
+                "{}",
+                tool.name()
+            );
+        }
     }
 }

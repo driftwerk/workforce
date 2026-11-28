@@ -399,6 +399,7 @@ async fn only_the_person_s_tickets_are_created_there() {
             suggestion_id: None,
             hop: 0,
             preference: None,
+            outside: None,
         };
         made_here(&d, &b, &agent).await;
         let remote = WriteJira::new(Creates::InProject);

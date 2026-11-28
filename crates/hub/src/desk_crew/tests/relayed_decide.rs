@@ -143,6 +143,7 @@ async fn a_machine_unbinds_the_homes_boss_only_while_its_home_holds_it_and_takes
                     link_id: Some("home-relay".into()),
                     call_id: Some(uuid::Uuid::new_v4().to_string()),
                     ceiling: None,
+                    outside: None,
                 },
                 "acme",
             )
@@ -880,6 +881,7 @@ async fn a_request_beside_a_job_the_home_holds_is_the_persons_on_the_machine() {
                     link_id: Some("home-relay".into()),
                     call_id: Some(uuid::Uuid::new_v4().to_string()),
                     ceiling: None,
+                    outside: None,
                 },
                 "acme",
             )
@@ -1034,6 +1036,7 @@ async fn a_question_of_a_session_the_homes_boss_runs_on_a_machine_is_answered_by
                     link_id: Some("home-relay".into()),
                     call_id: Some(uuid::Uuid::new_v4().to_string()),
                     ceiling: None,
+                    outside: None,
                 },
                 "acme",
             )

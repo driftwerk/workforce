@@ -175,15 +175,39 @@ pub const WORKER_READ_TOOLS: &[&str] = &[
 mod tests {
     use super::*;
 
+    // Mutating operation prefixes (the final dotted segment of a tool name).
+    const WRITE_OPS: &[&str] = &[
+        "create", "update", "delete", "append", "insert", "clear", "upload", "move", "rename",
+        "share", "mkdir", "send", "modify", "trash", "untrash", "archive", "mark", "add", "done",
+        "undo", "batch", "replace", "set", "copy", "dm",
+    ];
+
+    #[test]
+    fn the_tools_said_only_to_read_are_real_and_name_no_change() {
+        let all: std::collections::HashSet<&str> = tool_names().into_iter().collect();
+        for name in tool_helpers::READS
+            .iter()
+            .chain(tool_helpers::OUTSIDE_READS)
+        {
+            assert!(all.contains(name), "{name} is not a registered google tool");
+            let op = name.rsplit('.').next().unwrap_or("");
+            assert!(
+                !op.split('_').any(|word| WRITE_OPS.contains(&word)),
+                "{name} names a change"
+            );
+            assert!(
+                !workforce_agent::security::monitor::names_a_change(name, ""),
+                "{name} is named as a change"
+            );
+        }
+        for name in tool_helpers::OTHERS_WORDS {
+            assert!(tool_helpers::READS.contains(name), "{name} is not a read");
+        }
+    }
+
     #[test]
     fn worker_read_tools_are_real_and_non_mutating() {
         let all: std::collections::HashSet<&str> = tool_names().into_iter().collect();
-        // Mutating operation prefixes (the final dotted segment of a tool name).
-        const WRITE_OPS: &[&str] = &[
-            "create", "update", "delete", "append", "insert", "clear", "upload", "move", "rename",
-            "share", "mkdir", "send", "modify", "trash", "untrash", "archive", "mark", "add",
-            "done", "undo", "batch", "replace", "set", "copy", "dm",
-        ];
         for name in WORKER_READ_TOOLS {
             assert!(all.contains(name), "{name} is not a registered google tool");
             let op = name.rsplit('.').next().unwrap_or("");

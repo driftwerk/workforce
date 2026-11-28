@@ -749,6 +749,10 @@ impl Tool for PipelineTool {
         }
     }
 
+    fn reach(&self, _input: &serde_json::Value) -> Option<workforce_agent::tools::Reach> {
+        (self.op.access() == Access::Read).then_some(workforce_agent::tools::Reach::Reads)
+    }
+
     async fn execute(&self, input: Value) -> Result<ToolResult> {
         let start = Instant::now();
         let caller = caller_from_context(&self.is_admin);

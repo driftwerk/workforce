@@ -129,6 +129,10 @@ impl Tool for BudgetTool {
         })
     }
 
+    fn reach(&self, input: &serde_json::Value) -> Option<workforce_agent::tools::Reach> {
+        (input["action"].as_str() == Some("status")).then_some(workforce_agent::tools::Reach::Reads)
+    }
+
     async fn execute(&self, input: serde_json::Value) -> Result<ToolResult> {
         let start = Instant::now();
         let params: BudgetInput = serde_json::from_value(input)?;

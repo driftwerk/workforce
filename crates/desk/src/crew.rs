@@ -314,6 +314,9 @@ pub struct By {
     /// The person's preference a boss applied in doing it (H9), checked
     /// to be there and active: its decision cites it.
     pub preference: Option<uuid::Uuid>,
+    /// The outside content the boss's turn that did it had read, if any:
+    /// what it says to a session carries that in.
+    pub outside: Option<String>,
 }
 
 impl By {
@@ -331,6 +334,7 @@ impl By {
             suggestion_id: None,
             hop: 0,
             preference: None,
+            outside: None,
         }
     }
 
@@ -341,6 +345,7 @@ impl By {
             suggestion_id: None,
             hop: 0,
             preference: None,
+            outside: None,
         }
     }
 
@@ -351,6 +356,7 @@ impl By {
             suggestion_id: None,
             hop: 0,
             preference: None,
+            outside: None,
         }
     }
 

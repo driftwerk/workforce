@@ -223,6 +223,13 @@ pub trait JobHost: Send + Sync {
         job_id: &str,
         tail: Option<usize>,
     ) -> eyre::Result<serde_json::Value>;
+    /// [`Self::get_result`] as a turn reads it: what the job said fenced when
+    /// its run read outside content.
+    async fn result_for_a_turn(
+        &self,
+        job_id: &str,
+        tail: Option<usize>,
+    ) -> eyre::Result<serde_json::Value>;
     async fn chain_summary(&self, chain_id: &str) -> Option<ChainSummary>;
     async fn job_detail_for(
         &self,

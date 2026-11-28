@@ -14,7 +14,7 @@ use crate::store::DeskStore;
 
 const COLUMNS: &str = "id, at, sender, recipient, kind, text, in_reply_to, hop, delivery, \
     asked, escalation, group_id, delivered_at, handed_at, updated_at, chose, about, why, details, \
-    urgency";
+    urgency, outside";
 
 /// A question waiting on the person: asked of them, or given to them by
 /// the overseer (as [`crate::service`]'s `needs_you` reads a row).
@@ -56,6 +56,7 @@ fn message(row: &Row) -> Result<LineMessage> {
             .transpose()?,
         actions: Vec::new(),
         late: false,
+        outside: row.try_get("outside")?,
     };
     m.shape();
     Ok(m)
@@ -80,7 +81,7 @@ impl DeskStore {
             .execute(
                 &format!(
                     "INSERT INTO line_messages ({COLUMNS}) \
-                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20) \
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21) \
                      ON CONFLICT (id) DO UPDATE SET recipient = EXCLUDED.recipient, \
                      text = EXCLUDED.text, delivery = EXCLUDED.delivery, \
                      asked = EXCLUDED.asked, escalation = EXCLUDED.escalation, \
@@ -111,6 +112,7 @@ impl DeskStore {
                     &m.why,
                     &m.details,
                     &m.urgency.map(Urgency::as_str),
+                    &m.outside,
                 ],
             )
             .await?;
@@ -860,7 +862,7 @@ impl DeskStore {
         tx.execute(
             &format!(
                 "INSERT INTO line_messages ({COLUMNS}) \
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20)"
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21)"
             ),
             &[
                 &answer.id,
@@ -887,6 +889,7 @@ impl DeskStore {
                 &answer.why,
                 &answer.details,
                 &answer.urgency.map(Urgency::as_str),
+                &answer.outside,
             ],
         )
         .await?;

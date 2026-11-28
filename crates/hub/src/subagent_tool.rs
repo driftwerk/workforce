@@ -12,9 +12,11 @@ use async_trait::async_trait;
 use eyre::Result;
 use serde::Deserialize;
 use workforce_agent::runner::{CURRENT_SESSION_KEY, CURRENT_USER_ID};
-use workforce_agent::tools::{Tool, ToolResult};
+use workforce_agent::security::monitor::ContentScope;
+use workforce_agent::tools::{SurfaceEffect, Tool, ToolResult};
 use workforce_common::text::truncate_str;
 use workforce_orchestrator::workflow::package::{OutputField, VerifySpec};
+use workforce_skills::adapters::messaging_routing::writes;
 
 use crate::authz::{never_admin, IsAdminFn};
 use crate::hub_core::jobs::{
@@ -181,6 +183,26 @@ impl Tool for SubAgentTool {
         })
     }
 
+    /// A spawn naming a channel announces its result there.
+    fn surface_effect(&self, input: &serde_json::Value) -> Option<SurfaceEffect> {
+        (input["action"] == "spawn")
+            .then(|| named(input["channel_id"].as_str()))
+            .flatten()
+            .map(|channel| {
+                writes(&serde_json::json!({
+                    "channel": channel,
+                    "thread_id": named(input["thread_id"].as_str()),
+                    "platform": workforce_agent::security::monitor::turn_platform(),
+                }))
+            })
+    }
+
+    /// A sub-agent is the agent's own work: one spawned from a turn armed
+    /// by outside content is guarded as that turn is.
+    fn reach(&self, _input: &serde_json::Value) -> Option<workforce_agent::tools::Reach> {
+        Some(workforce_agent::tools::Reach::Stays)
+    }
+
     async fn execute(&self, input: serde_json::Value) -> Result<ToolResult> {
         let start = Instant::now();
         let input: SubAgentInput = serde_json::from_value(input)
@@ -255,8 +277,11 @@ impl SubAgentTool {
         let timeout_secs = input.timeout_secs.unwrap_or(DEFAULT_TIMEOUT_SECS);
 
         // Resolve messaging context so the runner announces the result in-thread.
-        let (channel_id, thread_id) = if input.channel_id.is_some() {
-            (input.channel_id, input.thread_id)
+        let (channel_id, thread_id) = if let Some(channel) = named(input.channel_id.as_deref()) {
+            (
+                Some(channel.to_string()),
+                named(input.thread_id.as_deref()).map(str::to_string),
+            )
         } else if let Some(ref sched) = self.service.scheduler {
             let session_key = CURRENT_SESSION_KEY
                 .try_with(|k| k.clone())
@@ -275,6 +300,14 @@ impl SubAgentTool {
                 model: input.model,
                 system_prompt: input.system_prompt,
                 handoff: (handoff != HandoffSpec::default()).then_some(handoff),
+                guarded_as: workforce_agent::runner::caller_content_guard()
+                    .filter(|guard| guard.armed().is_some())
+                    .map(|guard| {
+                        Box::new(ContentScope {
+                            stops: Vec::new(),
+                            ..guard.kept_scope()
+                        })
+                    }),
                 ..AgentJobConfig::new(
                     task.clone(),
                     profile,
@@ -470,9 +503,9 @@ impl SubAgentTool {
                         let part =
                             |key: &str| o.tool_result.as_ref().and_then(|t| t.get(key).cloned());
                         (
-                            (!o.full_output.is_empty()).then_some(o.full_output),
+                            (!o.full_output.is_empty()).then(|| o.text_for_a_turn(&o.full_output)),
                             part("findings"),
-                            part("package"),
+                            part("package").map(|package| o.value_for_a_turn(package)),
                         )
                     }
                     None => (None, None, None),
@@ -532,6 +565,11 @@ fn handed_back(
     out
 }
 
+/// `value` unless it is blank.
+fn named(value: Option<&str>) -> Option<&str> {
+    value.filter(|value| !value.trim().is_empty())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -556,6 +594,86 @@ mod tests {
         let plain = handed_back("j1", "completed", Some(prose.clone()), None, None, None);
         assert_eq!(plain["result"], prose);
         assert!(plain.get("package").is_none());
+    }
+
+    /// The guard of an armed turn that spawns a sub-agent goes with its job,
+    /// with the URLs that turn saw; a turn nothing armed sends none.
+    #[tokio::test]
+    async fn a_sub_agent_carries_the_guard_of_the_armed_turn_that_spawned_it() {
+        use workforce_agent::security::monitor::ContentGuard;
+        struct Kept(std::sync::Mutex<Vec<Option<Box<ContentScope>>>>);
+        #[async_trait::async_trait]
+        impl crate::job_runner::AgentExecutor for Kept {
+            async fn run_agent_job(
+                &self,
+                config: &crate::hub_core::jobs::AgentJobConfig,
+                _channel: &str,
+            ) -> Result<crate::job_runner::AgentRunResult> {
+                self.0.lock().unwrap().push(config.guarded_as.clone());
+                Ok(crate::job_runner::AgentRunResult::default())
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let service = crate::serve::testing::plain_service(dir.path()).await;
+        std::fs::create_dir_all(&service.workspace).unwrap();
+        let kept = Arc::new(Kept(std::sync::Mutex::default()));
+        service
+            .job_runner
+            .as_ref()
+            .unwrap()
+            .set_agent_executor(Arc::clone(&kept) as Arc<dyn crate::job_runner::AgentExecutor>);
+        let tool = SubAgentTool::new(Arc::clone(&service));
+        let spawn = serde_json::json!({ "action": "spawn", "task": "Sum up the page" });
+        let guard = Arc::new(ContentGuard::new(ContentScope::default()));
+        guard.read_outside("see https://docs.example/next", "web.fetch");
+        let armed =
+            workforce_agent::runner::with_content_guard(Some(guard), tool.execute(spawn.clone()))
+                .await
+                .unwrap();
+        assert!(armed.success, "{:?}", armed.error);
+        assert!(tool.execute(spawn).await.unwrap().success);
+        for _ in 0..500 {
+            if kept.0.lock().unwrap().len() == 2 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let carried = kept.0.lock().unwrap().clone();
+        assert_eq!(carried.iter().filter(|scope| scope.is_none()).count(), 1);
+        let scope = carried.into_iter().flatten().next().unwrap();
+        assert_eq!(scope.armed.as_deref(), Some("web.fetch"));
+        let job = ContentGuard::new(*scope);
+        let fetch = |url: &str| job.check("web.fetch", &serde_json::json!({ "url": url }), None);
+        assert!(fetch("https://docs.example/next").is_none());
+        assert!(fetch("https://elsewhere.example/?d=1").is_some());
+    }
+
+    /// A spawn naming a channel writes there on the turn's platform; a blank
+    /// one, or none, writes nowhere.
+    #[tokio::test]
+    async fn a_spawn_naming_a_channel_writes_there_on_the_turns_platform() {
+        let dir = tempfile::tempdir().unwrap();
+        let tool = SubAgentTool::new(crate::serve::testing::plain_service(dir.path()).await);
+        let spawn = |channel: &str| serde_json::json!({ "action": "spawn", "task": "t", "channel_id": channel, "thread_id": "" });
+        assert_eq!(tool.surface_effect(&spawn(" ")), None);
+        assert_eq!(
+            tool.surface_effect(&serde_json::json!({ "action": "spawn", "task": "t" })),
+            None
+        );
+        assert_eq!(
+            tool.surface_effect(&serde_json::json!({ "action": "list", "channel_id": "C9" })),
+            None
+        );
+        let on_teams = CURRENT_SESSION_KEY.sync_scope("teams:19:abc".to_string(), || {
+            tool.surface_effect(&spawn("C9"))
+        });
+        assert_eq!(
+            on_teams,
+            Some(SurfaceEffect::Writes {
+                platform: "teams".into(),
+                destination: "C9".into(),
+            })
+        );
     }
 
     /// An overseer that prefers real sessions spawns only read-only

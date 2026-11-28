@@ -105,7 +105,7 @@ async fn comments_are_read_from_the_issue_and_posted_as_the_person() {
         assert_eq!(c.len(), 3, "{got}");
         assert_eq!(
             c[0]["author"],
-            json!({ "kind": "person", "name": "Dana Kim", "on": "Jira" })
+            json!({ "kind": "person", "name": "Dana Kim", "id": "acc", "on": "Jira" })
         );
         assert_eq!(
             c[0]["body"], "Keep the setup short.",
@@ -576,6 +576,7 @@ fn a_comment_not_kept_is_answered_with_no_id() {
         author: Author {
             kind: AuthorKind::Person,
             name: "You".into(),
+            id: None,
             on: "Desk".into(),
         },
         posted_by: None,

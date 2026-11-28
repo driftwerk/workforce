@@ -343,6 +343,13 @@ async fn a_plans_session_on_a_machine_holds_its_slot_until_the_machine_says_it_w
                                 Value::Array(all)
                             }
                             "desk.session_start" => {
+                                // The boss's own tickets, from a turn that
+                                // read nothing: said to carry nothing in.
+                                assert!(
+                                    c.input.get("outside").is_some_and(Value::is_null),
+                                    "{}",
+                                    c.input
+                                );
                                 let s = json!({
                                     "id": uuid::Uuid::new_v4(), "name": c.input["name"],
                                     "cwd": c.input["cwd"], "state": "working", "lastReply": null,

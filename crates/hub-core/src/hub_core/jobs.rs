@@ -223,6 +223,11 @@ pub struct AgentJobConfig {
     /// sub-agent's own session no longer names it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub automated_origin: Option<String>,
+    /// The guard of the submitting turn when outside content armed it,
+    /// captured like `user_id`: the sub-agent's calls are guarded as that
+    /// turn's are.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub guarded_as: Option<Box<workforce_agent::security::monitor::ContentScope>>,
 }
 
 impl AgentJobConfig {
@@ -239,6 +244,7 @@ impl AgentJobConfig {
             research: None,
             handoff: None,
             automated_origin: crate::hub_core::origins::automated_origin(),
+            guarded_as: None,
         }
     }
 
@@ -728,9 +734,36 @@ pub struct JobOutput {
     /// Attempt number this output belongs to (for retried jobs).
     #[serde(default)]
     pub attempt: Option<u32>,
+    /// The outside content the job's run was armed by, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub read_outside: Option<String>,
 }
 
 impl JobOutput {
+    /// `text` of this output as a turn reads it: fenced as outside content
+    /// when the job read some, so that turn is armed by it.
+    pub fn text_for_a_turn(&self, text: &str) -> String {
+        match self.outside_source() {
+            Some(source) => fence(text, &source),
+            None => text.to_string(),
+        }
+    }
+
+    /// `value` of this output as a turn reads it: each of its strings fenced
+    /// in place when the job read outside content.
+    pub fn value_for_a_turn(&self, value: serde_json::Value) -> serde_json::Value {
+        match self.outside_source() {
+            Some(source) => fence_strings(value, &source),
+            None => value,
+        }
+    }
+
+    fn outside_source(&self) -> Option<String> {
+        self.read_outside
+            .as_deref()
+            .map(|read| format!("a sub-agent's work ({read})"))
+    }
+
     /// Get the last N lines of the full output.
     pub fn tail(&self, n: usize) -> String {
         let lines: Vec<&str> = self.full_output.lines().collect();
@@ -1061,6 +1094,8 @@ pub struct AgentRunResult {
     pub findings: Option<serde_json::Value>,
     pub claims: Vec<crate::hub_core::jobs::Finding>,
     pub package: Option<serde_json::Value>,
+    /// The outside content the run's guard was armed by, if any.
+    pub read_outside: Option<String>,
 }
 
 impl AgentRunResult {
@@ -1092,6 +1127,30 @@ impl AgentRunResult {
             out.insert("package".to_string(), package.clone());
         }
         (!out.is_empty()).then_some(serde_json::Value::Object(out))
+    }
+}
+
+fn fence(text: &str, source: &str) -> String {
+    workforce_agent::security::external_content::wrap_external_content(text, source).wrapped_content
+}
+
+fn fence_strings(value: serde_json::Value, source: &str) -> serde_json::Value {
+    use serde_json::Value;
+    match value {
+        Value::String(text) => Value::String(fence(&text, source)),
+        Value::Array(items) => Value::Array(
+            items
+                .into_iter()
+                .map(|item| fence_strings(item, source))
+                .collect(),
+        ),
+        Value::Object(fields) => Value::Object(
+            fields
+                .into_iter()
+                .map(|(key, item)| (key, fence_strings(item, source)))
+                .collect(),
+        ),
+        other => other,
     }
 }
 

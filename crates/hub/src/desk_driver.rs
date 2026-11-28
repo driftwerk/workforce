@@ -1171,6 +1171,9 @@ pub async fn mount(
         registry: Arc::clone(&state.registry),
     }));
     desk.serve_lines(crate::desk_line_mcp::LineMcp::new(desk.clone()));
+    desk.read_outside_with(Arc::new(|| {
+        workforce_agent::runner::caller_content_guard().and_then(|guard| guard.armed())
+    }));
     let computer = desk.computer();
     crate::desk_computer::prune_daily(computer.clone(), cancel_crew.clone());
     let browser_routes =

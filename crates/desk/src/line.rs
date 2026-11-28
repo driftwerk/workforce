@@ -391,6 +391,10 @@ pub struct LineMessage {
     /// after all: set on the one word of its going in (not stored).
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub late: bool,
+    /// The outside content it carries in, if any: what a boss's turn that
+    /// sent it had read, or a ticket others wrote that it hands out.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outside: Option<String>,
 }
 
 impl LineMessage {
@@ -422,6 +426,7 @@ impl LineMessage {
             actions: Vec::new(),
             urgency: None,
             late: false,
+            outside: None,
         }
     }
 
@@ -1359,6 +1364,9 @@ pub fn steering(
 pub fn marked(msg: &LineMessage) -> bool {
     msg.from.kind != PartyKind::You
 }
+
+/// What outside content the turn now calling Desk has read, if any.
+pub type ReadOutside = std::sync::Arc<dyn Fn() -> Option<String> + std::marker::Send + Sync>;
 
 pub fn marker(id: Uuid) -> String {
     format!("[Desk m:{}]", &id.simple().to_string()[..MARK])

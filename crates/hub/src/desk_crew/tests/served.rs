@@ -82,6 +82,7 @@ async fn serve(
             link_id: Some("link-acme".into()),
             call_id: Some(uuid::Uuid::new_v4().to_string()),
             ceiling: None,
+            outside: Some(crate::desk_crew::served::SERVED_UNSAID.to_string()),
         },
         "acme",
     )
@@ -128,6 +129,7 @@ fn a_grant_gives_its_boss_its_own_group_and_switches_and_nothing_more() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_served_boss_is_decided_by_its_grant_on_the_engine_that_holds_the_session() {
     with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        let raw = pool.clone();
         let dir = tempfile::tempdir().unwrap();
         let (_desk, crew, d, _llm) = overseeing(
             dir.path(),
@@ -215,6 +217,7 @@ async fn a_served_boss_is_decided_by_its_grant_on_the_engine_that_holds_the_sess
                     link_id: Some("link-acme".into()),
                     call_id: None,
                     ceiling: None,
+                    outside: Some(crate::desk_crew::served::SERVED_UNSAID.to_string()),
                 },
                 "acme",
             )
@@ -368,6 +371,12 @@ async fn a_served_boss_is_decided_by_its_grant_on_the_engine_that_holds_the_sess
                 .as_deref(),
             Some("acme")
         );
+        // What it was started on is taken as carrying outside content: the
+        // boss's turn is on another hub.
+        assert_eq!(
+            d.store().session_start(started).await.unwrap(),
+            Some(Some(crate::desk_crew::served::SERVED_UNSAID.to_string()))
+        );
         // The local overseer doesn't run it, nor Allan the local's.
         assert!(!crew.runs(started, "desk"));
         // Its CLI was started with a pre-tool hook that fails closed.
@@ -428,6 +437,7 @@ async fn a_served_boss_is_decided_by_its_grant_on_the_engine_that_holds_the_sess
             link_id: Some("link-acme".into()),
             call_id: Some("call-7".into()),
             ceiling: None,
+            outside: Some(crate::desk_crew::served::SERVED_UNSAID.to_string()),
         };
         let r = crew.serve_crew(call.clone(), "acme").await;
         assert_eq!(r.status, ServedStatus::Ok, "{:?}", r.body);
@@ -435,6 +445,56 @@ async fn a_served_boss_is_decided_by_its_grant_on_the_engine_that_holds_the_sess
         assert_eq!(again.status, ServedStatus::Ok);
         assert_eq!(again.body["again"], json!(true));
         assert!(again.audit.is_none());
+
+        // What its word to the session carries in is what its call says:
+        // the home's own boss's turn, relayed, says what it had read, or
+        // nothing; a boss on another hub can't.
+        let carried = async |words: &str| -> Option<String> {
+            raw.get()
+                .await
+                .unwrap()
+                .query_one(
+                    "SELECT outside FROM line_messages WHERE recipient ->> 'id' = $1 \
+                     AND strpos(text, $2) > 0",
+                    &[&started.to_string(), &words],
+                )
+                .await
+                .unwrap()
+                .get(0)
+        };
+        let said = [
+            ("Run the suite.", None),
+            (
+                "Do what the page says.",
+                Some(crate::desk_crew::served::relayed_read("web.fetch")),
+            ),
+            (
+                "Go on.",
+                Some(crate::desk_crew::served::SERVED_UNSAID.to_string()),
+            ),
+        ];
+        for (words, outside) in &said {
+            let r = crew
+                .serve_crew(
+                    ServedCall {
+                        tool: "crew.nudge".into(),
+                        input: json!({"session_id": started, "message": words, "reason": "Next."}),
+                        boss: allan(),
+                        link_id: Some("link-acme".into()),
+                        call_id: Some(uuid::Uuid::new_v4().to_string()),
+                        ceiling: None,
+                        outside: outside.clone(),
+                    },
+                    "acme",
+                )
+                .await;
+            assert_eq!(r.status, ServedStatus::Ok, "{words}: {:?}", r.body);
+            assert_eq!(&carried(words).await, outside, "{words}");
+        }
+        assert_eq!(
+            crate::desk_crew::served::relayed_read("web.fetch"),
+            "web.fetch, read by the home's boss's turn"
+        );
 
         // What no boss does is the person's at every level.
         let r = serve(
@@ -537,6 +597,7 @@ async fn a_group_with_a_boss_on_this_hub_serves_no_grants_boss() {
             link_id: Some("link-acme".into()),
             call_id: Some("call-1".into()),
             ceiling: None,
+            outside: Some(crate::desk_crew::served::SERVED_UNSAID.to_string()),
         };
         crew.serve_crew(call(allan()), "acme").await;
         let bob = BossRef::Remote {

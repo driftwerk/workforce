@@ -32,7 +32,7 @@ const RICH_PAGE: u64 = 25;
 const RICH_ISSUE_FIELDS: &str = r#"
                         estimate
                         cycle { number name startsAt endsAt }
-                        creator { name }
+                        creator { id name }
                         relations(first: 10) {
                             nodes { type relatedIssue { identifier title state { name type } } }
                         }
@@ -684,7 +684,7 @@ impl Tool for LinearIssueGetTool {
                     }
                     estimate
                     cycle { number name startsAt endsAt }
-                    creator { name }
+                    creator { id name }
                     relations(first: 10) {
                         nodes { type relatedIssue { identifier title state { name type } } }
                     }

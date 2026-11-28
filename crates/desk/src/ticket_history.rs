@@ -58,6 +58,10 @@ pub enum HistoryKind {
     Field,
 }
 
+/// Who made a change there: as Desk says it, by their name, and by their
+/// id there when it says.
+type Who = (HistoryBy, Option<String>, Option<String>);
+
 /// One change there, as Desk shows it.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -65,6 +69,10 @@ pub struct HistoryEvent {
     pub at: DateTime<Utc>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub actor: Option<String>,
+    /// Their id there (Linear's user id, Jira's account id), when it says:
+    /// none on a change kept before Desk kept it, or by no one named.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actor_id: Option<String>,
     pub by: HistoryBy,
     pub kind: HistoryKind,
     /// The field it changed, for a `field` change.
@@ -77,10 +85,11 @@ pub struct HistoryEvent {
 }
 
 impl HistoryEvent {
-    fn new(at: DateTime<Utc>, who: &(HistoryBy, Option<String>), kind: HistoryKind) -> Self {
+    fn new(at: DateTime<Utc>, who: &Who, kind: HistoryKind) -> Self {
         Self {
             at,
             actor: who.1.clone(),
+            actor_id: who.2.clone(),
             by: who.0,
             kind,
             field: None,
@@ -154,16 +163,18 @@ fn who(
     name: Option<String>,
     app: bool,
     writer: Option<&str>,
-) -> (HistoryBy, Option<String>) {
+) -> Who {
+    let id = id.map(str::trim).filter(|i| !i.is_empty());
+    let kept = id.map(str::to_string);
     if id.is_some() && id == writer {
-        return (HistoryBy::Desk, name);
+        return (HistoryBy::Desk, name, kept);
     }
     let github = name
         .as_deref()
         .is_some_and(|n| n.to_lowercase().contains("github"));
     match app && github {
-        true => (HistoryBy::Github, name),
-        false => (HistoryBy::Remote, name),
+        true => (HistoryBy::Github, name, kept),
+        false => (HistoryBy::Remote, name, kept),
     }
 }
 
@@ -195,7 +206,7 @@ fn linked_key(words: &str) -> String {
 /// One changelog item as an event, or none for noise.
 fn jira_item(
     at: DateTime<Utc>,
-    who: &(HistoryBy, Option<String>),
+    who: &Who,
     item: &Value,
 ) -> Option<HistoryEvent> {
     let field = text(&item["field"])?;
@@ -307,11 +318,11 @@ fn linear_entry(n: &Value, writer: Option<&str>) -> Vec<HistoryEvent> {
         (false, Some(b)) => {
             let github = b["type"].as_str() == Some("github");
             match github {
-                true => (HistoryBy::Github, text(&b["name"])),
+                true => (HistoryBy::Github, text(&b["name"]), None),
                 false => who(None, text(&b["name"]), true, writer),
             }
         }
-        (false, None) => (HistoryBy::Remote, None),
+        (false, None) => (HistoryBy::Remote, None, None),
     };
     let e = |kind| HistoryEvent::new(at, &who, kind);
     let pair = |a: &str, b: &str, f: fn(&Value) -> Option<String>| {

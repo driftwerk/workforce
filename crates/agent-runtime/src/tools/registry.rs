@@ -781,4 +781,37 @@ mod tests {
             assert_eq!(holder.get(name).unwrap().description(), "guarded", "{name}");
         }
     }
+
+    #[test]
+    fn a_connectors_write_answers_where_it_reaches_as_the_tool_it_wraps() {
+        struct Staying;
+
+        #[async_trait]
+        impl Tool for Staying {
+            fn name(&self) -> &str {
+                "linear.issue_create"
+            }
+            fn description(&self) -> &str {
+                "staying"
+            }
+            fn input_schema(&self) -> serde_json::Value {
+                serde_json::json!({})
+            }
+            fn reach(&self, _input: &serde_json::Value) -> Option<crate::tools::Reach> {
+                Some(crate::tools::Reach::Stays)
+            }
+            async fn execute(&self, _input: serde_json::Value) -> eyre::Result<ToolResult> {
+                Ok(ToolResult::success(serde_json::Value::Null, 1))
+            }
+        }
+
+        let registry = ToolRegistry::new();
+        registry.register(Arc::new(Staying));
+        let wrapped = registry.get("linear.issue_create").unwrap();
+        assert_eq!(wrapped.description(), "staying");
+        assert_eq!(
+            wrapped.reach(&serde_json::json!({})),
+            Some(crate::tools::Reach::Stays)
+        );
+    }
 }

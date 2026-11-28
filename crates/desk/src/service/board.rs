@@ -782,6 +782,7 @@ impl Desk {
             updated_at: at,
             version: 0,
         };
+        self.stamp_written(t.id, by, true).await.map_err(internal)?;
         self.0.store.add_ticket(&mut t).await.map_err(internal)?;
         let key = t.key(&b).unwrap_or_default();
         let text = format!("created {key} “{}”", crew::one_line(&t.title, 120));
@@ -800,6 +801,7 @@ impl Desk {
         let mut t = self.ticket_of(id).await?;
         let at = now();
         let mut said = vec![];
+        let mut replaced = false;
         if let Some(title) = patch.title.map(|s| s.trim().to_string()) {
             if title.is_empty() {
                 return Err(DeskError::Invalid("A ticket needs a title.".into()));
@@ -820,6 +822,7 @@ impl Desk {
                 if body != t.body {
                     said.push("edited its description".to_string());
                     t.body = body;
+                    replaced = true;
                 }
             }
             (None, Some(more)) => {
@@ -847,6 +850,9 @@ impl Desk {
         }
         if !said.is_empty() {
             t.updated_at = at;
+            self.stamp_written(t.id, by, replaced)
+                .await
+                .map_err(internal)?;
         }
         let quiet = said.is_empty();
         if let Some(pinned) = patch.pinned {
@@ -1492,9 +1498,13 @@ impl Desk {
         let mut text = format!("gave {key} to {}", view.label());
         if tell {
             let needs = self.need_keys(&t).await?;
+            let teller = By {
+                outside: self.carried_by(by).or(self.ticket_carries(&t).await),
+                ..by.clone()
+            };
             let said = self
                 .line_send(
-                    sender_of(by),
+                    sender_of(&teller),
                     Send::Tell {
                         to: Target::Session(view.id),
                         text: board::handed_text(key, &t, &needs),
@@ -1735,6 +1745,7 @@ impl Desk {
             suggestion_id: None,
             hop: 0,
             preference: None,
+            outside: None,
         };
         let why = format!("pull request #{} {}", pr.number, pr.state.as_str());
         match board::follows_pr(t.state, pr.state) {
@@ -1953,6 +1964,7 @@ impl Desk {
             suggestion_id: None,
             hop: 0,
             preference: None,
+            outside: None,
         };
         let say = |e: DeskError| match e {
             DeskError::NotFound => "That ticket is gone.".to_string(),
@@ -2095,6 +2107,53 @@ impl Desk {
                 Ok(json!({ "key": v.key, "state": v.ticket.state }))
             }
         }
+    }
+}
+
+impl Desk {
+    /// What the boss's turn writing `id` (a ticket or a comment) for `by`
+    /// had read, kept for those its words are given to: every boss's one
+    /// it `whole`ly wrote (made, or a ticket's description replaced), and
+    /// any edit that carried some, which stays. A boss's ticket with none
+    /// kept is taken as from before Desk said, until a boss whose turn had
+    /// read nothing, or the person, replaces its description: a rename or
+    /// an addition leaves the words it had.
+    pub(super) async fn stamp_written(&self, id: Uuid, by: &By, whole: bool) -> eyre::Result<()> {
+        let outside = self.carried_by(by);
+        let vouches = matches!(by.party.kind, PartyKind::Manager | PartyKind::You);
+        if outside.is_some() || (whole && vouches) {
+            self.0
+                .store
+                .put_written_outside(id, outside.as_deref())
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// Why ticket `t`'s words, as a session is given them, may carry
+    /// outside content ([`crate::knows_outside::ticket_outside`]); taken
+    /// as carrying some when they can't be read.
+    pub(super) async fn ticket_carries(&self, t: &Ticket) -> Option<String> {
+        let read = async {
+            let b = self.board_of(t.board).await?;
+            let comments = self.ticket_comments(t.id).await?;
+            let history = match t.external.as_ref().is_some_and(|e| e.synced) {
+                true => self.0.store.history_of(t.id).await.map_err(internal)?,
+                false => None,
+            };
+            let ids: Vec<Uuid> = std::iter::once(t.id)
+                .chain(comments.iter().map(|c| c.id))
+                .collect();
+            let stamps = self.0.store.written_outside(&ids).await.map_err(internal)?;
+            let writers = crate::knows_outside::Writers {
+                comments: &comments,
+                history: history.as_ref().map(|(events, _)| events.as_slice()),
+                stamps: &stamps,
+            };
+            Ok::<_, DeskError>(crate::knows_outside::ticket_outside(t, &b, writers))
+        };
+        read.await
+            .unwrap_or_else(|_| Some("a ticket whose writers couldn't be read".into()))
     }
 }
 

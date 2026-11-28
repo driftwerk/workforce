@@ -92,6 +92,28 @@ pub struct ServedCall {
     /// overseer's own level and switches, relayed): the call is decided at
     /// the lower of it and the grant's, never above either.
     pub ceiling: Option<Ceiling>,
+    /// What its boss's word to a session carries in from outside, as its
+    /// carrier says: the home's own boss's turn, relayed, says what it had
+    /// read (none: nothing); a boss on another hub can't, and carries
+    /// [`SERVED_UNSAID`].
+    pub outside: Option<String>,
+}
+
+/// What a served boss's word is taken to carry in: its turn is on another
+/// hub, which doesn't say what it had read.
+pub const SERVED_UNSAID: &str = "a boss on another hub, whose turn Desk can't see";
+
+/// The most of what a relayed boss's turn had read kept.
+const READ_MOST: usize = 200;
+
+/// What the home's boss's turn had read, as a relayed call says it: one
+/// short line, said as the home's.
+pub fn relayed_read(read: &str) -> String {
+    let read = workforce_desk::crew::one_line(read.trim(), READ_MOST);
+    match read.is_empty() {
+        true => "the home's boss's turn, which read outside content".into(),
+        false => format!("{read}, read by the home's boss's turn"),
+    }
 }
 
 /// Whether switch `k` of `act` is on: off unless said so.
@@ -562,8 +584,16 @@ impl CrewHub {
             // A call the home relayed is kept as an assignment at the
             // home; one of a boss served from its own hub, here.
             let relayed = call.link_id.as_deref() == Some(super::relay::RELAY_LINK);
-            self.served_act(tool, &call.input, &grant, &o, &boss, relayed)
-                .await
+            self.served_act(
+                tool,
+                &call.input,
+                &grant,
+                &o,
+                &boss,
+                relayed,
+                call.outside.clone(),
+            )
+            .await
         };
         // The boss answered a request itself: its ask to the person is
         // closed.
@@ -1105,6 +1135,7 @@ impl CrewHub {
         o: &Oversight,
         boss: &str,
         relayed: bool,
+        outside: Option<String>,
     ) -> Result<(ServedStatus, Value), String> {
         let mut order = super::assignments::Order::of(input);
         order.unrecorded = relayed;
@@ -1205,7 +1236,12 @@ impl CrewHub {
                 ));
             }
         }
-        let by = By::manager(boss, &boss_name(g), reason);
+        // What it says to a session carries in what its carrier says its
+        // turn had read.
+        let by = By {
+            outside,
+            ..By::manager(boss, &boss_name(g), reason)
+        };
         match self.gate_as(&action, o, Some(boss), true) {
             Gate::No(why) => Err(why.into_owned()),
             Gate::Refuse => {
