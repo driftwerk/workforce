@@ -78,6 +78,53 @@ impl DeskStore {
         Ok(())
     }
 
+    /// `h`, for `boss`, held until the person says whether its agent may
+    /// hand their boss requests.
+    pub async fn handed_hold(&self, h: &Handed, boss: &str) -> Result<()> {
+        let client = self.pool().get().await?;
+        client
+            .execute(
+                "UPDATE handed SET boss = $3, held_at = coalesce(held_at, now()) \
+                 WHERE agent = $1 AND id = $2 AND delivered_at IS NULL",
+                &[&h.agent, &h.id, &boss],
+            )
+            .await
+            .context("holding a handed request")?;
+        Ok(())
+    }
+
+    /// The requests of agent `agent` held for the person's word, oldest
+    /// first.
+    pub async fn handed_held(&self, agent: &str) -> Result<Vec<Handed>> {
+        let client = self.pool().get().await?;
+        client
+            .query(
+                &format!(
+                    "SELECT {COLUMNS} FROM handed WHERE agent = $1 \
+                     AND held_at IS NOT NULL AND delivered_at IS NULL ORDER BY asked_at"
+                ),
+                &[&agent],
+            )
+            .await
+            .context("reading the handed requests held")?
+            .iter()
+            .map(handed_of)
+            .collect()
+    }
+
+    /// `h` held no longer: delivered or dropped.
+    pub async fn handed_unhold(&self, h: &Handed) -> Result<()> {
+        let client = self.pool().get().await?;
+        client
+            .execute(
+                "UPDATE handed SET held_at = NULL WHERE agent = $1 AND id = $2",
+                &[&h.agent, &h.id],
+            )
+            .await
+            .context("letting go a handed request held")?;
+        Ok(())
+    }
+
     /// The requests delivered to `boss` lately.
     pub async fn handed_of_boss(&self, boss: &str) -> Result<Vec<Handed>> {
         let client = self.pool().get().await?;
@@ -286,6 +333,19 @@ mod tests {
             let given_up = store.handed_owed(10).await.unwrap();
             assert_eq!(given_up.len(), 1, "tried too often");
             assert_eq!(given_up[0].text, "refused");
+
+            let held = handed("driftwerk/allan");
+            store.handed_keep(&held).await.unwrap();
+            store.handed_hold(&held, "desk").await.unwrap();
+            store.handed_hold(&h, "desk").await.unwrap();
+            assert_eq!(
+                store.handed_held("driftwerk/allan").await.unwrap().iter().map(|x| x.id).collect::<Vec<_>>(),
+                [held.id],
+                "a request delivered is never held"
+            );
+            assert_eq!(store.handed_held("driftwerk/allan").await.unwrap()[0].boss.as_deref(), Some("desk"));
+            store.handed_unhold(&held).await.unwrap();
+            assert!(store.handed_held("driftwerk/allan").await.unwrap().is_empty());
 
             let (a, b) = tokio::join!(
                 store.handed_use(&h.agent, h.id),

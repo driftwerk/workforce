@@ -420,6 +420,9 @@ impl KnowsSync {
         let Some(crew) = crate::desk_crew::for_state(&self.state) else {
             return Ok(());
         };
+        if let Err(e) = crew.release_handed(agent).await {
+            tracing::warn!(agent = %agent, error = %format!("{e:#}"), "the requests held for the person's word weren't let go; tried again next pass");
+        }
         let delivering = crate::desk_crew::delivering(agent);
         let name = self.agent_name(agent);
         let (person, taken) = match self.target(agent, false) {

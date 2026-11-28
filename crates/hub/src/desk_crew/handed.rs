@@ -33,6 +33,8 @@ use workforce_common::channels::DESK_CHANNEL;
 use workforce_common::oversight::Scope;
 use workforce_desk::crew::one_line;
 use workforce_desk::handed::{agrees, covers, Handed, Kept, WORDS_MAX};
+use workforce_desk::open_item::{ClosedBy, NewItem, OpenItem, OpenKind};
+use workforce_desk::open_item_store::Opened;
 use workforce_desk::plan::PlanState;
 use workforce_desk::Speaker;
 
@@ -46,6 +48,7 @@ const TOO_LONG: &str =
 const SESSION_GONE: &str = "Desk doesn't have the session you named any more, so nothing was handed on. Ask me again about the work as it is now.";
 const AGREED_ALREADY: &str = "The person's request these words come from already agreed a plan of yours, so it agrees no other. Ask them in your DM whether they want this one too.";
 const UNCLAIMED: &str = "Desk couldn't keep which plan the person's request agreed, so nothing was saved. Try again in a moment.";
+const NOT_ON: &str = "Your Desk doesn't let me hand your boss requests, so nothing was handed on: in Desk, open my settings, and under What they see turn on Hand your boss requests. Then ask me again.";
 const SESSION_UNREADABLE: &str = "Your Desk couldn't tell which session your request is about, so nothing was handed on. Ask me again, naming the session as Desk shows it.";
 
 /// The requests whose boss's turn runs in this process now, by agent and
@@ -57,10 +60,15 @@ static DELIVERING: LazyLock<Mutex<HashMap<(String, Uuid), Handed>>> =
 struct Delivering((String, Uuid));
 
 impl Delivering {
-    fn begin(h: &Handed) -> Self {
+    /// `h`'s turn, unless one runs for it already.
+    fn begin(h: &Handed) -> Option<Self> {
         let key = (h.agent.clone(), h.id);
-        DELIVERING.lock().insert(key.clone(), h.clone());
-        Self(key)
+        let mut running = DELIVERING.lock();
+        if running.contains_key(&key) {
+            return None;
+        }
+        running.insert(key.clone(), h.clone());
+        Some(Self(key))
     }
 }
 
@@ -79,6 +87,55 @@ pub(crate) fn delivering(agent: &str) -> Vec<Uuid> {
         .filter(|(a, _)| a == agent)
         .map(|(_, id)| *id)
         .collect()
+}
+
+/// What the person's ask, whether an agent may hand their boss requests,
+/// is kept by, before the agent: one open at a time for each.
+const HAND_ASK: &str = "handed-link:";
+const YES: &str = "Yes";
+const NO: &str = "No";
+const ONLY_YOU: &str = "Only you can let an agent elsewhere hand your boss requests.";
+
+/// What the person is told where they asked while `h` waits for their
+/// word in Desk, its boss `boss`.
+fn held_word(boss: &str) -> String {
+    format!("Your Desk asks you first, in {boss}'s DM there, whether I may hand your boss requests. Say yes there and it's passed on; no, and it's dropped.")
+}
+
+/// The person's ask in their boss's DM: may `h`'s agent hand their boss
+/// requests, as it just asked to.
+fn hand_ask(h: &Handed) -> String {
+    let (hub, _) = h.agent.split_once('/').unwrap_or((h.agent.as_str(), ""));
+    let at = if hub == workforce_desk::rooms::LOCAL_HUB {
+        "on this computer's hub".to_string()
+    } else {
+        format!("on {}", one_line(hub, 64))
+    };
+    format!(
+        "{name} {at} asked to pass on your request from {place}: “{words}”. May {name} hand your boss requests from you? Desk holds this one until you say.",
+        name = h.agent_name,
+        place = h.place,
+        words = one_line(&h.words, 200),
+    )
+}
+
+/// The agent the person's ask `key` is about.
+fn hand_ask_agent(key: &str) -> Option<&str> {
+    key.strip_prefix(HAND_ASK)
+}
+
+/// Whether `answer` to `item` is the person's word on an agent handing
+/// their boss requests: Desk keeps it, never the boss.
+pub(super) fn hand_answers(item: &OpenItem, answer: &str) -> Option<bool> {
+    hand_ask_agent(&item.dedupe_key)?;
+    let answer = answer.trim();
+    if answer.eq_ignore_ascii_case(YES) {
+        Some(true)
+    } else if answer.eq_ignore_ascii_case(NO) {
+        Some(false)
+    } else {
+        None
+    }
 }
 
 /// What the person is told of a request boss `boss` holds whose answer
@@ -112,7 +169,7 @@ fn could_not_take(boss: &str) -> String {
 fn told(h: &Handed, person: &str, session: Option<&str>) -> String {
     let on = session.map_or_else(String::new, |s| format!(", on the session “{s}”"));
     format!(
-        "This is {person}'s own request, in their words, passed on by {agent}, their agent elsewhere, from their {place} conversation with it. They want this kept on track and any stall flagged: keep it as a goal with crew.plan, its goal in their own words and agreed: their words, exactly as here{on}. Their words agree that goal alone, nothing else. Desk tells {agent} of each stall, and {agent} tells them in {place}.",
+        "{person} asked {agent} in {place} to pass this on, in their words. They want this kept on track and any stall flagged: keep it as a goal with crew.plan, its goal in their own words and agreed: their words, exactly as here{on}. Their words agree that goal alone, nothing else. Desk tells {agent} of each stall, and {agent} tells them in {place}.",
         agent = h.agent_name,
         place = h.place,
     )
@@ -174,16 +231,34 @@ impl CrewHub {
             Ok(found) => found,
             Err(why) => return store.handed_say(&h, &why).await,
         };
-        let service = boss.0;
+        let may_hand = store.knows_rule(&h.agent).await?.and_then(|k| k.may_hand);
+        match may_hand {
+            Some(true) => self.hand_on(person, h, boss.0, name),
+            Some(false) => store.handed_say(&h, NOT_ON).await,
+            None => self.hold_handed(&boss.0, &h).await,
+        }
+    }
+
+    /// `h` delivered to boss `service`, for `person`, on its own task, so a
+    /// long turn never holds up the share; unless it is under way already.
+    fn hand_on(
+        self: &Arc<Self>,
+        person: &str,
+        h: Handed,
+        service: Arc<AgentService>,
+        name: Option<String>,
+    ) -> Result<()> {
         let h = Handed {
             boss: Some(service.agent_id.to_string()),
             delivered_at: Some(Utc::now().trunc_subsecs(6)),
             ..h
         };
+        let Some(delivering) = Delivering::begin(&h) else {
+            return Ok(());
+        };
         let crew = Arc::clone(self);
         let owner = person.to_string();
         let settling = crate::shutdown::Settling::begin();
-        let delivering = Delivering::begin(&h);
         tokio::spawn(async move {
             let _settling = settling;
             let _delivering = delivering;
@@ -191,6 +266,95 @@ impl CrewHub {
                 .await;
         });
         Ok(())
+    }
+
+    /// `h` held for the person's word on its agent handing their boss
+    /// requests: asked once in boss `service`'s DM, and the person told
+    /// where they asked.
+    async fn hold_handed(&self, service: &AgentService, h: &Handed) -> Result<()> {
+        let store = self.desk.store();
+        let boss = service.agent_id.as_str();
+        store.handed_hold(h, boss).await?;
+        let mut new = NewItem::ask(boss, OpenKind::Ask, None, &hand_ask(h));
+        new.dedupe_key = format!("{HAND_ASK}{}", h.agent);
+        new.options = vec![YES.into(), NO.into()];
+        new.cant_decide = Some(ONLY_YOU.into());
+        if let Opened::New(i) = store.item_open(&new).await? {
+            self.post_item(boss, &i, super::items::needs_you(&i), Vec::new())
+                .await;
+        }
+        store.handed_say(h, &held_word(&name_of(service))).await
+    }
+
+    /// The requests of agent `agent` held for the person's word, once they
+    /// said it (on its ask or in What they see): delivered when it may hand
+    /// their boss requests, else dropped, the person told. Its ask is
+    /// closed then.
+    pub(crate) async fn release_handed(self: &Arc<Self>, agent: &str) -> Result<()> {
+        let store = self.desk.store();
+        let Some(on) = store.knows_rule(agent).await?.and_then(|k| k.may_hand) else {
+            return Ok(());
+        };
+        let held = store.handed_held(agent).await?;
+        let person = self.person(None);
+        for h in held {
+            let handed = match (on, &person) {
+                (true, Some(p)) => match self.handed_boss(h.session.as_deref()) {
+                    Ok((boss, name)) => self.hand_on(p, h.clone(), boss.0, name),
+                    Err(why) => store.handed_say(&h, &why).await,
+                },
+                (true, None) => store.handed_say(&h, OWNER_UNKNOWN).await,
+                (false, _) => store.handed_say(&h, NOT_ON).await,
+            };
+            match handed {
+                Ok(()) => store.handed_unhold(&h).await?,
+                Err(e) => {
+                    tracing::warn!(handed = %h.id, error = %format!("{e:#}"), "a held request wasn't let go; it is tried again")
+                }
+            }
+        }
+        let why = if on {
+            "You let it hand your boss requests."
+        } else {
+            "You didn't let it hand your boss requests."
+        };
+        store
+            .item_close_of_key(&format!("{HAND_ASK}{agent}"), ClosedBy::Lapsed, why)
+            .await?;
+        Ok(())
+    }
+
+    /// The person's `answer` to `closed`, when it asks whether an agent may
+    /// hand their boss requests: kept, and what it held let go.
+    pub(super) async fn hand_answer(
+        self: &Arc<Self>,
+        closed: &OpenItem,
+        answer: &str,
+    ) -> Option<String> {
+        let on = hand_answers(closed, answer)?;
+        let agent = hand_ask_agent(&closed.dedupe_key)?;
+        let store = self.desk.store();
+        let kept = match store.knows_hand_put(agent, on, Utc::now()).await {
+            Ok(kept) => kept,
+            Err(e) => {
+                tracing::warn!(error = %format!("{e:#}"), "the person's word on an agent handing requests wasn't kept");
+                if let Err(e) = store.item_reopen(closed.id).await {
+                    tracing::warn!(error = %format!("{e:#}"), "an ask whose answer wasn't kept wasn't opened again");
+                }
+                return Some("Desk couldn't keep that just now. Try again.".into());
+            }
+        };
+        if !kept {
+            return Some("That agent isn't linked any more, so nothing changed.".into());
+        }
+        if let Err(e) = self.release_handed(agent).await {
+            tracing::warn!(error = %format!("{e:#}"), "what an agent handed wasn't let go; Desk's next pass does it");
+        }
+        Some(if on {
+            "Turned on: it may hand your boss requests, and what it asked is passed on now. You can turn it off in its settings, under What they see.".into()
+        } else {
+            "Kept off: what it asked was dropped, and it was told. You can turn it on in its settings, under What they see.".into()
+        })
     }
 
     /// The boss a request about `session` goes to, with the session's

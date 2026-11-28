@@ -65,6 +65,16 @@ fn sync_of(crew: &CrewHub, d: &Desk, knows: &Arc<MemoryKnows>, person: &str) -> 
     .over(Arc::clone(knows) as Arc<dyn KnowsStore>)
 }
 
+/// The person's link to this hub's agent `desk`, as Desk keeps it, with
+/// whether it may hand their boss requests: `None` as it is until they say.
+async fn link(d: &Desk, may_hand: Option<bool>) {
+    let rule = workforce_desk::knows::Rule::new(&[], false, Default::default()).unwrap();
+    d.store()
+        .knows_rule_put("local/desk", &rule, may_hand, chrono::Utc::now())
+        .await
+        .unwrap();
+}
+
 /// `boss`'s Desk DM with the person, theirs, the newest: the crew reads
 /// them as the person whose Desk this is, with GitHub as their key reads it.
 fn their_dm(boss: &AgentService, person: &str) {
@@ -185,6 +195,7 @@ async fn a_request_handed_from_slack_is_kept_as_a_goal_on_the_persons_words_and_
             queued["message"].as_str().unwrap().starts_with("Handed to your Desk."),
             "{queued}"
         );
+        link(&d, Some(true)).await;
         let sync = sync_of(&crew, &d, &knows, &owner());
         sync.take("local/desk").await.unwrap();
 
@@ -214,7 +225,7 @@ async fn a_request_handed_from_slack_is_kept_as_a_goal_on_the_persons_words_and_
         assert_eq!(answered.len(), 1);
         assert_eq!(answered[0].0, "D1");
         assert_eq!(answered[0].1.as_deref(), Some("1700.1"));
-        assert_eq!(asked_with(&llm, &[WORDS, "passed on by Desk"]).await, 1);
+        assert_eq!(asked_with(&llm, &[WORDS, "Desk in Slack to pass this on"]).await, 1);
         let told_agent = boss.sessions.get(&conversation).unwrap().unwrap();
         assert!(
             told_agent
@@ -316,6 +327,7 @@ async fn a_request_desk_cannot_deliver_is_said_back_saying_why_and_never_deliver
             Arc::clone(&slack) as _,
         );
         their_dm(&boss, &owner());
+        link(&d, Some(true)).await;
         let knows = MemoryKnows::new();
         let asking = |words: &str, session: Option<String>| asked("desk", words, session);
 
@@ -355,9 +367,24 @@ async fn a_request_desk_cannot_deliver_is_said_back_saying_why_and_never_deliver
         assert_eq!(saying(&slack, "This Desk isn't yours").len(), 1);
 
         assert_eq!(
-            asked_with(&llm, &["keep the old work on track", "passed on by Desk"]).await
-                + asked_with(&llm, &["keep that thing on track", "passed on by Desk"]).await
-                + asked_with(&llm, &["keep the docs green", "passed on by Desk"]).await,
+            asked_with(
+                &llm,
+                &[
+                    "keep the old work on track",
+                    "Desk in Slack to pass this on"
+                ]
+            )
+            .await
+                + asked_with(
+                    &llm,
+                    &["keep that thing on track", "Desk in Slack to pass this on"]
+                )
+                .await
+                + asked_with(
+                    &llm,
+                    &["keep the docs green", "Desk in Slack to pass this on"]
+                )
+                .await,
             0
         );
     })
@@ -387,6 +414,7 @@ async fn a_request_with_no_boss_over_it_is_told_what_turns_one_on() {
         })
         .await;
         their_dm(&boss, &owner());
+        link(&d, Some(true)).await;
         let knows = MemoryKnows::new();
         let loose = asked("desk", "keep the docs green on track please", None);
         handed_through(&crew, &d, &knows, &owner(), &loose).await;
@@ -410,7 +438,111 @@ async fn a_request_with_no_boss_over_it_is_told_what_turns_one_on() {
         );
         handed_through(&crew, &d, &knows, &owner(), &grouped).await;
         assert_eq!(saying(&slack, "No boss oversees").len(), 1);
-        assert_eq!(asked_with(&llm, &["passed on by Desk"]).await, 0);
+        assert_eq!(
+            asked_with(&llm, &["Desk in Slack to pass this on"]).await,
+            0
+        );
+    })
+    .await;
+}
+
+/// The open asks of the boss `desk` whether the agent `desk` may hand the
+/// person's boss requests.
+async fn hand_asks(d: &Desk) -> Vec<workforce_desk::open_item::OpenItem> {
+    d.store()
+        .items_not_closed(Some("desk"))
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|i| i.dedupe_key == "handed-link:local/desk")
+        .collect()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_request_from_a_link_not_let_hand_is_held_and_asked_once_then_passed_on_or_dropped() {
+    with_test_pool(workforce_desk::store::build_pool, |pool| async move {
+        const ON: &str = "Desk in Slack to pass this on";
+        let dir = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(dir.path()).unwrap();
+        let gh = mantis(chrono::Utc::now(), 22, "diverged").await;
+        let (boss, crew, d, llm) = boss_on(&base, pool.clone(), &checking(5), &gh).await;
+        let slack = SentToSlack::on(&boss).await;
+        boss.surface_registry.write().await.register(
+            SurfaceKey::workspace("slack", "T1"),
+            Arc::clone(&slack) as _,
+        );
+        their_dm(&boss, &owner());
+        let knows = MemoryKnows::new();
+
+        // A link made before: off, and never said.
+        link(&d, None).await;
+        let first = asked("desk", WORDS, None);
+        handed_through(&crew, &d, &knows, &owner(), &first).await;
+        let second = asked("desk", "keep the docs green on track please", None);
+        handed_through(&crew, &d, &knows, &owner(), &second).await;
+        assert_eq!(saying(&slack, "Your Desk asks you first").len(), 2);
+        let asks = hand_asks(&d).await;
+        assert_eq!(asks.len(), 1, "asked once");
+        assert!(
+            asks[0]
+                .text
+                .contains("asked to pass on your request from Slack"),
+            "{}",
+            asks[0].text
+        );
+        assert_eq!(asks[0].options, ["Yes", "No"]);
+        crew.take_handed(
+            &owner(),
+            crate::desk_knows::sync::local_handed("local/desk", "Desk", &first),
+        )
+        .await
+        .unwrap();
+        sync_of(&crew, &d, &knows, &owner())
+            .take("local/desk")
+            .await
+            .unwrap();
+        assert_eq!(asked_with(&llm, &[ON]).await, 0, "held, never delivered");
+
+        // Yes: on, and both passed on.
+        let said = crew.answer_item(asks[0].id, "Yes").await.unwrap();
+        assert!(said.starts_with("Turned on"), "{said}");
+        eventually("both passed on", async || {
+            (asked_with(&llm, &[WORDS, ON]).await == 1
+                && asked_with(&llm, &["keep the docs green", ON]).await == 1)
+                .then_some(())
+        })
+        .await;
+        let rule = d.store().knows_rule("local/desk").await.unwrap().unwrap();
+        assert_eq!(rule.may_hand, Some(true));
+
+        // Never said again, then No: dropped, and told so.
+        pool.get()
+            .await
+            .unwrap()
+            .execute(
+                "UPDATE knows_rules SET may_hand = NULL WHERE agent = 'local/desk'",
+                &[],
+            )
+            .await
+            .unwrap();
+        let third = asked("desk", "keep the guide fresh on track please", None);
+        handed_through(&crew, &d, &knows, &owner(), &third).await;
+        let asks = hand_asks(&d).await;
+        assert_eq!(asks.len(), 1);
+        let said = crew.answer_item(asks[0].id, "No").await.unwrap();
+        assert!(said.starts_with("Kept off"), "{said}");
+        sync_of(&crew, &d, &knows, &owner()).says().await;
+        let off = "Your Desk doesn't let me hand your boss requests";
+        assert_eq!(saying(&slack, off).len(), 1);
+
+        // Off: the next is told so at once, never asked.
+        let fourth = asked("desk", "keep the site up on track please", None);
+        handed_through(&crew, &d, &knows, &owner(), &fourth).await;
+        assert_eq!(saying(&slack, off).len(), 2);
+        assert!(hand_asks(&d).await.is_empty());
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert_eq!(asked_with(&llm, &["keep the guide fresh", ON]).await, 0);
+        assert_eq!(asked_with(&llm, &["keep the site up", ON]).await, 0);
     })
     .await;
 }
@@ -424,6 +556,7 @@ async fn a_request_taken_again_after_desk_stopped_is_delivered_once_or_said_to_w
         let (boss, crew, d, llm) = boss_on(&base, pool, &checking(5), &gh).await;
         let slack = SentToSlack::on(&boss).await;
         their_dm(&boss, &owner());
+        link(&d, Some(true)).await;
         let knows = MemoryKnows::new();
         let store = d.store();
         let kept = |h: &Asked| crate::desk_knows::sync::local_handed("local/desk", "Desk", h);
@@ -446,7 +579,7 @@ async fn a_request_taken_again_after_desk_stopped_is_delivered_once_or_said_to_w
             crew.take_handed(&owner(), kept(h)).await.unwrap();
         }
         eventually("the undelivered one delivered", async || {
-            (asked_with(&llm, &[WORDS, "passed on by Desk"]).await > 0).then_some(())
+            (asked_with(&llm, &[WORDS, "Desk in Slack to pass this on"]).await > 0).then_some(())
         })
         .await;
         let sync = sync_of(&crew, &d, &knows, &owner());
@@ -456,7 +589,7 @@ async fn a_request_taken_again_after_desk_stopped_is_delivered_once_or_said_to_w
         })
         .await;
         assert_eq!(
-            asked_with(&llm, &[WORDS, "passed on by Desk"]).await,
+            asked_with(&llm, &[WORDS, "Desk in Slack to pass this on"]).await,
             1,
             "delivered once"
         );
@@ -469,7 +602,11 @@ async fn a_request_taken_again_after_desk_stopped_is_delivered_once_or_said_to_w
             1
         );
         assert_eq!(
-            asked_with(&llm, &["keep the docs green", "passed on by Desk"]).await,
+            asked_with(
+                &llm,
+                &["keep the docs green", "Desk in Slack to pass this on"]
+            )
+            .await,
             0
         );
     })
@@ -531,12 +668,7 @@ async fn a_machines_desk_takes_no_request() {
         let machine = super::machine_desk(pool.clone(), machine_dir.path()).await;
         let (boss, crew, _d, llm) = boss_on(&base, pool, &checking(5), &gh).await;
         their_dm(&boss, &owner());
-        let rule = workforce_desk::knows::Rule::new(&[], false, Default::default()).unwrap();
-        machine
-            .store()
-            .knows_rule_put("local/desk", &rule, chrono::Utc::now())
-            .await
-            .unwrap();
+        link(&machine, Some(true)).await;
         let knows = MemoryKnows::new();
         knows.hand(&asked("desk", WORDS, None)).await.unwrap();
         sync_of(&crew, &machine, &knows, &owner()).pass().await;
@@ -559,7 +691,10 @@ async fn a_machines_desk_takes_no_request() {
             1,
             "still waiting for the person's own computer's Desk"
         );
-        assert_eq!(asked_with(&llm, &["passed on by Desk"]).await, 0);
+        assert_eq!(
+            asked_with(&llm, &["Desk in Slack to pass this on"]).await,
+            0
+        );
     })
     .await;
 }

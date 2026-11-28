@@ -10,8 +10,9 @@
 //! - `GET /api/desk/knows/{hub}/{agent}`: one agent's rule (its own work
 //!   alone until one is set), what it holds outside it, and what was shared
 //!   with it today, by kind.
-//! - `PUT /api/desk/knows/{hub}/{agent}` `{places, transcripts, digest}`:
-//!   keeps the rule, and answers what the agent holds that it no longer
+//! - `PUT /api/desk/knows/{hub}/{agent}` `{places, transcripts, digest,
+//!   mayHand}`: keeps the rule, and whether the agent may hand the person's
+//!   boss requests, and answers what the agent holds that it no longer
 //!   covers. Nothing more of that is shared meanwhile.
 //! - `POST /api/desk/knows/{hub}/{agent}/held` `{choice: "delete"|"keep"}`:
 //!   the person's choice for it, logged.
@@ -130,6 +131,10 @@ struct RuleBody {
     /// Left out: as it was.
     #[serde(default)]
     digest: Option<String>,
+    /// Whether the agent may hand the person's boss requests. Left out: as
+    /// it was.
+    #[serde(default, rename = "mayHand")]
+    may_hand: Option<bool>,
 }
 
 async fn put_rule(
@@ -161,7 +166,7 @@ async fn put_rule(
         Ok(r) => r,
         Err(why) => return error(StatusCode::BAD_REQUEST, why),
     };
-    match s.desk.knows_rule_set(&agent, &rule).await {
+    match s.desk.knows_rule_set(&agent, &rule, body.may_hand).await {
         Ok(changed) => Json(changed).into_response(),
         Err(e) => failed(e),
     }
@@ -361,6 +366,40 @@ mod tests {
             let (_, body) = send(&app, "GET", &format!("{uri}/machines"), None).await;
             assert_eq!(body["everything"], true);
             assert_eq!(body["machines"], json!({}));
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn handing_the_boss_requests_is_off_until_turned_on_and_kept_when_left_out() {
+        with_test_pool(build_pool, |pool| async move {
+            let dir = tempfile::tempdir().unwrap();
+            let d = desk(pool, dir.path()).await;
+            let app = knows_router(d.clone(), Arc::new(Bearer));
+            let uri = "/api/desk/knows/driftwerk/allan";
+            let (_, body) = send(&app, "GET", uri, None).await;
+            assert_eq!(body["rule"]["mayHand"], false);
+            let (_, body) = send(&app, "PUT", uri, Some(json!({ "places": [] }))).await;
+            assert_eq!(body["rule"]["mayHand"], false, "a link made is off");
+            let (status, body) = send(
+                &app,
+                "PUT",
+                uri,
+                Some(json!({ "places": [], "mayHand": true })),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            assert_eq!(body["rule"]["mayHand"], true);
+            let (_, body) = send(&app, "PUT", uri, Some(json!({ "places": ["all"] }))).await;
+            assert_eq!(body["rule"]["mayHand"], true, "left out, as it was");
+            let (_, body) = send(
+                &app,
+                "PUT",
+                uri,
+                Some(json!({ "places": ["all"], "mayHand": false })),
+            )
+            .await;
+            assert_eq!(body["rule"]["mayHand"], false);
         })
         .await;
     }

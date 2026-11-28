@@ -71,16 +71,20 @@ fn dropped(h: &Handed) -> String {
     )
 }
 
+/// Where the person says yes, the first time this agent hands their boss
+/// a request: Desk's own setting, never seen from here.
+const FIRST: &str = "If your Desk hasn't let me hand your boss requests yet, it asks you first in your boss's DM there: say yes and it's passed on.";
+
 /// When the person's Desk will take a request, from its last check-in.
 fn landing(checked: Option<DateTime<Utc>>, now: DateTime<Utc>) -> String {
     let unless = "If that isn't within a day, I'll tell you here and drop it.";
     match checked {
-        Some(at) if now - at <= OPEN_WITHIN => "Handed to your Desk. Its boss confirms here, and Desk tells you here when it stalls.".to_string(),
+        Some(at) if now - at <= OPEN_WITHIN => format!("Handed to your Desk. Its boss confirms here, and Desk tells you here when it stalls. {FIRST}"),
         Some(at) => format!(
-            "Your Desk last checked in at {} UTC, so it's closed or your computer is asleep. It picks this up once Desk is open on your computer. {unless}",
+            "Your Desk last checked in at {} UTC, so it's closed or your computer is asleep. It picks this up once Desk is open on your computer. {unless} {FIRST}",
             at.format("%Y-%m-%d %H:%M")
         ),
-        None => format!("Your Desk shares your work with me but hasn't checked in for requests yet: update Desk on your computer and open it. {unless}"),
+        None => format!("Your Desk shares your work with me but hasn't checked in for requests yet: update Desk on your computer and open it. {unless} {FIRST}"),
     }
 }
 
@@ -737,6 +741,12 @@ mod tests {
             "{stale}"
         );
         assert!(landing(None, now).contains("update Desk on your computer"));
+        for checked in [Some(now), Some(now - Duration::hours(3)), None] {
+            assert!(
+                landing(checked, now).ends_with("say yes and it's passed on."),
+                "where to say yes, the first time"
+            );
+        }
         assert_eq!(place_of("slack"), "Slack");
         assert_eq!(place_of("web"), "chat");
     }

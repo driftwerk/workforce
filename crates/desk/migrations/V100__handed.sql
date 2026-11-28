@@ -11,6 +11,8 @@ CREATE TABLE IF NOT EXISTS handed (
     taken_at TIMESTAMPTZ NOT NULL,
     boss TEXT,
     delivered_at TIMESTAMPTZ,
+    -- Held for the person's yes to its agent handing their boss requests.
+    held_at TIMESTAMPTZ,
     -- When it agreed a plan's goal: it agrees no other after.
     used_at TIMESTAMPTZ,
     PRIMARY KEY (agent, id)
@@ -31,3 +33,7 @@ CREATE TABLE IF NOT EXISTS handed_says (
 );
 
 CREATE INDEX IF NOT EXISTS handed_says_unsent ON handed_says (agent, at) WHERE sent_at IS NULL;
+
+-- Whether the agent may hand the person's boss requests: unset until the
+-- person says (off, and they are asked on the first one), on, or off.
+ALTER TABLE knows_rules ADD COLUMN IF NOT EXISTS may_hand BOOLEAN;
